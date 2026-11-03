@@ -98,6 +98,24 @@ fn no_go_forward_closes_only_after_prefix_and_lost_rollback_go_retains_watch() {
         UNKNOWN
     );
     assert!(model.fire("PendingClose", &mut state));
+    assert_eq!(
+        run(
+            ctx,
+            &facts,
+            Request::Reconcile(binding.clone()),
+            builtin.clone()
+        ),
+        UNKNOWN
+    );
+    assert!(
+        lookup(ctx, &binding)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .closed_restart
+            .is_none(),
+        "an unsettled native input cannot produce continuation evidence"
+    );
     let (completion, order) = pending_rx.recv_timeout(PATIENCE).unwrap();
     completion.finish(EgressReceipt::from_reported_delivery(Delivery::Full, order));
     assert!(model.fire("ForwardDrain", &mut state));
@@ -207,6 +225,10 @@ fn no_go_forward_closes_only_after_prefix_and_lost_rollback_go_retains_watch() {
         UNKNOWN
     );
     assert!(model.fire("EarlyRetirement", &mut state));
+    assert!(
+        operation.lock().unwrap().closed_restart.is_none(),
+        "a live Go-granted child never becomes a closed predecessor"
+    );
     assert_eq!(
         run(
             ctx,
@@ -229,6 +251,22 @@ fn no_go_forward_closes_only_after_prefix_and_lost_rollback_go_retains_watch() {
         "OK native-act state=retired reason=cohort-exited\n"
     );
     assert!(model.fire("Retire", &mut state));
+    let closed = operation
+        .lock()
+        .unwrap()
+        .closed_restart
+        .clone()
+        .expect("retained source and granted-child deaths");
+    assert!(closed.quiescent(&facts));
+    facts
+        .processes
+        .lock()
+        .unwrap()
+        .insert(7001, process(7001, 400, 600, 400, 91));
+    assert!(
+        !closed.quiescent(&facts),
+        "the named granted-child cohort must remain quiescent"
+    );
     assert_eq!(facts.signals.load(Ordering::SeqCst), 1);
     for law in &model.invariants {
         assert!(model.check_invariant(law.name, &state), "{}", law.name);

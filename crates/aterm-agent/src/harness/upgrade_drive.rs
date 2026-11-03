@@ -1665,16 +1665,21 @@ pub(super) fn shell_dialect_of(
 }
 
 pub(super) fn store_version(program: &Path) -> Option<String> {
+    if !super::upgrade_muse::store_build(program) && !super::upgrade_agy::store_build(program) {
+        return None;
+    }
     let build = program.parent()?.parent()?;
+    let dir = build.file_name()?.to_str()?;
     let record = build.with_extension("vendor");
     let text = crate::harness::accounts::read_bounded(&record, 64 * 1024)
         .ok()
         .flatten()?;
-    text.lines().find_map(|l| {
+    let version = text.lines().find_map(|l| {
         let v = l.trim().strip_prefix("version")?.trim_start();
         let v = v.strip_prefix('=')?.trim().trim_matches('"');
         (!v.is_empty() && !v.chars().any(char::is_control)).then(|| v.to_string())
-    })
+    })?;
+    super::upgrade_muse_live::build_version(&version, Some(dir)).map(|_| version)
 }
 
 /// `twin` when it is a managed twin that execs `program`'s own build ([`catalog::twin_binary`]).
@@ -1866,7 +1871,10 @@ fn managed_twin(layout: &atpkg::store::Layout, program: &str) -> Option<PathBuf>
     if !atpkg::linkmode::is_linked(layout, program) {
         return Some(twin);
     }
-    let exe = super::upgrade_catalog::twin_binary(&std::fs::read_to_string(&twin).ok()?)?;
+    let text = crate::harness::accounts::read_bounded(&twin, 64 * 1024)
+        .ok()
+        .flatten()?;
+    let exe = super::upgrade_catalog::twin_binary(&text)?;
     exe.starts_with(layout.prefix.join("store")).then_some(twin)
 }
 
@@ -2985,10 +2993,13 @@ impl ModelCtx {
         let now = i64::try_from(now_s()).unwrap_or(0);
         let path = state_dir(opts).join("models.json");
         let Ok(list) = (if opts.dry_run {
-            std::fs::read_to_string(&path).map_or_else(
-                |_| Ok(Priority::seed(now)),
-                |t| Priority::parse(&t).ok_or_else(String::new),
-            )
+            crate::harness::accounts::read_bounded(&path, 1024 * 1024)
+                .ok()
+                .flatten()
+                .map_or_else(
+                    || Ok(Priority::seed(now)),
+                    |t| Priority::parse(&t).ok_or_else(String::new),
+                )
         } else {
             models::load_or_seed(&path, now)
         }) else {
@@ -2996,7 +3007,11 @@ impl ModelCtx {
         };
         let managed = targets.managed.as_ref();
         let baked = managed
-            .and_then(|m| std::fs::read_to_string(&m.exe).ok())
+            .and_then(|m| {
+                crate::harness::accounts::read_bounded(&m.exe, 64 * 1024)
+                    .ok()
+                    .flatten()
+            })
             .and_then(|twin| catalog::twin_binary(&twin))
             .and_then(|bin| catalog::baked_cached(&bin, &state_dir(opts).join("builds")));
         let label = managed.map(|m| m.version.to_string()).unwrap_or_default();
@@ -3644,17 +3659,24 @@ fn model_wants_a_look(opts: &Opts, sf: &SessionFile, mctx: &ModelCtx) -> bool {
         .any(|(_, read, _)| matches!(read.verdict, ModelVerdict::Due { .. }))
 }
 
+/// The user's own model settings (`<home>/.claude/settings.json`), read bounded like every
+/// other settings read (the tap's mebibyte): missing, not a regular file, oversized or
+/// unreadable reads as no settings, never a wait on whatever stands at the path.
+fn user_settings(home: &Path) -> models::UserModelSettings {
+    crate::harness::accounts::read_bounded(&home.join(".claude/settings.json"), 1024 * 1024)
+        .ok()
+        .flatten()
+        .map(|t| models::parse_user_settings(&t))
+        .unwrap_or_default()
+}
+
 /// `aterm harness upgrade models`.
 #[must_use]
 pub fn models_report(opts: &Opts) -> String {
     use std::fmt::Write as _;
     let targets = Targets::read(opts);
     let mut ctx = ModelCtx::read(opts, &targets);
-    ctx.settle(Some(
-        std::fs::read_to_string(opts.home.join(".claude/settings.json"))
-            .map(|t| models::parse_user_settings(&t))
-            .unwrap_or_default(),
-    ));
+    ctx.settle(Some(user_settings(&opts.home)));
     let label = targets
         .managed
         .as_ref()
@@ -4007,6 +4029,10 @@ impl FailedStart {
         self.source == source && Version::parse(&self.to).as_ref() == Some(version)
     }
 
+    fn is_for(&self, agent: upgrade::Agent, version: &str, source: &str) -> bool {
+        self.source == source && upgrade::same_build(agent, &self.to, version)
+    }
+
     const fn rests(&self, now: u64) -> bool {
         now < self.failed_at.saturating_add(upgrade::RETRY_S)
     }
@@ -4232,10 +4258,10 @@ impl St {
         Version::parse(&self.from).is_none_or(|from| from == *running)
     }
 
-    pub(super) fn failed_start(&self) -> Option<FailedStart> {
+    fn carried_failed_start(&self) -> Option<FailedStart> {
         match self.agent {
-            upgrade::Agent::Claude => {}
-            upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => return None,
+            upgrade::Agent::Claude | upgrade::Agent::Muse | upgrade::Agent::Agy => {}
+            upgrade::Agent::Codex => return None,
         }
         match &self.phase {
             Phase::Failed(why) if why == "no-resume" && self.source != SAME_PROGRAM => {
@@ -4247,6 +4273,13 @@ impl St {
                 })
             }
             _ => self.failed_start_kept.clone(),
+        }
+    }
+
+    pub(super) fn failed_start(&self) -> Option<FailedStart> {
+        match self.agent {
+            upgrade::Agent::Claude => self.carried_failed_start(),
+            upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => None,
         }
     }
 
@@ -4492,8 +4525,11 @@ impl St {
             Some(old) => {
                 let kept =
                     old.source == SAME_PROGRAM && Version::parse(&old.to).as_ref() == Some(from);
-                let hold = (kept && old.request.holds_build(&to.version.to_string(), now))
-                    .then(|| (old.request.clone(), old.request_tab.clone(), old.request_at));
+                let hold = (kept
+                    && old
+                        .request
+                        .holds_build_for(old.agent, &to.version.to_string(), now))
+                .then(|| (old.request.clone(), old.request_tab.clone(), old.request_at));
                 let rested = old.failed_start().filter(|f| f.of(to));
                 let mut st = St {
                     fallback_from: fallback_origin(&old),
@@ -4556,15 +4592,22 @@ impl St {
             || self.tab != tab
             || thread.is_empty()
             || self.thread != thread
-            || self.source != "managed"
-            || !self.is_upgrade()
-            || !matches!(
+            || !upgrade::same_build(agent, &self.from, versions.0)
+        {
+            return None;
+        }
+        let upgrade_claim = self.source == "managed"
+            && self.is_upgrade()
+            && matches!(
                 self.phase,
                 Phase::Pending | Phase::Announced { .. } | Phase::Failed(_)
             )
-            || !upgrade::same_build(agent, &self.from, versions.0)
-            || !upgrade::same_build(agent, &self.to, versions.1)
-        {
+            && upgrade::same_build(agent, &self.to, versions.1);
+        let same_build_restart = !self.is_upgrade()
+            && matches!(self.source.as_str(), "managed" | SAME_PROGRAM)
+            && matches!(self.phase, Phase::Failed(_) | Phase::Done)
+            && upgrade::same_build(agent, &self.to, versions.0);
+        if !upgrade_claim && !same_build_restart {
             return None;
         }
         let request = self.request_for(tab);
@@ -4579,7 +4622,11 @@ impl St {
 
     fn word_onto(&self, to: &Candidate, now: u64, same: bool) -> (Request, String, u64) {
         match &self.request {
-            Request::Skip(_) if !self.request.holds_build(&to.version.to_string(), now) => {
+            Request::Skip(_)
+                if !self
+                    .request
+                    .holds_build_for(self.agent, &to.version.to_string(), now) =>
+            {
                 (Request::None, String::new(), 0)
             }
             Request::Now if !same => (Request::None, String::new(), 0),
@@ -4609,7 +4656,7 @@ impl St {
 
     pub(super) fn holds_off(&self, tab: &str, to: &Candidate, now: u64) -> bool {
         self.owners_hold(tab)
-            .is_some_and(|word| word.holds_build(&to.version.to_string(), now))
+            .is_some_and(|word| word.holds_build_for(self.agent, &to.version.to_string(), now))
             || self
                 .failed_start()
                 .is_some_and(|failed| failed.of(to) && failed.rests(now))
@@ -4620,10 +4667,11 @@ impl St {
             return;
         }
         st.native_coordination |= super::native_restart::coordinated(self);
-        let Some(build) = Version::parse(&st.to) else {
-            return;
-        };
-        if let Some(failed) = self.failed_start().filter(|f| f.is(&build, &st.source)) {
+        if self.agent == st.agent
+            && let Some(failed) = self
+                .carried_failed_start()
+                .filter(|f| f.is_for(st.agent, &st.to, &st.source))
+        {
             "no-resume".clone_into(&mut st.streak_why);
             st.stop_streak = failed.stop_streak;
         }
@@ -4639,7 +4687,7 @@ impl St {
             st.request_tab.clone_from(&self.request_tab);
             st.request_at = self.request_at;
         }
-        st.failed_start_kept = self.failed_start();
+        st.failed_start_kept = self.carried_failed_start();
         let behind = match &self.phase {
             Phase::Pending | Phase::Announced { .. } => self.is_upgrade(),
             Phase::Failed(_) => self.is_upgrade() || self.source == SAME_PROGRAM,
@@ -4647,20 +4695,19 @@ impl St {
                 self.source == SAME_PROGRAM
             }
         };
-        let same_build = self
-            .build_behind()
-            .is_some_and(|build| Version::parse(&st.from).as_ref() == Some(&build));
+        let same_build = self.agent == st.agent
+            && upgrade::same_build(self.agent, self.build_behind(), &st.from);
         if behind && same_build && self.pending_since != 0 {
             st.pending_since = self.pending_since;
         }
     }
 
-    fn build_behind(&self) -> Option<Version> {
-        Version::parse(if self.is_upgrade() {
+    fn build_behind(&self) -> &str {
+        if self.is_upgrade() {
             &self.from
         } else {
             &self.to
-        })
+        }
     }
 
     fn preserve_unresolved_native(&self, st: &mut St) -> bool {
@@ -5771,7 +5818,7 @@ pub(super) fn registry_life<'a>(
         }
     }
     let vouched = graph.filter(|graph| {
-        graph.is_dir()
+        std::fs::symlink_metadata(graph).is_ok_and(|m| m.is_dir())
             && !known_live.is_empty()
             && known_live.iter().all(|sid| entry(graph, sid) == Some(true))
     });
@@ -5807,8 +5854,9 @@ pub(super) fn registry_graph() -> Option<PathBuf> {
 pub(super) fn sat_a_week(entry: &std::fs::DirEntry, now: u64) -> bool {
     entry
         .metadata()
-        .and_then(|m| m.modified())
         .ok()
+        .filter(std::fs::Metadata::is_file)
+        .and_then(|m| m.modified().ok())
         .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
         .is_some_and(|at| now.saturating_sub(at.as_secs()) >= STATE_KEEP_S)
 }
@@ -5864,7 +5912,9 @@ fn prune_states(opts: &Opts, files: &[SessionFile], now: u64) {
 
 fn note_names_nothing(note: &Path, session: &str) -> bool {
     note_names_nothing_with(
-        std::fs::read_to_string(note),
+        read_record_text(note).and_then(|opt| {
+            opt.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "absent"))
+        }),
         session,
         |path| {
             std::fs::read_dir(path)
@@ -6993,7 +7043,7 @@ pub(super) fn lefts_through(
 /// [`lefts_through`] for a LOOP that keeps its ledger at `ledger` for session `sid`.
 #[must_use]
 pub fn lefts_beside(ledger: &Path, sid: Option<&str>) -> Vec<String> {
-    let read = |p: &Path| std::fs::read_to_string(p).ok();
+    let read = |p: &Path| read_record_text(p).ok().flatten();
     lefts_beside_in(ledger, &read(ledger).unwrap_or_default(), sid, &read)
 }
 
@@ -7067,7 +7117,7 @@ fn earlier_tabs_path(root: &Path, tab: &str) -> PathBuf {
 }
 
 fn noted_earlier_tabs(root: &Path, tab: &str) -> Vec<String> {
-    noted_earlier_tabs_read(root, tab, &|p| std::fs::read_to_string(p).ok())
+    noted_earlier_tabs_read(root, tab, &|p| read_record_text(p).ok().flatten())
 }
 
 fn noted_earlier_tabs_read(
@@ -7372,7 +7422,11 @@ pub fn note_writes(opts: &Opts, snap: &super::relaunch::Snapshot, dir: &Path) {
     }
     let text = dir.to_string_lossy();
     let path = writes_note_path(opts, session);
-    if std::fs::read_to_string(&path).is_ok_and(|t| t.trim_end() == text) {
+    if read_record_text(&path)
+        .ok()
+        .flatten()
+        .is_some_and(|t| t.trim_end() == text)
+    {
         return;
     }
     let _ = models::write_atomic(&path, &format!("{text}\n"));
@@ -7380,8 +7434,9 @@ pub fn note_writes(opts: &Opts, snap: &super::relaunch::Snapshot, dir: &Path) {
 
 pub(super) fn finish_dir(opts: &Opts, records: &Records, session: &str) -> Option<PathBuf> {
     let filed = records.dir().map(Path::to_path_buf);
-    let noted = std::fs::read_to_string(writes_note_path(opts, session))
+    let noted = read_record_text(&writes_note_path(opts, session))
         .ok()
+        .flatten()
         .map(|t| PathBuf::from(t.trim_end()))
         .filter(|d| !d.as_os_str().is_empty());
     let newest = |dir: &Path| transcript_in(dir, session).and_then(|p| newest_row_at(&p));
@@ -7427,8 +7482,9 @@ pub(super) fn note_moved_writes(
             bases.push(wt);
         }
     }
-    let noted = std::fs::read_to_string(writes_note_path(opts, session))
+    let noted = read_record_text(&writes_note_path(opts, session))
         .ok()
+        .flatten()
         .map(|t| PathBuf::from(t.trim_end()))
         .filter(|d| !d.as_os_str().is_empty());
     let floor = [Some(filed_dir.clone()), noted]
@@ -7572,7 +7628,8 @@ impl<'a> WhereWritten<'a> {
             .map(|scan| (scan.said_done(), scan.said_irreversible()))
     }
 
-    /// Whether the agent's last reply is a clean defense of its work (`Nothing left:`).
+    /// Whether the agent's last reply is a clean defense of its work (`Nothing left:`) or says it
+    /// could not finish (`Could not finish:`), each the tab's loop's to read.
     pub(super) fn defended(&self) -> Option<bool> {
         self.scan().map(upgrade::FinishedScan::defended)
     }
@@ -7724,13 +7781,12 @@ fn agy_limit_reset(_user_home: &Path, snap: &super::relaunch::Snapshot) -> Optio
         screen_model.as_deref(),
         now,
         |asked| {
-            super::agy_quota_store::rotate_worker_at(
+            super::agy_quota_store::rotate_worker_at_wall(
                 asked,
                 &snap.program,
                 &run.env,
                 &flags,
                 now,
-                true,
             )
         },
     )
@@ -8755,7 +8811,7 @@ pub(super) fn due_by(st: &St) -> Option<u64> {
     match st.request_for(&st.tab) {
         Request::None | Request::Now => step,
         Request::Skip(v) => {
-            let this_target = Version::parse(&v).is_some_and(|v| Some(v) == Version::parse(&st.to));
+            let this_target = upgrade::same_build(st.agent, &v, &st.to);
             if this_target && unbegun { None } else { step }
         }
         Request::DeferUntil(t) => {
@@ -8838,9 +8894,9 @@ pub fn typed(step: &str) -> bool {
 pub fn host_turn(step: &str) -> Option<crate::supervise::policy::turn_end::HostTurn> {
     use crate::supervise::policy::turn_end::HostTurn;
     typed(step).then(|| {
-        if step == "continued:restore"
-            || step.split_once(':').map_or(step, |(head, _)| head) == "announced"
-        {
+        if step == "continued:restore" {
+            HostTurn::Restore
+        } else if step.split_once(':').map_or(step, |(head, _)| head) == "announced" {
             HostTurn::Notice
         } else if step == "continued:check" {
             HostTurn::Check

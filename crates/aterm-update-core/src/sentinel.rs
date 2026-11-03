@@ -169,8 +169,24 @@ impl Sentinel {
     /// Confirm the running build booted healthy by removing the commit marker.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn confirm(&self) -> io::Result<()> {
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
+        if let Some(parent) = self.path.parent().filter(|dir| !dir.as_os_str().is_empty())
+            && std::fs::symlink_metadata(parent).is_ok_and(|meta| !meta.file_type().is_dir())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "boot sentinel parent path is not a directory",
+            ));
+        }
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) if meta.file_type().is_file() => match std::fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            },
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "boot sentinel path is not a regular file",
+            )),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }
@@ -269,6 +285,12 @@ impl Sentinel {
             Some(dir) if !dir.as_os_str().is_empty() => dir,
             _ => Path::new("."),
         };
+        if !std::fs::symlink_metadata(parent)?.file_type().is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "boot sentinel parent path is not a directory",
+            ));
+        }
         let tmp = parent.join(format!(".boot-sentinel.tmp-{}", std::process::id()));
         let mut f = {
             let mut opts = std::fs::OpenOptions::new();
@@ -303,6 +325,17 @@ impl Sentinel {
             }
             aterm_durable::refusal_accepted(crate::durable::finish(&f, flush))?;
             drop(f);
+            match std::fs::symlink_metadata(&self.path) {
+                Ok(meta) if !meta.file_type().is_file() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "boot sentinel path is not a regular file",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
             std::fs::rename(&tmp, &self.path)
         })();
         if let Err(error) = wrote {
@@ -648,6 +681,59 @@ mod tests {
         assert_eq!(kept.len(), MAX_NAMED_LAUNCHES);
         assert_eq!(kept.first().map(|n| n.pid), Some(1003));
         assert_eq!(kept.last().map(|n| n.pid), Some(1034));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NEGATIVE CONTROL: `arm` and `confirm` refuse symlinked parent directories and symlinked
+    /// sentinel paths without writing through or unlinking the symlink.
+    #[cfg(unix)]
+    #[test]
+    fn arm_and_confirm_refuse_symlinked_parent_and_non_regular_target() {
+        let (s, dir) = sentinel("symlink-guards");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, &s.path).unwrap();
+
+        assert!(s.arm(77).is_err(), "arm must refuse a symlink target");
+        assert!(
+            std::fs::symlink_metadata(&s.path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "arm must leave the symlink untouched"
+        );
+        assert!(
+            s.confirm().is_err(),
+            "confirm must refuse to unlink a symlink target"
+        );
+        assert!(
+            std::fs::symlink_metadata(&s.path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "confirm must leave the symlink in place"
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        std::fs::remove_file(&s.path).unwrap();
+
+        let outside = dir.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("boot.sentinel"), "99 1").unwrap();
+        let linked_dir = dir.join("linked-parent");
+        std::os::unix::fs::symlink(&outside, &linked_dir).unwrap();
+        let via_link = Sentinel::new(linked_dir.join("boot.sentinel"));
+        assert!(
+            via_link.arm(88).is_err(),
+            "arm must refuse a symlinked parent directory"
+        );
+        assert!(
+            via_link.confirm().is_err(),
+            "confirm must refuse a symlinked parent directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("boot.sentinel")).unwrap(),
+            "99 1"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

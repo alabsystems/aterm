@@ -276,7 +276,7 @@ fn read_manifests(root: &Path) -> Vec<(String, String)> {
         };
         for entry in entries.flatten() {
             let rel = format!("{top}/{}/Cargo.toml", entry.file_name().to_string_lossy());
-            if let Ok(text) = std::fs::read_to_string(root.join(&rel)) {
+            if let Ok(text) = crate::tree::read_to_string(&root.join(&rel)) {
                 out.push((rel, text));
             }
         }
@@ -364,7 +364,7 @@ fn head_commit(tree: &Path) -> Result<String, String> {
     let gitdir = if dot.is_dir() {
         dot
     } else {
-        let text = std::fs::read_to_string(&dot)
+        let text = crate::tree::read_to_string(&dot)
             .map_err(|e| format!("{} is not a git checkout ({e})", tree.display()))?;
         let dir = text
             .trim()
@@ -372,20 +372,20 @@ fn head_commit(tree: &Path) -> Result<String, String> {
             .ok_or_else(|| format!("{}: no `gitdir:` line", dot.display()))?;
         tree.join(dir)
     };
-    let common = std::fs::read_to_string(gitdir.join("commondir"))
+    let common = crate::tree::read_to_string(&gitdir.join("commondir"))
         .map_or_else(|_| gitdir.clone(), |c| gitdir.join(c.trim()));
-    let head = std::fs::read_to_string(gitdir.join("HEAD"))
+    let head = crate::tree::read_to_string(&gitdir.join("HEAD"))
         .map_err(|e| format!("{}: {e}", gitdir.join("HEAD").display()))?;
     let head = head.trim();
     let Some(name) = head.strip_prefix("ref: ") else {
         return Ok(head.to_string());
     };
     for dir in [&gitdir, &common] {
-        if let Ok(sha) = std::fs::read_to_string(dir.join(name)) {
+        if let Ok(sha) = crate::tree::read_to_string(&dir.join(name)) {
             return Ok(sha.trim().to_string());
         }
     }
-    std::fs::read_to_string(common.join("packed-refs"))
+    crate::tree::read_to_string(&common.join("packed-refs"))
         .ok()
         .and_then(|packed| {
             packed.lines().find_map(|l| {
@@ -416,7 +416,7 @@ pub fn cli(root: &Path, args: &[String]) -> Result<String, String> {
         }
     }
     let path = root.join(REGISTRY);
-    let mut rows = match std::fs::read_to_string(&path) {
+    let mut rows = match crate::tree::read_to_string(&path) {
         Ok(text) => parse(&text).map_err(|e| format!("{REGISTRY}: {e}"))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(format!("cannot read {REGISTRY}: {e}")),
@@ -441,7 +441,7 @@ pub fn cli(root: &Path, args: &[String]) -> Result<String, String> {
         }
         Ok(read_manifests(&source))
     };
-    let read = |rel: &str| std::fs::read_to_string(source.join(rel)).ok();
+    let read = |rel: &str| crate::tree::read_to_string(&source.join(rel)).ok();
     let mut log = String::new();
     match verb.as_str() {
         "record" => {
@@ -537,7 +537,8 @@ fn header_of(
     read: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Vec<Item>, String> {
     let path = vf5.join("blobs").join(harness);
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text =
+        crate::tree::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let header = clean::header_items(&text)
         .ok_or_else(|| format!("{} has no `// aterm:` header: pass --items", path.display()))?;
     let mut items = Vec::new();

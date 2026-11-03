@@ -2,18 +2,20 @@
 // Copyright 2026 Andrew Yates
 
 //! The mode light as the mode's one home where the glass rewrites Claude Code's mode row
-//! (`yolo`, `manual mode`), under the footer's gate.
+//! (`yolo`, `lame`), under the footer's gate: `yolo` in the rule's ink, a click on it turning it
+//! `lame`, and titles that say what each mode does.
 
 use std::time::{Duration, Instant};
 
-use aterm_agent::harness::lights::{self, Light};
+use aterm_agent::harness::lights::{self, Goal, Light, Mode};
 use aterm_window::event::{ElementState, MouseButton};
 
 use super::gesture_tests::{
-    BYPASS, Hosted, PGID, app, cell_at, draw_claude, feed, footer_row, frame, hit, host, painted,
-    pty, publish_facts, px_of, row_text,
+    AUTO, BYPASS, Hosted, PGID, a_minute_ago, app, cell_at, check_mode_toggle_transition,
+    draw_claude, drive_mode_toggle_action, feed, footer_row, frame, hit, host, interval, painted,
+    press_at, press_not_due, pty, publish_facts, px_of, redraw_mode_row, row_text, rule_ink,
 };
-use super::{Chip, cells_of};
+use super::{Chip, Refusal, TITLE_CLICK, cells_of};
 use crate::{App, WindowId};
 
 const MANUAL: &str = "  \u{23F8} manual mode on \u{00B7} ? for shortcuts";
@@ -76,9 +78,9 @@ fn mode_glass(app: &App, wid: WindowId) -> String {
 }
 
 /// THE MODE LIGHT IS THE MODE'S ONE HOME: where the glass rewrites the mode row (the pill and
-/// the key hints dropped, no job to keep: a blank row) the light names manual mode `manual mode`
-/// in one run of cells, at every width the whole row is drawn, pushing neither Autopilot nor
-/// the model off, and its last cell is still the click that asks for the next mode. Bypass, an
+/// the key hints dropped, no job to keep: a blank row) the light names manual mode `lame`, a word
+/// with no glyph, in one run of cells, at every width the whole row is drawn, pushing neither
+/// Autopilot nor the model off, and its last cell is still the click that asks for the next mode. Bypass, an
 /// expected mode no light shows at rest on Claude's own row, reads `yolo` alone there. A row
 /// Claude cut where only a key hint can be cut (`? for shor…`) is rewritten as the whole one; a
 /// row cut where a job may be stands as drawn, the light naming `manual`. CONTROL: unhosted,
@@ -97,11 +99,7 @@ fn the_mode_light_is_the_modes_one_home_on_a_rewritten_row() {
                 rewrite,
                 "{what}: the gate's witness, the mode row: {row:?}"
             );
-            let word = if rewrite {
-                "\u{23F8} manual mode"
-            } else {
-                "\u{23F8} manual"
-            };
+            let word = if rewrite { "lame" } else { "\u{23F8} manual" };
             let (cells, text) = light_cells(&app, wid);
             let rule = row_text(&app, wid, footer_row(&app, wid));
             assert_eq!(text, word, "{what}: {rule:?}");
@@ -112,7 +110,7 @@ fn the_mode_light_is_the_modes_one_home_on_a_rewritten_row() {
             );
             assert!(
                 painted(&app, wid, Chip::Autopilot),
-                "{what}: the longer word pushes no chip off: {rule:?}"
+                "{what}: the word pushes no chip off: {rule:?}"
             );
             assert!(
                 rule.contains("\u{25C6} Opus 5.5"),
@@ -151,7 +149,7 @@ fn the_mode_light_is_the_modes_one_home_on_a_rewritten_row() {
         let glass = mode_glass(&app, wid);
         if rewritten {
             assert!(glass.trim().is_empty(), "a cut key hint goes: {glass:?}");
-            assert_eq!(light_cells(&app, wid).1, "\u{23F8} manual mode", "{cut:?}");
+            assert_eq!(light_cells(&app, wid).1, "lame", "{cut:?}");
         } else {
             assert_eq!(glass.trim_end(), cut, "a cut row stands");
             assert_eq!(light_cells(&app, wid).1, "\u{23F8} manual", "{cut:?}");
@@ -159,21 +157,35 @@ fn the_mode_light_is_the_modes_one_home_on_a_rewritten_row() {
     }
 }
 
-/// THE MODE LIGHT'S TITLES NAME BYPASS AND MANUAL AS THE LIGHT DOES: where the row is rewritten
-/// the hover says `click for yolo or auto`, a stop says `stopped in manual mode`, and the arrival
-/// reads `yolo`; on Claude's own row they say `bypass` and `manual mode`.
+/// THE MODE LIGHT'S TITLES SAY WHAT EACH MODE DOES AND WHERE A CLICK GOES: the hover on manual
+/// says what it does ([`Mode::gist`]) and where a click goes (the click clause and
+/// [`Goal::words`]); a stop says its reason, the mode it stopped in named as the glass names it
+/// (`Refusal::says`), and where a click goes from there; the arrival at bypass says what bypass
+/// does and where a click goes. Where the row is rewritten, and only there, a title names Claude's
+/// own mode ([`Mode::claude_name`]) beside aterm's word for it (`yolo`, `lame`): on Claude's own
+/// row the chip already wears Claude's word, which no title repeats. Each expectation is built
+/// from its producer, never from the sentence.
 #[test]
-fn the_mode_lights_titles_name_bypass_and_manual_as_the_light_does() {
+fn the_mode_lights_titles_say_what_each_mode_does_and_where_a_click_goes() {
+    let first = a_minute_ago();
+    let apart = interval() + Duration::from_millis(1);
     for rewrite in [true, false] {
-        let (on, off, stopped, arrived) = if rewrite {
-            ("yolo", "manual mode", "stopped in manual mode", "yolo")
-        } else {
-            (
-                "bypass",
-                "manual",
-                "stopped in manual mode",
-                "\u{23F5}\u{23F5} bypass",
-            )
+        let clicks = |goal: Goal| format!("{TITLE_CLICK}{}", goal.words(rewrite));
+        let says = |rule: &str, mode: Mode, what: &str| {
+            assert!(
+                rule.contains(mode.gist()),
+                "rewrite={rewrite}: {what} says what {mode:?} does: {rule:?}"
+            );
+            assert_eq!(
+                rule.contains(mode.claude_name()),
+                rewrite,
+                "rewrite={rewrite}: {what} names Claude's {mode:?} where the row is rewritten, \
+                 and only there: {rule:?}"
+            );
+            assert!(
+                rule.contains(&clicks(Goal::of_mode(mode))),
+                "rewrite={rewrite}: {what} says where a click goes: {rule:?}"
+            );
         };
         let (mut app, wid, session, mut reader, _host) = claude_app(120, rewrite);
         draw_claude(&app, session, MANUAL);
@@ -181,15 +193,12 @@ fn the_mode_lights_titles_name_bypass_and_manual_as_the_light_does() {
         let (x, y) = px_of(&app, wid, hit(&app, wid, Light::Mode));
         app.on_cursor_moved(wid, x, y);
         frame(&mut app, wid);
-        let rule = row_text(&app, wid, footer_row(&app, wid));
-        assert!(
-            rule.contains(&format!(
-                "\u{23F8} {off}  Permission mode: click for {on} or auto"
-            )),
-            "rewrite={rewrite}: the hover: {rule:?}"
+        says(
+            &row_text(&app, wid, footer_row(&app, wid)),
+            Mode::Manual,
+            "the hover",
         );
-        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        press_at(&mut app, wid, first);
         assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
         app.windows
             .get_mut(&wid)
@@ -200,14 +209,18 @@ fn the_mode_lights_titles_name_bypass_and_manual_as_the_light_does() {
         app.on_claude_footer_changed(session);
         frame(&mut app, wid);
         let rule = row_text(&app, wid, footer_row(&app, wid));
+        let stopped = format!(
+            "{}{}",
+            Refusal::StoppedIn(Mode::Manual).says(rewrite),
+            clicks(Goal::On)
+        );
         assert!(
-            rule.contains(&format!("Permission mode: {stopped}")),
-            "rewrite={rewrite}: the stop: {rule:?}"
+            rule.contains(&stopped),
+            "rewrite={rewrite}: the stop says its reason and where a click goes: {rule:?}"
         );
         let (x, y) = px_of(&app, wid, hit(&app, wid, Light::Mode));
         app.on_cursor_moved(wid, x, y);
-        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
-        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        press_at(&mut app, wid, first + apart);
         assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
         feed(
             &app,
@@ -219,12 +232,12 @@ fn the_mode_lights_titles_name_bypass_and_manual_as_the_light_does() {
         frame(&mut app, wid);
         assert!(
             pty(&mut reader, 0).is_empty(),
-            "never pressed on from bypass"
+            "never pressed on from bypass, the goal"
         );
-        let rule = row_text(&app, wid, footer_row(&app, wid));
-        assert!(
-            rule.contains(&format!("{arrived}  Permission mode: {on} ")),
-            "rewrite={rewrite}: the arrival: {rule:?}"
+        says(
+            &row_text(&app, wid, footer_row(&app, wid)),
+            Mode::Bypass,
+            "the arrival",
         );
         let row = mode_glass(&app, wid);
         assert_eq!(
@@ -235,9 +248,223 @@ fn the_mode_lights_titles_name_bypass_and_manual_as_the_light_does() {
     }
 }
 
+/// A CLICK ON YOLO TURNS IT LAME (the owner, 2026-11-02): on a rewritten row `yolo` stands at
+/// rest in the ink of the rule it sits on (Claude's grey here, never its red); a click writes one
+/// shift+tab as the person's, the chip says `◐ yolo` while Claude answers, and once Claude shows
+/// manual mode the chip reads `lame`, in the row's own ink, with nothing more pressed. A second
+/// click from `lame` goes back to `yolo`. CONTROL: a rule in another grey draws `yolo` in that one.
+#[test]
+fn a_click_on_yolo_turns_it_lame() {
+    const GREY_RULE: &str = "\x1b[38;2;136;136;136m";
+    for grey in [true, false] {
+        let (mut app, wid, session, mut reader, _host) = claude_app(120, true);
+        draw_claude(&app, session, BYPASS);
+        if grey {
+            let rule = "\u{2500}".repeat(120);
+            feed(
+                &app,
+                session,
+                format!("\x1b[23;1H{GREY_RULE}{rule}\x1b[0m\x1b[22;3H").as_bytes(),
+            );
+        }
+        frame(&mut app, wid);
+        let (cells, text) = light_cells(&app, wid);
+        assert_eq!(text, "yolo", "grey={grey}: yolo at rest");
+        let ink = rule_ink(&app, wid, footer_row(&app, wid));
+        if grey {
+            assert_eq!(
+                ink, [136; 3],
+                "Claude's grey clears the chip floor on this ground"
+            );
+        }
+        for &at in &cells {
+            assert_eq!(
+                cell_at(&app, wid, at).fg,
+                ink,
+                "grey={grey}: the rule's ink"
+            );
+            assert_ne!(cell_at(&app, wid, at).fg, [0xE0, 0x5A, 0x5A], "never red");
+        }
+
+        let (x, y) = px_of(&app, wid, cells[0]);
+        app.on_cursor_moved(wid, x, y);
+        frame(&mut app, wid);
+        let rule = row_text(&app, wid, footer_row(&app, wid));
+        assert!(
+            rule.contains(Mode::Bypass.gist())
+                && rule.contains(&format!("{TITLE_CLICK}{}", Goal::Off.words(true))),
+            "the hover says what yolo is and what a click does: {rule:?}"
+        );
+        let first = a_minute_ago();
+        press_at(&mut app, wid, first);
+        assert_eq!(
+            pty(&mut reader, lights::SHIFT_TAB.len()),
+            lights::SHIFT_TAB,
+            "one shift+tab, the person's"
+        );
+        let goal = app.windows[&wid].claude_lights.sessions[&session]
+            .pending
+            .as_ref()
+            .map(|p| p.goal);
+        assert_eq!(goal, Some(Goal::Off), "to manual");
+        frame(&mut app, wid);
+        assert_eq!(light_cells(&app, wid).1, "\u{25D0} yolo", "in flight");
+        let rule = row_text(&app, wid, footer_row(&app, wid));
+        assert!(rule.contains("switching to lame\u{2026}"), "{rule:?}");
+
+        feed(
+            &app,
+            session,
+            format!("\x1b[24;1H\x1b[2K{MANUAL}\x1b[22;3H").as_bytes(),
+        );
+        app.on_claude_footer_changed(session);
+        assert!(
+            pty(&mut reader, 0).is_empty(),
+            "manual: nothing more pressed"
+        );
+        frame(&mut app, wid);
+        let (cells, text) = light_cells(&app, wid);
+        assert_eq!(text, "lame", "grey={grey}: yolo turned off is lame");
+        if grey {
+            assert_ne!(
+                cell_at(&app, wid, cells[0]).fg,
+                ink,
+                "lame is a deviation: the row's ink, not the rule's"
+            );
+        }
+
+        let (x, y) = px_of(&app, wid, cells[0]);
+        app.on_cursor_moved(wid, x, y);
+        press_at(&mut app, wid, first + interval() + Duration::from_millis(1));
+        assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB, "lame: back to yolo");
+        let goal = app.windows[&wid].claude_lights.sessions[&session]
+            .pending
+            .as_ref()
+            .map(|p| p.goal);
+        assert_eq!(goal, Some(Goal::On));
+    }
+}
+
+/// A RUN OF CLICKS ON YOLO TURNS IT OVER ONCE (review F1): the first click presses shift+tab,
+/// Claude answers auto, aterm presses on, Claude answers manual and the light reads `lame`, all
+/// before the second click of the double click comes, at the interval's last instant, on `lame`:
+/// that press is the double click's, and writes nothing, so the light stays `lame` rather than
+/// turning back toward `yolo`. A slow triple click's third press, at the last instant of the
+/// interval after the second though past the first's, is the same run of clicks and writes nothing
+/// either. A click a millisecond after the interval of the run's last press is a click of its own:
+/// the model's click back while the arrival's notice shows (`phase` 2), pressed at once.
+#[test]
+fn a_run_of_clicks_on_yolo_turns_it_over_once() {
+    let (mut app, wid, session, mut reader, _host) = claude_app(120, true);
+    draw_claude(&app, session, BYPASS);
+    frame(&mut app, wid);
+    let model = aterm_models_gui::claude_mode_toggle_model();
+    let mut state = model.init_state();
+    state.insert("mode", 0);
+    let (cells, text) = light_cells(&app, wid);
+    assert_eq!(text, "yolo", "yolo at rest");
+    let (x, y) = px_of(&app, wid, cells[0]);
+    app.on_cursor_moved(wid, x, y);
+    let first = a_minute_ago();
+    let since = Instant::now();
+    drive_mode_toggle_action("Click", || press_at(&mut app, wid, first));
+    press_not_due(&mut app, wid, session, since);
+    assert_eq!(
+        pty(&mut reader, 3),
+        lights::SHIFT_TAB,
+        "the first click presses"
+    );
+    check_mode_toggle_transition(&app, wid, session, "Click", &mut state, None);
+    redraw_mode_row(&app, session, AUTO);
+    check_mode_toggle_transition(&app, wid, session, "Answer", &mut state, None);
+    let since = Instant::now();
+    drive_mode_toggle_action("Press", || app.on_claude_footer_changed(session));
+    press_not_due(&mut app, wid, session, since);
+    assert_eq!(
+        pty(&mut reader, 3),
+        lights::SHIFT_TAB,
+        "auto is short of manual: a press on"
+    );
+    check_mode_toggle_transition(&app, wid, session, "Press", &mut state, None);
+    redraw_mode_row(&app, session, MANUAL);
+    check_mode_toggle_transition(&app, wid, session, "Answer", &mut state, None);
+    drive_mode_toggle_action("Arrive", || app.on_claude_footer_changed(session));
+    assert!(pty(&mut reader, 0).is_empty(), "manual: arrived");
+    check_mode_toggle_transition(&app, wid, session, "Arrive", &mut state, None);
+    frame(&mut app, wid);
+    let (cells, text) = light_cells(&app, wid);
+    assert_eq!(text, "lame", "arrived before the second click");
+
+    let (x, y) = px_of(&app, wid, cells[0]);
+    app.on_cursor_moved(wid, x, y);
+    press_at(&mut app, wid, first + interval());
+    assert!(
+        pty(&mut reader, 0).is_empty(),
+        "the double click's second press writes nothing"
+    );
+    assert!(
+        app.windows[&wid].claude_lights.sessions[&session]
+            .pending
+            .is_none(),
+        "and arms no toggle"
+    );
+    frame(&mut app, wid);
+    assert_eq!(light_cells(&app, wid).1, "lame", "the light stays lame");
+
+    let (x, y) = px_of(&app, wid, light_cells(&app, wid).0[0]);
+    app.on_cursor_moved(wid, x, y);
+    press_at(&mut app, wid, first + interval() * 2);
+    assert!(
+        pty(&mut reader, 0).is_empty(),
+        "a slow triple click's third press, within the interval of the second, writes nothing"
+    );
+    assert!(
+        app.windows[&wid].claude_lights.sessions[&session]
+            .pending
+            .is_none(),
+        "and arms no toggle"
+    );
+    frame(&mut app, wid);
+    assert_eq!(
+        light_cells(&app, wid).1,
+        "lame",
+        "the light still reads lame"
+    );
+
+    let (x, y) = px_of(&app, wid, light_cells(&app, wid).0[0]);
+    app.on_cursor_moved(wid, x, y);
+    let since = Instant::now();
+    drive_mode_toggle_action("Click", || {
+        press_at(
+            &mut app,
+            wid,
+            first + interval() * 3 + Duration::from_millis(1),
+        );
+    });
+    press_not_due(&mut app, wid, session, since);
+    assert_eq!(
+        pty(&mut reader, 3),
+        lights::SHIFT_TAB,
+        "a click a millisecond after the interval of the run's last press: the click back"
+    );
+    check_mode_toggle_transition(
+        &app,
+        wid,
+        session,
+        "Click",
+        &mut state,
+        Some(&[("phase", 2)][..]),
+    );
+    let goal = app.windows[&wid].claude_lights.sessions[&session]
+        .pending
+        .as_ref()
+        .map(|p| p.goal);
+    assert_eq!(goal, Some(Goal::On), "lame: back to yolo or auto");
+}
+
 /// THE MODE LIGHT'S WORD FOLLOWS THE REWRITE THE GLASS TAKES: with the cursor on the mode row
-/// the row stands as Claude drew it and the light says `manual`; the cursor back at the caret,
-/// the row is rewritten and the light says `manual mode`.
+/// the row stands as Claude drew it and the light says `⏸ manual`; the cursor back at the caret,
+/// the row is rewritten and the light says `lame`.
 #[test]
 fn the_mode_lights_word_follows_the_rewrite_the_glass_takes() {
     let (mut app, wid, session, _reader, _host) = claude_app(120, true);
@@ -256,5 +483,5 @@ fn the_mode_lights_word_follows_the_rewrite_the_glass_takes() {
     let row = mode_glass(&app, wid);
     assert!(row.trim().is_empty(), "{row:?}");
     let (_, text) = light_cells(&app, wid);
-    assert_eq!(text, "\u{23F8} manual mode");
+    assert_eq!(text, "lame");
 }

@@ -420,7 +420,7 @@ fn an_admins_own_publish_after_the_heal_keeps_the_head_that_still_carries() {
     let Approved { mx, mx_id } = approve_on_the_lower_side(&lab);
     heal(&lab);
 
-    sync_without_reconcile(&lab.st1, &urls).expect("st1 applies the higher version");
+    sync_without_reconcile(&lab.st1, &urls, None).expect("st1 applies the higher version");
     {
         let a1 = admin_open(&lab.st1).unwrap();
         assert!(

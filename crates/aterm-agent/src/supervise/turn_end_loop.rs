@@ -11,10 +11,10 @@ use super::super::policy::trace::{Outcome as TraceOutcome, TraceStep};
 use super::super::policy::turn_end::{
     ANSWERS_OFF, AccountAnswer, AccountAt, CREDITS_HOLD_MODEL_TOLD, CREDITS_HOLD_TOLD, Composer,
     ComposerRead, Conversation, CreditsCarry, GoAheadVerdict, LOGIN_SHARED_LOOK, MENU_DIVERTS,
-    OWN_WORDS_STAND, ProbeGate, RULE_ACCOUNT, RULE_LAND, RULE_LEFT, RULE_LOGIN, RULE_USAGE_PROBE,
-    RecordTurn, Restart, TRY_ANSWER_SLACK, WAKE_KEPT, account_hold, act_turn_work, budget_frees,
-    conversation_mark, decide_turn_end, decide_turn_end_traced, done_row_work, is_wait_resume,
-    outage_of, reads_conversation,
+    OWN_WORDS_STAND, ProbeGate, RULE_ACCOUNT, RULE_INPUT_LOST, RULE_LAND, RULE_LEFT, RULE_LOGIN,
+    RULE_USAGE_PROBE, RecordTurn, Restart, TRY_ANSWER_SLACK, WAKE_KEPT, account_hold,
+    act_turn_work, budget_frees, conversation_mark, decide_turn_end, decide_turn_end_traced,
+    done_row_work, is_wait_resume, outage_of, reads_conversation,
 };
 use super::super::tap_clock::{TapClock, TapSays, Timed, UsageWindow, timed};
 use super::wall_confirm::{Check, LeftRead};
@@ -278,21 +278,177 @@ pub(super) const WORD_SETTLES: &str = "the session's Autopilot word settles";
 /// Why the point is decided again after the hour's typing budget held its act.
 pub(super) const BUDGET_FREES: &str = "the hour's typing budget (continue_per_hour) frees";
 
-/// Hang detector timeout after the worker's input queue was last seen unread
-/// ([`Undrawn::Read`]).
+/// Hang detector timeout after the worker's input queue was last seen unread on a screen
+/// ([`Session::input_unread`]): input no write of this loop left, which no [`Custody`] holds.
 pub(super) const UNDRAWN_INPUT_HANG: Duration = Duration::from_secs(60);
 
-/// Why acts on a screen wait for the worker to draw input ([`Session::input_unread`]).
+/// The first wait of a line held in [`Custody`] that no clock of its own settles (its input read
+/// unread or unknown, a read of it not at rest, no restart in place, or a second loss), doubling at
+/// each wait in a row to [`CUSTODY_CAP`]: a held line wakes the loop a few times an hour, never
+/// three times a minute, and its draw, a person's keys or a turn wake it at once.
+pub(super) const CUSTODY_STEP: Duration = Duration::from_secs(20);
+
+/// The longest wait of a line held in [`Custody`] ([`CUSTODY_STEP`]), the dark wake's cap.
+pub(super) const CUSTODY_CAP: Duration = DARK_WAKE_CAP;
+
+/// The `waits`-th wait in a row of a line held in [`Custody`]: [`CUSTODY_STEP`] doubling to
+/// [`CUSTODY_CAP`].
+#[must_use]
+pub(super) fn custody_step(waits: u32) -> Duration {
+    CUSTODY_STEP
+        .checked_mul(1u32.checked_shl(waits).unwrap_or(u32::MAX))
+        .map_or(CUSTODY_CAP, |d| d.min(CUSTODY_CAP))
+}
+
+/// WHAT `status input=` HAS SAID OF A LINE HELD IN [`Custody`]. The session's input is one queue,
+/// read in order, so a read that finds it clear after the write proves the worker read the line:
+/// whatever it read since, it read the line first. Nothing on the screen says this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Undrawn {
-    /// `status` read the worker's input unread on the screen, last at this loop time: the
-    /// hold ends [`UNDRAWN_INPUT_HANG`] after it, the hang detector.
-    Read(Instant),
-    /// This loop's own text was written and given up on unechoed on the screen (an echo that
-    /// hung, or a screen that never moved after the write): it is never written again there,
-    /// however long the screen stands, as a starved worker that holds it queued would draw it
-    /// twice.
-    Written,
+pub(super) enum Held {
+    /// Every read since the write found input unread (`input=pending|typeahead`, or a stall's
+    /// word): the line may still be queued, and the worker draw it.
+    Unread,
+    /// A read found the input clear, the first at `since`: the worker read the line by then. It
+    /// stays read whatever later reads say, since the line came before any input they find.
+    Read { since: Instant },
+    /// No read said (`input=-`, no field, or no `status` answer).
+    Unknown,
+}
+
+impl Held {
+    /// The state a `status` input word `word` (`None`: no field or `-`) leaves `self` in at `now`.
+    pub(super) fn after(self, word: Option<&str>, now: Instant) -> Self {
+        match (self, word) {
+            (Self::Read { .. }, _) | (_, None | Some("-")) => self,
+            (_, Some("clear")) => Self::Read { since: now },
+            (_, Some(_)) => Self::Unread,
+        }
+    }
+
+    /// The state the first `status` read after a write leaves.
+    pub(super) fn first(word: Option<&str>, now: Instant) -> Self {
+        Self::Unknown.after(word, now)
+    }
+}
+
+/// A LINE THIS LOOP WROTE AND GAVE UP ON UNDRAWN, HELD IN CUSTODY (ATERM-KI-1101-3): formed where a
+/// fenced write's echo hung or its screen never moved after the write, on a read that shows none of
+/// it ([`Session::shows_none_of`]; [`Session::type_fenced`], [`Session::probe_type`]), and kept as one record per session until the line settles. The screen
+/// cannot tell a line the worker dropped from one it still holds, and writing again on one it holds
+/// doubles it, so while custody stands no loop writer writes ([`Session::custody_gate`], the
+/// occupancy guards' draft, the accounts probe's `PendingInput`) and no point's act is booked: it
+/// stays owed. A held line raises nothing: it is a journal record, never a badge or an ask.
+///
+/// It settles only by evidence ([`Session::custody_look`]): its draw (whole, in part, or with other
+/// words joined to it), handed to the [`LeftLine`] and [`OwnLine`] it was written as; a person's
+/// keys drawn after it (in order, their text came after the line); a turn after it, once `status`
+/// reads the input clear ([`Session::custody_turned`]); or its program's end, a restart's or any
+/// other. A move of the screen, a new point, an epoch, a stall's thaw, an edge or an Off park
+/// settles nothing. A line the worker read ([`Held::Read`]) and drew none of [`ECHO_HANG`] on, at
+/// rest, gets a restart in place ([`Restart::InputLost`]): the PTY holds no copy of it, and the
+/// process that might ends, so the point resumed is decided and written once. Where no restart
+/// can be made, where the host refused one, and after one already was, it is a doubling wait
+/// that writes nothing ([`custody_step`]). A break of the agent's own background work is no
+/// point: its evidence settles a line there too, but no restart is made at one
+/// ([`Session::custody_at_break`]).
+#[derive(Debug, Clone)]
+pub(super) struct Custody {
+    /// The line, and who wrote it: what its draw hands back, though the worker's turn has taken
+    /// the [`OwnLine`] since.
+    own: OwnLine,
+    /// The rule the write ran under, for its records.
+    rule: String,
+    /// The person's key count at the write: keys after it came after the line.
+    human: u64,
+    /// What `status input=` has said of it.
+    held: Held,
+    /// The agent's process at the write (`IdleHost::agent_pid`, `IdleHost::agent_started`), where
+    /// the host names one: another one since is the line's program ended.
+    process: Option<(Option<u32>, Option<i64>)>,
+    /// What the last record of the hold said, so the journal takes one line per change.
+    said: Option<String>,
+    /// The waits in a row with no clock of the custody's own ([`custody_step`]).
+    waits: u32,
+    /// A turn was read running since the write, or since a `status` read after one last found the
+    /// input not clear ([`Session::took`]): a turn ran after the line, which a clear read then
+    /// settles at a break as the worked arm settles it at a point ([`Session::custody_at_break`]).
+    ran: bool,
+}
+
+impl Custody {
+    /// Whether `shown` (a draft a read saw) is the line held.
+    pub(super) fn is(&self, shown: &str) -> bool {
+        self.own.is(shown)
+    }
+}
+
+/// The reason of the due a line held in [`Custody`] stands on ([`Session::custody_rearm`]).
+pub(super) const CUSTODY_DUE: &str = "the line held is looked at again";
+
+/// The reason of the due a write stands on where the line held was drawn on the read it was
+/// decided on ([`Session::custody_gate`]).
+const CUSTODY_DRAWN: &str = "the line held was drawn";
+
+/// What holds a write while a line stands in [`Custody`], as its records name it: the line's
+/// [`Held`] state and the input word `word` the last `status` read said.
+fn custody_said(held: Held, word: &str) -> String {
+    match held {
+        Held::Unread => format!("unread:{word}"),
+        Held::Read { .. } => "read".to_string(),
+        Held::Unknown => "unknown".to_string(),
+    }
+}
+
+/// How a line held in [`Custody`] settled ([`Session::custody_ended`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Settles {
+    /// Its program drew it, whole, in part or with other words joined to it.
+    Drawn,
+    /// A person's keys drew after it, and the draft is theirs.
+    Person,
+    /// A turn ran after it and `status` read the input clear.
+    Turn,
+    /// Its program ended: a restart in place took, or another process holds the tab.
+    Ended,
+}
+
+impl Settles {
+    /// The words of its `NOTE` ([`super::super::journal::LINE_SETTLED`]).
+    pub(super) const fn words(self) -> &'static str {
+        match self {
+            Self::Drawn => "is drawn",
+            Self::Person => "is under a person's keys",
+            Self::Turn => "went with a turn",
+            Self::Ended => "ended with its program",
+        }
+    }
+}
+
+/// What became of the restart in place asked for a line held in [`Custody`] since the last act
+/// submitted ([`Session::custody_lost`]): either way, a line lost from here waits and writes
+/// nothing, and the host is asked no more.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum LostRestart {
+    /// The host made it: a second loss is never restarted again.
+    Made,
+    /// The host did not make it (its step, or `-` where it answered none): a repeated failure
+    /// calls for a different approach, so it is not asked again at each due.
+    Unmade(String),
+}
+
+/// Why no restart in place is made for a line held in [`Custody`] under `[harness] relaunch =
+/// false`, as its `WAITING` records say.
+pub(super) const RELAUNCH_OFF: &str = "no restart in place (relaunch is off)";
+
+/// What a line held in [`Custody`] lets a write at a point do ([`Session::custody_gate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CustodyGate {
+    /// Nothing held: the write goes.
+    Free,
+    /// The line holds the write; a due stands for the next look.
+    Hold,
+    /// The worker read the line and drew none of it a minute on, at rest: a restart in place.
+    Lost,
 }
 
 /// Whether the `tries`-th deferred restart attempt is journaled.
@@ -559,7 +715,10 @@ pub(super) fn resume_jitter(sid: &str, reset_unix: i64, span: Duration) -> Durat
 #[must_use]
 pub fn standing_rules(policy: &crate::supervise::SupervisorConfig) -> Option<String> {
     let path = policy.rules_file.as_ref()?;
-    standing_rules_in(&std::fs::read_to_string(path).ok()?)
+    standing_rules_in(&crate::harness::ai_pool::read_bounded_text(
+        path,
+        1024 * 1024,
+    )?)
 }
 
 /// [`standing_rules`] of the rules file's text `text`, read by the caller.
@@ -1234,7 +1393,10 @@ impl<C: Ctl> Session<'_, C> {
         let draft = self
             .draft_seen
             .as_ref()
-            .filter(|(draft, _)| !self.own_line.as_ref().is_some_and(|own| own.is(draft)))
+            .filter(|(draft, _)| {
+                !self.own_line.as_ref().is_some_and(|own| own.is(draft))
+                    && !self.custody.as_ref().is_some_and(|c| c.is(draft))
+            })
             .map(|(_, at)| *at);
         self.person.max(draft)
     }
@@ -2035,6 +2197,10 @@ impl<C: Ctl> Session<'_, C> {
         }
         self.cruise_carry
             .live(self.turn_end.typed_untaken(), || self.fx.mono());
+        // A turn ran after a line held in custody (`Custody::ran`).
+        if let Some(c) = self.custody.as_mut() {
+            c.ran = true;
+        }
         // The agent left its last point, by whatever hand: that point's reach read is spent, and
         // no break of this turn is held on it (`Guard::Reach`).
         self.reach_seen = None;
@@ -2405,7 +2571,7 @@ impl<C: Ctl> Session<'_, C> {
                     None => return,
                 }
             }
-            TaskFace::Open | TaskFace::Theirs => {
+            TaskFace::Open | TaskFace::Theirs | TaskFace::Failed => {
                 self.land_receipt = None;
                 if !self.receipt_told {
                     return;
@@ -2431,7 +2597,9 @@ impl<C: Ctl> Session<'_, C> {
                     }
                 }
             }
-            TaskFace::Open | TaskFace::Theirs => self.receipt_moved(face, None, None),
+            TaskFace::Open | TaskFace::Theirs | TaskFace::Failed => {
+                self.receipt_moved(face, None, None);
+            }
         }
         if let Some(host) = &self.stall_host {
             match self.turn_end.face_start_noted() {
@@ -2590,7 +2758,9 @@ impl<C: Ctl> Session<'_, C> {
 
     /// THE LINE THIS LOOP LEFT AT `point`, WRITTEN BY `by` ([`LeftLine`], [`OwnLine`]): looked at
     /// again as its program draws it ([`Self::left_line_look`]), and the loop's own, no person's
-    /// draft. A read that cannot say is no text seen yet: the line's draw is still a move.
+    /// draft. A read that cannot say is no text seen yet: the line's draw is still a move. A line
+    /// of `text` held in [`Custody`] takes `by` as its writer, so its draw hands the line back as
+    /// `by` left it.
     fn left_own(&mut self, point: &Turn, text: &str, by: OwnBy) {
         let last = self.last.clone();
         let human = last.as_ref().and_then(|screen| screen.human_seq);
@@ -2601,6 +2771,9 @@ impl<C: Ctl> Session<'_, C> {
             stands: stands.unwrap_or(LeftStands::Nothing),
             human,
         });
+        if let Some(c) = self.custody.as_mut().filter(|c| c.own.is(text)) {
+            c.own.by = by.clone();
+        }
         self.own_line = Some(OwnLine {
             text: text.to_string(),
             by,
@@ -2812,6 +2985,7 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<TurnEndAction, Fail> {
+        self.custody_look(point, review);
         let at = super::occupancy_loop::LookAt::Point;
         self.left_look_at(&point.screen, at, Some(&opts.policy), Some(review));
         self.turn_end_at_point(point, worked, opts)
@@ -3205,6 +3379,9 @@ impl<C: Ctl> Session<'_, C> {
             action = TurnEndAction::Nothing;
         }
         self.fact_offer(r.fact.clone(), r.wake.clone(), &action);
+        if matches!(action, TurnEndAction::Nothing) {
+            self.turn_end.conclude_repeated(&r, now);
+        }
         let limit_draft_holds = (r.autopilot != Autopilot::Off)
             && crate::supervise::policy::exception::draft_holds_limit_switch(
                 &self.turn_end,
@@ -3337,6 +3514,7 @@ impl<C: Ctl> Session<'_, C> {
         if self.review_key(&turn) != self.review_key(seen) || self.point_model_moved(&turn) {
             return Ok(Again::Moved);
         }
+        self.custody_look(&turn, review);
         if self.left_line_went_on(&turn.screen, review) || self.left_went_holds(&turn) {
             return Ok(Again::Not);
         }
@@ -3504,7 +3682,13 @@ impl<C: Ctl> Session<'_, C> {
         let done = self.turn_end.task_done();
         let restates_wake = self.turn_end.take_wake_restated() && done && self.task_done_said;
         if done && (!self.task_done_said || restates_wake) {
-            let note = if self.turn_end.left_to_person() {
+            let note = if let Some(ending) = self.turn_end.gave_up() {
+                format!(
+                    "FAILED seq={seq} rule={RULE_LAND} {} (autopilot land): nothing more is typed \
+                     until a person or an orchestrator types",
+                    ending.words()
+                )
+            } else if self.turn_end.left_to_person() {
                 let note = format!(
                     "LEFT seq={seq} rule={RULE_LEFT} a person's own exchange (their message, \
                      answered within 10 min): nothing is typed until the next turn ends"
@@ -3524,7 +3708,7 @@ impl<C: Ctl> Session<'_, C> {
                      until a person or an orchestrator types"
                 )
             };
-            let ended = if self.turn_end.left_to_person() {
+            let ended = if self.turn_end.left_to_person() || self.turn_end.gave_up().is_some() {
                 None
             } else if restates_wake {
                 self.landed_noted_ms
@@ -3532,13 +3716,14 @@ impl<C: Ctl> Session<'_, C> {
             } else {
                 self.turn_end.restated_noted_ms()
             };
-            if !self.turn_end.left_to_person() {
+            let landing = !self.turn_end.left_to_person() && self.turn_end.gave_up().is_none();
+            if landing {
                 self.landed_noted_ms =
                     Some(ended.or(landing_read).unwrap_or_else(|| self.now_unix_ms()));
                 self.receipt_note = self.land_receipt.as_ref().map(|r| (r.line(seq), r.at_ms));
             }
             self.task_note = Some((note, ended));
-            if !self.turn_end.left_to_person() && !restates_wake {
+            if landing && !restates_wake {
                 self.ledger_row(
                     approvals::RULE_TASK_DONE,
                     approvals::Outcome::Waiting,
@@ -3637,7 +3822,9 @@ impl<C: Ctl> Session<'_, C> {
         if self.turn_end.exchange_at_wall() {
             self.ledger_left_at_wall(&point.screen, opts, seq);
         }
-        if !matches!(action, TurnEndAction::Restart { .. }) {
+        // A write a line held in custody may turn into its restart in place keeps that restart's
+        // run and back-off (`Self::custody_lost`).
+        if !matches!(action, TurnEndAction::Restart { .. }) && self.custody.is_none() {
             self.restart_waits = 0;
             self.restart_run = None;
         }
@@ -3804,6 +3991,12 @@ impl<C: Ctl> Session<'_, C> {
             self.stall_withheld = true;
             return Ok(());
         }
+        // A LINE HELD IN CUSTODY HOLDS EVERY WRITE (ATERM-KI-1101-3), or is lost and restarted.
+        match self.custody_gate(point, &action, (rule, opts), review)? {
+            CustodyGate::Free => {}
+            CustodyGate::Hold => return Ok(()),
+            CustodyGate::Lost => return self.custody_lost(point, rule, opts, allow, review),
+        }
         if self.input_unread(seq, rule, review) {
             return Ok(());
         }
@@ -3935,6 +4128,8 @@ impl<C: Ctl> Session<'_, C> {
             ));
         }
         self.turn_end.acted(&action, &r, self.fx.mono());
+        // An act submitted: a line lost from here may be restarted for again.
+        self.input_lost = None;
         // The point's reach read is spent by the act it let go (at the outage's cap, or by an arm
         // that types at any reach): the next decision reads its own (`turn_end_reading_as`), and
         // until then no break of the turn this act opens is held on it (`Guard::Reach`), whose
@@ -4102,6 +4297,11 @@ impl<C: Ctl> Session<'_, C> {
                 self.restart_waits = 0;
                 self.restart_run = None;
                 self.memory_refused = false;
+                // The process that might hold a line held in custody ended with this restart.
+                self.custody_ended(seq, Settles::Ended, review);
+                if matches!(why, Restart::InputLost) {
+                    self.input_lost = Some(LostRestart::Made);
+                }
                 let r = if matches!(why, Restart::Account { .. }) {
                     self.turn_end_reread_relaunched(&point.screen, opts)
                 } else {
@@ -4140,6 +4340,9 @@ impl<C: Ctl> Session<'_, C> {
                         Some(over) => format!("the agent, for its memory: {}", over.fact()),
                         None => "the agent, for its critical-memory banner".to_string(),
                     },
+                    Restart::InputLost => {
+                        "the agent, for the line it read and drew none of".to_string()
+                    }
                     Restart::Model { to } => format!("relaunch --model {to}"),
                     Restart::ModelBack { to } => {
                         format!(
@@ -4210,6 +4413,9 @@ impl<C: Ctl> Session<'_, C> {
                         (None, Restart::Account { to, at }) => {
                             approvals::account_switch_reason(to, *at)
                         }
+                        (None, Restart::InputLost) => {
+                            super::super::journal::LINE_READ_UNDRAWN.to_string()
+                        }
                         (None, _) => "the turn-end policy".to_string(),
                     };
                     self.ledger_row(rule, approvals::Outcome::Typed, &what, &reason, seq);
@@ -4256,6 +4462,13 @@ impl<C: Ctl> Session<'_, C> {
             _ => {
                 self.restart_waits = 0;
                 self.restart_run = None;
+                if matches!(why, Restart::InputLost) {
+                    // Refused or not answered: the loss waits from here, never asked again
+                    // (`Self::custody_lost`).
+                    self.input_lost = Some(LostRestart::Unmade(
+                        step.clone().unwrap_or_else(|| "-".to_string()),
+                    ));
+                }
                 let r = self.turn_end_reread(&point.screen, opts);
                 self.memory_over_wall |= over_wall;
                 self.turn_end
@@ -4558,13 +4771,12 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// INPUT THE WORKER HAS NOT READ STANDS BEFORE ANY ACT ([`Self::foreground_program`],
-    /// [`Self::redecide_soon`], [`LaunchCall::Again`], [`Undrawn`]).
+    /// [`Self::redecide_soon`], [`LaunchCall::Again`]).
     ///
     /// Input `status` read unread holds acts on the screen it was last read on until the screen
-    /// moves or [`UNDRAWN_INPUT_HANG`] passes ([`Undrawn::Read`]), and the point is decided again
-    /// soon. This loop's own text given up on unechoed holds them on the screen it was given up
-    /// on until that screen moves, with no end ([`Undrawn::Written`]): only a move lifts it, so
-    /// the point is decided again when one comes, not on a clock.
+    /// moves or [`UNDRAWN_INPUT_HANG`] passes, and the point is decided again soon. That input is
+    /// no line of this loop's: a line it wrote and gave up on undrawn is held in [`Custody`], which
+    /// no move of the screen and no clock lifts ([`Self::custody_gate`]).
     ///
     /// [`LaunchCall::Again`]: super::approval_loop::LaunchCall::Again
     pub(super) fn input_unread(&mut self, seq: u64, rule: &str, review: &mut dyn Review) -> bool {
@@ -4575,9 +4787,7 @@ impl<C: Ctl> Session<'_, C> {
             .clone()
             .filter(|w| matches!(w.as_str(), "pending" | "typeahead"));
         let why = if let Some(word) = unread {
-            if self.input_unread_at != Some((seq, Undrawn::Written)) {
-                self.input_unread_at = Some((seq, Undrawn::Read(now)));
-            }
+            self.input_unread_at = Some((seq, now));
             format!("the worker has not read the input written to it (input={word})")
         } else if self.input_undrawn(seq, now) {
             "the worker has not drawn the input it read (the screen has not moved since it was \
@@ -4590,21 +4800,484 @@ impl<C: Ctl> Session<'_, C> {
         review.note(&format!(
             "SKIPPED seq={seq} rule={rule} {why}; nothing written"
         ));
-        if self.input_unread_at != Some((seq, Undrawn::Written)) {
-            self.redecide_soon("the worker had not drawn the input written to it");
-        }
+        self.redecide_soon("the worker had not drawn the input written to it");
         true
     }
 
-    /// Whether the existing unread-input hold still covers this screen ([`Undrawn`]).
+    /// Whether the existing unread-input hold still covers this screen ([`UNDRAWN_INPUT_HANG`]).
     fn input_undrawn(&self, seq: u64, now: Instant) -> bool {
-        match self.input_unread_at {
-            Some((at, Undrawn::Written)) => at == seq,
-            Some((at, Undrawn::Read(since))) => {
-                at == seq && now.saturating_duration_since(since) < UNDRAWN_INPUT_HANG
-            }
-            None => false,
+        self.input_unread_at.is_some_and(|(at, since)| {
+            at == seq && now.saturating_duration_since(since) < UNDRAWN_INPUT_HANG
+        })
+    }
+
+    /// A LINE THIS LOOP WROTE, GIVEN UP ON UNDRAWN AT THE READ `point` (`why`), TAKEN INTO
+    /// [`Custody`]: `human` the key count its write was fenced on, `at` the content seq the write
+    /// left. One observing `status` read ([`Self::call_observed`], so a stall's word it finds
+    /// starts no stall look) says what the worker has read of it ([`Held`]); a clear read by the
+    /// write's held-text note ([`Self::note_text_held`]) dates its read that early. One `SKIPPED`
+    /// record ([`super::super::journal::LINE_HELD`]), no badge and no ask, and a due stands for
+    /// the next look ([`Self::custody_rearm`]). Its writer is named by [`Self::left_own`]; until
+    /// then it is the loop's own line ([`OwnBy::Line`]).
+    #[allow(clippy::too_many_arguments)]
+    fn custody_formed(
+        &mut self,
+        point: &Turn,
+        text: &str,
+        (rule, why): (&str, &str),
+        (human, at): (u64, u64),
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        let now = self.fx.mono();
+        let r = self.call_observed(&["status"])?;
+        let word = r
+            .ok()
+            .then(|| crate::supervise::screen::status_field(&r.stdout, "input"))
+            .flatten()
+            .map(str::to_string);
+        let mut held = Held::first(word.as_deref(), now);
+        if let Some((_, read_at, _)) = self
+            .held_note
+            .take()
+            .filter(|(seq, _, said)| *seq == at && said == "clear")
+        {
+            held = Held::Read { since: read_at };
         }
+        let process = self
+            .stall_host
+            .as_ref()
+            .map(|h| (h.agent_pid(), h.agent_started()));
+        let word = word.unwrap_or_else(|| "-".to_string());
+        review.note(&format!(
+            "SKIPPED seq={} rule={rule} typed, not submitted ({why}): `{}`; {} (input={word})",
+            point.screen.seq,
+            clip(text),
+            super::super::journal::LINE_HELD
+        ));
+        self.custody = Some(Custody {
+            own: OwnLine {
+                text: text.to_string(),
+                by: OwnBy::Line,
+            },
+            rule: rule.to_string(),
+            human,
+            held,
+            process,
+            said: Some(custody_said(held, &word)),
+            waits: 0,
+            ran: false,
+        });
+        self.custody_rearm();
+        Ok(())
+    }
+
+    /// Whether the read `screen` a write of `text` was given up on shows none of it: no typed text
+    /// in its composer (or no composer this read can say of) and no auto-mode setup offer risen
+    /// over the keys. Only such a line is taken into [`Custody`]; one drawn in part is a line left
+    /// ([`LeftLine`]), and its give-up asks as before.
+    fn shows_none_of(&mut self, screen: &Screen, text: &str) -> bool {
+        !self.offer_rose(&screen.rows)
+            && self
+                .left_stands(screen, text)
+                .is_none_or(|stands| stands == LeftStands::Nothing)
+    }
+
+    /// THE DUE A LINE HELD IN [`Custody`] STANDS ON: a read line's minute from its first clear
+    /// read ([`ECHO_HANG`], the hang detector), else the next of a doubling wait
+    /// ([`custody_step`]). Re-armed at every hold ([`Self::custody_gate`]), as a stall hold or an
+    /// edge may have cleared the due since: every hold leaves one standing.
+    fn custody_rearm(&mut self) {
+        let now = self.fx.mono();
+        let Some(c) = self.custody.as_mut() else {
+            return;
+        };
+        let at = match c.held {
+            Held::Read { since } if since + ECHO_HANG > now => since + ECHO_HANG,
+            _ => {
+                let at = now + custody_step(c.waits);
+                c.waits = c.waits.saturating_add(1);
+                at
+            }
+        };
+        self.set_due(at, CUSTODY_DUE);
+    }
+
+    /// A LOOK AT A LINE HELD IN [`Custody`] on the read `seen`: how it settled, if it did (`None`:
+    /// it stands held, or this read cannot say). Its draw (whole, a part of it arriving, or with
+    /// other words joined to it, or any typed text with no person's key since the write) hands it
+    /// to the [`LeftLine`] and [`OwnLine`] it was written as, so the look that decides a line left
+    /// decides it and its Enter is its writer's ([`Self::left_line_look`]); typed text that is not
+    /// the line, under a person's key since the write, is theirs: in order, their keys came after
+    /// the line. Nothing else settles it here.
+    pub(super) fn custody_look(&mut self, seen: &Turn, review: &mut dyn Review) -> Option<Settles> {
+        let c = self.custody.clone()?;
+        let stands = self.left_stands(&seen.screen, &c.own.text)?;
+        let shown = self
+            .reader(&seen.screen.rows)
+            .composer(&seen.screen.rows)
+            .map(|(_, lines)| lines.join(" "))
+            .unwrap_or_default();
+        let settles = match stands {
+            LeftStands::Nothing => return None,
+            LeftStands::Whole => Settles::Drawn,
+            LeftStands::Part
+                if c.own.joined_in(&shown)
+                    || squashed(&c.own.text).starts_with(&squashed(&shown)) =>
+            {
+                Settles::Drawn
+            }
+            LeftStands::Part if seen.screen.human_seq != Some(c.human) => Settles::Person,
+            LeftStands::Part => Settles::Drawn,
+        };
+        if settles == Settles::Drawn {
+            if self.left_line.is_none() {
+                self.left_line = Some(LeftLine {
+                    text: c.own.text.clone(),
+                    point_key: self.review_key(seen),
+                    stands: LeftStands::Nothing,
+                    human: seen.screen.human_seq,
+                });
+            }
+            if self.own_line.is_none() {
+                self.own_line = Some(c.own.clone());
+            }
+        }
+        self.custody_ended(seen.screen.seq, settles, review);
+        Some(settles)
+    }
+
+    /// The line held in [`Custody`] settled at content seq `seq`, as `settles` says: one `NOTE`
+    /// ([`super::super::journal::LINE_SETTLED`]), and no write holds on it from here. Where its
+    /// program ended, no draw of it comes: the line left and the loop's own line of its text go
+    /// with it.
+    pub(super) fn custody_ended(&mut self, seq: u64, settles: Settles, review: &mut dyn Review) {
+        let Some(c) = self.custody.take() else {
+            return;
+        };
+        if settles == Settles::Ended {
+            if self.left_line.as_ref().is_some_and(|l| c.own.is(&l.text)) {
+                self.left_line = None;
+            }
+            if self.own_line.as_ref().is_some_and(|o| c.own.is(&o.text)) {
+                self.own_line = None;
+            }
+        }
+        review.note(&format!(
+            "NOTE seq={seq} rule={} {} {}: `{}`",
+            c.rule,
+            super::super::journal::LINE_SETTLED,
+            settles.words(),
+            clip(&c.own.text)
+        ));
+    }
+
+    /// A TURN RAN AFTER A LINE HELD IN [`Custody`] (the loop's worked arm, at content seq `seq`):
+    /// it settles the line once a fresh `status` reads the input clear, which in order proves the
+    /// worker read it before the turn. A line still unread, or one no read can say of, outlasts
+    /// the turn: a worker that holds it queued draws it after.
+    pub(super) fn custody_turned(&mut self, seq: u64, review: &mut dyn Review) -> Result<(), Fail> {
+        if self.custody.is_none() {
+            return Ok(());
+        }
+        let r = self.call(&["status"])?;
+        if self.unserved(&r) {
+            return Err(Fail::Lost(format!("status failed: {}", r.stderr.trim())));
+        }
+        let word = r
+            .ok()
+            .then(|| crate::supervise::screen::status_field(&r.stdout, "input"))
+            .flatten();
+        if word == Some("clear") {
+            self.custody_ended(seq, Settles::Turn, review);
+            return Ok(());
+        }
+        let now = self.fx.mono();
+        if let Some(c) = self.custody.as_mut() {
+            c.held = c.held.after(word, now);
+            c.ran = false;
+        }
+        Ok(())
+    }
+
+    /// A LOOK AT A LINE HELD IN [`Custody`] AT A BREAK of the agent's own background work, on the
+    /// break's read `screen` (`Session::host_steps_in_background`), before any line the break
+    /// types. A break is no point: no restart in place is made there (it would end the background
+    /// work the break waits on), but the evidence that settles a line at a point settles it here
+    /// too: its draw or a person's keys ([`Self::custody_look`]), its
+    /// program's end ([`Self::custody_process_ended`]), and a turn read running since its write
+    /// (`Custody::ran`) once `status` reads the input clear ([`Self::custody_turned`]). A line
+    /// none of these settle stands held through the spell, every break's line held behind it as
+    /// behind a draft ([`Session::write_guards`]), until its program's next turn, or its next
+    /// point, where the gate decides it ([`Self::custody_gate`]).
+    pub(super) fn custody_at_break(
+        &mut self,
+        screen: &Screen,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        if self.custody.is_none() {
+            return Ok(());
+        }
+        let seen = self.turn_of(screen.clone());
+        if self.custody_look(&seen, review).is_some() {
+            return Ok(());
+        }
+        if self.custody_process_ended() {
+            self.custody_ended(screen.seq, Settles::Ended, review);
+            return Ok(());
+        }
+        if self.custody.as_ref().is_some_and(|c| c.ran) {
+            self.custody_turned(screen.seq, review)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the program a line held in [`Custody`] was written to ended: the host names
+    /// another agent process than the one at the write (`IdleHost::agent_pid`).
+    fn custody_process_ended(&self) -> bool {
+        let process = self
+            .stall_host
+            .as_ref()
+            .map(|h| (h.agent_pid(), h.agent_started()));
+        self.custody.as_ref().is_some_and(|c| {
+            matches!(
+                (c.process, process),
+                (Some((Some(was), _)), Some((Some(is), _))) if was != is
+            )
+        })
+    }
+
+    /// WHETHER A LINE HELD IN [`Custody`] HOLDS `action`'s WRITE AT `point` (`rule`, the act's),
+    /// and the restart in place it may take instead: the one gate every write a point decides goes
+    /// through, beside [`Self::left_went_holds`]. The line looked at on the judged read first
+    /// ([`Self::custody_look`]): drawn there, a write the policy decided on a read that took it for
+    /// no line of the loop's is held, and the point decided again soon; its Enter goes. Then one
+    /// ordinary `status` read ([`Self::foreground_program`], so a stall's word reaches the stall
+    /// look) moves what is known of it ([`Held`]), and another process in the tab is its program
+    /// ended. A line the worker read [`ECHO_HANG`] ago and still reads clear, where the policy
+    /// wants to write a line now, is read again in order, `status` then the screen (a draw that
+    /// came before the clear read shows on the screen after it): still undrawn and at rest
+    /// ([`Self::custody_at_rest`]), it is [`CustodyGate::Lost`]. Every other hold journals one
+    /// `SKIPPED` record per change and re-arms its due ([`Self::custody_rearm`]).
+    fn custody_gate(
+        &mut self,
+        point: &Turn,
+        action: &TurnEndAction,
+        (rule, opts): (&str, &SuperviseOpts),
+        review: &mut dyn Review,
+    ) -> Result<CustodyGate, Fail> {
+        if self.custody.is_none() {
+            return Ok(CustodyGate::Free);
+        }
+        let seq = point.screen.seq;
+        if let Some(settles) = self.custody_look(point, review) {
+            if settles == Settles::Drawn && !matches!(action, TurnEndAction::Submit { .. }) {
+                self.redecide_soon(CUSTODY_DRAWN);
+                return Ok(CustodyGate::Hold);
+            }
+            return Ok(CustodyGate::Free);
+        }
+        self.program = self.foreground_program()?;
+        let now = self.fx.mono();
+        let word = self.launch_status.input.clone();
+        if self.custody_process_ended() {
+            self.custody_ended(seq, Settles::Ended, review);
+            return Ok(CustodyGate::Free);
+        }
+        let Some(c) = self.custody.as_mut() else {
+            return Ok(CustodyGate::Free);
+        };
+        let was = c.held;
+        c.held = c.held.after(word.as_deref(), now);
+        if c.held != was {
+            c.waits = 0;
+        }
+        let writes_a_line = matches!(
+            action,
+            TurnEndAction::Type { .. }
+                | TurnEndAction::TypeCommand { .. }
+                | TurnEndAction::Submit { .. }
+        );
+        let lost = match c.held {
+            Held::Read { since } => {
+                writes_a_line && now >= since + ECHO_HANG && word.as_deref() == Some("clear")
+            }
+            Held::Unread | Held::Unknown => false,
+        };
+        let word = word.unwrap_or_else(|| "-".to_string());
+        if !lost {
+            let held = c.held;
+            self.custody_said(seq, rule, custody_said(held, &word), &word, review);
+            self.custody_rearm();
+            return Ok(CustodyGate::Hold);
+        }
+        let screen = self.screen()?;
+        let fresh = self.turn_of(screen);
+        if self.custody_look(&fresh, review).is_some() {
+            self.redecide_soon(CUSTODY_DRAWN);
+            return Ok(CustodyGate::Hold);
+        }
+        if !self.custody_at_rest(&fresh, opts) {
+            self.custody_said(seq, rule, "read:not-at-rest".to_string(), &word, review);
+            self.custody_rearm();
+            return Ok(CustodyGate::Hold);
+        }
+        Ok(CustodyGate::Lost)
+    }
+
+    /// One `SKIPPED` record of a write a line held in [`Custody`] holds, where what holds it
+    /// changed (`said`: [`custody_said`]'s word) since the last.
+    fn custody_said(
+        &mut self,
+        seq: u64,
+        rule: &str,
+        said: String,
+        word: &str,
+        review: &mut dyn Review,
+    ) {
+        let now = self.fx.mono();
+        let Some(c) = self.custody.as_mut() else {
+            return;
+        };
+        if c.said.as_deref() == Some(said.as_str()) {
+            return;
+        }
+        let evidence = match c.held {
+            Held::Read { since } => format!(
+                "input={word}, read {} s ago",
+                now.saturating_duration_since(since).as_secs()
+            ),
+            Held::Unread | Held::Unknown => format!("input={word}"),
+        };
+        let why = if said == "read:not-at-rest" {
+            "; the session is not at rest, so no restart in place yet"
+        } else {
+            ""
+        };
+        review.note(&format!(
+            "SKIPPED seq={seq} rule={rule} {}: `{}` ({evidence}){why}; nothing written",
+            super::super::journal::LINE_HELD,
+            clip(&c.own.text)
+        ));
+        c.said = Some(said);
+    }
+
+    /// WHETHER THE READ `fresh` OF A LINE HELD IN [`Custody`] IS AT REST, so a restart in place
+    /// loses nothing but the line: an idle phase its reader stands by (no turn running), a
+    /// composer drawn with no typed text, no dialog and no frame torn mid-redraw, no background
+    /// call of the agent's standing that the host reads (`IdleHost::background_jobs`, which names
+    /// one making no progress), no hold on the session, the session's word Cruise or Land, and
+    /// the person's grace past.
+    fn custody_at_rest(&mut self, fresh: &Turn, opts: &SuperviseOpts) -> bool {
+        let rows = &fresh.screen.rows;
+        let reader = self.reader(rows);
+        let drawn = fresh.phase == Phase::Idle
+            && reader.phase_authoritative(rows, &fresh.phase)
+            && reader.composer(rows).is_some()
+            && reader.prompt(rows).is_none()
+            && !reader.frame_torn(rows);
+        let Some(text) = self.custody.as_ref().map(|c| c.own.text.clone()) else {
+            return false;
+        };
+        let now = self.fx.mono();
+        let grace = Duration::from_secs(u64::from(opts.policy.human_grace_s));
+        let person = self
+            .person_ago(now)
+            .into_iter()
+            .chain(fresh.screen.human.ago())
+            .min();
+        drawn
+            && self.left_stands(&fresh.screen, &text) == Some(LeftStands::Nothing)
+            && !self.halted
+            && self.autopilot(opts) != Autopilot::Off
+            && person.is_none_or(|ago| ago >= grace)
+            && opts
+                .idle_host
+                .as_ref()
+                .is_none_or(|h| h.background_jobs().no_progress().is_none())
+    }
+
+    /// THE LINE HELD IN [`Custody`] IS LOST ([`CustodyGate::Lost`]): the worker read it and drew
+    /// none of it a minute on, at rest. The first time since the last act submitted, a restart in
+    /// place ([`Restart::InputLost`], as a memory restart's: [`Self::restart_agent`]); where none
+    /// can be made (relaunch off, no restart lane for this program, no host) a doubling wait that
+    /// writes nothing. A host's deferral (`wait:…`) is asked again as its back-off says; a
+    /// refusal or no answer is asked once ([`LostRestart::Unmade`]), and a loss after a restart
+    /// made ([`LostRestart::Made`]) is never restarted again: both wait, as a repeated failure
+    /// calls for a different approach.
+    fn custody_lost(
+        &mut self,
+        point: &Turn,
+        rule: &str,
+        opts: &SuperviseOpts,
+        allow: &[String],
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        let seq = point.screen.seq;
+        let now = self.fx.mono();
+        let Some((read_s, waits)) = self.custody.as_ref().map(|c| {
+            let read_s = match c.held {
+                Held::Read { since } => now.saturating_duration_since(since).as_secs(),
+                Held::Unread | Held::Unknown => 0,
+            };
+            (read_s, c.waits)
+        }) else {
+            return Ok(());
+        };
+        let undrawn = super::super::journal::LINE_READ_UNDRAWN;
+        let no_restart = match &self.input_lost {
+            Some(LostRestart::Made) => Some(super::super::journal::LINE_LOST_AGAIN.to_string()),
+            Some(LostRestart::Unmade(step)) => Some(format!(
+                "{undrawn}; {} ({step})",
+                super::super::journal::LINE_RESTART_UNMADE
+            )),
+            None if !opts.policy.relaunch => Some(format!("{undrawn}; {RELAUNCH_OFF}")),
+            None if !opts.idle_host.as_ref().is_some_and(|h| h.can_restart()) => Some(format!(
+                "{undrawn}; no restart in place ({})",
+                self.program.as_deref().unwrap_or("no host")
+            )),
+            None => None,
+        };
+        let until = now + custody_step(waits);
+        if let Some(c) = self.custody.as_mut() {
+            c.waits = c.waits.saturating_add(1);
+            c.said = Some("lost".to_string());
+        }
+        let why = format!(
+            "{}: nothing is written until it draws or a person's keys or a turn follow it",
+            no_restart.clone().unwrap_or_else(|| format!(
+                "{undrawn}; {}",
+                super::super::journal::LINE_RESTART_UNMADE
+            ))
+        );
+        if no_restart.is_some() {
+            if restart_note_due(waits) {
+                review.note(&format!(
+                    "WAITING seq={seq} until={} {why}",
+                    self.stamp_in(until)
+                ));
+            }
+            self.set_due(until, CUSTODY_DUE);
+            return Ok(());
+        }
+        review.note(&format!(
+            "NOTE seq={seq} rule={rule} {} {read_s} s on (input=clear, at rest): restarting it in \
+             place",
+            super::super::journal::LINE_READ_UNDRAWN
+        ));
+        let otherwise = TurnEndAction::WaitUntil {
+            until,
+            why,
+            wait: WaitKind::Other,
+        };
+        self.restart_agent(
+            point,
+            &Restart::InputLost,
+            RULE_INPUT_LOST,
+            otherwise,
+            opts,
+            allow,
+            review,
+        )
     }
 
     /// Park or back off when the server refuses a write.
@@ -4866,7 +5539,9 @@ impl<C: Ctl> Session<'_, C> {
     /// program has not read it), so the journal names the program, not aterm, as what the Enter
     /// waits on. One line per write, never per look, and nothing is typed. The read only observes
     /// ([`Self::call_observed`]): an `input=stalled` it finds starts no stall look, which the
-    /// echo's hang reaches as it would without the note.
+    /// echo's hang reaches as it would without the note. What it read of the input is kept for the
+    /// custody the echo's give-up may take the line into: a clear read dates the worker's read of
+    /// it ([`Self::custody_formed`]).
     fn note_text_held(&mut self, at: u64, rule: &str, review: &mut dyn Review) -> Result<(), Fail> {
         let r = self.call_observed(&["status"])?;
         let field = |f: &str| {
@@ -4875,6 +5550,7 @@ impl<C: Ctl> Session<'_, C> {
                 .flatten()
                 .unwrap_or("-")
         };
+        self.held_note = Some((at, self.fx.mono(), field("input").to_string()));
         review.note(&format!(
             "NOTE seq={at} rule={rule} {} {} s after the write: input={} input_bytes={} \
              input_wait_ms={}",
@@ -4956,14 +5632,20 @@ impl<C: Ctl> Session<'_, C> {
         let at = r.seq().unwrap_or(seq);
         let epoch = ScreenGen::parse(&generation).map(|g| g.epoch);
         let guarded = self.reader(rows).paste_guard();
+        self.held_note = None;
         let now = match self.await_echo(at, epoch, text, (human, guarded), (rule, review))? {
             Echoed::Whole(now) => now,
             Echoed::Not(now, why) => {
-                if why == ECHO_HUNG || unmoved_since(&now, at, epoch) {
-                    self.input_unread_at = Some((now.seq, Undrawn::Written));
-                }
+                let undrawn = (why == ECHO_HUNG || unmoved_since(&now, at, epoch))
+                    && self.shows_none_of(&now, text);
                 let turn = self.turn_of(now);
-                self.left_typed(&turn, text, why, review)?;
+                if undrawn {
+                    // Undrawn: held in custody, never written again while it may still come, and
+                    // no ask.
+                    self.custody_formed(&turn, text, (rule, why), (human, at), review)?;
+                } else {
+                    self.left_typed(&turn, text, why, review)?;
+                }
                 if why == ECHO_PERSON {
                     self.redecide_soon("a person keyed before the line drew");
                 }
@@ -5267,7 +5949,7 @@ impl<C: Ctl> Session<'_, C> {
         if self.probe_off {
             return Ok(Some(ProbeGate::ProbesOff));
         }
-        if self.input_undrawn(point.screen.seq, self.fx.mono()) {
+        if self.custody.is_some() || self.input_undrawn(point.screen.seq, self.fx.mono()) {
             return Ok(Some(ProbeGate::PendingInput));
         }
         if self.probe != UsageProbe::Idle {
@@ -5394,12 +6076,11 @@ impl<C: Ctl> Session<'_, C> {
             return false;
         }
         // A composer that shows nothing of the probe's `/usage` while its program may still draw
-        // it is no text cleared: the probe lasts on a screen that has not moved since the write
-        // was given up on unechoed ([`Self::input_undrawn`]), and while the line it left has not
-        // been seen whole with no person's key since, however the screen moved meanwhile
-        // ([`Self::probe_line_unseen`]).
+        // it is no text cleared: the probe lasts while a line given up on undrawn is held
+        // ([`Custody`]), and while the line it left has not been seen whole with no person's key
+        // since, however the screen moved meanwhile ([`Self::probe_line_unseen`]).
         if !self.holds_probe_draft(screen)
-            && !self.input_undrawn(screen.seq, self.fx.mono())
+            && self.custody.is_none()
             && !self.probe_line_unseen(screen)
         {
             self.probe_closed(screen.seq, review);
@@ -5443,7 +6124,10 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<Probed, Fail> {
         let seq = point.screen.seq;
         let (entered, human) = match self.under_hand(|s| s.probe_type(point, review))? {
-            ProbeTyped::Entered { at, human } => (at, human),
+            ProbeTyped::Entered { at, human } => {
+                tell.host.account_probe_typed();
+                (at, human)
+            }
             ProbeTyped::Not {
                 miss,
                 why,
@@ -5451,13 +6135,19 @@ impl<C: Ctl> Session<'_, C> {
                 left,
             } => {
                 tell.tell(Err(miss));
-                review.note(&format!("SKIPPED seq={seq} rule={RULE_USAGE_PROBE} {why}"));
+                // A `/usage` held in custody has its record, and raises nothing.
+                let held = self.custody.as_ref().is_some_and(|c| c.is(USAGE_COMMAND));
+                if !held {
+                    review.note(&format!("SKIPPED seq={seq} rule={RULE_USAGE_PROBE} {why}"));
+                }
                 if left {
                     // The `/usage` left typed is this loop's own line, drawn now or late: looked
                     // at again as it draws, no person's draft while the probe lasts, and its
                     // Enter the probe's.
                     self.left_own(point, USAGE_COMMAND, OwnBy::Probe);
-                    tell.host.inform(USAGE_LEFT);
+                    if !held {
+                        tell.host.inform(USAGE_LEFT);
+                    }
                 }
                 if then == Probed::Again && self.turn_end_due.is_none() {
                     self.redecide_soon("the accounts probe was not written");
@@ -5580,8 +6270,9 @@ impl<C: Ctl> Session<'_, C> {
     /// Type and submit `/usage` using `if-human=` and `if-gen=` fenced `send` and `key` calls.
     /// The write's echo is judged by [`Self::await_echo`], the continuation's rules: waited for
     /// as a hang detector while each read shows it on its way, its Enter fenced on the read
-    /// that shows it whole. A text left on a screen that never moved holds every act on that
-    /// screen ([`Self::input_unread`]) and the next probe ([`ProbeGate::PendingInput`]).
+    /// that shows it whole. A text given up on undrawn (an echo that hung, or a screen that never
+    /// moved after the write) is held in [`Custody`]: every act ([`Self::custody_gate`]) and the
+    /// next probe ([`ProbeGate::PendingInput`]) wait on it until it settles.
     fn probe_type(&mut self, point: &Turn, review: &mut dyn Review) -> Result<ProbeTyped, Fail> {
         let _duty = self.duty_guard(Scope::Walls);
         let seq = point.screen.seq;
@@ -5674,6 +6365,7 @@ impl<C: Ctl> Session<'_, C> {
         let at = r.seq().unwrap_or(seq);
         let epoch = ScreenGen::parse(&generation).map(|g| g.epoch);
         let guarded = self.reader(rows).paste_guard();
+        self.held_note = None;
         let now = match self.await_echo(
             at,
             epoch,
@@ -5683,10 +6375,19 @@ impl<C: Ctl> Session<'_, C> {
         )? {
             Echoed::Whole(now) => now,
             Echoed::Not(now, why) => {
-                if why == ECHO_HUNG || unmoved_since(&now, at, epoch) {
-                    // Input the worker has not drawn: no act goes behind it on
-                    // this screen ([`Self::input_unread`]).
-                    self.input_unread_at = Some((now.seq, Undrawn::Written));
+                if (why == ECHO_HUNG || unmoved_since(&now, at, epoch))
+                    && self.shows_none_of(&now, USAGE_COMMAND)
+                {
+                    // Input the worker has not drawn: held, so no act nor probe goes behind it
+                    // while it may still come ([`Self::custody_gate`]).
+                    let turn = self.turn_of(now.clone());
+                    self.custody_formed(
+                        &turn,
+                        USAGE_COMMAND,
+                        (RULE_USAGE_PROBE, why),
+                        (human, at),
+                        review,
+                    )?;
                 }
                 let stands = self
                     .reader(&now.rows)

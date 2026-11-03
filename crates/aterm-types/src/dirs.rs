@@ -53,7 +53,16 @@ pub const PASSWD_FILE_SEAM: &str = "ATERM_PASSWD_FILE";
 /// decode, and a stray legacy byte in another user's GECOS field cannot fail the lookup.
 #[cfg(unix)]
 fn passwd_home_dir(uid: u32) -> Option<PathBuf> {
-    let contents = std::fs::read(passwd_file()).ok()?;
+    use std::io::Read as _;
+    const MAX_PASSWD_BYTES: u64 = 16 * 1024 * 1024;
+    let file = crate::fs_restricted::open_regular_nonblock(&passwd_file()).ok()?;
+    let mut contents = Vec::new();
+    file.take(MAX_PASSWD_BYTES + 1)
+        .read_to_end(&mut contents)
+        .ok()?;
+    if contents.len() as u64 > MAX_PASSWD_BYTES {
+        return None;
+    }
     home_from_passwd(&contents, uid)
 }
 

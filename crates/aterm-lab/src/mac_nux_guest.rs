@@ -744,7 +744,8 @@ impl Reading {
     #[must_use]
     pub fn done(&self) -> bool {
         match &self.setup {
-            Some(field) => field == "done",
+            // `done;offered:…`: grants on offer hold nothing back.
+            Some(field) => field == "done" || field.starts_with("done;"),
             None => self.record.as_ref().is_some_and(|r| r.state == "completed"),
         }
     }
@@ -1249,6 +1250,8 @@ mod tests {
         );
         let mut done = Stall::new(STALL_MS);
         assert_eq!(done.see(5, &at("done")), Waited::Done);
+        let mut offered = Stall::new(60_000);
+        assert_eq!(offered.see(5, &at("done;offered:debugger")), Waited::Done);
         // A stage moving under an unchanged setup= is progress too.
         let mut stages = Stall::new(STALL_MS);
         let running = |bit| Reading {

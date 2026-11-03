@@ -9,6 +9,36 @@ use super::{
     Class, Findings, JobKind, JobRow, NamedRow, StartWait, TierB, Verdict, Wait, WaitName,
 };
 
+/// Count one local condition, keeping observed child activity distinct from independent jobs.
+#[must_use]
+pub fn verdict_summary<'a>(
+    rows: impl Iterator<Item = &'a JobRow>,
+    verdict: Verdict,
+) -> Option<String> {
+    let qualifies = matches!(verdict, Verdict::Quiet | Verdict::Stuck);
+    let (n, active) =
+        rows.filter(|r| r.verdict == verdict)
+            .fold((0usize, 0usize), |(n, active), r| {
+                (
+                    n + 1,
+                    active + usize::from(qualifies && r.working_descendant.is_some()),
+                )
+            });
+    if n == 0 {
+        return None;
+    }
+    let word = match verdict {
+        Verdict::WaitingYou => "waiting for you",
+        Verdict::Parked => "stopped",
+        other => other.word(),
+    };
+    Some(match active {
+        0 => format!("{n} {word}"),
+        a if a == n => format!("{n} local {word}, child activity"),
+        a => format!("{} {word}, {a} local {word} with child activity", n - a),
+    })
+}
+
 /// φ × 1000 as the row prints it.
 #[must_use]
 pub fn phi_text(phi_milli: u64) -> String {
@@ -161,6 +191,17 @@ impl JobRow {
     /// The person's sentence for the verdict.
     #[must_use]
     pub fn said(&self) -> String {
+        let said = self.local_said();
+        match self
+            .working_descendant
+            .filter(|_| matches!(self.verdict, Verdict::Quiet | Verdict::Stuck))
+        {
+            Some((pid, _)) => format!("local {said}; recent child activity at pid {pid}"),
+            None => said,
+        }
+    }
+
+    fn local_said(&self) -> String {
         let age = self.quiet_ms.map(age_words).unwrap_or_default();
         match self.verdict {
             Verdict::Fine => String::new(),

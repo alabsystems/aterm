@@ -149,7 +149,7 @@ impl KittyTenure {
             self.candidate = None;
             return self.worn.as_ref();
         }
-        match &self.candidate {
+        match &mut self.candidate {
             Some((cand, since)) if cand.as_ref() == raw => {
                 if now.saturating_duration_since(*since) >= dwell_for(raw)
                     && let Some((cand, _)) = self.candidate.take()
@@ -157,6 +157,17 @@ impl KittyTenure {
                     self.land(cand, now);
                 }
             }
+            Some((Some(cand), since)) => match raw {
+                Some(r) => {
+                    cand.id.clear();
+                    cand.id.push_str(&r.id);
+                    cand.basename.clear();
+                    cand.basename.push_str(&r.basename);
+                    cand.look = r.look;
+                    *since = now;
+                }
+                None => self.candidate = Some((None, now)),
+            },
             _ => self.candidate = Some((raw.cloned(), now)),
         }
         self.worn.as_ref()

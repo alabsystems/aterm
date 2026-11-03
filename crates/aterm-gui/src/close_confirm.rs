@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The in-window close/quit confirmation banner (Windows, and Linux, which has no native dialog).
+//! The in-window close/quit confirmation banner.
 
 use aterm_core::terminal::RenderCell;
 #[cfg(test)]
@@ -20,6 +20,9 @@ pub(crate) enum CloseReplay {
     Window(crate::WindowId),
     /// Quit the whole program (the Quit action).
     Quit,
+    /// Complete this AppKit termination request, preserving its Quit & Reopen identity.
+    #[cfg(unix)]
+    NativeTerminate { generation: u64 },
     /// Close tab `tab` of window `wid`.
     Tab {
         wid: crate::WindowId,
@@ -33,11 +36,21 @@ pub(crate) enum CloseReplay {
     },
 }
 
+impl CloseReplay {
+    /// Cancel only the native request this abandoned question belongs to.
+    pub(crate) fn cancel(self) {
+        #[cfg(unix)]
+        if let Self::NativeTerminate { generation } = self {
+            let _ = crate::menu::cancel_native_termination(generation);
+        }
+    }
+}
+
 /// One parked close/quit confirmation awaiting an answer.
 pub(crate) struct PendingClose {
     /// The window the banner splices into: the one the gesture would close.
     pub(crate) wid: crate::WindowId,
-    /// The copy the native dialog would have shown.
+    /// The confirmation's copy.
     pub(crate) prompt: ConfirmPrompt,
     /// What Enter replays.
     pub(crate) replay: CloseReplay,

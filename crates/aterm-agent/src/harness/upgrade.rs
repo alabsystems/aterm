@@ -2058,8 +2058,8 @@ impl FinishedScan {
         self.done_said
     }
 
-    /// Returns whether the model's last text turn is a clean defense of its work
-    /// ([`turn_end::clean_defense`]), with no prompt written after it.
+    /// Returns whether the model's last text turn is a clean defense of its work or its
+    /// `Could not finish:` ([`turn_end::reply_for_the_loop`]), with no prompt written after it.
     #[must_use]
     pub const fn defended(&self) -> bool {
         self.defended
@@ -2119,7 +2119,7 @@ impl FinishedScan {
         if !self.notice {
             (self.done_said, self.done_irreversible) = done_said(&words);
         }
-        self.defended = turn_end::clean_defense(Some(&words));
+        self.defended = turn_end::reply_for_the_loop(Some(&words));
         // THE LAND CHECK'S ANSWER LANDS A TASK (`land-check@v1`): `LANDED` alone, read as
         // the policy reads it; a defense's words land nothing, but where an older build's act
         // asked for it, as that build landed there.
@@ -4739,7 +4739,14 @@ impl Request {
     /// Returns whether this request holds an upgrade in `phase` to `target` at `now_s`.
     #[must_use]
     pub fn holds(&self, phase: &Phase, target: &str, now_s: u64) -> bool {
-        matches!(phase, Phase::Pending | Phase::Announced { .. }) && self.holds_build(target, now_s)
+        self.holds_for(Agent::Claude, phase, target, now_s)
+    }
+
+    /// Returns whether this request holds `agent`'s upgrade in `phase` to `target` at `now_s`.
+    #[must_use]
+    pub fn holds_for(&self, agent: Agent, phase: &Phase, target: &str, now_s: u64) -> bool {
+        matches!(phase, Phase::Pending | Phase::Announced { .. })
+            && self.holds_build_for(agent, target, now_s)
     }
 
     /// Returns whether this request skips or defers upgrading to `target` at `now_s`.
@@ -4847,7 +4854,19 @@ const fn held_word(request: &Request) -> &'static str {
 /// Suppresses [`Step::Rearm`] while `request` holds the upgrade to `target` at `now_s`.
 #[must_use]
 pub fn rearm_held(request: &Request, step: Step, target: &str, now_s: u64) -> Step {
-    if step == Step::Rearm && request.holds(&Phase::Pending, target, now_s) {
+    rearm_held_for(Agent::Claude, request, step, target, now_s)
+}
+
+/// Suppresses [`Step::Rearm`] while `request` holds `agent`'s upgrade to `target` at `now_s`.
+#[must_use]
+pub fn rearm_held_for(
+    agent: Agent,
+    request: &Request,
+    step: Step,
+    target: &str,
+    now_s: u64,
+) -> Step {
+    if step == Step::Rearm && request.holds_for(agent, &Phase::Pending, target, now_s) {
         Step::Wait(held_word(request))
     } else {
         step

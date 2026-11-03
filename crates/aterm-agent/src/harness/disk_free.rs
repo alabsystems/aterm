@@ -273,6 +273,23 @@ impl Outcome {
     }
 }
 
+/// THE BYTES SESSION `sid` REMOVED BY THIS COMMAND, by the ledger `rows` hold: what the blocks its
+/// `removed` and `failed` rows say each removal released. Unlike a rise in free space it is that
+/// session's own, though a row the ledger's bound cut is not in it.
+#[must_use]
+pub fn removed_by(rows: &[String], sid: &str) -> u64 {
+    rows.iter()
+        .filter_map(|line| aterm_json::from_str::<Value>(line).ok())
+        .filter(|row| {
+            let word = |key: &str| row.get(key).and_then(Value::as_str);
+            word("kind") == Some(KIND)
+                && word("sid") == Some(sid)
+                && matches!(word("action"), Some("removed" | "failed"))
+        })
+        .filter_map(|row| row.get("bytes").and_then(Value::as_u64))
+        .fold(0, u64::saturating_add)
+}
+
 /// One `disk-free` row of the disk ledger: `action` is `removing` (the intent, before the
 /// removal starts), `removed`, `failed` or `refused`.
 #[must_use]

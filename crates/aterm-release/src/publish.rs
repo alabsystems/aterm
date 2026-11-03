@@ -137,18 +137,21 @@ pub fn grid_block(label: &str, msg: &str) -> String {
 
 /// [`grid_block`] at an explicit width.
 pub fn grid_block_at(width: usize, label: &str, msg: &str) -> String {
-    debug_assert!(
-        label.chars().count() <= LABEL_MAX,
-        "label {label:?} is {} columns; the grid carries {LABEL_MAX} \
-         (a longer one eats its own separator — see VALUE_COL)",
-        label.chars().count()
-    );
     if msg.trim().is_empty() {
         return String::new();
     }
     let gutter = " ".repeat(VALUE_COL);
     let mut out = String::new();
-    let mut label_placed = false;
+    let mut label_placed = label.chars().count() > LABEL_MAX;
+    if label_placed {
+        for row in wrapped(label, width.saturating_add(VALUE_COL - 2)) {
+            if !row.trim().is_empty() {
+                out.push_str("  ");
+                out.push_str(&row);
+                out.push('\n');
+            }
+        }
+    }
     for (i, row) in wrapped(msg, width).iter().enumerate() {
         if i > 0 {
             out.push('\n');
@@ -170,6 +173,49 @@ pub fn grid_block_at(width: usize, label: &str, msg: &str) -> String {
 /// One transcript line (or block).
 pub fn step(label: &str, msg: &str) {
     println!("{}", grid_block(label, msg));
+}
+
+#[cfg(test)]
+mod grid_label_tests {
+    use super::*;
+
+    #[test]
+    fn long_labels_wrap_above_values_without_overwriting_the_column() {
+        for width in [20, 40, 80] {
+            for label in [
+                "release.openssl",
+                "release.source-signing",
+                "a long label with spaces",
+            ] {
+                let rendered = grid_block_at(width, label, "ready for use");
+                let lines: Vec<_> = rendered.lines().collect();
+                let first_value = lines
+                    .iter()
+                    .position(|row| row.starts_with(&" ".repeat(VALUE_COL)))
+                    .unwrap();
+                assert!(first_value > 0);
+                assert_eq!(
+                    lines[..first_value]
+                        .iter()
+                        .map(|row| row.trim())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    label
+                );
+                assert!(
+                    lines
+                        .iter()
+                        .all(|row| row.chars().count() <= width
+                            || row.split_whitespace().count() == 1)
+                );
+            }
+        }
+        assert_eq!(
+            grid_block_at(80, "short", "value"),
+            format!("  {:<LABEL_MAX$} value", "short")
+        );
+        assert!(grid_block_at(80, "release.source-signing", " ").is_empty());
+    }
 }
 
 /// "4m12s" / "38s" — whole-cut timing for the DONE line.
@@ -4600,12 +4646,13 @@ impl CutCtx {
             self.attaches_roster(),
         );
         names.extend(self.linux_asset_names());
+        names.push(crate::service_qualification::REPORT_ASSET.to_string());
         names.sort();
         names
     }
 
     fn validate_channel_assets(&self, names: &[String]) -> Result<()> {
-        channel::validate_channel_asset_set(
+        crate::service_qualification::validate_assets(
             names,
             &self.version,
             self.signature_required,
@@ -5797,6 +5844,24 @@ fn recover_published_cut(
         }
     }
     reconstruct_roster_assets(slug, release_object.id, &names, &manifest, &dist)?;
+    let qualification_digest = crate::service_qualification::report_digest(&manifest_bytes)?;
+    let report_name = crate::service_qualification::REPORT_ASSET;
+    if !exact_asset_present(&names, report_name)? {
+        return Err(Error::new(
+            "published recovery release has no service qualification report",
+        ));
+    }
+    verify_release_asset_digest_for_release_id_to(
+        slug,
+        release_object.id,
+        &tag,
+        report_name,
+        &qualification_digest,
+        &dist.join(report_name),
+    )?;
+    crate::service_qualification::verify_published_report(
+        &dist.join(manifest_out::MANIFEST_ASSET),
+    )?;
     let journal_path = dist.join("cut-state.toml");
     let journal = Journal {
         format: JOURNAL_FORMAT,
@@ -5977,6 +6042,24 @@ pub fn verified_release_bundle(
     version: &str,
     toolchain: &str,
 ) -> Result<VerifiedBundle> {
+    verified_release_bundle_with_inputs(
+        operator,
+        repo,
+        source,
+        version,
+        toolchain,
+        crate::build_inputs::current,
+    )
+}
+
+pub(crate) fn verified_release_bundle_with_inputs(
+    operator: &dyn GitRunner,
+    repo: &Path,
+    source: &str,
+    version: &str,
+    toolchain: &str,
+    inputs: impl FnOnce() -> std::result::Result<String, String>,
+) -> Result<VerifiedBundle> {
     let refuse = |why: String| {
         Error::new(format!(
             "{why} — a cut (a dry run too) signs only the bundle its \
@@ -6058,7 +6141,14 @@ pub fn verified_release_bundle(
             journal.prover
         )));
     }
-    let (yes, line) = gates::verified(operator, source, &complete.macho_sha256)?;
+    let inputs = inputs().map_err(Error::new)?;
+    if complete.inputs != inputs {
+        return Err(refuse(
+            "the compiler or SDK bytes changed since this bundle was built".into(),
+        ));
+    }
+    let (yes, line) =
+        gates::verified_with_inputs(operator, source, &complete.macho_sha256, || Ok(inputs))?;
     if !yes {
         return Err(refuse(format!("NOTHING SHIPS UNVERIFIED: {line}")));
     }
@@ -7241,6 +7331,16 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
         ctx.attribution.as_ref(),
         ctx.linux.as_ref(),
     )?;
+    crate::service_qualification::produce(
+        &ctx.repo,
+        &published,
+        &macho_sha256,
+        &app,
+        &dout.path,
+        ctx.build,
+        &ctx.commit,
+        &mpath,
+    )?;
     stage_roster_assets(&ctx.dist, ctx.roster.as_ref())?;
     let sig_path = mpath.with_extension("toml.sig");
     match fs::remove_file(&sig_path) {
@@ -7338,6 +7438,21 @@ fn prove_bundle_on_disk(ctx: &CutCtx) -> Result<()> {
 }
 
 fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
+    if ctx.artifact.is_some() {
+        crate::service_qualification::verify(&ctx.app_path(), &ctx.manifest_path())?;
+    } else {
+        if ctx.kind != CutKind::Real || !ctx.is_done("selfcheck") {
+            return Err(Error::new(
+                "an unbuilt candidate is not a published recovery snapshot",
+            ));
+        }
+        let release_id = ctx
+            .release_id
+            .ok_or_else(|| Error::new("recovery snapshot has no bound release ID"))?;
+        let published = unique_release_object_by_tag(&ctx.slug, &ctx.tag)?;
+        validate_channel_release_capability(published.as_ref(), release_id, &ctx.tag, false)?;
+        crate::service_qualification::verify_published_report(&ctx.manifest_path())?;
+    }
     if let Some(handoff) = &ctx.linux {
         handoff.verify_staged(&ctx.dist, &ctx.version, ctx.build, &ctx.commit)?;
     }
@@ -7350,21 +7465,23 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
         )),
     )?;
 
-    let provenance = fs::read(ctx.provenance_path())
-        .map_err(|error| Error::new(format!("read release provenance: {error}")))?;
-    validate_claim_provenance(&provenance, &ctx.version, ctx.build, &ctx.commit)?;
+    if ctx.artifact.is_some() {
+        let provenance = fs::read(ctx.provenance_path())
+            .map_err(|error| Error::new(format!("read release provenance: {error}")))?;
+        validate_claim_provenance(&provenance, &ctx.version, ctx.build, &ctx.commit)?;
 
-    if ctx.signature_required {
-        let fingerprint = ctx
-            .expected_embedded_pin()?
-            .ok_or_else(|| Error::new("signed channel has no pinned paper master"))?;
-        let provenance = fs::read_to_string(ctx.provenance_path())
-            .map_err(|error| Error::new(format!("read update-pin provenance: {error}")))?;
-        let expected = format!("update_pubkey_fingerprint_sha256={fingerprint}");
-        if !provenance.lines().any(|line| line == expected) {
-            return Err(Error::new(format!(
-                "release provenance is missing exact update-pin field {expected:?}"
-            )));
+        if ctx.signature_required {
+            let fingerprint = ctx
+                .expected_embedded_pin()?
+                .ok_or_else(|| Error::new("signed channel has no pinned paper master"))?;
+            let provenance = fs::read_to_string(ctx.provenance_path())
+                .map_err(|error| Error::new(format!("read update-pin provenance: {error}")))?;
+            let expected = format!("update_pubkey_fingerprint_sha256={fingerprint}");
+            if !provenance.lines().any(|line| line == expected) {
+                return Err(Error::new(format!(
+                    "release provenance is missing exact update-pin field {expected:?}"
+                )));
+            }
         }
     }
 
@@ -10097,6 +10214,14 @@ mod artifact_proof_tests {
             None,
         )
         .unwrap();
+        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        fs::write(app.join("Contents/MacOS/aterm"), b"test executable").unwrap();
+        crate::service_qualification::fixture(
+            &app,
+            BUILD,
+            &commit,
+            &dist.join(manifest_out::MANIFEST_ASSET),
+        );
         let ctx = CutCtx {
             credentials: None,
             apple: sign::AppleTier::Inactive,

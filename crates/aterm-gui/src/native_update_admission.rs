@@ -8,7 +8,8 @@
 pub(crate) struct AdmissionFacts {
     /// The reducer authorized an authenticated, strictly newer staged artifact.
     pub(crate) staged_verified: bool,
-    /// Every live PTY required by this attempt is encoded in a prepared handoff.
+    /// The overlap handoff can carry this attempt: every live PTY it requires, or, with none,
+    /// the windows alone ([`AdmissionFacts::observed`]).
     pub(crate) seamless_capable: bool,
     /// Opaque close-preflight evidence says native document/restore state is safe.
     pub(crate) native_state_certified: bool,
@@ -23,6 +24,46 @@ pub(crate) struct AdmissionFacts {
     pub(crate) image_kept: bool,
 }
 
+/// What `App::start_unix_update_handoff` measures before it classifies an attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Observation {
+    /// [`AdmissionFacts::staged_verified`].
+    pub(crate) staged_verified: bool,
+    /// The overlap handoff is available to this process (no `HandoffUnavailable`).
+    pub(crate) overlap_available: bool,
+    /// The handoff can run with no terminal session: the successor reads a sessionless grant,
+    /// the launched lane can reach it, and the windows carry a restorable layout.
+    pub(crate) sessionless_handoff: bool,
+    /// [`AdmissionFacts::native_state_certified`].
+    pub(crate) native_state_certified: bool,
+    /// [`AdmissionFacts::live_ptys`].
+    pub(crate) live_ptys: usize,
+    /// [`AdmissionFacts::foreground_jobs`].
+    pub(crate) foreground_jobs: usize,
+    /// [`AdmissionFacts::unknown_foregrounds`].
+    pub(crate) unknown_foregrounds: usize,
+    /// [`AdmissionFacts::image_kept`].
+    pub(crate) image_kept: bool,
+}
+
+impl AdmissionFacts {
+    /// The facts an observation gives: the overlap handoff carries an attempt with live
+    /// sessions whenever it is available, and one with none where it can run sessionless.
+    #[must_use]
+    pub(crate) const fn observed(seen: Observation) -> Self {
+        Self {
+            staged_verified: seen.staged_verified,
+            seamless_capable: seen.overlap_available
+                && (seen.live_ptys > 0 || seen.sessionless_handoff),
+            native_state_certified: seen.native_state_certified,
+            live_ptys: seen.live_ptys,
+            foreground_jobs: seen.foreground_jobs,
+            unknown_foregrounds: seen.unknown_foregrounds,
+            image_kept: seen.image_kept,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ApplyLane {
     Seamless,
@@ -35,7 +76,7 @@ pub(crate) enum AdmissionBlock {
     NativeStateUncertified,
     LivePtysNeedSeamless,
     ForegroundProbeUnknown,
-    KeptImageNeedsTerminal,
+    KeptImageWithoutHandoff,
 }
 
 impl AdmissionBlock {
@@ -54,8 +95,8 @@ impl AdmissionBlock {
                 "Update kept {} terminal session(s) running because their foreground process state could not be proven safe",
                 facts.unknown_foregrounds
             ),
-            Self::KeptImageNeedsTerminal => "The update installs when a terminal tab is open: \
-                 this aterm hands its terminals to the new build and never restarts in place"
+            Self::KeptImageWithoutHandoff => "The update waits: this aterm cannot hand itself \
+                 over to the new build here, and it never restarts in place"
                 .to_string(),
         }
     }
@@ -91,7 +132,7 @@ pub(crate) const fn classify(facts: AdmissionFacts) -> AdmissionDecision {
         return AdmissionDecision::Block(AdmissionBlock::ForegroundProbeUnknown);
     }
     if facts.image_kept {
-        return AdmissionDecision::Block(AdmissionBlock::KeptImageNeedsTerminal);
+        return AdmissionDecision::Block(AdmissionBlock::KeptImageWithoutHandoff);
     }
     AdmissionDecision::Apply(ApplyLane::Cold)
 }
@@ -176,6 +217,87 @@ mod tests {
             }),
             AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless),
             "inconsistent foreground/session counts fail closed"
+        );
+        assert_eq!(
+            classify(AdmissionFacts {
+                seamless_capable: true,
+                image_kept: true,
+                ..facts()
+            }),
+            AdmissionDecision::Apply(ApplyLane::Seamless),
+            "a kept image with no terminal session hands over when the handoff can"
+        );
+        assert_eq!(
+            classify(AdmissionFacts {
+                image_kept: true,
+                ..facts()
+            }),
+            AdmissionDecision::Block(AdmissionBlock::KeptImageWithoutHandoff)
+        );
+    }
+
+    fn seen() -> Observation {
+        Observation {
+            staged_verified: true,
+            overlap_available: true,
+            sessionless_handoff: true,
+            native_state_certified: true,
+            live_ptys: 0,
+            foreground_jobs: 0,
+            unknown_foregrounds: 0,
+            image_kept: true,
+        }
+    }
+
+    /// 0.145.0, 2026-11-02: a Dock-launched window holding only native tabs was refused
+    /// 249 times in four hours because the facts called the handoff incapable at zero
+    /// sessions.
+    #[test]
+    fn a_kept_image_with_no_terminal_hands_over_when_the_successor_reads_a_sessionless_grant() {
+        assert_eq!(
+            classify(AdmissionFacts::observed(seen())),
+            AdmissionDecision::Apply(ApplyLane::Seamless)
+        );
+        assert_eq!(
+            classify(AdmissionFacts::observed(Observation {
+                sessionless_handoff: false,
+                ..seen()
+            })),
+            AdmissionDecision::Block(AdmissionBlock::KeptImageWithoutHandoff),
+            "a successor that cannot read a sessionless grant is never handed one"
+        );
+        assert_eq!(
+            classify(AdmissionFacts::observed(Observation {
+                overlap_available: false,
+                ..seen()
+            })),
+            AdmissionDecision::Block(AdmissionBlock::KeptImageWithoutHandoff)
+        );
+        assert_eq!(
+            classify(AdmissionFacts::observed(Observation {
+                sessionless_handoff: false,
+                image_kept: false,
+                ..seen()
+            })),
+            AdmissionDecision::Apply(ApplyLane::Cold),
+            "a process that can replace its image keeps the cold lane at zero sessions"
+        );
+        for sessionless_handoff in [false, true] {
+            assert_eq!(
+                classify(AdmissionFacts::observed(Observation {
+                    sessionless_handoff,
+                    live_ptys: 2,
+                    foreground_jobs: 1,
+                    ..seen()
+                })),
+                AdmissionDecision::Apply(ApplyLane::Seamless),
+                "live sessions hand over whatever the sessionless grant"
+            );
+        }
+        assert!(
+            !AdmissionBlock::KeptImageWithoutHandoff
+                .message(AdmissionFacts::observed(seen()))
+                .contains("terminal tab")
         );
     }
 }

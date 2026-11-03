@@ -250,7 +250,7 @@ impl Operation {
     }
 }
 
-fn read_identity(pid: u32) -> Option<Identity> {
+pub(crate) fn read_identity(pid: u32) -> Option<Identity> {
     let r = aterm_sysprobe::kproc::record_read(pid).ok()??;
     Some(Identity {
         pid,
@@ -558,7 +558,7 @@ fn status_report(op: &Operation, state: &str, drained: bool) -> Value {
         "cause": "not_established", "coverage": "no_policy_observations"})
 }
 
-fn fixed_paths() -> Result<(PathBuf, PathBuf), String> {
+pub(crate) fn fixed_paths() -> Result<(PathBuf, PathBuf), String> {
     let exe = std::env::current_exe()
         .map_err(|e| e.to_string())?
         .canonicalize()

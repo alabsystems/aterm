@@ -22,6 +22,7 @@ pub mod channel;
 pub mod cli_path;
 pub mod clt_shim;
 
+pub mod fleet_name;
 pub mod identity;
 pub mod needs;
 pub mod network_state;

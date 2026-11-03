@@ -83,6 +83,28 @@ impl Policy {
         }
     }
 
+    /// Fold any vendor yanks and ALab build floors from `channel` into this policy.
+    #[must_use]
+    pub(crate) fn with_channel(mut self, channel: Option<&crate::manifest::Channel>) -> Self {
+        let Some(ch) = channel else {
+            return self;
+        };
+        for entry in &ch.yanked {
+            if let Some((program, rest)) = entry.split_once('@')
+                && is_vendor(program)
+            {
+                self.insert(program, rest);
+            }
+        }
+        for agent in crate::alab::ALAB_AGENTS {
+            let floor = self
+                .alab_floor(agent.program)
+                .max(ch.min_build_for(agent.program));
+            self.set_floor(agent.program, floor);
+        }
+        self
+    }
+
     /// Keep each `"<program>@<version>"` or `"<program>@<build>"` whose program is vendor-direct.
     #[must_use]
     pub(crate) fn from_entries<'a>(entries: impl IntoIterator<Item = &'a str>) -> Self {

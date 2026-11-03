@@ -119,9 +119,9 @@ fn a_frames_name_reads_back() {
 #[test]
 fn the_system_state_view_is_found_in_the_tab_topology() {
     let tabs = "window id=1 focused=true tabs=2 active=2 rows=36 cols=110\n  \
-                tab id=1 index=0 kind=terminal title=\"sh\" state=idle active=false\n    \
+                tab id=1 index=1 kind=terminal title=\"sh\" state=idle active=false\n    \
                 leaf path=/ view=3 rect_px=0,0,900,600 focused=false kind=terminal session=1\n  \
-                tab id=2 index=1 kind=app title=\"System State\" state=idle active=true\n    \
+                tab id=2 index=2 kind=app title=\"System State\" state=idle active=true\n    \
                 leaf path=/ view=9 rect_px=0,0,900,600 focused=true kind=app app=system-state title=\"System State\"\n";
     assert_eq!(system_state_view(tabs), Some(9));
     assert_eq!(system_state_view("window id=1 rows=2"), None);

@@ -1,12 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A Mac that is ALab's already gets back into the vault with nobody (owner, 2026-11-01: "No
-//! more asking to join"; `docs/DESIGN-automatic-alab-lan-admission-2026-10-29.md` §8).
+//! A Mac on the home ALab LAN gets into the vault with nobody, and so does a Mac that is ALab's
+//! already (owner, 2026-11-01: "No more asking to join"; 2026-11-02: "we assume that physical
+//! access to the LAN is sufficient proof"; `docs/DESIGN-automatic-lan-admission-2026-11-02.md`
+//! "Re-admission by proof").
 //!
-//! The Mac proves one of two things to any member, on a fresh challenge, and that member lets it
-//! in by itself ([`admit_by_proof`]):
+//! The Mac shows one of three things to any member, on a fresh challenge, and that member lets it
+//! in by itself, on that one connection, with the log bundle the Mac writes at once
+//! ([`admit_by_proof`]):
 //!
+//! - **Its place on the home ALab LAN.** The connection came from another host on the network
+//!   this member reads as its home ALab LAN (`members::desk::Local::automatically_admits`: the
+//!   default route's Ethernet or Wi-Fi subnet, never a hotspot, a VPN or a bridge, with fresh
+//!   member evidence there, `crate::home_lan`). Being there is the admission: a Mac no seat binds
+//!   takes a new seat under the next free label, with no hourly or daily share, and a seat whose
+//!   node key it proves moves to its new key as below, whatever binds that key.
 //! - **Its seat's node key.** The log binds its fleet node key to a seat by authority: the genesis
 //!   lists that key for the founder, or the seat's own `Node` record carries the key's signature
 //!   for it. The Mac's vault key changed (a reinstall, a reset vault folder), so the member signs
@@ -39,10 +48,11 @@
 //!   [`READMIT_EVERY_MS`] and at most [`MAX_READMISSIONS`] times in all, and a key another `Admit`
 //!   already names, a key two seats hold, and a key a member replaced go to a person. The Mac a
 //!   move left out is offered no Undo of it.
-//! - A member signs at most [`AUTOMATIC_PER_HOUR`] such admissions an hour; no member signs one
-//!   once the log holds [`PROVEN_PER_DAY`] `Admit`s of [`Evidence::Manual`] from the last day, or
-//!   is [`PROVEN_FILL`] full; and a node id the fleet book binds to another seat's key takes no
-//!   new seat.
+//! - Off the home ALab LAN, a member signs at most [`AUTOMATIC_PER_HOUR`] such admissions an
+//!   hour, and no member signs one once the log holds [`PROVEN_PER_DAY`] `Admit`s of
+//!   [`Evidence::Manual`] from the last day; a Mac on the LAN takes neither share, as the LAN is
+//!   the admission. No member signs one once the log is [`PROVEN_FILL`] full, and a node id the
+//!   fleet book binds to another seat's key takes no new seat.
 //! - Nothing is kept unless the evaluator, run over the signed records, seats the new key under
 //!   the label decided, with the node key it proved.
 
@@ -74,13 +84,46 @@ pub const PROVEN_PER_DAY: usize = 8;
 /// never pruned, and a full log takes no `Admit`, `Remove` or `Put` again, so the last quarter
 /// is kept for what people do.
 pub const PROVEN_FILL: (usize, usize) = (3, 4);
+
+/// The record-budget condition for a new admission by proof. This is only one
+/// prerequisite: it grants no membership and does not judge a pending request,
+/// an already admitted member, or a separate Commons enrollment exchange.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProofAdmissionCapacity {
+    /// Causally complete records in the observed log, excluding waiting records.
+    pub complete_records: usize,
+    /// At this count and above, new proof admissions leave the remaining records
+    /// reserved for other operations.
+    pub exclusive_record_limit: usize,
+    /// Whether the record budget permits considering a new proof. All other
+    /// admission checks still apply.
+    pub within_limit: bool,
+}
+
+impl ProofAdmissionCapacity {
+    /// Inspect the same complete record count and predicate as [`decide`].
+    #[must_use]
+    pub fn observe(log: &Log) -> Self {
+        let complete_records = log.held_count();
+        Self {
+            complete_records,
+            exclusive_record_limit: (MAX_RECORDS * PROVEN_FILL.0).div_ceil(PROVEN_FILL.1),
+            within_limit: room_for_proven(complete_records),
+        }
+    }
+}
 /// How long a seat must have signed nothing before a proof of its node key moves it: a Mac still
 /// running under the seat (its fleet key copied by Migration Assistant, a restore or a cloned
 /// disk onto a Mac that made a new vault key) keeps it, and a person decides.
 pub const DARK_FOR_MS: u64 = 24 * 60 * 60 * 1000;
 /// How long a member reads the vault's newest records before it decides a proof: one that reads
 /// none from any server or peer in that time may not know of a removal, and lets no new key in.
-pub const FRESH_WITHIN: Duration = Duration::from_secs(5);
+/// The whole `prove` exchange runs inside the fleet listener's handshake watchdog
+/// (`aterm_net::fleet::HANDSHAKE_WITHIN`, 3 s), so the read takes at most [`super::PROBE_DEADLINE`]
+/// in all, once an exchange ([`Proven::fresh`]): the configured server and the LAN peers are read at
+/// once, discovery and pulls bounded by it, so one server that does not answer leaves the peers
+/// their time (`super::sync_records_until`).
+pub const FRESH_WITHIN: Duration = super::PROBE_DEADLINE;
 const HOUR_MS: u64 = 60 * 60 * 1000;
 
 /// What a Mac proved to this member on one connection.
@@ -98,6 +141,12 @@ pub struct Proven<'a> {
     /// The fleet handshake also proved the fleet's current key, and this member's own drive
     /// admission takes the node.
     pub fleet: bool,
+    /// The connection came from another host on this member's home ALab LAN: the Mac is let in
+    /// for being there ([`crate::members::desk::Proving::lan`]).
+    pub lan: bool,
+    /// The check before possession on this exchange read the vault's newest records already
+    /// ([`crate::members::desk::Proving::fresh`]): [`admit_by_proof`] reads them no second time.
+    pub fresh: bool,
     /// What this member's fleet book says of the Mac and of the fleet.
     pub book: Book,
 }
@@ -146,6 +195,11 @@ pub enum How {
         /// The label it took.
         label: String,
     },
+    /// No seat binds its node key, and it asked from the home ALab LAN: a new seat.
+    Lan {
+        /// The label it took.
+        label: String,
+    },
 }
 
 /// What [`admit_by_proof`] came to.
@@ -188,8 +242,10 @@ pub(super) enum Decision {
         /// The label the genesis lists.
         label: String,
     },
-    /// Admit the new key under the next free label.
+    /// Admit the new key under the next free label: it proved the fleet's current key.
     Fleet,
+    /// Admit the new key under the next free label: it asked from the home ALab LAN.
+    Lan,
     /// Let nobody in: why.
     Refuse(String),
 }
@@ -198,7 +254,7 @@ pub(super) enum Decision {
 /// the seat's own `Node` record carries it, whose proof by the key [`Record::decode`] verified,
 /// or the seat took it by proof from a seat bound so ([`moved_by_proof`]). Any other `Admit`'s
 /// entrant key is the admitting member's word alone.
-fn bound_by_authority(log: &Log, seat: &MemberId, node: &[u8; 32]) -> bool {
+pub(super) fn bound_by_authority(log: &Log, seat: &MemberId, node: &[u8; 32]) -> bool {
     authority_within(log, seat, node, MAX_READMISSIONS + 1)
 }
 
@@ -336,6 +392,9 @@ fn claimed_label(log: &Log, seat: &MemberId) -> Option<String> {
 /// the module's head, read from `log` alone, so every member decides one proof alike.
 pub(super) fn decide(log: &Log, me: &MemberId, proven: &Proven<'_>, now_ms: u64) -> Decision {
     let refuse = |why: &str| Decision::Refuse(why.to_owned());
+    if now_ms == 0 {
+        return refuse("this member's clock is not set");
+    }
     let binding = proven.request.binding();
     let actor = binding.actor();
     let recipient = binding.recipient();
@@ -364,16 +423,16 @@ pub(super) fn decide(log: &Log, me: &MemberId, proven: &Proven<'_>, now_ms: u64)
     if membership.contains(&actor) {
         return Decision::Already;
     }
-    if automatic_this_hour(log, me, now_ms) >= AUTOMATIC_PER_HOUR {
+    if !proven.lan && automatic_this_hour(log, me, now_ms) >= AUTOMATIC_PER_HOUR {
         return refuse("this member let its share of Macs in this hour; another member may");
     }
-    if manual_this_day(log, now_ms) >= PROVEN_PER_DAY {
+    if !proven.lan && manual_this_day(log, now_ms) >= PROVEN_PER_DAY {
         return refuse(
             "the vault let as many Macs in as it lets in by proof a day: a person decides, or the \
              Mac comes in by itself tomorrow",
         );
     }
-    if !room_for_proven(log.records().count()) {
+    if !ProofAdmissionCapacity::observe(log).within_limit {
         return refuse(
             "the membership log is three quarters full, and the rest is kept for what people do: \
              a person decides",
@@ -390,10 +449,10 @@ pub(super) fn decide(log: &Log, me: &MemberId, proven: &Proven<'_>, now_ms: u64)
             {
                 return refuse("the seat this node key names is held out");
             }
-            if !bound_by_authority(log, &seat, &node) && !proven.fleet {
+            if !bound_by_authority(log, &seat, &node) && !proven.fleet && !proven.lan {
                 return refuse(
                     "only that seat's Admit binds this node key, which no proof by the key backs: \
-                     proving the fleet's key too, or a person's Allow, lets it in",
+                     proving the fleet's key too, or asking from the home ALab LAN, lets it in",
                 );
             }
             let past = readmissions(log, &node);
@@ -467,10 +526,13 @@ pub(super) fn decide(log: &Log, me: &MemberId, proven: &Proven<'_>, now_ms: u64)
                     label: founder.label.clone(),
                 };
             }
-            if !proven.fleet {
-                return refuse(NO_SEAT);
+            if proven.fleet {
+                Decision::Fleet
+            } else if proven.lan {
+                Decision::Lan
+            } else {
+                refuse(NO_SEAT)
             }
-            Decision::Fleet
         }
         NodeStanding::Retired(_) => refuse("a member replaced this node key with another"),
         NodeStanding::Contested => refuse("two seats hold this node key: a person decides"),
@@ -478,8 +540,9 @@ pub(super) fn decide(log: &Log, me: &MemberId, proven: &Proven<'_>, now_ms: u64)
     }
 }
 
-/// Why a Mac with neither a seat nor the fleet's key gets none by its proof.
-const NO_SEAT: &str = "no seat binds this node key, and the Mac did not prove the fleet's key";
+/// Why a Mac with no seat, no fleet key and no place on the home ALab LAN gets none by its proof.
+const NO_SEAT: &str = "no seat binds this node key, the Mac did not prove the fleet's key, and it \
+                       asked from off this member's home ALab LAN";
 
 /// Why a member that cannot sign lets nobody in.
 const NOT_HERE: &str = "this member admits nobody through the membership log";
@@ -492,8 +555,15 @@ const NOT_FRESH: &str = "this member did not read all of the vault's newest reco
 /// Whether this member read all of the vault's newest records from its servers and peers just now
 /// (within [`FRESH_WITHIN`]).
 fn read_newest(paths: &Paths) -> bool {
-    super::sync_records_until(paths, None, &[], None, Some(Instant::now() + FRESH_WITHIN))
-        .is_ok_and(|pass| !pass.untaken)
+    super::sync_records_until(
+        paths,
+        None,
+        &[],
+        None,
+        Some(Instant::now() + FRESH_WITHIN),
+        None,
+    )
+    .is_ok_and(|pass| !pass.untaken)
 }
 
 /// Whether a Mac under `node` has nothing in `log` that gives it a claim: no seat, no `Admit` and no
@@ -510,6 +580,48 @@ fn unclaimed(log: &Log, node: &[u8; 32]) -> bool {
             .any(|r| matches!(r.body(), Body::Admit { entrant, .. } if entrant.node_key == *node))
 }
 
+/// What [`refuses_before_possession_at_ms`] reads from `paths`'s held log, roster and signer on one
+/// pass: `Err(Some(why))` refuses before possession, `Err(None)` leaves an unreadable log or signer
+/// undecided here, and `Ok(decision)` is [`decide`]'s verdict when this member can sign.
+///
+/// On the unsynced pass (`!synced`), a Mac that proved neither the fleet's key nor a claim in the
+/// local log, and asked from off the home ALab LAN, is told [`NO_SEAT`] before touching the roster
+/// or local signer, so an unauthenticated caller learns nothing more of the log or of a copied
+/// recipient and triggers no server read.
+fn pre_possession_pass(
+    paths: &Paths,
+    proving: &crate::members::desk::Proving<'_>,
+    proven: &Proven<'_>,
+    now_ms: u64,
+    synced: bool,
+) -> Result<Decision, Option<String>> {
+    let Some((_, log, _, opened)) = held_log(paths).map_err(|_| None)? else {
+        return Err(Some(NOT_HERE.to_owned()));
+    };
+    if !synced && !proving.fleet && !proving.lan && unclaimed(&log, &proving.node) {
+        return Err(Some(NO_SEAT.to_owned()));
+    }
+    let binding = proving.request.binding();
+    if let Some(why) =
+        roster_keeps_out(paths, Some(&opened), binding, proving.node, None).map_err(|_| None)?
+    {
+        return Err(Some(why));
+    }
+    let Some((me, ..)) = log_entries::open_local_member_signer(paths, &log).map_err(|_| None)?
+    else {
+        return Err(Some(NOT_HERE.to_owned()));
+    };
+    if log.audience_left_out(&EpochAudience::Everyone, &me)
+        || held_audiences(&log, &opened, &me).is_none()
+    {
+        return Err(Some(NOT_HERE.to_owned()));
+    }
+    match decide(&log, &me, proven, now_ms) {
+        Decision::Refuse(why) => Err(Some(why)),
+        decision => Ok(decision),
+    }
+}
+
 /// Why the member at `paths` refuses `proving` at `now_ms` whatever the Mac proves next, or `None`
 /// where it would go on, as [`admit_by_proof`] rules. A desk asks this BEFORE the possession
 /// challenge, so the Mac has sent nothing a member could sign on and may try the next member and its
@@ -518,11 +630,12 @@ fn unclaimed(log: &Log, node: &[u8; 32]) -> bool {
 /// safe side, as nothing was signed and the Mac tries again. A readable state with no usable log
 /// refuses here too; a log or signer it cannot read decides nothing here.
 ///
-/// A Mac that proved neither the fleet's key nor a claim on its node key has shown only keys it
-/// chose, and is told [`NO_SEAT`] and nothing more of the log or of a recipient it may have copied,
-/// with no server read, so a Mac that proves itself to each member in turn waits on none of them.
-/// For any other the vault's newest records come only once [`decide`] would let it in, and decide
-/// again.
+/// A Mac that proved neither the fleet's key nor a claim on its node key, and asked from off the
+/// home ALab LAN, has shown only keys it chose, and is told [`NO_SEAT`] and nothing more of the log
+/// or of a recipient it may have copied, with no server read, so a Mac that proves itself to each
+/// member in turn waits on none of them. For any other (a Mac on the LAN included) the vault's
+/// newest records come only once [`decide`] would let it in, and the log,
+/// roster, local signer and [`decide`] are checked again on what came back.
 ///
 /// What stays for after possession: [`Book::moved_seats_read`]'s refusal, as the seat moves by itself
 /// once every member updated and a plain ask would put a person's Allow in front of the very seat it
@@ -534,46 +647,30 @@ pub fn refuses_before_possession_at_ms(
     book: Book,
     now_ms: u64,
 ) -> Option<String> {
-    let Some((_, log, _, opened)) = held_log(paths).ok()? else {
-        return Some(NOT_HERE.to_owned());
-    };
-    if !proving.fleet && unclaimed(&log, &proving.node) {
-        return Some(NO_SEAT.to_owned());
-    }
-    let binding = proving.request.binding();
-    if let Some(why) = roster_keeps_out(paths, Some(&opened), binding, proving.node) {
-        return Some(why);
-    }
-    let Some((me, ..)) = log_entries::open_local_member_signer(paths, &log).ok()? else {
-        return Some(NOT_HERE.to_owned());
-    };
-    if log.audience_left_out(&EpochAudience::Everyone, &me)
-        || held_audiences(&log, &opened, &me).is_none()
-    {
-        return Some(NOT_HERE.to_owned());
-    }
     let proven = Proven {
         request: proving.request,
         node: proving.node,
         name: proving.name,
         fleet: proving.fleet,
+        lan: proving.lan,
+        fresh: false,
         book: Book {
             moved_seats_read: true,
             ..book
         },
     };
-    match decide(&log, &me, &proven, now_ms) {
-        Decision::Refuse(why) => return Some(why),
-        Decision::Already => return None,
-        _ => {}
+    match pre_possession_pass(paths, proving, &proven, now_ms, false) {
+        Err(refusal) => return refusal,
+        Ok(Decision::Already) => return None,
+        Ok(_) => {}
     }
     if !read_newest(paths) {
         return Some(NOT_FRESH.to_owned());
     }
-    let (_, log, _, _) = held_log(paths).ok().flatten()?;
-    match decide(&log, &me, &proven, now_ms) {
-        Decision::Refuse(why) => Some(why),
-        _ => None,
+    proving.fresh.set(true);
+    match pre_possession_pass(paths, proving, &proven, now_ms, true) {
+        Err(refusal) => refusal,
+        Ok(_) => None,
     }
 }
 
@@ -613,7 +710,7 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
     // would one whose server holds a removal it cannot take, past a record of a kind only a newer
     // build writes: a pass that took records beside it, or named a memo's heads so the server
     // sent nothing, still did not read the vault's newest records.
-    let fresh = read_newest(paths);
+    let fresh = proven.fresh || read_newest(paths);
     // Read before the state is taken: an entry read under this process's lock finds no policy.
     let policy = super::handover::policy_servers(paths);
     let Some(lock) = StateLock::try_take_until(paths, Instant::now() + HANDOVER_LOCK_WAIT)? else {
@@ -623,10 +720,11 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
         return Ok(Readmit::NotHere);
     };
     let binding = proven.request.binding();
-    if let Some(why) = roster_keeps_out(paths, Some(&opened), binding, proven.node) {
+    if let Some(why) = roster_keeps_out(paths, Some(&opened), binding, proven.node, Some(&lock))? {
         return Ok(Readmit::Refused(why));
     }
-    let Some((me, device, incarnation)) = log_entries::open_local_member_signer(paths, &log)?
+    let Some((me, device, incarnation)) =
+        log_entries::open_local_member_signer_held(paths, &log, &lock)?
     else {
         return Ok(Readmit::NotHere);
     };
@@ -701,21 +799,24 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
                 )?,
                 How::Founder { label },
             ),
-            Decision::Fleet => {
+            Decision::Fleet | Decision::Lan => {
                 let label = log
                     .next_label(&name, &taken, &counted)
                     .ok_or_else(|| Error::new("no m<N> label up to m99999 is free"))?;
-                (
-                    log.admit_with(
-                        &signer,
-                        entrant(label.clone()),
-                        Evidence::Manual,
-                        &opened,
-                        &audiences,
-                        now_ms,
-                    )?,
-                    How::Fleet { label },
-                )
+                let signed = log.admit_with(
+                    &signer,
+                    entrant(label.clone()),
+                    Evidence::Manual,
+                    &opened,
+                    &audiences,
+                    now_ms,
+                )?;
+                let how = if decision == Decision::Fleet {
+                    How::Fleet { label }
+                } else {
+                    How::Lan { label }
+                };
+                (signed, how)
             }
             Decision::Refuse(why) => return Err(Error::new(why)),
         })
@@ -730,13 +831,16 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
     };
     let label_held = match &how {
         How::Already => true,
-        How::Seat { label } | How::Founder { label } | How::Fleet { label } => {
-            seated.label == *label
-        }
+        How::Seat { label }
+        | How::Founder { label }
+        | How::Fleet { label }
+        | How::Lan { label } => seated.label == *label,
     };
     let node_held = match &how {
-        How::Seat { .. } => membership.node(&proven.node) == NodeStanding::Member(actor),
-        _ => true,
+        How::Already => true,
+        How::Seat { .. } | How::Founder { .. } | How::Fleet { .. } | How::Lan { .. } => {
+            membership.node(&proven.node) == NodeStanding::Member(actor)
+        }
     };
     if !label_held || !node_held {
         return Ok(Readmit::Refused(format!(
@@ -805,6 +909,8 @@ pub fn prove_at_ms(
         node: proving.node,
         name: proving.name,
         fleet: proving.fleet,
+        lan: proving.lan,
+        fresh: proving.fresh.get(),
         book,
     };
     match admit_by_proof(paths, &proven, now_ms)? {

@@ -3,7 +3,7 @@
 
 //! A fresh application table discovered and repaired by ordinary running hosts.
 
-use super::{HANG, fail, save};
+use super::{HANG, fail, observed_bootstrap, save};
 use crate::{Fail, stop};
 use astream_wire::sync::Digest;
 use aterm_db::{
@@ -25,7 +25,7 @@ pub(crate) struct Table(Descriptor);
 
 impl Table {
     pub(crate) fn application(paths: &Paths, application: &str, role: &str) -> Result<Self, Fail> {
-        let bootstrap = Bootstrap::required(paths).map_err(fail)?;
+        let bootstrap = observed_bootstrap(paths)?;
         Descriptor::application(bootstrap.trust(), application, role, 1)
             .map(Self)
             .map_err(fail)
@@ -103,7 +103,7 @@ impl Table {
         paths: &Paths,
         config: &Path,
     ) -> Result<(Rows, BTreeSet<Digest>), Fail> {
-        let bootstrap = Bootstrap::required(paths).map_err(fail)?;
+        let bootstrap = observed_bootstrap(paths)?;
         let session = Session::observe(&bootstrap).map_err(fail)?;
         let directory = Directory::new(paths, bootstrap.trust());
         let catalog = directory

@@ -1,6 +1,6 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-//! Read ownership codes only through configured non-browser mailbox routes.
+//! Read ownership codes through configured mailbox routes, including native Proton sessions.
 use super::headless_oauth::{self, MailboxConfig, MailboxCredential};
 use std::{collections::BTreeSet, path::PathBuf, time::Duration};
 

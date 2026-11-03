@@ -282,6 +282,52 @@ fn mark_of(reading: &TurnEndReading, wall: Option<WallKind>) -> u64 {
     aterm_hash::fnv1a_64(letters.as_bytes())
 }
 
+/// HOW A MANAGED WORKER'S WORK ENDED UNFINISHED while its agent stands ([`TurnEndState::gave_up`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GaveUp {
+    /// Its reply said `Could not finish: <why>` ([`needs::could_not_finish`]).
+    CouldNotFinish,
+    /// The same reply came back with no work and Land's stop for that took the point
+    /// ([`TurnEndState::conclude_repeated`]).
+    Repeated,
+}
+
+impl GaveUp {
+    /// The task record's `why=` for it.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::CouldNotFinish => "could-not-finish",
+            Self::Repeated => "repeated",
+        }
+    }
+
+    /// The ending a record's `why=` names; `None` for any other word.
+    #[must_use]
+    pub fn of_word(word: &str) -> Option<Self> {
+        [Self::CouldNotFinish, Self::Repeated]
+            .into_iter()
+            .find(|ending| ending.word() == word)
+    }
+
+    /// What the loop's journal says of it.
+    #[must_use]
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::CouldNotFinish => "the worker said it could not finish",
+            Self::Repeated => "the worker repeated the same reply with no work",
+        }
+    }
+
+    /// The ending a journal's `FAILED` line names, by its [`Self::words`].
+    #[must_use]
+    pub fn of_journal_line(line: &str) -> Option<Self> {
+        [Self::CouldNotFinish, Self::Repeated]
+            .into_iter()
+            .find(|ending| line.contains(ending.words()))
+    }
+}
+
 /// The decider's check that holds an act at the same reply ([`TurnEndState::repeats`]).
 pub const SAME_REPLY: &str = "same-reply";
 
@@ -8951,6 +8997,13 @@ pub fn is_switch_ask(text: &str) -> bool {
     matches!(past_switch_why(text), Cow::Owned(_))
 }
 
+/// WHETHER THE REPLY `tail` IS THE TAB'S LOOP'S TO READ, not a relaunch's to carry on from: a clean
+/// defense ([`clean_defense`]) or a `Could not finish:` ([`needs::could_not_finish`]).
+#[must_use]
+pub fn reply_for_the_loop(tail: Option<&str>) -> bool {
+    clean_defense(tail) || tail.and_then(needs::could_not_finish).is_some()
+}
+
 /// WHETHER THE REPLY `tail` LANDS THE WORK, read at a land act's yield ([`TurnEndState::observe`]).
 #[must_use]
 pub fn clean_defense(tail: Option<&str>) -> bool {
@@ -9690,6 +9743,11 @@ pub const CREDITS_HOLD_MODEL_TOLD: &str = "usage credits carry the requests of t
      true` continues on credits";
 /// The agent restarted in its tab for Claude Code's critical-memory banner.
 pub const RULE_MEMORY_RESTART: &str = "memory-restart@v1";
+/// The agent restarted in its tab because it read the line the loop wrote to it and drew none of
+/// it a minute on, at rest ([`Restart::InputLost`]): the line the loop holds in custody
+/// (`supervise::run`'s `Custody`) is lost with its process, and the point resumed is decided and
+/// written once.
+pub const RULE_INPUT_LOST: &str = "input-lost-restart@v1";
 /// A turn the session's host typed (upgrade notice, carry-on; [`TurnEndState::host_typed`]).
 pub const RULE_HOST_TURN: &str = "harness-turn@v1";
 
@@ -9697,6 +9755,10 @@ pub const RULE_HOST_TURN: &str = "harness-turn@v1";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostTurn {
     Notice,
+    /// The one line a restart types where the resumed build warned something was lost: its reply
+    /// is read as a [`Self::Notice`]'s, and a short one moves the back-off as a [`Self::CarryOn`]'s
+    /// does ([`TurnEndState::back_off_from_restart_reply`]).
+    Restore,
     CarryOn,
     Check,
     /// The occupancy door's line at a break ([`TurnEndState::fact_typed`]): its answer is never a done
@@ -9708,9 +9770,19 @@ pub enum HostTurn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Restart {
     Memory,
-    Model { to: String },
-    ModelBack { to: Option<String> },
-    Account { to: String, at: AccountAt },
+    /// The worker read the line the loop wrote to it and drew none of it a minute on, at rest
+    /// ([`RULE_INPUT_LOST`]).
+    InputLost,
+    Model {
+        to: String,
+    },
+    ModelBack {
+        to: Option<String>,
+    },
+    Account {
+        to: String,
+        at: AccountAt,
+    },
 }
 
 /// Where an account move is asked ([`Restart::Account`]).
@@ -9748,6 +9820,7 @@ impl Restart {
     pub const fn word(&self) -> &'static str {
         match self {
             Restart::Memory => "memory",
+            Restart::InputLost => "input-lost",
             Restart::Model { .. } => "model",
             Restart::ModelBack { .. } => "model-back",
             Restart::Account {
@@ -12589,6 +12662,18 @@ pub struct TurnEndState {
     landing: bool,
     landing_act: Option<(u64, u64, Instant)>,
     landed: bool,
+    /// THE WORK ENDED UNFINISHED ([`Self::gave_up`]): [`Self::done`] stands at `2` with it, so
+    /// nothing is typed, until a turn runs.
+    gave_up: Option<GaveUp>,
+    /// The point judged last read `Could not finish:` under every gate but the manager's, which a
+    /// loop's first point has not read yet ([`Self::set_managed`]).
+    could_not_finish_read: bool,
+    /// THE FAILED CONCLUSION A LOOP BEFORE THIS ONE JOURNALED, and the mark of the reply it ended on
+    /// ([`Self::seed_failed`]), until this loop's first point takes it up or drops it.
+    gave_up_seed: Option<(GaveUp, Option<u64>)>,
+    /// No turn ran at the point judged last, so a failed conclusion a record holds still stands
+    /// there ([`Self::seed_gave_up`]).
+    point_turnless: bool,
     landed_mark: Option<u64>,
     off_landing: Option<Option<u64>>,
     point_mark: Option<u64>,
@@ -12716,6 +12801,11 @@ impl TaskFace {
         if state.left_to_person() {
             return TaskFace::Theirs;
         }
+        // The loop's own failed conclusion ([`TurnEndState::gave_up`]) stands until a turn runs or
+        // Cruise lifts it: the harness types nothing meanwhile, and no landing is under way.
+        if state.gave_up.is_some() {
+            return TaskFace::Failed;
+        }
         if state.landed() || state.landed_seed.is_some() {
             TaskFace::Landed
         } else {
@@ -12806,6 +12896,10 @@ impl TurnEndState {
             landing: false,
             landing_act: None,
             landed: false,
+            gave_up: None,
+            could_not_finish_read: false,
+            gave_up_seed: None,
+            point_turnless: false,
             landed_mark: None,
             off_landing: None,
             point_mark: None,
@@ -14603,7 +14697,11 @@ impl TurnEndState {
     /// WHY LAND STILL HOLDS ([`LandHeld`]).
     #[must_use]
     pub fn land_held(&self) -> Option<LandHeld> {
-        if !self.land.typed || self.land.hold.relanded || self.face() != TaskFace::Open {
+        if !self.land.typed
+            || self.land.hold.relanded
+            || (self.gave_up.is_some() && !self.other_turn)
+            || self.face() != TaskFace::Open
+        {
             return None;
         }
         let base = LandHeld {
@@ -15060,7 +15158,7 @@ impl TurnEndState {
     pub fn face_start_noted(&self) -> Option<i64> {
         let restated = match self.face_told? {
             TaskFace::Landed => self.landed_seed.is_some(),
-            TaskFace::Open | TaskFace::Theirs => false,
+            TaskFace::Open | TaskFace::Theirs | TaskFace::Failed => false,
         };
         self.seed_noted_ms.filter(|_| restated)
     }
@@ -15161,9 +15259,101 @@ impl TurnEndState {
         self.done_at
     }
 
-    /// A MANAGER WAITS ON THIS SESSION (`managed`).
-    pub const fn set_managed(&mut self, managed: bool) {
+    /// A MANAGER WAITS ON THIS SESSION (`managed`). A loop's first point is judged before the
+    /// record is read, so its `Could not finish:` word waits here for this.
+    pub fn set_managed(&mut self, managed: bool) {
         self.managed = managed;
+        if managed && std::mem::take(&mut self.could_not_finish_read) {
+            self.conclude(GaveUp::CouldNotFinish);
+        }
+    }
+
+    /// HOW THE WORK ENDED UNFINISHED, once it did ([`GaveUp`]): the task is done
+    /// ([`Self::task_done`]), not landed, and nothing is typed until a turn runs.
+    #[must_use]
+    pub const fn gave_up(&self) -> Option<GaveUp> {
+        self.gave_up
+    }
+
+    /// The work ends unfinished at the point judged last: Land's rest takes it, and what the books
+    /// owed a defense (the land check, its list) goes with it, since the check's words have no
+    /// answer to it.
+    fn conclude(&mut self, ending: GaveUp) {
+        self.gave_up = Some(ending);
+        self.done = 2;
+        self.landed = false;
+        self.by_check = false;
+        self.by_wake = false;
+        self.done_at = self.point_at;
+        self.exchange = false;
+        self.carrying = false;
+        self.checking = false;
+        self.open.clear();
+        self.repo = crate::harness::repo_work::RepoRead::Clean;
+        self.land.check_pending = false;
+        self.land.check_owed = false;
+        self.land.sent = None;
+        self.land_listed = None;
+    }
+
+    /// THE SAME REPLY ENDS A MANAGED WORKER'S WORK: at a Land point whose decision typed nothing
+    /// because the same reply came back with no work ([`Self::replies_stop`]), the rest it took has
+    /// no end but someone else's turn, so it is a conclusion and a waiting manager hears it. A
+    /// reply a wall or a standing need explains is not one: a wall has its own recovery, and a need
+    /// already tells them. A wordless reply is tried again later, so it is not one yet either.
+    pub fn conclude_repeated(&mut self, reading: &TurnEndReading, now: Instant) {
+        if reading.autopilot != Autopilot::Land
+            || !self.managed
+            || self.task_done()
+            || self.wall.is_some()
+            || reading.wall.is_some()
+            || reading.taskless
+            || !reading.at_point(self.stale_input)
+            || !self.needs.standing.is_empty()
+            || self.land.rest
+            || self.wordless_probe(reading).is_some()
+            || !self.replies_stop(reading, now)
+        {
+            return;
+        }
+        self.conclude(GaveUp::Repeated);
+    }
+
+    /// THE FAILED CONCLUSION A LOOP BEFORE THIS ONE JOURNALED: the rest a journal's landing seeds
+    /// ([`Self::seed_landed`]), since a relaunch restores the session's Land and no task record. It
+    /// takes this loop's first point where that point holds the same reply (`words`, where the
+    /// journal has its mark) under Land, by [`Self::seed_gave_up`]'s own conditions; a live turn
+    /// drops it, and so does any other point.
+    pub const fn seed_failed(&mut self, ending: GaveUp, words: Option<u64>) {
+        self.gave_up_seed = Some((ending, words));
+    }
+
+    /// THE WORK CONCLUDED: it landed, or it ended unfinished, and nothing is typed until a turn
+    /// runs. A relaunch's owed carry-on is settled with nothing typed at such a point
+    /// (`IdlePoint::done_under_land`).
+    #[must_use]
+    pub const fn concluded(&self) -> bool {
+        self.landed() || self.gave_up.is_some()
+    }
+
+    /// THE RECORD SAYS THE WORK ENDED UNFINISHED: whether that stands here, as
+    /// [`Self::seed_task_done`] asks of a landing. A turn that ran at the first point, an act in
+    /// flight or a wall means it no longer does, and the record is opened again.
+    pub fn seed_gave_up(&mut self, ending: GaveUp) -> bool {
+        if self.gave_up.is_some() {
+            return true;
+        }
+        if self.autopilot == Some(Autopilot::Cruise)
+            || !self.point_turnless
+            || self.task_done()
+            || self.wall.is_some()
+            || self.awaiting.is_some()
+            || self.after.is_some()
+        {
+            return false;
+        }
+        self.conclude(ending);
+        true
     }
 
     /// Whether a manager waits on this session ([`Self::set_managed`]).
@@ -15812,6 +16002,7 @@ impl TurnEndState {
             self.landed_words = None;
             self.seed_by_wake = false;
             self.seed_noted_ms = None;
+            self.gave_up_seed = None;
         }
         self.restating = None;
         self.ran |= std::mem::take(&mut self.point_last);
@@ -15843,13 +16034,13 @@ impl TurnEndState {
         self.resumed = None;
     }
 
-    /// A RESTART PROMPT'S SHORT REPLY MEASURES ITS BACK-OFF FROM THE REPLY ([`HostTurn::CarryOn`], or
-    /// [`HostTurn::Check`] where the agent's last words claimed the work done): the prompt may have
-    /// waited minutes behind a draft or under Off, and the point before it would have the loop's own
-    /// prompt straight after this one. A reply nobody saw work is measured from the prompt, which
-    /// is where an unheld prompt's own wait starts. One prompt per relaunch moves it, so no run of
-    /// them can hold the loop's own prompt back. An upgrade's notice ([`HostTurn::Notice`]) asks
-    /// again at its own pace and leaves the clock where it is.
+    /// A RESTART PROMPT'S SHORT REPLY MEASURES ITS BACK-OFF FROM THE REPLY ([`HostTurn::CarryOn`],
+    /// [`HostTurn::Restore`], or [`HostTurn::Check`] where the agent's last words claimed the work
+    /// done): the prompt may have waited minutes behind a draft or under Off, and the point before
+    /// it would have the loop's own prompt straight after this one. A reply nobody saw work is
+    /// measured from the prompt, which is where an unheld prompt's own wait starts. One prompt per
+    /// relaunch moves it, so no run of them can hold the loop's own prompt back. An upgrade's
+    /// notice ([`HostTurn::Notice`]) asks again at its own pace and leaves the clock where it is.
     fn back_off_from_restart_reply(
         &mut self,
         typed: Option<Instant>,
@@ -16943,6 +17134,7 @@ impl TurnEndState {
         let wake_repo = self.wake_repo.take();
         let seeded = self.landed_seed.take();
         let landing_words = self.landed_words.take();
+        let gave_up_seed = self.gave_up_seed.take();
         let seeded_by_wake = std::mem::take(&mut self.seed_by_wake);
         let noted = self.seed_noted_ms.take();
         self.restating = noted
@@ -17093,6 +17285,12 @@ impl TurnEndState {
         // no answer of the agent's own or real work between, counts as before, so a wall that cuts
         // every act still climbs the ladder (`SupervisorTurnEnd`'s `AWallPassesOncePerRung`).
         let uncounted = |short: u32, d: Duration, done: bool| streak(short, d, done).min(short);
+        // A TURN THE HARNESS'S OWN STOP ENDED gave no short answer either: the restart whose cut
+        // call a resume restores ([`Self::restored_cut`]) or the Esc it pressed on a turn the Mac
+        // slept through ([`Self::woken_esc`]) ended it, not the agent. Whether a read caught the
+        // turn running before the stop must not decide the next prompt's back-off (2026-11-03
+        // real-Claude flows f1 and f2: 2 min and 4 min after the same restart prompt's reply).
+        let harness_cut = reading.interrupted && self.woken_esc.is_some();
         let wall_cut = reading.wall.is_some();
         let pass = wall_cut && !self.cut_pass_spent;
         let mut cut_counted = false;
@@ -17170,7 +17368,7 @@ impl TurnEndState {
                     }
                     if self.point_at.is_none() {
                         self.new_point(now);
-                    } else if carry_on {
+                    } else if carry_on || host == Some(HostTurn::Restore) {
                         self.back_off_from_restart_reply(act_typed, d, now);
                     }
                 }
@@ -17201,6 +17399,8 @@ impl TurnEndState {
                 if is_continue_rule(rule) {
                     self.short = if pass {
                         self.cut_pass_spent = true;
+                        uncounted(self.short, d, done)
+                    } else if harness_cut {
                         uncounted(self.short, d, done)
                     } else {
                         cut_counted = wall_cut;
@@ -17290,6 +17490,8 @@ impl TurnEndState {
                             self.short = if pass {
                                 self.cut_pass_spent = true;
                                 uncounted(self.short, d, done)
+                            } else if harness_cut {
+                                uncounted(self.short, d, done)
                             } else {
                                 cut_counted = wall_cut;
                                 streak(self.short, d, done)
@@ -17305,9 +17507,10 @@ impl TurnEndState {
                         // reads it: a key, a scroll or a click, a draft, a driver's lease) is no
                         // prompt of aterm's: neither adds to the streak. A turn no act of aterm's
                         // asked is never aterm's to count but for a program's own going on, so
-                        // the hand only narrows the count toward that rule. Real work in either
-                        // must still clear it, rather than inheriting an overbroad skip.
-                        self.short = if own_going_on || hand {
+                        // the hand only narrows the count toward that rule, as the harness's own
+                        // stop does. Real work in any of them must still clear it, rather than
+                        // inheriting an overbroad skip.
+                        self.short = if own_going_on || hand || harness_cut {
                             uncounted(self.short, d, false)
                         } else {
                             streak(self.short, d, false)
@@ -17326,7 +17529,12 @@ impl TurnEndState {
                     self.new_point(at);
                 } else {
                     self.new_point(now);
-                    self.short = self.short.saturating_add(1);
+                    // The cut a relaunch's resume restores, the first point of the loop that
+                    // relaunch starts where its books hold a turn read running after their point,
+                    // is the harness's own stop, as in the arms above.
+                    if !harness_cut {
+                        self.short = self.short.saturating_add(1);
+                    }
                 }
                 land_judged = landing && act_seen && ok_to_leave && !answer_stopped;
                 if landing && act_seen && reading.wall.is_some() {
@@ -17654,6 +17862,16 @@ impl TurnEndState {
         if let Some(key) = reading.key.and_then(|ago| now.checked_sub(ago)) {
             self.person_keyed(key, keyed_in_turn.then_some(now), now);
         }
+        // A TURN RUN SINCE, OR CRUISE, WHICH NEVER RESTS, LIFTS A WORKER'S FAILED CONCLUSION: the
+        // point is a report again.
+        let turn_ran = awaited.is_some() || reading.worked.is_some();
+        self.point_turnless = !turn_ran;
+        if self.gave_up.is_some() && (turn_ran || reading.autopilot == Autopilot::Cruise) {
+            self.gave_up = None;
+            if self.done >= 2 && !self.landed && !self.exchange {
+                self.done = u8::from(done && reading.wall.is_none());
+            }
+        }
         if self.done < 2 {
             self.done_at = None;
         } else if done_before < 2 || self.points != points_before {
@@ -17725,6 +17943,31 @@ impl TurnEndState {
             // checked, so said again it is owed the check.
             self.land.check_pending = false;
             self.land.sent = None;
+        }
+        // THE WORKER'S OWN `Could not finish: <why>` (a managed worker's, under Land alone: Cruise
+        // never rests, and a person's own session has no one waiting on such a word). A turn the
+        // person stopped or a wall cut gave no such answer.
+        self.could_not_finish_read = (turn_ran || first_point)
+            && reading.autopilot == Autopilot::Land
+            && ok_to_leave
+            && !reading.interrupted
+            && !reading.said_cut
+            && !self.landed
+            && !self.exchange
+            && reading
+                .said_tail
+                .as_deref()
+                .and_then(needs::could_not_finish)
+                .is_some();
+        if self.managed && std::mem::take(&mut self.could_not_finish_read) {
+            self.conclude(GaveUp::CouldNotFinish);
+        }
+        if let Some((ending, words)) = gave_up_seed
+            && reading.autopilot == Autopilot::Land
+            && ok_to_leave
+            && words.is_none_or(|w| tail_mark == Some(w))
+        {
+            self.seed_gave_up(ending);
         }
         if self.landed() && !landed_before {
             self.landed_mark = seed_mark.or(tail_mark);
@@ -17866,7 +18109,7 @@ impl TurnEndState {
                     t.attempts = 0;
                     t.login.cancelled = false;
                     t.login.back_typed = true;
-                    if self.done >= 2 && !self.landed {
+                    if self.done >= 2 && !self.landed && self.gave_up.is_none() {
                         self.done = 0;
                     }
                 } else if let Some(t) = self.wall.as_mut().filter(|t| {
@@ -18884,7 +19127,7 @@ impl TurnEndState {
             self.account_startup = self.account.is_some();
         }
         match why {
-            Restart::Memory => {}
+            Restart::Memory | Restart::InputLost => {}
             Restart::Model { to } if made => {
                 let track = self.wall.as_ref().filter(|t| t.class == WallClass::Model);
                 let credits = self

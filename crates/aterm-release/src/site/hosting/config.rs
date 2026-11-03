@@ -92,7 +92,8 @@ pub fn parse(text: &str) -> Result<Hosting, String> {
     ignore.extend(ALWAYS_IGNORED.iter().map(|p| (*p).to_string()));
     let site = match hosting.get("site") {
         None => None,
-        Some(Value::String(site)) => Some(site.clone()),
+        Some(Value::String(site)) if !site.trim().is_empty() => Some(site.clone()),
+        Some(Value::String(_)) => return Err("hosting.site is empty".into()),
         Some(_) => return Err("hosting.site is not a string".into()),
     };
     let mut config = Map::new();
@@ -236,11 +237,12 @@ fn headers(value: &Value) -> Result<Value, String> {
                 .and_then(Value::as_str)
                 .ok_or_else(|| format!("{here}.value is missing or not a string"))?;
             if set
-                .insert(name.to_string(), Value::String(text.into()))
-                .is_some()
+                .keys()
+                .any(|existing| existing.eq_ignore_ascii_case(name))
             {
                 return Err(format!("{at} sets the header {name} twice"));
             }
+            set.insert(name.to_string(), Value::String(text.into()));
         }
         entry.insert("headers".into(), Value::Object(set));
         out.push(Value::Object(entry));

@@ -60,7 +60,20 @@ fn arguments(argv: &[OsString]) -> Option<Args> {
     })
 }
 
-fn run(args: Args) -> std::io::Result<()> {
+/// Checkpoints supplied only by an explicit Rust fixture caller. Installed entry
+/// points never accept a hook or consult a configuration/environment switch.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug)]
+pub enum FixtureStage {
+    BeforeAttach,
+    AfterAttach,
+    AfterGo,
+}
+
+fn run(
+    args: Args,
+    #[cfg(debug_assertions)] hook: Option<&dyn Fn(FixtureStage, ImagePhase) -> std::io::Result<()>>,
+) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     let mut client = super::upgrade_drive::harness_client(&args.socket, None)?;
     // SAFETY: the client exclusively owns this live socket; only its descriptor flags are read.
@@ -69,6 +82,10 @@ fn run(args: Args) -> std::io::Result<()> {
         return Err(std::io::Error::other(
             "native operation channel is not close-on-exec",
         ));
+    }
+    #[cfg(debug_assertions)]
+    if let Some(hook) = hook {
+        hook(FixtureStage::BeforeAttach, args.phase)?;
     }
     let Reply::Launch {
         command,
@@ -81,6 +98,10 @@ fn run(args: Args) -> std::io::Result<()> {
     else {
         return Err(std::io::Error::other("native launcher was not admitted"));
     };
+    #[cfg(debug_assertions)]
+    if let Some(hook) = hook {
+        hook(FixtureStage::AfterAttach, args.phase)?;
+    }
     // All preparation happens before Execute. No shell text is parsed, no new argv/env is
     // supplied by this child, and the host has already registered its exact birth/death watch.
     if Image::at(std::path::Path::new(&command.program)).as_ref() != Some(&command.image)
@@ -111,6 +132,10 @@ fn run(args: Args) -> std::io::Result<()> {
     if original != deadline_us {
         return Err(std::io::Error::other("native operation deadline changed"));
     }
+    #[cfg(debug_assertions)]
+    if let Some(hook) = hook {
+        hook(FixtureStage::AfterGo, args.phase)?;
+    }
     let refused = exec.exec_until(original);
     // An exec error is terminal for this helper. Even a failed error report leaves the exact
     // child and kernel witness owned by the original host operation; EOF never retires it.
@@ -130,7 +155,27 @@ pub(super) fn entry(argv: &[OsString]) -> Option<ExitCode> {
         return None;
     }
     if let Some(args) = arguments(&argv[1..]) {
-        let _terminal = run(args);
+        let _terminal = run(
+            args,
+            #[cfg(debug_assertions)]
+            None,
+        );
+    }
+    Some(ExitCode::from(126))
+}
+
+/// Exercise the actual native launcher with a fixture-owned checkpoint callback.
+/// This is never called by the installed CLI and has no runtime opt-in.
+#[cfg(debug_assertions)]
+pub fn fixture_entry(
+    argv: &[OsString],
+    hook: &dyn Fn(FixtureStage, ImagePhase) -> std::io::Result<()>,
+) -> Option<ExitCode> {
+    if argv.first().is_none_or(|arg| arg != "native-launch") {
+        return None;
+    }
+    if let Some(args) = arguments(&argv[1..]) {
+        let _terminal = run(args, Some(hook));
     }
     Some(ExitCode::from(126))
 }

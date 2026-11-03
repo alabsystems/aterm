@@ -267,6 +267,8 @@ impl Drop for Completion {
 struct QueueRoute {
     to: Option<Arc<Mutex<TemporalRecorder>>>,
     state: Arc<QueueState>,
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    costs: Option<Arc<crate::recording_cost::Costs>>,
 }
 
 /// How many messages a reader may have queued that the writer has not written yet.
@@ -329,6 +331,8 @@ fn open_to(
         route: Arc::new(QueueRoute {
             to: Some(recorder.clone()),
             state: state.clone(),
+            #[cfg(any(debug_assertions, feature = "dev-seams"))]
+            costs: spine.costs.handle(),
         }),
         state,
         spine,
@@ -381,7 +385,14 @@ fn writer() -> Result<&'static Sender<Queued>, String> {
                                 completion.begin_processing();
                             }
                             if let Some(to) = &completion.route.to {
-                                write_queued_with_poll(to, generation, msg, &mut || role.poll());
+                                write_queued_with_poll(
+                                    to,
+                                    generation,
+                                    msg,
+                                    &mut || role.poll(),
+                                    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+                                    completion.route.costs.as_deref(),
+                                );
                             }
                             completion.written();
                             completion.route.state.pool.relieve();
@@ -391,14 +402,17 @@ fn writer() -> Result<&'static Sender<Queued>, String> {
                     );
                 },
             )
-            .map(|_| tx)
+            .map(|worker| {
+                urgency::global().adopt_worker(Arc::new(worker));
+                tx
+            })
             .map_err(|error| format!("spawn temporal writer: {error}"))
         })
         .as_ref()
         .map_err(Clone::clone)
 }
 
-/// How long the shared writer naps once it has emptied its queue ([`serve`]). A writer waiting on
+/// How long the shared writer naps once it has emptied a backlog ([`serve`]). A writer waiting on
 /// its channel is woken by every send, so a reader streaming output wakes it once per slice, each
 /// wake a context switch on the cores the reader and its PTY drain run on; napping off the channel
 /// instead, it takes the slices that queued meanwhile as one batch. A new demand ends a nap at once
@@ -416,16 +430,18 @@ trait Inbox<Q> {
     fn nap(&mut self);
 }
 
-/// Write every message `inbox` brings, in the order queued. Once its queue is empty the writer naps
-/// and takes what queued meanwhile, unless `urgent()`; it waits on the channel only when a nap
-/// brought nothing, or while a demand is live.
+/// Write every message `inbox` brings, in the order queued. A backlog starts batching: once its
+/// queue is empty the writer naps and takes what queued meanwhile, unless `urgent()`. It waits
+/// on the channel after an isolated message or once a nap brought nothing, ending that batch.
 fn serve<Q>(inbox: &mut impl Inbox<Q>, urgent: impl Fn() -> bool, mut write: impl FnMut(Q)) {
     while let Some(first) = inbox.wait() {
+        let mut batching = false;
         let mut next = Some(first);
         while let Some(queued) = next {
             write(queued);
             next = inbox.take();
-            if next.is_none() && !urgent() {
+            batching |= next.is_some();
+            if next.is_none() && batching && !urgent() {
                 inbox.nap();
                 next = inbox.take();
             }
@@ -499,6 +515,8 @@ fn queue_in_with_demands(
             route: Arc::new(QueueRoute {
                 to: None,
                 state: state.clone(),
+                #[cfg(any(debug_assertions, feature = "dev-seams"))]
+                costs: spine.costs.handle(),
             }),
             state: state.clone(),
             spine,
@@ -840,6 +858,8 @@ impl Arm {
 /// Where the spine's resizes are up to, shared by every reader of a session.
 #[derive(Debug, Default)]
 pub(crate) struct SpineWatermark {
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    pub(crate) costs: crate::recording_cost::Owner,
     lifetime: AtomicU64,
     ordinal: AtomicU64,
     cell_px: AtomicU64,
@@ -1221,6 +1241,11 @@ impl SpineMark {
         term: &Terminal,
         mut input: InputSlice,
     ) {
+        #[cfg(any(debug_assertions, feature = "dev-seams"))]
+        let _cost = crate::recording_cost::begin(
+            tx.spine.costs.get().map(|cost| &cost.record),
+            u64::try_from(input.len()).ok(),
+        );
         input.marks = SliceMarks {
             sync_open: term.modes().synchronized_output(),
             command: term.started_command_seq() != pre.started,
@@ -1303,6 +1328,9 @@ impl SpineMark {
         if !due || !term.parser_is_ground() {
             return;
         }
+        #[cfg(any(debug_assertions, feature = "dev-seams"))]
+        let _cost =
+            crate::recording_cost::begin(tx.spine.costs.get().map(|cost| &cost.witness), Some(1));
         let Some(live) = term.checkpoint_visible() else {
             return;
         };
@@ -1699,9 +1727,13 @@ impl TemporalRecorder {
     /// What `temporal status` appends to its line.
     #[must_use]
     pub(crate) fn status_tail(&self) -> String {
-        self.handoff
+        let tail = self
+            .handoff
             .map(|gap| format!(" {}", gap.payload()))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        #[cfg(any(debug_assertions, feature = "dev-seams"))]
+        let tail = tail + &self.spine.costs.fields();
+        tail
     }
 
     /// Snapshot actual queued/in-progress work, not a barrier for a live producer.
@@ -3113,7 +3145,14 @@ impl Default for TemporalRecorder {
 /// The writer thread's step for one message a reader sent in recording generation `generation`.
 #[cfg(test)]
 fn write_queued(recorder: &Mutex<TemporalRecorder>, generation: u64, msg: TemporalMsg) {
-    write_queued_with_poll(recorder, generation, msg, &mut || {});
+    write_queued_with_poll(
+        recorder,
+        generation,
+        msg,
+        &mut || {},
+        #[cfg(any(debug_assertions, feature = "dev-seams"))]
+        None,
+    );
 }
 
 fn write_queued_with_poll(
@@ -3121,13 +3160,31 @@ fn write_queued_with_poll(
     generation: u64,
     msg: TemporalMsg,
     poll: &mut impl FnMut(),
+    #[cfg(any(debug_assertions, feature = "dev-seams"))] costs: Option<
+        &crate::recording_cost::Costs,
+    >,
 ) {
     poll();
     let lock = || recorder.lock().unwrap_or_else(PoisonError::into_inner);
-    let due = lock().apply_in(generation, msg);
+    let due = {
+        #[cfg(any(debug_assertions, feature = "dev-seams"))]
+        let _cost = crate::recording_cost::begin(costs.map(|cost| &cost.apply), Some(1));
+        lock().apply_in(generation, msg)
+    };
     if let Some(due) = due {
-        let minted = due.mint_with_poll(poll);
-        lock().rekeyed(minted);
+        let minted = {
+            #[cfg(any(debug_assertions, feature = "dev-seams"))]
+            let _cost = crate::recording_cost::begin(
+                costs.map(|cost| &cost.mint),
+                u64::try_from(due.plan.steps.len()).ok(),
+            );
+            due.mint_with_poll(poll)
+        };
+        {
+            #[cfg(any(debug_assertions, feature = "dev-seams"))]
+            let _cost = crate::recording_cost::begin(costs.map(|cost| &cost.commit), Some(1));
+            lock().rekeyed(minted);
+        }
     }
     poll();
 }
@@ -6798,6 +6855,8 @@ mod tests {
         tx.route = Arc::new(QueueRoute {
             to: Some(recorder.clone()),
             state: tx.state.clone(),
+            #[cfg(any(debug_assertions, feature = "dev-seams"))]
+            costs: tx.spine.costs.handle(),
         });
         let drain = tx.drain();
         assert!(tx.send(TemporalMsg::RawIn(InputSlice::at(b"x", clock(0)))));

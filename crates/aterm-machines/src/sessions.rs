@@ -180,12 +180,24 @@ pub(crate) fn read_sock_token(sock_path: &Path) -> Option<String> {
         })
 }
 
+fn same_hosted_session(
+    a: &crate::protocol::HostedSession,
+    b: &crate::protocol::HostedSession,
+) -> bool {
+    (!a.sid.is_empty() && a.sid == b.sid)
+        || (a.instance_pid != 0 && a.instance_pid == b.instance_pid && a.local_id == b.local_id)
+}
+
 fn enrich_sessions_dims_and_cwd(
     sock_path: &Path,
     token: &str,
     sessions: &mut [crate::protocol::HostedSession],
 ) {
-    if sessions.is_empty() {
+    if sessions.is_empty()
+        || sessions
+            .iter()
+            .all(|s| s.cols.is_some() && s.rows.is_some() && s.cwd.is_some())
+    {
         return;
     }
     let Ok(mut stream) = UnixStream::connect(sock_path) else {
@@ -212,9 +224,16 @@ fn enrich_sessions_dims_and_cwd(
     let mut reader = BufReader::new(stream);
     for s in sessions.iter_mut() {
         let mut dims_line = String::new();
-        if reader.by_ref().take(1024).read_line(&mut dims_line).is_ok()
-            && let Some(rest) = dims_line.trim().strip_prefix("OK ")
+        if reader
+            .by_ref()
+            .take(1024)
+            .read_line(&mut dims_line)
+            .is_err()
+            || !dims_line.ends_with('\n')
         {
+            break;
+        }
+        if let Some(rest) = dims_line.trim().strip_prefix("OK ") {
             let mut parts = rest.split_whitespace();
             if let (Some(r), Some(c)) = (
                 parts.next().and_then(crate::parse_uint::<u32>),
@@ -227,9 +246,11 @@ fn enrich_sessions_dims_and_cwd(
             }
         }
         let mut cwd_line = String::new();
-        if reader.by_ref().take(4096).read_line(&mut cwd_line).is_ok()
-            && let Some(rest) = cwd_line.trim().strip_prefix("OK ")
+        if reader.by_ref().take(4096).read_line(&mut cwd_line).is_err() || !cwd_line.ends_with('\n')
         {
+            break;
+        }
+        if let Some(rest) = cwd_line.trim().strip_prefix("OK ") {
             let decoded = pct_decode(rest.trim());
             if !decoded.is_empty() && decoded != "-" {
                 s.cwd = Some(shorten_home(&decoded));
@@ -265,7 +286,7 @@ fn query_instance_sessions(
     }
     let mut reader = BufReader::new(stream);
     let mut header = String::new();
-    if reader.by_ref().take(1024).read_line(&mut header).is_err() {
+    if reader.by_ref().take(1024).read_line(&mut header).is_err() || !header.ends_with('\n') {
         return Vec::new();
     }
     let Some(count) = header
@@ -284,7 +305,7 @@ fn query_instance_sessions(
             .take(64 * 1024)
             .read_line(&mut line)
             .is_err()
-            || line.is_empty()
+            || !line.ends_with('\n')
         {
             break;
         }
@@ -365,9 +386,7 @@ pub fn scan_local_aterm_sessions() -> Vec<crate::protocol::HostedSession> {
     let mut out = Vec::new();
     for d in dirs {
         for s in scan_aterm_sessions_in_dir(&d, SOCKET_WAIT) {
-            if !out.iter().any(|x: &crate::protocol::HostedSession| {
-                x.instance_pid == s.instance_pid && x.local_id == s.local_id
-            }) {
+            if !out.iter().any(|x| same_hosted_session(x, &s)) {
                 out.push(s);
             }
         }
@@ -459,5 +478,55 @@ mod tests {
             Some("blocked:permission")
         );
         assert_eq!(row("-"), None);
+    }
+
+    /// BOUNDED READ FRAMING AND ZERO-PID DEDUP: an oversized `cwd` reply without `\n` stops
+    /// enrichment rather than shifting its tail into the next session's `dims`, and `pid == 0`
+    /// graph rows with distinct `sid`s do not collapse on `local_id`.
+    /// NEGATIVE CONTROL: well-formed newline-terminated replies enrich the preceding session and
+    /// duplicate `sid`s still deduplicate.
+    #[test]
+    fn enrich_stops_on_unterminated_reply_and_dedup_preserves_distinct_zero_pid_sids() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("at-ses-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let sock = dir.path().join("aterm-77.sock");
+        std::fs::write(dir.path().join("aterm-77.token"), "abcd\n").unwrap();
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let _ = conn.read_to_end(&mut req);
+            let mut reply = b"OK 24 80\nOK ".to_vec();
+            reply.extend(std::iter::repeat_n(b'a', 4100));
+            reply.extend_from_slice(b"\nOK 50 160\nOK /Users//ok\n");
+            let _ = conn.write_all(&reply);
+            conn
+        });
+
+        let mut sessions = vec![
+            parse_aterm_roster_line(77, "0 s-first - alive zsh meta=0").unwrap(),
+            parse_aterm_roster_line(77, "1 s-second - alive zsh meta=0").unwrap(),
+        ];
+        enrich_sessions_dims_and_cwd(&sock, "abcd", &mut sessions);
+        let _held = server.join().unwrap();
+        assert_eq!(sessions[0].rows, Some(24));
+        assert_eq!(sessions[0].cols, Some(80));
+        assert_eq!(
+            sessions[0].cwd, None,
+            "oversized unterminated cwd must be dropped"
+        );
+        assert_eq!(
+            sessions[1].cols, None,
+            "tail of oversized cwd line must not desynchronize into session 1"
+        );
+        assert_eq!(sessions[1].cwd, None);
+
+        let a = parse_aterm_roster_line(0, "0 s-one - alive zsh meta=0").unwrap();
+        let b = parse_aterm_roster_line(0, "0 s-two - alive zsh meta=0").unwrap();
+        let a_dup = parse_aterm_roster_line(0, "0 s-one - alive zsh meta=0").unwrap();
+        assert!(!same_hosted_session(&a, &b));
+        assert!(same_hosted_session(&a, &a_dup));
     }
 }

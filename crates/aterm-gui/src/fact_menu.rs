@@ -549,9 +549,51 @@ fn recovery_report(progress: &aterm_agent::harness::account_progress::AccountPro
         ),
     ];
     lines.extend(progress.details.iter().cloned());
+    for diagnostic in &progress.login_diagnostics {
+        lines.push(format!(
+            "Last local sign-in for {}: {}",
+            diagnostic.label(),
+            diagnostic.words(),
+        ));
+        lines.push(format!(
+            "Attempt finished at {}",
+            aterm_agent::harness::usage::rfc3339_utc(diagnostic.completed_at),
+        ));
+    }
     lines.push(recovery_observed_line(progress.observed_at));
     lines.push(recovery_next_line(progress.next_at));
     lines.join("\n")
+}
+
+fn login_diagnostic_rows(
+    out: &mut Vec<MenuRow>,
+    diagnostic: &aterm_agent::harness::accounts_sync::LoginDiagnostic,
+    room: usize,
+) {
+    out.push(MenuRow::note(format!(
+        "Last local sign-in: {}",
+        diagnostic.label()
+    )));
+    let width = if room == 0 {
+        autopilot_menu::MAX_CONTENT
+    } else {
+        room.min(autopilot_menu::MAX_CONTENT)
+    };
+    let words = diagnostic.words();
+    let wrapped = crate::native_settings::wrap_to_box(&words, width as f32, &|text| {
+        crate::tab_menu::display_cells(text) as f32
+    });
+    let mut spoken = Some(words.as_str());
+    for line in wrapped {
+        out.push(MenuRow::note_spoken(
+            line,
+            spoken.take().unwrap_or_default(),
+        ));
+    }
+    out.push(MenuRow::note(format!(
+        "Finished {}",
+        aterm_agent::harness::usage::rfc3339_utc(diagnostic.completed_at),
+    )));
 }
 
 /// Build the menu rows for `fact` from `facts`.
@@ -678,6 +720,11 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 // Keep timing visible before a long list of retained route details.
                 out.push(MenuRow::note(recovery_observed_line(progress.observed_at)));
                 out.push(MenuRow::note(recovery_next_line(progress.next_at)));
+                let mut diagnostics: Vec<_> = progress.login_diagnostics.iter().collect();
+                diagnostics.sort_by_key(|diagnostic| std::cmp::Reverse(diagnostic.completed_at));
+                for diagnostic in diagnostics {
+                    login_diagnostic_rows(&mut out, diagnostic, facts.room);
+                }
                 for detail in progress.details.iter().skip(1) {
                     out.push(MenuRow::note(detail.clone()));
                 }

@@ -300,10 +300,10 @@ fn startup_cancel_watch_set_up_now_after_an_older_cancel_applies_the_plan_its_re
         }
         let snapshot = first.setup.snapshot().unwrap();
         assert!(!snapshot.cancelled, "{group:?}: the Cancel gave way");
-        assert_eq!(
-            snapshot.permissions_allowed,
-            group.is_none(),
-            "{group:?}: aterm's permission steps run only where the plan asks for them"
+        // Neither Set up now nor a group press asks for macOS's grants: they are on offer.
+        assert!(
+            !snapshot.permissions_allowed,
+            "{group:?}: aterm's permission steps wait for a person's press for them"
         );
     }
 }
@@ -329,7 +329,7 @@ fn startup_cancel_watch_an_accepted_provisional_offer_still_widens_once() {
     let snapshot = host.setup.snapshot().unwrap();
     assert_eq!(snapshot.plan.selection, Selection::all());
     assert_eq!(script().runs, [first, snapshot.revision]);
-    assert!(snapshot.revision > first && snapshot.permissions_allowed);
+    assert!(snapshot.revision > first && snapshot.run_allowed);
     assert_eq!(looks.get(), 1);
     clear_setup_run(snapshot.revision);
 }

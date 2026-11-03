@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 
 use aterm_json::{Value, json};
 
+#[path = "google_mail_auth.rs"]
+mod google_mail_auth;
+
 use super::auth_deadline::Deadline;
 use super::open_url::{
     DEFAULT_MAILBOX_DIR, EMAIL_FILE_MAX, MAILBOX_ENV, MailboxFlow, MetWord, decode_html_amp,
@@ -139,6 +142,10 @@ pub struct MailboxConfig {
     pub mailbox_passwords: BTreeMap<String, String>,
     /// Per-account Base32 TOTP secrets keyed by lowercase email address.
     pub totp_secrets: BTreeMap<String, String>,
+    /// Authenticated field deliveries bound to a registered mailbox authority.
+    pub mailbox_components: BTreeMap<aterm_secrets::mailbox_component::Component, String>,
+    /// The explicitly authenticated registered source used for component needs.
+    pub mailbox_source_home: Option<PathBuf>,
     /// Optional file tracking already-consumed message digests.
     pub seen_file: Option<PathBuf>,
     /// Words in the sender of the vendor's sign-in mail (`connector::Accounts::mail_senders`),
@@ -243,6 +250,7 @@ impl MailboxConfig {
                 out.imap_url.clone_from(&self.imap_url);
                 out.http_url.clone_from(&self.http_url);
             }
+            super::mailbox_needs::overlay_route(self, &mut out);
             return out;
         }
         let login = route.login.trim().to_ascii_lowercase();
@@ -286,6 +294,7 @@ impl MailboxConfig {
         if blank(&out.totp_secret) {
             out.totp_secret = lookup(&self.totp_secrets).or(out.totp_secret);
         }
+        super::mailbox_needs::overlay_route(self, &mut out);
         out
     }
 
@@ -330,6 +339,8 @@ impl MailboxConfig {
             passwords: BTreeMap::new(),
             mailbox_passwords: BTreeMap::new(),
             totp_secrets: BTreeMap::new(),
+            mailbox_components: super::mailbox_needs::empty_components(),
+            mailbox_source_home: self.mailbox_source_home.clone(),
             seen_file: self.seen_file.clone(),
             senders: self.senders.clone(),
             since: self.since,
@@ -451,6 +462,12 @@ impl MailboxConfig {
             return route.password.filter(|_| ready);
         }
         self.credential_for(&self.passwords, self.password.as_ref(), target_email)
+            .or_else(|| {
+                super::mailbox_needs::default_component(
+                    self,
+                    aterm_secrets::mailbox_component::Part::Password,
+                )
+            })
     }
 
     /// Look up the second-stage mailbox password for `target_email`.
@@ -465,6 +482,12 @@ impl MailboxConfig {
             self.mailbox_password.as_ref(),
             target_email,
         )
+        .or_else(|| {
+            super::mailbox_needs::default_component(
+                self,
+                aterm_secrets::mailbox_component::Part::SecondPassword,
+            )
+        })
     }
 
     /// Look up the Base32 TOTP secret for `target_email`.
@@ -475,6 +498,12 @@ impl MailboxConfig {
             return route.totp_secret.filter(|_| ready);
         }
         self.credential_for(&self.totp_secrets, self.totp_secret.as_ref(), target_email)
+            .or_else(|| {
+                super::mailbox_needs::default_component(
+                    self,
+                    aterm_secrets::mailbox_component::Part::Totp,
+                )
+            })
     }
 
     /// A contested label cannot reenter through email-derived lookup candidates. Explicit
@@ -667,6 +696,12 @@ impl MailboxConfig {
         merge_credentials(&mut self.passwords, other.passwords);
         merge_credentials(&mut self.mailbox_passwords, other.mailbox_passwords);
         merge_credentials(&mut self.totp_secrets, other.totp_secrets);
+        for (component, value) in other.mailbox_components {
+            self.mailbox_components.entry(component).or_insert(value);
+        }
+        if self.mailbox_source_home.is_none() {
+            self.mailbox_source_home = other.mailbox_source_home;
+        }
         if self.seen_file.is_none() {
             self.seen_file = other.seen_file;
         }
@@ -1530,6 +1565,10 @@ fn mailbox_aliases(
             }
         }
     }
+    // A row the lab renamed keeps the secrets its old label names (`alab_roster::renames`).
+    for (cli, label, email) in super::alab_roster::legacy_labels() {
+        note(cli == super::accounts::Cli::Claude, &label, Some(&email));
+    }
     for path in claude_fleets {
         if let Ok(Some(text)) = super::accounts::read_bounded(path, 256 * 1024)
             && let Ok(fleet) = super::accounts_sync::FleetRoster::from_toml(&text, "fleet")
@@ -1670,7 +1709,7 @@ fn discover_mailbox_config_sources(
     cfg.contested_labels = contested_labels(&aliases);
     for path in toml_candidates {
         if path.is_file()
-            && let Ok(text) = std::fs::read_to_string(&path)
+            && let Some(text) = super::ai_pool::read_bounded_text(&path, 2 * 1024 * 1024)
             && let Some(parsed) = MailboxConfig::parse_toml(&text, home)
         {
             cfg.merge_from(parsed);
@@ -1913,6 +1952,7 @@ fn discover_mailbox_config_sources(
     if cfg.login_record.is_none() {
         cfg.login_record = store_dir.map(|s| s.join(super::mailbox_routes::LOGIN_RECORD_FILE));
     }
+    super::mailbox_needs::load_components(home, &mut cfg);
     (cfg, aliases)
 }
 
@@ -1998,7 +2038,7 @@ pub(super) fn mailbox_config_from_override(
         .extension()
         .and_then(OsStr::to_str)
         .is_some_and(|ext| ext.trim_end() == "toml")
-        && let Ok(text) = std::fs::read_to_string(&path)
+        && let Some(text) = super::ai_pool::read_bounded_text(&path, 2 * 1024 * 1024)
         && let Some(parsed) = MailboxConfig::parse_toml(&text, home)
     {
         cfg.merge_from(parsed);
@@ -3813,13 +3853,13 @@ fn record_seen_digest(seen_file: Option<&Path>, seen: &mut BTreeSet<String>, dig
     }
 }
 
-struct ParsedImapUrl {
-    tls: bool,
-    user: Option<String>,
-    password: Option<String>,
-    host: String,
-    port: u16,
-    mailbox: String,
+pub(super) struct ParsedImapUrl {
+    pub(super) tls: bool,
+    pub(super) user: Option<String>,
+    pub(super) password: Option<String>,
+    pub(super) host: String,
+    pub(super) port: u16,
+    pub(super) mailbox: String,
 }
 
 fn strip_ascii_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
@@ -3828,7 +3868,7 @@ fn strip_ascii_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
         .map(|_| &s[prefix.len()..])
 }
 
-fn parse_imap_url(url: &str) -> Option<ParsedImapUrl> {
+pub(super) fn parse_imap_url(url: &str) -> Option<ParsedImapUrl> {
     let trimmed = url.trim();
     let (tls, rest) = if let Some(r) = strip_ascii_prefix_ci(trimmed, "imaps://") {
         (true, r)
@@ -4415,7 +4455,11 @@ fn fetch_imap_credential(
         .or(cfg_pw.as_deref())
         .unwrap_or("");
     let source = super::mailbox_routes::login_source(&imap_url);
-    if password.is_empty() || !login_may_be_tried(cfg, &source, user, seen) {
+    if password.is_empty() {
+        super::mailbox_needs::record_missing_imap_password(cfg, target_email);
+        return None;
+    }
+    if !login_may_be_tried(cfg, &source, user, seen) {
         return None;
     }
     let mut login = ImapLogin::NotReached;
@@ -5172,7 +5216,7 @@ fn scan_maildir_once_by(
     for (mtime, len, path) in candidates {
         auth_budget_ready(deadline)?;
         let mut raw = String::new();
-        let Ok(file) = std::fs::File::open(&path) else {
+        let Ok((file, _)) = super::disk::versions::open_regular_file(&path) else {
             tried.insert((path.clone(), len, mtime));
             continue;
         };
@@ -5414,6 +5458,9 @@ fn network_poll_interval(cfg: &MailboxConfig, target_email: Option<&str>) -> Dur
     }
 }
 
+#[cfg(unix)]
+#[path = "headless_native_mail.rs"]
+mod native_mail;
 const MAILBOX_TIMEOUT: &str = "timed out waiting for verification email in mailbox";
 
 /// Poll `cfg` for either a magic link or a 6-digit OTP addressed to `target_email`.
@@ -5472,11 +5519,28 @@ fn poll_mailbox_config_by(
     if let Some(deadline) = deadline {
         deadline.remaining().map_err(|_| expiry_words)?;
     }
+    #[cfg(unix)]
+    let source_cfg = cfg;
     let cfg = &*cfg.routed_for(target_email);
     if let Some(why) = plaintext_credential_refusal(cfg, target_email) {
         return Err(why);
     }
     let has_relay = cfg.relay_enabled && target_email.is_some();
+    #[cfg(unix)]
+    if let Some(result) = native_mail::poll(
+        source_cfg,
+        target_email,
+        deadline,
+        once,
+        seen_otps,
+        expiry_words,
+    ) && (result.is_ok()
+        || !has_relay
+        || deadline.is_some_and(Deadline::expired)
+        || result == Err(expiry_words))
+    {
+        return result;
+    }
     let has_non_webmail = cfg.dir.is_some()
         || cfg.effective_imap_url(target_email).is_some()
         || cfg.http_url.is_some()
@@ -6371,10 +6435,10 @@ fn webmail_script(
     return {{ state: "loading", url: href }};
   }}
 
-  const mpwVal = {mpw_json} || pwVal;
+  const mpwVal = {mpw_json};
   if (mpwEl) {{
     if (!mpwVal) {{
-      return {{ state: "needs_password", url: href }};
+      return {{ state: "needs_mailbox_password", url: href }};
     }}
     if (!{mailbox_pw_submitted}) {{
       setNativeValue(mpwEl, mpwVal);
@@ -6633,14 +6697,32 @@ fn poll_webmail_until(
                 .unwrap_or("loading");
             match state {
                 "needs_password" => {
+                    super::mailbox_needs::record_observed_missing(
+                        cfg,
+                        target_email,
+                        aterm_secrets::mailbox_component::Part::Password,
+                    );
                     return Err(
                         "webmail sign-in requires a password in mailbox.toml or ai-mailbox.toml",
                     );
                 }
                 "needs_totp" => {
+                    super::mailbox_needs::record_observed_missing(
+                        cfg,
+                        target_email,
+                        aterm_secrets::mailbox_component::Part::Totp,
+                    );
                     return Err(
                         "webmail sign-in requires a TOTP 2FA secret in mailbox.toml or ai-mailbox.toml",
                     );
+                }
+                "needs_mailbox_password" => {
+                    super::mailbox_needs::record_observed_missing(
+                        cfg,
+                        target_email,
+                        aterm_secrets::mailbox_component::Part::SecondPassword,
+                    );
+                    return Err("webmail sign-in requires a second mailbox password");
                 }
                 "submitted_user" => {
                     user_submitted = true;
@@ -6771,13 +6853,43 @@ fn poll_mailbox_or_webmail_until(
     seen_otps: &mut BTreeSet<String>,
 ) -> Result<MailboxCredential, &'static str> {
     deadline.left()?;
+    #[cfg(unix)]
+    let source_cfg = cfg;
     let cfg = &*cfg.routed_for(target_email);
     if let Some(why) = plaintext_credential_refusal(cfg, target_email) {
         return Err(why);
     }
+    let has_relay = cfg.relay_enabled && target_email.is_some();
     let has_non_webmail = cfg.dir.is_some()
         || cfg.effective_imap_url(target_email).is_some()
-        || cfg.http_url.is_some();
+        || cfg.http_url.is_some()
+        || has_relay;
+    #[cfg(unix)]
+    if let Some(native_res) = native_mail::poll(
+        source_cfg,
+        target_email,
+        Some(deadline),
+        false,
+        seen_otps,
+        super::auth_deadline::EXPIRED,
+    ) {
+        match native_res {
+            Ok(credential) => {
+                deadline.left()?;
+                remember_flow_otp(&credential, target_email, seen_otps);
+                return Ok(credential);
+            }
+            Err(err)
+                if err != native_mail::BUSY
+                    && (!has_relay
+                        || deadline.expired()
+                        || err == super::auth_deadline::EXPIRED) =>
+            {
+                return Err(err);
+            }
+            Err(_) => {}
+        }
+    }
     let result = if cfg.effective_webmail_url(target_email).is_some() {
         let mut seen_digests = load_seen_digests(cfg.seen_file.as_deref());
         let mut tried_files = BTreeSet::new();
@@ -7046,6 +7158,30 @@ fn drive_cdp_oauth_until(
     target_email: Option<&str>,
     (deadline, poll_interval): (Deadline<'_>, Duration),
     bot_stall: Duration,
+    mailbox_credential: impl FnMut(
+        &mut CdpClient,
+        Option<&str>,
+    ) -> Result<MailboxCredential, &'static str>,
+    deliver_callback: impl FnMut(&str) -> Result<u16, &'static str>,
+) -> Result<(), &'static str> {
+    let flow = MailboxFlow::new(authorize_url)?;
+    drive_cdp_oauth_flow_until(
+        cdp,
+        (authorize_url, flow, None),
+        target_email,
+        (deadline, poll_interval),
+        bot_stall,
+        mailbox_credential,
+        deliver_callback,
+    )
+}
+
+fn drive_cdp_oauth_flow_until(
+    cdp: &mut CdpClient,
+    (authorize_url, flow, google_config): (&str, MailboxFlow, Option<&MailboxConfig>),
+    target_email: Option<&str>,
+    (deadline, poll_interval): (Deadline<'_>, Duration),
+    bot_stall: Duration,
     mut mailbox_credential: impl FnMut(
         &mut CdpClient,
         Option<&str>,
@@ -7053,7 +7189,6 @@ fn drive_cdp_oauth_until(
     mut deliver_callback: impl FnMut(&str) -> Result<u16, &'static str>,
 ) -> Result<(), &'static str> {
     let _ = take_met();
-    let flow = MailboxFlow::new(authorize_url)?;
     let email = target_email
         .filter(|e| !e.trim().is_empty())
         .map(str::to_owned)
@@ -7104,9 +7239,28 @@ fn drive_cdp_oauth_until(
         )
         .map_err(browser_control_failed)?;
 
+    let google = authorize_url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?");
+    let google_password = google_config
+        .and_then(|config| config.password_for(email.as_deref()))
+        .map(aterm_mail::Secret::new);
+    let google_totp = google_config
+        .and_then(|config| {
+            if let Some(route) = config.route_for(email.as_deref()) {
+                let login = route.login.trim();
+                route
+                    .totp_secret
+                    .filter(|s| !login.is_empty() && !s.trim().is_empty())
+            } else {
+                config.totp_secret_for(email.as_deref())
+            }
+        })
+        .map(aterm_mail::Secret::new);
+    let mut password_submitted = false;
     let mut email_submitted = false;
     let mut otp_code: Option<String> = None;
     let mut otp_submitted = false;
+    let mut code_is_authenticator = false;
+    let mut google_authenticator_attempted = false;
     let mut mailbox_polls = 0usize;
     let mut needs_mailbox_ticks = 0usize;
     const MAX_MAILBOX_POLLS: usize = 3;
@@ -7134,6 +7288,17 @@ fn drive_cdp_oauth_until(
                 email_submitted,
                 otp_submitted,
             );
+            let expr = if google {
+                google_mail_auth::step_js(
+                    &expr,
+                    email.as_deref(),
+                    google_password.as_ref().map(aterm_mail::Secret::expose),
+                    password_submitted,
+                    code_is_authenticator,
+                )
+            } else {
+                expr
+            };
             let within = oauth_time_left(deadline, &bot, last_host.as_deref())?;
             let eval = match cdp.call(
                 Some(&session),
@@ -7250,7 +7415,7 @@ fn drive_cdp_oauth_until(
                 "submitted_email" => {
                     email_submitted = true;
                     needs_mailbox_ticks = 0;
-                    if mailbox_polls == 0 {
+                    if mailbox_polls == 0 && !google {
                         mailbox_polls += 1;
                         match mailbox_credential(cdp, email.as_deref())? {
                             MailboxCredential::MagicLink(magic_url) => {
@@ -7273,9 +7438,42 @@ fn drive_cdp_oauth_until(
                         }
                     }
                 }
+                "google_needs_totp" if google => {
+                    if google_authenticator_attempted {
+                        return Err("Google did not accept the supplied authenticator code");
+                    }
+                    let Some(secret) = google_totp.as_ref() else {
+                        if let Some(config) = google_config {
+                            super::mailbox_needs::record_observed_missing(
+                                config,
+                                email.as_deref(),
+                                aterm_secrets::mailbox_component::Part::Totp,
+                            );
+                        }
+                        return Err("Google requires an unavailable authenticator code");
+                    };
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|_| "System time is unavailable for Google authentication")?
+                        .as_secs();
+                    otp_code = Some(
+                        generate_totp_at(secret.expose(), now)
+                            .ok_or("Stored Google authenticator configuration is invalid")?,
+                    );
+                    otp_submitted = false;
+                    code_is_authenticator = true;
+                    google_authenticator_attempted = true;
+                    continue;
+                }
                 "needs_mailbox" => {
-                    let should_poll = mailbox_polls == 0
-                        || (needs_mailbox_ticks >= 2 && mailbox_polls < MAX_MAILBOX_POLLS);
+                    let changed_channel = google && code_is_authenticator;
+                    if changed_channel {
+                        otp_code = None;
+                        otp_submitted = false;
+                        code_is_authenticator = false;
+                    }
+                    let should_poll = mailbox_polls < MAX_MAILBOX_POLLS
+                        && (changed_channel || mailbox_polls == 0 || needs_mailbox_ticks >= 2);
                     if should_poll {
                         mailbox_polls += 1;
                         needs_mailbox_ticks = 0;
@@ -7304,6 +7502,26 @@ fn drive_cdp_oauth_until(
                             let _ = deadline.pause(poll_interval);
                         }
                     }
+                }
+                "google_no_password" => {
+                    if let Some(config) = google_config {
+                        super::mailbox_needs::record_observed_missing(
+                            config,
+                            email.as_deref(),
+                            aterm_secrets::mailbox_component::Part::Password,
+                        );
+                    }
+                    return Err(
+                        "No stored password or signed-in profile is available for this Google account",
+                    );
+                }
+                "google_refused" => {
+                    return Err(
+                        "Google account authorization requires an unavailable verification step",
+                    );
+                }
+                "submitted_password" => {
+                    password_submitted = true;
                 }
                 "submitted_otp" => {
                     otp_submitted = true;
@@ -7351,6 +7569,98 @@ fn start_browser(
         note_met(MetWord::BrowserStart, None);
         "could not spawn headless browser"
     })
+}
+
+fn google_mail_flow(authorize_url: &str) -> Result<MailboxFlow, &'static str> {
+    if authorize_url.split('?').next() != Some("https://accounts.google.com/o/oauth2/v2/auth") {
+        return Err("Google mail authorization requires Google's desktop OAuth endpoint");
+    }
+    MailboxFlow::pinned(
+        authorize_url,
+        super::open_url::Pin::Hosts(&["accounts.google.com"]),
+    )
+}
+
+fn google_credentials_config(config: &MailboxConfig, account: &str) -> bool {
+    if !super::mail_recovery::accounts(config)
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(account))
+        || config
+            .webmail_user_for(Some(account))
+            .is_none_or(|login| !login.eq_ignore_ascii_case(account))
+    {
+        return false;
+    }
+    // Inspect the configured route before readiness filtering: an observed
+    // missing password still needs the registered source's identity.
+    let route = config.route_for(Some(account));
+    let (imap, webmail, http) = if let Some(route) = &route {
+        (&route.imap_url, &route.webmail_url, &route.http_url)
+    } else {
+        (&config.imap_url, &config.webmail_url, &config.http_url)
+    };
+    if http.is_some() {
+        return false;
+    }
+    if let Some(url) = imap {
+        let Some(endpoint) = parse_imap_url(url) else {
+            return false;
+        };
+        if !endpoint.tls
+            || !endpoint.host.eq_ignore_ascii_case("imap.gmail.com")
+            || endpoint
+                .user
+                .as_deref()
+                .is_some_and(|login| !login.eq_ignore_ascii_case(account))
+        {
+            return false;
+        }
+    }
+    if webmail.as_deref().is_some_and(|url| {
+        super::login_drive::https_host(url).as_deref() != Some("mail.google.com")
+    }) {
+        return false;
+    }
+    imap.is_some()
+        || webmail.is_some()
+        || account.rsplit_once('@').is_some_and(|(_, domain)| {
+            domain.eq_ignore_ascii_case("gmail.com")
+                || domain.eq_ignore_ascii_case("googlemail.com")
+        })
+}
+
+/// One Google mail enrollment; its pages stay on Google's account origin.
+pub fn authorize_google_mail(
+    authorize_url: &str,
+    store_dir: &Path,
+    mailbox_cfg: Option<&MailboxConfig>,
+    target_email: &str,
+    timeout: Duration,
+) -> Result<(), &'static str> {
+    let _flow = google_mail_flow(authorize_url)?;
+    let mailbox_cfg = mailbox_cfg.filter(|config| google_credentials_config(config, target_email));
+    #[cfg(unix)]
+    {
+        let clock = Instant::now;
+        let deadline = Deadline::new(timeout, &clock);
+        finish_deadline(
+            authorize_pinned_browser_until(
+                authorize_url,
+                Some(store_dir),
+                mailbox_cfg,
+                Some(target_email),
+                deadline,
+                None,
+                super::open_url::Pin::Hosts(&["accounts.google.com"]),
+            ),
+            deadline,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (store_dir, mailbox_cfg, target_email, timeout);
+        Err("headless Google authorization is supported on Unix hosts only")
+    }
 }
 
 /// Complete OAuth authorization headlessly over CDP pipes using `mailbox_cfg` when needed.
@@ -7405,12 +7715,33 @@ pub(super) fn authorize_with_headless_browser_until(
     mailbox_cfg: Option<&MailboxConfig>,
     target_email: Option<&str>,
     deadline: Deadline<'_>,
+    pending_credential: Option<MailboxCredential>,
+) -> Result<(), &'static str> {
+    authorize_pinned_browser_until(
+        authorize_url,
+        store_dir,
+        mailbox_cfg,
+        target_email,
+        deadline,
+        pending_credential,
+        super::open_url::CLAUDE_PIN,
+    )
+}
+
+#[cfg(unix)]
+fn authorize_pinned_browser_until(
+    authorize_url: &str,
+    store_dir: Option<&Path>,
+    mailbox_cfg: Option<&MailboxConfig>,
+    target_email: Option<&str>,
+    deadline: Deadline<'_>,
     mut pending_credential: Option<MailboxCredential>,
+    pin: super::open_url::Pin,
 ) -> Result<(), &'static str> {
     use std::os::fd::OwnedFd;
 
     let _ = take_met();
-    let _flow = MailboxFlow::new(authorize_url)?;
+    let flow = MailboxFlow::pinned(authorize_url, pin)?;
     deadline.left()?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let browser = browser_for_start(find_headless_browser(home.as_deref()))?;
@@ -7449,18 +7780,31 @@ pub(super) fn authorize_with_headless_browser_until(
             let mut seen_otps = BTreeSet::new();
 
             deadline.left()?;
-            drive_cdp_oauth_until(
+            drive_cdp_oauth_flow_until(
                 &mut cdp,
-                authorize_url,
+                (
+                    authorize_url,
+                    flow,
+                    (pin == super::open_url::Pin::Hosts(&["accounts.google.com"]))
+                        .then_some(mailbox_cfg)
+                        .flatten(),
+                ),
                 email.as_deref(),
                 (deadline, Duration::from_millis(200)),
                 VENDOR_STALL,
                 |cdp_inner, em| {
-                    let mb = mailbox_cfg.filter(|c| c.is_configured_for(em)).ok_or(
-                        mailbox_cfg.and_then(|c| c.unready_words(em)).unwrap_or(
+                    let Some(mb) = mailbox_cfg.filter(|c| c.is_configured_for(em)) else {
+                        if let Some(cfg) = mailbox_cfg {
+                            super::mailbox_needs::record_observed_missing(
+                                cfg,
+                                em,
+                                aterm_secrets::mailbox_component::Part::Password,
+                            );
+                        }
+                        return Err(mailbox_cfg.and_then(|c| c.unready_words(em)).unwrap_or(
                             "headless browser requires sign-in, but no mailbox is configured",
-                        ),
-                    )?;
+                        ));
+                    };
                     poll_mailbox_or_pending_credential_until(
                         &mut pending_credential,
                         cdp_inner,
@@ -9047,6 +9391,9 @@ pub struct VendorApprover {
     pub sign_in_once: Option<String>,
     /// The mailbox, where one is configured for the row.
     pub mailbox: Option<MailboxConfig>,
+    /// Retain an unready source so an observed email-code step can record its
+    /// exact missing component instead of guessing the AI account's label.
+    pub mailbox_source: Option<MailboxConfig>,
     /// Where none is because the row's `[[mailboxes]]` entry has no password yet, its words
     /// ([`MailboxConfig::unready_words`]), said instead of "no mailbox is configured".
     pub mailbox_unready: Option<&'static str>,
@@ -9079,6 +9426,7 @@ impl VendorApprover {
             shared_dir: shared_dir.to_owned(),
             label_key: vendor_label_key(cli, label),
             sign_in_once: None,
+            mailbox_source: Some(mailbox.clone()),
             mailbox: Some(mailbox),
             mailbox_unready: None,
             mailbox_unready_login: None,
@@ -9114,6 +9462,7 @@ impl VendorApprover {
             .and_then(|cfg| cfg.route_for(email))
             .filter(|route| !route.ready())
             .map(|route| route.masked());
+        let mailbox_source = found.clone();
         let mailbox = found.filter(|cfg| cfg.is_configured_for(email));
         VendorApprover {
             shared_dir: shared_dir.to_path_buf(),
@@ -9122,6 +9471,7 @@ impl VendorApprover {
                 .renews_headlessly()
                 .then(|| format!("aterm harness accounts browser {label} --cli {}", cli.id())),
             mailbox,
+            mailbox_source,
             mailbox_unready,
             mailbox_unready_login,
             senders,
@@ -9148,8 +9498,6 @@ impl super::login_drive::Approver for VendorApprover {
         handoff: &super::login_drive::Handoff<'_>,
     ) -> super::login_drive::Approval {
         use super::login_drive::Approval;
-        use aterm_uds::spawnfd::spawn_with_two_fds;
-        use std::os::fd::OwnedFd;
         let bound = match FlowBound::of(handoff.url) {
             Ok(bound) => bound,
             Err(why) => return Approval::Refused(why.to_owned()),
@@ -9162,16 +9510,53 @@ impl super::login_drive::Approver for VendorApprover {
         let _claimed = match super::browser_window::ProfileLock::claim(&profile_dir) {
             Ok(claimed) => claimed,
             Err(why) => {
-                return Approval::NeedsYou(format!(
-                    "the row's browser profile is {}",
-                    why.words(&profile_dir)
-                ));
+                let message = format!("the row's browser profile is {}", why.words(&profile_dir));
+                return match why {
+                    super::browser_window::Refusal::Held(
+                        super::browser_window::Holder::Browser(_)
+                        | super::browser_window::Holder::Elsewhere { .. },
+                    ) => Approval::NeedsYou(message),
+                    super::browser_window::Refusal::Held(super::browser_window::Holder::Aterm(
+                        _,
+                    ))
+                    | super::browser_window::Refusal::Unlockable(_) => Approval::NotRun(message),
+                };
             }
         };
-        let Some(browser) = find_headless_browser(self.home.as_deref()) else {
-            return Approval::NeedsYou("no headless browser is installed here".to_owned());
+        let browser = match super::headless_fetch::ensure_headless_browser(
+            self.home.as_deref(),
+            &mut super::headless_fetch::Curl,
+            &|| (handoff.finished)() || Instant::now() >= handoff.deadline,
+        ) {
+            Ok(browser) => browser,
+            Err(why) => {
+                return Approval::NotRun(format!("headless browser preparation stopped: {why}"));
+            }
         };
-        let mut outcome = Approval::NeedsYou("the headless browser did not run".to_owned());
+        self.approve_in_profile(handoff, &bound, &profile_dir, &browser)
+    }
+
+    #[cfg(not(unix))]
+    fn approve(&mut self, _: &super::login_drive::Handoff<'_>) -> super::login_drive::Approval {
+        super::login_drive::Approval::NotRun(
+            "the headless sign-in runs on Unix hosts only".to_owned(),
+        )
+    }
+}
+
+impl VendorApprover {
+    #[cfg(unix)]
+    fn approve_in_profile(
+        &self,
+        handoff: &super::login_drive::Handoff<'_>,
+        bound: &FlowBound,
+        profile_dir: &Path,
+        browser: &HeadlessBrowser,
+    ) -> super::login_drive::Approval {
+        use super::login_drive::Approval;
+        use aterm_uds::spawnfd::spawn_with_two_fds;
+        use std::os::fd::OwnedFd;
+        let mut outcome = Approval::NotRun("the headless browser did not run".to_owned());
         let started = aterm_time::unix_secs().and_then(|t| i64::try_from(t).ok());
         let mailbox = self.mailbox.clone().map(|mut cfg| {
             cfg.since = started;
@@ -9183,13 +9568,15 @@ impl super::login_drive::Approver for VendorApprover {
             .unwrap_or("the page asks for the sign-in mail, and no mailbox is configured");
         let sign_in_once = self.sign_in_once.as_deref();
         let types_email = self.types_email;
-        let ran = in_profile(&profile_dir, |profile_dir| {
+        let mailbox_source = self.mailbox_source.as_ref();
+        let home = self.home.as_deref();
+        let ran = in_profile(profile_dir, |profile_dir| {
             let (cmd_read, cmd_write) =
                 std::io::pipe().map_err(|_| "could not open CDP command pipe")?;
             let (out_read, out_write) =
                 std::io::pipe().map_err(|_| "could not open CDP event pipe")?;
             let cmd =
-                headless_browser_command(&browser, profile_dir, &|name| std::env::var_os(name));
+                headless_browser_command(browser, profile_dir, &|name| std::env::var_os(name));
             let child = spawn_with_two_fds(cmd, OwnedFd::from(cmd_read), OwnedFd::from(out_write))
                 .map_err(|_| "could not spawn headless browser")?;
             let _guard = BrowserChild::new(child);
@@ -9216,7 +9603,7 @@ impl super::login_drive::Approver for VendorApprover {
                 filled_code: false,
                 filled_email: false,
                 filled_otp: false,
-                bound: Some(&bound),
+                bound: Some(bound),
                 sign_in_once,
                 types_email,
             };
@@ -9227,7 +9614,17 @@ impl super::login_drive::Approver for VendorApprover {
                 handoff.finished,
                 handoff.deadline,
                 |cdp_inner, em| {
-                    let mb = mailbox.as_ref().ok_or(no_mailbox)?;
+                    let Some(mb) = mailbox.as_ref() else {
+                        if let (Some(home), Some(source)) = (home, mailbox_source) {
+                            super::mailbox_needs::record_missing_for_target(
+                                home,
+                                source,
+                                em,
+                                aterm_secrets::mailbox_component::Part::Password,
+                            );
+                        }
+                        return Err(no_mailbox);
+                    };
                     poll_mailbox_or_webmail_for_credential(
                         cdp_inner,
                         mb,
@@ -9242,15 +9639,8 @@ impl super::login_drive::Approver for VendorApprover {
         });
         match ran {
             Ok(()) => outcome,
-            Err(why) => Approval::NeedsYou(why.to_owned()),
+            Err(why) => Approval::NotRun(why.to_owned()),
         }
-    }
-
-    #[cfg(not(unix))]
-    fn approve(&mut self, _: &super::login_drive::Handoff<'_>) -> super::login_drive::Approval {
-        super::login_drive::Approval::NeedsYou(
-            "the headless sign-in runs on Unix hosts only".to_owned(),
-        )
     }
 }
 

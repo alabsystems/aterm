@@ -1,10 +1,10 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# atpkg-keys: spec recovery from its 105 unit tests
+# atpkg-keys: spec recovery from its 108 unit tests
 
 > Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 3 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts updated 2026-10-29 to
+> deleted are gone, and the spec rows no longer cite those tests. Counts updated 2026-11-03 to
 > match the live test and spec tables.
 
 > Status 2026-10-16: this is the crate's migration worklist. Each spec below is proved
@@ -12,14 +12,14 @@
 > deleted. Every test maps to a spec (§4). Nothing
 > has been deleted yet.
 
-Source: `crates/atpkg-keys` (read only). I read every `#[test]` in src/{lib 4, fsio 6, master 13,
-pins_edit 14, provision 30, roster_ops 9} and tests/{owner_to_client 8, paper_master_to_client 2,
-provision_cli 14, roster_redo_model 5} (= 105), plus the code each one reaches, including the parts
+Source: `crates/atpkg-keys` (read only). I read every `#[test]` in src/{lib 5, fsio 6, master 14,
+pins_edit 14, provision 31, roster_ops 9} and tests/{owner_to_client 8, paper_master_to_client 2,
+provision_cli 14, roster_redo_model 5} (= 108), plus the code each one reaches, including the parts
 of `src/main.rs` that the CLI tests drive (`vet_args`, `flag`, `provision`, `confirm_transcription`,
 `machine_revoke`). `tests/keys_suite.rs` has no test; its module doc mentions the literal `#[test]`,
-which is why a raw grep counts 106.
+which is why a raw grep counts 109.
 
-Result: **44 specs**, covering **105 tests**. **0 tests are non-spec samples** (§4). Three of the
+Result: **44 specs**, covering **108 tests**. **0 tests are non-spec samples** (§4). Three of the
 specs (`client-*`) are properties of `atpkg` and `aterm-update-core` that this crate's integration
 tests happen to sample. They are recorded here so the tests are accounted for, and they should
 move to those crates' `SPECS.md` (§5.12).
@@ -296,7 +296,7 @@ Dependencies: `master-seed-decode`, `master-base32-roundtrip` (pure core), `scru
 `provision-write-rest-order` → the composites (`provision-setup-join-e2e`, `owner-client-roundtrip`) →
 `render-report-contract`, `cli-*` → `master-secret-noninterference`.
 
-- 105 tests read. Every test maps to one of the 44 specs (0 non-spec samples left, §4).
+- 108 tests read. Every test maps to one of the 44 specs (0 non-spec samples left, §4).
 - The biggest collapses: `anchor-append-contract` (9 primary), `roster-redo-refines-model` (9),
   `provision-preflight-table` (9), `roster-add-contract` (7), `master-parse-contract` and
   `client-install-accepts-iff-authorized` (6 each).
@@ -314,6 +314,8 @@ None left: `provision::a_broken_signature_target_leaves_the_roster_document_unch
 `lock_roster` + `publish_roster_locked` (`RosterLock::assert_snapshot` refusing an unreadable or
 unexpected `.sig` directory without committing a redo marker), and the test-only `publish_roster`
 wrapper has been deleted.
+
+## 5. Implied specs that look wrong, or disagree with the code
 
 The numbers are the ones the rows cite.
 

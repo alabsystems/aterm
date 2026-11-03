@@ -633,3 +633,23 @@ fn a_survey_lists_what_the_roots_hold_that_may_go_largest_first_and_removes_noth
         assert!(kept.exists(), "{} stays", kept.display());
     }
 }
+
+/// WHAT A WORKER REMOVED IS ITS OWN ROWS' BYTES: another session's rows, a refusal and an intent
+/// count for nothing, so the figure can differ from the volume's rise.
+#[test]
+fn removed_by_adds_a_sessions_own_removals() {
+    let at = |sid: &str, action: &str, bytes: Option<u64>| {
+        row(1, sid, Path::new("/c/x"), action, bytes, "words")
+    };
+    let rows = vec![
+        at("s-a", "removing", Some(1000)),
+        at("s-a", "removed", Some(10)),
+        at("s-a", "failed", Some(5)),
+        at("s-a", "refused", Some(70)),
+        at("s-b", "removed", Some(100)),
+        "not a row".to_string(),
+    ];
+    assert_eq!(removed_by(&rows, "s-a"), 15);
+    assert_eq!(removed_by(&rows, "s-b"), 100);
+    assert_eq!(removed_by(&rows, "s-c"), 0);
+}

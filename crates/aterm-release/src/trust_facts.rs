@@ -3858,14 +3858,14 @@ impl Plan {
         peaks: &BTreeMap<String, (u64, String)>,
     ) -> std::result::Result<(String, Vec<(String, String)>), String> {
         let shown = self.memory.display().to_string();
-        let text = fs::read_to_string(&self.memory)
+        let text = crate::durable::read_text(&self.memory)
             .map_err(|_| format!("memory record {shown} is missing"))?;
         let record = parse_memory(&text, &shown)?;
-        let ratchet = fs::read_to_string(&self.ratchet).ok();
+        let ratchet = crate::durable::read_text(&self.ratchet).ok();
         let obs = self
             .host_obs
             .as_ref()
-            .and_then(|p| fs::read_to_string(p).ok())
+            .and_then(|p| crate::durable::read_text(p).ok())
             .map(|t| parse_host_obs(&t))
             .unwrap_or_default();
         let driver_row = self.facts.driver_row();
@@ -3928,7 +3928,7 @@ impl Plan {
     /// and obligation record ([`crate::trust_oblig::RECORD_SUFFIX`]) beside it into `self.crates`.
     pub fn measure(&mut self) {
         let read = |p: PathBuf| {
-            fs::read_to_string(p)
+            crate::durable::read_text(&p)
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default()
         };
@@ -3941,9 +3941,9 @@ impl Plan {
                     .get(&c.name)
                     .map_or(c.name.as_str(), String::as_str);
                 let log = self.logdir.join(format!("{spec}.log"));
-                let rc = fs::read_to_string(self.logdir.join(format!("{spec}.log.rc")))
+                let rc = crate::durable::read_text(&self.logdir.join(format!("{spec}.log.rc")))
                     .map_or_else(|_| "?".to_string(), |s| s.trim().to_string());
-                *m = match fs::File::open(&log) {
+                *m = match crate::durable::open_regular_file(&log) {
                     Ok(f) => Measured::of_log(BufReader::new(f), &rc),
                     Err(_) => Measured {
                         rc,
@@ -3969,8 +3969,9 @@ impl Plan {
                 m.pace = Pace::parse(&read(self.logdir.join(format!("{spec}.log.pace"))));
                 m.trustd_lost =
                     one_line(&read(self.logdir.join(format!("{spec}.log.trustd-lost"))));
-                m.backstops = fs::read_to_string(
-                    self.logdir
+                m.backstops = crate::durable::read_text(
+                    &self
+                        .logdir
                         .join(format!("{spec}.log{}", crate::trust_oblig::RECORD_SUFFIX)),
                 )
                 .ok()
@@ -4044,7 +4045,9 @@ fn dep_info_check(target_root: &Path, lane: &LaneEnv) -> std::result::Result<(),
             if ft.is_dir() {
                 stack.push(p);
             } else if ft.is_file() && p.extension().is_some_and(|x| x == "d") {
-                let Ok(text) = fs::read(&p) else { continue };
+                let Ok(text) = crate::durable::read_file(&p) else {
+                    continue;
+                };
                 for floors in [RATCHET, MEMORY, BACKSTOPS] {
                     let file = floors.rsplit('/').next().unwrap_or(floors).as_bytes();
                     if text.windows(file.len()).any(|w| w == file) {
@@ -4071,7 +4074,7 @@ fn dep_info_check(target_root: &Path, lane: &LaneEnv) -> std::result::Result<(),
                     .and_then(Path::file_name)
                     .is_some_and(|n| n == "build")
             {
-                let Ok(text) = fs::read_to_string(&p) else {
+                let Ok(text) = crate::durable::read_text(&p) else {
                     continue;
                 };
                 for line in text.lines() {
@@ -4383,7 +4386,7 @@ pub fn conclude(
                 .map(|f| f.store.clone())
                 .unwrap_or_default();
             let stored = store.join(format!("{FACTS_PREFIX}{}", prov.key));
-            let base = fs::read_to_string(&stored)
+            let base = crate::durable::read_text(&stored)
                 .ok()
                 .and_then(|t| Facts::parse(&t));
             match base.map(|b| remeasured(&b, &facts)) {
@@ -4401,9 +4404,9 @@ pub fn conclude(
             }
         }
     }
-    let ratchet_text = fs::read_to_string(&plan.ratchet).ok();
+    let ratchet_text = crate::durable::read_text(&plan.ratchet).ok();
     let backstops_path = backstops_beside(&plan.ratchet);
-    let backstops_text = fs::read_to_string(&backstops_path).ok();
+    let backstops_text = crate::durable::read_text(&backstops_path).ok();
     let mut verdict = judge(
         &facts,
         ratchet_text.as_deref(),
@@ -4426,7 +4429,7 @@ pub fn conclude(
     .map_err(Error::new)?;
     let mut said: Vec<String> = Vec::new();
     if !verdict.memory_rows.is_empty() {
-        let written = fs::read_to_string(&plan.memory)
+        let written = crate::durable::read_text(&plan.memory)
             .map(|t| memory_rewritten(&t, &verdict.memory_rows))
             .map_err(|e| e.to_string())
             .and_then(|t| write_floor_files(&[(&plan.memory, Some(&t))]));
@@ -4511,7 +4514,7 @@ fn write_host_obs(path: &Path, plan: &Plan, verdict: &Verdict) -> std::io::Resul
             ))
         })
         .collect();
-    let old = fs::read_to_string(path).ok();
+    let old = crate::durable::read_text(path).ok();
     if set.is_empty() && old.is_none() {
         return Ok(());
     }
@@ -4673,7 +4676,7 @@ fn records_about(receipts: &Path, tsr: &str) -> Vec<(String, Facts)> {
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
             name.starts_with(FACTS_PREFIX).then_some(())?;
-            let facts = Facts::parse(&fs::read_to_string(e.path()).ok()?)?;
+            let facts = Facts::parse(&crate::durable::read_text(&e.path()).ok()?)?;
             (facts.provenance.as_ref()?.tree_sans_floors == tsr).then_some((name, facts))
         })
         .collect();
@@ -4701,7 +4704,7 @@ pub fn facts_for(
     let key = facts_key(&tsr, &id, LANE_WHOLE_TREE);
     let name = format!("{FACTS_PREFIX}{key}");
     let shown = format!("{FACTS_PREFIX}{}", short(&key));
-    let Ok(text) = fs::read_to_string(receipts.join(&name)) else {
+    let Ok(text) = crate::durable::read_text(&receipts.join(&name)) else {
         let others = records_about(receipts, &tsr);
         let mut why = format!(
             "no whole-tree Trust facts for its tree (every file but {RATCHET}, {MEMORY}, {COSTS} and {BACKSTOPS}) from the requested prover ({}, identity {}) (`{shown}`)",
@@ -4903,9 +4906,9 @@ pub fn run_cmd(repo: &Path, cmd: TrustCmd) -> i32 {
                 }
             };
             let path = repo.join(RATCHET);
-            let text = fs::read_to_string(&path).ok();
+            let text = crate::durable::read_text(&path).ok();
             let backstops_path = repo.join(BACKSTOPS);
-            let backstops = fs::read_to_string(&backstops_path).ok();
+            let backstops = crate::durable::read_text(&backstops_path).ok();
             let verdict = judge(
                 &facts,
                 text.as_deref(),
@@ -4954,7 +4957,7 @@ pub fn run_cmd(repo: &Path, cmd: TrustCmd) -> i32 {
             }
             if !verdict.memory_rows.is_empty() {
                 let mem = repo.join(MEMORY);
-                let written = fs::read_to_string(&mem)
+                let written = crate::durable::read_text(&mem)
                     .map(|t| memory_rewritten(&t, &verdict.memory_rows))
                     .map_err(|e| format!("could not write {}: {e}", mem.display()))
                     .and_then(|t| write_floor_files(&[(&mem, Some(&t))]));

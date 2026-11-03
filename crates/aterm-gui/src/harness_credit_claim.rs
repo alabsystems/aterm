@@ -537,8 +537,9 @@ impl crate::App {
                             "harness @{from}: credit claim {}: worker runs as @{sid}",
                             offer.id.word()
                         );
+                        let spot = app.upgrade_spot(&sid);
                         app.except(&crate::message_reporters::credit_claim_started_entry(
-                            &offer, &sid,
+                            &offer, &sid, &spot,
                         ));
                     }
                     Err(why) => {
@@ -799,17 +800,23 @@ pub(crate) fn note_term(
 
 /// Marks session `local`'s task `exited`, its claim worker's program gone, if its record is still
 /// `read`: as the harness's own exit mark does (`aterm_agent::supervise::mark_task_exited`), a
-/// landed task keeps its result, and the mark takes down the attention a deadline raised for the
-/// worker (the held or startup ask), which a program that ended no longer owes. It waits on no
-/// update's fence (`Err` until a later look). `Ok(None)` when the record moved since it was read.
+/// concluded task (landed, or failed with its reply) keeps its result, and the mark takes down the
+/// attention a deadline raised for the worker (the held or startup ask), which a program that
+/// ended no longer owes. It runs once the claim's time is up, so a task still open ends `why=` its
+/// stall's reason where it never got going (signed out, never started, held), else `expired`, and
+/// the claim's one report says which. It waits on no update's fence (`Err` until a later look).
+/// `Ok(None)` when the record moved since it was read.
 fn mark_ended(
     ctx: &crate::SessionCtx,
     local: u64,
     read: &TaskRecord,
 ) -> Result<Option<crate::task_record::MarkedWith>, crate::task_record::MarkFenced> {
     let mut mark = crate::task_record::TaskMark::new(TaskState::Exited);
-    mark.why = Some("exit");
-    if read.state == TaskState::Done && read.result_path.is_some() {
+    mark.why = Some(match (read.state, read.why) {
+        (TaskState::Stalled, Some(why)) => why,
+        _ => crate::task_record::WHY_EXPIRED,
+    });
+    if matches!(read.state, TaskState::Done | TaskState::Failed) && read.result_path.is_some() {
         mark.result_bytes = read.result_bytes;
         mark.result_path.clone_from(&read.result_path);
     }

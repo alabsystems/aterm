@@ -201,11 +201,13 @@ pub fn proven_pid(status: &str) -> Option<u32> {
         return None;
     }
     let holder = status_field(status, "supervisor")?;
-    holder
+    let pid = holder
         .strip_prefix("codex-alab%40")
-        .or_else(|| holder.strip_prefix("codex-alab@"))?
-        .parse()
-        .ok()
+        .or_else(|| holder.strip_prefix("codex-alab@"))?;
+    if pid.starts_with('0') {
+        return None;
+    }
+    crate::parse_uint::<u32>(pid).filter(|&p| p > 1)
 }
 
 /// Whether `id` is a canonical 8-4-4-4-12 lowercase/uppercase hex UUID.

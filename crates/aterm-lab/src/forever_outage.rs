@@ -20,8 +20,8 @@
 //!   - every act typed while the outage stood a try ([`RULE_OUTAGE_RESUME`]), each its one line
 //!     ([`line`](fn@line)) or, as Land's first, the instruction never given before it (12a's
 //!     rule), each on its rung counted from its own wall: the wait on the outage journaled where
-//!     the outage met the agent again names the rung as its due, and the try comes at it
-//!     ([`try_faults`]);
+//!     the outage met the agent again names the rung as its due, and the try comes at it, or at
+//!     the due of a settle on the Mac's wake journaled on time ([`try_faults`], [`latest_ms`]);
 //!   - nothing else typed into it, nothing escalated, needed or landed while it stood, and
 //!     nothing held while it stood or on the resume's answer;
 //!   - `aterm ctl status` saying `waiting=overload` while it stood, and no longer once the agent
@@ -402,10 +402,42 @@ pub(super) fn late_ms(rung: i64) -> i64 {
     (rung / 2).min(PERSISTENCE_GRACE_MS)
 }
 
+/// The longest a settle on the Mac's wake puts an act off: the loop's 30 s settle and the session's
+/// share of it, under a minute more. A wait naming a due further off is no settle.
+const WAKE_SETTLE_AT_MOST_MS: i64 = 90_000;
+
+/// Whether `line` is the wait the loop places for a settle on the Mac's wake.
+fn is_wake_settle(line: &str) -> bool {
+    line.starts_with("WAITING ")
+        && line
+            .split_once(" until=")
+            .and_then(|(_, rest)| rest.split_once(' '))
+            .is_some_and(|(_, why)| why.starts_with("the Mac woke"))
+}
+
+/// The latest a try on `rung` from `wall` may come, at `t`: [`late_ms`] past its rung. On a Mac kept
+/// running with its lid closed the loop's first decision can wait out one settle (design
+/// §14.17.5.5), so the try's first settle, journaled by then and no longer than a settle, moves that
+/// to [`late_ms`] past its own due. A settle decided late or longer than that moves nothing, and a
+/// second moves nothing more: a loop that re-arms at each decision is the limit that section names,
+/// and this lab says so. The due is stamped on the awake clock, so a Mac asleep a fifth of a settle
+/// or more can still read late here.
+fn latest_ms(seen: &Seen, wall: i64, t: i64, rung: i64) -> i64 {
+    let grace = late_ms(rung);
+    let latest = wall + rung + grace;
+    seen.journal
+        .iter()
+        .find(|(at, l)| *at > wall && *at < t && is_wake_settle(l))
+        .and_then(|(at, l)| {
+            wait_due(l).filter(|due| *at <= latest && due - *at <= WAKE_SETTLE_AT_MOST_MS)
+        })
+        .map_or(latest, |due| latest.max(due + grace))
+}
+
 /// What is wrong with try `a`, the `n`th, the try before it at `prev` (the outage's meeting, for
 /// the first): its words ([`wrong_words`], `owed` as it takes it); no wait on the outage journaled
 /// between, at the try's own wall; that wait's due off its rung from the wall by more than the
-/// ladder's slack; the try before its rung from the wall, or [`late_ms`] past it; no ledger row.
+/// ladder's slack; the try before its rung from the wall, or past [`latest_ms`]; no ledger row.
 /// The wall is where the loop read the outage meeting the agent again: the first point read after
 /// `prev`, or the wait it decided once the act's take window was over, whichever the due counts
 /// from (the loop starts an outage met by the mode's own act at its first reading, and moves a
@@ -445,7 +477,7 @@ fn try_faults(
             let past = a.at - wall;
             let when = if past < rung - DUE_SLACK_MS {
                 Some("BEFORE ITS RUNG")
-            } else if past > rung + late_ms(rung) {
+            } else if a.at > latest_ms(seen, wall, a.at, rung) {
                 Some("LATE")
             } else {
                 None

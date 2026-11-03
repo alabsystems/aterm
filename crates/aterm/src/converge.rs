@@ -464,7 +464,10 @@ const EARLIER_KEPT: usize = 8;
 /// What `record` says aterm wrote into each key, in [`MACHINE_KEYS`] order: its last write
 /// first, then the earlier ones newest first; `None` where there is no record.
 fn read_history(record: &Path) -> Result<Option<[Vec<String>; 2]>, String> {
-    let text = match std::fs::read_to_string(record) {
+    let text = match aterm_uds::atomic_file::read_regular_text(
+        record,
+        aterm_uds::atomic_file::MAX_CONFIG_BYTES,
+    ) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{}: {e}", record.display())),
@@ -552,7 +555,9 @@ fn record_written(
 /// kept from before it ([`EARLIER`]) go, so only that write reads as aterm's.
 fn confirm_written(record: &Path, keys: &[&str]) -> Result<(), String> {
     use aterm_toml::edit::{DocumentMut, Item};
-    let text = std::fs::read_to_string(record).map_err(|e| format!("{}: {e}", record.display()))?;
+    let text =
+        aterm_uds::atomic_file::read_regular_text(record, aterm_uds::atomic_file::MAX_CONFIG_BYTES)
+            .map_err(|e| format!("{}: {e}", record.display()))?;
     let mut doc: DocumentMut = text
         .parse()
         .map_err(|e| format!("{} is not valid TOML: {e}", record.display()))?;
@@ -803,7 +808,10 @@ fn write_identity_after_read(
     // The record first: a pass cut off between the two writes leaves a key aterm's record
     // names, never aterm's own write read as the person's. A write that does not land puts the
     // record back.
-    let before = std::fs::read(record).ok();
+    let before =
+        aterm_uds::atomic_file::read_regular(record, aterm_uds::atomic_file::MAX_CONFIG_BYTES)
+            .ok()
+            .map(|(b, _)| b);
     let now = read_identity_snapshot(&config)?.machines;
     record_written(record, &keys, &target, &now).map_err(|why| {
         format!("could not record what aterm writes, so aterm.toml is left as it was: {why}")
@@ -1128,7 +1136,12 @@ impl Ports for Live {
             FleetCheck::Idle(sync) => FleetRead::Idle(sync.report()),
             FleetCheck::Current => FleetRead::Current(FleetSync::Current.report()),
             FleetCheck::Due(why) => FleetRead::Due(why),
+            FleetCheck::Blocked(why) => FleetRead::Blocked(why),
         })
+    }
+
+    fn holds_fleet_key(&self) -> bool {
+        aterm_types::dirs::state_dir().is_none_or(|state| aterm_net::fleet::holds_fleet_key(&state))
     }
 
     fn sync_fleet(&self) -> Result<FleetDone, String> {

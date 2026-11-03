@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use aterm_json::{Map, Value};
 
 use super::agy_quota::{self, Quota, Standing};
+use super::provider_read;
 
 /// How long a reading stays current while every pool is open.
 pub const FRESH_OPEN_S: i64 = 15 * 60;
@@ -83,6 +84,21 @@ impl Reading {
             .filter(|b| !b.disabled && b.remaining.is_some_and(|f| f + f64::EPSILON < 1.0))
             .filter_map(agy_quota::Bucket::reset_at)
             .any(|at| self.as_of < at && now >= at)
+    }
+
+    /// Whether a refill this reading records has arrived, or finished settling, since `since`
+    /// (`self.as_of` or a later wall-read attempt): true once per refill or settle point.
+    fn refill_arrived_since(&self, since: i64, now: i64) -> bool {
+        self.quota
+            .groups
+            .iter()
+            .flat_map(|g| g.buckets.iter())
+            .filter(|b| !b.disabled && b.remaining.is_some_and(|f| f + f64::EPSILON < 1.0))
+            .filter_map(agy_quota::Bucket::reset_at)
+            .any(|at| {
+                let settled = at.saturating_add(RESET_SETTLE_S);
+                (since < at && now >= at) || (since < settled && now >= settled)
+            })
     }
 
     /// `self.quota` projected for a stale reading at `now`: each active non-full bucket whose
@@ -224,7 +240,7 @@ impl Store {
         (now >= at && now.saturating_sub(at) < FAIL_BACKOFF_S).then(|| (at, why.to_owned()))
     }
 
-    fn note_failure(&self, why: &str, now: i64) {
+    pub(super) fn note_failure(&self, why: &str, now: i64) {
         if std::fs::create_dir_all(&self.dir).is_ok() {
             let one_line = why.replace(['\r', '\n'], " ");
             let _ = super::upgrade_models::write_atomic(
@@ -232,6 +248,33 @@ impl Store {
                 &format!("{now} {one_line}\n"),
             );
         }
+    }
+
+    fn wall_read_path(&self) -> PathBuf {
+        self.dir.join(format!("{}.wall", self.key))
+    }
+
+    fn note_wall_read(&self, now: i64) {
+        if std::fs::create_dir_all(&self.dir).is_ok() {
+            let _ =
+                super::upgrade_models::write_atomic(&self.wall_read_path(), &format!("{now}\n"));
+        }
+    }
+
+    /// Whether a wall already had its read: one was attempted under [`WALL_READ_SPENT_S`] ago,
+    /// no newer reading superseded it, and `kept` names no refill that arrived since `at`. A
+    /// wall's later looks then decide on what is kept instead of asking agy again.
+    fn wall_read_spent(&self, kept: Option<&Reading>, now: i64) -> bool {
+        let Some(at) = super::accounts::read_bounded(&self.wall_read_path(), 64)
+            .ok()
+            .flatten()
+            .and_then(|text| text.trim().parse::<i64>().ok())
+        else {
+            return false;
+        };
+        now >= at
+            && now.saturating_sub(at) < WALL_READ_SPENT_S
+            && kept.is_none_or(|r| r.as_of <= at && !r.refill_arrived_since(at, now))
     }
 
     fn lock_path(&self) -> PathBuf {
@@ -572,7 +615,8 @@ impl Got {
 }
 
 /// The current reading for `store`: the kept one while fresh (unless `force`), else one read
-/// from `source` under the read lock and kept; a failed read falls back to the stale reading.
+/// from `source` under the read lock and kept, reported as `why` ([`provider_read::note`]); a
+/// failed read falls back to the stale reading.
 ///
 /// # Errors
 ///
@@ -583,6 +627,7 @@ pub fn current(
     now: i64,
     low: f64,
     force: bool,
+    why: provider_read::InUse,
 ) -> Result<(Reading, Got), String> {
     let kept = store.last();
     if let Some(r) = kept.as_ref().filter(|r| !force && r.fresh(now, low)) {
@@ -598,6 +643,13 @@ pub fn current(
             "another reader is asking agy now, and nothing was kept yet".to_owned()
         });
     };
+    provider_read::note(&provider_read::ProbeEvent {
+        at: now,
+        read: provider_read::Read::AgyUsage,
+        account: None,
+        login: None,
+        why,
+    });
     let read = source.read().and_then(|doc| {
         agy_quota::parse(&doc).map(|quota| Reading {
             as_of: now,
@@ -623,6 +675,11 @@ pub fn current(
 /// `agy -p /usage` read ([`rotate_launch_at`]), bounding wall-triggered reads to at most one per
 /// 30 seconds.
 pub const WALL_FORCE_FLOOR_S: i64 = 30;
+
+/// How long a wall's read serves every later look at a wall on the same home, unless a refill
+/// the reading records arrives first ([`Store::wall_read_spent`]). The store cannot see a wall
+/// end, so this is what lets a later wall read again; a wall that stands past it reads once more.
+pub const WALL_READ_SPENT_S: i64 = 60 * 60;
 
 /// What [`rotate_launch`] decided, with the reading it decided on.
 #[derive(Debug, Clone, PartialEq)]
@@ -654,7 +711,8 @@ pub fn rotate_launch(
 
 /// [`rotate_launch`] with `at_wall`: when `true` (a running `agy` session is stopped at a quota
 /// wall on screen), a kept reading at least [`WALL_FORCE_FLOOR_S`] old is refreshed and
-/// [`agy_quota::pick_at_wall`] decides the model.
+/// [`agy_quota::pick_at_wall`] decides the model. One wall makes one read
+/// ([`WALL_READ_SPENT_S`]): the loop's later looks at it decide on that reading.
 #[must_use]
 pub fn rotate_launch_at(
     asked: Option<&str>,
@@ -667,11 +725,31 @@ pub fn rotate_launch_at(
     if !rotation.enabled {
         return None;
     }
-    let force = store.recent_failure(now).is_none()
-        && store.last().map_or(at_wall, |r| {
-            r.refill_crossed(now) || (at_wall && now.saturating_sub(r.as_of) >= WALL_FORCE_FLOOR_S)
-        });
-    let (reading, got) = current(store, source, now, rotation.low, force).ok()?;
+    let kept = store.last();
+    let (reading, got) = if at_wall && store.wall_read_spent(kept.as_ref(), now) {
+        let reading = kept?;
+        let got = on_record(&reading, now, rotation.low);
+        (reading, got)
+    } else {
+        let force = store.recent_failure(now).is_none()
+            && kept.as_ref().map_or(at_wall, |r| {
+                r.refill_crossed(now)
+                    || (at_wall && now.saturating_sub(r.as_of) >= WALL_FORCE_FLOOR_S)
+            });
+        let why = if at_wall {
+            provider_read::InUse::AtWall
+        } else {
+            provider_read::InUse::Launching
+        };
+        let current_res = current(store, source, now, rotation.low, force, why);
+        // A read that failed spent this wall's read too (even with nothing kept yet): it asked agy.
+        let asked = matches!(current_res, Ok((_, Got::Read)))
+            || store.recent_failure(now).is_some_and(|(at, _)| at == now);
+        if at_wall && asked {
+            store.note_wall_read(now);
+        }
+        current_res.ok()?
+    };
     // At a live quota wall, a stale reading past any recorded refill cannot justify restarting the
     // running session.
     if got == Got::Stale && at_wall && (reading.refill_passed(now) || reading.refill_crossed(now)) {
@@ -696,6 +774,28 @@ pub fn rotate_launch_at(
             (model, false)
         }
     };
+    decide(reading, got, model, named, rotation, now, at_wall)
+}
+
+/// How a reading on record stands at `now` when nothing is asked of agy.
+fn on_record(reading: &Reading, now: i64, low: f64) -> Got {
+    if reading.fresh(now, low) && !reading.refill_crossed(now) {
+        Got::Kept
+    } else {
+        Got::Stale
+    }
+}
+
+/// The pick `reading` gives `model`.
+fn decide(
+    reading: Reading,
+    got: Got,
+    model: String,
+    named: bool,
+    rotation: &agy_quota::Rotation,
+    now: i64,
+    at_wall: bool,
+) -> Option<LaunchPick> {
     let effective_quota;
     let quota_for_pick = if got == Got::Stale && !at_wall {
         effective_quota = reading.quota_at_stale(now);
@@ -728,6 +828,48 @@ pub fn rotate_launch_at(
         named,
         got,
     })
+}
+
+/// What the reading on record says of a running session's model (`asked`, or the default last
+/// read), asking agy nothing: a session between turns is no launch and no wall, so it may rotate
+/// on what launches and walls last read, never read for itself. `None` when rotation is off or
+/// nothing is on record.
+#[must_use]
+pub fn rotate_on_record(
+    asked: Option<&str>,
+    store: &Store,
+    rotation: &agy_quota::Rotation,
+    now: i64,
+) -> Option<LaunchPick> {
+    if !rotation.enabled {
+        return None;
+    }
+    let reading = store.last()?;
+    let got = on_record(&reading, now, rotation.low);
+    let (model, named) = match asked {
+        Some(model) => (model.to_owned(), true),
+        None => (store.last_default()?, false),
+    };
+    decide(reading, got, model, named, rotation, now, false)
+}
+
+/// [`rotate_on_record`] for a worker running under `env` and `flags`.
+#[must_use]
+pub fn rotate_worker_on_record(
+    asked: Option<&str>,
+    env: &[(String, String)],
+    flags: &[String],
+    now: i64,
+) -> Option<LaunchPick> {
+    let state = machine_state()?;
+    let home = env
+        .iter()
+        .find(|(n, _)| n == super::upgrade_agy::HOME_ENV)
+        .map(|(_, v)| v.as_str());
+    let store = Store::new(&state, &launch_key(home, flags));
+    let (rotation, _) =
+        agy_quota::Rotation::from_path(aterm_types::dirs::aterm_config_path().as_deref());
+    rotate_on_record(asked, &store, &rotation, now)
 }
 
 /// When an agy launch for `asked` (or the kept default model when `None`) that [`rotate_launch`]
@@ -795,12 +937,22 @@ pub fn rotate_worker(
     flags: &[String],
     now: i64,
 ) -> Option<LaunchPick> {
-    rotate_worker_at(asked, exe, env, flags, now, false)
+    worker_read(asked, exe, env, flags, now, false)
 }
 
-/// [`rotate_worker`] with `at_wall` ([`rotate_launch_at`]).
+/// [`rotate_worker`] for a session stopped at a quota wall on its screen ([`rotate_launch_at`]).
 #[must_use]
-pub fn rotate_worker_at(
+pub fn rotate_worker_at_wall(
+    asked: Option<&str>,
+    exe: &Path,
+    env: &[(String, String)],
+    flags: &[String],
+    now: i64,
+) -> Option<LaunchPick> {
+    worker_read(asked, exe, env, flags, now, true)
+}
+
+fn worker_read(
     asked: Option<&str>,
     exe: &Path,
     env: &[(String, String)],

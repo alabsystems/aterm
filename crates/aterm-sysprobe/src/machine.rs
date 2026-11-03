@@ -533,6 +533,18 @@ pub struct MachineWords {
     pub os: Option<String>,
 }
 
+impl MachineWords {
+    /// The OS's major version, the first word of [`Self::os`] that starts with a number
+    /// (`macOS 27.0.1` reads 27).
+    #[must_use]
+    pub fn os_major(&self) -> Option<u64> {
+        self.os
+            .as_deref()?
+            .split_whitespace()
+            .find_map(|word| crate::parse_uint(word.split('.').next()?))
+    }
+}
+
 /// The machine's brand and OS words; empty fields where unreadable.
 #[must_use]
 pub fn machine_words() -> MachineWords {

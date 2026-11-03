@@ -92,9 +92,10 @@ impl<'a> Public<'a> {
     /// # Errors
     ///
     /// Usage, before any request, for a tag `path::refuse_bad_tag` refuses (empty, an empty
-    /// `/`-part, or a `.` or `..` part) or an asset `refuse_bad_asset` refuses (empty, an empty
-    /// or control-byte part, or a `.` or `..` `/`-part in `web_path`); Invalid over `cap` (the
-    /// part file deleted); NotFound for a 404; the call's or the write's error.
+    /// `/`-part, or a `.` or `..` part), an asset `refuse_bad_asset` refuses (empty, an empty or
+    /// control-byte part, or a `.` or `..` `/`-part in `web_path`), or a destination
+    /// `download::refuse_part_name` or `download::refuse_non_file` refuses; Invalid over `cap`
+    /// (the part file deleted); NotFound for a 404; the call's or the write's error.
     pub fn fetch(
         &self,
         slug: &Slug,
@@ -103,7 +104,11 @@ impl<'a> Public<'a> {
         dest: &std::path::Path,
         cap: u64,
     ) -> Result<u64> {
-        let call = Call::get(web_path(slug, tag, asset)?, anonymous(slug))
+        let path = web_path(slug, tag, asset)?;
+        download::refuse_part_name(dest)
+            .and_then(|()| download::refuse_non_file(dest))
+            .map_err(|e| e.with_repo(slug.to_string()))?;
+        let call = Call::get(path, anonymous(slug))
             .origin(OriginRole::Web)
             .accept(Accept::Media("application/octet-stream".to_string()))
             .hop(true)

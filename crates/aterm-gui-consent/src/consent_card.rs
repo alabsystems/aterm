@@ -108,12 +108,32 @@ impl NeedCause {
     }
 }
 
+/// Where the prompting program runs, as the card names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabPlace {
+    /// A tab the strip draws, 1-based.
+    Number(usize),
+    /// A worker's tab: under the Workers tab, with no chip for a number to name.
+    Workers,
+}
+
+impl TabPlace {
+    /// The place as a sentence ends on it: `in tab 2`, `under Workers`.
+    #[must_use]
+    pub fn words(self) -> String {
+        match self {
+            Self::Number(n) => format!("in tab {n}"),
+            Self::Workers => "under Workers".to_owned(),
+        }
+    }
+}
+
 /// The data the words are built from, so the reporter stays pure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NeedWords {
     pub cause: NeedCause,
-    /// The 1-based tab number the prompting program belongs to, when it resolved.
-    pub tab_number: Option<usize>,
+    /// Where the prompting program runs, when it resolved.
+    pub tab: Option<TabPlace>,
     /// A verified grant later read as off: the epoch is a new one.
     pub regressed: bool,
 }
@@ -125,8 +145,8 @@ impl NeedWords {
             return "Full Disk Access was on for aterm and macOS now reports it off".to_owned();
         }
         let in_tab = self
-            .tab_number
-            .map_or_else(String::new, |n| format!(" in tab {n}"));
+            .tab
+            .map_or_else(String::new, |tab| format!(" {}", tab.words()));
         match self.cause {
             NeedCause::PromptObserved { .. } => {
                 let mut what = Folder::AppData.label().to_owned();
@@ -164,7 +184,7 @@ impl NeedWords {
                 service: Some(Folder::AppData),
                 session: Some(1),
             },
-            tab_number: Some(1),
+            tab: Some(TabPlace::Number(1)),
             regressed: false,
         }
     }
@@ -1140,7 +1160,7 @@ mod tests {
         AccessRecord, CardFacts, CardPhase, CardState, DECIDE_ATTEMPTS, DECIDE_TIMEOUT,
         LAUNCH_SETTLE, LaunchVerdict, MARKER, MAX_MARKER_BYTES, MAX_RECORD_BYTES, Marker,
         NeedCause, NeedFacts, NeedVerdict, NeedWords, NotDue, OWNER_ACTED_HOLD, RECORD,
-        RENEW_AFTER, Verdict, WATCH_FOR, clear_opened, decide_launch, decide_need,
+        RENEW_AFTER, TabPlace, Verdict, WATCH_FOR, clear_opened, decide_launch, decide_need,
         is_prompt_while_granted, marker_path, read_marker, read_record, record_marker, record_path,
         report_state, retire_not_now, should_reassert, write_record, write_verified_host,
     };
@@ -2010,22 +2030,25 @@ mod tests {
     fn the_entry_line_names_the_cause_and_the_tab_it_knows() {
         let tab = NeedWords {
             cause: app_data_prompt(),
-            tab_number: Some(1),
+            tab: Some(TabPlace::Number(1)),
             regressed: false,
         };
-        let no_tab = NeedWords {
-            tab_number: None,
-            ..tab
-        };
+        let no_tab = NeedWords { tab: None, ..tab };
         assert!(tab.event_line().contains("tab 1"));
         assert!(!no_tab.event_line().contains("tab"), "never guessed");
+        let worker = NeedWords {
+            tab: Some(TabPlace::Workers),
+            ..tab
+        };
+        assert!(worker.event_line().contains("under Workers"));
+        assert!(!worker.event_line().contains("tab"), "it has no number");
         let regressed = NeedWords {
             regressed: true,
             ..tab
         };
         let eperm = NeedWords {
             cause: NeedCause::ProtectedRead { session: Some(2) },
-            tab_number: Some(2),
+            tab: Some(TabPlace::Number(2)),
             regressed: false,
         };
         assert_ne!(regressed.event_line(), tab.event_line());

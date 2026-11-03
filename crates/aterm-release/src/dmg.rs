@@ -189,7 +189,8 @@ fn build_in_stage(_app: &Path, _stage: &Path, _volname: &str, _dmg: &Path) -> Re
 pub fn sha256_file(path: &Path) -> Result<String, String> {
     use aterm_digest::Sha256;
     use std::io::Read;
-    let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut f = crate::durable::open_regular_file(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {

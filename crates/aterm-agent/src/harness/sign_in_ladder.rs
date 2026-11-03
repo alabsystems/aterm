@@ -7,11 +7,11 @@
 //! ([`super::accounts::note_sign_in_attempt`]), never as a silent stop and never as a person
 //! asked.
 //!
-//! The routes, in order ([`Read::route`]): a configured mailbox (a webmail-only one beside a
-//! headless browser); the row's own browser profile, driven in a headless browser; and, while
-//! neither is ready, the LAN vault, refreshed by a bounded `aterm secrets sync` where this
+//! The routes, in order ([`Read::route`]): a configured mailbox read directly; the row's own
+//! proven browser profile; and a webmail-only mailbox (the last two beside a headless browser).
+//! While none is ready, the LAN vault is refreshed by a bounded `aterm secrets sync` where this
 //! machine is a member, since it can deliver a newly published `ai-mailbox.toml`, after which
-//! the two are read again. The line also names what is never a route here: the row's own desk
+//! the routes are read again. The line also names what is never a route here: the row's own desk
 //! browser profile, which opens a window and so is never used unattended, and
 //! `[harness] hosts`, which renew their own logins and none of this machine's. No route opens a
 //! window on the desk or the system's default browser, and none copies, stores or relays a
@@ -40,8 +40,15 @@ pub(super) enum Mailbox {
     /// A mailbox the sign-in reads over a directory, IMAP or HTTP, with no browser needed.
     /// Also covers a steward's `mail-code` fleet relay (`ai-signin.toml` `relay = true`).
     Ready,
-    /// Only a webmail inbox, which a headless browser must read.
+    /// No reader but a webmail inbox, which a headless browser must read, and a password the
+    /// sign-in would use for the row. A password with no inbox named or known for its domain
+    /// reads this way too; its sign-in then says no webmail URL is configured.
     WebmailOnly,
+    /// Only a webmail inbox, with no password for the row (the file names none, or names a
+    /// password file not delivered yet). A headless browser still tries it, since the webmail
+    /// asks for a password only where it is signed out, but it is not the password the lab was
+    /// asked for ([`Read::holds_mailbox`]).
+    WebmailNoPassword,
     /// The row's email's own `[[mailboxes]]` entry ([`super::mailbox_routes::MailboxRoute::own`])
     /// has no password (or no login) yet: it is never tried, and that is said, never a failed
     /// sign-in. The lab may be asked for it ([`Read::wants_mailbox`]): the answer, kept under
@@ -223,24 +230,36 @@ impl Read {
             )
     }
 
-    /// The route a sign-in can take now, in the ladder's order: the mailbox (a webmail-only one
-    /// only beside a headless browser), then the row's own profile beside a headless browser.
+    /// Whether the row's mailbox ends the lab's ask for it ([`Read::wants_mailbox`]): one the
+    /// sign-in reads without a browser, or a webmail inbox with the row's password, whether or
+    /// not a headless browser is here to read the webmail. A webmail inbox with no password
+    /// ([`Mailbox::WebmailNoPassword`]) leaves the ask standing.
+    pub(super) fn holds_mailbox(&self) -> bool {
+        matches!(self.mailbox, Mailbox::Ready | Mailbox::WebmailOnly)
+    }
+
+    /// The route a sign-in can take now, in the ladder's order: a mailbox read directly, the
+    /// row's own proven profile, then a webmail-only mailbox (the browser routes need one).
     pub(super) fn route(&self) -> Option<Route> {
-        match self.mailbox {
-            Mailbox::Ready => return Some(Route::Mailbox),
-            Mailbox::WebmailOnly if self.browser => return Some(Route::Mailbox),
-            Mailbox::WebmailOnly
-            | Mailbox::NoPassword
-            | Mailbox::SharedNoPassword
-            | Mailbox::None => {}
+        if self.mailbox == Mailbox::Ready {
+            return Some(Route::Mailbox);
         }
-        (self.profile == Profile::Ready && self.browser).then_some(Route::Profile)
+        if self.profile == Profile::Ready && self.browser {
+            return Some(Route::Profile);
+        }
+        match self.mailbox {
+            Mailbox::WebmailOnly | Mailbox::WebmailNoPassword if self.browser => {
+                Some(Route::Mailbox)
+            }
+            _ => None,
+        }
     }
 
     /// The routes tried and what each found, one line in the ladder's order:
     /// `profile(none) mailbox(none configured) vault(seq 51, nothing new)
     /// headless-browser(none installed) hosts(none configured)`. The mailbox is named by its
     /// masked login where it has one: `mailbox(ab…@…)`, `mailbox(ab…@…, webmail only)`,
+    /// `mailbox(ab…@…, webmail only, no password)`,
     /// `mailbox(ab…@… has no password yet)`. An installed headless browser
     /// that no route drives is named as not run (`headless-browser(installed; not run: no
     /// profile or mailbox to drive)`), never as if a sign-in had been tried in it.
@@ -261,6 +280,10 @@ impl Read {
                     (Mailbox::Ready, None) => "ready".to_owned(),
                     (Mailbox::WebmailOnly, Some(login)) => format!("{login}, webmail only"),
                     (Mailbox::WebmailOnly, None) => "webmail only".to_owned(),
+                    (Mailbox::WebmailNoPassword, Some(login)) => {
+                        format!("{login}, webmail only, no password")
+                    }
+                    (Mailbox::WebmailNoPassword, None) => "webmail only, no password".to_owned(),
                     (Mailbox::NoPassword | Mailbox::SharedNoPassword, login) => format!(
                         "{} has no password yet",
                         login.unwrap_or("its [[mailboxes]] entry")

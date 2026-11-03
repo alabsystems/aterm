@@ -41,11 +41,21 @@ impl Address {
     }
 }
 
+fn is_token(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 fn unescape(text: &str) -> Result<String> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while let Some(&b) = bytes.get(i) {
+        if b.is_ascii_control() {
+            return Err(Error::Invalid("control byte in an address value"));
+        }
         if b == b'%' {
             let pair = bytes.get(i.saturating_add(1)..i.saturating_add(3));
             let pair = pair.ok_or(Error::Invalid("truncated %-escape in an address"))?;
@@ -70,18 +80,23 @@ pub fn parse(list: &str) -> Result<Vec<Address>> {
         let (transport, rest) = entry
             .split_once(':')
             .ok_or(Error::Invalid("address entry without a transport"))?;
-        if transport.is_empty() {
+        if !is_token(transport) {
             return Err(Error::Invalid("address entry without a transport"));
         }
         let mut params: Vec<(String, String)> = Vec::new();
-        for pair in rest.split(',').filter(|p| !p.is_empty()) {
-            let (key, value) = pair
-                .split_once('=')
-                .ok_or(Error::Invalid("address key without a value"))?;
-            if key.is_empty() || params.iter().any(|(k, _)| k == key) {
-                return Err(Error::Invalid("address key empty or repeated"));
+        if !rest.is_empty() {
+            for pair in rest.split(',') {
+                if pair.is_empty() {
+                    return Err(Error::Invalid("empty address parameter"));
+                }
+                let (key, value) = pair
+                    .split_once('=')
+                    .ok_or(Error::Invalid("address key without a value"))?;
+                if !is_token(key) || params.iter().any(|(k, _)| k == key) {
+                    return Err(Error::Invalid("address key empty or repeated"));
+                }
+                params.push((key.to_owned(), unescape(value)?));
             }
-            params.push((key.to_owned(), unescape(value)?));
         }
         out.push(Address {
             transport: transport.to_owned(),
@@ -94,6 +109,36 @@ pub fn parse(list: &str) -> Result<Vec<Address>> {
     Ok(out)
 }
 
+fn private_runtime_bus(dir: &std::path::Path) -> Option<String> {
+    if !dir.is_absolute() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::symlink_metadata(dir).ok()?;
+        if !meta.file_type().is_dir()
+            || meta.uid() != crate::conn::effective_uid()
+            || meta.mode() & 0o077 != 0
+        {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let meta = std::fs::symlink_metadata(dir).ok()?;
+        if !meta.file_type().is_dir() {
+            return None;
+        }
+    }
+    let path = dir.join("bus");
+    let bus_meta = std::fs::symlink_metadata(&path).ok()?;
+    if bus_meta.file_type().is_symlink() {
+        return None;
+    }
+    path.to_str().map(str::to_owned)
+}
+
 /// Resolves session bus addresses, or returns [`Error::Invalid`] for a malformed or non-UTF-8
 /// `DBUS_SESSION_BUS_ADDRESS` or [`Error::Io`] when none is configured.
 pub fn session_bus() -> Result<Vec<Address>> {
@@ -104,11 +149,10 @@ pub fn session_bus() -> Result<Vec<Address>> {
             return Err(Error::Invalid("session bus address is not UTF-8"));
         }
     }
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
-        let path = std::path::Path::new(&dir).join("bus");
-        if let (true, Some(text)) = (path.exists(), path.to_str()) {
-            return Ok(vec![Address::unix_path(text)]);
-        }
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty())
+        && let Some(text) = private_runtime_bus(std::path::Path::new(&dir))
+    {
+        return Ok(vec![Address::unix_path(&text)]);
     }
     Err(Error::Io(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -316,6 +360,53 @@ mod tests {
             assert!(
                 matches!(connect(address, None), Err(Error::Invalid(_))),
                 "{invalid}"
+            );
+        }
+    }
+
+    /// Address parsing rejects empty parameter slots, invalid transport/key tokens, and raw
+    /// control bytes, and the `XDG_RUNTIME_DIR` fallback refuses relative, shared, or symlinked
+    /// paths.
+    /// NEGATIVE CONTROL: `filter(|p| !p.is_empty())` and `path.exists()` admit `unix:path=/a,,guid=1`,
+    /// relative `XDG_RUNTIME_DIR`, world-writable directories, and symlinked `bus` entries.
+    #[test]
+    fn private_runtime_dir_and_address_syntax_guards_hold() {
+        for bad in [
+            "unix:path=/a,,guid=0f3b",
+            "unix:,path=/a",
+            "unix:path=/a,",
+            "un ix:path=/a",
+            "unix:pa th=/a",
+            "unix:path=/a\nb",
+        ] {
+            assert!(matches!(parse(bad), Err(Error::Invalid(_))), "{bad:?}");
+        }
+        assert!(private_runtime_bus(std::path::Path::new("relative-runtime")).is_none());
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("dbus-rt-")
+            .tempdir()
+            .unwrap();
+        let bus = scratch.path().join("bus");
+        std::fs::write(&bus, b"sentinel").unwrap();
+        assert_eq!(private_runtime_bus(scratch.path()).as_deref(), bus.to_str());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let target = scratch.path().join("real-bus");
+            std::fs::write(&target, b"sentinel").unwrap();
+            std::fs::remove_file(&bus).unwrap();
+            std::os::unix::fs::symlink(&target, &bus).unwrap();
+            assert!(
+                private_runtime_bus(scratch.path()).is_none(),
+                "symlinked $XDG_RUNTIME_DIR/bus must be refused"
+            );
+            std::fs::remove_file(&bus).unwrap();
+            std::fs::write(&bus, b"sentinel").unwrap();
+            std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            assert!(
+                private_runtime_bus(scratch.path()).is_none(),
+                "world/group-readable XDG_RUNTIME_DIR must be refused"
             );
         }
     }

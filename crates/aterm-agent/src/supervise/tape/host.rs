@@ -654,6 +654,7 @@ impl TapeValue for Option<RosterWord> {
 const fn turn_word(turn: HostTurn) -> &'static str {
     match turn {
         HostTurn::Notice => "notice",
+        HostTurn::Restore => "restore",
         HostTurn::CarryOn => "carry-on",
         HostTurn::Check => "check",
         HostTurn::Fact => "fact",
@@ -663,6 +664,7 @@ const fn turn_word(turn: HostTurn) -> &'static str {
 fn turn_of(word: &str) -> Result<HostTurn, CodecError> {
     [
         HostTurn::Notice,
+        HostTurn::Restore,
         HostTurn::CarryOn,
         HostTurn::Check,
         HostTurn::Fact,

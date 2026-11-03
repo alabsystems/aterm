@@ -463,8 +463,6 @@ pub const DELEGATED: &str = "ATERM_HOOK_TRANSFORMS_DELEGATED";
 pub struct Transforms {
     /// `ROOT`, `EXPORT`, `CAPTURED_COMMIT`.
     pub inputs: crate::transforms::Inputs,
-    /// A directory of the checkout this cutter was compiled from.
-    pub source: PathBuf,
     /// `CARGO_TARGET_DIR`: the captured commit's cutter builds in its `pre-promote.noindex`.
     pub target: Option<PathBuf>,
     /// [`DELEGATED`], when a delegating run set it.
@@ -474,19 +472,23 @@ pub struct Transforms {
     /// it is the build of, judged when it started ([`crate::cutter::running`]), or why it is
     /// none.
     pub handed: Option<Result<String, String>>,
+    /// This process's startup judgment, independent of whether it was handed on.
+    pub running: Result<String, String>,
     /// Environment for every git child (a test isolates git from this machine's).
     pub git_env: Vec<(String, String)>,
 }
 
 impl Transforms {
-    /// The engine's facts in this process's environment; the source is this crate's.
+    /// The engine's facts and this process's actual startup build judgment.
     /// # Errors
     /// `ROOT` or `EXPORT` unset.
     pub fn from_process() -> Result<Self, String> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let running = crate::cutter::running()
+            .map(str::to_string)
+            .map_err(|not| not.why.clone());
         Ok(Self {
             inputs: crate::transforms::Inputs::from_env()?,
-            source: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
             target: var("CARGO_TARGET_DIR").map(PathBuf::from),
             delegated: var(DELEGATED),
             handed: handed(
@@ -494,12 +496,9 @@ impl Transforms {
                     .as_deref()
                     .map(Path::new),
                 std::env::current_exe().ok().as_deref(),
-                || {
-                    crate::cutter::running()
-                        .map(str::to_string)
-                        .map_err(|not| not.why.clone())
-                },
+                || running.clone(),
             ),
+            running,
             git_env: Vec::new(),
         })
     }
@@ -520,99 +519,14 @@ pub fn handed(
     (resolved(named?)? == this).then(judged)
 }
 
-/// Why the checkout at `source` is not `full`'s source.
-#[must_use]
-pub fn source_differs(source: &Path, env: &[(String, String)], full: &str) -> Option<String> {
-    let short = &full[..full.len().min(12)];
-    let Some(top) = toplevel(source, env) else {
-        return Some(format!("{} is not inside a git checkout", source.display()));
-    };
-    let mut pending = vec![(top, full.to_string())];
-    while let Some((tree, revision)) = pending.pop() {
-        match git_output(
-            &tree,
-            env,
-            &[
-                "diff",
-                "--quiet",
-                "--ignore-submodules=none",
-                &revision,
-                "--",
-            ],
-        )
-        .and_then(|o| o.status.code())
-        {
-            Some(0) => {}
-            Some(1) => {
-                return Some(format!(
-                    "{}'s source tree differs from {short}",
-                    tree.display()
-                ));
-            }
-            _ => {
-                return Some(format!(
-                    "{} cannot compare itself with {short}",
-                    tree.display()
-                ));
-            }
-        }
-        let Some(list) = git(
-            &tree,
-            env,
-            &[
-                "ls-files",
-                "--others",
-                "--directory",
-                "--no-empty-directory",
-                "-z",
-            ],
-        ) else {
-            return Some(format!("{} cannot list its local files", tree.display()));
-        };
-        if !list.is_empty() {
-            return Some(format!(
-                "{} holds files {short} does not: {}",
-                tree.display(),
-                list.split('\0')
-                    .filter(|p| !p.is_empty())
-                    .take(4)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ));
-        }
-        let Some(index) = git(&tree, env, &["ls-files", "--stage", "-z"]) else {
-            return Some(format!("{} cannot list its gitlinks", tree.display()));
-        };
-        for entry in index.split('\0').filter(|e| e.starts_with("160000 ")) {
-            let Some((record, path)) = entry.split_once('\t') else {
-                return Some(format!("{} has an unreadable gitlink", tree.display()));
-            };
-            let Some(revision) = record.split_whitespace().nth(1) else {
-                return Some(format!("{} has an unreadable gitlink", tree.display()));
-            };
-            let sub = tree.join(path);
-            let initialized = toplevel(&sub, env)
-                .and_then(|top| top.canonicalize().ok())
-                .zip(sub.canonicalize().ok())
-                .is_some_and(|(top, sub)| top == sub);
-            if !initialized {
-                return Some(format!("{} is not an initialized submodule", sub.display()));
-            }
-            pending.push((sub, revision.to_string()));
-        }
-    }
-    None
-}
-
 /// The commit's own cutter, run in its worktree `tree` for the full sha, building into `target`.
 pub type There<'a> = dyn FnMut(&Path, &str, &Path) -> Result<i32, String> + 'a;
 
 /// The rewrites over a commit's export, run here.
 pub type Here<'a> = dyn FnMut(&crate::transforms::Inputs) -> Result<Vec<String>, String> + 'a;
 
-/// Rewrite the export by the captured commit's own rules: `here` when this cutter is that
-/// commit's (a handed cutter by its build, [`Transforms::handed`]; one `targo` built by its
-/// checkout's whole source), else `there`, that commit's own cutter in a worktree of it.
+/// Rewrite the export with an exactly proved running build, or an explicitly handed
+/// cutter admitted by the release policy; otherwise delegate to the commit's own build.
 pub fn transforms(
     facts: &Transforms,
     here: &mut Here<'_>,
@@ -655,7 +569,15 @@ pub fn transforms(
         Some(Err(why)) => Some(format!(
             "the cutter handed to the engine is no commit's build ({why})"
         )),
-        None => source_differs(&facts.source, env, &full),
+        None => match &facts.running {
+            Ok(built) if *built == full => None,
+            Ok(built) => Some(format!(
+                "this running cutter's build stamp {built} does not exactly match captured {full}"
+            )),
+            Err(why) => Some(format!(
+                "this running cutter is no commit's verified build ({why})"
+            )),
+        },
     };
     let Some(why) = differs else {
         if facts.handed.is_some() {
@@ -668,6 +590,11 @@ pub fn transforms(
             let _ = writeln!(
                 out,
                 "== transforms: by the cutter handed to the engine, {identity} (nothing built)"
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "== transforms: by this running cutter's verified build of {short} (nothing built)"
             );
         }
         let inputs = crate::transforms::Inputs {
@@ -686,7 +613,7 @@ pub fn transforms(
     };
     if facts.delegated.as_deref() == Some(full.as_str()) {
         return refuse(format!(
-            "{short}'s own cutter does not find its source to be {short} ({why}) — refusing \
+            "{short}'s own cutter cannot prove its build is {short} ({why}) — refusing \
              rather than handing the export on again"
         ));
     }

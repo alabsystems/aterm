@@ -54,8 +54,8 @@ pub fn glue(bytes: &[u8], stem: &str) -> Result<Vec<(String, Vec<u8>)>, String> 
 
 /// Bind `input` into `out_dir`; the files written.
 pub(crate) fn bind(input: &Path, out_dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let bytes =
-        std::fs::read(input).map_err(|e| format!("could not read {}: {e}", input.display()))?;
+    let bytes = crate::read_regular(input)
+        .map_err(|e| format!("could not read {}: {e}", input.display()))?;
     let stem = input
         .file_stem()
         .and_then(|s| s.to_str())

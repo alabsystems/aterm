@@ -201,7 +201,7 @@ fn startup_restore_retry_finishes_pending_before_binding_and_dispatches_once() {
     assert_eq!(admitted.revision, revision);
     assert!(!admitted.completed);
     assert_eq!(admitted.plan, host.setup.plan());
-    assert!(host.setup.snapshot().unwrap().permissions_allowed);
+    assert!(host.setup.snapshot().unwrap().run_allowed);
     run_prepared_setup(prepared, None, std::mem::take(&mut host.sent));
     assert_eq!(script().runs, [revision]);
     assert_eq!(STARTUP_CLAIMS.load(Ordering::Acquire), 0);
@@ -245,7 +245,7 @@ fn startup_restore_retry_stop_retires_the_retry_and_leaves_a_later_manual_choice
         assert!(!setup_stop_requested(revision));
         let resumed = chosen.snapshot().unwrap();
         assert_eq!(resumed.plan, held.plan);
-        assert!(!resumed.finished && resumed.permissions_allowed);
+        assert!(!resumed.finished && resumed.run_allowed);
         clear_setup_run(revision);
     }
 }

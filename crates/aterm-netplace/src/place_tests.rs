@@ -78,6 +78,9 @@ fn answer_on(route: &RouteFacts, member: &str, began: u64) -> Answer {
         member: member_key(Lane::Fleet, member),
         addr: Some(IpAddr::V4(route.address)),
         via: Some(route.address),
+        iface: Some(route.interface.clone()),
+        network: NetworkId::of(route),
+        logged: true,
         began_ms: began,
         at_ms: began + 500,
     }

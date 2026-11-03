@@ -14,7 +14,7 @@ pub enum Profile {
     /// `--profile opt-test`: release code generation, debug assertions on.
     Opt,
     /// `--profile fabric-shipped --features dev-seams`: the release's fat LTO and one codegen
-    /// unit, debug assertions off, with only the development seams on top.
+    /// unit, debug assertions off, with what the feature compiles in on top ([`Profile::describe`]).
     Shipped,
 }
 
@@ -88,10 +88,12 @@ impl Profile {
                  shipped)"
             }
             Profile::Shipped => {
-                "cargo profile `fabric-shipped` (inherits release) with `--features dev-seams`: \
-                 opt-level 3 on every crate, fat LTO, 1 codegen unit, debug assertions and \
-                 overflow checks off, as the release builds; the development seams read an \
-                 environment variable or two the shipped binary does not, and symbols stay"
+                "cargo profile `fabric-shipped` (inherits release, keeps its symbols) with \
+                 `--features dev-seams`: opt-level 3 on every crate, fat LTO, 1 codegen unit, \
+                 debug assertions and overflow checks off, the release's code generation of more \
+                 code than the release has: every `dev_seam!` read (the bench sets several, the \
+                 bridge's ack and live deadlines among them), the tallies, and what else the \
+                 feature holds, a frame's clock and fault reads among it"
             }
         }
     }

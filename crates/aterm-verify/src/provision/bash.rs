@@ -87,7 +87,7 @@ const CONFIGURE_ENV_REMOVED: [&str; 33] = [
 
 /// A step of the build: `program` with `args` in `src`, on [`BUILD_PATH`], without
 /// [`super::fish::removed`]'s variables or [`CONFIGURE_ENV_REMOVED`].
-fn step(program: &str, args: Vec<OsString>, src: &Path) -> Spawn {
+pub(super) fn step(program: &str, args: Vec<OsString>, src: &Path) -> Spawn {
     let mut remove = super::fish::removed();
     remove.extend(CONFIGURE_ENV_REMOVED.map(String::from));
     Spawn {
@@ -156,6 +156,7 @@ pub(super) fn build(
             url,
             program: &src.join("bash"),
             licence: &src.join("COPYING"),
+            version_args: &["--version"],
             answers: &|first| first.starts_with(&format!("GNU bash, version {version}(")),
         },
     )

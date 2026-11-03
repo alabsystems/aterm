@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// While aterm installs Apple's Command Line Tools, a spawn puts the shim directory just ahead of
+// While Apple's Command Line Tools are missing, a spawn puts the shim directory just ahead of
 // `/usr/bin` and names it in `ATERM_CLT_SHIM` (aterm-gui `clt_shim::settle_session_path`), and
 // its `.wanted` mark is there. A login shell's profile (`/etc/zprofile`'s `path_helper`, a fish
 // login's `/etc/paths`, a person's own rc line) then puts `/usr/bin` back in front of it, so
@@ -347,7 +347,7 @@ fn a_pwsh_keeps_the_shim_ahead_of_usr_bin_after_its_profile() {
 
 /// Once nothing wants the shim (its mark is gone: a Stop, an install that ended unfinished, the
 /// tools arrived), a shell started under a tab that had it still inherits `ATERM_CLT_SHIM`, and
-/// the directory stays until the next launch; no integration puts it back on PATH, and none
+/// the directory stays; no integration puts it back on PATH, and none
 /// names aterm's `BASH_ENV` hook. With the mark, the same shell places it (the control).
 #[cfg(unix)]
 #[test]
@@ -712,7 +712,15 @@ fn a_pwsh_clt_hook_handoff_keeps_its_user_predecessor_and_replacement() {
     .env("BASH_ENV", &own)
     .env("PATH", "/usr/bin:/bin")
     .env("POWERSHELL_TELEMETRY_OPTOUT", "1")
-    .env("POWERSHELL_UPDATECHECK", "Off");
+    .env("POWERSHELL_UPDATECHECK", "Off")
+    // Debian's bash treats a non-interactive shell with SSH_CLIENT set as an sshd-run
+    // shell: it sources /etc/bash.bashrc and never reads BASH_ENV, so under an SSH
+    // session (the Linux lane's limactl, an ssh CI) the hook chain below silently does
+    // not run (measured in the lane guest: minimal env runs the hook, +SSH_CLIENT
+    // sources bashrc instead). The handoff is the subject, not the ambient session.
+    .env_remove("SSH_CLIENT")
+    .env_remove("SSH_CONNECTION")
+    .env_remove("SSH_TTY");
     let output = cmd.output().unwrap();
     assert!(output.status.success(), "pwsh: {:?}", output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);

@@ -81,6 +81,13 @@ pub const fn crc32_poly_select(crc: u32, poly: u32) -> u32 {
     }
 }
 
+/// `fnv1a_64_xor` as `hash_island.rs` defines it in Clean:
+/// `h ^^^ word`.
+#[must_use]
+pub const fn fnv1a_64_xor(h: u64, word: u64) -> u64 {
+    h ^ word
+}
+
 /// `fnv1a_64_mul_prime` as `hash_island.rs` defines it in Clean:
 /// `xored * prime`.
 #[must_use]
@@ -223,6 +230,30 @@ mod tests {
             want
         );
         assert_eq!(answers(|[a, b]| super::crc_table_index_clamp(a, b)), want);
+        let want = "01210?2?0";
+        assert_eq!(answers(|[a, b]| crate::hash::fnv1a_64_xor(a, b)), want);
+        assert_eq!(answers(|[a, b]| super::fnv1a_64_xor(a, b)), want);
+        for a in [
+            0u64,
+            1,
+            2,
+            0x0000_0100_0000_01b3,
+            0xcbf2_9ce4_8422_2325,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            for b in [
+                0u64,
+                1,
+                2,
+                0x0000_0100_0000_01b3,
+                0xcbf2_9ce4_8422_2325,
+                u64::MAX - 1,
+                u64::MAX,
+            ] {
+                assert_eq!(crate::hash::fnv1a_64_xor(a, b), super::fnv1a_64_xor(a, b));
+            }
+        }
         let want = "000012021";
         assert_eq!(
             answers(|[a, b]| crate::hash::fnv1a_64_mul_prime(a, b)),

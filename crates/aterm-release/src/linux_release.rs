@@ -128,6 +128,10 @@ impl VerifierArtifact {
     }
 }
 
+fn open_regular_nonblock(path: &Path) -> std::io::Result<File> {
+    crate::durable::open_regular_file(path)
+}
+
 /// The file at `path` is `target`'s static bootstrap verifier of `size` bytes and SHA-256
 /// `sha256`: a regular file of that size, that architecture's ELF naming no program
 /// interpreter, of that digest.
@@ -149,7 +153,7 @@ pub fn static_verifier_file(
         ));
     }
     let mut bytes = Vec::new();
-    File::open(path)
+    open_regular_nonblock(path)
         .and_then(|file| file.take(pin::MAX_ASSET + 1).read_to_end(&mut bytes))
         .map_err(|e| format!("read {}: {e}", path.display()))?;
     target.validate_elf_header(bytes.get(..64).unwrap_or(&bytes))?;
@@ -279,7 +283,8 @@ pub const PIN_RECORD: &str = "aterm-bootstrap-verify-pin.toml";
 /// A record of another shape or interface, one this checkout's RELEASES.ledger does not
 /// claim, or an install.sh whose pin it cannot place: nothing is written.
 pub fn pin_verifier(root: &Path, record: &Path) -> Result<Pin, String> {
-    let text = fs::read_to_string(record).map_err(|e| format!("{}: {e}", record.display()))?;
+    let text =
+        crate::durable::read_text(record).map_err(|e| format!("{}: {e}", record.display()))?;
     write_pin(root, &pin::Record::parse(&text)?)
 }
 
@@ -290,8 +295,9 @@ pub fn pin_verifier(root: &Path, record: &Path) -> Result<Pin, String> {
 /// A record this checkout's RELEASES.ledger does not claim, one of another interface, or an
 /// install.sh whose pin it cannot place: nothing is written.
 pub fn write_pin(root: &Path, record: &pin::Record) -> Result<Pin, String> {
-    let read =
-        |path: &Path| fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()));
+    let read = |path: &Path| {
+        crate::durable::read_text(path).map_err(|e| format!("{}: {e}", path.display()))
+    };
     record.validate()?;
     let ledger = read(&root.join("RELEASES.ledger"))?;
     record.claimed_in(&ledger).map_err(|why| {
@@ -362,6 +368,9 @@ const WORKER_SCRIPT: &str = r#"main() {
 set -eu
 umask 077
 repo=$1 commit=$2 version=$3 build=$4 arch=$5
+case "$repo" in
+"~/"*) repo=$HOME/${repo#"~/"} ;;
+esac
 case "${XDG_CACHE_HOME:-}" in
 /*) cache=$XDG_CACHE_HOME ;;
 *) cache=$HOME/.cache ;;
@@ -409,7 +418,7 @@ fn pair_is_current(
     if !metadata.file_type().is_file() || metadata.len() > 65536 {
         return false;
     }
-    let Ok(text) = fs::read_to_string(&receipt) else {
+    let Ok(text) = crate::durable::read_regular_text(&receipt, 65536) else {
         return false;
     };
     let Ok(artifact) = aterm_toml::from_str::<Artifact>(&text) else {
@@ -418,6 +427,32 @@ fn pair_is_current(
     artifact.validate(version, build, commit).is_ok()
         && artifact.target == target.triple()
         && artifact.verify_file(&directory.join(&name)).is_ok()
+}
+
+fn valid_destination(destination: &str) -> bool {
+    let valid_host = |host: &str| shell_word(host, "") && host != "." && host != "..";
+    match destination.split_once('@') {
+        Some((user, host)) => shell_word(user, "") && valid_host(host),
+        None => valid_host(destination),
+    }
+}
+
+fn valid_repository(repository: &str) -> bool {
+    let Some(rel) = repository
+        .strip_prefix("~/")
+        .or_else(|| repository.strip_prefix('/'))
+    else {
+        return false;
+    };
+    !rel.is_empty()
+        && rel.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        })
 }
 
 impl Worker {
@@ -436,15 +471,12 @@ impl Worker {
             "x86_64" => LinuxTarget::X86_64,
             other => return Err(format!("unsupported Linux worker architecture {other:?}")),
         };
-        if !shell_word(destination, "@") {
+        if !valid_destination(destination) {
             return Err(format!(
                 "--linux-worker destination {destination:?} must be a plain ssh host or user@host"
             ));
         }
-        let path_ok = (repository.starts_with('/') || repository.starts_with("~/"))
-            && shell_word(repository.trim_start_matches('~'), "/")
-            && !repository.split('/').any(|part| part == "..");
-        if !path_ok {
+        if !valid_repository(repository) {
             return Err(format!(
                 "--linux-worker repository {repository:?} must be an absolute or ~/ path of \
                  plain characters"
@@ -734,7 +766,7 @@ impl Artifact {
             ));
         }
         let mut header = [0u8; 64];
-        File::open(path)
+        open_regular_nonblock(path)
             .and_then(|mut file| file.read_exact(&mut header))
             .map_err(|e| e.to_string())?;
         target(&self.target)?.validate_elf_header(&header)?;
@@ -918,7 +950,8 @@ impl Handoff {
                 return Err("unsafe or oversized Linux handoff receipt".into());
             }
             let artifact: Artifact = aterm_toml::from_str(
-                &fs::read_to_string(&receipt_path).map_err(|e| e.to_string())?,
+                &crate::durable::read_regular_text(&receipt_path, 65536)
+                    .map_err(|e| e.to_string())?,
             )
             .map_err(|e| format!("parse Linux handoff: {e}"))?;
             artifact.validate(version, build, commit)?;
@@ -985,7 +1018,8 @@ impl Handoff {
                 Ok(_) => {}
             }
             let verifier: VerifierArtifact = aterm_toml::from_str(
-                &fs::read_to_string(&receipt_path).map_err(|e| e.to_string())?,
+                &crate::durable::read_regular_text(&receipt_path, 65536)
+                    .map_err(|e| e.to_string())?,
             )
             .map_err(|e| format!("parse Linux bootstrap verifier receipt: {e}"))?;
             verifier.validate(version, build, commit)?;
@@ -1129,7 +1163,7 @@ fn atomic_copy(source: &Path, destination: &Path) -> Result<(), String> {
         .map_err(|e| format!("create Linux artifact stage: {e}"))?;
     let result = (|| {
         std::io::copy(
-            &mut File::open(source).map_err(|e| e.to_string())?,
+            &mut open_regular_nonblock(source).map_err(|e| e.to_string())?,
             &mut output,
         )
         .map_err(|e| e.to_string())?;
@@ -1220,7 +1254,7 @@ pub fn run_worker(
     let compiler_hash = sha256_file(&compiler)?;
     let driver_hash = sha256_file(&driver)?;
     let provenance_hash = sha256_file(&provenance)?;
-    let provenance_text = fs::read_to_string(&provenance).map_err(|e| e.to_string())?;
+    let provenance_text = crate::durable::read_text(&provenance).map_err(|e| e.to_string())?;
     let seal_field = |key: &str| -> Result<String, String> {
         let prefix = format!("{key}=");
         let values: Vec<_> = provenance_text
@@ -2059,6 +2093,8 @@ mod tests {
         }
     }
 
+    /// NEGATIVE CONTROL: `Worker::parse` must refuse malformed `user@host` destinations,
+    /// root/empty/dot/traversal repository segments, and shell metacharacters.
     #[test]
     fn a_worker_spec_is_one_shell_safe_host_and_path() {
         let worker = Worker::parse("aarch64=builder@buildhost:/home/builder/src/aterm").unwrap();
@@ -2074,9 +2110,20 @@ mod tests {
             "aarch64=host",
             "riscv64=host:/r",
             "aarch64=:/r",
+            "aarch64=@host:/r",
+            "aarch64=user@:/r",
+            "aarch64=a@b@c:/r",
+            "aarch64=user@-bad:/r",
+            "aarch64=.:/r",
             "aarch64=-oProxyCommand=evil:/r",
             "aarch64=host;rm:/r",
             "aarch64=host:relative/path",
+            "aarch64=host:/",
+            "aarch64=host:~/",
+            "aarch64=host:/r//sub",
+            "aarch64=host:/r/",
+            "aarch64=host:/r/.",
+            "aarch64=host:~/.",
             "aarch64=host:/r/../etc",
             "aarch64=host:/r with space",
             "aarch64=host:/r$(id)",

@@ -38,8 +38,8 @@ pub struct InstallFlags {
     pub no_arm: bool,
     /// A Linux builder with no machine key: it stages for a rostered machine.
     pub keyless: bool,
-    /// Which hosts the installed unit's runs build (`--host`, parsed by WP12): `gh` until
-    /// WP15.
+    /// Which hosts the installed unit's runs build (`--host`, recorded in its command line and
+    /// in `INSTALLED-FROM`): `gh` by default until WP15.
     pub host: HostChoice,
 }
 
@@ -49,18 +49,36 @@ impl InstallFlags {
     /// A usage error naming the flag.
     pub fn parse(args: &[String]) -> Result<Self> {
         let mut f = Self::default();
-        for a in args {
-            match a.as_str() {
-                "--allow-dirty" => f.allow_dirty = true,
-                "--no-arm" => f.no_arm = true,
-                "--keyless" => f.keyless = true,
-                other => {
-                    return Err(Error::usage(format!(
-                        "`lane install` does not take `{other}` (--allow-dirty, --no-arm, \
-                         --keyless)"
-                    )));
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            let value = match a.as_str() {
+                "--allow-dirty" => {
+                    f.allow_dirty = true;
+                    continue;
                 }
-            }
+                "--no-arm" => {
+                    f.no_arm = true;
+                    continue;
+                }
+                "--keyless" => {
+                    f.keyless = true;
+                    continue;
+                }
+                other => match HostChoice::flag_value(other, &mut it) {
+                    Some(value) => value,
+                    None => {
+                        return Err(Error::usage(format!(
+                            "`lane install` does not take `{other}` (--allow-dirty, --no-arm, \
+                             --keyless, --host gh|agh-staging|agh)"
+                        )));
+                    }
+                },
+            };
+            f.host = HostChoice::parse(value).ok_or_else(|| {
+                Error::usage(format!(
+                    "lane install --host takes gh, agh-staging or agh: {value}"
+                ))
+            })?;
         }
         Ok(f)
     }
@@ -173,6 +191,14 @@ impl Machine {
         })
     }
 
+    /// agh's directories as this machine's lane unit resolves them (its pinned
+    /// `config_home`, the state directory's parent), or `None` when they cannot be resolved:
+    /// what `lane install --host agh*` and `hosts check --unit-env` both judge.
+    #[must_use]
+    pub fn agh_dirs(&self, ctx: &Ctx) -> Option<agh::config::Dirs> {
+        agh::config::Dirs::resolve(&ctx.home, Some(&self.config_home), ctx.state_dir.parent())
+    }
+
     /// Refuse a lane this machine's service manager does not run.
     /// # Errors
     /// The refusal naming the OS the lane runs on.
@@ -222,7 +248,7 @@ pub struct Installed {
     pub armed: Vec<PathBuf>,
 }
 
-/// `atpkg-publish lane install <lane> [--allow-dirty] [--no-arm] [--keyless]`.
+/// `atpkg-publish lane install <lane> [--allow-dirty] [--no-arm] [--keyless] [--host gh|agh-staging|agh]`.
 /// # Errors
 /// What [`install_with`] answers.
 pub fn install(ctx: &Ctx, kind: LaneKind, flags: &InstallFlags) -> Result<()> {
@@ -232,7 +258,8 @@ pub fn install(ctx: &Ctx, kind: LaneKind, flags: &InstallFlags) -> Result<()> {
 
 /// The install, over an injected machine.
 /// # Errors
-/// A refusal for the wrong OS, a missing machine key or record, a checkout git cannot read or
+/// A refusal for the wrong OS, a missing machine key or record, a `--host` other than `gh` whose
+/// hosts check of the unit's agh.toml fails, a checkout git cannot read or
 /// one that is dirty, an atpkg store other than the one `XDG_CONFIG_HOME` names, a lane run in
 /// flight, a shell-era lane still in its first-exec hold, a build that failed, produced nothing
 /// or saw its inputs change, a snapshot that does not hash to its build, a unit its linter
@@ -264,6 +291,40 @@ pub fn install_with(
                 ""
             }
         )));
+    }
+    if flags.host != HostChoice::Gh {
+        // The agh.toml the unit will read, under its own XDG_CONFIG_HOME and XDG_STATE_HOME
+        // (finding F8), judged before anything is built, snapshotted or armed.
+        let h = flags.host.as_str();
+        // `--keyless` lets a builder with no key install; the run decides keyed or keyless by
+        // whether the key exists, so a keyed builder's run writes the public owner whatever
+        // the flag said, and is judged as one.
+        let stages_only = crate::hosts_check::stages_only(ctx, keyless_ok);
+        let dirs = machine.agh_dirs(ctx).ok_or_else(|| {
+            Error::refused(format!(
+                "lane install --host {h}: agh's directories cannot be resolved for this unit"
+            ))
+        })?;
+        let checks = crate::hosts_check::check(
+            ctx,
+            &dirs,
+            flags.host,
+            stages_only,
+            &crate::hosts_check::program_repos(),
+        );
+        let failed = crate::hosts_check::failed(&checks);
+        if !failed.is_empty() {
+            return Err(Error::refused(format!(
+                "lane install --host {h}: hosts check failed ({}) — run atpkg-publish hosts \
+                 check --host {h} --unit-env{}; nothing installed",
+                failed.join(", "),
+                if stages_only { " --keyless" } else { "" }
+            )));
+        }
+        tx.say(format!(
+            "hosts check --host {h}: every check holds ({})",
+            ctx.shown(&dirs.config_file())
+        ));
     }
     let repo = &ctx.repo_root;
     let before = Inputs::read(repo)?;
@@ -365,7 +426,7 @@ pub fn install_with(
             ctx.shown(&binary)
         )));
     }
-    let installed_from = format!(
+    let mut installed_from = format!(
         "commit {commit}{}{} of {}, snapshotted {} by atpkg-publish lane install {}\n\
          tool build: {}\nsha256 {sha256}\n",
         if on_main {
@@ -383,6 +444,10 @@ pub fn install_with(
         kind.as_str(),
         built.toolchain
     );
+    if flags.host != HostChoice::Gh {
+        // The choice, after the `sha256` line the self-check reads (`lane::self_check`).
+        installed_from.push_str(&format!("host {}\n", flags.host.as_str()));
+    }
     super::report::write_atomic(&snapshot.join("INSTALLED-FROM"), &installed_from)?;
     let snapshot = snapshot_dir.keep();
 
@@ -407,7 +472,7 @@ pub fn install_with(
         state_dir: ctx.state_dir.clone(),
         xdg_config_home: machine.config_home.clone(),
         shim_bin: ctx.pkg_prefix.join("bin"),
-        host: HostChoice::Gh,
+        host: flags.host,
     };
     let unit_files = units::render(&spec);
     let rendered_dir = ctx.state_dir.join("units");
@@ -454,7 +519,16 @@ pub fn install_with(
     aterm_uds::deadline::stamp_exec(&out.snapshot);
     let arm = machine.services.arm(kind, &out.armed);
     let stamped = stamp_at_bootout(&ctx.state_dir);
-    if let Retirement::Unknown(why) = arm? {
+    let arm = arm?;
+    if flags.host == HostChoice::Gh {
+        // The armed unit reads no agh.toml, so a config need an earlier `--host agh*` unit
+        // raised under the unit's directories says something no longer true. Best effort: it
+        // reads no agh.toml and creates nothing.
+        if let Some(dirs) = machine.agh_dirs(ctx) {
+            crate::ctx::clear_config_needs(&dirs);
+        }
+    }
+    if let Retirement::Unknown(why) = arm {
         tx.warn(format!(
             "armed {}; older jobs' retirement is unconfirmed ({why}) — kept all prior \
              snapshots and the live link; log {}",
@@ -661,7 +735,9 @@ pub const RETIRED: &str = "retired";
 /// The snapshot whose arm retired `dir`, as its [`RETIRED`] marker names it: the predecessor of
 /// an install that finds a shell-era `lane` still at its path.
 fn retired_by(dir: &Path, state_dir: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(dir.join(RETIRED)).ok()?;
+    let text =
+        crate::identity::read_regular_text(&dir.join(RETIRED), crate::identity::MAX_META_BYTES)
+            .ok()?;
     let name = text.trim();
     let p = state_dir.join(name);
     (name.starts_with("lane.") && !name.contains('/') && p.is_dir()).then_some(p)

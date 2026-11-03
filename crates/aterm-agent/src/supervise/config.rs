@@ -332,7 +332,7 @@ pub struct SupervisorConfig {
     pub relaunch: bool,
     /// How long an agent stands frozen (not reading its input, nobody's hand on it) before the supervisor restarts it (`restart if-stalled`) for its relaunch (`supervise/stall.rs`).
     pub stall_term_after_s: u32,
-    /// Restart a frozen agent (`restart pid=<n> if-stalled`) once it has stood [`Self::stall_term_after_s`].
+    /// Restart a frozen agent (`restart pid=<n> if-stalled`) once it has stood [`Self::stall_term_after_s`]: on by default (the owner, 2026-11-02: *"all things on by default"*), so a frozen agent resumes its conversation rather than wait on a warning; `false` is a limit, and the warning.
     pub stall_term: bool,
     /// How much memory a supervised agent's process group (physical footprint) may use before aterm warns.
     pub memory_ceiling: MemoryCeiling,
@@ -360,9 +360,9 @@ pub struct SupervisorConfig {
     /// AN `aterm:` FACT AT A BREAK (`[harness] stuck_break_note`, the owner's call O10): at a
     /// break of the agent's own background work, where no turn end comes for a fact to ride, the
     /// session's untold fact (a call at no progress, programs held at macOS's program check) is
-    /// typed as one line of its own, once per episode. A
-    /// key whose `true` is more power: it ships `false`, and only the root `[harness]` table's
-    /// `true` turns it on ([`Self::stuck_break_grant`]).
+    /// typed as one line of its own, once per episode. It ships on (the owner, 2026-11-02, deciding
+    /// O10: *"all things on by default"*); `false` is a limit, and `facts = false` withdraws it
+    /// ([`Self::stuck_break_grant`]).
     pub stuck_break_note: bool,
     /// Safe rules a retired key switched off ([`RETIRED_KEYS`]); no key of its own sets it.
     pub withheld: Withheld,
@@ -492,14 +492,14 @@ impl Default for SupervisorConfig {
             compact_on_context_wall: true,
             relaunch: true,
             stall_term_after_s: 600,
-            stall_term: false,
+            stall_term: true,
             memory_ceiling: MemoryCeiling::Auto,
             upgrade: true,
             upgrade_ask: false,
             human_grace_s: 120,
             occupancy: Occupancy::Observe,
             facts: true,
-            stuck_break_note: false,
+            stuck_break_note: true,
             withheld: Withheld::default(),
         }
     }
@@ -867,8 +867,8 @@ impl SupervisorConfig {
         word.unwrap_or(self.autopilot)
     }
 
-    /// THE ONE PREDICATE the stuck fact's line at a break passes: a [`StuckBreakGrant`] where the
-    /// owner's root table turned [`Self::stuck_break_note`] on and [`Self::facts`] is not off,
+    /// THE ONE PREDICATE the stuck fact's line at a break passes: a [`StuckBreakGrant`] where
+    /// neither [`Self::stuck_break_note`] nor [`Self::facts`] is off,
     /// whatever [`Self::occupancy`] says; nothing otherwise.
     #[must_use]
     pub const fn stuck_break_grant(&self) -> Option<StuckBreakGrant> {
@@ -1854,6 +1854,61 @@ fn written(value: &aterm_toml::Value) -> String {
     }
 }
 
+/// The root `[harness]` keys only the owner writes: the mode and the owner's own source and rule
+/// tables (`docs/DESIGN-harness-occupancy-2026-10-20.md` §1.1, §3.3).
+pub const OWNER_KEYS: [&str; 3] = ["occupancy", "occupancy_source", "occupancy_rule"];
+
+/// WHAT ONE TEXT OF aterm.toml SAYS IN THE OWNER'S KEYS ([`OWNER_KEYS`]), read so two texts
+/// compare: the mode [`SupervisorConfig::from_aterm_toml`] reads off it (a misplaced limit and an
+/// invalid file's lines included), and the keys as written. Two texts whose readings are equal
+/// say the same there; the GUI refuses a save of the aterm.toml in force whose reading differs
+/// from the file's when a control client made the save or an edit in it.
+#[derive(Debug, PartialEq)]
+pub struct OwnerKeys {
+    mode: Occupancy,
+    written: OwnerKeysWritten,
+}
+
+/// [`OwnerKeys`]'s keys as one text writes them.
+#[derive(Debug, PartialEq)]
+enum OwnerKeysWritten {
+    /// A TOML document: the root `[harness]` table's value of each key, `None` where absent.
+    Root([Option<aterm_toml::Value>; 3]),
+    /// Not TOML: every assignment the line-by-line reader files under one of the keys, at any
+    /// depth, as its path and its value's text.
+    Lines(Vec<(Vec<String>, String)>),
+}
+
+impl OwnerKeys {
+    /// The reading of `text`, the whole aterm.toml.
+    #[must_use]
+    pub fn of(text: &str) -> Self {
+        let mode = SupervisorConfig::from_aterm_toml(text).0.occupancy;
+        let written = match aterm_toml::from_str::<aterm_toml::Value>(text) {
+            Ok(doc) => {
+                let root = doc.get("harness").and_then(aterm_toml::Value::as_table);
+                OwnerKeysWritten::Root(OWNER_KEYS.map(|key| root.and_then(|t| t.get(key)).cloned()))
+            }
+            Err(_) => OwnerKeysWritten::Lines(
+                assignments(text)
+                    .into_iter()
+                    .filter(|(path, _)| {
+                        path.windows(2)
+                            .any(|pair| pair[0] == "harness" && OWNER_KEYS.contains(&pair[1]))
+                    })
+                    .map(|(path, value)| {
+                        (
+                            path.into_iter().map(str::to_string).collect(),
+                            value.to_string(),
+                        )
+                    })
+                    .collect(),
+            ),
+        };
+        Self { mode, written }
+    }
+}
+
 fn misplaced_note(at: &str, key: &str, limits: bool, refused: Option<String>) -> String {
     let effect = if limits {
         "it limits all the same; delete that line and set the key under [harness]"
@@ -2165,7 +2220,7 @@ mod tests {
         assert!(!read("[harness]\nlimit_wait = \"never\"\n").limit_wait);
         assert_eq!(full.continue_per_hour, 0, "no cap");
         assert_eq!(read(""), full, "no file, no table: every power");
-        assert!(!full.upgrade_ask && !full.stall_term && !full.rm_breaker_ask);
+        assert!(!full.upgrade_ask && full.stall_term && !full.rm_breaker_ask);
         let strict =
             read("[harness]\nupgrade_ask = true\nstall_term = true\nrm_breaker_ask = true\n");
         assert!(strict.upgrade_ask && strict.stall_term && strict.rm_breaker_ask);
@@ -2181,12 +2236,10 @@ mod tests {
                     | "land_at"
                     | "continue_text"
                     | "rules_file"
-                    | "stall_term"
                     | "limit_reset"
                     | "limit_reset_kinds"
                     | "usage_notes"
                     | "usage_credits"
-                    | "stuck_break_note"
                     | "hosts"
             );
             assert_eq!(c == full, text_key, "{key}: only a text has no limit");
@@ -3252,6 +3305,61 @@ mod tests {
         }
     }
 
+    /// THE OWNER'S KEYS READ EQUAL EXACTLY WHERE TWO TEXTS AGREE ON THEM: another key, a comment,
+    /// spacing and order leave the reading equal (the NEGATIVE CONTROL of every difference);
+    /// the mode, a source table, a rule, an owner key dropped, a misplaced limit, and an
+    /// invalid file's lines filed under one each tell the texts apart.
+    #[test]
+    fn owner_keys_differ_where_the_owners_keys_do_and_nowhere_else() {
+        let base = "font_px = 12.0\n[harness]\noccupancy = \"observe\"\nfacts = true\n";
+        let same = |text: &str| OwnerKeys::of(base) == OwnerKeys::of(text);
+        for text in [
+            base,
+            "font_px = 16.0\n[harness]\noccupancy = \"observe\"\nfacts = true\n",
+            "font_px = 12.0\n# a note\n[harness]\nfacts = true\noccupancy   =   \"observe\" # mine\n",
+            "font_px = 12.0\n[harness]\noccupancy = \"observe\"\nfacts = false\nautopilot = \"land\"\n",
+            "font_px = 12.0\n[harness]\noccupancy = \"observe\"\nfacts = true\n[theme.harness]\nfacts = false\n",
+        ] {
+            assert!(same(text), "{text:?}");
+        }
+        for text in [
+            "font_px = 12.0\n[harness]\noccupancy = \"prompt\"\nfacts = true\n",
+            "font_px = 12.0\nharness = { occupancy = \"prompt\", facts = true }\n",
+            "font_px = 12.0\n[harness]\nfacts = true\n",
+            "font_px = 12.0\n[harness]\noccupancy = \"observe\"\nfacts = true\n\
+             [harness.occupancy_source.trust]\nkind = \"git-ref\"\n",
+            "font_px = 12.0\n[harness]\noccupancy = \"observe\"\nfacts = true\n\
+             [[harness.occupancy_rule]]\nname = \"trust-base\"\n",
+            "font_px = 12.0\n[harness]\noccupancy = \"observe\"\nfacts = true\n\
+             [theme.harness]\noccupancy = \"off\"\n",
+            "font_px = \n[harness]\noccupancy = \"observe\"\nfacts = true\n",
+        ] {
+            assert!(!same(text), "{text:?}");
+        }
+
+        const TYPO: &str = "font_px = \n";
+        let broken = format!("{TYPO}[harness]\noccupancy = \"observe\"\n");
+        assert!(aterm_toml::from_str::<aterm_toml::Value>(&broken).is_err());
+        let reads = |text: &str| OwnerKeys::of(text);
+        assert_eq!(
+            reads(&broken),
+            reads(&format!(
+                "{TYPO}[harness]\noccupancy = \"observe\"\nfacts = false\n"
+            ))
+        );
+        let with_rule = format!("{broken}[[harness.occupancy_rule]]\nname = \"trust-base\"\n");
+        assert_eq!(
+            read(&broken).occupancy,
+            read(&with_rule).occupancy,
+            "the mode alone cannot tell these apart"
+        );
+        assert_ne!(reads(&broken), reads(&with_rule), "the lines do");
+        assert_ne!(
+            reads(&broken),
+            reads(&format!("{TYPO}[harness]\noccupancy = \"prompt\"\n"))
+        );
+    }
+
     /// THE STUCK FACT'S KEY SHIPS OFF, AND ONLY THE ROOT TABLE GRANTS IT: no
     /// grant by default; the root table's `true` grants it under every
     /// occupancy mode, and `facts = false` (a limit, in any table) takes it
@@ -3259,41 +3367,43 @@ mod tests {
     /// other key's `true` or limit grants nothing, and the grant it makes is
     /// no occupancy `prompt`.
     #[test]
-    fn the_stuck_break_note_ships_off_and_only_the_root_table_grants_it() {
+    fn the_stuck_break_note_ships_on_and_any_table_s_off_withdraws_it() {
         let full = SupervisorConfig::default();
-        assert!(full.facts && !full.stuck_break_note);
-        assert!(full.stuck_break_grant().is_none());
+        assert!(full.facts && full.stuck_break_note);
+        assert!(full.stuck_break_grant().is_some());
         for mode in Occupancy::ALL {
-            let on = read(&format!(
-                "[harness]\nstuck_break_note = true\noccupancy = \"{}\"\n",
-                mode.word()
-            ));
+            let on = read(&format!("[harness]\noccupancy = \"{}\"\n", mode.word()));
             assert!(on.stuck_break_grant().is_some(), "{mode:?}");
             assert_eq!(on.occupancy.grant().is_some(), mode == Occupancy::Prompt);
         }
         for text in [
-            "[harness]\nstuck_break_note = true\nfacts = false\n",
-            "[harness]\nstuck_break_note = true\n[theme]\nharness.facts = false\n",
-            "[theme]\nharness.stuck_break_note = true\n",
-            "[[keybind]]\nharness.stuck_break_note = true\n",
-            "[a]\nharness.stuck_break_note = true\n[harness]\nfacts = true\n",
-            "[harness]\nstuck_break_note = false\nstuck_break_note = true\n",
-            "[harness]\nstuck_break_note = \"sometimes\"\n",
+            "[harness]\nstuck_break_note = false\n",
+            "[harness]\nfacts = false\n",
+            "[theme]\nharness.facts = false\n",
+            "[theme]\nharness.stuck_break_note = false\n",
         ] {
             assert!(read(text).stuck_break_grant().is_none(), "{text:?}");
         }
-        for key in KEYS.iter().filter(|k| **k != "stuck_break_note") {
+        assert!(
+            read("[harness]\nstuck_break_note = \"sometimes\"\n")
+                .stuck_break_grant()
+                .is_some(),
+            "an unreadable value keeps the default"
+        );
+        for key in KEYS
+            .iter()
+            .filter(|k| !matches!(**k, "stuck_break_note" | "facts"))
+        {
             let mut c = full.clone();
-            let _ = c.set(key, "true");
-            assert!(c.stuck_break_grant().is_none(), "{key} = true");
             c.limit(key);
-            assert!(c.stuck_break_grant().is_none(), "{key} at its limit");
+            assert!(c.stuck_break_grant().is_some(), "{key} at its limit");
         }
-        let on = read("[harness]\nstuck_break_note = true\n");
-        assert!(!on.limits(&full) && full.limits(&on));
-        let mut c = on.clone();
-        c.limit("facts");
-        assert!(c.limits(&on) && c.stuck_break_grant().is_none());
+        for key in ["stuck_break_note", "facts"] {
+            let mut c = full.clone();
+            c.limit(key);
+            assert!(c.limits(&full) && c.stuck_break_grant().is_none(), "{key}");
+            assert!(!full.limits(&c), "{key}");
+        }
     }
 
     #[test]

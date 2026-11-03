@@ -141,8 +141,8 @@ pub use planner::{
 };
 #[cfg(not(any(test, debug_assertions)))]
 pub(crate) use planner::{
-    carried_since, clamp_stamps, counted_from, oldest, plan, plan_with, prune_stamps, stamp, Held,
-    Ledger, Plan, Planned, Stamps, View, Why,
+    carried_since, clamp_stamps, counted_from, oldest, plan, prune_stamps, stamp, Held, Ledger,
+    Plan, Planned, Stamps, View, Why,
 };
 #[cfg(test)]
 use planner::{stamped_at, STAMPS_MAX};

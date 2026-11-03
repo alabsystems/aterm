@@ -951,7 +951,10 @@ fn automatic_appkit_termination_dominates_close_and_revokes_commit() {
         crate::native_updater_service::ApplyMode::Automatic;
 
     assert!(app.defer_pending_update_handoff_teardown(
-        crate::DeferredHandoffTeardown::NativeTerminate { generation: 41 }
+        crate::DeferredHandoffTeardown::NativeTerminate {
+            generation: 41,
+            confirmed: false
+        }
     ));
     assert!(
         app.defer_pending_update_handoff_teardown(crate::DeferredHandoffTeardown::mutation(
@@ -961,7 +964,10 @@ fn automatic_appkit_termination_dominates_close_and_revokes_commit() {
     let pending = app.pending_update_handoff.as_ref().expect("pending");
     assert!(matches!(
         pending.teardown,
-        crate::DeferredHandoffTeardown::NativeTerminate { generation: 41 }
+        crate::DeferredHandoffTeardown::NativeTerminate {
+            generation: 41,
+            confirmed: false
+        }
     ));
     assert_ne!(
         app.update_handoff_activity_epoch, pending.activity_epoch,
@@ -972,6 +978,48 @@ fn automatic_appkit_termination_dominates_close_and_revokes_commit() {
         app.windows.len(),
         1,
         "AppKit cannot tear down before reaper wake"
+    );
+}
+
+#[test]
+fn deferred_native_confirmation_belongs_only_to_its_generation() {
+    use crate::DeferredHandoffTeardown::NativeTerminate;
+    let mut pending = NativeTerminate {
+        generation: 41,
+        confirmed: true,
+    };
+    pending.merge(NativeTerminate {
+        generation: 41,
+        confirmed: false,
+    });
+    assert_eq!(
+        pending,
+        NativeTerminate {
+            generation: 41,
+            confirmed: true
+        }
+    );
+    pending.merge(NativeTerminate {
+        generation: 42,
+        confirmed: false,
+    });
+    assert_eq!(
+        pending,
+        NativeTerminate {
+            generation: 42,
+            confirmed: false
+        }
+    );
+    pending.merge(NativeTerminate {
+        generation: 42,
+        confirmed: true,
+    });
+    assert_eq!(
+        pending,
+        NativeTerminate {
+            generation: 42,
+            confirmed: true
+        }
     );
 }
 
@@ -1521,7 +1569,7 @@ fn the_launch_reassert_posts_nothing_and_lights_the_menu_line_for_a_regression()
             service: None,
             session: None,
         },
-        tab_number: None,
+        tab: None,
         regressed: false,
     };
     app.reassert_fda_need(&words);
@@ -1718,7 +1766,7 @@ fn the_access_question_posts_nothing_and_watches_the_probe() {
     app.hold_fda_need(
         &NeedWords {
             cause: NeedCause::ProtectedRead { session: None },
-            tab_number: None,
+            tab: None,
             regressed: true,
         },
         t0,
@@ -1816,7 +1864,7 @@ fn a_grant_settles_the_card_and_is_a_record() {
     app.hold_fda_need(
         &super::consent_card::NeedWords {
             cause: super::consent_card::NeedCause::ProtectedRead { session: None },
-            tab_number: None,
+            tab: None,
             regressed: true,
         },
         t0,

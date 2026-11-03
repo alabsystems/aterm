@@ -152,7 +152,7 @@ fn watch_stop_handoff_a_new_accepted_resume_rearms_after_the_late_queued_stop() 
     let current = setup.snapshot().unwrap();
     assert_eq!(current.revision, resumed + 1);
     assert_eq!(current.plan.selection, Selection::all());
-    assert!(!current.finished && current.permissions_allowed);
+    assert!(!current.finished && current.run_allowed);
     assert!(script().stops.iter().all(|stopped| *stopped < resumed));
     assert!(
         script().runs.is_empty(),

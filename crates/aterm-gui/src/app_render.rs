@@ -13375,7 +13375,7 @@ impl App {
 
     /// Compute this window's tab-strip fingerprint for the frame (a RepaintKey term, so it runs before the early-out), refilling the window's resident `strip_titles_scratch` in place for the splice to paint from.
     pub(crate) fn redraw_tab_strip_state(&mut self, id: WindowId) -> u64 {
-        let tab_count = self.windows.get(&id).map_or(0, |ws| ws.tab_set.len());
+        let tab_count = self.windows.get(&id).map_or(0, |ws| ws.tab_set.shown_len());
         if self.tab_strip_enabled() && tab_count > 0 {
             let Some(mut titles) = self
                 .windows
@@ -13407,12 +13407,16 @@ impl App {
             titles.clear();
             return;
         };
-        titles.truncate(ws.tab_set.len());
-        for (i, tab) in ws.tab_set.tabs().iter().enumerate() {
+        titles.truncate(ws.tab_set.shown_len());
+        for (i, tab) in ws.tab_set.shown().iter().enumerate() {
             if i >= titles.len() {
                 titles.push(String::new());
             }
             let slot = &mut titles[i];
+            if let Some(title) = self.workers_chip_title(ws, tab) {
+                *slot = title;
+                continue;
+            }
             let fallback = if tab.presentation.title.is_empty() {
                 "aterm"
             } else {
@@ -13493,7 +13497,7 @@ impl App {
         metadata.clear();
         metadata.extend(
             ws.tab_set
-                .tabs()
+                .shown()
                 .iter()
                 .map(|tab| tab_bar::TabStripMetadata::from_presentation(&tab.presentation)),
         );
@@ -17417,8 +17421,8 @@ impl App {
         let (cols, tab_count, active) = match self.windows.get(&wid) {
             Some(ws) => (
                 ws.cols as usize,
-                ws.tab_set.len(),
-                ws.tab_set.active_index().unwrap_or(0),
+                ws.tab_set.shown_len(),
+                ws.tab_set.strip_active().unwrap_or(0),
             ),
             None => return,
         };
@@ -17445,7 +17449,11 @@ impl App {
         let rename = self
             .inline_rename_edit(wid)
             .map(|edit| (edit.tab, edit.text.clone(), edit.cursor))
-            .and_then(|(tab, text, cursor)| Some((self.tab_index_for_id(wid, tab)?, text, cursor)))
+            .and_then(|(tab, text, cursor)| {
+                let chip = self.windows.get(&wid)?.tab_set.chip_of(tab)?;
+                Some((self.tab_index_for_id(wid, chip)?, text, cursor))
+            })
+            .filter(|(tab, ..)| *tab < tab_count)
             .map(|(tab, text, cursor)| {
                 match self
                     .windows
@@ -18616,7 +18624,7 @@ impl App {
         )
     }
 
-    /// Device-pixel floor below the top-row banner band (this window's multi-line-paste confirmation, or the close/quit confirmation that shares its slot on Windows, [`crate::close_confirm`]).
+    /// Device-pixel floor below the top-row banner band (this window's multi-line-paste confirmation, or the close/quit confirmation that shares its slot, [`crate::close_confirm`]).
     pub(crate) fn paste_banner_tray_floor_y(&self, wid: WindowId) -> u32 {
         let Some(window) = self.windows.get(&wid) else {
             return 0;

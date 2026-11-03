@@ -5,6 +5,8 @@ use std::cell::Cell;
 
 use super::*;
 
+const ASKED: crate::harness::provider_read::InUse = crate::harness::provider_read::InUse::Asked;
+
 fn tmp(tag: &str) -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()
         .prefix(&format!("aterm-agy-quota-{tag}-"))
@@ -54,17 +56,17 @@ fn a_fresh_reading_is_kept_and_a_stale_one_read_again() {
     let dir = tmp("fresh");
     let store = Store::new(dir.path(), "home");
     let agy = Recorded::new(Ok(doc(0.8, 0.9, 0.9)));
-    let (r, got) = current(&store, &agy, NOW, 0.1, false).unwrap();
+    let (r, got) = current(&store, &agy, NOW, 0.1, false, ASKED).unwrap();
     assert_eq!((got, agy.reads.get(), r.as_of), (Got::Read, 1, NOW));
-    let (_, got) = current(&store, &agy, NOW + FRESH_OPEN_S - 1, 0.1, false).unwrap();
+    let (_, got) = current(&store, &agy, NOW + FRESH_OPEN_S - 1, 0.1, false, ASKED).unwrap();
     assert_eq!(
         (got, agy.reads.get()),
         (Got::Kept, 1),
         "every pool open: 15 minutes current"
     );
-    let (_, got) = current(&store, &agy, NOW + FRESH_OPEN_S, 0.1, false).unwrap();
+    let (_, got) = current(&store, &agy, NOW + FRESH_OPEN_S, 0.1, false, ASKED).unwrap();
     assert_eq!((got, agy.reads.get()), (Got::Read, 2));
-    let (_, got) = current(&store, &agy, NOW + FRESH_OPEN_S, 0.1, true).unwrap();
+    let (_, got) = current(&store, &agy, NOW + FRESH_OPEN_S, 0.1, true, ASKED).unwrap();
     assert_eq!(
         (got, agy.reads.get()),
         (Got::Read, 3),
@@ -78,8 +80,8 @@ fn a_tight_pool_is_read_more_often_and_a_passed_refill_at_once() {
     let dir = tmp("tight");
     let store = Store::new(dir.path(), "home");
     let agy = Recorded::new(Ok(doc(0.0, 0.9, 0.9)));
-    current(&store, &agy, NOW, 0.1, false).unwrap();
-    let (_, got) = current(&store, &agy, NOW + FRESH_TIGHT_S, 0.1, false).unwrap();
+    current(&store, &agy, NOW, 0.1, false, ASKED).unwrap();
+    let (_, got) = current(&store, &agy, NOW + FRESH_TIGHT_S, 0.1, false, ASKED).unwrap();
     assert_eq!(got, Got::Read, "a spent pool: 5 minutes current");
     let reset = aterm_types::rfc3339::parse_utc_fractional("2026-10-28T00:19:03Z").unwrap();
     let r = store.last().unwrap();
@@ -90,7 +92,7 @@ fn a_tight_pool_is_read_more_often_and_a_passed_refill_at_once() {
     let low_store = Store::new(dir.path(), "low-refill");
     let reset_5h = aterm_types::rfc3339::parse_utc_fractional("2026-10-24T05:49:13Z").unwrap();
     let low_agy = Recorded::new(Ok(doc(0.9, 0.9, 0.05)));
-    current(&low_store, &low_agy, reset_5h - 30, 0.1, false).unwrap();
+    current(&low_store, &low_agy, reset_5h - 30, 0.1, false, ASKED).unwrap();
     let low_r = low_store.last().unwrap();
     assert!(
         low_r.fresh(reset_5h + RESET_SETTLE_S - 1, 0.1),
@@ -108,7 +110,7 @@ fn a_failed_read_falls_back_to_the_last_kept_one() {
     let store = Store::new(dir.path(), "home");
     let bad = Recorded::new(Err("`agy -p /usage` exited 1".to_owned()));
     assert_eq!(
-        current(&store, &bad, NOW, 0.1, false).unwrap_err(),
+        current(&store, &bad, NOW, 0.1, false, ASKED).unwrap_err(),
         "`agy -p /usage` exited 1"
     );
     current(
@@ -117,9 +119,10 @@ fn a_failed_read_falls_back_to_the_last_kept_one() {
         NOW,
         0.1,
         true,
+        ASKED,
     )
     .unwrap();
-    let (r, got) = current(&store, &bad, NOW + FRESH_OPEN_S, 0.1, false).unwrap();
+    let (r, got) = current(&store, &bad, NOW + FRESH_OPEN_S, 0.1, false, ASKED).unwrap();
     assert_eq!((got, r.as_of), (Got::Stale, NOW));
 }
 
@@ -128,18 +131,18 @@ fn a_failed_read_is_not_retried_until_its_backoff_passes() {
     let dir = tmp("backoff");
     let store = Store::new(dir.path(), "home");
     let bad = Recorded::new(Err("signed out".to_owned()));
-    assert!(current(&store, &bad, NOW, 0.1, false).is_err());
-    let again = current(&store, &bad, NOW + 60, 0.1, false).unwrap_err();
+    assert!(current(&store, &bad, NOW, 0.1, false, ASKED).is_err());
+    let again = current(&store, &bad, NOW + 60, 0.1, false, ASKED).unwrap_err();
     assert!(
         again.contains("signed out") && again.contains("waits"),
         "{again}"
     );
     assert_eq!(bad.reads.get(), 1, "inside the backoff agy is not asked");
-    let _ = current(&store, &bad, NOW + 60, 0.1, true);
+    let _ = current(&store, &bad, NOW + 60, 0.1, true, ASKED);
     assert_eq!(bad.reads.get(), 2, "a forced read asks anyway");
     let good = Recorded::new(Ok(doc(0.5, 0.5, 0.5)));
     assert_eq!(
-        current(&store, &good, NOW + FAIL_BACKOFF_S + 60, 0.1, false)
+        current(&store, &good, NOW + FAIL_BACKOFF_S + 60, 0.1, false, ASKED)
             .unwrap()
             .1,
         Got::Read
@@ -160,12 +163,13 @@ fn a_held_lock_hands_out_the_kept_reading_and_asks_agy_nothing() {
         NOW,
         0.1,
         false,
+        ASKED,
     )
     .unwrap();
     let held = store.try_lock().expect("the first lock");
     assert!(store.try_lock().is_none(), "one reader at a time");
     let agy = Recorded::new(Ok(doc(0.4, 0.4, 0.4)));
-    let (_, got) = current(&store, &agy, NOW + FRESH_OPEN_S, 0.1, true).unwrap();
+    let (_, got) = current(&store, &agy, NOW + FRESH_OPEN_S, 0.1, true, ASKED).unwrap();
     assert_eq!((got, agy.reads.get()), (Got::Stale, 0));
     drop(held);
     assert!(
@@ -197,6 +201,7 @@ fn the_history_gives_each_limit_its_burn_and_when_it_runs_out() {
             at,
             0.1,
             true,
+            ASKED,
         )
         .unwrap();
     }
@@ -308,7 +313,7 @@ fn a_launch_rotates_off_the_spent_pool_on_the_kept_reading() {
 
     let spent = Recorded::new(Ok(doc(0.0, 0.0, 0.0)));
     let spent_store = Store::new(dir.path(), "spent");
-    let (reading, _) = current(&spent_store, &spent, NOW, r.low, false).unwrap();
+    let (reading, _) = current(&spent_store, &spent, NOW, r.low, false, ASKED).unwrap();
     let reset = reading
         .quota
         .groups
@@ -328,7 +333,7 @@ fn a_launch_rotates_off_the_spent_pool_on_the_kept_reading() {
         None,
         "a failed refresh after refill leaves launch availability unknown"
     );
-    let (shown, got) = current(&spent_store, &mute, settled, r.low, false).unwrap();
+    let (shown, got) = current(&spent_store, &mute, settled, r.low, false, ASKED).unwrap();
     assert_eq!((got, shown.as_of), (Got::Stale, NOW));
     assert_eq!(
         shown.quota, reading.quota,
@@ -339,7 +344,7 @@ fn a_launch_rotates_off_the_spent_pool_on_the_kept_reading() {
     // a stale launch pick still rotates off the weekly-spent pool onto the open pool.
     let partial_store = Store::new(dir.path(), "partial-stale");
     let partial = Recorded::new(Ok(doc(0.0, 0.9, 0.0)));
-    let _ = current(&partial_store, &partial, NOW, r.low, false).unwrap();
+    let _ = current(&partial_store, &partial, NOW, r.low, false, ASKED).unwrap();
     let stale_rot = rotate_launch(asked, &partial_store, &mute, &r, settled)
         .expect("weekly-spent pool still rotates to the pool whose 5h refill settled");
     assert_eq!(stale_rot.got, Got::Stale);
@@ -435,8 +440,9 @@ fn a_launch_rotates_off_the_spent_pool_on_the_kept_reading() {
         }
     );
 
-    // A spent bucket whose reset_at (NOW + 19_800) is crossed < WALL_FORCE_FLOOR_S after a
-    // pre-refill reading (NOW + 19_790) still forces a fresh read at the wall once `now >= reset_at`.
+    // A spent bucket whose reset_at (reset_5h) is crossed < WALL_FORCE_FLOOR_S after a
+    // pre-refill reading (reset_5h - 10) still forces a fresh read at the wall once `now >= reset_at`.
+    let reset_5h = aterm_types::rfc3339::parse_utc_fractional("2026-10-24T05:49:13Z").unwrap();
     let cross_store = Store::new(dir.path(), "cross");
     let pre_refill = Recorded::new(Ok(doc(0.0, 0.0, 0.0)));
     let _ = rotate_launch_at(
@@ -444,30 +450,47 @@ fn a_launch_rotates_off_the_spent_pool_on_the_kept_reading() {
         &cross_store,
         &pre_refill,
         &r,
-        NOW + 19_790,
+        reset_5h - 10,
         true,
     )
     .unwrap();
+    let mute_before = mute.reads.get();
     assert_eq!(
         rotate_launch_at(
             Some("claude-opus-5-5-medium"),
             &cross_store,
             &mute,
             &r,
-            NOW + 19_805,
+            reset_5h + 5,
             true,
         ),
         None,
         "a failed refresh after crossing reset_at at a wall refuses the pre-refill reading"
     );
+    assert_eq!(mute.reads.get(), mute_before + 1);
+    // That failed read was this wall's one read until the settle point (`reset_5h + RESET_SETTLE_S`),
+    // and still refuses the pre-refill reading without polling agy again inside the settle window.
     let _ = std::fs::remove_file(cross_store.failed_path());
     let post_refill = Recorded::new(Ok(doc(0.0, 1.0, 1.0)));
+    assert_eq!(
+        rotate_launch_at(
+            Some("claude-opus-5-5-medium"),
+            &cross_store,
+            &post_refill,
+            &r,
+            reset_5h + 40,
+            true,
+        ),
+        None,
+        "spent wall inside the settle window neither re-reads agy nor trusts the pre-refill reading"
+    );
+    assert_eq!(post_refill.reads.get(), 0);
     let crossed = rotate_launch_at(
         Some("claude-opus-5-5-medium"),
         &cross_store,
         &post_refill,
         &r,
-        NOW + 19_805,
+        reset_5h + 5 + WALL_READ_SPENT_S,
         true,
     )
     .unwrap();
@@ -482,7 +505,6 @@ fn a_launch_rotates_off_the_spent_pool_on_the_kept_reading() {
         default: Some("gemini-4-argon-high"),
         ..Recorded::new(Ok(doc(0.0, 0.8, 0.0)))
     };
-    let reset_5h = aterm_types::rfc3339::parse_utc_fractional("2026-10-24T05:49:13Z").unwrap();
     let initial = rotate_launch(None, &hold_store, &hold_agy, &r, NOW).unwrap();
     assert_eq!(
         initial.pick,
@@ -568,7 +590,7 @@ fn store_rejects_fifos_and_replaces_them_atomically() {
         .expect("non-regular lock file is treated as stale and replaced");
     drop(lock);
     let agy = Recorded::new(Ok(doc(0.75, 0.9, 0.9)));
-    let (r, got) = current(&store, &agy, NOW, 0.1, false).unwrap();
+    let (r, got) = current(&store, &agy, NOW, 0.1, false, ASKED).unwrap();
     assert_eq!((got, r.as_of), (Got::Read, NOW));
     assert_eq!(store.history().len(), 1);
     assert!(!r.fresh(i64::MAX, 0.1));
@@ -603,4 +625,160 @@ fn store_rejects_fifos_and_replaces_them_atomically() {
         None,
         "extreme sample timestamps must not overflow i64 subtraction"
     );
+}
+
+/// A running session between turns reads nothing, however old the record: it rotates on what
+/// launches and walls last read. CONTROL: a launch on the same aged record does ask agy.
+#[test]
+fn a_running_session_rotates_on_the_record_and_asks_agy_nothing() {
+    let dir = tmp("on-record");
+    let store = Store::new(dir.path(), "running");
+    let r = agy_quota::Rotation::default();
+    let asked = Some("claude-opus-5-5-medium");
+    let (none, events) =
+        crate::harness::provider_read::captured(|| rotate_on_record(asked, &store, &r, NOW));
+    assert_eq!(none, None, "nothing on record, and nothing asked");
+    assert!(events.is_empty());
+    let spent = Recorded::new(Ok(doc(0.95, 0.0, 0.0)));
+    let _ = rotate_launch(asked, &store, &spent, &r, NOW);
+    assert_eq!(spent.reads.get(), 1);
+    let aged = NOW + FRESH_OPEN_S * 2;
+    let (pick, events) =
+        crate::harness::provider_read::captured(|| rotate_on_record(asked, &store, &r, aged));
+    let pick = pick.expect("the record speaks");
+    assert!(
+        matches!(pick.pick, agy_quota::Pick::Rotate { .. }),
+        "{pick:?}"
+    );
+    assert_eq!(pick.got, Got::Stale);
+    assert!(events.is_empty(), "no read, no report");
+    let (_, events) =
+        crate::harness::provider_read::captured(|| rotate_launch(asked, &store, &spent, &r, aged));
+    assert_eq!(spent.reads.get(), 2, "CONTROL: a launch reads");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].why,
+        crate::harness::provider_read::InUse::Launching
+    );
+}
+
+/// However many times the loop looks at a wall, it reads once; a refill the reading records, or a
+/// wall standing past [`WALL_READ_SPENT_S`], reads once more. CONTROL: the first look and those
+/// two do read, on the same store, so the spent stamp is what holds the other looks back.
+#[test]
+fn a_wall_makes_one_read_however_often_it_is_looked_at() {
+    let dir = tmp("one-wall");
+    let store = Store::new(dir.path(), "wall");
+    let r = agy_quota::Rotation::default();
+    let asked = Some("claude-opus-5-5-medium");
+    let agy = Recorded::new(Ok(doc(0.95, 0.5, 0.0)));
+    let wall = |at: i64| rotate_launch_at(asked, &store, &agy, &r, at, true);
+    let reset = wall(NOW).expect("a pick").quota.groups[1].buckets[1]
+        .reset_at()
+        .expect("the wall's reset");
+    assert_eq!(agy.reads.get(), 1, "CONTROL: a wall's first look reads");
+    let shortly = reset.min(NOW + WALL_READ_SPENT_S) - 1;
+    let mut at = NOW + WALL_FORCE_FLOOR_S;
+    while at < shortly {
+        let _ = wall(at);
+        at += WALL_FORCE_FLOOR_S;
+    }
+    assert_eq!(agy.reads.get(), 1, "a standing wall has had its read");
+    let _ = wall(reset.max(NOW + WALL_READ_SPENT_S));
+    assert_eq!(
+        agy.reads.get(),
+        2,
+        "CONTROL: the refill arrived, or the hour passed"
+    );
+}
+
+/// NEGATIVE CONTROL: a failed wall read on a cold store or past a settled refill still spends the
+/// wall's one-hour read budget instead of re-polling every [`FAIL_BACKOFF_S`], while a newer
+/// launch reading supersedes an older cold-wall stamp so a later session's wall can refresh.
+#[test]
+fn failed_wall_reads_spend_the_wall_budget_without_repolling_after_backoff() {
+    let dir = tmp("failed-wall");
+    let r = agy_quota::Rotation::default();
+    let asked = Some("claude-opus-5-5-medium");
+
+    // 1. Cold store: a failed wall read writes `.wall` and makes zero extra reads past
+    // `FAIL_BACKOFF_S` until `WALL_READ_SPENT_S` elapses (or a newer launch reading arrives).
+    let cold_store = Store::new(dir.path(), "cold");
+    let failing = Recorded::new(Err("not signed in".to_owned()));
+    assert_eq!(
+        rotate_launch_at(asked, &cold_store, &failing, &r, NOW, true),
+        None
+    );
+    assert_eq!(failing.reads.get(), 1);
+    for at in [NOW + FAIL_BACKOFF_S + 10, NOW + WALL_READ_SPENT_S - 1] {
+        assert_eq!(
+            rotate_launch_at(asked, &cold_store, &failing, &r, at, true),
+            None
+        );
+    }
+    assert_eq!(
+        failing.reads.get(),
+        1,
+        "cold wall failure must spend the wall's one-hour read budget"
+    );
+    let signed_in = Recorded::new(Ok(doc(0.95, 0.95, 0.95)));
+    let launched = rotate_launch(
+        asked,
+        &cold_store,
+        &signed_in,
+        &r,
+        NOW + FAIL_BACKOFF_S + 20,
+    )
+    .expect("a later launch after sign-in still reads once backoff expires");
+    assert_eq!((launched.got, signed_in.reads.get()), (Got::Read, 1));
+    let later_wall = Recorded::new(Ok(doc(0.95, 0.5, 0.0)));
+    let rotated = rotate_launch_at(
+        asked,
+        &cold_store,
+        &later_wall,
+        &r,
+        NOW + FAIL_BACKOFF_S + 20 + WALL_FORCE_FLOOR_S,
+        true,
+    )
+    .expect("a new launch reading supersedes the earlier cold-wall stamp");
+    assert_eq!((rotated.got, later_wall.reads.get()), (Got::Read, 1));
+
+    // 2. Post-settle wall failure over a pre-refill reading (`reset_5h`,
+    // `settled = reset_5h + RESET_SETTLE_S`) holds the spent stamp for the full hour past
+    // `post_settle`.
+    let reset_5h = aterm_types::rfc3339::parse_utc_fractional("2026-10-24T05:49:13Z").unwrap();
+    let post_settle = reset_5h + RESET_SETTLE_S + 10;
+    let settled_store = Store::new(dir.path(), "settled");
+    let pre = Recorded::new(Ok(doc(0.0, 0.0, 0.0)));
+    let _ = rotate_launch_at(asked, &settled_store, &pre, &r, reset_5h - 10, true).unwrap();
+    assert_eq!(
+        rotate_launch_at(asked, &settled_store, &failing, &r, post_settle, true),
+        None
+    );
+    assert_eq!(failing.reads.get(), 2);
+    for at in [
+        post_settle + FAIL_BACKOFF_S + 10,
+        post_settle + WALL_READ_SPENT_S - 1,
+    ] {
+        assert_eq!(
+            rotate_launch_at(asked, &settled_store, &failing, &r, at, true),
+            None
+        );
+    }
+    assert_eq!(
+        failing.reads.get(),
+        2,
+        "post-settle failed wall read must not re-poll until WALL_READ_SPENT_S"
+    );
+    let recovered = Recorded::new(Ok(doc(0.0, 1.0, 1.0)));
+    let after_hour = rotate_launch_at(
+        asked,
+        &settled_store,
+        &recovered,
+        &r,
+        post_settle + WALL_READ_SPENT_S,
+        true,
+    )
+    .expect("CONTROL: once WALL_READ_SPENT_S elapses, the next look reads again");
+    assert_eq!((after_hour.got, recovered.reads.get()), (Got::Read, 1));
 }

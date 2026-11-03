@@ -46,8 +46,7 @@ impl Need {
             "agh.toml is missing on this builder",
             "the lanes route their GitHub identities through it, and a missing file is never \
              read as no identities",
-            "agh auth add NAME --file PATH --tier TIER, or aterm secrets sync, whose ~/.secrets \
-             token files agh adopts (docs/RUNBOOK-atpkg-republish.md)",
+            CONFIG_PROVISION,
             at_secs,
         )
     }
@@ -64,6 +63,13 @@ impl Need {
         )
     }
 }
+
+/// The step that provisions a missing agh.toml the lanes can use, from a builder's token
+/// files: `agh.config.missing`'s `then`, and the step `atpkg-publish hosts check` names. A
+/// profile named `dev` or `release` starts a file that routes alone.
+pub const CONFIG_PROVISION: &str = "agh auth add dev|release --file PATH --tier TIER --owner \
+                                    OWNER --write for each lane writer, then agh policy grant \
+                                    atpkg-publish REPO (docs/RUNBOOK-atpkg-republish.md)";
 
 /// The longest file `list` reads: 8 KiB.
 pub const NEED_MAX: usize = 8 << 10;

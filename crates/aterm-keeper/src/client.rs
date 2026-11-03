@@ -193,8 +193,8 @@ impl KeeperClient {
         self.stream
             .set_read_timeout(Some(WELCOME_WAIT.max(self.frame_wait)))?;
         let answer = read(self);
-        self.stream.set_read_timeout(Some(self.frame_wait))?;
-        answer
+        let reset = self.stream.set_read_timeout(Some(self.frame_wait));
+        answer.and_then(|value| reset.map(|()| value))
     }
 
     /// Send HELLO as a window and collect the WELCOME's offers.
@@ -339,8 +339,15 @@ impl KeeperClient {
             None,
         )?;
         self.answer(|c| match c.recv()?.map(|i| i.frame) {
-            Some(Frame::Welcome { .. }) => Ok(()),
-            other => Err(protocol(format!("expected WELCOME, got {other:?}"))),
+            Some(Frame::Welcome {
+                offers: 0,
+                identity,
+                caps,
+                ..
+            }) => c.welcomed(identity, caps),
+            other => Err(protocol(format!(
+                "expected an empty WELCOME, got {other:?}"
+            ))),
         })?;
         self.send(
             &Frame::Status {
@@ -1536,7 +1543,8 @@ mod tests {
                 let dial = || KeeperClient::connect(&sock, &id, Duration::from_secs(60));
                 let link = dial()?.hello_link("t", None, false);
                 let boot = dial()?.hello_app("t").map(|_| ());
-                Ok::<_, io::Error>((link, boot))
+                let stat = dial()?.status("t").map(|_| ());
+                Ok::<_, io::Error>((link, boot, stat))
             });
             while !window.is_finished() {
                 server.step(20).expect("step");
@@ -1552,8 +1560,8 @@ mod tests {
             {
                 aterm_spec::host::could_not_run(format_args!("{TRUSTD_SILENT}: {name}: {e}"));
             }
-            let (link, boot) = joined.expect("the keeper's code is this build's");
-            for (what, got) in [("link", link), ("boot", boot)] {
+            let (link, boot, stat) = joined.expect("the keeper's code is this build's");
+            for (what, got) in [("link", link), ("boot", boot), ("status", stat)] {
                 if let Err(e) = &got
                     && silent(e)
                 {
@@ -2501,6 +2509,129 @@ mod offer_tests {
                 Err(Refused::Gone(_))
             ),
             "an ended worker is gone, not full"
+        );
+    }
+
+    /// STATUS CHECKS THE KEEPER'S IDENTITY FLOOR AND EMPTY WELCOME: a `Designated` client
+    /// calling `status()` refuses a `SameUid` or legacy untagged `WELCOME` with `NotThisBuild`
+    /// and rejects a non-zero `offers` count as out of protocol.
+    /// NEGATIVE CONTROL: a `Designated` `WELCOME` with `offers: 0` succeeds and records `caps`,
+    /// and a `SameUid` client accepts a `SameUid` `WELCOME`.
+    #[cfg(unix)]
+    #[test]
+    fn status_enforces_the_clients_identity_floor_and_empty_welcome() {
+        let run_case = |policy: IdentityPolicy,
+                        offers: u16,
+                        served: Option<IdentityPolicy>,
+                        caps: Option<u8>,
+                        reply_status: bool| {
+            let (stream, peer_stream) = CtlStream::pair().expect("pair");
+            let peer = std::thread::spawn(move || {
+                peer_stream
+                    .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+                    .expect("timeout");
+                let hello = read_frame(&peer_stream)
+                    .expect("read")
+                    .expect("hello")
+                    .frame;
+                assert!(
+                    matches!(
+                        hello,
+                        Frame::Hello {
+                            class: PeerClass::Status,
+                            ..
+                        }
+                    ),
+                    "{hello:?}"
+                );
+                let welcome = Frame::Welcome {
+                    proto: PROTO,
+                    offers,
+                    version: "test".into(),
+                    identity: served,
+                    caps,
+                };
+                write_frame(&peer_stream, &welcome, None).expect("welcome");
+                if reply_status {
+                    let ask = read_frame(&peer_stream)
+                        .expect("read")
+                        .expect("status")
+                        .frame;
+                    assert!(matches!(ask, Frame::Status { .. }), "{ask:?}");
+                    write_frame(
+                        &peer_stream,
+                        &Frame::Status {
+                            text: "keeper=running".into(),
+                        },
+                        None,
+                    )
+                    .expect("status reply");
+                    Some(peer_stream)
+                } else {
+                    None
+                }
+            });
+            let wait = Duration::from_secs(2);
+            stream.set_read_timeout(Some(wait)).expect("read timeout");
+            stream.set_write_timeout(Some(wait)).expect("write timeout");
+            let client = KeeperClient {
+                stream,
+                frame_wait: wait,
+                policy,
+                keeper_caps: Cell::new(0),
+                syncs: Cell::new(0),
+                synced: Cell::new(0),
+            };
+            let got = client.status("t");
+            let _held = peer.join().expect("peer");
+            (client, got)
+        };
+
+        let (_, uid_floor) = run_case(
+            IdentityPolicy::Designated,
+            0,
+            Some(IdentityPolicy::SameUid),
+            Some(0),
+            false,
+        );
+        let err = uid_floor.expect_err("Designated status must refuse --identity uid keeper");
+        assert!(refused_identity(&err), "{err}");
+        assert!(err.to_string().contains("--identity uid"), "{err}");
+
+        let (_, untagged) = run_case(IdentityPolicy::Designated, 0, None, None, false);
+        let err = untagged.expect_err("Designated status must refuse untagged legacy keeper");
+        assert!(refused_identity(&err), "{err}");
+
+        let (_, non_empty) = run_case(
+            IdentityPolicy::Designated,
+            1,
+            Some(IdentityPolicy::Designated),
+            Some(0),
+            false,
+        );
+        let err = non_empty.expect_err("status WELCOME with offers != 0 is out of protocol");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+
+        let (designated_client, ok) = run_case(
+            IdentityPolicy::Designated,
+            0,
+            Some(IdentityPolicy::Designated),
+            Some(CAP_JOURNAL | CAP_SYNC),
+            true,
+        );
+        assert_eq!(ok.expect("Designated keeper accepted"), "keeper=running");
+        assert!(designated_client.keeper_journals() && designated_client.keeper_syncs());
+
+        let (_, same_uid_ok) = run_case(
+            IdentityPolicy::SameUid,
+            0,
+            Some(IdentityPolicy::SameUid),
+            Some(0),
+            true,
+        );
+        assert_eq!(
+            same_uid_ok.expect("SameUid client accepted"),
+            "keeper=running"
         );
     }
 }

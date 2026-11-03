@@ -569,3 +569,139 @@ fn a_landing_marks_what_aterm_checked() {
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(restated, (None, None), "no receipt, no checked=");
 }
+
+const COULD_NOT_FINISH_REPLY: &str = "Could not finish: the grammar the parser needs was deleted.";
+
+fn working_task() -> Option<(u64, String)> {
+    Some((
+        1,
+        "state=working from=s-0a1b since_ms=0 result_bytes=0".to_string(),
+    ))
+}
+
+/// The marks the loop asked for and how many turns it typed, on these `screens` and `task`.
+fn run_with_task(
+    tag: &str,
+    screens: Vec<Vec<String>>,
+    gates: Vec<usize>,
+    task: Option<(u64, String)>,
+) -> (Vec<String>, usize, Vec<String>) {
+    let root = crate::supervise::ScratchDir::new("conclusion", tag);
+    let host = Receipts::over(on_main(HEAD), None);
+    let mut m = mock(screens, gates);
+    m.task = task;
+    let opts = SuperviseOpts {
+        tasks: Some(root.join(tag)),
+        ..opts_for(&host, None)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            short_backoff: Duration::from_millis(30),
+            short_backoff_max: Duration::from_millis(60),
+            ..TurnEndTiming::default()
+        });
+    });
+    let marks = m
+        .task_requests
+        .iter()
+        .filter(|r| r.starts_with("task mark "))
+        .cloned()
+        .collect();
+    let turns = count(&m, "turn");
+    (marks, turns, lines)
+}
+
+/// A MANAGED WORKER'S `Could not finish:` MARKS ITS RECORD AND ENDS THE TYPING: Land's instruction
+/// went in, the reply came, and nothing follows it, however long the screen stands. The mark names
+/// no `checked=`, since nothing was. NEGATIVE CONTROL: the same reply in a session with no task
+/// record is a report like any other, and Land nudges on.
+#[test]
+fn a_could_not_finish_reply_marks_failed_and_types_nothing_more() {
+    let reply = || {
+        vec![
+            busy_screen(),
+            ended(PROGRESS),
+            busy_screen(),
+            ended(COULD_NOT_FINISH_REPLY),
+        ]
+    };
+    let (marks, turns, lines) = run_with_task("managed", reply(), vec![1], working_task());
+    assert_eq!(turns, 1, "the instruction alone: {lines:#?}");
+    let [mark] = marks.as_slice() else {
+        panic!("one mark: {marks:?}: {lines:#?}");
+    };
+    assert!(
+        mark.starts_with("task mark failed why=could-not-finish"),
+        "{mark}"
+    );
+    assert!(!mark.contains("checked="), "{mark}");
+
+    let (marks, turns, lines) = run_with_task("unmanaged", reply(), vec![1, 3], None);
+    assert!(marks.is_empty(), "{marks:?}");
+    assert!(turns >= 2, "Land goes on: {lines:#?}");
+}
+
+/// A CONCLUSION THE LOOP BEFORE THIS ONE MADE STANDS IN THIS ONE (a harness restart): nothing is
+/// typed at the reply it read and nothing is marked. NEGATIVE CONTROL: a record no `GaveUp` word
+/// names (`why=off`, the Autopilot word's to hold) seeds no rest, so the same screen under Land
+/// types the instruction.
+#[test]
+fn a_restarted_loop_takes_a_failed_record_and_types_nothing() {
+    let failed = |why: &str| {
+        Some((
+            3,
+            format!("state=failed from=s-0a1b since_ms=0 result_bytes=9 why={why}"),
+        ))
+    };
+    for why in ["could-not-finish", "repeated"] {
+        let (marks, turns, lines) =
+            run_with_task(why, vec![ended(PROGRESS)], Vec::new(), failed(why));
+        assert_eq!(turns, 0, "{why}: {lines:#?}");
+        assert!(marks.is_empty(), "{why}: {marks:?}");
+    }
+    let (_, turns, lines) = run_with_task(
+        "off",
+        vec![ended(PROGRESS), busy_screen()],
+        vec![0],
+        failed("off"),
+    );
+    assert!(turns >= 1, "the instruction: {lines:#?}");
+}
+
+/// THE SAME REPLY ENDS A MANAGED WORKER'S WORK: Land's instruction and its answer went in, the
+/// question came back word for word after no work, and the stop that takes the point marks `failed
+/// why=repeated` and types nothing new. NEGATIVE CONTROL: with no task record the same stop rests
+/// and marks nothing.
+#[test]
+fn the_same_reply_again_marks_failed_and_types_nothing_new() {
+    let asked = || {
+        let mut r = rows(&[
+            "⏺ Does the parser have to keep the old syntax?",
+            "",
+            "✻ Worked for 5s · done 4:24 PM",
+            "",
+        ]);
+        r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        r
+    };
+    let reply = || {
+        vec![
+            busy_screen(),
+            ended(PROGRESS),
+            busy_screen(),
+            asked(),
+            busy_screen(),
+            asked(),
+        ]
+    };
+    let (marks, turns, lines) = run_with_task("repeated", reply(), vec![1, 3], working_task());
+    assert_eq!(turns, 2, "the instruction and the answer: {lines:#?}");
+    let [mark] = marks.as_slice() else {
+        panic!("one mark: {marks:?}: {lines:#?}");
+    };
+    assert!(mark.starts_with("task mark failed why=repeated"), "{mark}");
+
+    let (marks, turns, lines) = run_with_task("rests", reply(), vec![1, 3], None);
+    assert!(marks.is_empty(), "{marks:?}");
+    assert_eq!(turns, 2, "{lines:#?}");
+}

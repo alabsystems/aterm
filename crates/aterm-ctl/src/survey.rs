@@ -84,7 +84,8 @@ pub struct PeerSurvey {
     pub unproven: bool,
     /// The node the read asked for, when the book names one.
     pub node: Option<String>,
-    /// The address it answered at, where it answered.
+    /// The address it answered at, where it answered; else the address its failed dial went to,
+    /// where the dial went to one (the on-link rule's, [`fleet_note_at`]).
     pub addr: Option<String>,
 }
 
@@ -105,6 +106,11 @@ pub enum PeerFault {
     /// Took the connection and sent no fleet handshake in time (a stopped, frozen or overloaded
     /// aterm), so the survey was not sent: alone in a read, exit 2.
     Unserved,
+    /// A host at its address answered the dial and no survey came back: it refused the connect
+    /// (no aterm listening), or the handshake, the proof or the reply failed. The dial reached the
+    /// link, so on this Mac's network it shows Local Network privacy let this process onto it
+    /// (`aterm_netplace::words::Dial::Reached`).
+    HostAnswered,
 }
 
 /// Aggregate result from [`FleetSurveyFn`].
@@ -180,6 +186,7 @@ pub(crate) fn parse_args(parts: &[String]) -> Result<Args, String> {
                     .and_then(|s| s.parse::<f64>().ok())
                     .filter(|s| *s > 0.0 && *s <= FLEET_WITHIN_MAX.as_secs_f64())
                     .map(Duration::from_secs_f64)
+                    .filter(|d| !d.is_zero())
                     .ok_or_else(|| USAGE.to_string())?;
                 timeout = true;
             }
@@ -326,6 +333,9 @@ enum Class {
     Stalled,
     /// An agent at work.
     Busy,
+    /// Ended unfinished within the last [`NEWLY_DONE_MS`]: a `failed` task, or one that exited
+    /// before it finished (`task_conclusion=failed`). Never counted as done.
+    Failed,
     /// Completed within the last [`NEWLY_DONE_MS`].
     Done,
     /// Any other agent.
@@ -367,6 +377,11 @@ fn class_of(s: &Fields) -> Class {
         Class::Stalled
     } else if agent == Some("busy") {
         Class::Busy
+    } else if (task == Some("failed")
+        || (task == Some("exited") && s.get("task_conclusion") == Some("failed")))
+        && recent("task_ms")
+    {
+        Class::Failed
     } else if (matches!(task, Some("done" | "exited")) && recent("task_ms"))
         || (agent == Some("idle") && recent("agent_ms"))
     {
@@ -414,13 +429,26 @@ fn running(s: &Fields) -> Option<&str> {
     })
 }
 
+fn is_decimal_figure(g: &str) -> bool {
+    if g.is_empty() || g.len() > 8 {
+        return false;
+    }
+    match g.split_once('.') {
+        None => g.bytes().all(|b| b.is_ascii_digit()),
+        Some((whole, frac)) => {
+            !whole.is_empty()
+                && !frac.is_empty()
+                && whole.bytes().all(|b| b.is_ascii_digit())
+                && frac.bytes().all(|b| b.is_ascii_digit())
+        }
+    }
+}
+
 /// What a build's front waiting for memory (`wait=memory`) claims, as its line says it after its
 /// program: ` (<GiB> GiB, <n> ahead)`, either half where its record says only that one, nothing
 /// where it says neither. A figure that is no number (a peer's) is not shown.
 fn claim_shown(s: &Fields) -> String {
-    let gib = s
-        .get("wait_gib")
-        .filter(|g| g.len() <= 8 && g.bytes().all(|b| b.is_ascii_digit() || b == b'.'));
+    let gib = s.get("wait_gib").filter(|g| is_decimal_figure(g));
     let ahead = s.number("wait_ahead").map(|n| format!("{n} ahead"));
     match (gib.map(|g| format!("{g} GiB")), ahead) {
         (Some(gib), Some(ahead)) => format!(" ({gib}, {ahead})"),
@@ -444,11 +472,14 @@ fn shown(text: &str, cap: usize) -> String {
 }
 
 /// A typed-by credit within `room`, and whether the line keeps it whole: a fleet credit keeps
-/// `(node <8 hex>) over the fleet`, its host cut only to the room left, or dropped; any other is
+/// `(node <head>) over the fleet`, its host cut only to the room left, or dropped; any other is
 /// cut at 24.
 fn credit_shown(by: &str, room: usize) -> (String, bool) {
     const FLEET: &str = " over the fleet";
-    let node = |word: &str| word.len() == 8 && word.bytes().all(|b| b.is_ascii_hexdigit());
+    // A node's head: eight hex digits, more where another node the driven Mac knows shares them,
+    // up to its whole id (`fleet_member::node_head`).
+    let node =
+        |word: &str| (8..=32).contains(&word.len()) && word.bytes().all(|b| b.is_ascii_hexdigit());
     let Some(named) = by.strip_suffix(FLEET) else {
         return (shown(by, 24), false);
     };
@@ -542,6 +573,24 @@ pub(crate) fn walled_until_ms(row: &Fields) -> Option<u64> {
     row.number("walled_until").map(|s| s.saturating_mul(1000))
 }
 
+/// When an account row's seven-day window resets (`week_reset=`, Unix seconds), in Unix
+/// milliseconds on its instance's clock, as its header's `at_ms=`.
+pub(crate) fn week_reset_ms(row: &Fields) -> Option<u64> {
+    row.number("week_reset").map(|s| s.saturating_mul(1000))
+}
+
+/// The seven-day window figure of `row` at `at_ms`: `None` once its `week_reset=` has passed on
+/// its instance's clock.
+pub(crate) fn effective_pct7(row: &Fields, at_ms: Option<u64>) -> Option<u64> {
+    if week_reset_ms(row)
+        .zip(at_ms)
+        .is_some_and(|(reset, at)| reset <= at)
+    {
+        return None;
+    }
+    row.number("pct7")
+}
+
 /// What one account row says, for [`accounts_line`]: its label (`id=`), and its windows where it
 /// can take a session, else why not (`walled 3h` from the instance's own clock, `at_ms=`, which a
 /// wall that ended by then no longer stands on: its rows may be read up to a minute before it
@@ -566,8 +615,11 @@ fn account_said(row: &Fields, at_ms: Option<u64>, remote: bool) -> String {
     }
     let mut said = label;
     let mut figures = false;
-    for (key, window) in [("pct7", "7d"), ("pct5", "5h")] {
-        if let Some(pct) = row.number(key) {
+    for (pct, window) in [
+        (effective_pct7(row, at_ms), "7d"),
+        (row.number("pct5"), "5h"),
+    ] {
+        if let Some(pct) = pct {
             said.push_str(&format!(" {window} {pct}%"));
             figures = true;
         }
@@ -656,6 +708,7 @@ fn header_line(reply: &HostReply, survey: &Survey) -> String {
         (Class::Asking, "asking"),
         (Class::Stalled, "stalled"),
         (Class::Busy, "busy"),
+        (Class::Failed, "failed"),
         (Class::Done, "done"),
     ] {
         let n = survey
@@ -867,7 +920,7 @@ fn session_line(s: &Fields, own: Option<&str>, remote: bool, cut: bool) -> Strin
     if let Some(ms) = s.number("human_ms").filter(|&ms| ms < NEWLY_DONE_MS) {
         line.push_str(&format!(" human={}", age(ms)));
     }
-    // A name in words at content (a tab's name, `<host> (node <8 hex>) over the fleet`), shown as
+    // A name in words at content (a tab's name, `<host> (node <head>) over the fleet`), shown as
     // the title is.
     let mut kept = 0;
     if let (Some(by), Some(ms)) = (
@@ -1009,8 +1062,8 @@ fn excerpts(s: &Fields, facts: bool) -> Vec<Excerpt> {
     } else {
         &[("attention", "attention"), ("goal", "goal")]
     };
-    let finished =
-        matches!(s.get("task"), Some("done" | "exited")) || s.get("agent") == Some("idle");
+    let finished = matches!(s.get("task"), Some("done" | "exited" | "failed"))
+        || s.get("agent") == Some("idle");
     worded
         .iter()
         .copied()
@@ -1149,7 +1202,7 @@ fn fill_order(blocks: &Blocks) -> Vec<Unit> {
         let Ok(block) = block else {
             continue;
         };
-        let mut nth = [0usize; 7];
+        let mut nth = [0usize; 8];
         let mut round = 0usize;
         for (e, entry) in block.entries.iter().enumerate() {
             let class = entry.class as usize;
@@ -1448,6 +1501,7 @@ fn more_line(rest: &[Entry]) -> String {
         (Class::Asking, "asking"),
         (Class::Stalled, "stalled"),
         (Class::Busy, "busy"),
+        (Class::Failed, "failed"),
         (Class::Done, "done"),
         (Class::Agent, "other agents"),
         (Class::Running, "running shells"),
@@ -1869,11 +1923,20 @@ fn place_now() -> Option<aterm_netplace::Place> {
     }
 }
 
-/// The note a fleet read ends with, given this Mac's network place `place`: away from the ALab LAN
-/// (on another network), a read no dialled peer answered says where this Mac is
-/// (`aterm_netplace::words::survey_note`), not a Local Network privacy blame and not nothing (the
-/// timeouts of a hotspot); a sandbox that refused every connect is still said as the sandbox.
-/// Elsewhere it is [`fleet_note`]'s.
+/// The note a fleet read ends with, given this Mac's network place `place`:
+///
+/// - a sandbox that refused every connect is still said as the sandbox;
+/// - a member on this Mac's network that this read found no route to, while nothing there
+///   answered (no member, and no host that refused or failed a handshake), is this Mac's own
+///   Local Network privacy, wherever this Mac is
+///   (`aterm_netplace::words::on_link`, [`aterm_netplace::words::ON_LINK_PRIVACY_NOTE`]), a
+///   member on the same phone hotspot included;
+/// - away from the ALab LAN (on another network), a read no dialled peer answered says where this
+///   Mac is (`aterm_netplace::words::survey_note`), not a privacy blame and not nothing (the
+///   timeouts of a hotspot);
+/// - a no-route the on-link rule placed off this network, or on it while another member there
+///   answered (that member's own, off the link now: its row says so), blames no privacy setting;
+///   only one with no address to judge keeps [`fleet_note`]'s, which is the rest's note.
 pub(crate) fn fleet_note_at(
     peers: &[PeerSurvey],
     place: Option<&aterm_netplace::Place>,
@@ -1883,6 +1946,11 @@ pub(crate) fn fleet_note_at(
     if note == Some(SANDBOX_NOTE) {
         return note.map(str::to_owned);
     }
+    let on_link =
+        place.map(|place| aterm_netplace::words::on_link(place, peers.iter().map(dial_of)));
+    if on_link.is_some_and(|on_link| on_link.privacy > 0) {
+        return Some(aterm_netplace::words::ON_LINK_PRIVACY_NOTE.to_owned());
+    }
     let dialled = peers.iter().any(|peer| peer.fault != PeerFault::NotDialled);
     let answered = peers.iter().any(|peer| peer.answer.is_ok());
     if dialled
@@ -1891,7 +1959,27 @@ pub(crate) fn fleet_note_at(
     {
         return Some(away);
     }
+    if note == Some(NO_ROUTE_NOTE) && on_link.is_some_and(|on_link| on_link.unplaced == 0) {
+        return None;
+    }
     note.map(str::to_owned)
+}
+
+/// One peer's dial as the on-link rule reads it (`aterm_netplace::words::Dial`): an answer from
+/// its address, a no-route to the address its dial went to, a host that answered there with no
+/// survey ([`PeerFault::HostAnswered`]), or anything else.
+fn dial_of(peer: &PeerSurvey) -> aterm_netplace::words::Dial {
+    use aterm_netplace::words::Dial;
+    let addr = peer
+        .addr
+        .as_deref()
+        .and_then(|addr| addr.parse::<std::net::IpAddr>().ok());
+    match (&peer.answer, peer.fault) {
+        (Ok(_), _) => addr.map_or(Dial::Other, Dial::Answered),
+        (Err(_), PeerFault::NoRoute) => Dial::NoRoute(addr),
+        (Err(_), PeerFault::HostAnswered) => addr.map_or(Dial::Other, Dial::Reached),
+        (Err(_), _) => Dial::Other,
+    }
 }
 
 /// Return a shared diagnostic note if all dialled peers failed with the same local fault.

@@ -64,6 +64,13 @@ fn apple_window() -> Reading {
     }
 }
 
+/// A mark this build's own landing wrote at `path` ([`Mark::note_opened`]): the tab opened for
+/// this account at an earlier launch of this build.
+pub(super) fn this_builds_mark(path: &std::path::Path) {
+    assert!(Mark::at(path.to_path_buf()).note_opened());
+    assert!(path.is_file(), "a mark from this build");
+}
+
 fn publish_run(app: &mut App, revision: u64, running: Vec<Setting>) {
     let permissions = Some(crate::InitialSetupPermissionPolicy {
         revision,
@@ -102,7 +109,7 @@ fn page() -> (App, WindowId) {
     assert!(app.commit_glassless_native_frame(wid));
     assert!(app.system_state_frontmost_in(wid));
     app.workstation_setup.developer_tools = Install::Wanted(4);
-    assert!(app.developer_tools_install_due(true, false, false));
+    assert!(app.developer_tools_install_due(false));
     (app, wid)
 }
 
@@ -112,7 +119,7 @@ fn book(app: &mut App, wid: WindowId, revision: u64) -> u64 {
     };
     let id = test_support::book_unasked(app, wid, install_tab_then(revision));
     assert!(
-        !app.developer_tools_install_due(true, false, false),
+        !app.developer_tools_install_due(false),
         "a second request must not start another shell while the first is pending"
     );
     id
@@ -122,22 +129,47 @@ fn tabs(app: &App) -> usize {
     app.windows.values().map(|ws| ws.tab_set.len()).sum()
 }
 
+/// The automatic tab is the window's selected one, up front with its password prompt, whatever the
+/// window was showing and whether or not it has focus: the install is a launch's early step.
+/// NEGATIVE CONTROL: the keys and the dialog slot still defer it
+/// (`clt_landing_defers_while_the_person_types`, `clt_landing_defers_a_new_dialog_without_losing_the_install`).
 #[test]
-fn automatic_install_starts_without_taking_the_current_tabs_focus() {
-    let (mut app, wid) = page();
-    let active = app.windows[&wid].tab_set.active_id();
-    let (window, ask, then) = app
-        .begin_developer_tools_install(aterm)
-        .expect("automatic install is due");
-    assert_eq!(window, wid);
-    assert!(ask.background);
-    let id = test_support::book_as(&mut app, window, &ask, then);
-    let (landed, read) = land(&mut app, window, id);
-    assert!(landed);
-    assert_eq!(app.windows[&wid].tab_set.active_id(), active);
-    assert!(app.system_state_frontmost_in(wid));
-    assert_eq!(drain(&read), go_line());
-    assert!(app.developer_tools_install_active());
+fn automatic_install_lands_up_front_with_no_focus_condition() {
+    for (focused, occluded, on_terminal) in [
+        (true, false, false),
+        (false, false, false),
+        (true, true, false),
+        (false, true, true),
+    ] {
+        let (mut app, wid) = page();
+        if on_terminal {
+            app.switch_tab_in(wid, 0);
+        }
+        app.on_occlusion_changed(wid, occluded);
+        app.windows.get_mut(&wid).unwrap().focused = focused;
+        assert!(app.developer_tools_install_due(false));
+        let (window, ask, then) = app
+            .begin_developer_tools_install(aterm)
+            .expect("automatic install is due");
+        assert_eq!(window, wid);
+        assert!(!ask.background, "the password prompt comes up front");
+        let id = test_support::book_as(&mut app, window, &ask, then);
+        let (landed, read) = land(&mut app, window, id);
+        assert!(landed, "{focused} {occluded} {on_terminal}");
+        assert_eq!(drain(&read), go_line());
+        assert!(app.developer_tools_install_active());
+        assert_eq!(
+            app.windows[&wid].tab_set.active_id(),
+            app.developer_tools_tab().and_then(|(_, index)| {
+                app.windows[&wid]
+                    .tab_set
+                    .tabs()
+                    .get(index)
+                    .map(|tab| tab.id)
+            }),
+            "its tab is the selected one"
+        );
+    }
 }
 
 fn land(app: &mut App, wid: WindowId, id: u64) -> (bool, std::fs::File) {
@@ -185,7 +217,7 @@ fn assert_retry_lands_once(app: &mut App, wid: WindowId, revision: u64) {
         Install::Wanted(revision)
     );
     assert!(app.system_state_frontmost_in(wid));
-    assert!(app.developer_tools_install_due(true, false, false));
+    assert!(app.developer_tools_install_due(false));
     let before = tabs(app);
     let id = book(app, wid, revision);
     let (landed, read) = land(app, wid, id);
@@ -196,23 +228,13 @@ fn assert_retry_lands_once(app: &mut App, wid: WindowId, revision: u64) {
     app.want_developer_tools_install(revision, true);
     app.want_developer_tools_install(revision + 1, true);
     assert_eq!(app.workstation_setup.developer_tools, Install::Opened);
-    assert!(!app.developer_tools_install_due(true, false, false));
+    assert!(!app.developer_tools_install_due(false));
     assert_eq!(
         tabs(app),
         before + 1,
         "later callbacks cannot create a second tab"
     );
     assert!(drain(&read).is_empty(), "the command was typed once");
-}
-
-#[test]
-fn clt_landing_defers_a_run_that_started_another_stage() {
-    let (mut app, wid) = page();
-    let id = book(&mut app, wid, 4);
-    publish_run(&mut app, 4, vec![Setting::Spotlight]);
-    assert_deferred(&mut app, wid, id, Install::Wanted(4));
-    publish_run(&mut app, 4, Vec::new());
-    assert_retry_lands_once(&mut app, wid, 4);
 }
 
 #[test]
@@ -226,7 +248,7 @@ fn clt_landing_an_external_installer_holds_the_automatic_request() {
     );
     INSTALL_EXTERNAL_PROBES.with(|count| count.set(0));
     assert!(
-        !app.developer_tools_install_due(true, false, false),
+        !app.developer_tools_install_due(false),
         "an external installer needs no competing automatic password tab"
     );
     assert_eq!(INSTALL_EXTERNAL_PROBES.with(std::cell::Cell::get), 1);
@@ -240,7 +262,7 @@ fn clt_landing_an_external_installer_holds_the_automatic_request() {
 fn clt_landing_defers_an_installer_that_started_while_the_shell_spawned() {
     let (mut app, wid) = page();
     app.workstation_setup.developer_tools_probe = Some(idle);
-    assert!(app.developer_tools_install_due(true, false, false));
+    assert!(app.developer_tools_install_due(false));
     let id = book(&mut app, wid, 4);
     app.workstation_setup.developer_tools_probe = Some(external_installer_running);
     INSTALL_EXTERNAL_PROBES.with(|count| count.set(0));
@@ -248,7 +270,7 @@ fn clt_landing_defers_an_installer_that_started_while_the_shell_spawned() {
     assert_eq!(INSTALL_EXTERNAL_PROBES.with(std::cell::Cell::get), 1);
     assert!(
         !app.workstation_setup.developer_tools_mark.opened(),
-        "a refused landing consumes no once-per-Mac automatic attempt"
+        "a refused landing consumes no automatic attempt of this build"
     );
     app.workstation_setup.developer_tools_probe = Some(idle);
     assert_retry_lands_once(&mut app, wid, 4);
@@ -360,7 +382,7 @@ fn clt_landing_a_failed_shell_tells_nobody_to_open_it_again() {
     assert!(!failed(&mut app, wid, id));
     assert_eq!(app.messages.live_rows().count(), notices);
     assert_eq!(app.workstation_setup.developer_tools, Install::Opened);
-    assert!(!app.developer_tools_install_due(true, false, false));
+    assert!(!app.developer_tools_install_due(false));
 
     let (mut app, wid) = page();
     let notices = app.messages.live_rows().count();
@@ -401,60 +423,6 @@ fn clt_landing_defers_a_new_dialog_without_losing_the_install() {
 }
 
 #[test]
-fn clt_landing_keeps_the_terminal_the_person_selected() {
-    let (mut app, wid) = page();
-    let id = book(&mut app, wid, 4);
-    app.switch_tab_in(wid, 0);
-    assert!(!app.system_state_frontmost_in(wid));
-    assert_deferred(&mut app, wid, id, Install::Wanted(4));
-    assert!(app.open_system_state_tab_in_window(wid));
-    assert_retry_lands_once(&mut app, wid, 4);
-}
-
-#[test]
-fn clt_landing_waits_while_its_window_is_occluded_or_unfocused() {
-    for occluded in [false, true] {
-        let (mut app, wid) = page();
-        let id = book(&mut app, wid, 4);
-        if occluded {
-            app.on_occlusion_changed(wid, true);
-        } else {
-            app.windows.get_mut(&wid).unwrap().focused = false;
-        }
-        assert!(!app.system_state_frontmost_in(wid));
-        assert_deferred(&mut app, wid, id, Install::Wanted(4));
-        if occluded {
-            app.on_occlusion_changed(wid, false);
-        } else {
-            app.windows.get_mut(&wid).unwrap().focused = true;
-        }
-        assert_retry_lands_once(&mut app, wid, 4);
-    }
-}
-
-#[test]
-fn clt_landing_another_front_page_does_not_authorize_the_old_destination() {
-    for close in [false, true] {
-        let (mut app, wid) = page();
-        let id = book(&mut app, wid, 4);
-        let other = WindowId(1);
-        app.install_window_state(other, crate::stub_session(60_000), 90, 160);
-        app.windows.get_mut(&other).unwrap().os_window_for_test = true;
-        assert!(app.open_system_state_tab_in_window(other));
-        app.windows.get_mut(&wid).unwrap().focused = false;
-        app.windows.get_mut(&other).unwrap().focused = true;
-        app.frontmost_window = Some(other);
-        app.sync_active_session();
-        assert!(app.system_state_frontmost_in(other));
-        if close {
-            assert_eq!(app.close_window_logical(wid), crate::CloseOutcome::Stay);
-        }
-        assert_deferred(&mut app, wid, id, Install::Wanted(4));
-        assert_retry_lands_once(&mut app, other, 4);
-    }
-}
-
-#[test]
 fn clt_landing_a_newer_request_survives_the_old_shells_completion() {
     let (mut app, wid) = page();
     let id = book(&mut app, wid, 4);
@@ -479,7 +447,7 @@ fn clt_landing_withdrawal_and_stop_leave_no_empty_tab() {
             app.want_developer_tools_install(4, false);
         }
         assert_deferred(&mut app, wid, id, Install::Unasked);
-        assert!(!app.developer_tools_install_due(true, false, false));
+        assert!(!app.developer_tools_install_due(false));
     }
 }
 
@@ -735,11 +703,13 @@ fn clt_landing_system_state_shutdown_cannot_republish_a_retired_front_page() {
     assert_eq!(app.messages.live_rows().count(), notices);
 }
 
-/// aterm opens the tab by itself once per account on this Mac (design §3.3): its landing writes
-/// the account's mark, and a later launch that reads the mark never opens the tab by itself,
-/// though its run wants the tools again. Install… is the way then.
+/// aterm opens the tab by itself once per account and build on this Mac (design §3.3): its
+/// landing writes this build into the account's mark, and a later launch of the same build that
+/// reads the mark never opens the tab by itself, though its run wants the tools again. Install…
+/// is the way then. Another build's launch, an update's, retries once
+/// ([`Mark::opened_on_build`]).
 #[test]
-fn clt_landing_opens_the_tab_by_itself_once_per_account() {
+fn clt_landing_opens_the_tab_by_itself_once_per_account_and_build() {
     let dir = aterm_tempfile::tempdir().expect("a config directory");
     let mark = dir.path().join("command-line-tools-tab");
     let (mut app, wid) = page();
@@ -753,7 +723,7 @@ fn clt_landing_opens_the_tab_by_itself_once_per_account() {
     assert!(later.workstation_setup.developer_tools_mark.opened());
     assert_eq!(later.workstation_setup.developer_tools, Install::Wanted(4));
     assert!(
-        !later.developer_tools_install_due(true, false, false),
+        !later.developer_tools_install_due(false),
         "a later launch never opens it by itself"
     );
 }
@@ -765,7 +735,7 @@ fn clt_landing_opens_the_tab_by_itself_once_per_account() {
 fn clt_landing_install_opens_the_tab_on_a_press() {
     let dir = aterm_tempfile::tempdir().expect("a config directory");
     let mark = dir.path().join("command-line-tools-tab");
-    std::fs::write(&mark, "opened\n").expect("a mark from an earlier launch");
+    this_builds_mark(&mark);
     let (mut app, wid) = page();
     app.workstation_setup.developer_tools_mark = Mark::at(mark);
     app.workstation_setup.developer_tools = Install::Pressed;
@@ -803,7 +773,7 @@ fn clt_landing_a_press_never_waits_behind_a_panel_out_of_sight() {
     assert!(!macos_dialog_up());
     let dir = aterm_tempfile::tempdir().expect("a config directory");
     let mark = dir.path().join("command-line-tools-tab");
-    std::fs::write(&mark, "opened\n").expect("a mark from an earlier launch");
+    this_builds_mark(&mark);
     let (mut app, _) = page();
     // No install of the run's own is due once the guard frees: the press alone opens the tab.
     app.workstation_setup.developer_tools_mark = Mark::at(mark);
@@ -862,7 +832,7 @@ fn clt_landing_a_press_during_full_disk_access_queues_with_reason_and_runs_once_
 
     let dir = aterm_tempfile::tempdir().expect("a config directory");
     let mark = dir.path().join("command-line-tools-tab");
-    std::fs::write(&mark, "opened\n").expect("a mark from an earlier launch");
+    this_builds_mark(&mark);
     let (mut app, wid) = page();
     app.workstation_setup.developer_tools_mark = Mark::at(mark);
     app.access_steps.set_reach(StepsReach {
@@ -974,7 +944,7 @@ fn clt_landing_a_press_during_full_disk_access_queues_with_reason_and_runs_once_
 fn clt_landing_a_queued_press_waits_for_a_quiet_keyboard_once_the_slot_frees() {
     let dir = aterm_tempfile::tempdir().expect("a config directory");
     let mark = dir.path().join("command-line-tools-tab");
-    std::fs::write(&mark, "opened\n").expect("a mark from an earlier launch");
+    this_builds_mark(&mark);
     let (mut app, wid) = page();
     app.workstation_setup.developer_tools_mark = Mark::at(mark);
     app.access_steps.set_reach(StepsReach {
@@ -1329,8 +1299,14 @@ fn a_pressed_tab_that_cannot_land_says_why_on_the_row() {
     assert_eq!(shown(&app), Some(ToolsInstall::Queued));
 }
 
-/// Apple's own installer window, waiting for the person's press, needs them there; a
-/// placeholder nothing holds is no install, and the row offers Install….
+/// Apple's own installer window, waiting for the person's press, needs them there: before its
+/// install starts (no placeholder yet), and left open past its bound beside a placeholder an
+/// ended install left as long ago. While it or the placeholder is younger than its bound, it is
+/// the install a person started there (a press hours after the window opened creates a young
+/// placeholder), and the row waits calmly. A placeholder nothing holds is no install, and the
+/// row offers Install….
+/// NEGATIVE CONTROL: a tab whose program still asks for the password, beside a window left open
+/// and a leftover placeholder, asks for it again once the window goes: nothing installed.
 #[test]
 fn apples_installer_window_needs_the_person_and_a_stale_placeholder_does_not_install() {
     let (mut app, _) = page();
@@ -1344,6 +1320,29 @@ fn apples_installer_window_needs_the_person_and_a_stale_placeholder_does_not_ins
     );
     app.workstation_setup.developer_tools_probe = Some(|| Reading {
         placeholder: true,
+        apple_window: true,
+        ..Reading::default()
+    });
+    app.publish_system_state(missing.clone());
+    assert_eq!(
+        shown(&app),
+        Some(ToolsInstall::AppleWindow),
+        "a window left open past its bound beside a leftover placeholder as old"
+    );
+    app.workstation_setup.developer_tools_probe = Some(|| Reading {
+        placeholder: true,
+        apple_window: true,
+        apple_window_young: true,
+        ..Reading::default()
+    });
+    app.publish_system_state(missing.clone());
+    assert_eq!(
+        shown(&app),
+        Some(ToolsInstall::Installing),
+        "the install a person started in the window"
+    );
+    app.workstation_setup.developer_tools_probe = Some(|| Reading {
+        placeholder: true,
         ..Reading::default()
     });
     app.publish_system_state(missing.clone());
@@ -1351,12 +1350,13 @@ fn apples_installer_window_needs_the_person_and_a_stale_placeholder_does_not_ins
     assert!(menu(&app).is_some());
 
     // The tab's program opened Apple's window (Apple's catalog listed no tools) and asks the
-    // person to press Install there, with its placeholder held: they are needed there, whatever
-    // the placeholder says, until the window goes.
+    // person to press Install there, with its own stamped placeholder held: they are needed
+    // there until the window goes, and then the program reads the tools back.
     app.workstation_setup.developer_tools_session = vec![Terminal::running(77, false, None)];
     app.workstation_setup.developer_tools_probe = Some(|| Reading {
         placeholder: true,
         apple_window: true,
+        live_run: true,
         ..Reading::default()
     });
     app.publish_system_state(missing.clone());
@@ -1366,11 +1366,27 @@ fn apples_installer_window_needs_the_person_and_a_stale_placeholder_does_not_ins
         Some(crate::system_state::APPLE_WINDOW_NOTE)
     );
     app.workstation_setup.developer_tools_probe = Some(idle);
-    app.publish_system_state(missing);
+    app.publish_system_state(missing.clone());
     assert_eq!(
         shown(&app),
         Some(ToolsInstall::Installing),
         "once the window goes, the program reads the tools back"
+    );
+
+    app.workstation_setup.developer_tools_session = vec![Terminal::running(78, false, None)];
+    app.workstation_setup.developer_tools_probe = Some(|| Reading {
+        placeholder: true,
+        apple_window: true,
+        ..Reading::default()
+    });
+    app.publish_system_state(missing.clone());
+    assert_eq!(shown(&app), Some(ToolsInstall::AppleWindow));
+    app.workstation_setup.developer_tools_probe = Some(idle);
+    app.publish_system_state(missing);
+    assert_eq!(
+        shown(&app),
+        Some(ToolsInstall::Password),
+        "nothing installed while the window stood open"
     );
 }
 
@@ -1398,53 +1414,83 @@ fn wanted(shim: &std::path::Path) -> bool {
     aterm_types::clt_shim::wanted_mark(shim).is_file()
 }
 
-/// A person's Stop ends the run's want of the tools, and the git-and-friends shim comes off new
-/// shells with it: no shell opened after it is told the tools are on their way while nothing
-/// installs them. The directory stays for the shells that have it, until the next launch.
-#[test]
-fn a_stop_takes_the_shim_off_new_shells() {
-    let dir = aterm_tempfile::tempdir().expect("a state directory");
-    let (mut app, _) = page();
-    let shim = shim_in(&mut app, dir.path());
-    app.want_developer_tools_install(4, true);
-    assert!(
-        shim.is_dir() && wanted(&shim),
-        "a pass that wants the tools lays the shim"
-    );
-    app.stop_initial_setup_permissions();
-    assert_eq!(app.workstation_setup.developer_tools, Install::Unasked);
-    assert!(
-        !wanted(&shim),
-        "Stop withdrew the want: new shells do not get it"
-    );
-    assert!(shim.is_dir(), "the directory goes at the next launch");
+/// Whether a shim's line says the tools are on their way: its installing mark is there.
+fn installing_said(shim: &std::path::Path) -> bool {
+    aterm_types::clt_shim::installing_mark(shim).is_file()
 }
 
-/// The tab opening spends the automatic attempt, not the want: once the tools arrived, the next
-/// pass says it no longer waits on them, and the shim comes off new shells, though the tab stays
-/// opened for the launch. An older pass's word withdraws no newer want.
+/// A launch's want that a durable Stop holds back opens no tab, so its shim's line says the tools
+/// are missing, not on their way: a `git` there names Install…, not an install that never runs.
+/// NEGATIVE CONTROL: the same want with no Stop in the run's records says they are on their way.
 #[test]
-fn tools_that_arrived_take_the_shim_off_new_shells_after_the_tab_opened() {
+fn a_launch_want_a_durable_stop_holds_says_no_install_is_on_its_way() {
+    for stopped in [false, true] {
+        let dir = aterm_tempfile::tempdir().expect("a state directory");
+        let mut app = App::headless_for_test();
+        let shim = shim_in(&mut app, dir.path());
+        if stopped {
+            app.publish_system_state(crate::SetupStatus {
+                run: Some(crate::InitialSetupRunPolicy {
+                    revision: 4,
+                    allowed: false,
+                }),
+                finished: true,
+                ..crate::SetupStatus::default()
+            });
+        }
+        app.want_developer_tools_install(LAUNCH_WANT, true);
+        assert_eq!(
+            app.workstation_setup.developer_tools_want,
+            Some(LAUNCH_WANT)
+        );
+        assert!(wanted(&shim), "stopped: {stopped}: the tools are missing");
+        assert_eq!(
+            installing_said(&shim),
+            !stopped,
+            "stopped: {stopped}: the line follows an install that can run"
+        );
+    }
+}
+
+/// A person's Stop ends the want of the tools, not the shim: new shells still get it, as Apple's
+/// dialog is what it keeps away, and its line stops saying they are on their way.
+#[test]
+fn a_stop_leaves_the_shim_and_ends_its_word_of_an_install() {
     let dir = aterm_tempfile::tempdir().expect("a state directory");
     let (mut app, _) = page();
     let shim = shim_in(&mut app, dir.path());
     app.want_developer_tools_install(4, true);
+    assert!(wanted(&shim) && installing_said(&shim));
+    app.stop_initial_setup_permissions();
+    assert_eq!(app.workstation_setup.developer_tools, Install::Unasked);
+    assert!(wanted(&shim), "the tools are still missing");
+    assert!(!installing_said(&shim), "nothing installs them");
+}
+
+/// The tools arrive by any route: the watch's next second takes the shim off new shells, though a
+/// want stands and no pass or tab said a word.
+/// NEGATIVE CONTROL: a second with them still missing leaves it.
+#[test]
+fn tools_that_arrived_by_any_route_take_the_shim_off_new_shells() {
+    let dir = aterm_tempfile::tempdir().expect("a state directory");
+    let (mut app, _) = page();
+    let shim = shim_in(&mut app, dir.path());
+    app.want_developer_tools_install(4, true);
+    app.developer_tools_watch();
     assert!(wanted(&shim));
-    app.workstation_setup.developer_tools = Install::Opened;
-    app.want_developer_tools_install(3, false);
-    assert!(wanted(&shim), "an older pass withdraws no newer want");
-    app.want_developer_tools_install(5, false);
-    assert_eq!(app.workstation_setup.developer_tools, Install::Opened);
+    TOOLS_PRESENT.with(|present| present.set(true));
+    app.developer_tools_watch();
+    assert_eq!(app.workstation_setup.developer_tools_want, Some(4));
+    assert!(!wanted(&shim) && !installing_said(&shim));
     assert!(
-        !wanted(&shim),
-        "no pass wants the tools: new shells do not get it"
+        shim.is_dir(),
+        "the directory stays for the shells that have it"
     );
-    assert!(shim.is_dir(), "the directory goes at the next launch");
 }
 
 /// The tab's program said the tools are installed: the shim comes off new shells at once, ahead
 /// of the next pass's word, though a pass still wants them. A shell that has it runs the tools'
-/// own programs through it until the next launch removes it.
+/// own programs through it for as long as it lives.
 #[test]
 fn tools_the_tab_installed_take_the_shim_off_new_shells_at_once() {
     let dir = aterm_tempfile::tempdir().expect("a state directory");
@@ -1462,37 +1508,47 @@ fn tools_the_tab_installed_take_the_shim_off_new_shells_at_once() {
         !wanted(&shim),
         "the tab installed them: new shells do not get it"
     );
-    assert!(shim.is_dir(), "the directory goes at the next launch");
+    assert!(
+        shim.is_dir(),
+        "the directory stays for the shells that have it"
+    );
 }
 
 /// A launch reconciles the shim an earlier launch left (one that ended mid-install, stopped, or
-/// crashed): no pass wants the tools yet, so it goes with its mark, whether or not they are
-/// installed.
+/// crashed), with its marks: with the tools there it stays, unwanted, its links made again onto
+/// this launch's executable for the processes that still reach it; with them missing it is laid
+/// again, wanted, saying nothing of an install yet.
 #[test]
-fn a_launch_removes_the_shim_an_earlier_launch_left() {
+fn a_launch_relinks_what_an_earlier_launch_left_and_wants_the_shim_while_the_tools_are_missing() {
     for present in [false, true] {
         let dir = aterm_tempfile::tempdir().expect("a state directory");
         let shim = dir.path().join("clt-shim");
         std::fs::create_dir_all(&shim).unwrap();
         std::os::unix::fs::symlink("/nonexistent/aterm", shim.join("git")).unwrap();
         std::fs::write(aterm_types::clt_shim::wanted_mark(&shim), b"").unwrap();
+        std::fs::write(aterm_types::clt_shim::installing_mark(&shim), b"").unwrap();
         TOOLS_PRESENT.with(|tools| tools.set(present));
         let kept = crate::clt_shim::Shim::at(shim.clone(), tools_present);
-        kept.reconcile(false);
-        assert!(!kept.laid() && !shim.exists(), "present: {present}");
-        assert!(!wanted(&shim), "present: {present}");
+        kept.reconcile();
+        assert!(kept.laid(), "present: {present}");
+        assert_eq!(wanted(&shim), !present, "present: {present}");
+        assert!(!installing_said(&shim), "present: {present}");
+        assert!(
+            !std::fs::read_link(shim.join("git")).is_ok_and(|to| to.ends_with("nonexistent/aterm")),
+            "present: {present}: no link of the earlier launch's"
+        );
     }
 }
 
 /// An install that ended without the tools (the program said it did not finish, the account
 /// proved no administrator's, or it ended any other way, or nobody knows how) leaves nothing
-/// installing them: the shim comes off new shells at once, though the pass's want stands, and a
-/// later pass that wants them lays it for no shell until an install starts again. Its directory
-/// stays for the shells that have it, which a shim with no mark hands to Apple's own route.
-/// NEGATIVE CONTROL: a shim that follows the want alone stays on new shells after each of these
-/// ends, telling them the tools are on their way while nothing installs them.
+/// installing them: the shim's line says they are missing, not on their way, at once, though the
+/// pass's want stands, and a later pass that wants them changes nothing until an install starts
+/// again. New shells keep the shim: nothing ever hands them to Apple's stub.
+/// NEGATIVE CONTROL: a line that follows the want alone tells them the tools are on their way
+/// after each of these ends, while nothing installs them.
 #[test]
-fn an_install_that_ended_unfinished_takes_the_shim_off_new_shells() {
+fn an_install_that_ended_unfinished_keeps_the_shim_and_ends_its_word_of_an_install() {
     use aterm_pty::ChildExit;
     let not_admin = i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN);
     for end in [
@@ -1506,10 +1562,7 @@ fn an_install_that_ended_unfinished_takes_the_shim_off_new_shells() {
         let (mut app, _) = page();
         let shim = shim_in(&mut app, dir.path());
         app.want_developer_tools_install(4, true);
-        assert!(
-            wanted(&shim),
-            "{end:?}: a pass that wants the tools lays it"
-        );
+        assert!(installing_said(&shim), "{end:?}: on their way");
         app.workstation_setup.developer_tools = Install::Opened;
         app.workstation_setup.developer_tools_session = vec![Terminal::running(77, false, None)];
         app.workstation_setup.developer_tools_attempt = Some(77);
@@ -1519,15 +1572,44 @@ fn an_install_that_ended_unfinished_takes_the_shim_off_new_shells() {
             Some(4),
             "{end:?}: the want stands"
         );
-        assert!(!wanted(&shim), "{end:?}: nothing installs them");
-        assert!(
-            shim.is_dir(),
-            "{end:?}: the directory goes at the next launch"
-        );
+        assert!(wanted(&shim), "{end:?}: the tools are still missing");
+        assert!(!installing_said(&shim), "{end:?}: nothing installs them");
         app.want_developer_tools_install(5, true);
         assert!(
-            !wanted(&shim),
-            "{end:?}: a later pass's want alone puts it back on no shell"
+            !installing_said(&shim),
+            "{end:?}: a later pass's want alone"
+        );
+    }
+}
+
+/// An install whose program said it failed asks again at the next launch by itself, while the tab's
+/// other ends keep the account's mark: a person's Ctrl-C (at the password prompt or later), which
+/// the program ends on its stop's own exit, is a decline, as a closed tab is.
+/// NEGATIVE CONTROL: a signal (a person closing the tab) and a stop leave the mark, and so no
+/// launch's want.
+#[test]
+fn a_failed_install_asks_again_at_the_next_launch_and_a_closed_tab_does_not() {
+    use aterm_pty::ChildExit;
+    let stopped = i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED);
+    for (end, asks_again) in [
+        (Some(ChildExit::Code(1)), true),
+        (Some(ChildExit::Code(stopped)), false),
+        (Some(ChildExit::Signal(1)), false),
+        (None, false),
+    ] {
+        let dir = aterm_tempfile::tempdir().expect("a state directory");
+        let path = dir.path().join("command-line-tools-tab");
+        this_builds_mark(&path);
+        let (mut app, _) = page();
+        app.workstation_setup.developer_tools_mark = Mark::at(path.clone());
+        app.workstation_setup.developer_tools = Install::Opened;
+        app.workstation_setup.developer_tools_session = vec![Terminal::running(77, false, None)];
+        app.workstation_setup.developer_tools_attempt = Some(77);
+        app.developer_tools_install_ended(77, end);
+        assert_eq!(Mark::at(path).opened(), !asks_again, "{end:?}");
+        assert!(
+            !app.workstation_setup.developer_tools.due(false),
+            "{end:?}: never twice in a launch"
         );
     }
 }
@@ -1590,7 +1672,7 @@ fn a_late_install_result_does_not_replace_the_retry_state() {
         assert!(landed);
         assert_eq!(drain(&retry_read), go_line());
         assert!(app.developer_tools_install_active());
-        assert!(wanted(&shim));
+        assert!(installing_said(&shim));
 
         if let Some(exit) = exit {
             app.pool
@@ -1640,37 +1722,45 @@ fn a_late_install_result_does_not_replace_the_retry_state() {
             "{exit:?}"
         );
         assert!(mark.is_file(), "{exit:?}: the retry still owns the opening");
-        assert!(wanted(&shim), "{exit:?}: the retry is still installing");
+        assert!(
+            installing_said(&shim),
+            "{exit:?}: the retry is still installing"
+        );
         assert_eq!(step(&mut app), Some(ToolsInstall::Password), "{exit:?}");
         assert!(drain(&retry_read).is_empty());
 
         app.developer_tools_install_ended(retry, Some(ChildExit::Code(1)));
         assert!(app.workstation_setup.developer_tools_unfinished);
         assert!(
-            !wanted(&shim),
-            "the current attempt's failure still ends its shim"
+            !installing_said(&shim),
+            "the current attempt's failure still ends its word"
         );
     }
 }
 
-/// A launch whose account's tab opened at an earlier launch reads the tools unfinished: a pass
-/// that wants them lays the shim for no new shell, as nothing installs them, until a person's
-/// Install… starts an install, which puts it back.
+/// A launch whose account's tab opened at an earlier launch of this build reads the tools
+/// unfinished (a newer build's launch reads them as never tried, and retries once): a pass that
+/// wants them lets the shim say nothing of an install, as nothing installs them, until a person's
+/// Install… starts one.
 /// NEGATIVE CONTROL: a launch that ignores the mark tells new shells the tools are on their way
-/// with no tab open; a start that keeps them unfinished leaves the install's shells with Apple's
-/// dialog.
+/// with no tab open.
 #[test]
-fn a_launch_after_an_unfinished_install_lays_the_shim_once_an_install_starts() {
+fn a_launch_after_an_unfinished_install_says_an_install_once_one_starts() {
     let dir = aterm_tempfile::tempdir().expect("a config directory");
     let mark = dir.path().join("command-line-tools-tab");
-    std::fs::write(&mark, "opened\n").expect("a mark from an earlier launch");
-    let launched =
-        crate::workstation_setup::Host::for_launch_marked(None, true, Mark::at(mark.clone()));
+    this_builds_mark(&mark);
+    let launched = crate::workstation_setup::Host::for_launch_marked(
+        None,
+        true,
+        Mark::at(mark.clone()),
+        crate::clt_shim::Shim::default(),
+    );
     assert!(launched.developer_tools_unfinished, "the mark says so");
     let fresh = crate::workstation_setup::Host::for_launch_marked(
         None,
         true,
         Mark::at(dir.path().join("no-mark")),
+        crate::clt_shim::Shim::default(),
     );
     assert!(!fresh.developer_tools_unfinished, "no tab opened before");
 
@@ -1679,13 +1769,19 @@ fn a_launch_after_an_unfinished_install_lays_the_shim_once_an_install_starts() {
     app.workstation_setup.developer_tools_unfinished = launched.developer_tools_unfinished;
     let shim = shim_in(&mut app, dir.path());
     app.want_developer_tools_install(4, true);
-    assert!(!wanted(&shim), "nothing installs them yet");
+    assert!(
+        wanted(&shim) && !installing_said(&shim),
+        "nothing installs them yet"
+    );
     app.workstation_setup.developer_tools = Install::Pressed;
     let id = test_support::book(&mut app, wid, pressed_tab_then());
     let (landed, read) = land(&mut app, wid, id);
     assert!(landed);
     assert_eq!(drain(&read), go_line());
-    assert!(wanted(&shim), "the install started: new shells get it");
+    assert!(
+        installing_said(&shim),
+        "the install started: its line says so"
+    );
 }
 
 /// Low Data Mode holds the download back: the tab's program says so and exits with its own code,
@@ -1721,14 +1817,14 @@ fn low_data_mode_spends_no_automatic_opening() {
     assert_eq!(shown(&app), Some(ToolsInstall::LowData));
     assert_eq!(menu(&app), None, "a calm wait: no menu line");
     assert!(
-        !app.developer_tools_install_due(true, false, false),
+        !app.developer_tools_install_due(false),
         "the automatic tab waits while Low Data Mode is on"
     );
 
     app.workstation_setup.developer_tools_network = Some(NetworkWatch::stand_in());
     app.developer_tools_low_data(false);
     assert!(
-        app.developer_tools_install_due(true, false, false),
+        app.developer_tools_install_due(false),
         "the tab opens by itself once Low Data Mode is off"
     );
     assert_ne!(step(&mut app), Some(ToolsInstall::LowData));
@@ -1754,20 +1850,84 @@ fn a_non_administrator_is_told_and_no_tab_opens_by_itself() {
     assert_eq!(shown(&app), Some(ToolsInstall::NotAdmin));
     assert_eq!(menu(&app), None, "nothing here changes it");
     app.workstation_setup.developer_tools = Install::Wanted(4);
-    assert!(!app.developer_tools_install_due(true, false, false));
+    assert!(!app.developer_tools_install_due(false));
 }
 
-/// Tools installed in a tab this window did not open run no package pass, so a reading past the
-/// wait ends the digest's "missing" entry. Negative control: a reading still waiting keeps it.
+/// A status publication reads compiler presence while a missing-tools exception is unresolved,
+/// even when repositories already work through packaged git. Missing or unread presence leaves
+/// it alone; an installed compiler ends it without a package pass, then costs no further probe.
+/// Negative controls: call settlement only from the tools-wait branch, or trust the repositories
+/// reading instead of compiler presence.
 #[test]
-fn a_repositories_reading_past_the_tools_ends_the_missing_entry() {
+fn status_publication_ends_missing_tools_only_when_the_compiler_is_installed() {
     use crate::toolchain_words::{CToolchain, c_toolchain_entry};
+    thread_local! {
+        static INSTALLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    fn installed() -> Option<bool> {
+        READS.with(|reads| reads.set(reads.get() + 1));
+        INSTALLED.with(std::cell::Cell::get)
+    }
     let (mut app, _wid) = page();
     let missing = c_toolchain_entry(CToolchain::Missing);
+    let key = missing.key();
+    let ready_repositories = tools_there(&tools_missing(&app));
+    assert!(app.workstation_setup.developer_tools_installed.is_none());
     app.except(&missing);
-    let waiting = tools_missing(&app);
-    app.developer_tools_install_step(&waiting);
-    assert!(app.owes_exception(&missing.key()), "still waiting: kept");
-    app.developer_tools_install_step(&tools_there(&waiting));
-    assert!(!app.owes_exception(&missing.key()), "past the wait: ended");
+    app.publish_system_state(ready_repositories.clone());
+    assert!(app.owes_exception(&key), "headless: no host probe");
+    app.workstation_setup.developer_tools_installed = Some(installed);
+    READS.with(|reads| reads.set(0));
+    for presence in [None, Some(false)] {
+        INSTALLED.with(|installed| installed.set(presence));
+        app.publish_system_state(ready_repositories.clone());
+        assert!(app.owes_exception(&key), "compiler presence {presence:?}");
+    }
+    INSTALLED.with(|installed| installed.set(Some(true)));
+    app.publish_system_state(ready_repositories.clone());
+    assert!(!app.owes_exception(&key), "the compiler arrived");
+    let reads = READS.with(std::cell::Cell::get);
+    app.publish_system_state(ready_repositories);
+    assert_eq!(
+        READS.with(std::cell::Cell::get),
+        reads,
+        "resolved: no probe"
+    );
+}
+
+/// Dismissal closes the display, not its unresolved cause. A later compiler observation ends
+/// that filing, so another missing compiler is a new episode. Pending entries are canceled too.
+#[test]
+fn compiler_arrival_resolves_dismissed_and_pending_missing_tools() {
+    use crate::toolchain_words::{CToolchain, c_toolchain_entry};
+    use aterm_messages::{Outcome, Retired};
+
+    let (mut app, _wid) = page();
+    let missing = c_toolchain_entry(CToolchain::Missing);
+    let key = missing.key();
+    let status = tools_there(&tools_missing(&app));
+    app.workstation_setup.developer_tools_installed = Some(|| Some(false));
+    app.except(&missing);
+    let id = app.messages.digest().entries[0].id;
+    assert!(app.dismiss_exception(id));
+    app.publish_system_state(status.clone());
+    assert_eq!(
+        app.messages.log().get(id).unwrap().retired(),
+        Some(&Retired::Dismissed)
+    );
+    app.workstation_setup.developer_tools_installed = Some(|| Some(true));
+    app.publish_system_state(status.clone());
+    assert_eq!(
+        app.messages.log().get(id).unwrap().retired(),
+        Some(&Retired::Resolved(Outcome::Ok))
+    );
+    app.except(&missing);
+    assert!(app.owes_exception(&key), "a new missing compiler is news");
+    assert_ne!(app.messages.digest().entries[0].id, id);
+    app.publish_system_state(status.clone());
+    app.except_after(&missing, std::time::Duration::from_secs(60));
+    assert!(app.owes_exception(&key), "pending ripening");
+    app.publish_system_state(status);
+    assert!(!app.owes_exception(&key), "the pending cause already ended");
 }

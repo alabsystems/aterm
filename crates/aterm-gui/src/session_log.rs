@@ -473,14 +473,25 @@ struct AgentRun {
 pub(crate) const ASKED_END_STANDS: std::time::Duration =
     std::time::Duration::from_secs(crate::restart_act::DEADLINE.as_secs() + 5);
 
-/// Which of aterm's acts asked a program to end: the `word=` of its `act` mark.
+/// HOW LONG AN END aterm ASKED FOR STANDS FOR ITS AGENT'S EXIT ([`SessionLog::end_asked_of`]):
+/// an agent asked to end (the `signal` verb's `SIGTERM`, the Overview's Stop) may take longer than
+/// [`ASKED_END_STANDS`] to end in order, and its exit is still its asker's; one that ends more than
+/// ten minutes after the ask ended for some other reason.
+pub(crate) const ASKED_EXIT_STANDS: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Which of aterm's acts asked a program to end, and so its `act` mark's `word=`.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AskWord {
-    /// The restart act's `SIGTERM` (`ctl restart`, the tab's restart pill).
+    /// The restart act's `SIGTERM` (`ctl restart`, the tab's restart pill), or the ask its carrier
+    /// stands for an act a Commit cut: an end that asks for the program back.
     Restart,
-    /// The `signal` verb's `term`, `kill`, `int`, `quit` or `hup`.
+    /// The `signal` verb's `term`, `kill`, `quit` or `hup`: a stop, which owns its agent's exit
+    /// ([`SessionLog::end_asked_of`]).
     Signal,
+    /// The `signal` verb's `int`: an interrupt (Claude Code's Ctrl-C, which stops a turn and ends
+    /// nothing), whose end, when it ends one, still reads as asked.
+    Interrupt,
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -489,7 +500,7 @@ impl AskWord {
     pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Restart => "restart",
-            Self::Signal => "signal",
+            Self::Signal | Self::Interrupt => "signal",
         }
     }
 }
@@ -502,6 +513,9 @@ pub(crate) struct EndAsker<'a> {
     pub(crate) timeline: &'a std::sync::Mutex<crate::session_timeline::SessionTimeline>,
     /// Who asked.
     pub(crate) by: Actor,
+    /// The words that name the program that asked, when a control connection did (its typing's
+    /// credit, [`crate::typed_by::Caller::words`]: `claude (pid 4242)`): the act's `from=`.
+    pub(crate) from: Option<&'a str>,
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -509,13 +523,15 @@ impl EndAsker<'_> {
     /// The act's mark and its ask, just before the signal to group `pgid` ([`SessionLog::ask_end`]).
     pub(crate) fn ask(self, pgid: i32, word: AskWord) {
         with_slog(self.timeline, |slog, at| {
-            slog.ask_end(pgid, word, self.by, at);
+            slog.ask_end(pgid, word, self.by, self.from, at);
         });
     }
 
-    /// The ask alone, for an act a seamless update's Commit cut ([`SessionLog::stand_ask`]).
+    /// The ask alone, for a restart act a seamless update's Commit cut ([`SessionLog::stand_ask`]).
     pub(crate) fn stand(self, pgid: i32) {
-        with_slog(self.timeline, |slog, at| slog.stand_ask(pgid, self.by, at));
+        with_slog(self.timeline, |slog, at| {
+            slog.stand_ask(pgid, AskWord::Restart, self.by, at);
+        });
     }
 
     /// Whether the signal this asker asked of group `pgid` was delivered, from what its `kill` or
@@ -558,15 +574,19 @@ fn with_slog(
 /// AN END aterm ASKED FOR ([`SessionLog::ask_end`]): the process group it signals, the `cmd`
 /// run that ends with it (none when the group is the shell's own), whether the log had yet to
 /// see that group's job in front (`unseen`: the command running at the ask is then decided by
-/// its own stamps, [`SessionLog::asked_cmd`]), who asked, and the stretch of the log's monotonic
-/// clock it stands for.
-#[derive(Clone, Copy, Debug)]
+/// its own stamps, [`SessionLog::asked_cmd`]), which act asked it (`word`), who asked (and the
+/// words naming the program that did, `from`), the stretch of the log's monotonic clock it stands
+/// for, and the wall time it was made at.
+#[derive(Clone, Debug)]
 struct AskedEnd {
     pgid: i32,
     cmd: Option<Node>,
     unseen: bool,
+    word: AskWord,
     by: Actor,
+    from: Option<String>,
     from_mono: u64,
+    from_wall: u64,
     until_mono: u64,
 }
 
@@ -1372,8 +1392,41 @@ impl SessionLog {
     /// The asker of the end aterm asked for that group `pgid`'s end at `at` is, if one stands.
     fn asked_of_group(&self, pgid: i32, at: Stamp) -> Option<Actor> {
         self.ask
+            .as_ref()
             .filter(|a| a.pgid == pgid && a.stands(at))
             .map(|a| a.by)
+    }
+
+    /// THE ASKER OF AN AGENT'S EXIT: who asked aterm through its `signal` verb to stop group `pgid`
+    /// (and the words naming the program that did), if that stop stands for its exit now. The host
+    /// reads it at an agent's exit, which is then that asker's whatever the end left behind. Only a
+    /// stop asks that ([`AskWord::Signal`]): an interrupt ([`AskWord::Interrupt`]) ends no agent on
+    /// purpose, and a restart ([`AskWord::Restart`]) asks for it back, by the stamp the host reads
+    /// instead. It stands while it stands for the group's own end ([`Self::asked_of_group`] at the
+    /// log's clock), and, for an agent that began at `began_wall_ms` (its kernel start, when known)
+    /// no later than the ask, for [`ASKED_EXIT_STANDS`] past the ask: an agent may take longer than
+    /// [`ASKED_END_STANDS`] to end in order, and an ask made before it began was of another process
+    /// its group's id named.
+    pub(crate) fn end_asked_of(
+        &self,
+        pgid: i32,
+        began_wall_ms: Option<u64>,
+    ) -> Option<(Actor, Option<String>)> {
+        let now = self.now();
+        let exit_stands = u64::try_from(ASKED_EXIT_STANDS.as_millis()).unwrap_or(u64::MAX);
+        self.ask
+            .as_ref()
+            .filter(|a| {
+                a.pgid == pgid
+                    && a.word == AskWord::Signal
+                    && (a.stands(now)
+                        || began_wall_ms.is_some_and(|began| {
+                            a.from_wall >= began
+                                && a.from_mono <= now.mono_ms
+                                && now.mono_ms - a.from_mono <= exit_stands
+                        }))
+            })
+            .map(|a| (a.by, a.from.clone()))
     }
 
     /// The asker of the end aterm asked for that command `node`'s close at `at` is, if one stands:
@@ -1384,6 +1437,7 @@ impl SessionLog {
     /// unread had ended before the ask, and one begun after it is another's.
     fn asked_cmd(&self, node: Node, at: Stamp) -> Option<Actor> {
         self.ask
+            .as_ref()
             .filter(|a| {
                 a.stands(at)
                     && (a.cmd == Some(node)
@@ -1681,11 +1735,20 @@ impl SessionLog {
     }
 
     /// aterm IS ABOUT TO END GROUP `pgid` ON `by`'s ASK (the restart act's `SIGTERM`, the `signal`
-    /// verb's ending signals): `mark <run> act word=<restart|signal> by=<asker> src=aterm
-    /// conf=exact` on the group's agent run, else its program run, else the running command,
-    /// else the session; then the end stands as asked ([`Self::stand_ask`]).
+    /// verb's ending signals): `mark <run> act word=<restart|signal> by=<asker>
+    /// [from=<program>] src=aterm conf=exact` on the group's agent run, else its program run, else
+    /// the running command, else the session, `from` the words naming the program that asked
+    /// when a control connection did; then the end stands as asked ([`Self::stand_ask`]), `from`
+    /// with it.
     #[cfg_attr(not(unix), allow(dead_code))]
-    pub(crate) fn ask_end(&mut self, pgid: i32, word: AskWord, by: Actor, at: Stamp) {
+    pub(crate) fn ask_end(
+        &mut self,
+        pgid: i32,
+        word: AskWord,
+        by: Actor,
+        from: Option<&str>,
+        at: Stamp,
+    ) {
         self.resync();
         let node = self
             .agent
@@ -1695,7 +1758,14 @@ impl SessionLog {
             .or(self.fg.filter(|f| f.pgid == pgid).map(|f| f.node))
             .or(self.cmd.map(|c| c.node))
             .unwrap_or(Node::SESSION);
-        if let Ok(f) = Fields::new().word(Key::Word, word.word()) {
+        let fields = Fields::new()
+            .word(Key::Word, word.word())
+            .map(|f| match from {
+                // A program's name the field refuses still leaves the act, unnamed.
+                Some(from) => f.clone().text(Key::From, from).unwrap_or(f),
+                None => f,
+            });
+        if let Ok(f) = fields {
             let _ = self.log.mark(
                 Mark::new(Kind::Act, Src::Aterm, Conf::Exact)
                     .at(node)
@@ -1704,19 +1774,22 @@ impl SessionLog {
                 at,
             );
         }
-        self.stand_ask(pgid, by, at);
+        self.stand_ask(pgid, word, by, at);
+        if let Some(a) = self.ask.as_mut() {
+            a.from = from.map(str::to_string);
+        }
     }
 
-    /// THE END OF GROUP `pgid` STANDS AS `by`'s ASK from `at` for [`ASKED_END_STANDS`], replacing
-    /// any other: with it the running `cmd` run, when the group is the one the log saw in front
-    /// (or its program or agent run's) and not the shell's own (a shell whose group is unread is
-    /// taken as in front). When the log still has the shell in front (its sweep has yet to see
-    /// the group's job), the command is the one whose own stamps span the ask
-    /// ([`Self::asked_cmd`]), so a command whose D is still unread then keeps its own end, and
-    /// one the sweep has yet to see running takes the asked end. A seamless update's carrier
+    /// THE END OF GROUP `pgid` STANDS AS `by`'s ASK (made by act `word`) from `at` for
+    /// [`ASKED_END_STANDS`], replacing any other: with it the running `cmd` run, when the group is
+    /// the one the log saw in front (or its program or agent run's) and not the shell's own (a
+    /// shell whose group is unread is taken as in front). When the log still has the shell in
+    /// front (its sweep has yet to see the group's job), the command is the one whose own stamps
+    /// span the ask ([`Self::asked_cmd`]), so a command whose D is still unread then keeps its own
+    /// end, and one the sweep has yet to see running takes the asked end. A seamless update's carrier
     /// registers the act a Commit cut this way, with no mark: its predecessor wrote it.
     #[cfg_attr(not(unix), allow(dead_code))]
-    pub(crate) fn stand_ask(&mut self, pgid: i32, by: Actor, at: Stamp) {
+    pub(crate) fn stand_ask(&mut self, pgid: i32, word: AskWord, by: Actor, at: Stamp) {
         self.resync();
         let shells = self.root_pgid <= 0 || pgid == self.root_pgid;
         let in_front = pgid == self.front_pgid
@@ -1728,8 +1801,11 @@ impl SessionLog {
             pgid,
             cmd: self.cmd.filter(|_| in_front && !shells).map(|c| c.node),
             unseen: !shells && !in_front && shell_in_front,
+            word,
             by,
+            from: None,
             from_mono: at.mono_ms,
+            from_wall: at.wall_ms,
             until_mono: at.mono_ms.saturating_add(stands),
         });
     }
@@ -1747,7 +1823,7 @@ impl SessionLog {
     /// stays, and the act's reply says why).
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn withdraw_ask(&mut self, pgid: i32) {
-        if self.ask.is_some_and(|a| a.pgid == pgid) {
+        if self.ask.as_ref().is_some_and(|a| a.pgid == pgid) {
             self.ask = None;
         }
     }
@@ -1757,6 +1833,7 @@ impl SessionLog {
     #[cfg(test)]
     pub(crate) fn asked_end(&self) -> Option<(i32, Actor, u64)> {
         self.ask
+            .as_ref()
             .map(|a| (a.pgid, a.by, a.until_mono.saturating_sub(a.from_mono)))
     }
 

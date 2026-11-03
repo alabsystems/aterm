@@ -75,6 +75,15 @@ pub struct SliceBuild {
     pub secs: u64,
     /// Peak resident bytes of the build child and the children it waited for (`wait4`'s `ru_maxrss`), `None` where the host does not report it.
     pub peak_bytes: Option<u64>,
+    /// CPU nanoseconds charged to the reaped build child and descendants it waited
+    /// for. This is not wall time and excludes descendants abandoned without a wait.
+    pub cpu_ns: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BuildUsage {
+    peak_bytes: Option<u64>,
+    cpu_ns: Option<u64>,
 }
 
 /// The file name of a universal cut's x86_64 execution record.
@@ -307,7 +316,7 @@ fn validate_release_rustup_shim_dir(
                 path.display()
             ));
         }
-        let file = File::open(&path)
+        let file = crate::durable::open_regular_file(&path)
             .map_err(|error| format!("open release {tool} shim {}: {error}", path.display()))?;
         let opened = file.metadata().map_err(|error| {
             format!(
@@ -649,11 +658,11 @@ fn build_slices(
         let built = build_one(plan, take, "aterm", target, Some(&log));
         let secs = t.elapsed().as_secs();
         match built {
-            Ok(peak_bytes) => {
+            Ok(usage) => {
                 println!(
                     "==> [{triple}] done in {}{}",
                     fmt_elapsed(t),
-                    peak_bytes.map_or_else(String::new, |b| format!(
+                    usage.peak_bytes.map_or_else(String::new, |b| format!(
                         " (peak {} MiB resident)",
                         b / (1024 * 1024)
                     ))
@@ -661,7 +670,8 @@ fn build_slices(
                 Ok(SliceBuild {
                     triple,
                     secs,
-                    peak_bytes,
+                    peak_bytes: usage.peak_bytes,
+                    cpu_ns: usage.cpu_ns,
                 })
             }
             Err(error) => Err(format!("[{triple}] {error}\n{}", log_tail(&log, 40))),
@@ -715,7 +725,7 @@ fn clock_now() -> String {
 }
 
 fn log_tail(log: &Path, n: usize) -> String {
-    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let text = crate::durable::read_text(log).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..]
         .iter()
@@ -1029,7 +1039,7 @@ fn build_one(
     pkg: &str,
     target: Option<&str>,
     log: Option<&Path>,
-) -> Result<Option<u64>, String> {
+) -> Result<BuildUsage, String> {
     let run = SliceRun {
         verb: "build",
         pkg,
@@ -1109,7 +1119,7 @@ struct SliceRun<'a> {
     static_crt: bool,
 }
 
-fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<Option<u64>, String> {
+fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<BuildUsage, String> {
     let &SliceRun {
         verb, pkg, target, ..
     } = run;
@@ -1189,33 +1199,76 @@ fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<Opti
     } else {
         println!("{banner}");
     }
+    let started = Instant::now();
     let child = cmd
         .spawn()
         .map_err(|e| format!("spawn {driver_name} for {pkg}: {e}"))?;
-    let (status, peak_bytes) =
+    let (status, usage) =
         wait_with_peak(child).map_err(|e| format!("wait for {driver_name} for {pkg}: {e}"))?;
+    let event = build_cpu_event(pkg, target, verb, status, usage, started.elapsed(), log);
+    println!("{event}");
+    if let Some(log) = log {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(log)
+            .map_err(|e| format!("append {}: {e}", log.display()))?;
+        writeln!(file, "{event}").map_err(|e| format!("append {}: {e}", log.display()))?;
+    }
     if !status.success() {
         return Err(format!("{driver_name} {verb} -p {pkg} failed ({status})"));
     }
-    Ok(peak_bytes)
+    Ok(usage)
 }
 
-/// Wait for `child` and read the peak resident memory of it and the children it waited
-/// for (`wait4`'s `ru_maxrss`), which decides whether the next build's slices may run at
-/// once.
+fn build_cpu_event(
+    package: &str,
+    target: Option<&str>,
+    verb: &str,
+    status: std::process::ExitStatus,
+    usage: BuildUsage,
+    wall: std::time::Duration,
+    log: Option<&Path>,
+) -> String {
+    format!(
+        "release-event: {}",
+        aterm_json::json!({
+            "schema": 1, "event": "build-child-finished",
+            "package": package, "target": target, "verb": verb,
+            "log": log.map(|path| path.to_string_lossy().into_owned()),
+            "outcome": if status.success() { "ok" } else { "FAIL" },
+            "exit_code": status.code(), "execution_s": wall.as_secs_f64(),
+            "child_cpu": usage.cpu_ns.map(|ns| aterm_json::json!({
+                "scope": "reaped-child-and-waited-descendants",
+                "observed_s": std::time::Duration::from_nanos(ns).as_secs_f64(),
+            })),
+            "peak_bytes": usage.peak_bytes,
+        })
+    )
+}
+
+/// Wait for `child` and retain its CPU and peak resident memory, including the
+/// children it waited for (`wait4`'s rusage). The peak decides whether the next
+/// build's slices may run at once; CPU is separate from the wall clock.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn wait_with_peak(
     mut child: aterm_uds::spawnfd::Child,
-) -> std::io::Result<(std::process::ExitStatus, Option<u64>)> {
+) -> std::io::Result<(std::process::ExitStatus, BuildUsage)> {
     let usage = child.wait_with_rusage()?;
-    Ok((usage.status, Some(usage.maxrss).filter(|b| *b > 0)))
+    Ok((
+        usage.status,
+        BuildUsage {
+            peak_bytes: Some(usage.maxrss).filter(|b| *b > 0),
+            cpu_ns: u64::try_from(usage.cpu.as_nanos()).ok(),
+        },
+    ))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn wait_with_peak(
     mut child: aterm_uds::spawnfd::Child,
-) -> std::io::Result<(std::process::ExitStatus, Option<u64>)> {
-    Ok((child.wait()?, None))
+) -> std::io::Result<(std::process::ExitStatus, BuildUsage)> {
+    Ok((child.wait()?, BuildUsage::default()))
 }
 
 fn require_rustup_target(triple: &str) -> Result<(), String> {
@@ -1495,12 +1548,18 @@ fn parse_thin_macho_update_pin<R: Read + Seek>(
 }
 
 fn read_thin_macho_update_pin(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path)
+    let mut file = crate::durable::open_regular_file(path)
         .map_err(|error| format!("open architecture slice {}: {error}", path.display()))?;
-    let file_len = file
+    let meta = file
         .metadata()
-        .map_err(|error| format!("stat architecture slice {}: {error}", path.display()))?
-        .len();
+        .map_err(|error| format!("stat architecture slice {}: {error}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "architecture slice {}: not a regular file",
+            path.display()
+        ));
+    }
+    let file_len = meta.len();
     parse_thin_macho_update_pin(&mut file, file_len)
         .map_err(|error| format!("architecture slice {}: {error}", path.display()))
 }
@@ -2240,9 +2299,43 @@ mod tests {
             .args(["-c", "exit 23"])
             .spawn()
             .unwrap();
-        let (status, peak) = super::wait_with_peak(child).unwrap();
+        let (status, usage) = super::wait_with_peak(child).unwrap();
         assert_eq!(status.code(), Some(23));
-        assert!(peak.is_some_and(|bytes| bytes > 0), "{peak:?}");
+        assert!(usage.peak_bytes.is_some_and(|bytes| bytes > 0), "{usage:?}");
+        assert!(usage.cpu_ns.is_some(), "{usage:?}");
+        let event = super::build_cpu_event(
+            "aterm",
+            None,
+            "build",
+            status,
+            super::BuildUsage {
+                peak_bytes: usage.peak_bytes,
+                cpu_ns: Some(8_000_000_000),
+            },
+            std::time::Duration::from_secs(3),
+            None,
+        );
+        let value: aterm_json::Value =
+            aterm_json::from_str(event.strip_prefix("release-event: ").unwrap()).unwrap();
+        assert_eq!(value["outcome"].as_str(), Some("FAIL"));
+        assert_eq!(value["execution_s"].as_f64(), Some(3.0));
+        assert_eq!(value["child_cpu"]["observed_s"].as_f64(), Some(8.0));
+        assert_eq!(
+            value["child_cpu"]["scope"].as_str(),
+            Some("reaped-child-and-waited-descendants")
+        );
+        let unknown = super::build_cpu_event(
+            "aterm",
+            None,
+            "build",
+            status,
+            super::BuildUsage::default(),
+            std::time::Duration::from_secs(3),
+            None,
+        );
+        let value: aterm_json::Value =
+            aterm_json::from_str(unknown.strip_prefix("release-event: ").unwrap()).unwrap();
+        assert!(value["child_cpu"].is_null());
     }
 
     /// A stage whose shipped binary was started and never showed it ran is refused, not
@@ -2973,6 +3066,7 @@ mod tests {
                     triple: "aarch64-apple-darwin",
                     secs: 1,
                     peak_bytes: None,
+                    cpu_ns: None,
                 }],
                 archs: "x86_64 arm64".into(),
                 compiler_line: "trust".into(),

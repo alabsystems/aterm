@@ -54,6 +54,39 @@ pub fn process_presence(pid: i32) -> ProcessPresence {
     }
 }
 
+/// Query a dedicated positive process group atomically, without delivering a signal.
+/// `Absent` means this namespace's kernel returned `ESRCH` for the entire group. An empty
+/// process census or a dead leader cannot establish this fact. Permission failures remain
+/// `Unknown`; `Exited` is never returned for a group. A caller interpreting a durable group
+/// must independently bind this read to its captured boot and pid namespace.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn group_presence(pgid: u32) -> ProcessPresence {
+    let Ok(group) = i32::try_from(pgid) else {
+        return ProcessPresence::Unknown;
+    };
+    if group <= 1 {
+        return ProcessPresence::Unknown;
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: group is greater than one, so its negative addresses exactly one group,
+        // never this process's group by pid zero or every process by -1. Signal zero only
+        // checks existence and permission; no signal is delivered.
+        if unsafe { libc::kill(-group, 0) } == 0 {
+            ProcessPresence::Present
+        } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            ProcessPresence::Absent
+        } else {
+            ProcessPresence::Unknown
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ProcessPresence::Unknown
+    }
+}
+
 /// Whether `pid` reads as a process that has exited and is not yet reaped. On XNU: `SZOMB`, or
 /// a record only the zombie lookup finds. XNU takes an exiting process off its live list before
 /// it ends its threads and address space, so from then every live read ([`read_birth`],
@@ -498,9 +531,13 @@ pub use kin::held_among;
 pub use kin::{
     GroupMembers, HeldNow, Lineage, MARKER_VARS, MAX_GROUP_PIDS, Markers, TRUST_CHECK_VAR,
     VERIFY_RUN_VAR, at_program_check, boot_id, group_listing_can_be_whole, group_members, held_age,
-    held_programs, launchd_idversion, launched_before, pid_namespace, process_serial,
+    held_programs, host_id, launchd_idversion, launched_before, pid_namespace, process_serial,
     read_identity, read_lineage, read_process_markers, stripped_from_child, thread_ran,
 };
+
+#[path = "process_image.rs"]
+mod image;
+pub use image::{LoadedImage, image_matches_file};
 
 #[cfg(target_vendor = "apple")]
 pub use kin::{BsdInfoWithUniqId, UniqIdentifierInfo, bsdinfo_uniq, uniq_identifier};
@@ -517,6 +554,29 @@ pub fn read_birth(pid: i32) -> Option<Birth> {
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         read_process_birth(pid).map(Birth::from)
+    }
+}
+
+/// The kernel's CodeDirectory hash for a running Apple image, bracketed by its process
+/// identity. Unlike a hash read from the pathname, this identifies the code loaded by exec.
+/// Returns `None` off Apple platforms or when the kernel refuses the read.
+#[must_use]
+pub fn read_code_directory_hash(pid: i32) -> Option<[u8; 20]> {
+    #[cfg(target_vendor = "apple")]
+    {
+        unsafe extern "C" {
+            fn csops(pid: i32, ops: u32, useraddr: *mut core::ffi::c_void, usersize: usize) -> i32;
+        }
+        let before = read_identity(pid)?;
+        let mut hash = [0_u8; 20];
+        // SAFETY: hash holds 20 writable bytes, exactly the length passed to CS_OPS_CDHASH.
+        let result = unsafe { csops(pid, 5, hash.as_mut_ptr().cast(), hash.len()) };
+        (result == 0 && read_identity(pid) == Some(before)).then_some(hash)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = pid;
+        None
     }
 }
 
@@ -648,6 +708,33 @@ impl BsdShortInfo {
     pub const SSTOP: u32 = 4;
     /// `pbsi_flags`: the process has replaced the image it was forked with (`P_EXEC`).
     pub const PROC_FLAG_EXEC: u32 = 0x4000;
+}
+
+/// Whether `pid` is stopped (a `SIGSTOP`, a tracer's stop): it answers nothing until resumed.
+#[must_use]
+pub fn is_stopped(pid: u32) -> bool {
+    #[cfg(target_vendor = "apple")]
+    {
+        i32::try_from(pid)
+            .ok()
+            .and_then(read_short_info)
+            .is_some_and(|info| info.pbsi_status == BsdShortInfo::SSTOP)
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // `T` is a job-control stop, `t` a tracer's.
+        i32::try_from(pid).ok().is_some_and(|id| {
+            read_proc_text(std::path::Path::new(&format!("/proc/{pid}/stat")))
+                .ok()
+                .and_then(|stat| procfs::stat_start(&stat, id))
+                .is_some_and(|(state, _)| matches!(state, 'T' | 't'))
+        })
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// `pid`'s short BSD record ([`BsdShortInfo`]).
@@ -1115,13 +1202,16 @@ pub fn translation() -> Translation {
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn translator() -> Option<String> {
-    let kernel = std::fs::read_to_string("/proc/sys/kernel/arch").ok()?;
+    let kernel =
+        crate::atomic_file::read_regular_text(std::path::Path::new("/proc/sys/kernel/arch"), 1024)
+            .ok()?;
     let (kernel, code) = (kernel.trim(), std::env::consts::ARCH);
     if kernel.is_empty() || kernel == code {
         return None;
     }
     let rosetta =
-        std::fs::read_to_string("/proc/cpuinfo").is_ok_and(|info| info.contains("VirtualApple"));
+        crate::atomic_file::read_regular_text(std::path::Path::new("/proc/cpuinfo"), 1024 * 1024)
+            .is_ok_and(|info| info.contains("VirtualApple"));
     Some(if rosetta {
         "Rosetta".to_string()
     } else {
@@ -1523,7 +1613,8 @@ fn linux_reader() -> Option<(u32, u64)> {
 /// # Errors
 /// The file's read error.
 pub fn read_proc_text(path: &std::path::Path) -> std::io::Result<String> {
-    std::fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    crate::atomic_file::read_regular(path, 256 * 1024)
+        .map(|(bytes, _)| String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// `pid`'s `stat`, `status` and `stat` again, the reads [`procfs::start`] and
@@ -3366,6 +3457,13 @@ mod kill_self_tests {
 mod presence_tests {
     use super::{ProcessPresence, process_presence, read_birth};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn group_query_refuses_process_and_all_process_selectors() {
+        for group in [0, 1, u32::MAX] {
+            assert_eq!(super::group_presence(group), ProcessPresence::Unknown);
+        }
+    }
 
     /// A child that has exited and is not yet reaped (a zombie) reads `Exited`, a live one
     /// `Present`, and the zombie reads no birth. Negative control: answer `Present` whenever the

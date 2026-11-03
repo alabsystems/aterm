@@ -311,13 +311,25 @@ pub fn read_server_heads(paths: &Paths, extra_urls: &[String]) -> crate::Result<
         return Ok(out);
     }
 
-    for url in candidate_server_urls(paths, &config, extra_urls) {
-        if let Ok(Fetched::Body(bytes)) = transport::fetch_within_as(
-            &url,
-            None,
-            servers_within(SERVER_HEAD_DEADLINE),
-            Some(&identity.recipient().to_bech32()),
-        ) && let Ok(head) = decode_verified_head(paths, url, bytes, &config, &pin, &identity)
+    // Every candidate is read at once, within one deadline, each body kept only where its
+    // signature verifies ([`super::fan_out::bodies_within`]): one after another, each server that
+    // takes the read and never answers held the mirror for a deadline of its own. Heads are
+    // opened and kept in the candidates' order, as they were read by read.
+    let urls = candidate_server_urls(paths, &config, extra_urls);
+    let reader = identity.recipient().to_bech32();
+    let bodies = super::fan_out::bodies_within(
+        &urls,
+        servers_within(SERVER_HEAD_DEADLINE),
+        Some(&reader),
+        |bytes| {
+            envelope::verify_for_reader(&bytes, &config.name, &pin, &config.followed, None)
+                .is_ok()
+                .then_some(bytes)
+        },
+    );
+    for (url, body) in urls.into_iter().zip(bodies) {
+        if let Some(bytes) = body
+            && let Ok(head) = decode_verified_head(paths, url, bytes, &config, &pin, &identity)
         {
             out.push(head);
         }
@@ -442,6 +454,9 @@ pub(super) fn reconcile_merged_metadata_with_log(
                     }
                     if existing.hint.is_none() {
                         existing.hint = member.hint;
+                    }
+                    if existing.hw_hint.is_none() {
+                        existing.hw_hint = member.hw_hint;
                     }
                     if existing.claimed_label.is_none() {
                         existing.claimed_label = member.claimed_label;
@@ -577,6 +592,9 @@ pub(super) fn reconcile_merged_metadata_with_log(
                 }
                 if existing.hint.is_none() {
                     existing.hint = m.hint;
+                }
+                if existing.hw_hint.is_none() {
+                    existing.hw_hint = m.hw_hint;
                 }
                 for alias in m.aliases {
                     if !existing.aliases.contains(&alias) {
@@ -1012,36 +1030,23 @@ pub(super) fn publish_to_servers_for_admin_until(
         None => super::publish_lock(paths)?,
     };
     drop(super::configured_admin_until(paths, expected, deadline)?);
-    // Every PUT runs at once. Each one has its own exchange deadline, and the list holds up to
-    // `discover::MAX_CANDIDATES` browsed servers that nothing has verified. Run one after
-    // another, a server that accepts and never answers would hold the publish for one deadline
-    // per server. Run at once, it holds it for one deadline, as the single PUT to
-    // `config.source` did before F6.
-    let put = |url: &String| transport::publish_until(&Source::Url(url.clone()), bytes, deadline);
-    let results = std::thread::scope(|scope| {
-        let handles: Vec<_> = urls
-            .iter()
-            .map(|url| {
-                std::thread::Builder::new()
-                    .name("vault-publish".to_owned())
-                    .spawn_scoped(scope, move || put(url))
-            })
-            .collect();
-        urls.iter()
-            .zip(handles)
-            .map(|(url, handle)| {
-                let res = match handle {
-                    Ok(handle) => handle
-                        .join()
-                        .unwrap_or_else(|_| Err(Error::new("a publishing thread panicked"))),
-                    // No thread to spare: this one PUTs once the others are under way.
-                    Err(_) => put(url),
-                };
-                (url.clone(), res)
-            })
-            .collect()
+    // Every PUT runs at once, all of them within one exchange deadline (the caller's, or one
+    // exchange from now), and the list holds up to `discover::MAX_CANDIDATES` browsed servers
+    // that nothing has verified. Run one after another, a server that accepts and never answers
+    // would hold the publish for one deadline per server. Run at once, it holds it for one
+    // deadline, as the single PUT to `config.source` did before F6.
+    let deadline = deadline.unwrap_or_else(|| Instant::now() + transport::EXCHANGE);
+    let results = super::fan_out::each_at_once("vault-publish", urls, |url| {
+        transport::publish_until(&Source::Url(url.clone()), bytes, Some(deadline))
     });
-    Ok(results)
+    Ok(urls
+        .iter()
+        .zip(results)
+        .map(|(url, res)| {
+            let res = res.unwrap_or_else(|| Err(Error::new("a publishing thread panicked")));
+            (url.clone(), res)
+        })
+        .collect())
 }
 
 /// PUT `bytes` to every server URL in `urls` (holding `paths`'s publish lock, and its state lock

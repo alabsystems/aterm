@@ -155,7 +155,7 @@ impl CustodyLock {
             held();
         };
         let result = if let Some(deadline) = deadline {
-            aterm_uds::private_file::lock_exclusive_until_with(
+            aterm_uds::file_lock::lock_exclusive_until_with(
                 &custody_file,
                 deadline,
                 "another local Commons bootstrap is active",
@@ -168,7 +168,7 @@ impl CustodyLock {
             )]
             custody_file.lock()
         } else {
-            aterm_uds::private_file::lock_exclusive_until_with(
+            aterm_uds::file_lock::lock_exclusive_until_with(
                 &custody_file,
                 std::time::Instant::now() + CUSTODY_WAIT,
                 "another local Commons bootstrap is active",
@@ -1451,6 +1451,13 @@ impl Bootstrap {
     /// changed, missing, busy or no longer private state grants no authorization.
     pub fn revalidate_custody(&self) -> Result<()> {
         Self::validate_snapshot(&self.paths, &self.snapshot)?;
+        self.revalidate_immutable_custody()
+    }
+
+    /// Check the same immutable custody after a caller has independently
+    /// revalidated and exclusively held the exact vault observation. This does
+    /// not acquire another state observation or grant any authority by itself.
+    pub(crate) fn revalidate_immutable_custody(&self) -> Result<()> {
         for (path, expected) in &self.immutable {
             if &custody_digest(path)? != expected {
                 return Err(Error::new(
@@ -1675,22 +1682,56 @@ impl Bootstrap {
     /// the age recipient alone cannot activate a different enrolled writer.
     /// The returned handle still rechecks its journal before exposing any key.
     pub fn access(&self) -> Result<Option<super::roster::Access>> {
+        client::with_roster_observation(&self.paths, |observation| {
+            let journal = Journal::read_existing(&self.journal_dir, self.trust())?;
+            self.access_in_observed(&journal, observation.state_lock())
+        })
+        .map(Option::flatten)
+    }
+
+    pub(crate) fn access_held(
+        &self,
+        lock: &client::StateLock,
+    ) -> Result<Option<super::roster::Access>> {
         let journal = Journal::read_existing(&self.journal_dir, self.trust())?;
-        self.access_in(&journal)
+        self.access_in_held(&journal, lock)
     }
 
     /// Validate against an already open journal, a writer or a read-only view,
     /// so a short local batch shares one consistent control observation.
     pub fn access_in(&self, journal: &Journal) -> Result<Option<super::roster::Access>> {
+        client::with_roster_observation(&self.paths, |observation| {
+            self.access_in_observed(journal, observation.state_lock())
+        })
+        .map(Option::flatten)
+    }
+
+    pub(crate) fn access_in_held(
+        &self,
+        journal: &Journal,
+        lock: &client::StateLock,
+    ) -> Result<Option<super::roster::Access>> {
+        self.access_in_observed(journal, Some(lock))
+    }
+
+    fn access_in_observed(
+        &self,
+        journal: &Journal,
+        lock: Option<&client::StateLock>,
+    ) -> Result<Option<super::roster::Access>> {
         if journal.trust() != self.trust() {
             return Err(Error::new("Commons access has another trust context"));
         }
-        if client::local_recipient_denied_in_roster(&self.paths) {
+        if let Some(lock) = lock
+            && client::local_recipient_denial_held(&self.paths, lock)?
+        {
             return Ok(None);
         }
         let maybe_access = if let Some((log, heads_digest)) =
             client::trusted_commons_log(&self.paths, self.trust())?
         {
+            let lock =
+                lock.ok_or_else(|| Error::new("Commons membership log has no vault observation"))?;
             let me = self.device.identity.recipient();
             let req = self.request()?;
             if log.wraps_to(&me)
@@ -1739,6 +1780,7 @@ impl Bootstrap {
                     &self.device.identity,
                     &log,
                     heads_digest,
+                    lock,
                 )?
             } else {
                 super::roster::current(journal, &self.device.identity)?

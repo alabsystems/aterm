@@ -2,12 +2,20 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Canonical tape encoding and decoding for GitHub HTTP requests, responses, and wire failures.
+//! Canonical tape encoding and decoding for every door a tape keeps: GitHub HTTP requests,
+//! responses and wire failures, route decisions, facts, git runs and their answers, streamed
+//! bodies, and credentialed requests with their write bodies.
 
 use std::io::Cursor;
 
+#[cfg(any(unix, test))]
+use crate::error::SideEffect;
 use crate::error::{Error, Replay, Result};
-use crate::policy::{Decision, RouteRequest};
+use crate::git::GitOp;
+use crate::policy::{
+    AnonymousWhy, ChainStep, Decision, Named, Presence, Refusal, RefusalCode, RouteRequest,
+    RouteTarget, Tier,
+};
 use crate::redact::Redactor;
 use crate::wire::{
     Endpoints, Origin, OriginRole, Phase, WireBody, WireError, WireKind, WireRequest, WireResponse,
@@ -36,28 +44,50 @@ pub const KEPT_HEADERS: [&str; 15] = [
 /// A reply body over this many bytes is taped as its digest and size only.
 pub const BODY_TAPE_MAX: usize = 1 << 20;
 
-/// The query a CDN URL is written with: its signature is a bearer secret with an expiry.
+/// The query a redirect off the API is written with: a CDN's signature, or another host's token, is a bearer secret with an expiry.
 const SIGNED_REDACTED: &str = "signed=redacted";
 
 /// The line a reply over `BODY_TAPE_MAX` holds in place of its body.
 const BODY_DIGEST: &str = "body-digest";
 
-/// Every wire kind, by its slug: how `decode` reads a `failed` line's kind back.
-const WIRE_KINDS: [WireKind; 13] = [
-    WireKind::Dns,
-    WireKind::Connect,
-    WireKind::Proxy,
-    WireKind::Tls,
-    WireKind::Trust,
-    WireKind::Timeout,
-    WireKind::Idle,
-    WireKind::Reset,
-    WireKind::Truncated,
-    WireKind::TooLarge,
-    WireKind::Protocol,
-    WireKind::Revoked,
-    WireKind::Local,
-];
+/// `fn $name(slug) -> Option<$ty>`: the variant of `$ty` whose `slug()` is `slug`, among the
+/// variants listed. The list is both the candidates and an exhaustive match over them (inside
+/// agh, `#[non_exhaustive]` excuses no match), so a variant `$ty` gains and the list lacks
+/// fails to compile here, never to decode on a replay.
+macro_rules! by_slug {
+    ($name:ident, $ty:ident: $($variant:ident),+ $(,)?) => {
+        fn $name(slug: &str) -> Option<$ty> {
+            [$($ty::$variant),+].into_iter().find(|candidate| match candidate {
+                $($ty::$variant)|+ => candidate.slug() == slug,
+            })
+        }
+    };
+    // The same, with `$all` every listed variant, for a test that walks them.
+    ($name:ident, $all:ident, $ty:ident: $($variant:ident),+ $(,)?) => {
+        $crate::fx::canon::by_slug!($name, $ty: $($variant),+);
+        #[cfg(test)]
+        const $all: &[$ty] = &[$($ty::$variant),+];
+    };
+}
+pub(crate) use by_slug;
+
+// How `decode` reads a `failed` line's wire kind back.
+by_slug!(
+    wire_kind,
+    WireKind: Dns,
+    Connect,
+    Proxy,
+    Tls,
+    Trust,
+    Timeout,
+    Idle,
+    Reset,
+    Truncated,
+    TooLarge,
+    Protocol,
+    Revoked,
+    Local,
+);
 
 /// Whether `name` is kept, ASCII case-insensitively.
 #[must_use]
@@ -74,7 +104,7 @@ pub(super) fn cut(headers: Vec<(String, String)>) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Filters `headers` to [`KEPT_HEADERS`] with lowercased names, redacting queries on `location` URLs targeting `endpoints.asset_hosts()`.
+/// Filters `headers` to [`KEPT_HEADERS`] with lowercased names, redacting the query of a `location` URL whose origin is an asset host or any origin but the API's (`signed_redacted`).
 #[must_use]
 pub fn keep(endpoints: &Endpoints, headers: Vec<(String, String)>) -> Vec<(String, String)> {
     cut(headers)
@@ -89,10 +119,15 @@ pub fn keep(endpoints: &Endpoints, headers: Vec<(String, String)>) -> Vec<(Strin
         .collect()
 }
 
-/// Replaces `url`'s query with `signed=redacted` when its origin is an asset host.
+/// Replaces `url`'s query with `signed=redacted` when its origin is an asset host, or any
+/// origin but the API's: a redirect off the API (an asset's CDN, codeload's `?token=`, an
+/// artifact's or a log's signed blob URL) carries its bearer secret in its query. agh follows
+/// a `location` only to the CDN (whose request is taped by its path) or on the API origin
+/// (a moved repository), and those it reads whole.
 fn signed_redacted(endpoints: &Endpoints, url: &str) -> Option<String> {
     let (origin, path_and_query) = Origin::parse(url)?;
-    if !endpoints.asset_hosts().contains(&origin) {
+    let api = endpoints.origin(OriginRole::Api);
+    if origin == *api && !endpoints.asset_hosts().contains(&origin) {
         return None;
     }
     let (path, _query) = path_and_query.split_once('?')?;
@@ -130,23 +165,23 @@ fn sorted_query(query: &str) -> String {
         .join("&")
 }
 
-/// The next of a request M1's tapes cannot hold: every run of it would be refused the same.
+/// The next of a request an anonymous tape cannot hold: every run of it would be refused the same.
 const ANONYMOUS_READS: &str =
-    "run it without --record or --replay: M1's tapes hold anonymous reads alone";
+    "run it without --record or --replay: an anonymous tape holds anonymous reads alone";
 
 /// Encodes `req` into canonical tape request bytes (method, path and sorted or redacted query, origin role, sorted headers excluding `user-agent`, `as anonymous`, and `body none`).
 ///
 /// # Errors
 ///
 /// `Replay::StreamNotTaped` for a body other than `WireBody::Empty`, or a request with `auth`
-/// set (M1's tapes are anonymous); CouldNotRun, `Sub::Protocol`, for a URL on none of
+/// set (an anonymous tape holds no credential); CouldNotRun, `Sub::Protocol`, for a URL on none of
 /// `endpoints`' origins.
 pub fn request(req: &WireRequest<'_>, endpoints: &Endpoints) -> Result<Vec<u8>> {
     if !matches!(req.body, WireBody::Empty) {
         return Err(Error::replay(
             Replay::StreamNotTaped,
             format!(
-                "a {} with a body is not taped: M1's tapes hold reads alone",
+                "a {} with a body is not taped: an anonymous tape holds reads alone",
                 req.method.as_str()
             ),
         )
@@ -160,7 +195,7 @@ pub fn request(req: &WireRequest<'_>, endpoints: &Endpoints) -> Result<Vec<u8>> 
     if credentialed {
         return Err(Error::replay(
             Replay::StreamNotTaped,
-            "a request that carries a credential is not taped: M1's tapes are anonymous",
+            "a request that carries a credential is not taped: this tape is anonymous",
         )
         .with_next(ANONYMOUS_READS));
     }
@@ -218,8 +253,7 @@ fn head(req: &WireRequest<'_>, endpoints: &Endpoints) -> Result<String> {
 
 /// `sha256:{hex}` of `bytes`.
 fn sha256_of(bytes: &[u8]) -> String {
-    let digest = aterm_digest::Sha256::digest(bytes);
-    format!("sha256:{}", aterm_codec::hex::encode_lower(&digest))
+    crate::model::Sha256Digest::of(bytes).to_string()
 }
 
 /// `sha256:{hex} {len}` of `canonical`: the journal's `request` field (§4.6.8), so an intent
@@ -280,8 +314,94 @@ pub fn request_credentialed(req: &WireRequest<'_>, endpoints: &Endpoints) -> Res
 /// joined by `\n`.
 #[must_use]
 pub fn route_request(req: &RouteRequest) -> Vec<u8> {
-    let _ = req;
-    Vec::new()
+    let target = match &req.target {
+        RouteTarget::Repo(slug) => format!("route repo {slug}"),
+        RouteTarget::Owner(owner) => format!("route owner {owner}"),
+        RouteTarget::Unscoped => "route unscoped".to_string(),
+        RouteTarget::Identity => "route identity".to_string(),
+    };
+    let named = match &req.named {
+        Named::Default => "named default".to_string(),
+        Named::Literal(literal) => format!("named literal {}", literal.slug()),
+        Named::Target(name) => format!("named target {name}"),
+    };
+    format!(
+        "{target}\naccess {}\n{named}\nanonymous {}\nas {}",
+        req.access.slug(),
+        u8::from(req.anonymous),
+        req.as_profile.as_deref().unwrap_or("-")
+    )
+    .into_bytes()
+}
+
+/// A routing fact's question (`Fx::fact`): `fact {question} {profile}`, one line.
+#[must_use]
+pub fn fact_request(question: &str, profile: &str) -> Vec<u8> {
+    format!("fact {} {}", one_line(question), one_line(profile)).into_bytes()
+}
+
+/// A routing fact's answer: `answer {text}`, the text through `Redactor::shapes` on one line.
+#[must_use]
+pub fn fact_reply(answer: &str) -> Vec<u8> {
+    format!("answer {}", one_line(answer)).into_bytes()
+}
+
+/// A fact's answer read back.
+///
+/// # Errors
+///
+/// `Replay::Format` for bytes `fact_reply` did not write.
+pub fn fact_decode(bytes: &[u8]) -> Result<String> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.strip_prefix("answer "))
+        .filter(|answer| !answer.contains('\n'))
+        .map(str::to_string)
+        .ok_or_else(|| not_written_here("routing fact"))
+}
+
+// How `route_decode` reads a `refuse` line's code back.
+by_slug!(
+    refusal_code,
+    RefusalCode: WriterAbsent,
+    WriterUnusable,
+    ChainExhausted,
+    ChainStoppedUnusable,
+    WriteNone,
+    ReleaseNeedsLiteral,
+    ReleaseTargetForWrite,
+    AsNotInChain,
+    AsNotWriter,
+    ConfigInvalid,
+    TierMismatch,
+    MethodNotRead,
+    AnonymousWriterRead,
+    ProfileUnknown,
+    IdentityNeedsAs,
+    UnscopedNotRead,
+    NotGranted,
+);
+
+// How `route_decode` reads an `anonymous` line's reason back.
+by_slug!(
+    anonymous_why,
+    AnonymousWhy: Asked,
+    ChainFellThrough,
+    NoConfig
+);
+
+/// One line of a taped text: `Redactor::shapes`, with a CR or LF written as a space.
+fn one_line(text: &str) -> String {
+    Redactor::shapes(text).replace(['\r', '\n'], " ")
+}
+
+/// `Replay::Format`: bytes `route_reply` or `git_reply` did not write.
+fn not_written_here(what: &str) -> Error {
+    Error::replay(
+        Replay::Format,
+        format!("the tape's {what} is not one agh wrote"),
+    )
+    .with_next(super::tape::RECORD_AGAIN)
 }
 
 /// A decision: `send {profile} {tier}`; `anonymous {why}` (`AnonymousWhy::slug`); or
@@ -290,8 +410,27 @@ pub fn route_request(req: &RouteRequest) -> Vec<u8> {
 /// a replayed refusal prints the error line the recorded one printed.
 #[must_use]
 pub fn route_reply(decision: &Decision) -> Vec<u8> {
-    let _ = decision;
-    Vec::new()
+    let text = match decision {
+        Decision::Send { profile, tier } => format!("send {} {}", one_line(profile), tier.slug()),
+        Decision::Anonymous { why } => format!("anonymous {}", why.slug()),
+        Decision::Refuse(refusal) => {
+            let mut text = format!(
+                "refuse {}\nwhy {}\nnext {}",
+                refusal.code.slug(),
+                one_line(&refusal.why),
+                one_line(&refusal.next)
+            );
+            for (step, presence) in &refusal.tried {
+                text.push_str(&format!(
+                    "\ntried {} {}",
+                    one_line(step.label()),
+                    presence.slug()
+                ));
+            }
+            text
+        }
+    };
+    text.into_bytes()
 }
 
 /// A decision read back.
@@ -300,18 +439,100 @@ pub fn route_reply(decision: &Decision) -> Vec<u8> {
 ///
 /// `Replay::Format` for bytes `route_reply` did not write.
 pub fn route_decode(bytes: &[u8]) -> Result<Decision> {
-    let _ = bytes;
-    Err(Error::not_yet("the route door", "WP10"))
+    let bad = || not_written_here("routing decision");
+    let text = std::str::from_utf8(bytes).map_err(|_| bad())?;
+    let mut lines = text.split('\n');
+    let first = lines.next().unwrap_or_default();
+    let (word, rest) = first.split_once(' ').ok_or_else(bad)?;
+    let decision = match word {
+        "send" => {
+            let (profile, tier) = rest.rsplit_once(' ').ok_or_else(bad)?;
+            let tier = Tier::parse(tier).ok_or_else(bad)?;
+            if profile.is_empty() {
+                return Err(bad());
+            }
+            Decision::Send {
+                profile: profile.to_string(),
+                tier,
+            }
+        }
+        "anonymous" => Decision::Anonymous {
+            why: anonymous_why(rest).ok_or_else(bad)?,
+        },
+        "refuse" => {
+            let code = refusal_code(rest).ok_or_else(bad)?;
+            let mut field = |name: &str| -> Result<String> {
+                let line = lines.next().ok_or_else(bad)?;
+                if line == name {
+                    return Ok(String::new());
+                }
+                line.strip_prefix(name)
+                    .and_then(|rest| rest.strip_prefix(' '))
+                    .map(str::to_string)
+                    .ok_or_else(bad)
+            };
+            let why = field("why")?;
+            let next = field("next")?;
+            let mut tried = Vec::new();
+            for line in lines.by_ref() {
+                let step = line.strip_prefix("tried ").ok_or_else(bad)?;
+                let (label, presence) = step.rsplit_once(' ').ok_or_else(bad)?;
+                let step = match label {
+                    "" => return Err(bad()),
+                    "anonymous" => ChainStep::Anonymous,
+                    name => ChainStep::Profile(name.to_string()),
+                };
+                let presence = Presence::from_slug(presence).ok_or_else(bad)?;
+                tried.push((step, presence));
+            }
+            Decision::Refuse(Refusal {
+                code,
+                why,
+                next,
+                tried,
+            })
+        }
+        _ => return Err(bad()),
+    };
+    if lines.next().is_some() {
+        return Err(bad());
+    }
+    Ok(decision)
 }
 
-/// A git run's canonical bytes: `git {op} {owner}/{repo}` (`clone`, `fetch`, `ls-remote`,
-/// `push-delete`), then the op's own words, one per line (`depth {n}`, `ref {name}`,
-/// `expect {sha}`). Never the URL (the tape's header names the endpoints), the environment,
+/// A git run's canonical bytes: `git {op} {owner}/{repo}` (`clone`, `fetch`, `fetch-main`,
+/// `ls-remote`, `push-delete`), then the op's own words, one per line (`depth {n}`,
+/// `into {ref}`, `ref {name}`, `expect {sha}`). Never the URL (the tape's header names the endpoints), the environment,
 /// the grant's nonce or a path.
 #[must_use]
 pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
-    let _ = run;
-    Vec::new()
+    let slug = &run.slug;
+    let text = match &run.op {
+        GitOp::Clone { depth, .. } => match depth {
+            Some(depth) => format!("git clone {slug}\ndepth {depth}"),
+            None => format!("git clone {slug}"),
+        },
+        GitOp::Fetch { .. } => format!("git fetch {slug}"),
+        GitOp::FetchMain { into, .. } => format!("git fetch-main {slug}\ninto {into}"),
+        GitOp::LsRemote { reference } => match reference {
+            Some(reference) => format!("git ls-remote {slug}\nref {reference}"),
+            None => format!("git ls-remote {slug}"),
+        },
+        GitOp::PushDelete { reference, expect } => {
+            format!("git push-delete {slug}\nref {reference}\nexpect {expect}")
+        }
+    };
+    text.into_bytes()
+}
+
+/// One stream's pieces for `git_reply`: `{name} {n}`, then each piece, shaped.
+fn git_stream(out: &mut Vec<u8>, name: &str, bytes: &[u8]) {
+    let pieces: Vec<&[u8]> = bytes.split(|&b| b == b'\n').collect();
+    out.extend_from_slice(format!("\n{name} {}", pieces.len()).as_bytes());
+    for piece in pieces {
+        out.push(b'\n');
+        out.extend_from_slice(&super::tape::shaped(piece));
+    }
 }
 
 /// A git run's answer: `exit {code}` or `exit signal`, then `stdout {n}` and stdout's `n`
@@ -319,8 +540,184 @@ pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
 /// `Redactor::shapes`. An empty stream is one empty piece.
 #[must_use]
 pub fn git_reply(out: &super::child::ChildOut) -> Vec<u8> {
-    let _ = out;
-    Vec::new()
+    let mut bytes = match out.code {
+        Some(code) => format!("exit {code}"),
+        None => "exit signal".to_string(),
+    }
+    .into_bytes();
+    git_stream(&mut bytes, "stdout", &out.stdout);
+    git_stream(&mut bytes, "stderr", &out.stderr);
+    bytes
+}
+
+/// `git_reply`'s bytes read back.
+///
+/// # Errors
+///
+/// `Replay::Format` for bytes `git_reply` did not write.
+#[cfg(any(unix, test))]
+pub(crate) fn git_decode(bytes: &[u8]) -> Result<super::child::ChildOut> {
+    let bad = || not_written_here("git answer");
+    let mut lines = bytes.split(|&b| b == b'\n');
+    let exit = lines
+        .next()
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .and_then(|line| line.strip_prefix("exit "))
+        .ok_or_else(bad)?;
+    let code = match exit {
+        "signal" => None,
+        code => Some(code.parse::<i32>().map_err(|_| bad())?),
+    };
+    let mut stream = |name: &str| -> Result<Vec<u8>> {
+        let line = lines.next().ok_or_else(bad)?;
+        let count: u64 = std::str::from_utf8(line)
+            .ok()
+            .and_then(|line| line.strip_prefix(name))
+            .and_then(|rest| rest.strip_prefix(' '))
+            .and_then(crate::path::digits)
+            .filter(|n| *n > 0)
+            .ok_or_else(bad)?;
+        let mut out = Vec::new();
+        for i in 0..count {
+            let piece = lines.next().ok_or_else(bad)?;
+            if i > 0 {
+                out.push(b'\n');
+            }
+            out.extend_from_slice(piece);
+        }
+        Ok(out)
+    };
+    let stdout = stream("stdout")?;
+    let stderr = stream("stderr")?;
+    if lines.next().is_some() {
+        return Err(bad());
+    }
+    Ok(super::child::ChildOut {
+        code,
+        stdout,
+        stderr,
+    })
+}
+
+// How `git_answer` reads a `failed` line's side effect back.
+#[cfg(any(unix, test))]
+by_slug!(side_effect, SideEffect: None, Unknown, Applied);
+
+/// A git run that ended with no exit to tape: `child::run`'s error, which is could_not_run,
+/// `Sub::Local` (the run could not start, could not be waited for, or did not finish in its
+/// budget). `failed {side effect}` (`none`, `unknown` or `applied`), then `why {text}`, the
+/// text through `Redactor::shapes` with a CR or LF written as a space. `git_answer` reads it
+/// back, so a replay ends where the recorded run did, with the same side effect.
+#[cfg(any(unix, test))]
+pub(crate) fn git_failure(e: &Error) -> Vec<u8> {
+    format!("failed {}\nwhy {}", e.side_effect.slug(), one_line(&e.why)).into_bytes()
+}
+
+/// A taped git answer read back: `git_reply`'s bytes as the run's output (`git_decode`),
+/// `git_failure`'s as its error.
+///
+/// # Errors
+///
+/// `Replay::Format` for bytes neither wrote.
+#[cfg(any(unix, test))]
+pub(crate) fn git_answer(
+    bytes: &[u8],
+) -> Result<std::result::Result<super::child::ChildOut, Error>> {
+    let Some(rest) = bytes.strip_prefix(b"failed ") else {
+        return git_decode(bytes).map(Ok);
+    };
+    let bad = || not_written_here("git answer");
+    let text = std::str::from_utf8(rest).map_err(|_| bad())?;
+    let (effect, why) = text.split_once('\n').ok_or_else(bad)?;
+    let side_effect = side_effect(effect).ok_or_else(bad)?;
+    let why = why.strip_prefix("why ").ok_or_else(bad)?;
+    if why.contains('\n') {
+        return Err(bad());
+    }
+    Ok(Err(Error::local(why).with_side_effect(side_effect)))
+}
+
+/// The line a streamed reply holds in place of its body: the sidecar's digest and length.
+#[cfg(unix)]
+const BODY_FILE: &str = "body-file";
+
+/// A streamed answer on a credentialed tape: `status {status}`, the kept headers, then
+/// `body-file sha256:{hex} {len}`, the sidecar that holds its bytes (`{tape}.d/{hex}`).
+#[cfg(unix)]
+pub(crate) fn stream_reply(
+    status: u16,
+    headers: &[(String, String)],
+    hex: &str,
+    len: u64,
+) -> Vec<u8> {
+    let mut text = format!("status {status}\n");
+    for (name, value) in headers {
+        text.push_str(name);
+        text.push(' ');
+        text.push_str(value);
+        text.push('\n');
+    }
+    text.push_str(&format!("{BODY_FILE} sha256:{hex} {len}"));
+    text.into_bytes()
+}
+
+/// A streamed answer's head, read back from `stream_reply`'s bytes.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct StreamHead {
+    /// The status.
+    pub(crate) status: u16,
+    /// The kept headers, in order.
+    pub(crate) headers: Vec<(String, String)>,
+    /// The sidecar's lowercase hex SHA-256.
+    pub(crate) hex: String,
+    /// The body's length.
+    pub(crate) len: u64,
+}
+
+/// `stream_reply`'s bytes, or `failure`'s, read back.
+///
+/// # Errors
+///
+/// `Replay::Format` for bytes neither wrote.
+#[cfg(unix)]
+pub(crate) fn stream_decode(bytes: &[u8]) -> Result<std::result::Result<StreamHead, WireError>> {
+    if let Some(rest) = bytes.strip_prefix(b"failed ") {
+        return decode_failure(rest).map(Err);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| not_a_reply("a stream's head not UTF-8"))?;
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    let last = lines
+        .pop()
+        .and_then(|line| line.strip_prefix(BODY_FILE))
+        .and_then(|rest| rest.strip_prefix(" sha256:"))
+        .ok_or_else(|| not_a_reply("a streamed answer without its body-file line"))?;
+    let (hex, len) = last
+        .split_once(' ')
+        .ok_or_else(|| not_a_reply("a body-file line without its length"))?;
+    let well_formed = aterm_codec::hex::is_lower(hex, 64);
+    let len = crate::path::digits(len)
+        .filter(|_| well_formed)
+        .ok_or_else(|| not_a_reply("a body-file line that is not a sha256 digest and a length"))?;
+    let mut lines = lines.into_iter();
+    let status = lines
+        .next()
+        .and_then(|line| line.strip_prefix("status "))
+        .and_then(crate::path::digits::<u16>)
+        .ok_or_else(|| not_a_reply("a status that is no number"))?;
+    let mut headers = Vec::new();
+    for line in lines {
+        let (name, value) = line
+            .split_once(' ')
+            .ok_or_else(|| not_a_reply("a header line without a value"))?;
+        headers.push((name.to_string(), value.to_string()));
+    }
+    Ok(Ok(StreamHead {
+        status,
+        headers,
+        hex: hex.to_string(),
+        len,
+    }))
 }
 
 /// Encodes `status`, `headers`, and `body` into canonical tape reply bytes, replacing bodies over [`BODY_TAPE_MAX`] with a `body-digest` header.
@@ -334,10 +731,9 @@ pub fn reply(status: u16, headers: &[(String, String)], body: &[u8]) -> Vec<u8> 
         text.push('\n');
     }
     if body.len() > BODY_TAPE_MAX {
-        let digest = aterm_digest::Sha256::digest(body);
         text.push_str(&format!(
-            "{BODY_DIGEST} sha256:{} {}\n\n",
-            aterm_codec::hex::encode_lower(&digest),
+            "{BODY_DIGEST} {} {}\n\n",
+            sha256_of(body),
             body.len()
         ));
         return text.into_bytes();
@@ -391,11 +787,7 @@ fn decode_failure(rest: &[u8]) -> Result<WireError> {
         "answered" => Phase::Answered,
         _ => return Err(not_a_reply("a failure of no phase agh names")),
     };
-    let kind = WIRE_KINDS
-        .iter()
-        .copied()
-        .find(|k| k.slug() == kind)
-        .ok_or_else(|| not_a_reply("a failure of no wire kind agh names"))?;
+    let kind = wire_kind(kind).ok_or_else(|| not_a_reply("a failure of no wire kind agh names"))?;
     Ok(WireError {
         phase,
         kind,
@@ -582,6 +974,102 @@ mod tests {
         }
     }
 
+    /// `git_decode` reads back what `git_reply` wrote, and refuses what it did not.
+    #[test]
+    fn git_replies_round_trip() {
+        use super::super::child::ChildOut;
+        use super::{git_decode, git_reply};
+        let out = |code: Option<i32>, stdout: &[u8], stderr: &[u8]| ChildOut {
+            code,
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        };
+        for answer in [
+            out(Some(0), b"", b""),
+            out(Some(0), b"abc\n", b""),
+            out(Some(1), b"", b"one\ntwo\nthree"),
+            out(None, b"x", b"\n"),
+        ] {
+            assert_eq!(
+                git_decode(&git_reply(&answer)).expect("decodes"),
+                answer,
+                "{answer:?}"
+            );
+        }
+        assert_eq!(
+            git_reply(&out(Some(0), b"", b"")),
+            b"exit 0\nstdout 1\n\nstderr 1\n"
+        );
+        let token = agh_fake::token("canon-git");
+        let shaped = git_decode(&git_reply(&out(
+            Some(128),
+            b"",
+            format!("fatal: {token}\n").as_bytes(),
+        )))
+        .expect("decodes");
+        assert_eq!(shaped.stderr, b"fatal: [redacted]\n");
+        let run = aterm_codec::base64::encode(b"agh:canon-git-1").expect("base64");
+        assert_eq!(run.len(), 20);
+        assert!(run.bytes().any(|b| !b.is_ascii_alphabetic()), "{run}");
+        let basic = git_decode(&git_reply(&out(
+            Some(128),
+            b"",
+            format!("remote: Basic {run}\nfatal: denied").as_bytes(),
+        )))
+        .expect("decodes");
+        let stderr = String::from_utf8(basic.stderr).expect("UTF-8");
+        assert_eq!(stderr, "remote: Basic [redacted]\nfatal: denied");
+        for junk in [
+            &b""[..],
+            b"exit 0",
+            b"exit x\nstdout 1\n\nstderr 1\n",
+            b"exit 0\nstdout 2\n\nstderr 1\n",
+            b"exit 0\nstdout 1\n\nstderr 1\n\nmore",
+        ] {
+            let refused = git_decode(junk).expect_err("not git_reply's");
+            assert_eq!(refused.sub, Sub::Replay(Replay::Format), "{junk:?}");
+        }
+    }
+
+    /// A git run that ended with no exit is taped as its error and read back as that error,
+    /// its side effect kept and its why shaped; any other `failed` bytes are `Replay::Format`.
+    #[test]
+    fn git_failures_round_trip() {
+        use super::{git_answer, git_failure};
+        use crate::error::SideEffect;
+
+        let token = agh_fake::token("canon-git-failure");
+        for effect in [SideEffect::None, SideEffect::Unknown, SideEffect::Applied] {
+            let failed =
+                crate::error::Error::local(format!("/usr/bin/git did not finish\nwith {token}"))
+                    .with_side_effect(effect);
+            let back = git_answer(&git_failure(&failed))
+                .expect("decodes")
+                .expect_err("a failure");
+            assert_eq!(back.kind, Kind::CouldNotRun);
+            assert_eq!(back.sub, Sub::Local);
+            assert_eq!(back.side_effect, effect);
+            assert_eq!(back.why, "/usr/bin/git did not finish with [redacted]");
+        }
+        let ran = super::super::child::ChildOut {
+            code: Some(0),
+            stdout: b"ok".to_vec(),
+            stderr: Vec::new(),
+        };
+        let answer = git_answer(&super::git_reply(&ran)).expect("decodes");
+        assert_eq!(answer.expect("an exit"), ran);
+        for junk in [
+            &b"failed"[..],
+            b"failed maybe\nwhy x",
+            b"failed none",
+            b"failed none\nwhy x\nmore",
+            b"failed none\nhow x",
+        ] {
+            let refused = git_answer(junk).expect_err("not git_failure's");
+            assert_eq!(refused.sub, Sub::Replay(Replay::Format), "{junk:?}");
+        }
+    }
+
     /// A file body is named by the digest the pipeline set; with none, it is not taped.
     #[test]
     fn a_file_body_is_named_by_its_digest_or_refused() {
@@ -601,6 +1089,31 @@ mod tests {
         assert_eq!(
             (refused.kind, refused.sub.clone()),
             (Kind::CouldNotRun, Sub::Replay(Replay::StreamNotTaped))
+        );
+    }
+
+    /// A redirect off the API keeps no query: codeload's `?token=` and a signed blob URL's
+    /// `?sig=` are bearer secrets. One on the API origin is kept as it is.
+    #[test]
+    fn a_location_off_the_api_keeps_no_query() {
+        let e = Endpoints::github_com();
+        let location = |url: &str| {
+            let kept = super::keep(&e, vec![("Location".to_string(), url.to_string())]);
+            kept.into_iter().map(|(_, value)| value).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            location("https://codeload.github.com/o/r/legacy.tar.gz/refs/heads/main?token=ABCDEF"),
+            ["https://codeload.github.com/o/r/legacy.tar.gz/refs/heads/main?signed=redacted"]
+        );
+        assert_eq!(
+            location("https://pipelines.example.net/logs/1.zip?sv=2025&se=9&sig=c2lnbmF0dXJl"),
+            ["https://pipelines.example.net/logs/1.zip?signed=redacted"]
+        );
+        let api = "https://api.github.com/repositories/9/releases?page=2&per_page=100";
+        assert_eq!(location(api), [api]);
+        assert_eq!(
+            location("https://codeload.github.com/o/r/tar.gz/main"),
+            ["https://codeload.github.com/o/r/tar.gz/main"]
         );
     }
 }

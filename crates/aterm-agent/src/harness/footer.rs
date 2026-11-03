@@ -2873,11 +2873,11 @@ fn prefix_of_parts(cut: &str, parts: &[&str]) -> bool {
 
 /// What the lights block names Claude's bypass mode (`⏵⏵ bypass permissions on`) where the glass
 /// rewrites its mode row ([`mode_row_rewrite_under`]): yolo, the default, full auto and named
-/// quietly.
+/// quietly, in the ink of the rule it sits on.
 pub const YOLO_ON: &str = "yolo";
-/// What it names the manual mode (`⏸ manual mode on`), the mode that asks before each tool: any
-/// yolo turned off is manual mode.
-pub const YOLO_OFF: &str = "manual mode";
+/// What it names the manual mode (`⏸ manual mode on`), the mode that asks before each tool and
+/// the one a click on `yolo` turns to: yolo turned off is lame (the owner's word, 2026-11-02).
+pub const YOLO_OFF: &str = "lame";
 
 /// How many items a rewritten mode row keeps ([`ModeRow`]); a row with more stands as drawn.
 pub const MODE_ROW_ITEMS: usize = 8;
@@ -4230,11 +4230,11 @@ pub const LEAN_FORMS: usize = 4;
 pub struct LightsWidth {
     /// The chips, one blank apart.
     pub chips: usize,
-    /// `Light: what  `.
+    /// The whole title and its gap.
     pub title: usize,
     /// The whole title with parts given up, widest first, each still more than the short form.
     pub lean: [usize; LEAN_FORMS],
-    /// `what  `.
+    /// The short form and its gap.
     pub short: usize,
     /// The title says why (a stopped mode return, a refusal, a switch note) rather than what the pointer or selection shows.
     pub reason: bool,
@@ -4243,11 +4243,11 @@ pub struct LightsWidth {
 /// Which of the lights' titles is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitleFit {
-    /// `Light: what`.
+    /// The whole title.
     Full,
     /// The `n`th of the whole title's leaner forms ([`LightsWidth::lean`]).
     Lean(u8),
-    /// `what` alone.
+    /// The short form alone.
     Short,
     /// None.
     None,

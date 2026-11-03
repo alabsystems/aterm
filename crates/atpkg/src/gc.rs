@@ -534,13 +534,18 @@ fn run_in(
         let Some(witness) = live.get(&program) else {
             continue;
         };
-        let vendor_yanks = crate::vendor_direct::is_vendor(&program)
-            .then(|| crate::vendor_direct::policy::Policy::current(layout, None));
-        let lands_on = |b: u64| match &vendor_yanks {
-            Some(policy) => {
-                crate::vendor_direct::lane::rollback_lands_on(layout, policy, &program, b)
-            }
-            None => crate::flow::rollback_lands_on(layout, channel, &program, b),
+        let vendor_yanks = crate::vendor_direct::is_vendor(&program).then(|| {
+            crate::vendor_direct::policy::Policy::current(layout, None).with_channel(channel)
+        });
+        let witness_is_alab = crate::alab::build_is_alab(layout, &program, witness.build);
+        let lands_on = |b: u64| {
+            (!witness_is_alab || crate::alab::build_is_alab(layout, &program, b))
+                && match &vendor_yanks {
+                    Some(policy) => {
+                        crate::vendor_direct::lane::rollback_lands_on(layout, policy, &program, b)
+                    }
+                    None => crate::flow::rollback_lands_on(layout, channel, &program, b),
+                }
         };
         let mut gone = Vec::new();
         for b in reclaimable(&installed, witness, &lands_on) {
@@ -2724,6 +2729,52 @@ mod tests {
             );
             assert!(sidecar(33, suffix).is_file(), "{suffix} of a parked build");
         }
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    #[test]
+    fn an_active_alab_build_keeps_its_alab_rollback_target_and_respects_channel_floors() {
+        let l = layout("alab-rollback-gc");
+        let b = 2_026_101_602_u64;
+        for (build, is_alab, is_live) in
+            [(b - 2, true, false), (b - 1, false, false), (b, true, true)]
+        {
+            let dir = seed(&l, "codex", build, is_live);
+            if is_alab {
+                let entry = format!("bin/{}", tool("codex").exe_file());
+                std::fs::write(
+                    dir.join(crate::alab::PACKAGE_JSON),
+                    format!(
+                        r#"{{"layoutVersion":1,"version":"0.164.0-dev.{build}+gabc","entrypoint":"{entry}"}}"#
+                    ),
+                )
+                .unwrap();
+                std::fs::write(dir.join(crate::alab::ALAB_BUILD_JSON), b"{}").unwrap();
+            }
+        }
+        let report = run_in(&l, None, None, &|_| Vec::new(), &|| Some(Vec::new()));
+        assert_eq!(
+            report.reclaimed,
+            vec![("codex".to_string(), vec![b - 1])],
+            "a non-ALab build between two ALab builds is reclaimed while the ALab rollback target is kept"
+        );
+        assert!(l.build_dir("codex", b - 2).is_dir());
+
+        let ch = Channel {
+            name: "stable".into(),
+            channel_build: 1,
+            min_build: 0,
+            min_build_by_program: BTreeMap::from([("codex".to_string(), b)]),
+            yanked: Vec::new(),
+            pin: BTreeMap::new(),
+            pin_by_target: BTreeMap::new(),
+        };
+        let report = run_in(&l, None, Some(&ch), &|_| Vec::new(), &|| Some(Vec::new()));
+        assert_eq!(
+            report.reclaimed,
+            vec![("codex".to_string(), vec![b - 2])],
+            "an ALab build below the channel's min_build_by_program floor is reclaimed"
+        );
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 }

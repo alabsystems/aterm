@@ -74,6 +74,7 @@ fn the_longest_words_fit_the_record_and_the_ledger_whole() {
         for mailbox in [
             Mailbox::Ready,
             Mailbox::WebmailOnly,
+            Mailbox::WebmailNoPassword,
             Mailbox::NoPassword,
             Mailbox::SharedNoPassword,
             Mailbox::None,
@@ -297,19 +298,19 @@ fn each_route_needs_what_it_drives() {
         Some(Route::Mailbox),
         "a mailbox read over a directory, IMAP or HTTP needs no browser"
     );
-    let webmail = Read {
-        mailbox: Mailbox::WebmailOnly,
-        ..bare()
-    };
-    assert_eq!(webmail.route(), None, "a webmail inbox needs a browser");
-    assert_eq!(
-        Read {
-            browser: true,
-            ..webmail
-        }
-        .route(),
-        Some(Route::Mailbox)
-    );
+    for mailbox in [Mailbox::WebmailOnly, Mailbox::WebmailNoPassword] {
+        let webmail = Read { mailbox, ..bare() };
+        assert_eq!(webmail.route(), None, "a webmail inbox needs a browser");
+        assert_eq!(
+            Read {
+                browser: true,
+                ..webmail
+            }
+            .route(),
+            Some(Route::Mailbox),
+            "{mailbox:?}: tried beside a browser, a password or none"
+        );
+    }
     let profile = Read {
         profile: Profile::Ready,
         ..bare()
@@ -342,7 +343,18 @@ fn each_route_needs_what_it_drives() {
         }
         .route(),
         Some(Route::Mailbox),
-        "the mailbox comes first"
+        "a directly read mailbox comes first"
+    );
+    assert_eq!(
+        Read {
+            browser: true,
+            profile: Profile::Ready,
+            mailbox: Mailbox::WebmailOnly,
+            ..bare()
+        }
+        .route(),
+        Some(Route::Profile),
+        "a proven profile comes before a fresh sign-in through webmail"
     );
 }
 

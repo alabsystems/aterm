@@ -433,6 +433,7 @@ fn the_order_reads_atpkgs_plain_versions() {
     assert!(!moves_onto("1.4.0", "1.4.1-R1"));
     assert!(!moves_onto("1.4.0", "x"));
     assert!(build_version("1.4.0", Some("1000001000004000000")).is_some());
+    assert!(build_version("1.4.0", Some("01000001000004000000")).is_none());
     assert!(build_version("1.4.1", Some("1000001000004000000")).is_none());
 }
 
@@ -574,6 +575,13 @@ fn a_launch_that_set_its_own_environment_is_named() {
         ("K=\"$(cat \")\")\" agy", "K"),
         ("K=`cat ~/.k` agy", "K"),
         ("env \"GEMINI_API_KEY=k\" agy", "GEMINI_API_KEY"),
+        ("GEMINI_\\\nAPI_KEY=k agy", "GEMINI_API_KEY"),
+        ("GEMINI_API_KEY=\\\nk agy", "GEMINI_API_KEY"),
+        ("GEMINI_API_KEY=k ag\\\r\ny", "GEMINI_API_KEY"),
+        ("'HTTPS_PROXY'=http://p:1 agy", "HTTPS_PROXY"),
+        ("\"GEMINI_API_KEY\"=k agy", "GEMINI_API_KEY"),
+        ("HTTP\\S_PROXY=http://p:1 agy", "HTTPS_PROXY"),
+        ("env -- 'GEMINI_API_KEY=$RAW' agy", "GEMINI_API_KEY"),
     ] {
         assert_eq!(inline_env(line).as_deref(), Some(want), "{line}");
     }
@@ -589,6 +597,9 @@ fn a_launch_that_set_its_own_environment_is_named() {
         "env -- agy",
         "X=$(make) ; agy",
         "echo 'X=1 ; agy'",
+        "echo 'X=1\\\n; agy'",
+        "'FOO=1' agy",
+        "FOO\\=1 agy",
         "sh agy.sh",
         "X=1 agyk",
         "",

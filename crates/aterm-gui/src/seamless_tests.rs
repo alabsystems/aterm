@@ -199,18 +199,16 @@ impl Drop for ScratchEnv {
     }
 }
 
-/// Run the calling test alone in `children` side-by-side children ([`env_alone`]'s kind), `marker` naming each child's index (0-based), and return each passed child's stdout.
+/// Run the calling test alone in `children` successive children ([`env_alone`]'s kind), `marker` naming each child's index (0-based), and return each passed child's stdout. Each shard may hold many real PTYs, so a queued shard must not spend its child hang detector waiting for another shard's fixture lease.
 #[cfg(unix)]
 pub(crate) fn run_in_children(marker: &str, children: usize) -> Vec<String> {
-    let spawned: Vec<crate::test_alone::Running> = (0..children)
+    (0..children)
         .map(|index| {
             let index = std::ffi::OsString::from(index.to_string());
             crate::test_alone::spawn_alone_with(&[(marker, &index)])
+                .passed()
+                .stdout
         })
-        .collect();
-    spawned
-        .into_iter()
-        .map(|child| child.passed().stdout)
         .collect()
 }
 
@@ -784,6 +782,7 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
         native_tabs: Vec::new(),
         tab_order: Vec::new(),
         active_item: Some(0),
+        workers_in_front: false,
         restored_tabs: ids
             .iter()
             .map(|id| RestoredTab {
@@ -813,9 +812,11 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
                     claim_ended: false,
                     not_claim_worker: false,
                     claim_worker: None,
+                    task: None,
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,
+                parked: false,
             })
             .collect(),
     }])
@@ -3912,6 +3913,7 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
                 claim_ended: false,
                 not_claim_worker: false,
                 claim_worker: None,
+                task: None,
             },
         )))
     };
@@ -3927,6 +3929,7 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
                 },
                 focused_path: vec![crate::restore::RestoreBranch::Second],
                 zoomed: false,
+                parked: false,
             }];
         }),
         vec![untitled(0), titled(1, records[1])],
@@ -4199,6 +4202,7 @@ fn a_layout_naming_an_exited_pane_is_still_placed() {
             root: RestoredSplitTree::leaf(RestoredView::Native(settings)),
             focused_path: Vec::new(),
             zoomed: false,
+            parked: false,
         });
         layout.to_toml().expect("the desk serializes")
     };
@@ -4256,6 +4260,7 @@ fn an_unplaced_layout_hands_over_the_drafts_it_carried() {
             root: RestoredSplitTree::leaf(RestoredView::Native(settings)),
             focused_path: Vec::new(),
             zoomed: false,
+            parked: false,
         });
         layout.to_toml().expect("the desk serializes")
     };
@@ -4382,6 +4387,114 @@ fn a_held_panes_sid_crosses_unless_it_names_another_session() {
         vec![(5, Some(sids[0])), (6, None), (7, None), (8, None)],
         "every screen shows; only a sid that names no other session crosses"
     );
+}
+
+/// A sessionless handoff hands over windows alone; with no window to place this process has
+/// nothing to take over, so it refuses whole and exits before it opens one.
+#[test]
+#[cfg(unix)]
+fn a_sessionless_handoff_with_no_layout_to_place_is_the_producers_refusal() {
+    let Some(_env) = env_alone() else { return };
+    let _restore = restore_env();
+    let staged = stage_outgoing_handoff("nolayout", 0, None);
+    assert!(
+        staged.fds_wire.is_empty(),
+        "PRECONDITION: no session is handed"
+    );
+    let (ready_read, ready_write) = pipe_pair("ready");
+    let (commit_read, commit_write) = pipe_pair("commit");
+    staged.publish_env(ready_write, commit_read, None);
+    let incoming = take_incoming_as(ReceiverShape::Current);
+    assert!(incoming.adopted.is_empty() && incoming.layout.is_none());
+    assert_eq!(incoming.refusal, Some(WholeRefusal::Producer));
+    for fd in [ready_read, ready_write, commit_read, commit_write] {
+        aterm_pty::close_fd(fd);
+    }
+    staged.teardown();
+}
+
+/// A successor admitted with no session is a handoff's successor all the same: it restores the
+/// handed layout and holds its freeze until the Commit, never the quit layout a parent still
+/// owns.
+#[test]
+fn a_successor_admitted_with_no_session_boots_as_one() {
+    let boot = |headless, admitted, adopted, channels| {
+        successor_boot(headless, admitted, adopted, channels)
+    };
+    let sessionless = boot(false, true, false, true);
+    assert_eq!(
+        sessionless,
+        SuccessorBoot {
+            handed_over: true,
+            takes_handed_layout: true,
+            incoming_handoff_pending: true,
+        }
+    );
+    assert_eq!(
+        boot(false, true, true, true),
+        sessionless,
+        "with sessions too"
+    );
+    assert_eq!(
+        boot(false, false, false, false),
+        SuccessorBoot {
+            handed_over: false,
+            takes_handed_layout: false,
+            incoming_handoff_pending: false,
+        },
+        "CONTROL: a fresh launch takes the quit layout"
+    );
+    assert!(
+        !boot(true, true, false, true).takes_handed_layout,
+        "a headless successor places no window"
+    );
+    assert!(
+        !boot(false, true, false, false).incoming_handoff_pending,
+        "no overlap channel, no Commit to wait for"
+    );
+}
+
+/// The positive control: a sessionless handoff whose windows hold a tab this build restores
+/// is taken over with its layout and no session.
+#[test]
+#[cfg(unix)]
+fn a_sessionless_handoff_with_a_native_tab_is_taken_over() {
+    let Some(_env) = env_alone() else { return };
+    let _restore = restore_env();
+    // A window of no session's tab is no layout at all, so the desk is built whole.
+    let native_desk = |_: &str| {
+        let mut layout = exact_legacy_layout(&[9]);
+        layout.windows[0].restored_tabs = vec![RestoredTab {
+            root: RestoredSplitTree::leaf(RestoredView::Native(
+                crate::restore::NativeLeafRestore::settings("/text-fonts".to_string()),
+            )),
+            focused_path: Vec::new(),
+            zoomed: false,
+            parked: false,
+        }];
+        layout.to_toml().expect("the desk serializes")
+    };
+    let staged = stage_outgoing_handoff("nativeonly", 0, Some(&native_desk));
+    assert!(
+        staged.fds_wire.is_empty(),
+        "PRECONDITION: no session is handed"
+    );
+    let (ready_read, ready_write) = pipe_pair("ready");
+    let (commit_read, commit_write) = pipe_pair("commit");
+    staged.publish_env(ready_write, commit_read, None);
+    let incoming = take_incoming_as(ReceiverShape::Current);
+    assert_eq!(incoming.refusal, None, "the windows alone are a handoff");
+    assert!(incoming.adopted.is_empty(), "no session is adopted");
+    let layout = incoming
+        .layout
+        .as_ref()
+        .expect("the handed layout is placed");
+    assert_eq!(layout.windows[0].restored_tabs.len(), 1, "the Settings tab");
+    drop(incoming);
+    for fd in [ready_read, ready_write, commit_read, commit_write] {
+        aterm_pty::close_fd(fd);
+    }
+    staged.teardown();
 }
 
 #[test]

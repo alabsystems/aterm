@@ -11,12 +11,82 @@ const QUEUES_WITHIN: Duration = PROBE_DEADLINE.saturating_mul(2);
 #[cfg(test)]
 const QUEUES_WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
 
+/// Independent observations, never a synthetic queue with a combined home-LAN claim.
+pub(super) struct Observations {
+    pub(super) queues: Vec<Heard>,
+    pub(super) incomplete: bool,
+}
+
+/// Look for explicit identities across every authorized queue. Unlike the standing
+/// approver's fair reader, this neither advances nor limits itself to a cursor batch.
+/// Every connection shares the caller's deadline and the fan-out's thread bound.
+pub(super) fn lookup(
+    config: &Config,
+    policy: &[String],
+    deadline: Instant,
+) -> crate::Result<Observations> {
+    let Source::Url(primary) = &config.source else {
+        return Ok(Observations {
+            queues: Vec::new(),
+            incomplete: false,
+        });
+    };
+    let until = deadline.min(Instant::now() + QUEUES_WITHIN);
+    let urls = peer_candidates::policy_queues(config, primary, policy);
+    let answers = fan_out::each_at_once("join-lookup", &urls, |url| {
+        if url != primary {
+            join_routing::verify_mirror(config, url, until)?;
+        }
+        read(url, &Heard::default(), Duration::ZERO, Some(until)).map(|(queue, _)| queue)
+    });
+    let mut queues = Vec::new();
+    let mut incomplete = false;
+    for answer in answers {
+        match answer {
+            Some(Ok(queue)) => queues.push(queue),
+            Some(Err(_)) | None => incomplete = true,
+        }
+    }
+    if queues.is_empty() {
+        return Err(Error::of_kind(
+            crate::ErrorKind::JoinQueueIncomplete,
+            "no verified join queue answered",
+        ));
+    }
+    Ok(Observations { queues, incomplete })
+}
+
 pub(super) fn hear(
     paths: &Paths,
     config: &Config,
     heard: &mut Heard,
     wait: Duration,
 ) -> crate::Result<(Vec<String>, bool)> {
+    hear_bounded(paths, config, heard, wait, None)
+}
+
+pub(super) fn hear_until(
+    paths: &Paths,
+    config: &Config,
+    heard: &mut Heard,
+    deadline: Instant,
+) -> crate::Result<(Vec<String>, bool)> {
+    hear_bounded(paths, config, heard, Duration::ZERO, Some(deadline))
+}
+
+fn hear_bounded(
+    paths: &Paths,
+    config: &Config,
+    heard: &mut Heard,
+    wait: Duration,
+    deadline: Option<Instant>,
+) -> crate::Result<(Vec<String>, bool)> {
+    if deadline.is_some_and(|end| Instant::now() >= end) {
+        return Err(Error::of_kind(
+            crate::ErrorKind::TimedOut,
+            "join queue observation deadline elapsed",
+        ));
+    }
     let Source::Url(primary) = &config.source else {
         *heard = Heard::default();
         return Ok((Vec::new(), true));
@@ -26,17 +96,18 @@ pub(super) fn hear(
     } else {
         Vec::new()
     };
-    let until = Instant::now() + QUEUES_WITHIN;
+    let ordinary = Instant::now() + QUEUES_WITHIN;
+    let until = deadline.map_or(ordinary, |end| end.min(ordinary));
     let discovery = PeerDiscovery::direct(Some(until));
-    // The explicit pool excludes discovery hints: a queue's home-LAN claims need
-    // policy authority, as well as a mirror that proves the vault's signing lineage.
+    // The explicit pool excludes discovery hints: a queue an approver judges requests from
+    // needs policy authority, as well as a mirror that proves the vault's signing lineage.
     let urls = if policy.is_empty() {
         Vec::new()
     } else {
         discovery.select_queues(paths, config, primary, &policy, &heard.url)
     };
     if !urls.iter().any(|url| url != primary) {
-        return match read(primary, heard, wait, None) {
+        return match read(primary, heard, wait, deadline.map(|_| until)) {
             Ok((current, moved)) => {
                 let lines = current.lines.clone();
                 *heard = current;
@@ -122,7 +193,7 @@ fn read(
             Ok((heard.clone(), false))
         }
         // The URL now resolves to another server. Its version cannot validate the previous
-        // server's listing or home claims; get a full listing within the same deadline.
+        // server's listing; get a full listing within the same deadline.
         transport::Joins::Unchanged if after.is_some() => {
             read(url, &Heard::default(), Duration::ZERO, until)
         }

@@ -462,7 +462,7 @@ pub const fn raw(bytes: &[u8]) -> Result<RawTone<'_>, ToneModelError> {
 /// The loaded (dequantized) classifier.
 #[derive(Clone, Debug)]
 pub struct ToneModel {
-    emb: Vec<f32>,
+    emb: Box<[[f32; EMBED]; BUCKETS]>,
     w1: [[f32; HIDDEN]; EMBED],
     b1: [f32; HIDDEN],
     w2: [[f32; TONE_COUNT]; HIDDEN],
@@ -478,8 +478,18 @@ impl ToneModel {
             (byte as i8) as f32 * scale
         }
         let raw = raw(bytes)?;
-        let mut emb = Vec::with_capacity(raw.emb.len());
-        emb.extend(raw.emb.iter().map(|&b| deq_row(raw.emb_scale, b)));
+        let mut emb = Box::new([[0.0f32; EMBED]; BUCKETS]);
+        let mut b = 0;
+        while b < BUCKETS {
+            let base = b * EMBED;
+            let row = &mut emb[b];
+            let mut c = 0;
+            while c < EMBED {
+                row[c] = deq_row(raw.emb_scale, raw.emb[base + c]);
+                c += 1;
+            }
+            b += 1;
+        }
         let mut w1 = [[0.0f32; HIDDEN]; EMBED];
         let mut r = 0;
         while r < EMBED {
@@ -541,9 +551,7 @@ impl ToneModel {
         s: &mut ToneScratch,
     ) -> bool {
         s.sum = [0.0; EMBED];
-        let Some(emb_rows) = self.emb.as_chunks::<EMBED>().0.first_chunk::<BUCKETS>() else {
-            return false;
-        };
+        let emb_rows = &*self.emb;
         let n = for_each_ngram_bucket_chars(chars, |bucket| {
             let row = &emb_rows[bucket & (BUCKETS - 1)];
             let mut i = 0;
@@ -681,7 +689,7 @@ impl ToneModel {
         s: &mut ToneScratch,
     ) -> Option<Tone> {
         s.sum = [0.0; EMBED];
-        let emb_rows = self.emb.as_chunks::<EMBED>().0.first_chunk::<BUCKETS>()?;
+        let emb_rows = &*self.emb;
         let n = for_each_ngram_bucket_char_slices(slices, |bucket| {
             let row = &emb_rows[bucket & (BUCKETS - 1)];
             let mut i = 0;
@@ -947,7 +955,7 @@ mod tests {
         assert_eq!(bytes.len(), ASSET_LEN);
         let m = ToneModel::from_bytes(&bytes).expect("round trip");
         let step = emb.iter().fold(0.0f32, |a, &v| a.max(v.abs())) / 127.0;
-        for (orig, got) in emb.iter().zip(&m.emb) {
+        for (orig, got) in emb.iter().zip(m.emb.iter().flatten()) {
             assert!((orig - got).abs() <= step * 0.5 + 1e-6);
         }
         for (orig, got) in b1.iter().zip(&m.b1) {

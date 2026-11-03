@@ -1582,24 +1582,32 @@ impl App {
 
     /// Location text and `Show tab` navigation target for `sid`.
     pub(crate) fn upgrade_spot(&self, sid: &str) -> message_reporters::UpgradeSpot {
-        let store = self.store.read().unwrap_or_else(|p| p.into_inner());
         let several = self.windows.len() > 1;
         for (window, (wid, ws)) in self.windows.iter().enumerate() {
             for (index, tab) in ws.tab_set.tabs().iter().enumerate() {
-                let shown = tab.root.any_leaf(&mut |view| {
-                    self.view_store
-                        .get(*view)
-                        .copied()
-                        .and_then(crate::tab_model::View::terminal_session)
-                        .and_then(|local| store.by_local(local))
-                        .is_some_and(|h| h.sid.as_str() == sid)
-                });
+                // Off the store's lock before a worker's name reads the store again.
+                let shown = {
+                    let store = self.store.read().unwrap_or_else(|p| p.into_inner());
+                    tab.root.any_leaf(&mut |view| {
+                        self.view_store
+                            .get(*view)
+                            .copied()
+                            .and_then(crate::tab_model::View::terminal_session)
+                            .and_then(|local| store.by_local(local))
+                            .is_some_and(|h| h.sid.as_str() == sid)
+                    })
+                };
                 if shown {
+                    let window_named = several.then_some(window + 1);
                     return message_reporters::UpgradeSpot {
-                        place: message_reporters::tab_place(
-                            several.then_some(window + 1),
-                            index + 1,
-                        ),
+                        place: if tab.parked {
+                            message_reporters::worker_place(
+                                window_named,
+                                &self.tab_name(tab, index),
+                            )
+                        } else {
+                            message_reporters::tab_place(window_named, index + 1)
+                        },
                         nav: u16::try_from(index + 1)
                             .ok()
                             .map(|tab| Intent::ShowSession {
@@ -1751,24 +1759,46 @@ impl App {
 }
 
 fn runs_older(row: &Row, managed: &str) -> bool {
-    use aterm_agent::harness::upgrade::Version;
+    use aterm_agent::harness::upgrade::Agent;
+
     let runs = if matches!(row.phase, Phase::Done | Phase::Relaunched { .. }) {
         &row.to
     } else {
         &row.from
     };
-    match (Version::parse(runs), Version::parse(managed)) {
-        (Some(runs), Some(managed)) => runs < managed,
-        _ => !same_build(runs, managed),
+    if let Some(ord) = aterm_agent::harness::upgrade::build_order(row.agent, runs, managed) {
+        return ord == std::cmp::Ordering::Less;
     }
+    match row.agent {
+        Agent::Codex => {
+            if let (Some(a), Some(b)) = (
+                atpkg::alab::AlabVersion::parse(runs.trim()),
+                atpkg::alab::AlabVersion::parse(managed.trim()),
+            ) {
+                return a.precedence() < b.precedence()
+                    || (a.precedence() == b.precedence() && a.sha9 != b.sha9);
+            }
+        }
+        Agent::Claude | Agent::Agy | Agent::Muse => {}
+    }
+    !same_build(runs, managed)
+}
+
+fn parse_vendor_version(text: &str) -> Option<atpkg::vendor_direct::Version> {
+    let t = text.trim();
+    let t = t.strip_prefix('v').unwrap_or(t);
+    atpkg::vendor_direct::Version::parse(t)
 }
 
 fn same_build(a: &str, b: &str) -> bool {
     use aterm_agent::harness::upgrade::Version;
-    match (Version::parse(a), Version::parse(b)) {
-        (Some(a), Some(b)) => a == b,
-        _ => a == b,
+    if let (Some(a), Some(b)) = (Version::parse(a), Version::parse(b)) {
+        return a == b;
     }
+    if let (Some(a), Some(b)) = (parse_vendor_version(a), parse_vendor_version(b)) {
+        return a == b;
+    }
+    a == b
 }
 
 fn agent_pane_word<T>(
@@ -2854,6 +2884,35 @@ mod tests {
                 && !detail.contains("Claude Code session"),
             "{detail}"
         );
+        let muse_on_newer = Row {
+            agent: Agent::Muse,
+            from: "1.4.9-R6297.2".to_string(),
+            to: "1.4.9-R6297.3".to_string(),
+            ..row("s-muse", 60)
+        };
+        assert!(!runs_older(&muse_on_newer, "1.4.9-R6297.1"));
+        assert!(!runs_older(&muse_on_newer, "v1.4.9-R6297.2"));
+        assert!(runs_older(&muse_on_newer, "1.4.9-R6297.3"));
+        assert!(same_build("v1.4.9-R6297.2", "1.4.9-R6297.2"));
+        let agy_on_newer = Row {
+            agent: Agent::Agy,
+            from: "1.4.10-R6500.2".to_string(),
+            to: "1.4.10-R6500.3".to_string(),
+            ..row("s-agy", 60)
+        };
+        assert!(!runs_older(&agy_on_newer, "1.4.10-R6500.1"));
+        assert!(!runs_older(&agy_on_newer, "v1.4.10-R6500.2"));
+        assert!(runs_older(&agy_on_newer, "1.4.10-R6500.3"));
+        assert!(same_build("v1.4.10-R6500.2", "1.4.10-R6500.2"));
+        let codex_alab = Row {
+            agent: Agent::Codex,
+            from: "0.165.0-dev.12+g012345678".to_string(),
+            to: "0.165.0-dev.13+g987654321".to_string(),
+            ..row("s-codex-alab", 60)
+        };
+        assert!(!runs_older(&codex_alab, "0.165.0-dev.11+gabcdef012"));
+        assert!(!runs_older(&codex_alab, "0.165.0-dev.12+g012345678"));
+        assert!(runs_older(&codex_alab, "0.165.0-dev.13+g987654321"));
     }
 
     #[test]

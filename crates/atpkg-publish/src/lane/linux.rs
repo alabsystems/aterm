@@ -18,7 +18,7 @@ use crate::artifact::lineage_switch::{self, Switch};
 use crate::artifact::{pkgdoc, upload};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
-use crate::host::Slug;
+use crate::host::{HostRole, Slug, gh_serves, preflight_each};
 use crate::programs::{self, ProgramDef, Shape};
 use crate::quad::{self, VerifiedQuad};
 use crate::triple::{Os, Triple};
@@ -468,7 +468,7 @@ pub fn run(ctx: &Ctx, opts: &Options, deps: &Deps<'_>, tx: &Transcript) -> Resul
             if let Some(started) = state.stalled_since(ctx.now_unix) {
                 return Err(Error::refused(format!(
                     "the run holding {} started {} — a stalled run; find it with `pgrep -fl \
-                     'atpkg-publish lane run linux'` and kill it",
+                     'atpkg-publish( --host [a-z-]+)? lane run linux'` and kill it",
                     state.lock.display(),
                     aterm_types::rfc3339::format_rfc3339(u64::try_from(started).unwrap_or(0))
                 )));
@@ -528,7 +528,17 @@ impl Run<'_> {
             std::process::id(),
             if opts.dry_run { " (DRY_RUN)" } else { "" }
         ));
-        if !opts.dry_run {
+        if !opts.dry_run && !gh_serves(ctx, HostRole::Staging) {
+            // Check 6 (finding F2): under agh the staging identity is agh.toml's writer, asked
+            // before any clone or latch.
+            let slug = ctx.staging_slug(atpkg::manifest::INDEX_REPO);
+            if let Err(e) = ctx.hosts.staging.write_preflight(&slug) {
+                return Err(Error::cannot_run(format!(
+                    "staging writer unavailable on {slug}: {e} — the lane reads the private \
+                     staging repos only through agh.toml's writers"
+                )));
+            }
+        } else if !opts.dry_run {
             match ctx.usable_token(&ctx.tokens.staging) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -802,45 +812,94 @@ impl Run<'_> {
         };
         let publish = have_key && (!ready.is_empty() || !signed_earlier.is_empty());
         if publish {
-            match ctx.usable_token(&ctx.tokens.channel) {
-                Ok(true) => {}
-                Ok(false) => {
-                    ready_md.refusal = Some(format!(
-                        "the channel token at {} is missing or empty, and the public uploads need \
-                         it.\nPut it there, then run the ceremony below.",
-                        ctx.shown(&ctx.tokens.channel)
-                    ));
-                    ready_md.write(Phase::Staged)?;
-                    return Err(Error::refused(format!(
-                        "channel token file missing/empty: {} (the public uploads need it) — nothing \
-                         signed; ceremony: {ceremony}",
-                        ctx.shown(&ctx.tokens.channel),
-                    )));
+            if !gh_serves(ctx, HostRole::Staging) {
+                // Check 6, per program: each staging repository the keyed uploads write, asked
+                // before anything is signed (check 6 proper asked the index repository alone).
+                // The uploads an earlier run signed write only the public owner.
+                let slugs = ready.iter().map(|(p, _)| ctx.staging_slug(&p.repo));
+                if let Err((slug, e)) = preflight_each(&*ctx.hosts.staging, slugs) {
+                    return refuse_unsigned(
+                        &mut ready_md,
+                        format!(
+                            "the staging writer on {slug} is unavailable ({e}), and the staging \
+                             uploads need it.\nProvision it, then run the ceremony below."
+                        ),
+                        &format!(
+                            "staging writer unavailable on {slug}: {e} (the staging uploads \
+                             need it)"
+                        ),
+                        &ceremony,
+                    );
                 }
-                Err(why) => {
-                    ready_md.refusal = Some(format!(
-                        "the channel token at {} cannot be used ({why}), and the public uploads \
-                         need it.\nFix it, then run the ceremony below.",
-                        ctx.shown(&ctx.tokens.channel)
-                    ));
-                    ready_md.write(Phase::Staged)?;
-                    return Err(Error::refused(format!(
-                        "channel token file invalid/unreadable: {} ({why}) — nothing signed; \
-                         ceremony: {ceremony}",
-                        ctx.shown(&ctx.tokens.channel),
-                    )));
+            }
+            if !gh_serves(ctx, HostRole::Channel) {
+                // Check 7 (finding F2): the public writer on the index repository and on each
+                // program repository the public uploads write, before anything is signed.
+                let slugs = std::iter::once(ctx.index_slug()).chain(
+                    ready
+                        .iter()
+                        .map(|(p, _)| *p)
+                        .chain(signed_earlier.iter().copied())
+                        .map(|p| ctx.public_slug(&p.repo)),
+                );
+                if let Err((slug, e)) = preflight_each(&*ctx.hosts.channel, slugs) {
+                    return refuse_unsigned(
+                        &mut ready_md,
+                        format!(
+                            "the public writer on {slug} is unavailable ({e}), and the public \
+                             uploads need it.\nProvision it, then run the ceremony below."
+                        ),
+                        &format!(
+                            "public writer unavailable on {slug}: {e} (the public uploads need \
+                             it)"
+                        ),
+                        &ceremony,
+                    );
+                }
+            } else {
+                let token = ctx.shown(&ctx.tokens.channel);
+                match ctx.usable_token(&ctx.tokens.channel) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return refuse_unsigned(
+                            &mut ready_md,
+                            format!(
+                                "the channel token at {token} is missing or empty, and the \
+                                 public uploads need it.\nPut it there, then run the ceremony \
+                                 below."
+                            ),
+                            &format!(
+                                "channel token file missing/empty: {token} (the public uploads \
+                                 need it)"
+                            ),
+                            &ceremony,
+                        );
+                    }
+                    Err(why) => {
+                        return refuse_unsigned(
+                            &mut ready_md,
+                            format!(
+                                "the channel token at {token} cannot be used ({why}), and the \
+                                 public uploads need it.\nFix it, then run the ceremony below."
+                            ),
+                            &format!("channel token file invalid/unreadable: {token} ({why})"),
+                            &ceremony,
+                        );
+                    }
                 }
             }
             let key = match crate::identity::signer_for(ctx, &head.roster) {
                 Ok(signer) => signer.key,
                 Err(e) => {
-                    ready_md.refusal = Some(format!(
-                        "{e}.\nA live machine of the roster finishes it with the ceremony below."
-                    ));
-                    ready_md.write(Phase::Staged)?;
-                    return Err(Error::refused(format!(
-                        "{e} — nothing signed; ceremony: {ceremony}"
-                    )));
+                    return refuse_unsigned(
+                        &mut ready_md,
+                        format!(
+                            "{e}.\nA live machine of the roster finishes it with the ceremony \
+                             below."
+                        ),
+                        &e.to_string(),
+                        &ceremony,
+                    );
                 }
             };
             let recheck = work.join("recheck");
@@ -1224,8 +1283,9 @@ impl Run<'_> {
         let (name, build) = (&p.name, p.build);
         let dir = staged_dir.join(name);
         let staged = staged_manifest(staged_dir, name, build);
-        let staged_bytes = std::fs::read(&staged)
-            .map_err(|e| Error::io(format!("read {}", staged.display()), &e))?;
+        let staged_bytes =
+            crate::identity::read_regular_bytes(&staged, crate::identity::MAX_META_BYTES)
+                .map_err(|e| Error::io(format!("read {}", staged.display()), &e))?;
         for (owner, slug) in self.owners(p) {
             let (published, _) = self.published_now(p, owner, &slug, head, recheck)?;
             if !staged_bytes.starts_with(&published) {
@@ -1307,8 +1367,9 @@ impl Run<'_> {
         let _ = std::fs::remove_dir_all(&dir);
         match rows::fetch(host, slug, name, build, &dir, head) {
             Fetched::Present { manifest, path } => {
-                let bytes = std::fs::read(&path)
-                    .map_err(|e| Error::io(format!("read {}", path.display()), &e))?;
+                let bytes =
+                    crate::identity::read_regular_bytes(&path, crate::identity::MAX_META_BYTES)
+                        .map_err(|e| Error::io(format!("read {}", path.display()), &e))?;
                 Ok((bytes, manifest))
             }
             Fetched::Absent(why) | Fetched::Unreachable(why) | Fetched::Invalid(why) => {
@@ -1331,10 +1392,16 @@ impl Run<'_> {
         let (name, build) = (&p.name, p.build);
         let staged = staged_manifest(staged_dir, name, build);
         let sig = key.sign_file(&staged)?;
-        let verified = std::fs::read(&staged)
-            .and_then(|bytes| Ok((bytes, std::fs::read(&sig)?)))
-            .map_err(|e| Error::io(format!("read back {}", staged.display()), &e))
-            .and_then(|(bytes, signature)| verify_as(head, &bytes, &signature, p));
+        let verified =
+            crate::identity::read_regular_bytes(&staged, crate::identity::MAX_META_BYTES)
+                .and_then(|bytes| {
+                    Ok((
+                        bytes,
+                        crate::identity::read_regular_bytes(&sig, crate::identity::MAX_META_BYTES)?,
+                    ))
+                })
+                .map_err(|e| Error::io(format!("read back {}", staged.display()), &e))
+                .and_then(|(bytes, signature)| verify_as(head, &bytes, &signature, p));
         if let Err(e) = verified {
             let _ = std::fs::remove_file(&sig);
             return Err(Error::refused(format!(
@@ -1399,7 +1466,8 @@ impl Run<'_> {
         let staged = staged_manifest(staged_dir, name, build);
         let sig = staged.with_extension("toml.sig");
         let read = |path: &Path| {
-            std::fs::read(path).map_err(|e| Error::io(format!("read {}", path.display()), &e))
+            crate::identity::read_regular_bytes(path, crate::identity::MAX_META_BYTES)
+                .map_err(|e| Error::io(format!("read {}", path.display()), &e))
         };
         let (staged_bytes, signature) = (read(&staged)?, read(&sig)?);
         let slug = ctx.public_slug(&p.repo);
@@ -1486,7 +1554,10 @@ fn tarballs(manifest: &PkgManifest, targets: &[Triple], dir: &Path) -> Vec<PathB
 
 /// Whether `a` holds exactly the bytes of `b` (false when either cannot be read).
 fn same_bytes(a: &Path, b: Option<&Path>) -> bool {
-    match (std::fs::read(a), b.map(std::fs::read)) {
+    match (
+        crate::identity::read_regular_bytes(a, crate::identity::MAX_META_BYTES),
+        b.map(|p| crate::identity::read_regular_bytes(p, crate::identity::MAX_META_BYTES)),
+    ) {
         (Ok(a), Some(Ok(b))) => a == b,
         _ => false,
     }
@@ -1614,6 +1685,26 @@ pub enum Phase {
     Published,
 }
 
+/// A refusal before anything is signed: READY.md says `refusal` (staged, in place of the
+/// ceremony's preamble), and the run is Refused, why `{why} — nothing signed; ceremony:
+/// {ceremony}`.
+///
+/// # Errors
+///
+/// Always: READY.md's write error, or that refusal.
+fn refuse_unsigned<T>(
+    ready_md: &mut Ready<'_>,
+    refusal: String,
+    why: &str,
+    ceremony: &str,
+) -> Result<T> {
+    ready_md.refusal = Some(refusal);
+    ready_md.write(Phase::Staged)?;
+    Err(Error::refused(format!(
+        "{why} — nothing signed; ceremony: {ceremony}"
+    )))
+}
+
 struct Ready<'a> {
     ctx: &'a Ctx,
     staged_dir: &'a Path,
@@ -1639,7 +1730,6 @@ impl Ready<'_> {
         let ctx = self.ctx;
         let (n, next) = (self.n, self.n.saturating_add(1));
         let key = ctx.shown(&ctx.identity.key);
-        let token = ctx.shown(&ctx.tokens.channel);
         let ready = list(self.ready.iter().map(|(p, _)| p.name.as_str()));
         let mut s = format!(
             "# READY — staged Linux artifacts for atpkg-index-{n}\n\n\
@@ -1678,11 +1768,14 @@ impl Ready<'_> {
                             .as_deref()
                             .unwrap_or("this run stopped before the key")
                     ),
-                    (true, true) => {
-                        format!(
+                    // A refusal before the uploads an earlier run signed is the reason the
+                    // follow-up index is not published.
+                    (true, true) => match self.refusal.as_deref() {
+                        Some(refusal) => format!("{none}: {refusal}\n"),
+                        None => format!(
                             "{none}: nothing is READY. This box holds the machine key at {key}.\n"
-                        )
-                    }
+                        ),
+                    },
                     (false, false) => format!(
                         "{none}: this box has no machine key at {key}.\nA rostered machine \
                          finishes it with the ceremony below.\n"
@@ -1739,9 +1832,45 @@ impl Ready<'_> {
         if phase == Phase::Published || (self.ready.is_empty() && self.signed_earlier.is_empty()) {
             return s;
         }
+        // Check 8 (design §16.7): each owner's credential and command are spelled by the host
+        // that writes it; the channel token's path is read only where RestHost serves it.
+        let (staging_gh, channel_gh) = (
+            gh_serves(ctx, HostRole::Staging),
+            gh_serves(ctx, HostRole::Channel),
+        );
+        let credentials = match (staging_gh, channel_gh) {
+            (true, true) => format!("owner tokens including {}", ctx.shown(&ctx.tokens.channel)),
+            (false, true) => format!(
+                "agh.toml's writer for {} and the channel token {}",
+                ctx.accounts.staging,
+                ctx.shown(&ctx.tokens.channel)
+            ),
+            _ if ctx
+                .accounts
+                .staging
+                .eq_ignore_ascii_case(&ctx.accounts.public) =>
+            {
+                format!("agh.toml's writer for {}", ctx.accounts.public)
+            }
+            _ => format!(
+                "agh.toml's writers for {} and {}",
+                ctx.accounts.staging, ctx.accounts.public
+            ),
+        };
+        let host = ctx.host_choice();
+        let global = if staging_gh && channel_gh {
+            String::new()
+        } else {
+            format!("--host {} ", host.as_str())
+        };
+        let index_global = if channel_gh {
+            String::new()
+        } else {
+            format!("--host {} ", host.as_str())
+        };
         s.push_str(&format!(
             "\nThe ceremony: resume the updated installed Linux lane on its rostered builder, \
-             with the machine key at {key} and owner tokens including {token}. Keep the staged \
+             with the machine key at {key} and {credentials}. Keep the staged \
              files byte-for-byte; the lane verifies their signatures and that each target \
              addition extends the published manifest, then reserves the exact version on both \
              owners before uploading. Generic raw public upload cannot perform that repair.\n\n"
@@ -1771,11 +1900,12 @@ impl Ready<'_> {
             s.push('\n');
         }
         s.push_str(&format!(
-            "```sh\natpkg-publish lane run linux --sha256 <installed-snapshot-sha256>\n```\n\n\
+            "```sh\natpkg-publish {global}lane run linux --sha256 \
+             <installed-snapshot-sha256>\n```\n\n\
              Use the SHA recorded by `atpkg-publish lane install linux` for the installed \
              updated snapshot. The lane resumes a partial same-version publication and then \
              publishes follow-up index {next}; its pins stay unchanged and clients re-plan. \
-             `atpkg-publish index --upload` also mirrors genuinely new or identical public \
+             `atpkg-publish {index_global}index --upload` also mirrors genuinely new or identical public \
              packs, but cannot authorize a changed public target extension on its own.\n"
         ));
         s

@@ -383,7 +383,7 @@ fn read_credentials_bytes(path: &Path, max: u64) -> Result<Vec<u8>, String> {
 
 /// Current uid via `id -u`; keeps the crate free of a libc dependency for one syscall.
 #[cfg(unix)]
-fn current_uid() -> Result<u32, String> {
+pub(crate) fn current_uid() -> Result<u32, String> {
     let out = command(ID_TOOL)
         .arg("-u")
         .output()

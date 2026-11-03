@@ -3,12 +3,12 @@
 
 //! A pooled CLI's accounts as a launch or a running session of it meets them, for every CLI the
 //! connector table pools ([`Cli`]): the login a launch aterm makes starts under
-//! ([`launch_env`]), after each of its rows' usage is read in that row's own home
-//! ([`record_usage`]), and the advice a running session gets from its own CLI's roster and store,
+//! ([`launch_env`]), reading only the usage of the row it is about to start on, in that row's own
+//! home ([`read_launch_rows`]), and the advice a running session gets from its own CLI's roster and store,
 //! with the relaunch line a move writes ([`session_move`]). Claude Code's sessions keep the
 //! host's own flow (its transcripts and `/usage` reads); these read the pool's files (its
 //! roster as `logins.json` binds it, [`accounts::bound`]), the session's environment, the usage
-//! sample its caller read and, for Codex, OpenAI's `/wham/usage` endpoint for each row's login.
+//! sample its caller read and, for Codex, OpenAI's `/wham/usage` endpoint for the row launched.
 
 use std::io;
 use std::path::Path;
@@ -19,13 +19,15 @@ use super::accounts::{
 };
 pub use super::codex_app_login::Reading;
 use super::codex_app_login::Usage;
+use super::provider_read;
 use super::relaunch::{self, PoolRelaunch};
 use crate::ai::connector::Seam;
 
-/// How old a row's usage sample may be before a launch reads it again ([`record_usage`]).
+/// How old a row's usage sample may be before a launch about to start on it reads it again
+/// ([`read_launch_rows`]).
 pub const USAGE_FRESH_S: i64 = 300;
 
-/// How long one read of a row's usage is waited for ([`live_usage`]).
+/// How long one read of a row's usage is waited for ([`LiveUsage`]).
 pub const USAGE_READ_WAIT: Duration = Duration::from_secs(10);
 
 /// A reader of one login's usage ([`ReadUsage`]): [`LiveUsage`] is the product's; a test
@@ -35,6 +37,13 @@ pub trait UsageReader: Sync {
     /// `expected_email`. The reader must reject a known identity mismatch in the credential
     /// snapshot it actually uses.
     fn read(&self, cli: Cli, home: &Path, expected_email: Option<&str>, now: i64) -> Reading;
+
+    /// Whether [`Self::read`] for `cli` asks a provider, and so is reported
+    /// ([`provider_read::note`]). A reader with nothing to ask for `cli` makes no read.
+    fn reads_provider(&self, cli: Cli) -> bool {
+        let _ = cli;
+        true
+    }
 }
 
 impl<F> UsageReader for F
@@ -68,6 +77,10 @@ impl UsageReader for LiveUsage {
             now,
             expected_email,
         )
+    }
+
+    fn reads_provider(&self, cli: Cli) -> bool {
+        cli == Cli::Codex
     }
 }
 
@@ -491,37 +504,78 @@ fn pool_read_using<T>(
     read_held(&store, &_held)
 }
 
-/// Reads the usage of each of `roster`'s rows of `cli` whose login is here (`enrolled`, or the
-/// default row) and whose sample is older than [`USAGE_FRESH_S`] or lacks the current login
-/// context, each in its own home and at once, with `read`; records each reading under its row in
-/// `cli`'s store (its sample and the wall it names; a login the provider refused as signed out,
-/// and a signed-out one that reads again as signed in) in one transaction. The labels recorded.
-/// When an overlay CLI's default row is due, its default home is read before linking and reading
-/// the overlay homes so any shared suffix file the CLI creates at startup exists there first.
-/// Samples from the future or before the last managed renewal are ignored. A context mismatch
-/// never clears stored usage or limits; only an accepted new sample receives the current tag.
-/// A non-file or unreadable Codex backend leaves its file accounts unpolled.
-/// # Errors
-/// Account state, bindings or current policy could not be read, the policy changed during
-/// polling, or fresh usage could not be recorded. A caller must not select from the old
-/// state after a failed write.
-pub fn record_usage(
-    seat: &Seat<'_>,
-    cli: Cli,
-    roster: &Roster,
-    enrolled: &std::collections::BTreeSet<String>,
-    read: ReadUsage<'_>,
-) -> Result<Vec<String>, String> {
-    if seat.keyring_held(cli) {
-        return Ok(Vec::new());
-    }
-    let before = pool_snapshot(seat, cli)?;
-    if before.roster != *roster {
-        return Err("account policy or login changed before usage read".into());
-    }
-    poll_usage(seat, cli, &before, enrolled, read).map(|(_, labels)| labels)
+/// Whether a launch about to start on `row` reads its usage: its sample is older than
+/// [`USAGE_FRESH_S`], stamped ahead, or lacks the current login context.
+fn usage_due(seat: &Seat<'_>, cli: Cli, before: &PoolSnapshot, row: &Row) -> bool {
+    before.state.accounts.get(&row.label).is_none_or(|account| {
+        account.sample_context.as_ref() != Some(&sample_context(seat, cli, row, &before.logins))
+            || account.sample.as_ref().is_none_or(|sample| {
+                sample.at > seat.now || seat.now.saturating_sub(sample.at) >= USAGE_FRESH_S
+            })
+    })
 }
 
+/// The most rows one launch reads ([`read_launch_rows`]). A pool whose picks keep turning out
+/// spent starts on what it knows after this many, so a launch never becomes a sweep of the pool.
+pub const LAUNCH_READS: usize = 3;
+
+/// The owner's no-polling rule at a launch: only the row the launch is about to start on is read.
+/// The row is picked from what is on record; a read that shows it cannot serve (a wall, a sign-out)
+/// makes the next pick the row being launched, up to [`LAUNCH_READS`]. Where nothing on record
+/// serves, a row known signed out is the one left to try, so a login signed in again by hand comes
+/// back. Every other row's figures stay as they were read, with their age.
+///
+/// # Errors
+///
+/// As [`poll_usage`]. A caller must not select from the old state after a failed write.
+fn read_launch_rows(
+    seat: &Seat<'_>,
+    cli: Cli,
+    snapshot: &mut PoolSnapshot,
+    enrolled: &std::collections::BTreeSet<String>,
+    unread: Option<&super::codex_alab::AuthPathUnread>,
+    read: ReadUsage<'_>,
+) -> Result<(), String> {
+    let roster = snapshot.roster.clone();
+    let mut asked = std::collections::BTreeSet::new();
+    while asked.len() < LAUNCH_READS {
+        let picked = pick_row(cli, &roster, &snapshot.state, enrolled, unread, seat.now);
+        let next = picked.ok().or_else(|| {
+            roster.rows.iter().find(|row| {
+                !asked.contains(&row.label)
+                    && (row.dir.is_none() || (unread.is_none() && enrolled.contains(&row.label)))
+                    && accounts::row_available_here(row, &snapshot.state, seat.now)
+                    && snapshot
+                        .state
+                        .accounts
+                        .get(&row.label)
+                        .is_some_and(|account| account.auth == accounts::Auth::SignedOut)
+            })
+        });
+        let Some(row) = next else {
+            return Ok(());
+        };
+        if !asked.insert(row.label.clone()) || !usage_due(seat, cli, snapshot, row) {
+            return Ok(());
+        }
+        snapshot.state = poll_usage(seat, cli, snapshot, row, read)?.0;
+    }
+    Ok(())
+}
+
+/// Reads the usage of the one `row`, in its own home, with `read`, reporting the read
+/// ([`provider_read::note`]) before making it, and records the reading under its row in `cli`'s
+/// store (its sample and the wall it names; a login the provider refused as signed out, and a
+/// signed-out one that reads again as signed in) in one transaction. The state after, and whether
+/// anything was recorded. Samples
+/// from the future or before the last managed renewal are ignored. A context mismatch never clears
+/// stored usage or limits; only an accepted new sample receives the current tag. A non-file or
+/// unreadable Codex backend leaves its file account unread.
+///
+/// # Errors
+///
+/// Account state, bindings or current policy could not be read, the policy changed during the
+/// read, or fresh usage could not be recorded.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -550,63 +604,26 @@ fn poll_usage(
     seat: &Seat<'_>,
     cli: Cli,
     before: &PoolSnapshot,
-    enrolled: &std::collections::BTreeSet<String>,
+    row: &Row,
     read: ReadUsage<'_>,
-) -> Result<(accounts::State, Vec<String>), String> {
+) -> Result<(accounts::State, bool), String> {
     let store = seat.store(cli);
-    let due_rows: Vec<&Row> = before
-        .roster
-        .rows
-        .iter()
-        .filter(|row| row.dir.is_none() || enrolled.contains(&row.label))
-        .filter(|row| {
-            before.state.accounts.get(&row.label).is_none_or(|account| {
-                account.sample_context.as_ref()
-                    != Some(&sample_context(seat, cli, row, &before.logins))
-                    || account.sample.as_ref().is_none_or(|sample| {
-                        sample.at > seat.now || seat.now.saturating_sub(sample.at) >= USAGE_FRESH_S
-                    })
-            })
-        })
-        .collect();
-    if due_rows.is_empty() {
-        return Ok((before.state.clone(), Vec::new()));
+    let Some(home) = row_home(cli, row, seat.home) else {
+        return Ok((before.state.clone(), false));
+    };
+    if read.reads_provider(cli) {
+        provider_read::note(&provider_read::ProbeEvent {
+            at: seat.now,
+            read: provider_read::Read::CodexEndpoint,
+            account: Some(row.label.clone()),
+            login: None,
+            why: provider_read::InUse::Launching,
+        });
     }
-    let is_overlay = matches!(cli.accounts().seam, Seam::Overlay { .. });
-    let mut readings: Vec<(String, Reading)> = Vec::new();
-    if is_overlay {
-        for row in due_rows.iter().copied().filter(|row| row.dir.is_none()) {
-            if let Some(home) = row_home(cli, row, seat.home) {
-                let reading = read.read(cli, &home, row.expected_identity_email(), seat.now);
-                readings.push((row.label.clone(), reading));
-            }
-        }
-    }
-    let parallel_due: Vec<(&Row, std::path::PathBuf)> = due_rows
-        .into_iter()
-        .filter(|row| !is_overlay || row.dir.is_some())
-        .filter_map(|row| Some((row, row_home(cli, row, seat.home)?)))
-        .collect();
-    if !parallel_due.is_empty() {
-        readings.extend(std::thread::scope(|scope| {
-            let reads: Vec<_> = parallel_due
-                .iter()
-                .map(|(row, home)| {
-                    let label = row.label.clone();
-                    scope.spawn(move || {
-                        (
-                            label,
-                            read.read(cli, home, row.expected_identity_email(), seat.now),
-                        )
-                    })
-                })
-                .collect();
-            reads
-                .into_iter()
-                .filter_map(|r| r.join().ok())
-                .collect::<Vec<_>>()
-        }));
-    }
+    let mut readings: Vec<(String, Reading)> = vec![(
+        row.label.clone(),
+        read.read(cli, &home, row.expected_identity_email(), seat.now),
+    )];
     readings.retain(|(_, reading)| *reading != Reading::Unread);
     let held = store
         .acquire_within(&accounts::LOCK_LADDER)
@@ -631,7 +648,7 @@ fn poll_usage(
         Reading::Unread => false,
     });
     if readings.is_empty() {
-        return Ok((current.state, Vec::new()));
+        return Ok((current.state, false));
     }
     let mut state_after = None;
     let path = seat.config_dir.join(cli.accounts().roster_file);
@@ -693,18 +710,49 @@ fn poll_usage(
     })?;
     Ok((
         state_after.ok_or("usage transaction supplied no state")?,
-        readings.into_iter().map(|(label, _)| label).collect(),
+        true,
     ))
 }
 
-/// [`LiveUsage`]'s usage, where it read one.
-#[must_use]
-pub fn live_usage(cli: Cli, home: &Path, expected_email: Option<&str>, now: i64) -> Option<Usage> {
-    LiveUsage.read(cli, home, expected_email, now).usage()
+/// Test seam: a row at a time, as many launches would, each of `roster`'s rows of `cli` whose login
+/// is here and whose sample is due, through [`poll_usage`]; the labels read. The mechanics of one
+/// read are tested through this; nothing in the product reads more than the launching row.
+///
+/// # Errors
+///
+/// As [`poll_usage`].
+#[cfg(test)]
+pub(crate) fn record_usage(
+    seat: &Seat<'_>,
+    cli: Cli,
+    roster: &Roster,
+    enrolled: &std::collections::BTreeSet<String>,
+    read: ReadUsage<'_>,
+) -> Result<Vec<String>, String> {
+    if seat.keyring_held(cli) {
+        return Ok(Vec::new());
+    }
+    let mut before = pool_snapshot(seat, cli)?;
+    if before.roster != *roster {
+        return Err("account policy or login changed before usage read".into());
+    }
+    let mut labels = Vec::new();
+    for row in &before.roster.clone().rows {
+        if (row.dir.is_none() || enrolled.contains(&row.label))
+            && usage_due(seat, cli, &before, row)
+        {
+            let (state, recorded) = poll_usage(seat, cli, &before, row, read)?;
+            before.state = state;
+            if recorded {
+                labels.push(row.label.clone());
+            }
+        }
+    }
+    Ok(labels)
 }
 
 /// The login a launch aterm makes of `cli` starts under ([`accounts::launch_row`] over the bound
-/// roster, once [`record_usage`] read each row's usage with `read`): `None` with an unpinned lone
+/// roster, reading with `read` only the row it is about to start on, [`read_launch_rows`]): `None` with an unpinned lone
 /// default-home row, with an empty roster, for a CLI whose seam no lab pass measured
 /// ([`crate::ai::connector::Accounts::measured`]), or where the CLI keeps its login in the OS
 /// keyring ([`Seat::keyring_held`]). Under `[harness] accounts = "off"` only the owner's pin
@@ -1207,7 +1255,7 @@ fn launch_env_using(
     // Who holds each account, as the claims read now, before a row is picked.
     seat.claim(cli, super::claims::Act::Look);
     let mut snapshot = pool_snapshot(seat, cli)?;
-    let roster = &snapshot.roster;
+    let roster = &snapshot.roster.clone();
     if roster.rows.is_empty() {
         return Ok(None);
     }
@@ -1267,8 +1315,8 @@ fn launch_env_using(
         default_execution(cli, roster, &snapshot.state)?;
         return Ok(None);
     }
-    let (mut state, _) = poll_usage(seat, cli, &snapshot, &enrolled, read)?;
-    snapshot.state = state.clone();
+    read_launch_rows(seat, cli, &mut snapshot, &enrolled, unread, read)?;
+    let mut state = snapshot.state.clone();
     if let Some(why) = unread
         && let Some(pinned) = pinned_own(roster, &state)
     {

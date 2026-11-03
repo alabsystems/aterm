@@ -16,7 +16,7 @@ pub struct Bar {
     pub min_exact_permille: u32,
 }
 
-/// The bar keeper P4 waits on.
+/// The bar the on-by-default keeper (P4) is held to.
 pub const P4: Bar = Bar {
     min_days: 14,
     min_kills: 3,
@@ -130,8 +130,8 @@ impl Soak {
         }
         lines.push(
             "not judged  the real-Claude lab's read of Claude Code after a restore that was not \
-             exact (Q1): a lab run, not a ledger row (read on 2.1.304; read it again on the \
-             Claude Code P4 ships against)"
+             exact (Q1): a lab run, not a ledger row (read on 2.1.304; read it again on each new \
+             Claude Code)"
                 .to_string(),
         );
         let unmet = self.criteria.iter().filter(|c| !c.met).count();

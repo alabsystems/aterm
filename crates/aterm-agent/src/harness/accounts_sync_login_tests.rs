@@ -98,6 +98,72 @@ fn fleet_of(rows: &[(&str, &str, &str)]) -> FleetRoster {
     FleetRoster::from_toml(&text, "fixture").expect("the fixture fleet admits")
 }
 
+#[test]
+fn machine_identity_is_not_inherited_from_the_default_logins_fleet_row() {
+    for machine in ["m30", ""] {
+        let desk = Desk::new(machine);
+        desk.default_login("sol-m27@example.test");
+        let profile = desk.home.join(".claude.json");
+        let before = fs::read(&profile).unwrap();
+        let fleet = fleet_of(&[
+            ("m27", "m27", "sol-m27@example.test"),
+            ("m27-2", "m27", "sun-m27@example.test"),
+            ("m30", "m30", "moon-m30@example.test"),
+        ]);
+        fs::write(desk.fleet_file(), fleet.to_toml_for(Some(OptIn::Named))).unwrap();
+
+        let synced = sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW);
+        if machine.is_empty() {
+            assert!(
+                synced.is_err(),
+                "a provider login cannot identify this machine: {synced:?}"
+            );
+            assert!(
+                !desk.roster().exists(),
+                "no other machine's roster is published"
+            );
+        } else {
+            assert_eq!(synced.expect("explicit local identity").0, machine);
+            assert!(desk.rows().row("m27-2").is_none());
+        }
+        assert_eq!(fs::read(&profile).unwrap(), before);
+    }
+}
+
+#[test]
+fn machine_identity_is_not_inferred_from_discovered_addresses() {
+    for machine in ["m30", ""] {
+        let desk = Desk::new(machine);
+        desk.default_login("sol-m27@example.test");
+        fs::write(
+            desk.home.join(".claude.json.backup"),
+            "{\"oauthAccount\":{\"emailAddress\":\"owner@example.test\"}}\n",
+        )
+        .unwrap();
+        let env = quiet_env(
+            &desk.home,
+            &desk.state,
+            &desk.config.join("aterm.toml"),
+            NOW,
+        );
+        let discovered = discover_local_fleet_with_min(&env, 1);
+        if machine.is_empty() {
+            assert!(
+                discovered.is_none(),
+                "addresses do not assign a machine: {discovered:?}"
+            );
+        } else {
+            let fleet =
+                discovered.expect("the explicitly identified machine can discover accounts");
+            assert_eq!(fleet.accounts.len(), 1);
+            assert_eq!(fleet.accounts[0].machines, [machine]);
+            assert_eq!(fleet.accounts[0].email, "owner@example.test");
+        }
+        assert!(!desk.fleet_file().exists(), "discovery only observes");
+        assert!(!desk.roster().exists(), "discovery only observes");
+    }
+}
+
 fn sync(desk: &Desk, fleet: &FleetRoster, machine: &str, default: &str, now: i64) -> Roster {
     persist_accounts_sync(
         &desk.store(),
@@ -892,7 +958,6 @@ pub(super) fn upkeep_effects<'a>(
     UpkeepEffects {
         fetch,
         spawn_renewal: spawn,
-        quota_refresh: &|_, _, _, _| {},
         sync_cooldown: cooldown,
         rediscovery,
         renew_guard: guard,

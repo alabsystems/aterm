@@ -60,11 +60,19 @@ pub mod fleet_log;
 /// fleet.
 #[cfg(unix)]
 mod fleet_member;
+/// The production signed-image service backend and immutable native proof.
+#[cfg(unix)]
+pub mod service_activation;
+/// Bounded signed service repair over the native fleet Drive transport.
+pub mod service_repair_rpc;
 #[cfg(all(unix, any(test, debug_assertions)))]
 pub use fleet_member::test_sync_from_vault_at;
 /// `aterm members`: Macs joining ALab and the members that let them in.
 #[cfg(unix)]
 pub mod members_cli;
+/// Bounded, value-free release preparation observations over authenticated control.
+#[cfg(unix)]
+pub mod operational;
 /// `vault-join`: a Mac whose vault key changed proves itself to a member over the fleet.
 #[cfg(unix)]
 pub mod vault_join;
@@ -72,8 +80,8 @@ pub mod vault_join;
 /// driven over it.
 #[cfg(unix)]
 pub use fleet_member::{
-    FleetCheck, FleetSync, FleetSyncError, check_from_cache, drive_fleet, survey_fleet,
-    sync_from_cache, try_sync_from_cache,
+    FleetCheck, FleetSync, FleetSyncError, check_from_cache, drive_fleet, drive_fleet_proven,
+    survey_fleet, sync_from_cache, try_sync_from_cache,
 };
 /// The harness core.
 pub mod harness;
@@ -789,7 +797,10 @@ impl RelayClient<aterm_uds::CtlStream> {
 
 /// Arm one blocking operation with the exchange's remaining time. Socket timer granularity
 /// can round it up; the monotonic clock is checked again before accepting the result.
-fn arm_ctl(stream: &aterm_uds::CtlStream, wait: std::time::Duration) -> std::io::Result<()> {
+pub(crate) fn arm_ctl(
+    stream: &aterm_uds::CtlStream,
+    wait: std::time::Duration,
+) -> std::io::Result<()> {
     let wait = wait.max(std::time::Duration::from_millis(1));
     let armed = stream
         .set_read_timeout(Some(wait))
@@ -982,9 +993,11 @@ COMMANDS
     replay FILE... --shadow [--set k=v...] [--policy FILE]
                        Decide every recorded decision again under this build and the
                        candidate (else the recorded) policy; `needs:` names missing
-                       inputs and `TAINT` marks rows after the first difference. Exit 0
+                       inputs and `TAINT` marks rows after the first difference. On a
+                       tape longer than the shadow ledger holds, `past the ledger:`
+                       counts the rest and names the limit; none is decided again. Exit 0
                        (all matched), 1 (diverged), 2 (unshadowable tape, usage error)
-                       or 3 (undecidable point).
+                       or 3 (undecidable point, or one past the ledger).
     replay --check FILE|DIR... [--set k=v...] [--policy FILE]
                        Replay every tape named, and every `*.atape`/`*.atape.txt` under
                        each DIR, in acts mode: a verdict per tape and a count of each.

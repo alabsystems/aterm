@@ -353,6 +353,12 @@ impl RestHost {
         }
     }
 
+    /// Before a clobber of `name`: its staged copy (`{name}.atpkg-staged`) an earlier replace
+    /// left, and every temporary an `AghHost` clobber of the same name left
+    /// (`{name}.agh-{8 hex}`, `agh::github::releases::is_clobber_temporary_of`), are deleted.
+    /// During the swap both hosts write the same staging releases, and this clobber leaves
+    /// `name` whole whatever the other host left, so either temporary would stay on the
+    /// release, an asset the mirror refuses to republish.
     fn drop_staged(
         client: &Client,
         slug: &Slug,
@@ -360,10 +366,24 @@ impl RestHost {
         name: &str,
     ) -> Result<(), HostError> {
         match asset_of(object, &format!("{name}{STAGED}")) {
-            Ok((staged, _)) => Self::delete_asset(client, slug, staged),
-            Err(HostError::NotFound) => Ok(()),
-            Err(e) => Err(e),
+            Ok((staged, _)) => Self::delete_asset(client, slug, staged)?,
+            Err(HostError::NotFound) => {}
+            Err(e) => return Err(e),
         }
+        let agh_temporaries = object["assets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|asset| {
+                asset["name"].as_str().is_some_and(|asset| {
+                    agh::github::releases::is_clobber_temporary_of(asset, name)
+                })
+            })
+            .filter_map(|asset| asset["id"].as_u64());
+        for temporary in agh_temporaries {
+            Self::delete_asset(client, slug, temporary)?;
+        }
+        Ok(())
     }
 
     fn replace_one(

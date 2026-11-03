@@ -186,6 +186,37 @@ fn observe_store_if_declared_until<T>(
     action(&session, &store, descriptor.scope).map(Some)
 }
 
+/// This Mac's lab and the catalog it holds, read as an observer that creates nothing: `None`
+/// where there is no Commons here, and an empty catalog where none is held yet.
+///
+/// # Errors
+/// Custody, membership or the catalog's storage cannot be read.
+pub(crate) fn peek_catalog(
+    paths: &Paths,
+) -> Result<
+    Option<(
+        aterm_secrets::commons::journal::Trust,
+        crate::catalog::Snapshot,
+    )>,
+> {
+    let deadline = admission_deadline();
+    let paths = crate::generation::observed_paths_until(paths, deadline)?;
+    if Bootstrap::cached(&paths)
+        .map_err(crate::table::failure)?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let (bootstrap, _) = Bootstrap::established_with_journal_until(&paths, deadline)
+        .map_err(crate::table::failure)?;
+    let session = Session::observe_until(&bootstrap, deadline)?;
+    let directory = Directory::new(&paths, bootstrap.trust());
+    Ok(Some((
+        bootstrap.trust(),
+        directory.snapshot_if_exists(&session)?,
+    )))
+}
+
 fn pass_current(deadline: std::time::Instant) -> Result<()> {
     if std::time::Instant::now() >= deadline {
         Err(Error::new("application pass deadline expired"))

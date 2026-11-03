@@ -6,8 +6,8 @@
 //! ([`cache_root`]) only where none is found:
 //! - the chrome-headless-shell ([`Archive::host`]), where no headless browser is found
 //!   ([`super::headless_oauth::find_headless_browser`]) and a headless sign-in waits on one alone
-//!   (the Grok gate's automatic rung, `super::grok_signin::LiveAuto`, where the vendor's page
-//!   answers that browser, which accounts.x.ai's does not): the browser lane's own pin;
+//!   (the Grok gate's automatic rung, `super::grok_signin::LiveAuto`, and vendor renewal's
+//!   `super::headless_oauth::VendorApprover`): the browser lane's own pin;
 //! - the full Chrome for Testing that opens a window ([`Archive::host_window`]), where no such
 //!   Chromium is found ([`super::browser_window::find_window_browser`]) and `aterm harness
 //!   accounts browser` would open one ([`super::browser_window::fetch_window_browser`]).
@@ -354,8 +354,8 @@ fn ensure_headless_with(
 
 /// The lowercase sha256 of the file at `path`.
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("the download cannot be read: {e}"))?;
+    let (mut file, _) = super::disk::versions::open_regular_file(path)
+        .map_err(|e| format!("the download cannot be read: {e}"))?;
     let mut hash = aterm_digest::Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {

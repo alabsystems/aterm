@@ -82,6 +82,16 @@
 	     parent also publishes in ATERM_HANDOFF_GRANT_CAPS. -->
 	<key>ATermHandoffGrantChunks</key>
 	<string>chunks1</string>
+	<!-- A DECLARED CAPABILITY, read like ATermHandoffGrantChunks: this build's
+	     successor side reads a SESSIONLESS rendezvous grant (a grant whose
+	     session list is empty, crates/aterm-gui handoff_rendezvous.rs), so an
+	     outgoing build whose windows hold no terminal session may still hand
+	     itself over to this one in the overlap lane. Without the key a parent
+	     never sends an empty grant, because every build before this one refuses
+	     it. The value is the token the parent also publishes in
+	     ATERM_HANDOFF_GRANT_CAPS. -->
+	<key>ATermHandoffGrantEmpty</key>
+	<string>empty1</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
 	<key>NSHumanReadableCopyright</key>

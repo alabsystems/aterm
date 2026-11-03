@@ -711,12 +711,15 @@ mod probe {
         struct Effects {
             control_sent: usize,
             control_received: usize,
+            membership_sent: usize,
+            membership_received: usize,
             application_sent: usize,
             application_received: usize,
             keys_sent: usize,
             keys_received: usize,
             conflicts_sent: usize,
             conflicts_received: usize,
+            credential_handoff: bool,
             deferred: usize,
             unaccounted_exchange: bool,
         }
@@ -724,12 +727,15 @@ mod probe {
             fn assisted(&self) -> bool {
                 self.control_sent != 0
                     || self.control_received != 0
+                    || self.membership_sent != 0
+                    || self.membership_received != 0
                     || self.application_sent != 0
                     || self.application_received != 0
                     || self.keys_sent != 0
                     || self.keys_received != 0
                     || self.conflicts_sent != 0
                     || self.conflicts_received != 0
+                    || self.credential_handoff
                     || self.deferred != 0
                     || self.unaccounted_exchange
             }
@@ -737,6 +743,15 @@ mod probe {
                 self.control_sent += report.sent;
                 self.control_received += report.received;
                 self.deferred += report.deferred;
+            }
+            fn membership(&mut self, report: Option<ControlReport>, error: Option<&str>) {
+                if let Some(report) = report {
+                    self.membership_sent += report.sent;
+                    self.membership_received += report.received;
+                    self.deferred += report.deferred;
+                }
+                // No report can also mean a partially completed legacy exchange.
+                self.unaccounted_exchange |= report.is_none() || error.is_some();
             }
             fn application(&mut self, report: &Report) {
                 self.application_sent += report.sent;
@@ -750,12 +765,15 @@ mod probe {
             fn accumulate(&mut self, other: &Self) {
                 self.control_sent += other.control_sent;
                 self.control_received += other.control_received;
+                self.membership_sent += other.membership_sent;
+                self.membership_received += other.membership_received;
                 self.application_sent += other.application_sent;
                 self.application_received += other.application_received;
                 self.keys_sent += other.keys_sent;
                 self.keys_received += other.keys_received;
                 self.conflicts_sent += other.conflicts_sent;
                 self.conflicts_received += other.conflicts_received;
+                self.credential_handoff |= other.credential_handoff;
                 self.deferred += other.deferred;
                 self.unaccounted_exchange |= other.unaccounted_exchange;
             }
@@ -763,9 +781,11 @@ mod probe {
                 json!({
                     "control_sent":self.control_sent,"application_sent":self.application_sent,
                     "control_received":self.control_received,"application_received":self.application_received,
+                    "membership_sent":self.membership_sent,"membership_received":self.membership_received,
                     "keys_sent":self.keys_sent,"keys_received":self.keys_received,
                     "conflicts_sent":self.conflicts_sent,"deferred":self.deferred,
                     "conflicts_received":self.conflicts_received,
+                    "credential_handoff":self.credential_handoff,
                     "unaccounted_exchange":self.unaccounted_exchange,
                 })
             }
@@ -926,9 +946,22 @@ mod probe {
                 .exchange_started
                 .then(|| finished.repair.application_interrupted())
                 .flatten();
+            let membership = finished
+                .exchange_started
+                .then(|| finished.repair.membership())
+                .flatten();
+            let membership_error = finished
+                .exchange_started
+                .then(|| finished.repair.membership_error())
+                .flatten();
+            let handoff = finished
+                .exchange_started
+                .then(|| finished.repair.handoff())
+                .flatten();
             // Failed control exchanges can already have sent records. Retain
             // that uncertainty under the current authenticated identity, not
             // merely this endpoint; another advertisement may name the same peer.
+            // A failed transport dial starts no exchange and transfers no records.
             let actor = finished
                 .exchange_started
                 .then(|| finished.repair.authenticated_actor())
@@ -936,22 +969,28 @@ mod probe {
             let authenticated = actor.is_some();
             let failed = finished.result.is_err();
             let unaccounted = peer.previous_unaccounted
-                || failed
+                || (finished.exchange_started && failed)
                 || application_error.is_some()
                 || interrupted.is_some()
                 || finished.cancelled;
             let prior = actor.map(|actor| effects.entry(actor).or_default());
             let mut before = Value::Null;
             let global_before = global.value();
-            // Sending or receiving control, keys or data can enable an ordinary
-            // runtime to spread a marker. Per-peer zero sends do not exclude
-            // that causal path. Count both directions, including this round.
+            // Sending or receiving membership, control, keys or data can enable
+            // an ordinary runtime to spread a marker. Per-peer zero sends do not
+            // exclude that causal path. Count both directions, including this round.
             let mut current = Effects {
                 unaccounted_exchange: unaccounted,
                 ..Effects::default()
             };
             if let Ok(control) = &finished.result {
                 current.control(control);
+            }
+            if finished.exchange_started {
+                current.membership(membership, membership_error);
+                // The published count covers local changes only; a negotiated
+                // handoff can also have sent credentials to this peer.
+                current.credential_handoff = handoff.is_some();
             }
             if let Some(application) = application.or(interrupted) {
                 current.application(&application);
@@ -965,6 +1004,14 @@ mod probe {
                 prior.accumulate(&current);
             }
             global.accumulate(&current);
+            let membership = membership.map_or(Value::Null, |report| {
+                json!({"sent":report.sent,"received":report.received,"deferred":report.deferred})
+            });
+            let handoff = match handoff {
+                None => Value::Null,
+                Some(Ok(published)) => json!({"published":published}),
+                Some(Err(error)) => json!({"error":error}),
+            };
             let control = match &finished.result {
                 Ok(report) => json!({
                     "sent":report.sent,"received":report.received,"deferred":report.deferred,
@@ -988,6 +1035,8 @@ mod probe {
                 "direct_inspector_assistance":direct_assistance,
                 "classification":classification(application,table,expected,assisted),
                 "control":control,"application":application_value,
+                "membership":membership,"membership_error":membership_error,
+                "credential_handoff":handoff,
                 "application_error":application_error,
                 "application_interrupted":crate::serve::application_value(interrupted),
                 "application_deferral":crate::serve::deferral_value(
@@ -997,7 +1046,7 @@ mod probe {
                     finished.repair.application_batch_deferral()
                 ),
             }));
-            peer.previous_unaccounted = unaccounted;
+            peer.previous_unaccounted = current.unaccounted_exchange;
             peer.repair = Some(finished.repair);
             peer.next = Instant::now() + Duration::from_secs(3);
         }
@@ -1336,6 +1385,110 @@ mod probe {
                     ),
                     positive
                 );
+            }
+
+            #[test]
+            fn failed_dial_does_not_taint_later_inventory_but_started_exchange_does() {
+                let table = [1; 32];
+                let summary = InventorySummary {
+                    count: 1,
+                    fingerprint: [2; 32],
+                };
+                let equal = Report {
+                    table: Some(table),
+                    local_known: Some(summary),
+                    local_offered: Some(summary),
+                    peer_known: Some(summary),
+                    ..Report::default()
+                };
+                for exchange_started in [false, true] {
+                    let address = SocketAddr::from(([127, 0, 0, 1], 1));
+                    let mut peers = BTreeMap::from([(
+                        address,
+                        Peer {
+                            repair: None,
+                            next: Instant::now(),
+                            previous_unaccounted: false,
+                        },
+                    )]);
+                    let mut global = Effects::default();
+                    let mut rounds = Vec::new();
+                    observe(
+                        Finished {
+                            address,
+                            repair: Repair::default(),
+                            exchange_started,
+                            cancelled: false,
+                            result: Err("connection failed".into()),
+                        },
+                        &table,
+                        summary,
+                        &mut peers,
+                        &mut BTreeMap::new(),
+                        &mut global,
+                        &mut rounds,
+                    );
+                    assert_eq!(global.assisted(), exchange_started);
+                    assert_eq!(peers[&address].previous_unaccounted, exchange_started);
+                    assert!(rounds[0]["control"]["error"].as_str().is_some());
+                    assert_eq!(
+                        classification(Some(equal), &table, summary, global.assisted())
+                            == "preexisting-retention-without-inspector-repair",
+                        !exchange_started
+                    );
+                }
+            }
+
+            #[test]
+            fn membership_transfers_and_incomplete_exchanges_taint_later_evidence() {
+                for (report, error, assisted) in [
+                    (Some(ControlReport::default()), None, false),
+                    (
+                        Some(ControlReport {
+                            sent: 1,
+                            ..ControlReport::default()
+                        }),
+                        None,
+                        true,
+                    ),
+                    (
+                        Some(ControlReport {
+                            received: 1,
+                            ..ControlReport::default()
+                        }),
+                        None,
+                        true,
+                    ),
+                    (
+                        Some(ControlReport {
+                            deferred: 1,
+                            ..ControlReport::default()
+                        }),
+                        None,
+                        true,
+                    ),
+                    (None, None, true),
+                    (Some(ControlReport::default()), Some("interrupted"), true),
+                ] {
+                    let mut current = Effects::default();
+                    current.membership(report, error);
+                    let mut later = Effects::default();
+                    later.accumulate(&current);
+                    assert_eq!(current.assisted(), assisted);
+                    assert_eq!(later.assisted(), assisted);
+                    if let Some(report) = report {
+                        assert_eq!(later.value()["membership_sent"], json!(report.sent));
+                        assert_eq!(later.value()["membership_received"], json!(report.received));
+                        assert_eq!(later.value()["deferred"], json!(report.deferred));
+                    }
+                }
+                let mut later = Effects::default();
+                later.accumulate(&Effects {
+                    credential_handoff: true,
+                    ..Effects::default()
+                });
+                assert!(later.assisted());
+                assert_eq!(later.value()["credential_handoff"], json!(true));
             }
 
             #[test]

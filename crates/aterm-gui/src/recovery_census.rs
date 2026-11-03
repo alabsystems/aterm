@@ -378,7 +378,7 @@ fn marker_pid_birth(name: &str) -> Option<(u32, u64)> {
 
 fn panic_report_time(path: &Path) -> Option<u64> {
     use std::io::{BufRead as _, BufReader, Read as _};
-    let file = std::fs::File::open(path).ok()?;
+    let file = crate::logging::open_regular_nonblock(path).ok()?;
     let mut first = String::new();
     BufReader::new(file.take(512)).read_line(&mut first).ok()?;
     let at = first.split("crashed at unix ").nth(1)?;
@@ -391,7 +391,7 @@ fn panic_report_time(path: &Path) -> Option<u64> {
 
 fn marker_signal(path: &Path) -> Option<u8> {
     use std::io::Read as _;
-    let file = std::fs::File::open(path).ok()?;
+    let file = crate::logging::open_regular_nonblock(path).ok()?;
     let mut head = String::new();
     file.take(256).read_to_string(&mut head).ok()?;
     let after = head.split("fatal signal ").nth(1)?;

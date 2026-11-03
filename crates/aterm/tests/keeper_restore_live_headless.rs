@@ -10,8 +10,8 @@ use std::time::Duration;
 use aterm_update::recovery_ledger::{KeeperAtLaunch, Row, ledger_path, read_rows};
 
 use crate::keeper_world::{
-    GAP, HANG, Proc, Start, World, admitted, await_keeper, await_start, boot, keeper, keeper_code,
-    keeper_reached, ledger_dir, world,
+    GAP, HANG, Proc, Start, World, admitted, await_keeper, await_start, boot, keeper, keeper_cli,
+    keeper_code, keeper_reached, keeper_status, ledger_dir, world, world_saying,
 };
 use crate::launch_isolation;
 use crate::live_ctl::{Ctl, fields};
@@ -179,6 +179,87 @@ fn crash_and_recover(root: &Path, a: Proc, seams: &[(&str, &str)]) -> (Proc, Ctl
     let (b, sock) = boot(root, &tag, seams);
     let ctl = admitted(&sock);
     (b, ctl)
+}
+
+/// A launch's start of its keeper as a bundled window's (`keeper_link::JOB_LABEL_SEAM`), under a
+/// test label.
+const JOB_LABEL_SEAM: &str = "ATERM_DEBUG_KEEPER_JOB_LABEL";
+
+/// Ends the job a launch submitted under a test label, whatever the test did.
+struct Job<'a> {
+    root: &'a Path,
+    label: String,
+}
+
+impl Drop for Job<'_> {
+    fn drop(&mut self) {
+        keeper_cli(self.root, &["stop", "--label", &self.label]);
+    }
+}
+
+fn job_label(tag: &str) -> String {
+    format!(
+        "{}.{}.{tag}",
+        aterm_keeper::job::TEST_LABEL_PREFIX,
+        std::process::id()
+    )
+}
+
+/// What a new Mac's first window does, on real processes: a config that says nothing about the
+/// keeper starts it, the session registers with it once it answers, and a SIGKILL brings the
+/// session back. The controls: the same launch under `enabled = false`, and a launch that is not a
+/// bundled window, start nothing and have no journal.
+#[test]
+fn a_config_that_says_nothing_starts_the_keeper_and_survives_a_crash() {
+    let off = world_saying("o", "[keeper]\nenabled = false\n");
+    let off_label = job_label("off");
+    let (off_instance, sock) = boot(&off.0, "a", &[(JOB_LABEL_SEAM, &off_label)]);
+    await_status(&mut Ctl::connect(&sock), "journal_off", "keeper-off");
+    drop(off_instance);
+    assert_eq!(
+        aterm_keeper::job::state(&off_label).expect("launchctl"),
+        aterm_keeper::job::JobState::Absent,
+        "`enabled = false` starts no keeper"
+    );
+
+    let lab = world_saying("l", "");
+    let (lab_instance, sock) = boot(&lab.0, "a", &[]);
+    await_status(&mut Ctl::connect(&sock), "journal_off", "keeper-off");
+    drop(lab_instance);
+
+    let world = world_saying("d", "");
+    let root = world.0.clone();
+    let label = job_label("default");
+    let _job = Job {
+        root: &root,
+        label: label.clone(),
+    };
+    let (a, sock) = boot(&root, "a", &[(JOB_LABEL_SEAM, &label)]);
+    let mut last = String::new();
+    let answered = aterm_spec::wait::within(crate::keeper_world::FIRST_EXEC_HANG, GAP, || {
+        last = keeper_status(&root);
+        last.lines()
+            .any(|line| line.starts_with("masters="))
+            .then_some(())
+    });
+    assert!(
+        answered.is_some(),
+        "the keeper the launch started never answered; its status:\n{last}"
+    );
+    assert!(
+        matches!(
+            aterm_keeper::job::state(&label).expect("launchctl"),
+            aterm_keeper::job::JobState::Loaded { pid: Some(_) }
+        ),
+        "the keeper runs as the job the launch submitted"
+    );
+    let mut ctl = Ctl::connect(&sock);
+    let (screen, _) = run_a(&root, &mut ctl, false);
+    drop(ctl);
+    let (_b, mut ctl) = crash_and_recover(&root, a, &[(JOB_LABEL_SEAM, &label)]);
+    await_status(&mut ctl, "restore", "exact");
+    let (restored, _) = screen_and_modes(&mut ctl);
+    assert_eq!(restored, screen, "the screen is A's last one");
 }
 
 #[test]

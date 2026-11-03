@@ -29,6 +29,11 @@ pub struct GridCursorState {
     pub tab_defaults_suppressed: bool,
     /// Deferred wrap flag (xterm `do_wrap`).
     pub pending_wrap: bool,
+    /// The glyph before the cursor is still the one a zero-width mark continues though the cursor
+    /// stands across an edge from it: a print from outside the left margin stepped onto the
+    /// margin, or a rewrap carried the cursor to column 0 of a row continuing that glyph's. Every
+    /// motion ends it (xterm's `char_was_written`, on these edges); elsewhere it decides nothing.
+    pub follows_glyph: bool,
     /// BCE (background color erase) template cell.
     pub cursor_template: Cell,
     /// Truecolor BCE background RGB (`None` for default or indexed background).
@@ -81,11 +86,15 @@ impl GridCursorState {
         self.pending_wrap
     }
 
-    /// Clear any deferred wrap request (skips the store when already false).
+    /// Clear any deferred wrap request (skips the store when already false), and with it
+    /// [`Self::follows_glyph`]: whatever resolves a wrap is a motion or an edit of the cursor's row.
     #[inline]
     pub(crate) const fn clear_pending_wrap(&mut self) {
         if self.pending_wrap {
             self.pending_wrap = false;
+        }
+        if self.follows_glyph {
+            self.follows_glyph = false;
         }
     }
 
@@ -132,6 +141,7 @@ impl GridCursorState {
     pub(crate) const fn restore_saved_cursor(&mut self, cursor: Cursor) {
         self.cursor = cursor;
         self.pending_wrap = self.saved_cursor.pending_wrap;
+        self.follows_glyph = false;
     }
 
     /// Get the current scroll region.

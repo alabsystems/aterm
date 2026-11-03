@@ -1784,7 +1784,9 @@ fn self_uninstall_with_acaffiene(
                 };
                 let exec_refused = said
                     .as_ref()
-                    .and_then(|(_, file)| std::fs::read(file).ok())
+                    .and_then(|(_, file)| {
+                        crate::metadata_io::read_bounded_regular(file, 64 * 1024).ok()
+                    })
                     .is_some_and(|err| sudo_refused_exec(run_as, code, &err, &atpkg));
                 if exec_refused || (exited && !sudo_may_not_have_run(run_as, code)) {
                     atpkg_proven = Some(atpkg.clone());
@@ -2609,7 +2611,7 @@ fn checkout_pages(src: &Path) -> Vec<Page> {
             if !page.is_file() {
                 return None;
             }
-            let bytes = std::fs::read(&page).ok()?;
+            let bytes = crate::metadata_io::read_bounded_regular(&page, 1024 * 1024).ok()?;
             Some((section, name, Cow::Owned(bytes)))
         })
         .collect()
@@ -2853,7 +2855,7 @@ fn checkout_icons(dir: &Path) -> Vec<Icon> {
             if !png.is_file() {
                 return None;
             }
-            let bytes = std::fs::read(&png).ok()?;
+            let bytes = crate::metadata_io::read_bounded_regular(&png, 1024 * 1024).ok()?;
             Some((name, Cow::Owned(bytes)))
         })
         .collect()

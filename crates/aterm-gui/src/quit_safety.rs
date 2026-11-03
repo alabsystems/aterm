@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use aterm_uds::process::child_pids;
 
-/// The copy for a destructive close/quit confirmation dialog, handed as is to the platform alert (`AppRt::confirm` → `NSAlert`).
+/// The copy for a destructive close/quit confirmation, shown in the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConfirmPrompt {
-    /// The alert's primary message (`NSAlert.messageText`).
+    /// The primary message.
     pub title: &'static str,
-    /// The secondary explanatory line (`NSAlert.informativeText`).
+    /// The secondary explanatory line.
     pub body: &'static str,
     /// The affirmative (destructive) button label; a "Cancel" button is always added alongside it.
     pub proceed: &'static str,

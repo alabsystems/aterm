@@ -754,8 +754,11 @@ fn remedy_run_as(
 }
 
 #[test]
-fn a_worker_frozen_past_the_bound_is_warned_about_and_left_running() {
-    assert!(!SupervisorConfig::default().stall_term, "the default warns");
+fn with_stall_term_off_a_worker_frozen_past_the_bound_is_warned_about_and_left_running() {
+    assert!(
+        SupervisorConfig::default().stall_term,
+        "the default restarts it"
+    );
     let default = SupervisorConfig::default().stall_term_after_s;
     let (signals, lines, informed) = warn_run(INPUT_STALLED_LONG, true, default, |_| {});
     assert!(

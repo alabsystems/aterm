@@ -191,7 +191,17 @@ struct Units {
     seen: std::collections::BTreeMap<(u32, u64), (Option<crate::unitgraph::UnitName>, u64)>,
 }
 
-/// A STAGE'S MEMORY METER: what its children's clocks read of their process groups
+/// CPU actually observed in a stage's child process groups. Short-lived descendants
+/// can end between samples, so this is a lower bound, never a complete CPU total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservedCpu {
+    /// Sum of each observed process incarnation's largest CPU counter, nanoseconds.
+    pub nanoseconds: u64,
+    /// Distinct process incarnations whose counters were observed.
+    pub processes: usize,
+}
+
+/// A STAGE'S RESOURCE METER: what its children's clocks read of their process groups
 /// ([`Meter::book`]), each group's footprint summed over its members, the stage's held together;
 /// and, for a meter that attributes them ([`Meter::attributing`]), each heavy compiler's peak by
 /// the unit it compiles.
@@ -199,6 +209,7 @@ struct Units {
 pub struct Meter {
     held: Mutex<Held>,
     units: Option<Mutex<Units>>,
+    cpu: Mutex<std::collections::BTreeMap<(u32, u64), u64>>,
 }
 
 impl Meter {
@@ -215,6 +226,7 @@ impl Meter {
     pub fn attributing(reader: UnitReader, floor: u64) -> Arc<Meter> {
         Arc::new(Meter {
             held: Mutex::default(),
+            cpu: Mutex::default(),
             units: Some(Mutex::new(Units {
                 reader,
                 floor,
@@ -259,6 +271,13 @@ impl Meter {
         if members.is_empty() {
             return;
         }
+        {
+            let mut cpu = self.cpu.lock().unwrap_or_else(PoisonError::into_inner);
+            for member in members {
+                let counter = cpu.entry((member.pid, member.start)).or_default();
+                *counter = (*counter).max(member.cpu_ns);
+            }
+        }
         let mut h = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         let sum = members
             .iter()
@@ -291,6 +310,20 @@ impl Meter {
             .unwrap_or_else(PoisonError::into_inner)
             .live
             .remove(&pgid);
+    }
+
+    /// Retain observed CPU after groups exit, counting a process incarnation once
+    /// even if it moves between groups. No sample is unknown, not zero; CPU from
+    /// descendants that exited between samples and in-process verifier work is absent.
+    #[must_use]
+    pub fn observed_cpu(&self) -> Option<ObservedCpu> {
+        let cpu = self.cpu.lock().unwrap_or_else(PoisonError::into_inner);
+        (!cpu.is_empty()).then(|| ObservedCpu {
+            nanoseconds: cpu
+                .values()
+                .fold(0_u64, |sum, value| sum.saturating_add(*value)),
+            processes: cpu.len(),
+        })
     }
 
     /// The stage's peak, bytes: the most its live groups held together at a read, and never less
@@ -450,7 +483,7 @@ impl StageKey for Key {
         };
         key.checkout = ctx.root.display().to_string();
         key.variant = match id {
-            StageId::Test => Some(format!("jobs {}", ctx.test_jobs())),
+            StageId::Test | StageId::SpecCheckers => Some(format!("jobs {}", ctx.test_jobs())),
             StageId::ForeignCells
             | StageId::WasmSmoke
             | StageId::WasmGlue

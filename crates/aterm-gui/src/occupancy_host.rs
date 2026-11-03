@@ -1472,7 +1472,7 @@ pub(crate) fn cmd_occupancy(sid: Option<&str>, rest: &str) -> String {
                 .unwrap_or_default();
             let ledger = aterm_types::dirs::state_dir()
                 .map(|state| aterm_agent::supervise::approvals::ledger_under(&state, Some(sid)))
-                .and_then(|path| std::fs::read_to_string(path).ok())
+                .and_then(|path| crate::occupancy_ring::read_ring_text(&path).ok())
                 .unwrap_or_default();
             replay_reply_local(
                 sid,

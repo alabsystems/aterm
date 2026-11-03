@@ -159,8 +159,23 @@ impl KeeperEnv for Env<'_> {
 #[must_use]
 pub fn read_marker(pid: u32, marker: &MarkerRef) -> MarkerEvidence {
     use std::os::unix::ffi::OsStrExt as _;
+    if marker.dir.contains(&0)
+        || marker
+            .dir
+            .split(|b| *b == b'/')
+            .any(|seg| seg == b"." || seg == b"..")
+    {
+        return MarkerEvidence::Unknown;
+    }
     let dir = Path::new(std::ffi::OsStr::from_bytes(&marker.dir));
-    if !dir.is_absolute() {
+    if !dir.is_absolute()
+        || !dir.components().all(|c| {
+            matches!(
+                c,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+    {
         return MarkerEvidence::Unknown;
     }
     let our_uid = aterm_uds::peer::our_uid();
@@ -949,6 +964,30 @@ mod tests {
         let seen = dir.join(format!("crash-marker-{pid}-7-lab.log.seen"));
         std::fs::rename(&marker, &seen).expect("consumed");
         assert_eq!(read_marker(pid, &m), MarkerEvidence::Dead, "a consumed one");
+
+        // NEGATIVE CONTROL: `.`, `..`, and embedded NULs in `marker.dir` return `Unknown` rather
+        // than traversing into `dir`.
+        for bad_dir in [
+            format!(
+                "{}/../{}",
+                dir.display(),
+                dir.file_name().unwrap().to_string_lossy()
+            )
+            .into_bytes(),
+            format!("{}/.", dir.display()).into_bytes(),
+            {
+                let mut nul = dir.as_os_str().as_bytes().to_vec();
+                nul.push(0);
+                nul
+            },
+        ] {
+            let bad = MarkerRef {
+                nanos: 7,
+                dir: bad_dir,
+            };
+            assert_eq!(read_marker(pid, &bad), MarkerEvidence::Unknown);
+        }
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

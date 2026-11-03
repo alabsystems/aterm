@@ -133,8 +133,44 @@ fn read_msg(e: &Element) -> Result<Msg, String> {
     })
 }
 
+fn read_protocol_xml(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    const MAX_PROTOCOL_XML_BYTES: u64 = 16 << 20;
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    if meta.len() > MAX_PROTOCOL_XML_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "protocol XML exceeds 16 MiB limit",
+        ));
+    }
+    let cap = usize::try_from(meta.len().min(MAX_PROTOCOL_XML_BYTES)).unwrap_or(0);
+    let mut buf = Vec::with_capacity(cap);
+    file.take(MAX_PROTOCOL_XML_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_PROTOCOL_XML_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "protocol XML grew past 16 MiB limit while reading",
+        ));
+    }
+    String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 fn read(dir: &Path, file: &str, copying: &str) -> Result<Protocol, String> {
-    let src = std::fs::read_to_string(dir.join(file)).map_err(|e| format!("{file}: {e}"))?;
+    let src = read_protocol_xml(&dir.join(file)).map_err(|e| format!("{file}: {e}"))?;
     let root = xml::parse(&src).map_err(|e| format!("{file}: {e}"))?;
     if root.name != "protocol" {
         return Err(format!("{file}: root <{}>", root.name));

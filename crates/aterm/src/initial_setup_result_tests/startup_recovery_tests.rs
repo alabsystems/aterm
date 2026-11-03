@@ -474,7 +474,7 @@ fn corrupt_accepted_answer_recovery(stop: bool, in_place: bool, prior_target: bo
         register_admitted_run(revision, send_admission(), false, None);
         let resumed = chosen.snapshot().unwrap();
         assert_eq!(resumed.plan, snapshot.plan);
-        assert!(!resumed.finished && resumed.permissions_allowed);
+        assert!(!resumed.finished && resumed.run_allowed);
         assert!(!setup_stop_requested(revision));
         clear_setup_run(revision);
         assert!(script().runs.is_empty());

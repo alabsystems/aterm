@@ -745,6 +745,12 @@ mod tests {
             assert!(text.contains(&format!("birth={birth}")), "{text}");
             assert_eq!(brief_line(&v, &[7]), Some(format!("jobs {text}")));
             assert_eq!(v.rows[0].wire(), raw);
+            let said = v.rows[0].said();
+            assert!(
+                said.contains("local") && said.contains("activity"),
+                "{said}"
+            );
+            assert!(said.contains("16998"), "{said}");
             assert_eq!(v.rows[0].class, Class::Polling);
             assert_eq!(v.rows[0].verdict, Verdict::Stuck);
             assert!(!v.rows[0].no_progress);
@@ -791,6 +797,7 @@ mod tests {
         );
         assert!(!text.contains('φ'), "unknown phi is not zero: {text}");
         v.rows[0].working_descendant = None;
+        assert!(!v.rows[0].said().contains("activity"));
         assert_eq!(summary(&rows_in(&v, &[7])), "1 job · 1 quiet");
         assert_eq!(status_fields(Some(&v), &[7], 0), "job=quiet job_quiet_ms=-");
         v.rows[0].working_descendant = Some((16998, 99));

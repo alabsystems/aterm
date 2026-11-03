@@ -476,11 +476,11 @@ fn an_agent_switched_off_in_the_tab_ends_the_exit_left_to_the_host() {
         let mut h = a.hooks();
         h.acts.relaunch_restored = Arc::new(|_, _, _, _| "refused:inert".to_string());
         let (world, line) = (Arc::clone(&a), Arc::clone(&h.acts.relaunch));
-        h.acts.relaunch = Arc::new(move |sid, pid, snap, left, upgrade, asked| {
+        h.acts.relaunch = Arc::new(move |sid, pid, snap, left, upgrade, asked, carried| {
             if world.agent_in(sid).is_some_and(|(now, _)| now != snap.pid) {
                 return "wait:shell-prompt".to_string();
             }
-            line(sid, pid, snap, left, upgrade, asked)
+            line(sid, pid, snap, left, upgrade, asked, carried)
         });
         let mut codex_off = on();
         codex_off.off.push(Program::Codex);

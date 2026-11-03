@@ -32,6 +32,7 @@ mod doctor_retire;
 mod exactly_once;
 mod fabric_cli;
 mod fabric_on;
+mod handler_tally;
 mod handoff_cost;
 mod link_state;
 mod log_mail;

@@ -506,7 +506,27 @@ impl Drop for RetireLock {
 /// `log`'s lock, or the refusal of a log a running broker holds.
 fn retire_lock(log: &Path) -> Result<RetireLock, String> {
     let at = log.display();
-    let holding = std::fs::File::open(log).map_err(|e| format!("{at}: {e}"))?;
+    let meta = std::fs::symlink_metadata(log).map_err(|e| format!("{at}: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err(format!("{at} is not a file; it is left as it was"));
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+    }
+    let holding = opts.open(log).map_err(|e| {
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return format!("{at} is not a file; it is left as it was");
+        }
+        format!("{at}: {e}")
+    })?;
+    if !holding.metadata().is_ok_and(|m| m.is_file()) {
+        return Err(format!("{at} is not a file; it is left as it was"));
+    }
     #[expect(
         clippy::disallowed_methods,
         reason = "the guard's own take: its Drop releases by LOCK_UN"
@@ -564,15 +584,42 @@ fn refuses_retire(log: &Path) -> Result<(), String> {
     }
 }
 
-/// The folder a stopped [`retire`] of `log` was moving to, from its marker; `None` with no marker.
-fn retiring_to(log: &Path) -> Result<Option<PathBuf>, String> {
-    let marker = beside(log, RETIRING);
-    let name = match std::fs::read_to_string(&marker) {
-        Ok(name) => name,
+fn is_retired_folder_name(name: &str) -> bool {
+    name.strip_prefix("retired-").is_some_and(|ms| {
+        !ms.is_empty() && ms.len() <= 39 && ms.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+fn read_retiring_marker(marker: &Path) -> Result<Option<String>, String> {
+    let meta = match std::fs::symlink_metadata(marker) {
+        Ok(meta) => meta,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{}: {e}", marker.display())),
     };
-    if !name.starts_with("retired-") || name.contains('/') {
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "{} is not a regular file; nothing moved",
+            marker.display()
+        ));
+    }
+    match aterm_uds::atomic_file::read_regular_text(marker, 64) {
+        Ok(name) => Ok(Some(name)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => Err(format!(
+            "{} names no retired folder ({e}); nothing moved",
+            marker.display()
+        )),
+        Err(e) => Err(format!("{}: {e}", marker.display())),
+    }
+}
+
+/// The folder a stopped [`retire`] of `log` was moving to, from its marker; `None` with no marker.
+fn retiring_to(log: &Path) -> Result<Option<PathBuf>, String> {
+    let marker = beside(log, RETIRING);
+    let Some(name) = read_retiring_marker(&marker)? else {
+        return Ok(None);
+    };
+    if !is_retired_folder_name(&name) {
         return Err(format!(
             "{} names no retired folder ({name:?}); nothing moved",
             marker.display()
@@ -612,11 +659,33 @@ fn retire_names(log: &Path) -> Result<Vec<String>, String> {
         .ok_or_else(|| format!("{at} names no file"))?;
     let prefix = format!("{name}.");
     let marker = format!("{name}{RETIRING}");
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .map_err(|e| format!("{}: {e}", dir.display()))?
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|entry| entry.starts_with(&prefix) && *entry != marker)
-        .collect();
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let raw_name = entry.file_name();
+        let Some(entry_name) = raw_name.to_str() else {
+            if raw_name.to_string_lossy().starts_with(&prefix) {
+                return Err(format!(
+                    "{}: non-UTF-8 sidecar {:?}; nothing moved",
+                    dir.display(),
+                    raw_name
+                ));
+            }
+            continue;
+        };
+        if entry_name.starts_with(&prefix) && entry_name != marker {
+            let ft = entry
+                .file_type()
+                .map_err(|e| format!("{}: {e}", entry.path().display()))?;
+            if !ft.is_file() {
+                return Err(format!(
+                    "{} is not a file; it is left as it was",
+                    entry.path().display()
+                ));
+            }
+            names.push(entry_name.to_owned());
+        }
+    }
     names.sort();
     if present(log) {
         names.push(name);

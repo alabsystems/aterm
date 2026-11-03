@@ -531,6 +531,95 @@ fn an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold(
         Request::None,
         "nothing written"
     );
+    for (agent, resume_hint) in [
+        (
+            upgrade::Agent::Muse,
+            "`muse resume` in the tab takes its session back",
+        ),
+        (
+            upgrade::Agent::Agy,
+            "`agy` in the tab (then `/resume`) takes its conversation back",
+        ),
+    ] {
+        save(
+            &o,
+            "ccc",
+            &St {
+                agent,
+                from: "1.4.10-R6427.1".to_string(),
+                to: "1.4.10-R6500.1".to_string(),
+                phase: Phase::Exiting { at_s: NOW },
+                tab: "s-busy".to_string(),
+                ..st.clone()
+            },
+        );
+        let in_flight = ask(&o, "s-busy", Ask::Defer(60), false).expect_err("in flight");
+        assert!(
+            in_flight.contains("once the agent is signalled"),
+            "{agent:?}: {in_flight}"
+        );
+        save(
+            &o,
+            "ccc",
+            &St {
+                agent,
+                from: "1.4.10-R6427.1".to_string(),
+                to: "1.4.10-R6500.1".to_string(),
+                phase: Phase::Failed("no-resume".to_string()),
+                exited_at: NOW - 30,
+                tab: "s-busy".to_string(),
+                ..st.clone()
+            },
+        );
+        let down = ask(&o, "s-busy", Ask::Now, false).expect_err("stopped after SIGTERM");
+        assert!(
+            down.contains("stopped after its SIGTERM ended the agent")
+                && down.contains(resume_hint),
+            "{agent:?}: {down}"
+        );
+        let answered = |_: &BTreeSet<String>| {
+            Some(vec![Holder {
+                pid: 99,
+                led: true,
+                ..holder("other-agent", "2.1.281", Some("s-busy"))
+            }])
+        };
+        let stopped =
+            ask_within(&o, "s-busy", Ask::Now, None, ASK_LOCK_WAIT, &answered).expect_err("back");
+        assert!(stopped.starts_with(REFUSED_STOPPED), "{agent:?}: {stopped}");
+        let (skipped_row, _) =
+            ask_within(&o, "s-busy", Ask::Skip, None, ASK_LOCK_WAIT, &answered).expect("skip");
+        assert!(
+            !skipped_row.failed_after_exit(),
+            "{agent:?}: answered row clears failed_after_exit"
+        );
+        let prior = St {
+            agent,
+            from: "1.4.10-R6427.1".to_string(),
+            to: "1.4.10-R6500.1".to_string(),
+            source: "managed".to_string(),
+            phase: Phase::Pending,
+            pending_since: NOW - 600,
+            request: Request::Skip("1.4.10-R6500.1".to_string()),
+            request_tab: TAB.to_string(),
+            request_at: NOW - 300,
+            ..St::default()
+        };
+        let mut restarted = St {
+            agent,
+            from: "1.4.10-R6427.1".to_string(),
+            to: "1.4.10-R6427.1".to_string(),
+            source: crate::harness::upgrade_drive::SAME_PROGRAM.to_string(),
+            ..St::default()
+        };
+        prior.kept_by_restart(TAB, &mut restarted);
+        assert_eq!(restarted.pending_since, NOW - 600, "{agent:?}");
+        assert_eq!(
+            restarted.request,
+            Request::Skip("1.4.10-R6500.1".to_string()),
+            "{agent:?}"
+        );
+    }
 
     let held = super::super::sweep_lock(&o).expect("lock").expect("held");
     let before = load(&o, "aaa");
@@ -1209,44 +1298,29 @@ fn jobs_on_a_tty(
     u32,
     (std::os::fd::OwnedFd, std::os::fd::OwnedFd),
 ) {
-    use aterm_uds::spawnfd::InheritNothing as _;
-    use std::os::fd::{FromRawFd as _, OwnedFd};
-    use std::os::unix::process::CommandExt as _;
-    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-    // SAFETY: both descriptors were just opened above and are owned here alone.
-    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-    let tty = |fd: &OwnedFd| std::process::Stdio::from(fd.try_clone().expect("dup"));
     let exe = std::env::current_exe().expect("exe");
     let park = format!(
         "'{}' harness::upgrade_drive::tests::park_when_asked --exact </dev/null >/dev/null 2>&1",
         exe.display()
     );
     let pid_file = dir.join("back.pid");
-    let mut shell = std::process::Command::new(crate::test_program::kept("/bin/sh"));
-    shell
-        .inherit_nothing()
-        .args([
-            "-c",
-            &format!(
-                "set -m; {park} & printf '%s\\n' \"$!\" > '{}'; exec {park}",
-                pid_file.display()
-            ),
-        ])
-        .env("UPGRADE_DRIVE_TEST_PARK", "1")
-        .env("ATERM_PARENT_SESSION_ID", tab)
-        .stdin(tty(&slave))
-        .stdout(tty(&slave))
-        .stderr(tty(&slave));
-    // SAFETY: pre-exec closure calls only async-signal-safe `setsid` and `ioctl(TIOCSCTTY)`.
-    unsafe {
-        shell.pre_exec(|| {
-            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut front = shell.spawn().expect("sh");
+    let sh_path = crate::test_program::kept("/bin/sh");
+    let cmd_str = format!(
+        "set -m; {park} & printf '%s\\n' \"$!\" > '{}'; exec {park}",
+        pid_file.display()
+    );
+    let (master, slave, mut front) = aterm_pty::spawn_session_leader_on_pty(|slave| {
+        let tty = || slave.try_clone().map(std::process::Stdio::from);
+        let mut shell = std::process::Command::new(&sh_path);
+        shell
+            .args(["-c", &cmd_str])
+            .env("UPGRADE_DRIVE_TEST_PARK", "1")
+            .env("ATERM_PARENT_SESSION_ID", tab)
+            .stdout(tty()?)
+            .stderr(tty()?);
+        Ok(shell)
+    })
+    .expect("sh");
     let parked = |pid: u32| {
         atpkg::caller_shell::process_args(pid).is_some_and(|a| {
             a.env_var("UPGRADE_DRIVE_TEST_PARK").is_some()
@@ -4012,8 +4086,8 @@ fn moved_state_as(
             "2.1.283",
         ),
         upgrade::Agent::Codex => (format!("codex-{TAB}"), "0.157.0", "0.157.1"),
-        upgrade::Agent::Muse => unreachable!("Muse Code's quiet upgrade keeps no ladder state"),
-        upgrade::Agent::Agy => unreachable!("agy's quiet upgrade keeps no ladder state"),
+        upgrade::Agent::Muse => (format!("muse-{TAB}"), "1.4.10-R6427.1", "1.4.10-R6500.1"),
+        upgrade::Agent::Agy => (format!("agy-{TAB}"), "1.4.10-R6427.1", "1.4.10-R6500.1"),
     };
     save(
         o,
@@ -4046,7 +4120,7 @@ fn fresh_claude_state(o: &Opts, exited_at: u64) -> String {
 
 #[test]
 fn a_move_that_failed_after_its_exit_stands_with_no_holder() {
-    use upgrade::Agent::{Claude, Codex};
+    use upgrade::Agent::{Agy, Claude, Codex, Muse};
     let tabs = [LiveTab {
         sid: TAB.to_string(),
         fgpgid: Some(7),
@@ -4060,6 +4134,12 @@ fn a_move_that_failed_after_its_exit_stands_with_no_holder() {
         (Codex, "no-resume-hint"),
         (Codex, "hint-mismatch"),
         (Codex, "stale-exit"),
+        (Muse, "no-resume"),
+        (Muse, "resume-refused"),
+        (Muse, "no-session"),
+        (Agy, "no-resume"),
+        (Agy, "started-fresh"),
+        (Agy, "conversation-gone"),
     ] {
         let dir = ScratchDir::new("upgrade-status", &format!("failed-{agent:?}-{why}"));
         let o = opts(&dir);
@@ -4100,41 +4180,55 @@ fn a_move_that_failed_after_its_exit_stands_with_no_holder() {
     let mut view = View::default();
     view.refresh_with(&o, &tabs, now_s(), &nobody, &mut |r| sent.push(r.to_vec()));
     assert_eq!(sent.last().map(Vec::len), Some(0));
-    let dir = ScratchDir::new("upgrade-status", "cl-failed-resumed");
-    let o = opts(&dir);
-    let resumed = moved_state(
-        &o,
-        Claude,
-        Phase::Failed("stale-exit".to_string()),
-        now_s() - 60,
-    );
-    let mut old = load(&o, &resumed).unwrap();
-    old.proc_start = "Mon Oct 26 12:00:00 2026".into();
-    save(&o, &resumed, &old);
-    let held_on = |version: &'static str| {
-        move |s: &BTreeSet<String>| -> Option<Vec<Holder>> {
-            Some(
-                s.iter()
-                    .map(|s| Holder {
-                        proc_start: "Mon Oct 26 12:01:00 2026".into(),
-                        ..holder(s, version, Some(TAB))
-                    })
-                    .collect(),
-            )
-        }
-    };
-    let mut view = View::default();
-    view.refresh_with(&o, &tabs, now_s(), &held_on("2.1.281"), &mut |r| {
-        sent.push(r.to_vec());
-    });
-    let rows = sent.last().cloned().unwrap_or_default();
-    assert_eq!(rows.len(), 1, "held again on the old build: shown");
-    assert_eq!(rows[0].remedy(now_s()), Some(Remedy::ByHand));
-    let mut view = View::default();
-    view.refresh_with(&o, &tabs, now_s(), &held_on("2.1.283"), &mut |r| {
-        sent.push(r.to_vec());
-    });
-    assert_eq!(sent.last().map(Vec::len), Some(0), "on the target: gone");
+    for (agent, old_ver, new_ver) in [
+        (Claude, "2.1.281", "2.1.283"),
+        (Muse, "1.4.10-R6427.1", "1.4.10-R6500.1"),
+        (Agy, "1.4.10-R6427.1", "1.4.10-R6500.1"),
+    ] {
+        let dir = ScratchDir::new("upgrade-status", &format!("failed-resumed-{agent:?}"));
+        let o = opts(&dir);
+        let resumed = moved_state(
+            &o,
+            agent,
+            Phase::Failed("stale-exit".to_string()),
+            now_s() - 60,
+        );
+        let mut old = load(&o, &resumed).unwrap();
+        old.proc_start = "Mon Oct 26 12:00:00 2026".into();
+        save(&o, &resumed, &old);
+        let held_on = |version: &'static str| {
+            move |s: &BTreeSet<String>| -> Option<Vec<Holder>> {
+                Some(
+                    s.iter()
+                        .map(|s| Holder {
+                            proc_start: "Mon Oct 26 12:01:00 2026".into(),
+                            ..holder(s, version, Some(TAB))
+                        })
+                        .collect(),
+                )
+            }
+        };
+        let mut view = View::default();
+        view.refresh_with(&o, &tabs, now_s(), &held_on(old_ver), &mut |r| {
+            sent.push(r.to_vec());
+        });
+        let rows = sent.last().cloned().unwrap_or_default();
+        assert_eq!(
+            rows.len(),
+            1,
+            "{agent:?} held again on the old build: shown"
+        );
+        assert_eq!(rows[0].remedy(now_s()), Some(Remedy::ByHand), "{agent:?}");
+        let mut view = View::default();
+        view.refresh_with(&o, &tabs, now_s(), &held_on(new_ver), &mut |r| {
+            sent.push(r.to_vec());
+        });
+        assert_eq!(
+            sent.last().map(Vec::len),
+            Some(0),
+            "{agent:?} on the target: gone"
+        );
+    }
 }
 
 const NEW: &str = "5eed0000-1111-2222-3333-444455556666";
@@ -4357,6 +4451,29 @@ fn a_fresh_claude_in_the_down_tab_is_read_by_the_real_holders() {
     assert!(of(holders(&o, &vet, Some(&tabs)), NEW).is_empty());
     down(now_s() - EXITED_FAILURE_SHOWN_S - 1);
     assert!(of(holders(&o, &vet, Some(&tabs)), NEW).is_empty());
+    for lane_agent in [upgrade::Agent::Muse, upgrade::Agent::Agy] {
+        let lane_dir =
+            ScratchDir::new("upgrade-status", &format!("agent-back-real-{lane_agent:?}"));
+        let lane_opts = Opts {
+            home: o.home.clone(),
+            ..opts(&lane_dir)
+        };
+        std::fs::create_dir_all(state_dir(&lane_opts)).expect("lane state");
+        let lane_session = moved_state(
+            &lane_opts,
+            lane_agent,
+            Phase::Failed("no-resume".to_string()),
+            exited,
+        );
+        let lane_vet: BTreeSet<String> = [lane_session].into();
+        let lane_window = of(holders(&lane_opts, &lane_vet, Some(&tabs)), NEW);
+        assert_eq!(lane_window.len(), 1, "{lane_agent:?}: {lane_window:?}");
+        assert!(lane_window[0].led, "{lane_agent:?}");
+        assert!(
+            status_rows(&lane_opts, false).0.is_empty(),
+            "{lane_agent:?} down tab is answered by live agent in its tab"
+        );
+    }
     down(exited);
 
     let _ = agent.kill();
@@ -9120,6 +9237,35 @@ fn a_stop_for_a_resume_by_someone_else_reads_as_its_own() {
         stop_words(claude, "another-stop-nobody-named"),
         "control: the words for a stop nobody named"
     );
+    for (agent, why) in [
+        (upgrade::Agent::Muse, "no-session"),
+        (upgrade::Agent::Muse, "resume-refused"),
+        (upgrade::Agent::Muse, "relaunch-ended"),
+        (upgrade::Agent::Agy, "conversation-gone"),
+        (upgrade::Agent::Agy, "resume-refused"),
+        (upgrade::Agent::Agy, "relaunch-ended"),
+        (upgrade::Agent::Agy, "relaunch-unwitnessed"),
+        (upgrade::Agent::Agy, "started-fresh"),
+    ] {
+        assert_ne!(
+            stop_words(agent, why),
+            unnamed,
+            "{agent:?} {why} reads as its own stop"
+        );
+    }
+    for (agent, wait) in [
+        (upgrade::Agent::Muse, "session-held"),
+        (upgrade::Agent::Muse, "held"),
+        (upgrade::Agent::Agy, "conversation-held"),
+        (upgrade::Agent::Agy, "held"),
+        (upgrade::Agent::Codex, "thread-locked"),
+        (upgrade::Agent::Codex, "held"),
+    ] {
+        assert!(
+            wait_words_of(agent, wait).is_some(),
+            "{agent:?} {wait} has wait words"
+        );
+    }
 }
 
 /// The owner's press word reads the window's claims under the claims read's own bound, the

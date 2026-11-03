@@ -7,10 +7,41 @@ use crate::durable::Flush;
 use std::io::Write as _;
 use std::path::Path;
 
-/// The marker's text, when a regular, non-symlink file of at most `max_bytes` sits at `path`.
+/// The marker's text, when a regular, non-symlink file of at most `max_bytes` sits at `path`
+/// inside a real (non-symlink) parent directory.
 #[inline]
 pub fn read_marker(path: &Path, max_bytes: usize) -> Option<String> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
+        && !std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_dir())
+    {
+        return None;
+    }
     aterm_effects::file_feed::read_bounded_regular_utf8(path, max_bytes).ok()
+}
+
+fn ensure_marker_target(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_file() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "marker path is occupied by something that is not a marker",
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn ensure_real_parent(path: &Path) -> std::io::Result<()> {
+    let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    if !std::fs::symlink_metadata(dir)?.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "marker parent path is not a directory",
+        ));
+    }
+    Ok(())
 }
 
 /// Atomically writes `text` to `path` using `flush` ([`Flush::Ordered`], [`Flush::Durable`]),
@@ -21,19 +52,6 @@ pub fn write_marker(
     max_bytes: usize,
     flush: Flush,
 ) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_file() => {}
-        Ok(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "marker path is occupied by something that is not a marker",
-            ));
-        }
-        Err(_) => {}
-    }
     if text.len() > max_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -43,6 +61,17 @@ pub fn write_marker(
     let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "marker has no name")
     })?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if std::fs::symlink_metadata(dir).is_ok_and(|m| !m.file_type().is_dir()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "marker parent path is not a directory",
+            ));
+        }
+        std::fs::create_dir_all(dir)?;
+        ensure_real_parent(path)?;
+    }
+    ensure_marker_target(path)?;
     let tmp = path.with_file_name(format!("{name}.tmp-{}", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -56,7 +85,10 @@ pub fn write_marker(
         .write_all(text.as_bytes())
         .and_then(|()| finish(&file, flush));
     drop(file);
-    let written = written.and_then(|()| std::fs::rename(&tmp, path));
+    let written = written
+        .and_then(|()| ensure_real_parent(path))
+        .and_then(|()| ensure_marker_target(path))
+        .and_then(|()| std::fs::rename(&tmp, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -73,7 +105,7 @@ pub fn write_marker(
         };
         if let Ok(dir) = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_DIRECTORY)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(dir)
         {
             let _ = crate::durable::sync_all(&dir);
@@ -96,6 +128,14 @@ fn finish(file: &std::fs::File, flush: Flush) -> std::io::Result<()> {
 
 /// Remove the marker at `path`, if a regular file is there ([`write_marker`]).
 pub fn remove_marker(path: &Path) -> std::io::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
+        && std::fs::symlink_metadata(dir).is_ok_and(|m| !m.file_type().is_dir())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "marker parent path is not a directory",
+        ));
+    }
     match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_file() => std::fs::remove_file(path),
         Ok(_) => Err(std::io::Error::new(
@@ -309,6 +349,34 @@ mod tests {
             std::fs::read(&temporary).ok(),
             Some(b"another creator's bytes".to_vec()),
             "a refused exclusive create has no cleanup authority over the collision"
+        );
+    }
+
+    /// NEGATIVE CONTROL: symlinked parent directories are refused by `read_marker`,
+    /// `write_marker`, and `remove_marker` without touching files in the link target.
+    #[cfg(unix)]
+    #[test]
+    fn markers_refuse_symlinked_parent_directories() {
+        let root = aterm_tempfile::TempDir::new().expect("a private marker fixture");
+        let target_dir = root.path().join("target-dir");
+        std::fs::create_dir(&target_dir).expect("target dir");
+        let target_marker = target_dir.join("answered");
+        std::fs::write(&target_marker, "untouched").expect("target marker");
+
+        let linked_dir = root.path().join("linked-dir");
+        std::os::unix::fs::symlink(&target_dir, &linked_dir).expect("symlink dir");
+        let through_link = linked_dir.join("answered");
+
+        assert_eq!(read_marker(&through_link, 64), None);
+        let write_err = write_marker(&through_link, "overwritten", 64, Flush::Durable)
+            .expect_err("symlinked parent must be refused");
+        assert_eq!(write_err.kind(), std::io::ErrorKind::InvalidInput);
+        let remove_err =
+            remove_marker(&through_link).expect_err("symlinked parent must not unlink target");
+        assert_eq!(remove_err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read_to_string(&target_marker).expect("target intact"),
+            "untouched"
         );
     }
 }

@@ -36,6 +36,10 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("broker failure world retained: {}", self.0.display());
+            return;
+        }
         // Only a directory this value successfully created can reach this cleanup.
         let _ = std::fs::remove_dir_all(&self.0);
     }

@@ -85,6 +85,17 @@ one-shot run that booted it died is stopped as `down` stops it, and booted afres
                            lane's desktop session (WinSta0, a Task Scheduler task); a one-shot exec (it booted the VM)
                            shuts it down and reverts the disk when CMD ends. Interrupted, CMD goes on in the guest and a
                            VM the exec booted keeps running until `down` or the next run stops it
+  attach --pid N --birth SECONDS:MICROSECONDS --plan HEX exec [exec options] CMD...
+                           take exclusive custody of that exact already-kept VM and run exec's copy/command only.
+                           Requires matching live kernel generation, booter, recorded and guest plan, runner and
+                           active desktop. Never boot, provision, reap leftovers, change display, power off or revert;
+                           missing/unknown/mismatched custody refuses without recovery. The repo's current plan is
+                           reported separately; a held guest is never migrated by this command.
+                           Instead of exec: settings --source SHA40 --gui-sha SHA256 --ctl-sha SHA256
+                           --backend cpu|warp --out ABSOLUTE-NEW-DIRECTORY captures three owned Settings cases
+                           without building or changing desktop scaling. App source binding requires retained build
+                           evidence; supplied executable hashes are checked. Geometry/pixels needing review remain
+                           observations, not an automatic declaration that the library layout laws passed.
   smoke [--arch aarch64|x86_64]...
                            the lane's acceptance per arch (both unless named): aterm, aterm-gui and aterm-ctl built,
                            `aterm --version` printing this checkout's build number, and one aterm-gui --headless driven over
@@ -148,6 +159,7 @@ pub fn cmd_windows(args: &[String]) -> Res {
         "down" => cmd_down(),
         "status" => cmd_status(),
         "exec" => cmd_exec(rest),
+        "attach" => cmd_attach(rest),
         "smoke" => crate::windows_smoke::cmd_smoke(rest),
         "window" => crate::windows_window::cmd_window(rest),
         "uia" => crate::windows_uia::cmd_uia(rest),
@@ -1800,6 +1812,255 @@ pub struct Up {
     booter: Option<PathBuf>,
 }
 
+/// Explicit custody of an already running VM. Neither an absent observation nor a
+/// PID alone identifies a held VM.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldVm {
+    pid: i32,
+    birth: aterm_uds::process::ProcessBirth,
+    plan: String,
+}
+
+impl HeldVm {
+    fn matches(
+        &self,
+        actual: Option<DaemonProcess>,
+        booter: &crate::vm_admit::Booter,
+        plan: Option<&str>,
+    ) -> bool {
+        actual
+            == Some(DaemonProcess {
+                pid: self.pid,
+                birth: self.birth,
+            })
+            && booter.kept
+            && booter.vm_pid == u32::try_from(self.pid).ok()
+            && booter.vm_birth == Some((self.birth.seconds, self.birth.microseconds))
+            && plan == Some(self.plan.as_str())
+    }
+
+    pub(crate) fn check(&self, l: &Layout) -> Result<(), Fail> {
+        let booter = crate::vm_admit::Booter::read(&l.booter())
+            .ok_or_else(|| not_run("held VM has no readable booter identity; preserved"))?;
+        let actual = daemon(l, Daemon::Qemu).map_err(not_run)?;
+        if !self.matches(actual, &booter, snapshot_plan(l).as_deref()) {
+            return Err(not_run(
+                "held VM PID, generation, kept record or provisioned plan differs; preserved",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod held_vm_tests {
+    use super::*;
+
+    #[test]
+    fn held_identity_requires_every_observed_component() {
+        let held = HeldVm {
+            pid: 42,
+            birth: aterm_uds::process::ProcessBirth {
+                seconds: 123,
+                microseconds: 456,
+            },
+            plan: "d15bf16566021279".into(),
+        };
+        let actual = Some(DaemonProcess {
+            pid: held.pid,
+            birth: held.birth,
+        });
+        let mut booter = crate::vm_admit::Booter::me("test", Path::new("/test"));
+        booter.kept = true;
+        booter.vm_pid = Some(42);
+        booter.vm_birth = Some((123, 456));
+        assert!(held.matches(actual, &booter, Some(&held.plan)));
+        assert!(!held.matches(None, &booter, Some(&held.plan)));
+        assert!(!held.matches(actual, &booter, None));
+        assert!(!held.matches(actual, &booter, Some("0000000000000000")));
+        for changed in [
+            DaemonProcess {
+                pid: 43,
+                birth: held.birth,
+            },
+            DaemonProcess {
+                pid: 42,
+                birth: aterm_uds::process::ProcessBirth {
+                    seconds: 124,
+                    microseconds: 456,
+                },
+            },
+        ] {
+            assert!(!held.matches(Some(changed), &booter, Some(&held.plan)));
+        }
+        booter.vm_birth = None;
+        assert!(!held.matches(actual, &booter, Some(&held.plan)));
+        booter.vm_birth = Some((123, 456));
+        booter.vm_pid = None;
+        assert!(!held.matches(actual, &booter, Some(&held.plan)));
+        booter.vm_pid = Some(42);
+        booter.kept = false;
+        assert!(!held.matches(actual, &booter, Some(&held.plan)));
+    }
+
+    #[test]
+    fn attach_custody_arguments_are_mandatory_and_exact() {
+        let args = |s: &str| s.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+        let good = args("--pid 42 --birth 123:456 --plan d15bf16566021279 exec cargo test");
+        assert!(parse_attach(&good).is_ok());
+        for bad in [
+            "",
+            "--pid 42 exec cargo test",
+            "--pid 1 --birth 123:456 --plan d15bf16566021279 exec x",
+            "--pid 42 --birth 123:1000000 --plan d15bf16566021279 exec x",
+            "--pid 42 --birth 123:456 --plan unknown exec x",
+            "--pid 42 --birth 123:456 --plan d15bf16566021279",
+        ] {
+            assert!(parse_attach(&args(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn attaching_unknown_layout_cannot_create_or_recover_it() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let layout = Layout::under(root.path());
+        let held = HeldVm {
+            pid: 42,
+            birth: aterm_uds::process::ProcessBirth {
+                seconds: 123,
+                microseconds: 456,
+            },
+            plan: "d15bf16566021279".into(),
+        };
+        assert!(attach_existing(layout.clone(), &held).is_err());
+        assert!(!layout.home.exists());
+        assert!(!layout.cache.exists());
+        // Even an existing layout containing an unrelated sentinel stays intact.
+        std::fs::create_dir_all(&layout.home).unwrap();
+        std::fs::write(layout.home.join("preserve"), b"existing held data").unwrap();
+        assert!(attach_existing(layout.clone(), &held).is_err());
+        assert_eq!(
+            std::fs::read(layout.home.join("preserve")).unwrap(),
+            b"existing held data"
+        );
+        assert!(!layout.run().exists());
+    }
+}
+
+/// Attach under the caller's lane lock, without any lifecycle recovery or cleanup.
+/// The deliberately retained guest need not have today's provisioning plan.
+fn attach_existing(l: Layout, held: &HeldVm) -> Result<Up, Fail> {
+    held.check(&l)?;
+    let tools = Tools::find()?;
+    let admitted = crate::vm_admit::admit(&crate::vm_admit::WINDOWS, false)?;
+    held.check(&l)?;
+    let port = read_port(&l).ok_or_else(|| not_run("held VM recorded no SSH port; preserved"))?;
+    let admin = Ssh::new(&l, port);
+    let ssh = admin.runner();
+    let identity = ssh.ps(&format!(
+        "$ErrorActionPreference='Stop'; if ($env:USERNAME -ine {}) {{ exit 125 }}; \
+         if ((Get-Content -Raw {}).Trim() -cne {}) {{ exit 125 }}; {}",
+        guest::ps_quote(guest::RUNNER),
+        guest::ps_quote(guest::STAMP),
+        guest::ps_quote(&held.plan),
+        guest::desktop_check()
+    ));
+    if !identity.ok() || !identity.text.lines().any(|s| s.trim() == guest::DESKTOP_UP) {
+        return Err(not_run(format!(
+            "held guest runner, plan or interactive desktop is unavailable; preserved: {}",
+            identity.tail(5)
+        )));
+    }
+    held.check(&l)?;
+    println!(
+        "windows: attached held QEMU pid {} birth {}:{} plan {}; lifecycle and display unchanged",
+        held.pid, held.birth.seconds, held.birth.microseconds, held.plan
+    );
+    println!(
+        "windows: current source provisioning plan {} (observed only)",
+        guest::fingerprint(&guest::provision_steps())
+    );
+    Ok(Up {
+        layout: l,
+        tools,
+        ssh,
+        admin,
+        booted_here: false,
+        timings: Vec::new(),
+        admitted,
+        booter: None,
+    })
+}
+
+fn parse_attach(args: &[String]) -> Result<(HeldVm, &[String]), Fail> {
+    let usage = || {
+        Fail::usage(
+            "windows attach --pid N --birth SECONDS:MICROSECONDS --plan HEX exec|settings ...",
+        )
+    };
+    let [pid_flag, pid, birth_flag, birth, plan_flag, plan, rest @ ..] = args else {
+        return Err(usage());
+    };
+    if pid_flag != "--pid" || birth_flag != "--birth" || plan_flag != "--plan" {
+        return Err(usage());
+    }
+    let pid = pid
+        .parse::<i32>()
+        .ok()
+        .filter(|p| *p > 1)
+        .ok_or_else(usage)?;
+    let (seconds, microseconds) = birth.split_once(':').ok_or_else(usage)?;
+    let seconds = seconds.parse::<u64>().map_err(|_| usage())?;
+    let microseconds = microseconds
+        .parse::<u64>()
+        .ok()
+        .filter(|us| *us < 1_000_000)
+        .ok_or_else(usage)?;
+    if plan.len() != 16 || !plan.bytes().all(|b| b.is_ascii_hexdigit()) || rest.is_empty() {
+        return Err(usage());
+    }
+    Ok((
+        HeldVm {
+            pid,
+            birth: aterm_uds::process::ProcessBirth {
+                seconds,
+                microseconds,
+            },
+            plan: plan.clone(),
+        },
+        rest,
+    ))
+}
+
+fn cmd_attach(args: &[String]) -> Res {
+    let (held, rest) = parse_attach(args)?;
+    // Parse before taking custody; never pass an unknown verb to a lifecycle route.
+    let [verb, args @ ..] = rest else {
+        unreachable!()
+    };
+    if !matches!(verb.as_str(), "exec" | "settings") {
+        return Err(Fail::usage("windows attach supports exec|settings"));
+    }
+    if verb == "exec" {
+        let _ = parse_exec(args)?;
+    } else {
+        crate::windows_settings::validate_args(args)?;
+    }
+    let l = Layout::find()?;
+    if !l.home.is_dir() {
+        return Err(not_run("held VM layout is absent; preserved"));
+    }
+    held.check(&l)?;
+    let _lock = lane_lock(&l)?;
+    let up = attach_existing(l, &held)?;
+    held.check(&up.layout)?;
+    if verb == "exec" {
+        exec_on(up, parse_exec(args)?)
+    } else {
+        crate::windows_settings::run(&up, &held, args)
+    }
+}
+
 impl Up {
     /// The environment the guest's `cargo` gets for `arch` ([`guest::cargo_env`]), its job count
     /// the cores this run was admitted (`CARGO_BUILD_JOBS`).
@@ -2601,6 +2862,10 @@ fn cmd_exec(args: &[String]) -> Res {
     let l = Layout::find()?;
     let _lock = boot_lane(&l)?;
     let up = bring_up(false)?;
+    exec_on(up, ask)
+}
+
+fn exec_on(up: Up, ask: ExecArgs) -> Res {
     let repo = crate::paths::physical(&paths().repo);
     let t0 = Instant::now();
     match copy_tree(&up.layout, &up.ssh, &repo) {

@@ -137,6 +137,8 @@ pub(super) fn launched_job(
         command: std::process::Command::new("/usr/bin/true"),
         verify_staged_candidate,
         grant_chunks: false,
+        grant_empty: false,
+        sessionless: false,
         installed_activation,
         bundle: None,
         cancel,

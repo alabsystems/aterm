@@ -48,7 +48,22 @@ fn a_view_on_the_instant_before_a_clear_shows_that_screen_and_the_live_grid_stay
         before.iter().any(|row| row == "row-40"),
         "fixture: the forty rows are on screen: {before:#?}"
     );
-    let status = ctl.ok("temporal status");
+    // PTY idleness does not imply that the asynchronous recorder has caught up.
+    // The reader queues its slice under the terminal lock, so after the screen
+    // above is quiescent, an empty writer queue makes latest_tick its recorded cut.
+    let status = aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the recorder to finish the screen shown before clear",
+        || {
+            let status = ctl.ok("temporal status");
+            let state = fields(&status);
+            assert_eq!(state.get("writer_queue"), Some(&"present"), "{status}");
+            assert_eq!(state.get("writer_gone"), Some(&"false"), "{status}");
+            (state.get("writer_in_flight") == Some(&"0")
+                && state.get("pending_resizes") == Some(&"0"))
+            .then_some(status)
+        },
+    );
     let tick: u64 = fields(&status)["latest_tick"]
         .parse()
         .unwrap_or_else(|_| panic!("a latest_tick: {status}"));

@@ -8,6 +8,12 @@ use std::io;
 use std::os::windows::io::RawHandle;
 
 use crate::Limits;
+#[cfg(test)]
+use crate::job_fold::{
+    HUNDRED_NS_PER_SEC_TEST as HUNDRED_NS_PER_SEC, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_PROCESS_TIME,
+};
+use crate::job_fold::{JobObjectExtendedLimitInformation, fold_job_limits};
 
 /// No-op: Windows limits are installed by [`apply_to_job`].
 pub(crate) fn apply_limits(_limits: &Limits) -> io::Result<()> {
@@ -15,10 +21,6 @@ pub(crate) fn apply_limits(_limits: &Limits) -> io::Result<()> {
 }
 
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
-const JOB_OBJECT_LIMIT_PROCESS_TIME: u32 = 0x0000_0002;
-const JOB_OBJECT_LIMIT_PROCESS_MEMORY: u32 = 0x0000_0100;
-const JOB_OBJECT_LIMIT_ACTIVE_PROCESS: u32 = 0x0000_0008;
-const HUNDRED_NS_PER_SEC: i64 = 10_000_000;
 
 const JOB_OBJECT_BASIC_UI_RESTRICTIONS_CLASS: i32 = 4;
 const JOB_OBJECT_UILIMIT_READCLIPBOARD: u32 = 0x0000_0002;
@@ -63,20 +65,7 @@ pub(crate) fn apply_to_job(limits: &Limits, job: RawHandle) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    if let Some(bytes) = limits.address_space {
-        info.ProcessMemoryLimit = usize::try_from(bytes).unwrap_or(usize::MAX);
-        info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
-    }
-    if let Some(secs) = limits.cpu_seconds {
-        info.BasicLimitInformation.PerProcessUserTimeLimit = i64::try_from(secs)
-            .unwrap_or(i64::MAX)
-            .saturating_mul(HUNDRED_NS_PER_SEC);
-        info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_TIME;
-    }
-    if let Some(max) = limits.active_processes {
-        info.BasicLimitInformation.ActiveProcessLimit = max;
-        info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-    }
+    fold_job_limits(&mut info, limits);
 
     // SAFETY: `job` is a valid job handle and `info` a fully-initialized struct of the stated size.
     let set = unsafe {
@@ -119,42 +108,6 @@ fn apply_ui_restrictions(job: RawHandle) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-#[repr(C)]
-#[allow(non_snake_case)]
-struct JobObjectBasicLimitInformation {
-    PerProcessUserTimeLimit: i64,
-    PerJobUserTimeLimit: i64,
-    LimitFlags: u32,
-    MinimumWorkingSetSize: usize,
-    MaximumWorkingSetSize: usize,
-    ActiveProcessLimit: u32,
-    Affinity: usize,
-    PriorityClass: u32,
-    SchedulingClass: u32,
-}
-
-#[repr(C)]
-#[allow(non_snake_case)]
-struct IoCounters {
-    ReadOperationCount: u64,
-    WriteOperationCount: u64,
-    OtherOperationCount: u64,
-    ReadTransferCount: u64,
-    WriteTransferCount: u64,
-    OtherTransferCount: u64,
-}
-
-#[repr(C)]
-#[allow(non_snake_case)]
-struct JobObjectExtendedLimitInformation {
-    BasicLimitInformation: JobObjectBasicLimitInformation,
-    IoInfo: IoCounters,
-    ProcessMemoryLimit: usize,
-    JobMemoryLimit: usize,
-    PeakProcessMemoryUsed: usize,
-    PeakJobMemoryUsed: usize,
 }
 
 #[repr(C)]

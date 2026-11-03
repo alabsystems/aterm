@@ -278,7 +278,7 @@ pub(crate) fn read_others(harness_state: &Path, own: &str, today: i64) -> Vec<Ab
         if name == own || !is_book_name(name) || !entry.file_type().is_ok_and(|t| t.is_file()) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+        let Ok(text) = crate::occupancy_ring::read_ring_text(&entry.path()) else {
             continue;
         };
         let Ok(SchemaOnly { schema }) = aterm_json::from_str::<SchemaOnly>(&text) else {

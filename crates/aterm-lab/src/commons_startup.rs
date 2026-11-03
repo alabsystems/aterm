@@ -302,8 +302,15 @@ pub(crate) fn image(window: &Instance, out: &Path, name: &str) -> Result<(), Fai
     }
 }
 
+/// Read only existing custody, so an observer cannot repair the host under test.
+fn observed_bootstrap(paths: &Paths) -> Result<Bootstrap, Fail> {
+    Bootstrap::established_with_journal_until(paths, Instant::now() + HANG)
+        .map(|(bootstrap, _)| bootstrap)
+        .map_err(fail)
+}
+
 fn require_enrolled(paths: &Paths, log_backed: bool) -> Result<(), Fail> {
-    let enrolled = Bootstrap::required(paths).map_err(fail)?;
+    let enrolled = observed_bootstrap(paths)?;
     if enrolled.is_log_backed().map_err(fail)? != log_backed
         || (log_backed && enrolled.log_witness().map_err(fail)?.is_none())
     {
@@ -331,7 +338,8 @@ fn require_enrolled(paths: &Paths, log_backed: bool) -> Result<(), Fail> {
 /// history before it can repair application data.
 /// `--peer-cycle` then stops the source, restores the recipient's history across
 /// its own restart with the source still absent, and reconnects the source.
-/// It checks authenticated reachability and retained local account data separately.
+/// It checks authenticated reachability and retained local account data separately,
+/// and requires a new table row written during the outage to reach the returning source.
 /// `--peer-details` adds selected-peer native captures and requires a bundled executable.
 /// `--local-follower` adds a fresh window sharing the source vault through another configuration.
 /// It checks the GUI's retained owner observation and the window's ordinary CLI inventory reads.
@@ -560,6 +568,8 @@ pub fn cmd(args: &[String]) -> Res {
                 (reverse, "reverse", &reverse_value),
                 (after_restart, "after-restart", &after_restart_value),
             ],
+            application: &application,
+            rows: &mut rows,
         }
         .run(node)?
     } else {
@@ -621,6 +631,9 @@ pub fn cmd(args: &[String]) -> Res {
     println!("commons-startup PASS output={}", out.display());
     Ok(0)
 }
+
+#[cfg(test)]
+mod observation_tests;
 
 #[cfg(test)]
 mod tests {

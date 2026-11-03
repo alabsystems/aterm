@@ -959,7 +959,7 @@ fn install_bootstrap(
     // A join may have changed the slot after the snapshot was observed. Pin
     // only while that exact authenticated observation still describes it.
     // from_snapshot does local custody I/O only and never retakes StateLock.
-    let _lock = StateLock::take(paths)?;
+    let lock = StateLock::take(paths)?;
     let current = config(paths)?.ok_or_else(|| Error::new("creation lost its configuration"))?;
     compatible(&current, &pending.config()?)?;
     let state = load_state(paths)?;
@@ -990,8 +990,7 @@ fn install_bootstrap(
     ) {
         return Err(Error::new("creation Commons control history is not ready"));
     }
-    drop(journal);
-    if snapshot.sequence() == 1 && bootstrap.access()?.is_none() {
+    if snapshot.sequence() == 1 && bootstrap.access_in_held(&journal, &lock)?.is_none() {
         return Err(Error::new("creation founder membership is not ready"));
     }
     Ok(())

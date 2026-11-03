@@ -318,6 +318,7 @@ pub fn is_source_shape(name: &str) -> bool {
 #[must_use]
 pub fn publishable_asset_names(version: &str) -> Vec<String> {
     let mut names = required_asset_names(version, true, true);
+    names.push(crate::service_qualification::REPORT_ASSET.to_string());
     names.extend(linux_asset_names(version));
     names.sort();
     names

@@ -3578,7 +3578,6 @@ fn a_shell_on_its_pty_has_it_for_its_terminal() {
 #[test]
 fn piped_interactive_shells_in_a_background_group_neither_stop_nor_touch_the_tty() {
     use aterm_uds::spawnfd::InheritNothing as _;
-    use std::os::fd::{FromRawFd as _, OwnedFd};
     use std::os::unix::process::CommandExt as _;
 
     const STAGE_VAR: &str = "ATERM_TEST_BG_TTY_STAGE";
@@ -3688,28 +3687,17 @@ fn piped_interactive_shells_in_a_background_group_neither_stop_nor_touch_the_tty
     let mut shells = ShellLanes::default();
     let _ = posix_lanes(&mut shells);
 
-    let (master, slave) = aterm_pty::open_pty_pair().expect("open pty");
-    // SAFETY: `open_pty_pair` returned two fresh, close-on-exec descriptors owned here alone.
-    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
     let exe = std::env::current_exe().expect("test binary");
-    let mut cmd = Command::new(exe);
-    cmd.inherit_nothing();
-    cmd.args(["--exact", TEST_NAME, "--nocapture"])
-        .env(STAGE_VAR, "leader")
-        .stdin(std::process::Stdio::from(slave))
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    // SAFETY: between fork and exec, `setsid` and `ioctl` alone, both async-signal-safe:
-    // `leader` owns a dedicated pty session whose slave is fd 0.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut leader = cmd.spawn().expect("spawn session leader");
+    let (master, slave, mut leader) = aterm_pty::spawn_session_leader_on_pty(|_| {
+        let mut cmd = Command::new(&exe);
+        cmd.args(["--exact", TEST_NAME, "--nocapture"])
+            .env(STAGE_VAR, "leader")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        Ok(cmd)
+    })
+    .expect("spawn session leader");
+    drop(slave);
     let pty_out = pump(PtyMaster(std::fs::File::from(master)));
     let leader_out = pump(leader.stdout.take().expect("leader stdout"));
     let leader_err = pump(leader.stderr.take().expect("leader stderr"));
@@ -4475,4 +4463,34 @@ fn old_script_folders_are_collected_and_young_or_newest_ones_kept() {
         std::fs::read_to_string(root.join("aterm_shell_integration.zsh")).unwrap(),
         "legacy"
     );
+}
+
+/// `install_script_set` refuses a symlinked `root` instead of writing through it, and
+/// `collect_old_script_sets` ignores symlinked address/scratch entries instead of traversing or
+/// deleting their targets.
+/// NEGATIVE CONTROL: calling `create_dir_all(root)` without checking `symlink_metadata(root)`
+/// installs scripts inside the symlink target, and using `entry.metadata()` in
+/// `collect_old_script_sets` follows symlinked `.tmp-*` or address entries.
+#[cfg(unix)]
+#[test]
+fn symlinked_roots_are_refused_and_gc_ignores_symlink_entries() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let sentinel = outside.join("keep.txt");
+    std::fs::write(&sentinel, "precious").unwrap();
+
+    let linked_root = tmp.path().join("linked-si");
+    std::os::unix::fs::symlink(&outside, &linked_root).unwrap();
+    assert!(install_script_set(&linked_root).is_err());
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "precious");
+
+    let real_root = tmp.path().join("real-si");
+    install_script_set(&real_root).unwrap();
+    std::os::unix::fs::symlink(&outside, real_root.join(".tmp-0000000000000000-9-9")).unwrap();
+    std::os::unix::fs::symlink(&outside, real_root.join("ffffffffffffffff")).unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(30 * 24 * 3600);
+    collect_old_script_sets(&real_root, later);
+    assert!(outside.exists() && sentinel.exists());
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "precious");
 }

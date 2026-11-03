@@ -18,6 +18,7 @@ pub mod machine;
 pub mod prefix;
 pub mod stub;
 pub mod tap;
+pub mod trust;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -195,7 +196,7 @@ thread_local! {
     static VIA_REROUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn via_reroute() -> bool {
+pub(super) fn via_reroute() -> bool {
     VIA_REROUTE.with(std::cell::Cell::get)
 }
 
@@ -375,6 +376,18 @@ fn native_args(
 ) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
     let canonical = canonical_kind_switches(rest);
     let rest: &[String] = &canonical;
+    // Brew warns on its deprecated wrapper envs, then reads
+    // the disabled internal-API env while fetching API files;
+    // both precede the command's parser.
+    if reaches_ruby_startup(cmd, rest)
+        && let Some(message) =
+            deprecated_env_warnings(WRAPPER_DEPRECATED_ENVS, |key| std::env::var(key).ok())
+    {
+        return Err(InstallError::Failed(message));
+    }
+    if let Some(message) = internal_api_env_error(cmd, rest, |key| std::env::var(key).ok()) {
+        return Err(InstallError::Failed(message));
+    }
     let unsupported =
         || InstallError::Unsupported(format!("'{cmd}' with these arguments is not native"));
     let unknown = || {
@@ -414,14 +427,621 @@ fn native_args(
             ))
         }
     };
-    // Brew's `--ask` switch is disabled (ask mode is the default).
-    if matches!(cmd, "install" | "upgrade" | "reinstall") && has_flag(rest, "--ask", "") {
+    // Brew's disabled switches (`odisabled` in each command's
+    // parser): usage errors in brew's exact wording, before any
+    // command work. `--ask` is one (ask mode is the default).
+    let disabled_cmd = match cmd {
+        "ls" => "list",
+        "-S" => "search",
+        "up" => "update",
+        "abv" => "info",
+        "instal" => "install",
+        other => other,
+    };
+    if let Some(message) = disabled_env_error(disabled_cmd, |key| std::env::var(key).ok()) {
+        return Err(InstallError::Failed(message));
+    }
+    if disabled_cmd == "bundle"
+        && let Some(message) =
+            deprecated_env_warnings(BUNDLE_DEPRECATED_ENVS, |key| std::env::var(key).ok())
+    {
+        return Err(InstallError::Failed(message));
+    }
+    const TRUSTED_TAP: Option<&str> = Some("the default trusted-tap behaviour");
+    const NO_REPLACEMENT: Option<&str> = None;
+    // Tuples are (display name, kind, replacement, alternate
+    // spelling that also counts as present).
+    let disabled: &[(&str, &str, Option<&str>, &str)] = match disabled_cmd {
+        "install" | "upgrade" | "reinstall" => {
+            &[("--ask", "switch", Some("the default behaviour"), "")]
+        }
+        "deps"
+        | "desc"
+        | "readall"
+        | "search"
+        | "uses"
+        | "bump"
+        | "livecheck"
+        | "unbottled"
+        | "determine-test-runners" => &[("--eval-all", "switch", TRUSTED_TAP, "")],
+        "audit" => &[
+            ("--eval-all", "switch", TRUSTED_TAP, ""),
+            ("--[no-]signing", "switch", NO_REPLACEMENT, ""),
+        ],
+        "options" => &[
+            ("--eval-all", "switch", TRUSTED_TAP, ""),
+            ("--command", "flag", NO_REPLACEMENT, ""),
+        ],
+        "info" => &[
+            ("--eval-all", "switch", TRUSTED_TAP, ""),
+            ("--fetch-manifest", "switch", NO_REPLACEMENT, ""),
+        ],
+        "tap" => &[(
+            "--eval-all",
+            "switch",
+            Some("the default tap verification behaviour"),
+            "",
+        )],
+        "list" => &[(
+            "--installed-as-dependency",
+            "switch",
+            Some("--no-installed-on-request"),
+            "",
+        )],
+        "update" => &[("--merge", "switch", NO_REPLACEMENT, "")],
+        "gist-logs" => &[("--with-hostname", "switch", NO_REPLACEMENT, "")],
+        "bundle" => &[("--describe", "switch", Some("the default behaviour"), "")],
+        "bottle" | "pr-pull" | "pr-upload" => &[("--committer", "flag", NO_REPLACEMENT, "")],
+        "irb" => &[(
+            "--pry",
+            "switch",
+            Some("the default IRB backend (Pry is largely unmaintained upstream)"),
+            "",
+        )],
+        "tap-new" => &[("--pull-label", "flag", NO_REPLACEMENT, "")],
+        "test-bot" => &[(
+            "--[no-]skip-recursive-dependents",
+            "switch",
+            Some("the default behaviour"),
+            "",
+        )],
+        "update-perl-resources" | "update-python-resources" => {
+            &[("-s", "switch", NO_REPLACEMENT, "--silent")]
+        }
+        _ => &[],
+    };
+    for (name, kind, replacement, alt) in disabled {
+        let present = if *kind == "flag" {
+            has_flag_eq(rest, name)
+        } else if let Some(base) = name.strip_prefix("--[no-]") {
+            // Brew names the declared `--[no-]x` form whichever
+            // spelling was passed.
+            has_flag(rest, &format!("--{base}"), "") || has_flag(rest, &format!("--no-{base}"), "")
+        } else {
+            has_flag(rest, name, alt)
+        };
+        if present {
+            let tail = match replacement {
+                Some(replacement) => format!("Use {replacement} instead."),
+                None => "There is no replacement.".to_string(),
+            };
+            return Err(InstallError::Failed(format!(
+                "Error: Calling the `{name}` {kind} is disabled! {tail}"
+            )));
+        }
+    }
+    if disabled_cmd == "install" && has_flag_eq(rest, "--env") {
         return Err(InstallError::Failed(
-            "Error: Calling the `--ask` switch is disabled! Use the default behaviour instead."
+            "Error: Calling `brew install --env` is disabled! \
+             Use `env :std` in specific formula files instead."
                 .to_string(),
         ));
     }
+    // Flags that take values, from each command's own `flag`
+    // declarations (used by the missing/needless-argument
+    // parse errors).
+    let value_flags: &[&str] = match cmd {
+        "info" => &["--days", "--category", "--json"],
+        "cleanup" => &["--prune"],
+        "outdated" | "upgrade" => &["--minimum-version", "--min-version", "--severity", "--json"],
+        "deps" => &["--os", "--arch", "--brewfile"],
+        "fetch" | "--cache" => &["--os", "--arch", "--bottle-tag"],
+        "readall" => &["--os", "--arch"],
+        "install" | "reinstall" => &["--bottle-arch", "--cc", "--env"],
+        "missing" => &["--hide"],
+        "services" => &["--file", "--max-wait", "--sudo-service-user"],
+        "options" => &["--command"],
+        "log" => &["--max-count"],
+        "exec" => &["--sandbox"],
+        "vulns" => &["--fix-type"],
+        "--env" | "env" => &["--shell"],
+        "tap-info" => &["--json"],
+        _ => &[],
+    };
+    // A required-value flag at the end of the option list is
+    // OptionParser's "missing argument" error, raised while
+    // parsing (ahead of the constraint checks below). --json
+    // and --brewfile take optional values, so they are exempt.
+    {
+        let pre: Vec<&String> = rest.iter().take_while(|arg| arg.as_str() != "--").collect();
+        if let Some(last) = pre.last()
+            && value_flags.contains(&last.as_str())
+            && !matches!(last.as_str(), "--json" | "--brewfile")
+        {
+            return Err(InstallError::Failed(format!(
+                "Error: missing argument: {last}"
+            )));
+        }
+    }
+    // Brew's parser `conflicts` groups beyond the formula/cask
+    // kind pair (handled below) and the per-command pairs
+    // already encoded further down. Members are (display name,
+    // alternate spelling); brew lists every present member in
+    // declaration order when two or more appear.
+    type ConflictMember = (&'static str, &'static [&'static str]);
+    const fn m(name: &'static str) -> ConflictMember {
+        (name, &[])
+    }
+    let conflict_groups: &[&[ConflictMember]] = match disabled_cmd {
+        "outdated" => &[
+            &[("--quiet", &["-q"]), ("--verbose", &["-v"]), m("--json")],
+            &[m("--vulnerable"), m("--cask")],
+        ],
+        "leaves" => &[&[m("--installed-on-request"), m("--installed-as-dependency")]],
+        "trust" | "untrust" => &[&[
+            ("--tap", &["--taps"]),
+            ("--formula", &["--formulae"]),
+            ("--cask", &["--casks"]),
+            ("--command", &["--commands"]),
+        ]],
+        "desc" => &[&[
+            ("--search", &["-s"]),
+            ("--name", &["-n"]),
+            ("--description", &["-d"]),
+        ]],
+        "search" => &[
+            &[m("--desc"), m("--pull-request")],
+            &[m("--open"), m("--closed")],
+        ],
+        "log" => &[&[m("-1"), m("--max-count")]],
+        "install" => &[
+            &[m("--ignore-dependencies"), m("--only-dependencies")],
+            &[m("--adopt"), ("--force", &["-f"])],
+        ],
+        "upgrade" => &[&[m("--vulnerable"), m("--cask")]],
+        "fetch" => &[
+            &[
+                ("--build-from-source", &["-s"]),
+                m("--build-bottle"),
+                m("--force-bottle"),
+                m("--bottle-tag"),
+            ],
+            &[m("--os"), m("--bottle-tag")],
+            &[m("--arch"), m("--bottle-tag")],
+            &[m("--all-platforms"), m("--os")],
+            &[m("--all-platforms"), m("--arch")],
+            &[m("--all-platforms"), m("--bottle-tag")],
+        ],
+        "services" => &[
+            &[m("--all"), m("--file")],
+            &[m("--max-wait"), m("--no-wait")],
+        ],
+        "vulns" => &[&[
+            m("--fix-available"),
+            m("--no-fix-available"),
+            m("--fix-type"),
+        ]],
+        "--cache" => &[
+            &[
+                ("--build-from-source", &["-s"]),
+                m("--force-bottle"),
+                m("--bottle-tag"),
+                m("--HEAD"),
+                m("--cask"),
+            ],
+            &[m("--os"), m("--bottle-tag")],
+            &[m("--arch"), m("--bottle-tag")],
+        ],
+        "--prefix" => &[&[m("--unbrewed"), m("--installed")]],
+        _ => &[],
+    };
+    for group in conflict_groups {
+        // Brew declares the formula/cask pair before the
+        // vulnerable/cask pair, so with all three present the
+        // kind pair reports first (its own check below is
+        // shadowed by --vulnerable's native refusal).
+        if group.first().map(|(name, _)| *name) == Some("--vulnerable")
+            && has_flag(rest, "--formula", "")
+            && has_flag(rest, "--cask", "")
+        {
+            let message = if disabled_cmd == "upgrade" {
+                "Error: Invalid usage: Options --cask and --formulae are mutually exclusive."
+            } else {
+                "Error: Invalid usage: Options --formula and --cask are mutually exclusive."
+            };
+            return Err(InstallError::Failed(message.to_string()));
+        }
+        let present: Vec<&str> = group
+            .iter()
+            .filter(|(name, alts)| {
+                has_flag_eq(rest, name) || alts.iter().any(|alt| has_flag_eq(rest, alt))
+            })
+            .map(|(name, _)| *name)
+            .collect();
+        if present.len() > 1 {
+            return Err(InstallError::Failed(format!(
+                "Error: Invalid usage: Options {} are mutually exclusive.",
+                present.join(" and ")
+            )));
+        }
+    }
+    // Brew's parser `depends_on` constraints not already
+    // encoded per command below: the dependent switch cannot
+    // be passed without its requirement.
+    let depends_on: &[(&str, &str)] = match disabled_cmd {
+        "deps" => &[("--prune", "--tree")],
+        "info" => &[
+            ("--days", "--analytics"),
+            ("--category", "--analytics"),
+            ("--variations", "--json"),
+        ],
+        "outdated" | "upgrade" => &[("--severity", "--vulnerable")],
+        "search" => &[("--open", "--pull-request"), ("--closed", "--pull-request")],
+        _ => &[],
+    };
+    for (switch, requires) in depends_on {
+        if has_flag_eq(rest, switch) && !has_flag_eq(rest, requires) {
+            return Err(InstallError::Failed(format!(
+                "Error: Invalid usage: `{switch}` cannot be passed without `{requires}`."
+            )));
+        }
+    }
+    if cmd == "services" {
+        // Brew's services subcommands resolve like bundle's:
+        // unknown names and out-of-scope switches are parser
+        // errors ahead of the (delegated) execution.
+        const SERVICE_SUBS: &[&str] = &[
+            "cleanup", "info", "kill", "list", "restart", "run", "start", "stop",
+        ];
+        const SERVICE_SCOPED: &[(&str, &str, &[&str])] = &[
+            (
+                "--all",
+                "switch",
+                &["info", "kill", "restart", "run", "start", "stop"],
+            ),
+            ("--json", "switch", &["info", "list"]),
+            ("--file", "flag", &["restart", "run", "start"]),
+            ("--max-wait", "flag", &["stop"]),
+            ("--no-wait", "switch", &["stop"]),
+            ("--keep", "switch", &["stop"]),
+        ];
+        let mut first_positional = None;
+        {
+            let mut args = rest.iter().take_while(|arg| arg.as_str() != "--");
+            while let Some(arg) = args.next() {
+                if matches!(
+                    arg.as_str(),
+                    "--file" | "--max-wait" | "--sudo-service-user"
+                ) {
+                    args.next();
+                } else if !arg.starts_with('-') {
+                    first_positional = Some(arg.as_str());
+                    break;
+                }
+            }
+        }
+        if let Some(named) = first_positional
+            && !SERVICE_SUBS.contains(&named)
+        {
+            return Err(InstallError::Failed(format!(
+                "Error: Invalid usage: unknown subcommand: `{named}`"
+            )));
+        }
+        let subcommand = first_positional.unwrap_or("list");
+        for arg in rest.iter().take_while(|arg| arg.as_str() != "--") {
+            let name = arg.split('=').next().unwrap_or(arg);
+            if let Some((display, kind, subs)) = SERVICE_SCOPED
+                .iter()
+                .find(|(display, _, _)| *display == name)
+                && !subs.contains(&subcommand)
+            {
+                return Err(InstallError::Failed(format!(
+                    "Error: Invalid usage: The `{subcommand}` subcommand does not accept \
+                     the `{display}` {kind}."
+                )));
+            }
+        }
+    }
+    if cmd == "trust" {
+        for arg in rest.iter().take_while(|arg| arg.as_str() != "--") {
+            if arg == "--json" {
+                return Err(InstallError::Failed(
+                    "Error: missing argument: --json".to_owned(),
+                ));
+            }
+            if let Some(version) = arg.strip_prefix("--json=")
+                && version != "v1"
+            {
+                return Err(InstallError::Failed(format!(
+                    "Error: Invalid usage: invalid JSON version: {version}"
+                )));
+            }
+        }
+    }
     if cmd == "bundle" {
+        // Brew's bundle type toggles: each enabled spelling
+        // conflicts with the disabled, no-cleanup and no-dump
+        // forms, registered in type order (extensions in
+        // registration order), with --file/--global last.
+        let present_any = |spellings: &[&str]| spellings.iter().any(|s| has_flag_eq(rest, s));
+        let conflict = |a: &str, b: &str| {
+            Err(InstallError::Failed(format!(
+                "Error: Invalid usage: Options {a} and {b} are mutually exclusive."
+            )))
+        };
+        // (display, spellings, type slug for cleanup/dump forms)
+        type BundleToggle = (
+            &'static str,
+            &'static [&'static str],
+            &'static str,
+            &'static [&'static str],
+            &'static str,
+        );
+        const BUILTINS: &[BundleToggle] = &[
+            (
+                "--formula",
+                &["--formula", "--formulae", "--brews"],
+                "--no-formula",
+                &["--no-formula", "--no-formulae", "--no-brews"],
+                "brew",
+            ),
+            (
+                "--cask",
+                &["--cask", "--casks"],
+                "--no-cask",
+                &["--no-cask", "--no-casks"],
+                "cask",
+            ),
+            (
+                "--tap",
+                &["--tap", "--taps"],
+                "--no-tap",
+                &["--no-tap", "--no-taps"],
+                "tap",
+            ),
+        ];
+        for (enabled, enabled_spellings, disabled, disabled_spellings, slug) in BUILTINS {
+            if present_any(enabled_spellings) && present_any(disabled_spellings) {
+                return conflict(enabled, disabled);
+            }
+            for variant in ["--no-cleanup-", "--no-dump-"] {
+                let other = format!("{variant}{slug}");
+                if present_any(enabled_spellings) && has_flag_eq(rest, &other) {
+                    return conflict(enabled, &other);
+                }
+            }
+        }
+        for ext in [
+            "mas", "vscode", "go", "cargo", "uv", "flatpak", "winget", "krew", "npm",
+        ] {
+            let enabled = format!("--{ext}");
+            if !has_flag_eq(rest, &enabled) {
+                continue;
+            }
+            for variant in ["--no-", "--no-cleanup-", "--no-dump-"] {
+                let other = format!("{variant}{ext}");
+                if has_flag_eq(rest, &other) {
+                    return conflict(&enabled, &other);
+                }
+            }
+        }
+        if has_flag_eq(rest, "--file") && has_flag(rest, "--global", "-g") {
+            return conflict("--file", "--global");
+        }
+        // Brew's subcommand scope check: a switch declared for
+        // other bundle subcommands is a usage error naming the
+        // chosen subcommand (default `install`) and the switch's
+        // first declared spelling. Entries are (display, kind,
+        // spellings, accepting subcommands); shared switches
+        // (--file/--global, globals) accept everywhere. Tokens
+        // are scanned in argv order; exec stops at its command.
+        const TYPE_SUBS: &[&str] = &["add", "cleanup", "dump", "list", "remove"];
+        type BundleScope = (
+            &'static str,
+            &'static str,
+            &'static [&'static str],
+            &'static [&'static str],
+        );
+        const SCOPED: &[BundleScope] = &[
+            (
+                "--install",
+                "switch",
+                &["--install"],
+                &[
+                    "add", "check", "cleanup", "dump", "edit", "env", "exec", "list", "remove",
+                    "sh",
+                ],
+            ),
+            (
+                "--no-upgrade",
+                "switch",
+                &["--no-upgrade"],
+                &["check", "install"],
+            ),
+            ("--upgrade", "switch", &["--upgrade"], &["install"]),
+            (
+                "--upgrade-formulae",
+                "flag",
+                &["--upgrade-formulae", "--upgrade-formula"],
+                &["install"],
+            ),
+            ("--jobs", "flag", &["--jobs"], &["install"]),
+            (
+                "-f",
+                "switch",
+                &["-f", "--force"],
+                &["cleanup", "dump", "install"],
+            ),
+            ("--cleanup", "switch", &["--cleanup"], &["install"]),
+            (
+                "--force-cleanup",
+                "switch",
+                &["--force-cleanup"],
+                &["install"],
+            ),
+            ("--overwrite", "switch", &["--overwrite"], &["install"]),
+            ("--zap", "switch", &["--zap"], &["cleanup", "install"]),
+            ("--all", "switch", &["--all"], &["cleanup", "list"]),
+            (
+                "--formula",
+                "switch",
+                &["--formula", "--formulae", "--brews"],
+                TYPE_SUBS,
+            ),
+            ("--cask", "switch", &["--cask", "--casks"], TYPE_SUBS),
+            ("--tap", "switch", &["--tap", "--taps"], TYPE_SUBS),
+            (
+                "--no-formula",
+                "switch",
+                &["--no-formula", "--no-formulae", "--no-brews"],
+                &["cleanup", "dump"],
+            ),
+            (
+                "--no-cask",
+                "switch",
+                &["--no-cask", "--no-casks"],
+                &["cleanup", "dump"],
+            ),
+            (
+                "--no-tap",
+                "switch",
+                &["--no-tap", "--no-taps"],
+                &["cleanup", "dump"],
+            ),
+            (
+                "--no-cleanup-brew",
+                "switch",
+                &["--no-cleanup-brew"],
+                &["cleanup"],
+            ),
+            (
+                "--no-cleanup-cask",
+                "switch",
+                &["--no-cleanup-cask"],
+                &["cleanup"],
+            ),
+            (
+                "--no-cleanup-tap",
+                "switch",
+                &["--no-cleanup-tap"],
+                &["cleanup"],
+            ),
+            ("--no-dump-brew", "switch", &["--no-dump-brew"], &["dump"]),
+            ("--no-dump-cask", "switch", &["--no-dump-cask"], &["dump"]),
+            ("--no-dump-tap", "switch", &["--no-dump-tap"], &["dump"]),
+            (
+                "--no-describe",
+                "switch",
+                &["--no-describe"],
+                &["add", "dump"],
+            ),
+            ("--no-restart", "switch", &["--no-restart"], &["dump"]),
+            ("--check", "switch", &["--check"], &["env", "exec", "sh"]),
+            (
+                "--no-secrets",
+                "switch",
+                &["--no-secrets"],
+                &["env", "exec", "sh"],
+            ),
+            ("--services", "switch", &["--services"], &["exec", "sh"]),
+            ("--sandbox", "flag", &["--sandbox"], &["exec"]),
+            ("--deny-network", "switch", &["--deny-network"], &["exec"]),
+        ];
+        const SUBCOMMANDS: &[&str] = &[
+            "add", "check", "cleanup", "dump", "edit", "env", "exec", "install", "list", "remove",
+            "sh",
+        ];
+        // The first positional names the subcommand; --file's
+        // separate value is not positional.
+        let mut first_positional = None;
+        {
+            let mut args = rest.iter().take_while(|arg| arg.as_str() != "--");
+            while let Some(arg) = args.next() {
+                if arg == "--file" {
+                    args.next();
+                } else if !arg.starts_with('-') {
+                    first_positional = Some(arg.as_str());
+                    break;
+                }
+            }
+        }
+        if let Some(named) = first_positional
+            && !SUBCOMMANDS.contains(&named)
+            // `status` inspects the legacy bundled Homebrew; it is
+            // an abrew-native extension, unknown under the reroute.
+            && !(named == "status" && !via_reroute())
+        {
+            return Err(InstallError::Failed(format!(
+                "Error: Invalid usage: unknown subcommand: `{named}`"
+            )));
+        }
+        let subcommand = first_positional.unwrap_or("install");
+        if SUBCOMMANDS.contains(&subcommand) {
+            let mut seen_subcommand = false;
+            for arg in rest.iter().take_while(|arg| arg.as_str() != "--") {
+                if arg.as_str() == subcommand && !seen_subcommand {
+                    seen_subcommand = true;
+                    continue;
+                }
+                if seen_subcommand && subcommand == "exec" && !arg.starts_with('-') {
+                    break;
+                }
+                let name = arg.split('=').next().unwrap_or(arg);
+                if let Some((display, kind, _, subs)) = SCOPED
+                    .iter()
+                    .find(|(_, _, spellings, _)| spellings.contains(&name))
+                {
+                    if !subs.contains(&subcommand) {
+                        return Err(InstallError::Failed(format!(
+                            "Error: Invalid usage: The `{subcommand}` subcommand does not \
+                             accept the `{display}` {kind}."
+                        )));
+                    }
+                    continue;
+                }
+                // Extension type toggles are generated per extension.
+                for ext in [
+                    "mas", "vscode", "go", "cargo", "uv", "flatpak", "winget", "krew", "npm",
+                ] {
+                    let (allowed, display) = if name == format!("--{ext}") {
+                        // mas/winget declare no `add` support, so brew
+                        // never registers their switches there.
+                        (
+                            TYPE_SUBS.contains(&subcommand)
+                                && !(subcommand == "add" && matches!(ext, "mas" | "winget")),
+                            format!("--{ext}"),
+                        )
+                    } else if name == format!("--no-{ext}") {
+                        (
+                            matches!(subcommand, "cleanup" | "dump"),
+                            format!("--no-{ext}"),
+                        )
+                    } else if name == format!("--no-cleanup-{ext}") {
+                        (subcommand == "cleanup", format!("--no-cleanup-{ext}"))
+                    } else if name == format!("--no-dump-{ext}") {
+                        (subcommand == "dump", format!("--no-dump-{ext}"))
+                    } else {
+                        continue;
+                    };
+                    if !allowed {
+                        return Err(InstallError::Failed(format!(
+                            "Error: Invalid usage: The `{subcommand}` subcommand does not \
+                             accept the `{display}` switch."
+                        )));
+                    }
+                }
+            }
+        }
         return bundle_args(rest);
     }
     let (flags, min, max, names): (&[&str], usize, usize, bool) = match cmd {
@@ -464,6 +1084,8 @@ fn native_args(
                 "--no-ask",
                 "--yes",
                 "-y",
+                "--minimum-version",
+                "--min-version",
             ],
             0,
             usize::MAX,
@@ -559,6 +1181,8 @@ fn native_args(
                 "--json",
                 "--json=v1",
                 "--json=v2",
+                "--minimum-version",
+                "--min-version",
             ],
             0,
             usize::MAX,
@@ -655,7 +1279,19 @@ fn native_args(
             usize::MAX,
             true,
         ),
-        "fetch" => (&["--cask", "--formula", "--deps"], 1, usize::MAX, true),
+        "fetch" => (
+            &[
+                "--cask",
+                "--formula",
+                "--deps",
+                "--os",
+                "--arch",
+                "--bottle-tag",
+            ],
+            1,
+            usize::MAX,
+            true,
+        ),
         "deps" => (
             &[
                 "--tree",
@@ -680,6 +1316,9 @@ fn native_args(
                 "--dot",
                 "--annotate",
                 "--missing",
+                "--brewfile",
+                "--os",
+                "--arch",
                 "--formula",
                 "--formulae",
                 "--cask",
@@ -694,6 +1333,36 @@ fn native_args(
             0,
             1,
             true,
+        ),
+        "trust" => (
+            &[
+                "--tap",
+                "--taps",
+                "--formula",
+                "--formulae",
+                "--cask",
+                "--casks",
+                "--command",
+                "--commands",
+                "--json=v1",
+            ],
+            0,
+            usize::MAX,
+            false,
+        ),
+        "untrust" => (
+            &[
+                "--tap",
+                "--formula",
+                "--formulae",
+                "--cask",
+                "--casks",
+                "--command",
+                "--commands",
+            ],
+            0,
+            usize::MAX,
+            false,
         ),
         "tap" => (
             &[
@@ -717,7 +1386,12 @@ fn native_args(
         "help" | "--help" | "-h" => (&[], 0, 1, false),
         "completions" => (&[], 0, 1, false),
         "--prefix" | "--cellar" | "--caskroom" => (&[], 0, usize::MAX, true),
-        "--cache" => (&["--formula", "--cask"], 0, usize::MAX, true),
+        "--cache" => (
+            &["--formula", "--cask", "--os", "--arch", "--bottle-tag"],
+            0,
+            usize::MAX,
+            true,
+        ),
         "--repository" | "--repo" => (&[], 0, 1, false),
         "--taps" => (&[], 0, 0, false),
         "analytics" => (&[], 0, 1, false),
@@ -747,15 +1421,21 @@ fn native_args(
             arg,
             "--verbose" | "-v" | "--quiet" | "-q" | "--debug" | "-d"
         ) || flags.contains(&arg)
-            || (cmd == "info"
-                && (arg
-                    .strip_prefix("--days=")
-                    .is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-                    || arg.strip_prefix("--category=").is_some_and(valid_component)))
+            || (cmd == "info" && (arg.starts_with("--days=") || arg.starts_with("--category=")))
             || (cmd == "cleanup"
                 && arg.strip_prefix("--prune=").is_some_and(|v| {
                     v == "all" || (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
                 }))
+            || (cmd == "deps"
+                && (arg.starts_with("--brewfile=")
+                    || arg.starts_with("--os=")
+                    || arg.starts_with("--arch=")))
+            || (matches!(cmd, "fetch" | "--cache")
+                && (arg.starts_with("--os=")
+                    || arg.starts_with("--arch=")
+                    || arg.starts_with("--bottle-tag=")))
+            || (matches!(cmd, "outdated" | "upgrade")
+                && (arg.starts_with("--minimum-version=") || arg.starts_with("--min-version=")))
             || (cmd == "missing"
                 && arg.strip_prefix("--hide=").is_some_and(|v| {
                     v.is_empty()
@@ -768,15 +1448,138 @@ fn native_args(
                             })
                 }))
     };
-    if cmd == "info" {
-        for arg in rest.iter().take_while(|arg| arg.as_str() != "--") {
-            if let Some(version) = arg.strip_prefix("--json=")
-                && !matches!(version, "v1" | "v2")
-            {
-                return Err(InstallError::Failed(format!(
-                    "Error: Invalid usage: invalid JSON version: {version}"
-                )));
+    // `--minimum-version` (outdated/upgrade) is a one-name
+    // check; brew raises the arity error when the command
+    // starts, ahead of its own JSON-version handling. A blank
+    // value counts as absent, like `present?`.
+    if matches!(cmd, "outdated" | "upgrade")
+        && minimum_version_value(rest).is_some_and(|v| v.chars().any(|c| !c.is_whitespace()))
+        && commands::operands_without_flag_values(
+            rest,
+            &["--minimum-version", "--min-version", "--severity"],
+        )
+        .len()
+            != 1
+    {
+        return Err(InstallError::Failed(
+            "Error: Invalid usage: `--minimum-version` requires exactly one formula or cask argument."
+                .to_string(),
+        ));
+    }
+    // Brew validates an explicit --json=<version> per command
+    // (info takes v1/v2, outdated only v2 with a dedicated v1
+    // message, tap-info only v1).
+    for arg in rest.iter().take_while(|arg| arg.as_str() != "--") {
+        let Some(version) = arg.strip_prefix("--json=") else {
+            continue;
+        };
+        let valid = match cmd {
+            "info" => matches!(version, "v1" | "v2"),
+            "outdated" => {
+                if version == "v1" {
+                    return Err(InstallError::Failed(
+                        "Error: `brew outdated --json=v1` is no longer supported. \
+                         Use brew outdated --json=v2 instead."
+                            .to_string(),
+                    ));
+                }
+                version == "v2"
             }
+            "tap-info" => version == "v1",
+            _ => continue,
+        };
+        if !valid {
+            return Err(InstallError::Failed(format!(
+                "Error: Invalid usage: invalid JSON version: {version}"
+            )));
+        }
+    }
+    // brew's reinstall has no `--dry-run` switch (abrew's
+    // direct dialect keeps it; under the reroute brew's
+    // parser error wins).
+    if via_reroute()
+        && cmd == "reinstall"
+        && let Some(flag) = rest
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .find(|arg| matches!(arg.as_str(), "--dry-run" | "-n"))
+    {
+        return Err(InstallError::Failed(format!(
+            "Error: invalid option: {flag}"
+        )));
+    }
+    // Brew validates --os/--arch simulation values when the
+    // command starts (SimulateSystem.with): macOS release
+    // symbols plus macos/linux, and only :arm/:intel arches.
+    // OptionParser consumes the next token as the value even
+    // when it spells another switch; the last spelling wins.
+    if matches!(cmd, "deps" | "fetch" | "--cache") {
+        let last_value = |flag: &str| {
+            let mut value = None;
+            let mut args = rest.iter().take_while(|arg| arg.as_str() != "--");
+            while let Some(arg) = args.next() {
+                if arg == flag {
+                    value = args.next().map(String::as_str);
+                } else if let Some(v) = arg.strip_prefix(&format!("{flag}=")) {
+                    value = Some(v);
+                }
+            }
+            value
+        };
+        // --cache additionally accepts "all" (every tag).
+        let cache_all = cmd == "--cache";
+        if cmd == "deps" && last_value("--os") == Some("all") {
+            return Err(InstallError::Failed(
+                "Error: Invalid usage: `brew deps --os=all` is not supported.".to_string(),
+            ));
+        }
+        if cmd == "deps" && last_value("--arch") == Some("all") {
+            return Err(InstallError::Failed(
+                "Error: Invalid usage: `brew deps --arch=all` is not supported.".to_string(),
+            ));
+        }
+        if let Some(os) = last_value("--os")
+            && !(cache_all && os == "all")
+            && !matches!(
+                os,
+                "macos"
+                    | "linux"
+                    | "golden_gate"
+                    | "tahoe"
+                    | "sequoia"
+                    | "sonoma"
+                    | "ventura"
+                    | "monterey"
+                    | "big_sur"
+            )
+        {
+            return Err(InstallError::Failed(format!("Error: Unknown OS: {os}")));
+        }
+        if let Some(arch) = last_value("--arch")
+            && !(cache_all && arch == "all")
+            && !matches!(arch, "arm" | "intel")
+        {
+            return Err(InstallError::Failed(
+                "Error: New arch must be :arm or :intel".to_string(),
+            ));
+        }
+    }
+    // A boolean switch passed a value is brew's OptionParser
+    // "needless argument" error; value flags are exempt.
+    for arg in rest.iter().take_while(|arg| arg.as_str() != "--") {
+        let Some(eq) = arg.find('=') else { continue };
+        let name = &arg[..eq];
+        let boolean = (name.starts_with("--") || name.len() == 2 && name.starts_with('-'))
+            && (flags.contains(&name)
+                || matches!(
+                    name,
+                    "--verbose" | "-v" | "--quiet" | "-q" | "--debug" | "-d"
+                ))
+            && !value_flags.contains(&name);
+        if boolean {
+            return Err(InstallError::Failed(format!(
+                "Error: needless argument: {arg}"
+            )));
         }
     }
     if rest
@@ -999,16 +1802,35 @@ fn native_args(
         let json = rest
             .iter()
             .any(|s| matches!(s.as_str(), "--json" | "--json=v1" | "--json=v2"));
-        let days = flag_value(rest, "--days").map_err(|()| unsupported())?;
-        let category = flag_value(rest, "--category").map_err(|()| unsupported())?;
+        // Empty `--days=`/`--category=` values are absent to
+        // brew (Ruby `present?`); non-empty values validate
+        // with brew's usage errors (cmd/info.rb).
+        let days = valued_flag_last(rest, "--days").filter(|v| !v.is_empty());
+        let category = valued_flag_last(rest, "--category").filter(|v| !v.is_empty());
         if days
             .as_deref()
             .is_some_and(|v| !matches!(v, "30" | "90" | "365"))
-            || category
-                .as_deref()
-                .is_some_and(|v| !matches!(v, "install" | "install-on-request" | "build-error"))
         {
-            return Err(unsupported());
+            return Err(InstallError::Failed(
+                "Error: Invalid usage: `--days` must be one of 30, 90, 365.".to_string(),
+            ));
+        }
+        if let Some(category) = category.as_deref() {
+            const FORMULA_CATEGORIES: [&str; 3] = ["install", "install-on-request", "build-error"];
+            if !ops.is_empty() && !FORMULA_CATEGORIES.contains(&category) {
+                return Err(InstallError::Failed(format!(
+                    "Error: Invalid usage: `--category` must be one of {} when querying formulae.",
+                    FORMULA_CATEGORIES.join(", ")
+                )));
+            }
+            if !FORMULA_CATEGORIES.contains(&category)
+                && !matches!(category, "cask-install" | "os-version")
+            {
+                return Err(InstallError::Failed(format!(
+                    "Error: Invalid usage: `--category` must be one of {}, cask-install, os-version.",
+                    FORMULA_CATEGORIES.join(", ")
+                )));
+            }
         }
         if (days.is_some() || category.is_some()) && !analytics {
             return Err(unsupported());
@@ -1034,9 +1856,31 @@ fn native_args(
     }
     if (matches!(cmd, "search" | "-S") || desc_modes == 1)
         && let Some(pattern) = search_regex_pattern(&ops.join(" "))
-        && compile_search_regex(pattern).is_err()
     {
-        return Err(unsupported());
+        match compile_search_regex(pattern) {
+            Ok(_) => {}
+            // Syntax failures every regex dialect rejects take
+            // brew's error; merely unsupported constructs (and
+            // oversized programs) still delegate.
+            Err(aterm_regex::Error::Syntax(msg))
+                if [
+                    "unclosed ",
+                    "unopened group",
+                    "repetition operator missing expression",
+                    "incomplete escape sequence",
+                    "invalid character class range",
+                    "invalid repetition count range",
+                ]
+                .iter()
+                .any(|marker| msg.contains(marker)) =>
+            {
+                return Err(InstallError::Failed(format!(
+                    "Error: {} is not a valid regex.",
+                    ops.join(" ")
+                )));
+            }
+            Err(_) => return Err(unsupported()),
+        }
     }
     if cmd == "switch" && !ops.get(1).is_some_and(|s| valid_component(s)) {
         return Err(unsupported());
@@ -1063,41 +1907,130 @@ fn native_args(
         }
         _ => {}
     }
+    if cmd == "deps" {
+        deps_brewfile_admission(rest)?;
+    }
     Ok(None)
+}
+
+/// The `--brewfile` flag's value in `rest`, if the flag is
+/// present: `None` for a bare `--brewfile`, the `=` value
+/// (possibly empty) otherwise. OptionParser's optional-value
+/// flag never consumes the next argument, and a repeat takes
+/// the last occurrence.
+fn brewfile_flag_value(rest: &[String]) -> Option<Option<String>> {
+    let mut value = None;
+    for arg in rest.iter().take_while(|arg| arg.as_str() != "--") {
+        if arg == "--brewfile" {
+            value = Some(None);
+        } else if let Some(v) = arg.strip_prefix("--brewfile=") {
+            value = Some(Some(v.to_string()));
+        }
+    }
+    value
+}
+
+/// The last value of a required-value flag in `rest` (`=` or
+/// space form; OptionParser consumes the next token verbatim).
+fn valued_flag_last(rest: &[String], flag: &str) -> Option<String> {
+    let mut value = None;
+    let mut it = rest.iter().take_while(|arg| arg.as_str() != "--");
+    while let Some(arg) = it.next() {
+        if arg == flag {
+            value = it.next().cloned();
+        } else if let Some(v) = arg
+            .strip_prefix(flag)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            value = Some(v.to_string());
+        }
+    }
+    value
+}
+
+/// The `--minimum-version`/`--min-version` value in `rest`
+/// (brew: `args.minimum_version || args.min_version` — the
+/// long spelling wins when both are given, a repeat takes the
+/// last). A required-value flag consumes the next token
+/// verbatim, or takes an `=` value.
+fn minimum_version_value(rest: &[String]) -> Option<String> {
+    fn last_value(rest: &[String], flag: &str) -> Option<String> {
+        let mut value = None;
+        let mut it = rest.iter().take_while(|arg| arg.as_str() != "--");
+        while let Some(arg) = it.next() {
+            if arg == flag {
+                value = it.next().cloned();
+            } else if let Some(v) = arg
+                .strip_prefix(flag)
+                .and_then(|rest| rest.strip_prefix('='))
+            {
+                value = Some(v.to_string());
+            }
+        }
+        value
+    }
+    last_value(rest, "--minimum-version").or_else(|| last_value(rest, "--min-version"))
+}
+
+/// `deps --brewfile` is native only for Brewfiles the deps
+/// parser fully reads; an unreadable file is still admitted —
+/// the command itself reports brew's `No Brewfile found`.
+fn deps_brewfile_admission(rest: &[String]) -> Result<(), InstallError> {
+    let Some(value) = brewfile_flag_value(rest) else {
+        return Ok(());
+    };
+    // Reading stdin here would consume it before the command
+    // runs; cmd_deps stays fail-closed on rows it cannot read.
+    if value.as_deref() == Some("-") {
+        return Ok(());
+    }
+    let path = bundle::deps_brewfile_path(value.as_deref());
+    let Ok(text) = aterm_uds::atomic_file::read_regular_text(&path, 4 * 1024 * 1024) else {
+        return Ok(());
+    };
+    let (_, skipped) = bundle::parse_brewfile_deps(&text);
+    if skipped.is_empty() {
+        Ok(())
+    } else {
+        Err(InstallError::Unsupported(
+            "'deps --brewfile' with these Brewfile rows is not native".to_owned(),
+        ))
+    }
 }
 
 fn bundle_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
     let unsupported =
         || InstallError::Unsupported("bundle arguments or Brewfile rows are not native".to_owned());
     match rest.first().map(String::as_str) {
-        Some("status" | "remove") if rest.len() == 1 => Ok(None),
-        Some("dump") => {
-            let mut file = false;
-            let mut force = false;
-            let mut it = rest[1..].iter();
-            while let Some(arg) = it.next() {
-                if arg == "--file" && !file {
-                    file = true;
-                    if !it.next().is_some_and(|s| !s.is_empty()) {
-                        return Err(unsupported());
-                    }
-                } else if arg.strip_prefix("--file=").is_some_and(|s| !s.is_empty()) && !file {
-                    file = true;
-                } else if matches!(arg.as_str(), "--force" | "-f") && !force {
-                    force = true;
-                } else {
-                    return Err(unsupported());
-                }
+        Some("status") if rest.len() == 1 => Ok(None),
+        // Direct abrew's bare `bundle remove` removes the legacy
+        // bundled Homebrew; brew's removes Brewfile entries and
+        // requires names (also direct abrew with names).
+        Some("remove") if rest.len() == 1 && !via_reroute() => Ok(None),
+        Some("remove") => bundle_edit_args(rest.get(1..).unwrap_or(&[]), false),
+        Some("add") => bundle_edit_args(rest.get(1..).unwrap_or(&[]), true),
+        Some("dump") => match bundle::dump_selection(rest) {
+            Some(sel) if !sel.extensions_enabled => Ok(None),
+            _ => Err(unsupported()),
+        },
+        Some("install") | None => brewfile_args(rest.get(1..).unwrap_or(&[]), false),
+        Some("check") => brewfile_args(rest.get(1..).unwrap_or(&[]), true),
+        Some("list") => bundle_list_args(rest.get(1..).unwrap_or(&[])),
+        Some("cleanup") => {
+            if rest.iter().any(|a| a == "--install") {
+                return Err(unsupported());
             }
-            Ok(None)
+            match bundle::cleanup_selection(rest) {
+                Some(sel) if !sel.extensions_enabled => Ok(None),
+                _ => Err(unsupported()),
+            }
         }
-        Some("check" | "install") | None => brewfile_args(rest.get(1..).unwrap_or(&[])),
-        Some(flag) if flag.starts_with("--file") => brewfile_args(rest),
+        Some(flag) if flag.starts_with("--file") => brewfile_args(rest, false),
         _ => Err(unsupported()),
     }
 }
 
-fn brewfile_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
+fn bundle_list_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
     let unsupported =
         || InstallError::Unsupported("bundle arguments or Brewfile rows are not native".to_owned());
     let mut file = None;
@@ -1113,6 +2046,137 @@ fn brewfile_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, 
             && file.is_none()
         {
             file = Some(std::path::PathBuf::from(path));
+        } else if matches!(
+            arg.as_str(),
+            "--all"
+                | "--formula"
+                | "--formulae"
+                | "--brews"
+                | "--cask"
+                | "--casks"
+                | "--tap"
+                | "--taps"
+                | "--verbose"
+                | "-v"
+                | "--quiet"
+                | "-q"
+                | "--debug"
+                | "-d"
+        ) || bundle::EXTENSION_KEYS
+            .iter()
+            .any(|k| arg.as_str() == format!("--{k}"))
+        {
+            // `bundle list` type/display switches.
+        } else {
+            return Err(unsupported());
+        }
+    }
+    let text = bundle::read_brewfile(file.as_deref()).map_err(InstallError::Failed)?;
+    if bundle::parse_brewfile_list(&text).is_none() {
+        return Err(unsupported());
+    }
+    Ok(None)
+}
+
+/// Admission for `bundle add`/`bundle remove` (brew's Brewfile
+/// editing subcommands): at least one name, at most one type
+/// switch group, plain names only.
+fn bundle_edit_args(
+    rest: &[String],
+    add: bool,
+) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
+    let unsupported =
+        || InstallError::Unsupported("bundle arguments or Brewfile rows are not native".to_owned());
+    let sub = if add { "add" } else { "remove" };
+    let mut file = None;
+    let mut types: Vec<&str> = Vec::new();
+    let mut names = 0usize;
+    let mut it = rest.iter();
+    let mut after_dashdash = false;
+    while let Some(arg) = it.next() {
+        let a = arg.as_str();
+        if after_dashdash {
+            names += 1;
+        } else if a == "--" {
+            after_dashdash = true;
+        } else if a == "--file" && file.is_none() {
+            file = Some(std::path::PathBuf::from(
+                it.next()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(unsupported)?,
+            ));
+        } else if let Some(path) = a.strip_prefix("--file=").filter(|s| !s.is_empty())
+            && file.is_none()
+        {
+            file = Some(std::path::PathBuf::from(path));
+        } else if matches!(a, "--formula" | "--formulae" | "--brews") {
+            types.push("brew");
+        } else if matches!(a, "--cask" | "--casks") {
+            types.push("cask");
+        } else if matches!(a, "--tap" | "--taps") {
+            types.push("tap");
+        } else if let Some(key) = bundle::EXTENSION_KEYS
+            .iter()
+            .find(|k| a.strip_prefix("--") == Some(k))
+        {
+            types.push(key);
+        } else if matches!(a, "--verbose" | "-v" | "--quiet" | "-q" | "--debug" | "-d")
+            || (add && a == "--no-describe")
+        {
+            // Display/add switches with no admission effect.
+        } else if a.starts_with('-') && a != "-" {
+            return Err(unsupported());
+        } else {
+            if a.contains(['"', '\n']) {
+                return Err(unsupported());
+            }
+            names += 1;
+        }
+    }
+    types.sort_unstable();
+    types.dedup();
+    if types.len() > 1 {
+        return Err(InstallError::Failed(format!(
+            "Error: Invalid usage: `{sub}` supports only one type of entry at a time."
+        )));
+    }
+    if names == 0 {
+        return Err(InstallError::Failed(
+            "Error: Invalid usage: This command requires at least 1 named argument.".to_owned(),
+        ));
+    }
+    if !add {
+        bundle::read_brewfile(file.as_deref()).map_err(InstallError::Failed)?;
+    }
+    Ok(None)
+}
+
+fn brewfile_args(
+    rest: &[String],
+    check: bool,
+) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
+    let unsupported =
+        || InstallError::Unsupported("bundle arguments or Brewfile rows are not native".to_owned());
+    let mut file = None;
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--file" && file.is_none() {
+            file = Some(std::path::PathBuf::from(
+                it.next()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(unsupported)?,
+            ));
+        } else if let Some(path) = arg.strip_prefix("--file=").filter(|s| !s.is_empty())
+            && file.is_none()
+        {
+            file = Some(std::path::PathBuf::from(path));
+        } else if check
+            && matches!(
+                arg.as_str(),
+                "--verbose" | "-v" | "--no-upgrade" | "--quiet" | "-q"
+            )
+        {
+            // `bundle check` display switches.
         } else {
             return Err(unsupported());
         }
@@ -1151,7 +2215,17 @@ fn prelock_admission(
         // own error, not a plan to admit or delegate.
         if opts.upgrade {
             let short = Formula::short_name(name);
-            if prefix.installed_one(prefix::Kind::Formula, short).is_none()
+            let formula_installed = prefix.installed_one(prefix::Kind::Formula, short).is_some()
+                || api
+                    .formula(name)
+                    .ok()
+                    .or_else(|| tap::lookup(prefix, name))
+                    .is_some_and(|f| {
+                        prefix
+                            .installed_one(prefix::Kind::Formula, &f.name)
+                            .is_some()
+                    });
+            if !formula_installed
                 && prefix
                     .installed_one(prefix::Kind::Cask, api::canonical_cask_token(short))
                     .is_none()
@@ -1172,8 +2246,8 @@ fn prelock_admission(
             let name_opts = if args.first().is_some_and(|a| a == "install")
                 && !opts.force
                 && !env_set("HOMEBREW_NO_INSTALL_UPGRADE")
-                && !prefix.is_pinned(Formula::short_name(name))
-                && outdated_linked_formula(prefix, api, name).is_some()
+                && outdated_linked_formula(prefix, api, name)
+                    .is_some_and(|(f, _)| !prefix.is_pinned(&f.name))
             {
                 install::InstallOpts {
                     upgrade: true,
@@ -1218,6 +2292,30 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
     if args.is_empty() {
         // Under the `brew` reroute, no arguments is brew's usage
         // error: the help message on stderr, exit 1.
+        if via_reroute() {
+            eprint!("{}", help_texts::TOP);
+            return ExitCode::from(1);
+        }
+        print!("{HELP_MAIN}");
+        return ExitCode::SUCCESS;
+    }
+    // Brew's shell entry treats a leading --version (or a lone
+    // -v, after its shift trick) as the version command and
+    // ignores everything after it.
+    if matches!(args[0].as_str(), "--version" | "-v") {
+        println!("abrew {} (aterm)", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    // Only global flags and no command is the no-arguments
+    // case in brew (help), not an unknown command.
+    let global_only = args.iter().all(|arg| {
+        matches!(arg.as_str(), "--verbose" | "--quiet" | "--debug")
+            || (arg.len() > 1
+                && arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg[1..].chars().all(|c| matches!(c, 'v' | 'q' | 'd')))
+    });
+    if global_only {
         if via_reroute() {
             eprint!("{}", help_texts::TOP);
             return ExitCode::from(1);
@@ -1316,10 +2414,21 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         "--help" | "-h" | "help" => {
-            print!(
-                "{}",
-                help_for(rest.first().map(String::as_str).unwrap_or(""))
-            );
+            let topic = rest.first().map(String::as_str).unwrap_or("");
+            if !topic.is_empty()
+                && !matches!(topic, "--help" | "-h" | "help")
+                && !command_names(true).contains(&canonical_help_command(topic))
+            {
+                let dictionary: Vec<String> = command_names(true)
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect();
+                return failed(&format!(
+                    "Error: Invalid usage: Unknown command: brew {topic}{}",
+                    commands::command_suggestion(topic, &dictionary)
+                ));
+            }
+            print!("{}", help_for(topic));
             return ExitCode::SUCCESS;
         }
         "--prefix" | "--cellar" | "--caskroom" => {
@@ -1560,7 +2669,16 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "linkage" => cmd_linkage(prefix, &api, rest),
         "log" => cmd_log(prefix, rest),
         "tap" => cmd_tap(prefix, rest),
-        "untap" => each_name(rest, |n| tap::remove(prefix, n)),
+        "trust" => cmd_trust(prefix, &api, rest),
+        "untrust" => cmd_untrust(prefix, &api, rest),
+        "untap" => {
+            let names = operands(rest);
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            match tap::remove_all(prefix, &refs) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => failed(&e),
+            }
+        }
         "tap-info" => cmd_tap_info(prefix, &api, rest),
         "bundle" => cmd_bundle(prefix, &api, args, rest, prepared),
         _ => not_native(prefix, args, cmd),
@@ -1606,6 +2724,230 @@ fn has_flag(rest: &[String], long: &str, short: &str) -> bool {
     rest.iter()
         .take_while(|s| s.as_str() != "--")
         .any(|s| s == long || (!short.is_empty() && s == short))
+}
+
+/// Whether brew reaches its Ruby startup for this invocation
+/// (shell helpers in `bin/brew`/`brew.sh` and the abrew stub
+/// controls never do, and unknown commands die first): the
+/// shared gate for the startup env behaviours below — the
+/// deprecated wrapper-variable warnings and the disabled
+/// internal-API env, both ahead of argument parsing.
+fn reaches_ruby_startup(cmd: &str, rest: &[String]) -> bool {
+    let canonical = match cmd {
+        "ls" => "list",
+        "up" => "update",
+        other => other,
+    };
+    // Shell paths (brew.sh / ShellCommand) and the abrew
+    // stub controls never fetch API files.
+    if matches!(
+        canonical,
+        "--version"
+            | "-v"
+            | "--help"
+            | "-h"
+            | "help"
+            | "--prefix"
+            | "--cellar"
+            | "--caskroom"
+            | "--repository"
+            | "--repo"
+            | "--taps"
+            | "shellenv"
+            | "update"
+            | "which-formula"
+            | "exec"
+            | "on"
+            | "off"
+            | "status"
+    ) {
+        return false;
+    }
+    // Plain `list` and bare `tap`/`--cache` are shell forms;
+    // their Ruby forms fetch.
+    if canonical == "list"
+        && operands(rest).is_empty()
+        && !rest.iter().any(|arg| {
+            matches!(
+                arg.split('=').next().unwrap_or(arg),
+                "--versions" | "--pinned" | "--multiple" | "--full-name" | "--json"
+            )
+        })
+    {
+        return false;
+    }
+    if canonical == "tap" && rest.is_empty() {
+        return false;
+    }
+    if canonical == "--cache"
+        && operands_without_flag_values(rest, &["--os", "--arch", "--bottle-tag"]).is_empty()
+        && valued_flag_last(rest, "--os").is_none()
+        && valued_flag_last(rest, "--arch").is_none()
+    {
+        return false;
+    }
+    COMMANDS.contains(&cmd)
+        || BREW_BUILTIN_COMMANDS.contains(&cmd)
+        || BREW_DEVELOPER_COMMANDS.contains(&cmd)
+        || command_names(true).contains(&cmd)
+}
+
+/// `HOMEBREW_USE_INTERNAL_API` is a disabled boolean env
+/// brew reads while fetching API files at Ruby-command
+/// startup, ahead of argument parsing; any non-blank value
+/// (including `0`/`false`) errors.
+fn internal_api_env_error(
+    cmd: &str,
+    rest: &[String],
+    get: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if !reaches_ruby_startup(cmd, rest) {
+        return None;
+    }
+    get("HOMEBREW_USE_INTERNAL_API")
+        .filter(|value| value.chars().any(|c| !c.is_whitespace()))
+        .map(|_| {
+            "Error: Calling HOMEBREW_USE_INTERNAL_API is disabled! \
+             Use the default behaviour instead."
+                .to_string()
+        })
+}
+
+/// Print brew's warnings for deprecated (warn-tier) env vars
+/// in read order; under developer mode the first present one
+/// is an error instead (`disable_for_developers`), returned
+/// for the caller to fail with. Any non-blank value counts.
+fn deprecated_env_warnings(
+    vars: &[(&str, &str)],
+    get: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let present =
+        |key: &str| get(key).is_some_and(|value| value.chars().any(|c| !c.is_whitespace()));
+    let developer = present("HOMEBREW_DEVELOPER");
+    for (name, replacement) in vars {
+        if present(name) {
+            let message = format!("Calling {name} is deprecated! Use {replacement} instead.");
+            if developer {
+                return Some(format!("Error: {message}"));
+            }
+            tty::opoo!("Warning: {message}");
+        }
+    }
+    None
+}
+
+/// The deprecated wrapper envs brew reads for every Ruby
+/// command (`check_deprecated_bash_variables`), in read order.
+const WRAPPER_DEPRECATED_ENVS: &[(&str, &str)] = &[
+    ("HOMEBREW_FORCE_BREW_WRAPPER", "your wrapper directly"),
+    (
+        "HOMEBREW_FORCE_BREW_WRAPPER_HELP_MESSAGE",
+        "custom help in your wrapper",
+    ),
+    (
+        "HOMEBREW_NO_FORCE_BREW_WRAPPER",
+        "an environment without $HOMEBREW_NO_FORCE_BREW_WRAPPER",
+    ),
+];
+
+/// The deprecated bundle cleanup envs the bundle parser reads.
+const BUNDLE_DEPRECATED_ENVS: &[(&str, &str)] = &[
+    (
+        "HOMEBREW_BUNDLE_INSTALL_CLEANUP",
+        "`brew bundle cleanup` after `brew bundle install`",
+    ),
+    (
+        "HOMEBREW_BUNDLE_FORCE_INSTALL_CLEANUP",
+        "`brew bundle cleanup --force` after `brew bundle install`",
+    ),
+];
+
+/// Brew's disabled environment variables for the switches
+/// above: brew's parser reads the switch's env var while
+/// building, so the env error precedes any switch error.
+/// `HOMEBREW_EVAL_ALL` errors with any non-empty value;
+/// `HOMEBREW_ASK` is boolean (`0`/`false` stay quiet).
+fn disabled_env_error(cmd: &str, get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let present = |key: &str| get(key).filter(|value| !value.is_empty());
+    let truthy = |key: &str| {
+        present(key).is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    };
+    if matches!(
+        cmd,
+        "deps"
+            | "desc"
+            | "info"
+            | "options"
+            | "readall"
+            | "search"
+            | "uses"
+            | "audit"
+            | "bump"
+            | "determine-test-runners"
+            | "livecheck"
+            | "unbottled"
+    ) && present("HOMEBREW_EVAL_ALL").is_some()
+    {
+        return Some(
+            "Error: Calling HOMEBREW_EVAL_ALL is disabled! \
+             Use the default trusted-tap behaviour instead."
+                .to_string(),
+        );
+    }
+    if matches!(cmd, "install" | "upgrade" | "reinstall") {
+        if truthy("HOMEBREW_ASK") {
+            return Some(
+                "Error: Calling HOMEBREW_ASK is disabled! Use the default behaviour instead."
+                    .to_string(),
+            );
+        }
+        // The shared cask switches read these while their
+        // parsers build; presence alone (even `0`) errors.
+        for key in [
+            "HOMEBREW_CASK_OPTS_BINARIES",
+            "HOMEBREW_CASK_OPTS_REQUIRE_SHA",
+        ] {
+            if present(key).is_some() {
+                return Some(format!(
+                    "Error: Calling {key} is disabled! Use HOMEBREW_CASK_OPTS instead."
+                ));
+            }
+        }
+    }
+    if cmd == "bundle" {
+        // Every bundle subcommand reads these (counter-vars
+        // suppress their pair); brew reads them in this order.
+        if truthy("HOMEBREW_BUNDLE_NO_SECRETS") && !truthy("HOMEBREW_BUNDLE_SECRETS") {
+            return Some(
+                "Error: Calling HOMEBREW_BUNDLE_NO_SECRETS is disabled! \
+                 Use the default behaviour instead."
+                    .to_string(),
+            );
+        }
+        if truthy("HOMEBREW_BUNDLE_DESCRIBE") && !truthy("HOMEBREW_BUNDLE_NO_DESCRIBE") {
+            return Some(
+                "Error: Calling HOMEBREW_BUNDLE_DESCRIBE is disabled! \
+                 Use the default behaviour instead."
+                    .to_string(),
+            );
+        }
+        if present("HOMEBREW_BUNDLE_DUMP_DESCRIBE").is_some() {
+            return Some(
+                "Error: Calling HOMEBREW_BUNDLE_DUMP_DESCRIBE is disabled! \
+                 Use HOMEBREW_BUNDLE_DESCRIBE instead."
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+/// Like `has_flag` for value flags, which also arrive as
+/// `--flag=value`.
+fn has_flag_eq(rest: &[String], long: &str) -> bool {
+    rest.iter()
+        .take_while(|s| s.as_str() != "--")
+        .any(|s| s == long || s.starts_with(&format!("{long}=")))
 }
 
 const COMMANDS: &[&str] = &[
@@ -2013,55 +3355,22 @@ mod admission_tests {
                 vec!["--cask", "--ignore-dependencies", "firefox"],
             ),
             ("info", vec!["--analytics"]),
-            ("info", vec!["--days=30", "wget"]),
-            ("info", vec!["--category", "install", "wget"]),
             ("info", vec!["--analytics", "--json", "wget"]),
             ("info", vec!["--analytics", "--installed", "wget"]),
-            ("info", vec!["--analytics", "wget", "--days=40"]),
-            ("info", vec!["--analytics", "--days", "40", "wget"]),
-            ("info", vec!["--analytics", "wget", "--days"]),
-            ("info", vec!["--analytics", "wget", "--days="]),
-            ("info", vec!["--analytics", "--days", "wget"]),
-            ("info", vec!["--analytics", "--days", "--formula", "wget"]),
-            ("info", vec!["--analytics", "wget", "--category=other"]),
-            ("info", vec!["--analytics", "--category", "other", "wget"]),
-            ("info", vec!["--analytics", "wget", "--category"]),
-            ("info", vec!["--analytics", "wget", "--category="]),
-            (
-                "info",
-                vec!["--analytics", "--category", "--days=30", "wget"],
-            ),
             ("info", vec!["--analytics", "--days", "30"]),
             ("info", vec!["--analytics", "--category", "install"]),
             (
                 "info",
                 vec!["--analytics", "--days=30", "--category=install"],
             ),
-            (
-                "info",
-                vec!["--analytics", "--days=30", "--days=90", "wget"],
-            ),
-            (
-                "info",
-                vec![
-                    "--analytics",
-                    "--category=install",
-                    "--category",
-                    "build-error",
-                    "wget",
-                ],
-            ),
             ("link", vec!["--HEAD", "wget"]),
             ("services", vec!["start", "wget"]),
             ("postinstall", vec!["wget"]),
             ("cleanup", vec!["--prune=soon"]),
-            ("--cache", vec!["--os=all", "wget"]),
             ("--cache", vec!["-s", "wget"]),
             ("--cache", vec!["--HEAD", "wget"]),
             ("--repository", vec!["notatap"]),
             ("--repo", vec!["a/b/c"]),
-            ("desc", vec!["-s", "-n", "wget"]),
-            ("desc", vec!["--search", "--description", "wget"]),
             ("desc", vec!["-s", "/(?=http)client/"]),
             ("missing", vec!["--hide=../outside"]),
             ("list", vec!["--versions", "--json", "wget"]),
@@ -2194,6 +3503,22 @@ mod admission_tests {
             ("info", vec!["--json=v2", "wget"]),
             ("info", vec!["--analytics", "wget"]),
             ("info", vec!["--analytics", "--days=30", "wget"]),
+            ("info", vec!["--analytics", "wget", "--days="]),
+            ("info", vec!["--analytics", "wget", "--category="]),
+            (
+                "info",
+                vec!["--analytics", "--days=30", "--days=90", "wget"],
+            ),
+            (
+                "info",
+                vec![
+                    "--analytics",
+                    "--category=install",
+                    "--category",
+                    "build-error",
+                    "wget",
+                ],
+            ),
             (
                 "info",
                 vec!["--analytics", "--days", "90", "--cask", "firefox"],
@@ -2415,6 +3740,222 @@ mod admission_tests {
     }
 
     #[test]
+    fn deprecated_envs_escalate_only_for_developers() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| (*v).to_string())
+            }
+        };
+        // Absent or blank: nothing (and nothing printed).
+        assert!(deprecated_env_warnings(WRAPPER_DEPRECATED_ENVS, env(&[])).is_none());
+        assert!(
+            deprecated_env_warnings(
+                WRAPPER_DEPRECATED_ENVS,
+                env(&[("HOMEBREW_FORCE_BREW_WRAPPER", "")])
+            )
+            .is_none()
+        );
+        // Developer mode turns the first present warning, in
+        // read order, into the error.
+        assert_eq!(
+            deprecated_env_warnings(
+                WRAPPER_DEPRECATED_ENVS,
+                env(&[
+                    ("HOMEBREW_DEVELOPER", "1"),
+                    ("HOMEBREW_NO_FORCE_BREW_WRAPPER", "0")
+                ])
+            )
+            .as_deref(),
+            Some(
+                "Error: Calling HOMEBREW_NO_FORCE_BREW_WRAPPER is deprecated! \
+                 Use an environment without $HOMEBREW_NO_FORCE_BREW_WRAPPER instead."
+            )
+        );
+        assert_eq!(
+            deprecated_env_warnings(
+                BUNDLE_DEPRECATED_ENVS,
+                env(&[
+                    ("HOMEBREW_DEVELOPER", "1"),
+                    ("HOMEBREW_BUNDLE_FORCE_INSTALL_CLEANUP", "1"),
+                    ("HOMEBREW_BUNDLE_INSTALL_CLEANUP", "1"),
+                ])
+            )
+            .as_deref(),
+            Some(
+                "Error: Calling HOMEBREW_BUNDLE_INSTALL_CLEANUP is deprecated! \
+                 Use `brew bundle cleanup` after `brew bundle install` instead."
+            ),
+            "install-cleanup is read before its force sibling"
+        );
+    }
+
+    #[test]
+    fn internal_api_env_error_scopes_like_brew() {
+        let set = |_: &str| Some("1".to_string());
+        let err = "Error: Calling HOMEBREW_USE_INTERNAL_API is disabled! \
+                   Use the default behaviour instead.";
+        // Ruby commands fetch API files before parsing.
+        assert_eq!(
+            internal_api_env_error("info", &argv(&["jq"]), set).as_deref(),
+            Some(err)
+        );
+        assert_eq!(
+            internal_api_env_error("deps", &argv(&["--quiet", "--verbose"]), set).as_deref(),
+            Some(err),
+            "the fetch precedes parser conflict errors"
+        );
+        // Falsy-but-present values still error (boolean :set);
+        // blank stays quiet.
+        assert!(internal_api_env_error("info", &argv(&[]), |_| Some("0".to_string())).is_some());
+        assert!(internal_api_env_error("info", &argv(&[]), |_| Some(String::new())).is_none());
+        assert!(internal_api_env_error("info", &argv(&[]), |_| None).is_none());
+        // Shell paths and unknown commands never reach it.
+        assert!(internal_api_env_error("--prefix", &argv(&["jq"]), set).is_none());
+        assert!(internal_api_env_error("--version", &argv(&[]), set).is_none());
+        assert!(internal_api_env_error("which-formula", &argv(&["jq"]), set).is_none());
+        assert!(internal_api_env_error("no-such-cmd", &argv(&[]), set).is_none());
+        assert!(internal_api_env_error("list", &argv(&[]), set).is_none());
+        assert!(internal_api_env_error("list", &argv(&["--versions"]), set).is_some());
+        assert!(internal_api_env_error("tap", &argv(&[]), set).is_none());
+        assert!(internal_api_env_error("--cache", &argv(&[]), set).is_none());
+        assert!(internal_api_env_error("--cache", &argv(&["jq"]), set).is_some());
+    }
+
+    #[test]
+    fn deps_os_arch_simulation_values_admit() {
+        let failed = |cmd: &str, args: &[&str]| match native_args(cmd, &argv(args)) {
+            Err(InstallError::Failed(m)) => m,
+            other => panic!("expected usage failure for {cmd} {args:?}, got {other:?}"),
+        };
+        assert_eq!(
+            failed("deps", &["--os=all", "curl"]),
+            "Error: Invalid usage: `brew deps --os=all` is not supported."
+        );
+        assert_eq!(
+            failed("deps", &["--arch=all", "curl"]),
+            "Error: Invalid usage: `brew deps --arch=all` is not supported."
+        );
+        assert!(matches!(
+            native_args("deps", &argv(&["--os=linux", "--arch=intel", "curl"])),
+            Ok(None)
+        ));
+        assert!(matches!(
+            native_args("deps", &argv(&["--os", "sequoia", "curl"])),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn minimum_version_arity_is_a_usage_error() {
+        let arity = "Error: Invalid usage: `--minimum-version` requires exactly one formula or cask argument.";
+        let failed = |cmd: &str, args: &[&str]| match native_args(cmd, &argv(args)) {
+            Err(InstallError::Failed(m)) => m,
+            other => panic!("expected usage failure for {cmd} {args:?}, got {other:?}"),
+        };
+        assert_eq!(failed("outdated", &["--minimum-version=1.0"]), arity);
+        assert_eq!(
+            failed("outdated", &["--min-version", "1.0", "jq", "wget"]),
+            arity
+        );
+        assert!(matches!(
+            native_args("outdated", &argv(&["--minimum-version=1.0", "jq"])),
+            Ok(None)
+        ));
+        assert!(matches!(
+            native_args("outdated", &argv(&["--minimum-version", "1.0", "jq"])),
+            Ok(None)
+        ));
+        // A blank value is absent: no arity demand.
+        assert!(matches!(
+            native_args("outdated", &argv(&["--minimum-version=", "jq", "wget"])),
+            Ok(None)
+        ));
+        // upgrade shares the arity error and the native flag.
+        assert_eq!(failed("upgrade", &["--minimum-version=1.0"]), arity);
+        assert!(matches!(
+            native_args("upgrade", &argv(&["--minimum-version=1.0", "jq"])),
+            Ok(None)
+        ));
+        // The long spelling wins over the alias, blank included.
+        assert!(matches!(
+            native_args(
+                "outdated",
+                &argv(&["--min-version=1.0", "--minimum-version=", "jq", "wget"])
+            ),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn deps_brewfile_rows_gate_admission() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let file = temp.path().join("Brewfile");
+        let flag = format!("--brewfile={}", file.to_str().unwrap());
+        // Options and other entry types are read past: deps
+        // uses only the brew/cask names.
+        std::fs::write(
+            &file,
+            "tap \"me/tools\"\nbrew \"wget\", link: false\ncask \"firefox\"\nmas \"Xcode\", id: 497799835\nvscode \"dbaeumer.vscode-eslint\"\ncask_args appdir: \"/Applications\"\n",
+        )
+        .unwrap();
+        assert!(matches!(native_args("deps", &argv(&[&flag])), Ok(None)));
+        // Ruby the line parser cannot read delegates.
+        std::fs::write(&file, "brew \"wget\" if OS.mac?\n").unwrap();
+        assert!(matches!(
+            native_args("deps", &argv(&[&flag])),
+            Err(InstallError::Unsupported(_))
+        ));
+        // A missing file is admitted: the command reports
+        // brew's own "No Brewfile found".
+        std::fs::remove_file(&file).unwrap();
+        assert!(matches!(native_args("deps", &argv(&[&flag])), Ok(None)));
+    }
+
+    #[test]
+    fn bundle_edit_admission_requires_names_and_one_type() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let file = temp.path().join("Brewfile");
+        std::fs::write(&file, "brew \"wget\"\n").unwrap();
+        let flag = format!("--file={}", file.to_str().unwrap());
+        let failed = |args: &[&str]| match native_args("bundle", &argv(args)) {
+            Err(InstallError::Failed(m)) => m,
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert_eq!(
+            failed(&["add"]),
+            "Error: Invalid usage: This command requires at least 1 named argument."
+        );
+        assert_eq!(
+            failed(&["add", "--formula", "--cask", "wget"]),
+            "Error: Invalid usage: `add` supports only one type of entry at a time."
+        );
+        assert_eq!(
+            failed(&["add", "--mas", "Xcode"]),
+            "Error: Invalid usage: The `add` subcommand does not accept the `--mas` switch."
+        );
+        assert!(matches!(
+            native_args("bundle", &argv(&["add", "wget"])),
+            Ok(None)
+        ));
+        assert!(matches!(
+            native_args("bundle", &argv(&["remove", &flag, "wget"])),
+            Ok(None)
+        ));
+        assert_eq!(
+            failed(&["remove", &flag]),
+            "Error: Invalid usage: This command requires at least 1 named argument."
+        );
+        // Bare remove (direct dialect) stays the payload verb.
+        assert!(matches!(
+            native_args("bundle", &argv(&["remove"])),
+            Ok(None)
+        ));
+    }
+
+    #[test]
     fn plural_kind_switches_canonicalize_exact_tokens_only() {
         assert_eq!(
             canonical_kind_switches(&argv(&["--formulae", "wget", "--casks"])),
@@ -2445,6 +3986,230 @@ mod admission_tests {
         assert_eq!(
             failed("install", &["--ask", "acl"]),
             "Error: Calling the `--ask` switch is disabled! Use the default behaviour instead."
+        );
+        // Brew's other `odisabled` switches: same parser refusal,
+        // replacement text verbatim or "no replacement".
+        assert_eq!(
+            failed("deps", &["--eval-all", "acl"]),
+            "Error: Calling the `--eval-all` switch is disabled! Use the default trusted-tap behaviour instead."
+        );
+        assert_eq!(
+            failed("tap", &["--eval-all"]),
+            "Error: Calling the `--eval-all` switch is disabled! Use the default tap verification behaviour instead."
+        );
+        assert_eq!(
+            failed("info", &["--fetch-manifest", "acl"]),
+            "Error: Calling the `--fetch-manifest` switch is disabled! There is no replacement."
+        );
+        assert_eq!(
+            failed("ls", &["--installed-as-dependency"]),
+            "Error: Calling the `--installed-as-dependency` switch is disabled! Use --no-installed-on-request instead."
+        );
+        assert_eq!(
+            failed("options", &["--command=install"]),
+            "Error: Calling the `--command` flag is disabled! There is no replacement."
+        );
+        assert_eq!(
+            failed("up", &["--merge"]),
+            "Error: Calling the `--merge` switch is disabled! There is no replacement."
+        );
+        assert_eq!(
+            failed("install", &["--env=std", "acl"]),
+            "Error: Calling `brew install --env` is disabled! Use `env :std` in specific formula files instead."
+        );
+        // Developer commands carry the same parser refusals even
+        // though the commands themselves are not native.
+        assert_eq!(
+            failed("audit", &["--no-signing", "acl"]),
+            "Error: Calling the `--[no-]signing` switch is disabled! There is no replacement."
+        );
+        assert_eq!(
+            failed("bottle", &["--committer=x"]),
+            "Error: Calling the `--committer` flag is disabled! There is no replacement."
+        );
+        assert_eq!(
+            failed("update-python-resources", &["--silent", "acl"]),
+            "Error: Calling the `-s` switch is disabled! There is no replacement."
+        );
+        assert_eq!(
+            failed("test-bot", &["--skip-recursive-dependents"]),
+            "Error: Calling the `--[no-]skip-recursive-dependents` switch is disabled! Use the default behaviour instead."
+        );
+        // Parser conflict groups: every present member is listed
+        // in declaration order, short spellings by long name.
+        assert_eq!(
+            failed("outdated", &["-v", "--json"]),
+            "Error: Invalid usage: Options --verbose and --json are mutually exclusive."
+        );
+        assert_eq!(
+            failed("outdated", &["--quiet", "--json", "--verbose"]),
+            "Error: Invalid usage: Options --quiet and --verbose and --json are mutually exclusive."
+        );
+        assert_eq!(
+            failed(
+                "leaves",
+                &["--installed-on-request", "--installed-as-dependency"]
+            ),
+            "Error: Invalid usage: Options --installed-on-request and --installed-as-dependency are mutually exclusive."
+        );
+        assert_eq!(
+            failed("log", &["-1", "--max-count=2", "acl"]),
+            "Error: Invalid usage: Options -1 and --max-count are mutually exclusive."
+        );
+        assert_eq!(
+            failed("trust", &["--tap", "--formula", "--cask", "x/y"]),
+            "Error: Invalid usage: Options --tap and --formula and --cask are mutually exclusive."
+        );
+        // Bundle toggles: canonical display names, --file last,
+        // and --describe itself is a disabled switch.
+        assert_eq!(
+            failed("bundle", &["list", "--describe"]),
+            "Error: Calling the `--describe` switch is disabled! Use the default behaviour instead."
+        );
+        assert_eq!(
+            failed("bundle", &["check", "--formulae", "--no-brews"]),
+            "Error: Invalid usage: Options --formula and --no-formula are mutually exclusive."
+        );
+        assert_eq!(
+            failed("bundle", &["check", "--cask", "--no-cleanup-cask"]),
+            "Error: Invalid usage: Options --cask and --no-cleanup-cask are mutually exclusive."
+        );
+        assert_eq!(
+            failed("bundle", &["list", "--mas", "--no-dump-mas"]),
+            "Error: Invalid usage: Options --mas and --no-dump-mas are mutually exclusive."
+        );
+        assert_eq!(
+            failed("bundle", &["list", "--file=x", "--global"]),
+            "Error: Invalid usage: Options --file and --global are mutually exclusive."
+        );
+        // Bundle subcommand switch scope, in argv order.
+        assert_eq!(
+            failed("bundle", &["list", "--no-describe"]),
+            "Error: Invalid usage: The `list` subcommand does not accept the `--no-describe` switch."
+        );
+        assert_eq!(
+            failed("bundle", &["list", "--force"]),
+            "Error: Invalid usage: The `list` subcommand does not accept the `-f` switch."
+        );
+        assert_eq!(
+            failed("bundle", &["env", "--formula"]),
+            "Error: Invalid usage: The `env` subcommand does not accept the `--formula` switch."
+        );
+        assert_eq!(
+            failed("bundle", &["check", "--no-mas"]),
+            "Error: Invalid usage: The `check` subcommand does not accept the `--no-mas` switch."
+        );
+        assert_eq!(
+            failed("bundle", &["--no-describe"]),
+            "Error: Invalid usage: The `install` subcommand does not accept the `--no-describe` switch."
+        );
+        // Unknown subcommands (bundle and services) and
+        // services switch scope.
+        assert_eq!(
+            failed("bundle", &["frobnicate"]),
+            "Error: Invalid usage: unknown subcommand: `frobnicate`"
+        );
+        assert_eq!(
+            failed("bundle", &["--file", "Brewfile", "frobnicate"]),
+            "Error: Invalid usage: unknown subcommand: `frobnicate`"
+        );
+        assert_eq!(
+            failed("services", &["frobnicate"]),
+            "Error: Invalid usage: unknown subcommand: `frobnicate`"
+        );
+        assert_eq!(
+            failed("services", &["--file=x"]),
+            "Error: Invalid usage: The `list` subcommand does not accept the `--file` flag."
+        );
+        assert_eq!(
+            failed("services", &["stop", "--json"]),
+            "Error: Invalid usage: The `stop` subcommand does not accept the `--json` switch."
+        );
+        // Parser depends_on constraints.
+        assert_eq!(
+            failed("deps", &["--prune", "acl"]),
+            "Error: Invalid usage: `--prune` cannot be passed without `--tree`."
+        );
+        assert!(native_args("deps", &argv(&["--prune", "--tree", "acl"])).is_ok());
+        assert_eq!(
+            failed("info", &["--variations", "acl"]),
+            "Error: Invalid usage: `--variations` cannot be passed without `--json`."
+        );
+        assert_eq!(
+            failed("search", &["--open", "acl"]),
+            "Error: Invalid usage: `--open` cannot be passed without `--pull-request`."
+        );
+        // Boolean switches reject =values (needless argument),
+        // and explicit JSON versions are validated per command.
+        assert_eq!(
+            failed("outdated", &["--quiet=x"]),
+            "Error: needless argument: --quiet=x"
+        );
+        assert_eq!(
+            failed("outdated", &["-q=x"]),
+            "Error: needless argument: -q=x"
+        );
+        assert_eq!(
+            failed("desc", &["--search=x", "acl"]),
+            "Error: needless argument: --search=x"
+        );
+        assert_eq!(
+            failed("outdated", &["--json=v1"]),
+            "Error: `brew outdated --json=v1` is no longer supported. Use brew outdated --json=v2 instead."
+        );
+        assert_eq!(
+            failed("tap-info", &["--json=v2", "homebrew/core"]),
+            "Error: Invalid usage: invalid JSON version: v2"
+        );
+        assert!(native_args("cleanup", &argv(&["--prune=30"])).is_ok());
+        // Required-value flags at the end of the option list.
+        assert_eq!(
+            failed("outdated", &["--severity"]),
+            "Error: missing argument: --severity"
+        );
+        assert_eq!(
+            failed("deps", &["--os", "--"]),
+            "Error: missing argument: --os"
+        );
+        assert!(
+            !matches!(
+                native_args("deps", &argv(&["--brewfile"])),
+                Err(InstallError::Failed(ref m)) if m.contains("missing argument")
+            ),
+            "optional-value --brewfile never lacks an argument"
+        );
+        // --os/--arch simulation values are validated as brew's
+        // SimulateSystem validates them.
+        assert_eq!(
+            failed("deps", &["--os=plan9", "acl"]),
+            "Error: Unknown OS: plan9"
+        );
+        assert_eq!(
+            failed("deps", &["--os", "--tree", "acl"]),
+            "Error: Unknown OS: --tree"
+        );
+        assert_eq!(
+            failed("fetch", &["--arch=arm64", "acl"]),
+            "Error: New arch must be :arm or :intel"
+        );
+        // Universally invalid regex syntax is brew's error,
+        // not a delegation.
+        assert_eq!(
+            failed("search", &["/[/"]),
+            "Error: /[/ is not a valid regex."
+        );
+        assert_eq!(
+            failed("search", &["/+/"]),
+            "Error: /+/ is not a valid regex."
+        );
+        assert_eq!(
+            failed("desc", &["--search", "/(abc/"]),
+            "Error: /(abc/ is not a valid regex."
+        );
+        assert!(native_args("outdated", &argv(&["--json"])).is_ok());
+        assert!(
+            native_args("deps", &argv(&["--", "--eval-all"])).is_ok(),
+            "a disabled spelling after -- is a named argument"
         );
         assert!(native_args("install", &argv(&["--no-ask", "acl"])).is_ok());
         assert!(native_args("install", &argv(&["-y", "acl"])).is_ok());
@@ -2582,6 +4347,22 @@ mod admission_tests {
             }
         };
         assert!(msg(&["services", "list"]).contains("'services' is not native"));
+        let cat_args = argv(&["--analytics", "wget", "--category=other"]);
+        assert_eq!(
+            native_args("info", &cat_args),
+            Err(InstallError::Failed(
+                "Error: Invalid usage: `--category` must be one of install, \
+                 install-on-request, build-error when querying formulae."
+                    .replace("                 ", "")
+            ))
+        );
+        let days_args = argv(&["--analytics", "wget", "--days=40"]);
+        assert_eq!(
+            native_args("info", &days_args),
+            Err(InstallError::Failed(
+                "Error: Invalid usage: `--days` must be one of 30, 90, 365.".to_string()
+            ))
+        );
         assert!(valid_cask_version("4.2.1,20260531.1"));
         assert!(valid_cask_version("1.0"));
         assert!(!valid_cask_version("../1.0"));
@@ -2592,6 +4373,22 @@ mod admission_tests {
         assert_eq!(dispatch(&fresh, &argv(&["list"])), ExitCode::SUCCESS);
         assert!(!fresh.root.exists());
         assert_eq!(dispatch(&fresh, &argv(&["--version"])), ExitCode::SUCCESS);
+        assert_eq!(
+            dispatch(&fresh, &argv(&["--version", "extra"])),
+            ExitCode::SUCCESS,
+            "a leading --version ignores everything after it"
+        );
+        assert_eq!(
+            dispatch(&fresh, &argv(&["--verbose"])),
+            ExitCode::SUCCESS,
+            "global flags alone are the no-arguments help case"
+        );
+        assert_eq!(dispatch(&fresh, &argv(&["-v", "-v"])), ExitCode::SUCCESS);
+        assert_eq!(
+            dispatch(&fresh, &argv(&["help", "frobnicate"])),
+            ExitCode::from(1),
+            "help for an unknown topic is brew's unknown-command error"
+        );
         assert!(!fresh.root.exists());
         for q in [
             &["--repository", "homebrew/core"][..],
@@ -2709,6 +4506,114 @@ mod admission_tests {
             native_args("analytics", &argv(&["bogus"])),
             Err(InstallError::Failed(_))
         ));
+    }
+
+    #[test]
+    fn disabled_env_vars_match_brew() {
+        let env = |pairs: &[(&str, &str)]| {
+            let owned: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            move |key: &str| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        };
+        // Any non-empty HOMEBREW_EVAL_ALL errors on eval commands…
+        for value in ["1", "0", "false"] {
+            assert_eq!(
+                disabled_env_error("deps", env(&[("HOMEBREW_EVAL_ALL", value)])),
+                Some(
+                    "Error: Calling HOMEBREW_EVAL_ALL is disabled! Use the default trusted-tap behaviour instead."
+                        .to_string()
+                )
+            );
+        }
+        // …but an empty value is quiet, and other commands never read it.
+        assert_eq!(
+            disabled_env_error("deps", env(&[("HOMEBREW_EVAL_ALL", "")])),
+            None
+        );
+        assert_eq!(
+            disabled_env_error("list", env(&[("HOMEBREW_EVAL_ALL", "1")])),
+            None
+        );
+        assert_eq!(
+            disabled_env_error("tap", env(&[("HOMEBREW_EVAL_ALL", "1")])),
+            None
+        );
+        // HOMEBREW_ASK is boolean: truthy errors on install family only.
+        assert_eq!(
+            disabled_env_error("install", env(&[("HOMEBREW_ASK", "1")])),
+            Some(
+                "Error: Calling HOMEBREW_ASK is disabled! Use the default behaviour instead."
+                    .to_string()
+            )
+        );
+        for quiet in ["0", "false", ""] {
+            assert_eq!(
+                disabled_env_error("upgrade", env(&[("HOMEBREW_ASK", quiet)])),
+                None
+            );
+        }
+        assert_eq!(
+            disabled_env_error("deps", env(&[("HOMEBREW_ASK", "1")])),
+            None
+        );
+        // Cask-opts envs: presence (even `0`) errors, after ASK.
+        assert_eq!(
+            disabled_env_error("reinstall", env(&[("HOMEBREW_CASK_OPTS_BINARIES", "0")])),
+            Some(
+                "Error: Calling HOMEBREW_CASK_OPTS_BINARIES is disabled! Use HOMEBREW_CASK_OPTS instead."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            disabled_env_error(
+                "install",
+                env(&[
+                    ("HOMEBREW_ASK", "1"),
+                    ("HOMEBREW_CASK_OPTS_REQUIRE_SHA", "1")
+                ])
+            ),
+            Some(
+                "Error: Calling HOMEBREW_ASK is disabled! Use the default behaviour instead."
+                    .to_string()
+            )
+        );
+        // Bundle envs: boolean with counter-vars, secrets first.
+        assert_eq!(
+            disabled_env_error(
+                "bundle",
+                env(&[
+                    ("HOMEBREW_BUNDLE_DESCRIBE", "1"),
+                    ("HOMEBREW_BUNDLE_NO_SECRETS", "1")
+                ])
+            ),
+            Some(
+                "Error: Calling HOMEBREW_BUNDLE_NO_SECRETS is disabled! Use the default behaviour instead."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            disabled_env_error(
+                "bundle",
+                env(&[
+                    ("HOMEBREW_BUNDLE_DESCRIBE", "1"),
+                    ("HOMEBREW_BUNDLE_NO_DESCRIBE", "1")
+                ])
+            ),
+            None
+        );
+        assert_eq!(
+            disabled_env_error("bundle", env(&[("HOMEBREW_BUNDLE_DUMP_DESCRIBE", "0")])),
+            Some(
+                "Error: Calling HOMEBREW_BUNDLE_DUMP_DESCRIBE is disabled! Use HOMEBREW_BUNDLE_DESCRIBE instead."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            disabled_env_error("list", env(&[("HOMEBREW_BUNDLE_DESCRIBE", "1")])),
+            None
+        );
     }
 
     #[test]

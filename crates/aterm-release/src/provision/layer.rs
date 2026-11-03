@@ -19,7 +19,7 @@ pub(crate) trait ReleaseHost: Send + Sync {
     /// It ran and printed no report: why.
     fn base(&self) -> Result<Option<aterm_converge::Report>, String>;
 
-    /// Each row a bare `verify provision` provides, as its read-only check finds it.
+    /// Each row `verify provision --release` provides, checked read-only.
     /// # Errors
     /// No `$HOME` names the caches.
     fn develop(&self) -> Result<Vec<(&'static str, State)>, String>;
@@ -29,6 +29,14 @@ pub(crate) trait ReleaseHost: Send + Sync {
 
     /// The publication engine's checkout (`$PUBLICATION_ENGINE`, else `~/publication`).
     fn publication(&self) -> PathBuf;
+
+    /// Whether the engine's launcher starts successfully on the publication PATH.
+    /// # Errors
+    /// The launcher or its runtime is unavailable.
+    fn publication_bootstrap(&self) -> Result<(), String>;
+
+    /// Exercise source signing separately from the Apple certificate and notary tools.
+    fn source_signing(&self) -> Result<(), String>;
 
     /// The site checkout `ship site` syncs, where one is named.
     /// # Errors
@@ -79,6 +87,7 @@ enum Kind {
     Develop,
     Openssl,
     Publication,
+    SourceSigning,
     EngineReach,
     Site,
     SiteKey,
@@ -90,11 +99,12 @@ struct LayerItem {
     host: Arc<dyn ReleaseHost>,
 }
 
-const ITEMS: [(&str, Kind); 7] = [
+const ITEMS: [(&str, Kind); 8] = [
     ("base", Kind::Base),
     ("develop", Kind::Develop),
     ("release.openssl", Kind::Openssl),
     ("release.publication", Kind::Publication),
+    ("release.source-signing", Kind::SourceSigning),
     ("release.engine-reach", Kind::EngineReach),
     ("release.site", Kind::Site),
     ("release.site-key", Kind::SiteKey),
@@ -231,8 +241,11 @@ impl LayerItem {
             };
         }
         match self.host.find("gitleaks") {
-            Some(gitleaks) => Probe::Ok {
-                now: format!("{shown}/bin/pub, gitleaks {}", gitleaks.display()),
+            Some(gitleaks) => match self.host.publication_bootstrap() {
+                Ok(()) => Probe::Ok {
+                    now: format!("{shown}/bin/pub, gitleaks {}", gitleaks.display()),
+                },
+                Err(why) => Probe::Unusable { why },
             },
             None => Probe::Person {
                 step: self.id.into(),
@@ -249,7 +262,7 @@ impl LayerItem {
     /// `insteadOf` route), so a machine without that spelling stages nothing.
     fn probe_engine_reach(&self) -> Probe {
         let registry = self.host.publication().join(REGISTRY);
-        let text = match std::fs::read_to_string(&registry) {
+        let text = match crate::durable::read_text(&registry) {
             Ok(text) => text,
             Err(e) => {
                 return Probe::Blocked {
@@ -322,8 +335,7 @@ impl LayerItem {
         }
     }
 
-    /// The deployer's key is a file this account can open: opened, never read, so the
-    /// audit holds none of its bytes.
+    /// Validate the key with the deployment parser, without sending a token request.
     fn probe_site_key(&self) -> Probe {
         match self.host.site_key() {
             Err(why) => Probe::Unusable { why },
@@ -335,31 +347,21 @@ impl LayerItem {
                     self.site_key_lab()
                 ),
             },
-            Ok(Some(key)) => {
-                let opened = std::fs::File::open(&key)
-                    .and_then(|f| f.metadata())
-                    .map(|m| m.is_file());
-                match opened {
-                    Ok(true) => Probe::Ok {
-                        now: format!("{} is readable", key.display()),
-                    },
-                    Ok(false) => Probe::Person {
-                        step: self.id.into(),
-                        how: format!(
-                            "the site's service-account key {} is not a file",
-                            key.display()
-                        ),
-                    },
-                    Err(e) => Probe::Person {
-                        step: self.id.into(),
-                        how: format!(
-                            "the site's service-account key {} cannot be read: {e}{}",
-                            key.display(),
-                            self.site_key_lab()
-                        ),
-                    },
-                }
-            }
+            Ok(Some(key)) => match validate_site_key(&key) {
+                Ok(()) => Probe::Ok {
+                    now: format!(
+                        "{} parses as a signing key for Google's token endpoint; Google authentication is not checked",
+                        key.display()
+                    ),
+                },
+                Err(why) => Probe::Person {
+                    step: self.id.into(),
+                    how: format!(
+                        "the site's service-account key is unusable: {why}{}",
+                        self.site_key_lab()
+                    ),
+                },
+            },
         }
     }
 
@@ -369,13 +371,16 @@ impl LayerItem {
                 only: Layer::Base.name().into(),
             },
             Kind::Develop => Remedy::Provision {
-                args: String::new(),
+                args: "--release".into(),
             },
             Kind::Openssl => Remedy::None,
             Kind::Publication => Remedy::Command(
                 "clone the publication engine at ~/publication (or name one: \
                  PUBLICATION_ENGINE), with gitleaks on PATH"
                     .into(),
+            ),
+            Kind::SourceSigning => Remedy::Command(
+                "restore the complete registered release ring, build atpkg-keys with `targo --unverified build --profile gate -p atpkg-keys`, and provide OpenSSL 3 or newer through PUBLISH_OPENSSL".into(),
             ),
             Kind::EngineReach => Remedy::Command(
                 "give this machine what the registry's address needs (its SSH key and host \
@@ -427,9 +432,10 @@ impl Item for LayerItem {
     fn title(&self) -> String {
         match self.kind {
             Kind::Base => "every machine's base layer".into(),
-            Kind::Develop => "the tools a checkout's tests run".into(),
+            Kind::Develop => "the pinned build and source-signing tools".into(),
             Kind::Openssl => "macOS's LibreSSL, which release signing uses".into(),
             Kind::Publication => "the publication engine".into(),
+            Kind::SourceSigning => "source-attestation signing and independent verification".into(),
             Kind::EngineReach => "the engine's addresses for this repository".into(),
             Kind::Site => "the site checkout and its firebase.json".into(),
             Kind::SiteKey => "the site deployer's service-account key".into(),
@@ -442,6 +448,13 @@ impl Item for LayerItem {
             Kind::Develop => self.probe_develop(),
             Kind::Openssl => self.probe_openssl(),
             Kind::Publication => self.probe_publication(),
+            Kind::SourceSigning => match self.host.source_signing() {
+                Ok(()) => Probe::Ok {
+                    now: "registered ring, source signer and OpenSSL Ed25519 verification passed"
+                        .into(),
+                },
+                Err(why) => Probe::Unusable { why },
+            },
             Kind::EngineReach => self.probe_engine_reach(),
             Kind::Site => self.probe_site(),
             Kind::SiteKey => self.probe_site_key(),
@@ -477,9 +490,27 @@ impl Item for LayerItem {
     }
 }
 
-fn items(host: &Arc<dyn ReleaseHost>) -> Vec<Box<dyn Item>> {
+#[derive(Clone, Copy)]
+enum Audit {
+    All,
+    BeforeIdentity,
+    SourceSigning,
+}
+
+impl Audit {
+    fn includes(self, kind: Kind) -> bool {
+        match self {
+            Self::All => true,
+            Self::BeforeIdentity => kind != Kind::SourceSigning,
+            Self::SourceSigning => kind == Kind::SourceSigning,
+        }
+    }
+}
+
+fn items(host: &Arc<dyn ReleaseHost>, audit: Audit) -> Vec<Box<dyn Item>> {
     ITEMS
         .iter()
+        .filter(|(_, kind)| audit.includes(*kind))
         .map(|&(id, kind)| {
             Box::new(LayerItem {
                 id,
@@ -527,10 +558,26 @@ fn check_of(row: &ItemReport) -> Check {
 
 /// Every item over `host`, probed and planned, as `(id, check)` in [`ITEMS`] order.
 pub(crate) fn audit(host: &Arc<dyn ReleaseHost>) -> Vec<(&'static str, Check)> {
-    let items = items(host);
+    audit_selected(host, Audit::All)
+}
+
+pub(crate) fn audit_before_identity(host: &Arc<dyn ReleaseHost>) -> Vec<(&'static str, Check)> {
+    audit_selected(host, Audit::BeforeIdentity)
+}
+
+pub(crate) fn audit_source_signing(host: &Arc<dyn ReleaseHost>) -> Vec<(&'static str, Check)> {
+    audit_selected(host, Audit::SourceSigning)
+}
+
+fn audit_selected(host: &Arc<dyn ReleaseHost>, audit: Audit) -> Vec<(&'static str, Check)> {
+    let items = items(host, audit);
+    let selected: Vec<_> = ITEMS
+        .iter()
+        .filter(|(_, kind)| audit.includes(*kind))
+        .collect();
     match aterm_converge::run(&items, Mode::Plan, &mut aterm_converge::ReadOnly) {
-        Ok(rows) => ITEMS
-            .iter()
+        Ok(rows) => selected
+            .into_iter()
             .map(|&(id, _)| {
                 let check = rows.iter().find(|r| r.id == id).map_or_else(
                     || Check::CouldNotRun(format!("the engine reported no row for {id}")),
@@ -539,27 +586,39 @@ pub(crate) fn audit(host: &Arc<dyn ReleaseHost>) -> Vec<(&'static str, Check)> {
                 (id, check)
             })
             .collect(),
-        Err(refusal) => ITEMS
-            .iter()
+        Err(refusal) => selected
+            .into_iter()
             .map(|&(id, _)| (id, Check::CouldNotRun(refusal.to_string())))
             .collect(),
     }
 }
 
 /// Move the deployer key's need after a provision's audit (not `--check`): a key missing at
-/// the catalog path is asked of the lab, a key present meets the need, and a key named
+/// the catalog path is asked of the lab, a locally valid key meets the need, and a key named
 /// somewhere else, or named nowhere, is never asked for, since the vault delivers only to its
 /// catalog path and the deploy reads only the path it names. The line to show, if any.
 pub(crate) fn settle_site_key(host: &Arc<dyn ReleaseHost>) -> Option<String> {
     let key = host.site_key().ok()?;
-    let present = key
-        .as_ref()
-        .is_some_and(|key| std::fs::metadata(key).is_ok_and(|meta| meta.is_file()));
-    let step = if present {
+    let valid = match key.as_ref().map(|key| validate_site_key(key)) {
+        Some(Ok(())) => true,
+        Some(Err(why))
+            if key
+                .as_ref()
+                .is_some_and(|key| std::fs::symlink_metadata(key).is_ok()) =>
+        {
+            return Some(format!(
+                "the deployer's key is unusable: {why}; the need is not marked fulfilled"
+            ));
+        }
+        _ => false,
+    };
+    let step = if valid {
         NeedStep::Satisfied
     } else {
         match (&key, host.catalog_site_key()) {
-            (Some(key), Some(catalog)) if *key == catalog => NeedStep::Raise,
+            (Some(key), Some(catalog)) if same_missing_destination(key, &catalog) => {
+                NeedStep::Raise
+            }
             (Some(key), Some(catalog)) => {
                 return Some(format!(
                     "the deployer's key is named at {}, not at {}, where the vault delivers it: \
@@ -593,11 +652,50 @@ pub(crate) fn settle_site_key(host: &Arc<dyn ReleaseHost>) -> Option<String> {
     }
 }
 
+/// Parse the same bounded regular file as deployment, admitting only Google's endpoint.
+/// This proves local signing material, not remote authorization.
+fn validate_site_key(path: &Path) -> Result<(), String> {
+    let key = crate::site::hosting::Key::read(path)?;
+    crate::site::hosting::Origins::google()
+        .admit(&key.token_uri)
+        .map(|_| ())
+        .map_err(|_| "the service-account token endpoint is not Google's admitted endpoint".into())
+}
+
+/// Resolve existing parents as the deployer would, without opening a key or treating a
+/// dangling leaf symlink as a file the vault may replace. Missing parents are not guessed.
+fn same_missing_destination(named: &Path, catalog: &Path) -> bool {
+    let absent = |path| {
+        std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    };
+    if !absent(named) || !absent(catalog) {
+        return false;
+    }
+    if named == catalog {
+        return true;
+    }
+    let Some(name) = named.file_name() else {
+        return false;
+    };
+    if catalog.file_name() != Some(name) {
+        return false;
+    }
+    match (
+        named.parent().and_then(|p| p.canonicalize().ok()),
+        catalog.parent().and_then(|p| p.canonicalize().ok()),
+    ) {
+        (Some(named), Some(catalog)) => named == catalog,
+        _ => false,
+    }
+}
+
 /// This machine.
 #[cfg(unix)]
 pub(crate) struct System {
     repo: PathBuf,
     home: PathBuf,
+    source_helper: Result<Option<PathBuf>, String>,
 }
 
 #[cfg(unix)]
@@ -607,7 +705,13 @@ impl System {
         Self {
             repo: repo.to_path_buf(),
             home: home.to_path_buf(),
+            source_helper: Ok(None),
         }
+    }
+
+    pub(crate) fn with_source_helper(mut self, helper: Result<Option<PathBuf>, String>) -> Self {
+        self.source_helper = helper;
+        self
     }
 
     fn installed_aterm(&self) -> Option<PathBuf> {
@@ -657,15 +761,18 @@ impl ReleaseHost for System {
             .ok_or("no $HOME names this user's cache")?;
         let host = aterm_verify::provision::System::new(&self.repo);
         Ok(
-            aterm_verify::provision::select(&aterm_verify::provision::Options::default())
-                .into_iter()
-                .map(|row| {
-                    (
-                        row.name,
-                        aterm_verify::provision::check(row, &machine, &host),
-                    )
-                })
-                .collect(),
+            aterm_verify::provision::select(&aterm_verify::provision::Options {
+                release: true,
+                ..Default::default()
+            })
+            .into_iter()
+            .map(|row| {
+                (
+                    row.name,
+                    aterm_verify::provision::check(row, &machine, &host),
+                )
+            })
+            .collect(),
         )
     }
 
@@ -697,6 +804,25 @@ impl ReleaseHost for System {
         std::env::var_os("PUBLICATION_ENGINE")
             .filter(|v| !v.is_empty())
             .map_or_else(|| self.home.join("publication"), PathBuf::from)
+    }
+
+    fn publication_bootstrap(&self) -> Result<(), String> {
+        crate::release_steps::engine_bootstrap(&self.repo, &self.publication())
+    }
+
+    fn source_signing(&self) -> Result<(), String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("source signing clock: {e}"))?
+            .as_secs();
+        let helper = self.source_helper.as_ref().map_err(Clone::clone)?;
+        crate::source_signing::Tools::probe(
+            &self.repo,
+            &self.home,
+            i64::try_from(now).unwrap_or(i64::MAX),
+            helper.as_deref(),
+        )
+        .map(|_| ())
     }
 
     fn site(&self) -> Result<Option<PathBuf>, String> {
@@ -774,6 +900,9 @@ mod tests {
         site: Option<PathBuf>,
         site_key: Option<PathBuf>,
         tools: Vec<&'static str>,
+        bootstrap_error: Option<&'static str>,
+        source_signing_error: Option<&'static str>,
+        source_signing_calls: std::sync::atomic::AtomicUsize,
         unreached: Vec<&'static str>,
         needs: std::sync::Mutex<Vec<NeedStep>>,
     }
@@ -792,6 +921,15 @@ mod tests {
         }
         fn publication(&self) -> PathBuf {
             self.home.join("publication")
+        }
+        fn publication_bootstrap(&self) -> Result<(), String> {
+            self.bootstrap_error.map_or(Ok(()), |why| Err(why.into()))
+        }
+        fn source_signing(&self) -> Result<(), String> {
+            self.source_signing_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.source_signing_error
+                .map_or(Ok(()), |why| Err(why.into()))
         }
         fn site(&self) -> Result<Option<PathBuf>, String> {
             Ok(self.site.clone())
@@ -851,13 +989,21 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    fn write_deployer_key(home: &Path) {
+        std::fs::write(
+            home.join("deployer.json"),
+            crate::site::hosting::key::tests::key_json("https://oauth2.googleapis.com/token"),
+        )
+        .unwrap();
+    }
+
     fn whole(home: &Path) -> Fake {
         std::fs::create_dir_all(home.join("publication/.git")).unwrap();
         executable(&home.join("publication/bin/pub"));
         registry(home, &aterm_entry());
         std::fs::create_dir_all(home.join("site")).unwrap();
         std::fs::write(home.join("site/firebase.json"), "{}").unwrap();
-        std::fs::write(home.join("deployer.json"), "{}").unwrap();
+        write_deployer_key(home);
         whole_keeping(home)
     }
 
@@ -891,6 +1037,21 @@ mod tests {
     fn line_of(fake: Fake, id: &str) -> Check {
         let checks = audit(&(Arc::new(fake) as Arc<dyn ReleaseHost>));
         checks.into_iter().find(|(i, _)| *i == id).unwrap().1
+    }
+
+    #[test]
+    fn a_present_engine_without_its_runtime_is_not_ready_and_recovers() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mut fake = whole(dir.path());
+        fake.bootstrap_error = Some("launcher runtime unavailable");
+        assert!(matches!(
+            line_of(fake, "release.publication"),
+            Check::CouldNotRun(why) if why.contains("launcher runtime unavailable")
+        ));
+        assert!(matches!(
+            line_of(whole_keeping(dir.path()), "release.publication"),
+            Check::Pass(_)
+        ));
     }
 
     #[test]
@@ -928,13 +1089,13 @@ mod tests {
         }
         std::fs::remove_file(home.join("deployer.json")).unwrap();
         match line_of(whole_keeping(home), "release.site-key") {
-            Check::Fail { what, .. } => assert!(what.contains("cannot be read"), "{what}"),
+            Check::Fail { what, .. } => assert!(what.contains("deployer.json"), "{what}"),
             other => panic!("{other:?}"),
         }
         let mut fake = whole(home);
         fake.site_key = Some(home.join("site"));
         match line_of(fake, "release.site-key") {
-            Check::Fail { what, .. } => assert!(what.contains("not a file"), "{what}"),
+            Check::Fail { what, .. } => assert!(what.contains("site"), "{what}"),
             other => panic!("{other:?}"),
         }
         assert!(matches!(
@@ -952,13 +1113,109 @@ mod tests {
             site: Some(home.join("site")),
             site_key: Some(home.join("deployer.json")),
             tools: vec!["gitleaks"],
+            bootstrap_error: None,
+            source_signing_error: None,
+            source_signing_calls: std::sync::atomic::AtomicUsize::new(0),
             unreached: Vec::new(),
             needs: std::sync::Mutex::new(Vec::new()),
         }
     }
 
+    #[test]
+    fn apple_tools_do_not_hide_an_unavailable_source_signer() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mut fake = whole(dir.path());
+        fake.source_signing_error = Some("source signing needs OpenSSL 3");
+        assert!(matches!(
+            line_of(fake, "release.source-signing"),
+            Check::CouldNotRun(_)
+        ));
+        assert!(matches!(
+            line_of(whole_keeping(dir.path()), "release.source-signing"),
+            Check::Pass(_)
+        ));
+    }
+
+    #[test]
+    fn identity_dependent_signing_is_checked_after_provisioning_not_as_its_prerequisite() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mut fake = whole(dir.path());
+        fake.source_signing_error = Some("identity not created yet");
+        let mut fake = Arc::new(fake);
+        let host: Arc<dyn ReleaseHost> = fake.clone();
+        assert!(
+            super::super::blockers(&audit(&host)) > 0,
+            "the original order blocks creation"
+        );
+        let calls = fake.source_signing_calls.load(SeqCst);
+        assert_eq!(super::super::blockers(&audit_before_identity(&host)), 0);
+        assert_eq!(
+            fake.source_signing_calls.load(SeqCst),
+            calls,
+            "no premature signing call"
+        );
+        assert!(
+            super::super::blockers(&audit_source_signing(&host)) > 0,
+            "readiness still fails before the identity exists"
+        );
+        drop(host);
+        Arc::get_mut(&mut fake).unwrap().source_signing_error = None;
+        let host: Arc<dyn ReleaseHost> = fake.clone();
+        assert_eq!(super::super::blockers(&audit_source_signing(&host)), 0);
+        drop(host);
+        Arc::get_mut(&mut fake).unwrap().develop =
+            vec![("openssl-signing", State::Missing("not installed".into()))];
+        let host: Arc<dyn ReleaseHost> = fake.clone();
+        assert!(
+            super::super::blockers(&audit_before_identity(&host)) > 0,
+            "signing tools are still prerequisites"
+        );
+    }
+
+    #[test]
+    fn deployer_key_discovery_recognizes_an_equivalent_missing_destination() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::fs::create_dir_all(home.join("site/inner")).unwrap();
+        let fake = Arc::new(Fake {
+            site_key: Some(home.join("site/inner/../../deployer.json")),
+            ..whole_keeping(home)
+        });
+        let host: Arc<dyn ReleaseHost> = fake.clone();
+        assert_eq!(settle_site_key(&host).as_deref(), Some("posted to the lab"));
+        assert_eq!(*fake.needs.lock().unwrap(), [NeedStep::Raise]);
+        assert!(!home.join("deployer.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployer_key_discovery_respects_symlinks_before_parent_components() {
+        use std::os::unix::fs::symlink;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::fs::create_dir_all(home.join("elsewhere/deep")).unwrap();
+        symlink(home.join("elsewhere/deep"), home.join("alias")).unwrap();
+        let fake = Arc::new(Fake {
+            site_key: Some(home.join("alias/../deployer.json")),
+            ..whole_keeping(home)
+        });
+        let host: Arc<dyn ReleaseHost> = fake.clone();
+        assert!(settle_site_key(&host).unwrap().contains("is not asked"));
+        assert!(fake.needs.lock().unwrap().is_empty());
+        assert!(!same_missing_destination(
+            &home.join("absent/../deployer.json"),
+            &home.join("deployer.json"),
+        ));
+        symlink(home.join("missing-key"), home.join("deployer.json")).unwrap();
+        assert!(!same_missing_destination(
+            &home.join("deployer.json"),
+            &home.join("deployer.json"),
+        ));
+    }
+
     /// A key missing at the catalog path is asked of the lab only by a provision run, never by
-    /// an audit; a key named elsewhere is never asked for; a key present meets the need.
+    /// an audit; a key named elsewhere is never asked for; a valid key meets the need.
     #[test]
     fn the_deployer_key_row_asks_the_lab_only_for_the_catalog_path_and_only_on_a_run() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -983,7 +1240,7 @@ mod tests {
             Check::Fail { what, .. } => assert!(what.contains("the lab: posted"), "{what}"),
             other => panic!("{other:?}"),
         }
-        std::fs::write(home.join("deployer.json"), "{}").unwrap();
+        write_deployer_key(home);
         assert_eq!(settle_site_key(&host).as_deref(), Some("fulfilled"));
         assert_eq!(
             *fake.needs.lock().unwrap(),
@@ -1020,6 +1277,49 @@ mod tests {
             unnamed.needs.lock().unwrap().is_empty(),
             "a deploy that names no key is never raised for: nothing would read the delivery"
         );
+    }
+
+    #[test]
+    fn malformed_deployer_keys_neither_pass_the_audit_nor_fulfill_the_need() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let fake = Arc::new(whole(home));
+        let host: Arc<dyn ReleaseHost> = fake.clone();
+        fake.needs.lock().unwrap().push(NeedStep::Raise);
+        for bytes in [
+            "{}".to_owned(),
+            "not-json-private-marker".to_owned(),
+            crate::site::hosting::key::tests::key_json("https://untrusted.invalid/token"),
+            crate::site::hosting::key::tests::key_json("https://oauth2.googleapis.com/token")
+                .replace(
+                    concat!("-----BEGIN ", "PRIVATE KEY-----"),
+                    "invalid-private-marker",
+                ),
+        ] {
+            std::fs::write(home.join("deployer.json"), bytes).unwrap();
+            let checks = audit(&host);
+            let check = &checks
+                .iter()
+                .find(|(id, _)| *id == "release.site-key")
+                .unwrap()
+                .1;
+            assert!(matches!(check, Check::Fail { .. }), "{check:?}");
+            let why = settle_site_key(&host).unwrap();
+            assert!(why.contains("not marked fulfilled"), "{why}");
+            assert!(!format!("{check:?}{why}").contains("private-marker"));
+            assert!(!fake.needs.lock().unwrap().contains(&NeedStep::Satisfied));
+        }
+        write_deployer_key(home);
+        assert!(matches!(
+            audit(&host)
+                .iter()
+                .find(|(id, _)| *id == "release.site-key")
+                .unwrap()
+                .1,
+            Check::Pass(_)
+        ));
+        assert_eq!(settle_site_key(&host).as_deref(), Some("fulfilled"));
+        assert!(fake.needs.lock().unwrap().contains(&NeedStep::Satisfied));
     }
 
     #[test]
@@ -1150,7 +1450,7 @@ mod tests {
         match find("develop") {
             Check::Fail { what, fix } => {
                 assert!(what.contains("missing: fish"), "{what}");
-                assert_eq!(fix, "targo --unverified verify provision");
+                assert_eq!(fix, "targo --unverified verify provision --release");
             }
             other => panic!("{other:?}"),
         }

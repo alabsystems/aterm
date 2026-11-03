@@ -283,13 +283,17 @@ fn worker_turns(items: &[Item]) -> Vec<TurnRows<'_>> {
     out
 }
 
-/// The rule a result is read by: a check's or a plain turn's.
+/// The rule a result is read by: a check's, a plain turn's, or a worker's that failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DoneBy {
     /// The newest turn is a harness check's: the report before it, then what its reply adds.
     Check,
     /// The newest turn's final message, no token required.
     Turn,
+    /// The final message of the newest turn of a worker that ended unfinished. It is read as
+    /// [`Self::Turn`] is, even where that turn answers a harness check or nudge: such a reply
+    /// says no `DONE` or `LANDED`, so a check's rule would read it as `no-reply`.
+    Failed,
 }
 
 impl DoneBy {
@@ -299,6 +303,7 @@ impl DoneBy {
         match self {
             DoneBy::Check => "check",
             DoneBy::Turn => "turn",
+            DoneBy::Failed => "failed",
         }
     }
 
@@ -308,6 +313,7 @@ impl DoneBy {
         match word {
             "check" | "done-check" => Some(DoneBy::Check),
             "turn" | "marker" => Some(DoneBy::Turn),
+            "failed" => Some(DoneBy::Failed),
             _ => None,
         }
     }
@@ -352,7 +358,9 @@ fn read_items(items: &[Item], by: DoneBy) -> (DoneBy, Result<Report, &'static st
     let Some((newest, before)) = turns.split_last() else {
         return (by, Err("no-reply"));
     };
-    if by == DoneBy::Check || newest.is_check() {
+    if by == DoneBy::Failed {
+        (DoneBy::Failed, by_turn(newest))
+    } else if by == DoneBy::Check || newest.is_check() {
         (DoneBy::Check, by_check(newest, before))
     } else {
         (DoneBy::Turn, by_turn(newest))
@@ -1208,6 +1216,18 @@ fn check_stem(stem: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// What a sidecar's line adds for a snapshot read by [`DoneBy::Failed`] ([`failed_rule`]).
+const FAILED_RULE: &str = "rule=failed";
+
+/// The rule the snapshot at `path` read by, for reading its miss again: [`DoneBy::Failed`] where its
+/// sidecar says so ([`FAILED_RULE`]), since a land check's answer that says `Could not finish:` is no
+/// report by the check's rule. Any other reads by [`DoneBy::Turn`], the turn's own rule.
+fn failed_rule(path: &Path) -> DoneBy {
+    let failed = super::footer::read_small(&sidecar_of(path), SIDECAR_READ_BYTES)
+        .is_some_and(|t| t.split_whitespace().any(|word| word == FAILED_RULE));
+    if failed { DoneBy::Failed } else { DoneBy::Turn }
+}
+
 fn write_snapshot(
     tasks: &Path,
     stem: &str,
@@ -1228,7 +1248,13 @@ fn write_snapshot(
     }
     let path = tasks.join(format!("{stem}.result.md"));
     super::upgrade_models::write_atomic(&path, text)?;
-    super::upgrade_models::write_atomic(&sidecar_of(&path), &format!("{}\n", source.line()))?;
+    // A FAILED CONCLUSION'S MISS IS READ AGAIN BY ITS OWN RULE ([`failed_rule`]).
+    let rule = if by == DoneBy::Failed {
+        format!(" {FAILED_RULE}")
+    } else {
+        String::new()
+    };
+    super::upgrade_models::write_atomic(&sidecar_of(&path), &format!("{}{rule}\n", source.line()))?;
     Ok(Snapshot {
         path,
         bytes: text.len() as u64,
@@ -1575,7 +1601,7 @@ pub fn reread_with(
     let (jsonl, _) = tail_of(&transcript, TRANSCRIPT_READ_BYTES)?;
     let end = end_of(&jsonl, &Opener::Row(turn));
     end.upto?;
-    let report = read(&upto(jsonl, end), DoneBy::Turn).report.ok()?;
+    let report = read(&upto(jsonl, end), failed_rule(path)).report.ok()?;
     Some(Reread {
         report,
         transcript,

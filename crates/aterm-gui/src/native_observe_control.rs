@@ -59,7 +59,7 @@ pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, tail: &str) -> St
     };
     let initial = {
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-        context(ctx, &meta, &caller, &System(&ctx.native_policy))
+        context(ctx, &meta, &caller, &System(&ctx.native_policy, false))
     };
     let Some(initial) = initial else {
         return unknown();
@@ -68,7 +68,8 @@ pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, tail: &str) -> St
     match request {
         Request::Refresh(binding) => {
             let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(fresh) = context(ctx, &meta, &caller, &System(&ctx.native_policy)) else {
+            let Some(fresh) = context(ctx, &meta, &caller, &System(&ctx.native_policy, false))
+            else {
                 return unknown();
             };
             let reply = observations
@@ -102,7 +103,8 @@ pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, tail: &str) -> St
                 return unknown();
             }
             let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(fresh) = context(ctx, &meta, &caller, &System(&ctx.native_policy)) else {
+            let Some(fresh) = context(ctx, &meta, &caller, &System(&ctx.native_policy, false))
+            else {
                 return unknown();
             };
             let Some(now) = Clock::System.now_us() else {

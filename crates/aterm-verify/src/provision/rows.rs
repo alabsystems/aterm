@@ -108,6 +108,11 @@ pub enum Install {
         /// Patches, in the order they apply.
         patches: &'static [Archive],
     },
+    /// Native source-signing executable, statically linked to its pinned OpenSSL libraries.
+    OpenSsl {
+        /// Upstream source tarball, held to its size and SHA-256.
+        source: Archive,
+    },
     /// Crate CLI built by `targo --unverified install --locked` at its lockfile pin.
     Cargo,
     /// Browser engine pinned by the browser lane.
@@ -162,7 +167,9 @@ impl Row {
             Install::Unpack { archives, .. } | Install::Rustup { init: archives, .. } => {
                 archives.iter().find(|a| a.platform == platform).copied()
             }
-            Install::Build { source, .. } | Install::Configure { source, .. } => self
+            Install::Build { source, .. }
+            | Install::Configure { source, .. }
+            | Install::OpenSsl { source } => self
                 .tool_row()
                 .and_then(|t| t.pin)
                 .is_some_and(|p| p.pinned_for(platform))
@@ -223,7 +230,19 @@ const BASH_PATCHES: [Archive; aterm_uds::host::bash::PATCHES.len()] = {
 pub const MICROSOFT_TEAM: &str = "UBF8T346G9";
 
 /// Every row, in the order a run provides them.
-pub const ROWS: [Row; 13] = [
+pub const ROWS: [Row; 14] = [
+    Row {
+        name: "openssl-signing",
+        tool: Some("openssl-signing"),
+        install: Install::OpenSsl {
+            source: Archive {
+                platform: "source",
+                url: "https://github.com/openssl/openssl/releases/download/openssl-{v}/openssl-{v}.tar.gz",
+                sha256: "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a",
+                bytes: 53_279_637,
+            },
+        },
+    },
     Row {
         name: "gitleaks",
         tool: Some("gitleaks"),

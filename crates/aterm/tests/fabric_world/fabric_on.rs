@@ -715,11 +715,10 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
         .expect("the model has Grants")
         .1 = 8;
     let stale = |s: &Scratch, node: &str| {
-        std::fs::write(
-            s.root().join("node.cap"),
+        harness::write_cap(
+            &s.root().join("node.cap"),
             format!("rw,p={node}:/f/local/pub/{node}/> {}\n", "00".repeat(32)),
-        )
-        .expect("stale cap");
+        );
     };
     let foreign = |s: &Scratch, node: &str| {
         let lines: String = aterm_link::enable::node_grants("local", node)
@@ -729,7 +728,7 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
                 astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
             })
             .collect();
-        std::fs::write(s.root().join("node.cap"), lines).expect("foreign cap");
+        harness::write_cap(&s.root().join("node.cap"), lines);
     };
     let renode = |s: &Scratch| {
         let secret = std::fs::read(s.root().join("mint.secret")).expect("secret");
@@ -740,7 +739,7 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
                 astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
             })
             .collect();
-        std::fs::write(s.root().join("node.cap"), lines).expect("another node's cap");
+        harness::write_cap(&s.root().join("node.cap"), lines);
     };
     let node_of = |s: &Scratch| -> String {
         std::fs::create_dir_all(s.root().join("link-state")).expect("state");
@@ -933,7 +932,7 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
     }
 }
 
-fn held_fifo(path: &Path) -> std::fs::File {
+fn fifo_with_no_writer(path: &Path) {
     use std::os::unix::ffi::OsStrExt as _;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a FIFO path");
     // SAFETY: a NUL-terminated path, live for the call.
@@ -945,6 +944,10 @@ fn held_fifo(path: &Path) -> std::fs::File {
         path.display(),
         std::io::Error::last_os_error()
     );
+}
+
+fn held_fifo(path: &Path) -> std::fs::File {
+    fifo_with_no_writer(path);
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1431,7 +1434,7 @@ fn role_identity_unreadable_state_never_writes() {
         let node = b"n-00000000000000aa\n";
         let cap = b"the cap the root already holds\n";
         std::fs::write(s.root().join("link-state/node"), node).expect("node");
-        std::fs::write(s.root().join("node.cap"), cap).expect("cap");
+        harness::write_cap(&s.root().join("node.cap"), cap);
         match bad {
             "config-toml" => std::fs::write(s.config(), "[fabric]\ncommand = [\n").unwrap(),
             "config-directory" => std::fs::create_dir(s.config()).unwrap(),
@@ -1632,7 +1635,7 @@ fn off_then_on_for_another_fleet_mints_that_fleets_ring() {
             astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
         })
         .collect();
-    std::fs::write(s.root().join("node.cap"), &by_hand).expect("a ring minted by hand");
+    harness::write_cap(&s.root().join("node.cap"), &by_hand);
     let (code, out, err) = s.fabric(&["off", "--service", "none"]);
     assert_eq!(code, 0, "off:\n{out}{err}");
     let dry = dry_cap("third");
@@ -2046,6 +2049,322 @@ fn mint_for_never_claims_0600_of_a_file_that_is_not() {
     assert_eq!(harness::mode_of(Path::new(&victim)), 0o644);
 }
 
+/// A CAP IS READ BY THE OWNER-ONLY RULE, through every verb that takes its path. A cap as every
+/// build wrote it, 0600 in a folder others can list, keeps working. One others can read, a symlink
+/// and a FIFO with no writer are each refused at once, naming the file and what to do, behind
+/// `output_within`'s one-minute hang detector; a plain read waits for ever on the FIFO.
+#[test]
+fn every_verb_that_takes_a_cap_path_refuses_a_wide_one_a_link_and_a_fifo_at_once() {
+    let s = Scratch::new("cap-refused");
+    let _broker = Broker::spawn(&s);
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let shared = s.dir.join("shared");
+    std::fs::create_dir_all(&shared).expect("a folder others can list");
+    chmod(&shared, 0o755);
+    let cap = s.path("shared/h-review.cap");
+    let (code, out, err) = s.fabric(&["mint-for", "h-review", "--out", &cap]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(mode_of(Path::new(&cap)), 0o600, "what mint-for writes");
+    let (code, out, err) = s.fabric(&["inbox", "--cap-file", &cap, "--peek"]);
+    assert_eq!(code, 0, "a cap as written keeps working:\n{out}\n{err}");
+
+    let wide = s.path("shared/wide.cap");
+    std::fs::copy(&cap, &wide).expect("a copy of the cap");
+    chmod(Path::new(&wide), 0o644);
+    let link = s.path("shared/link.cap");
+    std::os::unix::fs::symlink(&cap, &link).expect("a link to the cap");
+    let fifo = s.path("shared/fifo.cap");
+    fifo_with_no_writer(Path::new(&fifo));
+
+    let sock = s.sock();
+    let state = s.path("shared/serve-state");
+    let token = s.path("shared/serve.token");
+    std::fs::write(&token, "observer-token\n").expect("a token");
+    chmod(Path::new(&token), 0o600);
+    for (bad, says) in [
+        (&wide, format!("chmod 600 {wide}")),
+        (&link, "name the file it points at".to_string()),
+        (&fifo, "aterm fabric mint-for".to_string()),
+    ] {
+        let verbs = [
+            ("fabric halt", s.fabric(&["halt", "--cap-file", bad, "x"])),
+            ("fabric brief", s.fabric(&["brief", "--cap-file", bad])),
+            (
+                "fabric inbox",
+                s.fabric(&["inbox", "--cap-file", bad, "--peek"]),
+            ),
+            (
+                "fabric post",
+                s.fabric(&[
+                    "post",
+                    "--cap-file",
+                    bad,
+                    "to=@s-0000000000000000a1ce@n-00000000000000aa",
+                    "kind=answer",
+                    "re=1",
+                    "x",
+                ]),
+            ),
+            (
+                "link ls",
+                s.link(&[
+                    "ls",
+                    "--fleet",
+                    "local",
+                    "--broker",
+                    &sock,
+                    "--cap-file",
+                    bad,
+                ]),
+            ),
+            (
+                "link notify",
+                s.link(&[
+                    "notify",
+                    "--fleet",
+                    "local",
+                    "--broker",
+                    &sock,
+                    "--cap-file",
+                    bad,
+                    "--on",
+                    "ask:h-review",
+                    "--exec",
+                    "/usr/bin/true",
+                ]),
+            ),
+            (
+                "link serve",
+                s.link(&[
+                    "serve",
+                    "--fleet",
+                    "local",
+                    "--broker",
+                    &sock,
+                    "--cap-file",
+                    bad,
+                    "--state",
+                    &state,
+                    "--sock",
+                    &s.path("no-such.sock"),
+                    "--token-file",
+                    &token,
+                ]),
+            ),
+        ];
+        for (verb, (code, out, err)) in verbs {
+            assert_ne!(code, 0, "{verb} {bad}:\n{out}\n{err}");
+            assert!(
+                err.contains(bad.as_str()) && err.contains(&says),
+                "{verb} names {bad} and says `{says}`:\n{out}\n{err}"
+            );
+        }
+    }
+    assert_eq!(mode_of(Path::new(&wide)), 0o644, "reading narrows nothing");
+}
+
+/// `on` NEVER REPLACES A RING IT WAS REFUSED: where others could have reached it, a ring that sat
+/// readable may have been read, so it names the file and leaves it at its mode, as its secret step
+/// does, in a dry run too and whether or not there is a secret yet. The fabric keeps running on it
+/// meanwhile; `status` and `doctor` say so, in one warning whose fix is the file's. Once fixed, or
+/// moved aside, `on` goes on as ever.
+#[test]
+fn on_never_replaces_a_ring_the_owner_rule_refuses() {
+    let s = Scratch::new("cap-on-refused");
+    let _broker = Broker::spawn(&s);
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let cap = s.root().join("node.cap");
+    let shown = cap.display().to_string();
+    assert_eq!(mode_of(&cap), 0o600, "what `on` mints");
+    let ring = std::fs::read(&cap).expect("the ring");
+    let failed = |out: &str, says: &str| {
+        step(out, "cap")
+            .iter()
+            .any(|l| l.contains("FAILED") && l.contains(&shown) && l.contains(says))
+    };
+
+    for args in [
+        &["on", "--dry-run", "--service", "none"][..],
+        &["on", "--service", "none"][..],
+    ] {
+        chmod(&s.root(), 0o755);
+        chmod(&cap, 0o644);
+        let (code, out, err) = s.fabric(args);
+        assert_eq!(code, 2, "{args:?}\n{out}\n{err}");
+        assert!(
+            failed(&out, &format!("chmod 600 {shown}")),
+            "{args:?}\n{out}"
+        );
+        assert!(failed(&out, "move it aside"), "{args:?}\n{out}");
+        assert_eq!(mode_of(&cap), 0o644, "{args:?} tightens nothing");
+        assert_eq!(std::fs::read(&cap).expect("the ring"), ring, "{args:?}");
+    }
+    let (_, out, err) = s.fabric(&[]);
+    assert!(
+        out.contains("UNREADABLE") && out.contains(&format!("chmod 600 {shown}")),
+        "the status report names it:\n{out}\n{err}"
+    );
+    let (_, out, err) = s.fabric(&["doctor"]);
+    assert!(
+        out.contains(&format!("chmod 600 {shown}")),
+        "doctor names it whole:\n{out}\n{err}"
+    );
+    for false_fix in ["re-mints", "bus could not be read"] {
+        assert!(
+            !out.contains(false_fix),
+            "doctor's fix is the refusal's, not `{false_fix}`:\n{out}\n{err}"
+        );
+    }
+
+    chmod(&cap, 0o600);
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        step(&out, "cap").iter().any(|l| l.contains("already")),
+        "the ring is the one it was:\n{out}"
+    );
+    assert_eq!(std::fs::read(&cap).expect("the ring"), ring);
+
+    let real = s.path("real.cap");
+    std::fs::rename(&cap, &real).expect("move the ring");
+    std::os::unix::fs::symlink(&real, &cap).expect("a link in its place");
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 2, "a link:\n{out}\n{err}");
+    assert!(failed(&out, "is a symlink"), "{out}");
+    assert!(
+        std::fs::symlink_metadata(&cap)
+            .expect("the link")
+            .file_type()
+            .is_symlink(),
+        "`on` leaves it"
+    );
+    std::fs::remove_file(&cap).expect("the link");
+
+    fifo_with_no_writer(&cap);
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 2, "a FIFO, within the hang detector:\n{out}\n{err}");
+    assert!(failed(&out, "is a FIFO"), "{out}");
+    std::fs::remove_file(&cap).expect("the FIFO");
+
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 0, "moved aside, `on` mints:\n{out}\n{err}");
+    assert_eq!(mode_of(&cap), 0o600);
+    assert_eq!(
+        std::fs::read(&cap).expect("the ring"),
+        ring,
+        "the same tags"
+    );
+}
+
+/// The verdict on a ring does not wait for the secret: over a root holding nothing but a ring it
+/// was refused, the dry run says what the real run stops at, not a mint it will never make. The
+/// way a person reaches this is the remedy `mint-for` prints, to move the secret aside.
+#[test]
+fn on_says_the_same_of_a_refused_ring_dry_and_real_with_no_secret_yet() {
+    let s = Scratch::new("cap-on-nosecret");
+    let _broker = Broker::spawn(&s);
+    chmod(&s.root(), 0o755);
+    let cap = s.root().join("node.cap");
+    std::fs::write(&cap, "by hand\n").expect("a ring by hand");
+    chmod(&cap, 0o644);
+    let shown = cap.display().to_string();
+    for args in [
+        &["on", "--dry-run", "--service", "none"][..],
+        &["on", "--service", "none"][..],
+    ] {
+        let (code, out, err) = s.fabric(args);
+        assert_eq!(code, 2, "{args:?}\n{out}\n{err}");
+        assert!(
+            step(&out, "cap")
+                .iter()
+                .any(|l| l.contains("FAILED") && l.contains(&format!("chmod 600 {shown}"))),
+            "{args:?}\n{out}"
+        );
+        assert_eq!(mode_of(&cap), 0o644, "{args:?}");
+        chmod(&s.root(), 0o755);
+    }
+}
+
+/// Setup leaves refused rings intact in a private root, in both dry and real runs.
+/// Permission denial does not authorize changing the file's mode or replacing its contents.
+#[test]
+fn on_preserves_refused_rings_even_in_a_private_root() {
+    let s = Scratch::new("cap-on-private");
+    let _broker = Broker::spawn(&s);
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let cap = s.root().join("node.cap");
+    let ring = std::fs::read(&cap).expect("the ring");
+    assert_eq!(mode_of(&s.root()), 0o700);
+    for mode in [0o644, 0o000] {
+        chmod(&cap, mode);
+        for dry in [true, false] {
+            let args: &[&str] = if dry {
+                &["on", "--dry-run", "--service", "none"]
+            } else {
+                &["on", "--service", "none"]
+            };
+            let (code, out, err) = s.fabric(args);
+            assert_eq!(code, 2, "mode {mode:o}, dry={dry}:\n{out}\n{err}");
+            assert!(
+                step(&out, "cap").iter().any(|line| line.contains("FAILED")),
+                "{out}"
+            );
+            assert_eq!(mode_of(&cap), mode, "the refused file was changed");
+        }
+        chmod(&cap, 0o600);
+        assert_eq!(std::fs::read(&cap).expect("preserved ring"), ring);
+    }
+}
+
+/// `(0600)` IS WHAT THE READERS JUDGE. A folder whose access list passes to its new files gives a
+/// cap written there a hole its mode does not show, so `mint-for --out` says so and keeps no cap
+/// there, rather than report a file aterm then refuses. A cap already there, carrying its own
+/// entry, is refused naming `chmod -N` and left. Cleared, both work.
+#[cfg(target_os = "macos")]
+#[test]
+fn mint_for_keeps_no_cap_in_a_folder_whose_access_list_lets_others_into_it() {
+    let acl = |args: &[&str], path: &Path| {
+        let done = aterm_uds::spawnfd::command("chmod")
+            .args(args)
+            .arg(path)
+            .status()
+            .expect("run chmod");
+        assert!(done.success(), "chmod {args:?}");
+    };
+    let s = Scratch::new("cap-acl");
+    let _broker = Broker::spawn(&s);
+    let (code, out, err) = s.fabric(&["on", "--service", "none"]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let shared = s.dir.join("shared");
+    std::fs::create_dir_all(&shared).expect("a folder");
+    let cap = s.path("shared/h-acl.cap");
+
+    acl(&["+a", "everyone allow read,file_inherit"], &shared);
+    let (code, out, err) = s.fabric(&["mint-for", "h-acl", "--out", &cap]);
+    assert_ne!(code, 0, "{out}\n{err}");
+    assert!(err.contains("access list"), "{out}\n{err}");
+    assert!(!out.contains("(0600)"), "{out}\n{err}");
+    assert!(!Path::new(&cap).exists(), "no cap others can read is kept");
+
+    acl(&["-N"], &shared);
+    let (code, out, err) = s.fabric(&["mint-for", "h-acl", "--out", &cap]);
+    assert_eq!(code, 0, "cleared, it writes:\n{out}\n{err}");
+    let (code, out, err) = s.fabric(&["inbox", "--cap-file", &cap, "--peek"]);
+    assert_eq!(code, 0, "and aterm reads it:\n{out}\n{err}");
+
+    acl(&["+a", "everyone allow read"], Path::new(&cap));
+    let (code, out, err) = s.fabric(&["mint-for", "h-acl", "--out", &cap]);
+    assert_ne!(code, 0, "{out}\n{err}");
+    assert!(err.contains(&format!("chmod -N {cap}")), "{out}\n{err}");
+    assert!(Path::new(&cap).exists(), "a cap it did not write is left");
+    acl(&["-N"], Path::new(&cap));
+    let (code, out, err) = s.fabric(&["mint-for", "h-acl", "--out", &cap]);
+    assert_eq!(code, 0, "cleared, the same cap stands:\n{out}\n{err}");
+}
+
 #[test]
 fn a_person_reads_an_ask_and_answers_it_as_a_human() {
     let s = Scratch::new("person");
@@ -2191,7 +2510,7 @@ fn a_broker_that_refuses_a_lapsed_ring_is_named_as_answering() {
             astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
         })
         .collect();
-    std::fs::write(s.root().join("node.cap"), &lapsed).expect("a lapsed ring minted by hand");
+    harness::write_cap(&s.root().join("node.cap"), &lapsed);
     let (code, out, err) = s.fabric(&["on", "--fleet", "work", "--service", "none"]);
     assert_ne!(code, 0, "{out}{err}");
     let broker = step(&out, "broker").join("\n");

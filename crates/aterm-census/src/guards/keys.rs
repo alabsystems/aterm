@@ -44,7 +44,7 @@ fn key_material(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
     surface.extend(tool);
     for rel in &surface {
-        match std::fs::read(tree.root.join(rel)) {
+        match crate::tree::read_bytes(&tree.root.join(rel)) {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes);
                 for (i, line) in text.lines().enumerate() {

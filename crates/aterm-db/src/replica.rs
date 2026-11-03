@@ -410,6 +410,9 @@ pub struct Repair {
     pub(crate) deferral: Option<InventoryDeferral>,
     pub(crate) batch_deferral: Option<BatchDeferral>,
     pub(crate) interrupted: Option<Report>,
+    /// What this round's table-ID lists said of the peer's clock (`crate::clock`, F22), kept
+    /// whether or not the table repair after them succeeded.
+    pub(crate) clock: Option<crate::clock::Reading>,
 }
 
 /// Volatile work hints learned from authenticated inventory exchanges. These
@@ -496,10 +499,20 @@ pub struct Replica {
     /// The table a push names ([`First`], [`Self::prefer`]).
     first: First,
     backfill: Arc<Mutex<Backfill>>,
+    /// Whether a Commons round's table-ID list carries this Mac's clock mark (`crate::clock`);
+    /// tests turn it off to stand for a build from before F22.
+    marks: bool,
+    /// The claims ring's tables within [`crate::clock::BAND`] periods of one period, by digest,
+    /// and that period: what a peer that sends no mark offered is matched against.
+    offers: Arc<Mutex<Option<RingOffers>>>,
     /// The clock that places the ring windows, in place of the system's.
     #[cfg(test)]
     pub(crate) ring_clock: Option<u64>,
 }
+/// One period and the claims ring's tables within [`crate::clock::BAND`] periods of it, each
+/// table's digest with its period ([`Replica::offers`]).
+type RingOffers = (u64, BTreeMap<Digest, u64>);
+
 impl Replica {
     pub fn new(paths: Paths, tables: Vec<(Scope, PathBuf)>) -> Result<Self> {
         if tables.len() > MAX_TABLES {
@@ -525,6 +538,8 @@ impl Replica {
             commons: None,
             first: First::default(),
             backfill: Arc::default(),
+            marks: true,
+            offers: Arc::default(),
             #[cfg(test)]
             ring_clock: None,
         })
@@ -594,6 +609,8 @@ impl Replica {
             commons: Some((directory, config)),
             first: First::default(),
             backfill: Arc::default(),
+            marks: true,
+            offers: Arc::default(),
             #[cfg(test)]
             ring_clock: None,
         }
@@ -610,6 +627,55 @@ impl Replica {
 
     pub(crate) fn share_backfill(&mut self, backfill: &Arc<Mutex<Backfill>>) {
         self.backfill = backfill.clone();
+    }
+
+    /// Send no clock mark, as a build from before F22 (tests).
+    #[cfg(test)]
+    pub(crate) const fn with_marks(mut self, marks: bool) -> Self {
+        self.marks = marks;
+        self
+    }
+
+    /// The wall time a clock mark carries and a reading is taken at (ms): the system's, or the
+    /// test's ring clock.
+    fn wall_ms(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(now) = self.ring_clock {
+            return Some(now.saturating_mul(1000));
+        }
+        aterm_time::unix_millis()
+    }
+
+    /// What the claims tables a peer that sent no mark offered say of its clock, received at
+    /// `recv_ms` (`crate::clock::Reading::from_offers`): the claims ring's tables within
+    /// [`crate::clock::BAND`] periods of this clock's, matched against `remote`, whose digests are
+    /// formed once per period.
+    fn offered_reading(
+        &self,
+        remote: &BTreeSet<Digest>,
+        recv_ms: u64,
+    ) -> Option<crate::clock::Reading> {
+        use crate::catalog::ring::CLAIMS;
+        let period = CLAIMS.epoch_of(recv_ms / 1000);
+        let mut offers = self
+            .offers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if offers.as_ref().is_none_or(|(at, _)| *at != period) {
+            let mut tables = BTreeMap::new();
+            let band = period.saturating_sub(crate::clock::BAND)
+                ..=period.saturating_add(crate::clock::BAND);
+            for epoch in band {
+                tables.insert(CLAIMS.scope(self.trust, epoch).ok()?.digest(), epoch);
+            }
+            *offers = Some((period, tables));
+        }
+        let (_, tables) = offers.as_ref()?;
+        let offered: BTreeSet<u64> = remote
+            .iter()
+            .filter_map(|id| tables.get(id).copied())
+            .collect();
+        crate::clock::Reading::from_offers(&offered, recv_ms, CLAIMS.period_s)
     }
 
     /// The clock one exchange places the ring windows by, read once per exchange.
@@ -678,6 +744,7 @@ impl Replica {
             })?;
         Ok(Round {
             replica: self,
+            started: Instant::now(),
             bootstrap,
             observation,
             legacy_observation,
@@ -799,6 +866,7 @@ impl Replica {
         repair.deferral = None;
         repair.batch_deferral = None;
         repair.interrupted = None;
+        repair.clock = None;
         let round = self.round(peer)?;
         round.exchange_with_policy(stream, peer, side, repair, policy)
     }
@@ -859,6 +927,8 @@ struct Inventory {
 
 struct Round<'a> {
     replica: &'a Replica,
+    /// When this side began the round, before its probe: a peer builds its mark after this.
+    started: Instant,
     bootstrap: Bootstrap,
     observation: [u8; 64],
     legacy_observation: Option<[u8; 64]>,
@@ -932,22 +1002,20 @@ impl Round<'_> {
 
     fn prepare_batch<K>(
         &self,
-        peer: Actor,
+        session: &Session<'_>,
         id: Digest,
         keys: &[K],
         mut encode: impl FnMut(&Session<'_>, &Store, &K) -> Result<Vec<u8>>,
     ) -> Result<Vec<Vec<u8>>> {
-        self.local(peer, |session| {
-            // This batch still admits current membership and policy. No table
-            // contents are needed when it has no keys to encode.
-            if keys.is_empty() {
-                return Ok(Vec::new());
-            }
-            let store = self.store(session, id)?;
-            keys.iter()
-                .map(|key| encode(session, &store, key))
-                .collect()
-        })
+        // The sender supplies its current admitted session. No table contents
+        // are needed when the outgoing batch has no keys to encode.
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let store = self.store(session, id)?;
+        keys.iter()
+            .map(|key| encode(session, &store, key))
+            .collect()
     }
 
     fn retain_primary(&self, peer: Actor, id: Digest) -> Result<bool> {
@@ -1035,35 +1103,38 @@ impl Round<'_> {
             |session| {
                 // Custody and journal replay can take time. Read local policy
                 // after admitting the session, before admitting this batch.
-                // Config writers need not take a control lock: later edits take
-                // effect at the next admission, not retroactively on this one.
-                if let Some((directory, config)) = &self.commons {
-                    let policy = crate::catalog::policy::Policy::read(config)?;
-                    if !policy.enabled
-                        || Some(&policy) != self.policy.as_ref()
-                        || policy
-                            .excluded
-                            .contains(&directory.catalog_scope().digest())
-                    {
-                        return Err(Error::new(
-                            "Commons subscription policy changed or disabled",
-                        ));
-                    }
-                }
-                if let Some((directory, _)) = &self.commons
-                    && let Some(id) = self.active_table.get()
-                    && !directory.permits(
-                        session,
-                        self.policy.as_ref().expect("Commons policy captured"),
-                        id,
-                        self.now,
-                    )?
-                {
-                    return Err(Error::new("table subscription changed during repair"));
-                }
+                self.check_table_policy(session)?;
                 run(session)
             },
         )
+    }
+
+    fn check_table_policy(&self, session: &Session<'_>) -> Result<()> {
+        if let Some((directory, config)) = &self.commons {
+            let policy = crate::catalog::policy::Policy::read(config)?;
+            if !policy.enabled
+                || Some(&policy) != self.policy.as_ref()
+                || policy
+                    .excluded
+                    .contains(&directory.catalog_scope().digest())
+            {
+                return Err(Error::new(
+                    "Commons subscription policy changed or disabled",
+                ));
+            }
+        }
+        if let Some((directory, _)) = &self.commons
+            && let Some(id) = self.active_table.get()
+            && !directory.permits(
+                session,
+                self.policy.as_ref().expect("Commons policy captured"),
+                id,
+                self.now,
+            )?
+        {
+            return Err(Error::new("table subscription changed during repair"));
+        }
+        Ok(())
     }
 
     fn exchange_with_policy(
@@ -1185,9 +1256,28 @@ impl Round<'_> {
             .conflicts
             .retain(|id, _| self.tables.contains_key(id));
         let local: BTreeSet<_> = self.local(peer, |_| Ok(self.tables.keys().copied().collect()))?;
-        let remote = exchange_ids(stream, side, &local, MAX_TABLES, || {
+        // A Commons round's list carries this Mac's clock mark while it has room below the bound
+        // every receiver since 0.145 enforces; the marks a peer sent come out before anything
+        // else reads its list, so no mark is ever common, selected, adopted or pushed.
+        let marks = self.marks && self.commons.is_some();
+        let listed = with_mark(&local, marks.then(|| self.wall_ms()).flatten());
+        let received = exchange_ids(stream, side, &listed, MAX_TABLES, || {
             self.local(peer, |_| Ok(()))
         })?;
+        let (remote, heard) = if self.marks {
+            crate::clock::split(&received)
+        } else {
+            (received, crate::clock::Heard::Nothing)
+        };
+        if marks && let Some(recv) = self.wall_ms() {
+            repair.clock = match heard {
+                crate::clock::Heard::One(peer) => {
+                    crate::clock::Reading::from_mark(peer, recv, self.started.elapsed())
+                }
+                crate::clock::Heard::Several => None,
+                crate::clock::Heard::Nothing => self.offered_reading(&remote, recv),
+            };
+        }
         let common: BTreeSet<_> = local.intersection(&remote).copied().collect();
         let force_regular = side == Side::Initiator && std::mem::take(&mut repair.table_yield);
         let follow_up = if side == Side::Initiator {
@@ -1548,19 +1638,21 @@ impl Round<'_> {
         if let Some(last) = proofs.last() {
             repair.conflicts.insert(id, *last);
         }
-        let batch = self.prepare_batch(peer, id, &proofs, |session, store, key| {
-            store
-                .proof_wire(session, key)?
-                .ok_or_else(|| Error::new("table conflict disappeared"))
-        })?;
+        let prepare = |session: &Session<'_>| {
+            self.prepare_batch(session, id, &proofs, |session, store, key| {
+                store
+                    .proof_wire(session, key)?
+                    .ok_or_else(|| Error::new("table conflict disappeared"))
+            })
+        };
         match side {
             Side::Initiator => {
-                self.send_batch(stream, peer, &batch, BatchKind::Conflict, report)?;
+                self.send_batch(stream, peer, prepare, BatchKind::Conflict, report)?;
                 self.receive_batch(stream, peer, id, BatchKind::Conflict, repair, report)?;
             }
             Side::Responder => {
                 self.receive_batch(stream, peer, id, BatchKind::Conflict, repair, report)?;
-                self.send_batch(stream, peer, &batch, BatchKind::Conflict, report)?;
+                self.send_batch(stream, peer, prepare, BatchKind::Conflict, report)?;
             }
         }
         Ok(true)
@@ -1658,18 +1750,19 @@ impl Round<'_> {
         if let Some(last) = ids.last() {
             repair.records.insert(id, *last);
         }
-        let batch = self
-            .prepare_batch(peer, id, &ids, |session, store, key| {
+        let prepare = |session: &Session<'_>| {
+            self.prepare_batch(session, id, &ids, |session, store, key| {
                 store
                     .wire(session, key)?
                     .map(ToOwned::to_owned)
                     .ok_or_else(|| Error::new("table record disappeared"))
             })
-            .map_err(|error| at("batch preparation", error))?;
+            .map_err(|error| at("batch preparation", error))
+        };
         let sent = report.sent;
         match side {
             Side::Initiator => {
-                self.send_batch(stream, peer, &batch, BatchKind::Operation, report)
+                self.send_batch(stream, peer, prepare, BatchKind::Operation, report)
                     .map_err(|error| at("operation send", error))?;
                 self.receive_batch(stream, peer, id, BatchKind::Operation, repair, report)
                     .map_err(|error| at("operation receive", error))?;
@@ -1677,28 +1770,36 @@ impl Round<'_> {
             Side::Responder => {
                 self.receive_batch(stream, peer, id, BatchKind::Operation, repair, report)
                     .map_err(|error| at("operation receive", error))?;
-                self.send_batch(stream, peer, &batch, BatchKind::Operation, report)
+                self.send_batch(stream, peer, prepare, BatchKind::Operation, report)
                     .map_err(|error| at("operation send", error))?;
             }
         }
-        report.caught_up = whole && report.sent - sent == batch.len();
+        report.caught_up = whole && report.sent - sent == ids.len();
         Ok(())
     }
     fn send_batch(
         &self,
         stream: &mut (impl Read + Write),
         peer: Actor,
-        batch: &[Vec<u8>],
+        prepare: impl FnOnce(&Session<'_>) -> Result<Vec<Vec<u8>>>,
         kind: BatchKind,
         report: &mut Report,
     ) -> Result<()> {
-        self.local(peer, |_| Ok(()))?;
+        // Prepare under the same current custody, membership and policy admission
+        // that permits this send. Release its guards before any network I/O.
+        let batch = self.local(peer, |session| {
+            let batch = prepare(session)?;
+            // Config writers need no custody lock. Preserve the send boundary's
+            // policy check even when preparation takes time.
+            self.check_table_policy(session)?;
+            Ok(batch)
+        })?;
         stream.write_all(&(batch.len() as u32).to_le_bytes())?;
-        for wire in batch {
+        for wire in &batch {
             control::send_frame(stream, wire)?;
         }
         stream.flush()?;
-        for wire in batch {
+        for wire in &batch {
             let mut receipt = [0; 33];
             stream.read_exact(&mut receipt)?;
             if receipt[..32] != Sha256::digest(wire) || receipt[32] > 1 {
@@ -1846,6 +1947,19 @@ fn cycle<const N: usize>(
                 .filter(move |id| after.is_some_and(|after| **id <= after)),
         )
 }
+/// `local` with the clock mark of `wall` (ms) where one is given and the list has room for it
+/// below [`MAX_TABLES`], which every receiver since 0.145 enforces (`receive_ids`): a full list
+/// goes without.
+fn with_mark(local: &BTreeSet<Digest>, wall: Option<u64>) -> BTreeSet<Digest> {
+    let mut listed = local.clone();
+    if let Some(wall) = wall
+        && listed.len() < MAX_TABLES
+    {
+        listed.insert(crate::clock::mark(wall));
+    }
+    listed
+}
+
 fn exchange_ids<const N: usize>(
     stream: &mut (impl Read + Write),
     side: Side,

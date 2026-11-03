@@ -958,9 +958,10 @@ fn toolset_reads(
 
 /// Run this executable's `aterm pkg <args>` as `base.pkg.toolset`'s pass: a child that
 /// inherits this process's environment (the store, the config and the network it reads are
-/// init's), standard input closed and its output kept, ended at `budget`. Under a private
-/// state root it carries the window's lead ([`atpkg::cli::PRIVATE_STATE_ROOT_FLAG`]), as the
-/// window's passes there do.
+/// init's), standard input closed and its output kept, ended at `budget`. With no terminal on
+/// either, it is no person's command ([`atpkg::cli::a_person_typed_this`]), so it ends with no
+/// setup follow-up of its own. Under a private state root it carries the window's lead
+/// ([`atpkg::cli::PRIVATE_STATE_ROOT_FLAG`]), as the window's passes there do.
 #[cfg(unix)]
 fn run_pkg(
     args: &[String],

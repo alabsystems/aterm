@@ -223,7 +223,7 @@ fn a_ghost_nodes_rows_are_retired_as_that_node_beside_a_live_bridge() {
         .iter()
         .map(|g| harness::cap_line(g))
         .collect();
-    std::fs::write(&ghost_cap, caps).expect("its node cap");
+    harness::write_cap(&ghost_cap, caps);
     let ghost = "s-0000000000000000a1ce";
     let subject = format!("/f/{FLEET}/pub/{ghost_node}/{ghost}/presence");
     w.god()

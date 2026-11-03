@@ -99,7 +99,7 @@ src/tests.rs	rgb_percent_scales_and_clamps_each_component	rgb-percent
 src/tests.rs	hls_to_rgb_follows_dec_shifted_hsl	hls-range	decode-refines-model
 ```
 
-## 4. Tests §2 does not map
+## 3. Coverage
 
 - 23 live tests mapped in §2 across the 14 specs (0 non-spec tests remain; 25 original tests read in the initial 2026-10-15 audit).
 - The biggest collapse is `decode-refines-model`, with 8 primary tests plus 3 shared.
@@ -109,6 +109,10 @@ src/tests.rs	hls_to_rgb_follows_dec_shifted_hsl	hls-range	decode-refines-model
 
 The module-level `const _` assert `SIXEL_MAX_PARAMS >= 5` in `src/tests.rs` guards the second clause
 of `params-bound`; it goes once that clause is proved.
+
+## 4. Tests that are not spec samples
+
+None: all 23 live `#[test]` functions in `src/tests.rs` are mapped in §2.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

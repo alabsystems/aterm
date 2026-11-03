@@ -12,7 +12,7 @@ use super::{Log, download_retried, flag_value, host_error, probe_served};
 use crate::artifact::{package, pkgdoc, upload};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
-use crate::host::{HostError, Probe, Replace};
+use crate::host::{HostError, HostRole, Probe, Replace, gh_serves, preflight_each};
 use crate::quad::{self, VerifiedQuad};
 
 /// How the mirror runs.
@@ -89,8 +89,10 @@ pub fn check_staged(
     let tag = upload::tag(program, build);
     let mf = pkgdoc::manifest_name(program, build);
     let sig = pkgdoc::sig_name(program, build);
-    let (Ok(bytes), Ok(sig_bytes)) = (std::fs::read(dir.join(&mf)), std::fs::read(dir.join(&sig)))
-    else {
+    let (Ok(bytes), Ok(sig_bytes)) = (
+        crate::identity::read_regular_bytes(&dir.join(&mf), MANIFEST_CAP),
+        crate::identity::read_regular_bytes(&dir.join(&sig), MANIFEST_CAP),
+    ) else {
         return Err(Error::refused(format!(
             "{tag} on staging lacks the signed pkg manifest pair ({mf}, {sig})"
         )));
@@ -172,6 +174,18 @@ pub fn mirror(
     let result = mirror_in(ctx, quad, opts, log, &work);
     let _ = std::fs::remove_dir_all(&work);
     result
+}
+
+/// The public repositories a mirror of `quad` can write to, each once: the `[programs.*] repo`
+/// of every program a channel pins. A pin whose program names no repo is left to the walk,
+/// which refuses it.
+fn public_repos(quad: &VerifiedQuad) -> BTreeSet<String> {
+    quad.index
+        .channels
+        .iter()
+        .flat_map(crate::pins::union)
+        .filter_map(|(program, _)| quad.index.programs.get(&program).map(|p| p.repo.clone()))
+        .collect()
 }
 
 fn mirror_in(
@@ -276,8 +290,10 @@ fn one(
         }
     }
     if public_mf && public_sig {
-        let bytes = std::fs::read(pub_dir.join(&mf)).map_err(|e| Error::io(&mf, &e))?;
-        let sig_bytes = std::fs::read(pub_dir.join(&sig)).map_err(|e| Error::io(&sig, &e))?;
+        let bytes = crate::identity::read_regular_bytes(&pub_dir.join(&mf), MANIFEST_CAP)
+            .map_err(|e| Error::io(&mf, &e))?;
+        let sig_bytes = crate::identity::read_regular_bytes(&pub_dir.join(&sig), MANIFEST_CAP)
+            .map_err(|e| Error::io(&sig, &e))?;
         let pkg = quad.verify_pkg(&bytes, &sig_bytes).map_err(|e| {
             Error::refused(format!(
                 "{public}@{tag} serves a manifest the client's verifier refuses — PKG \
@@ -321,8 +337,12 @@ fn one(
     })?;
     let (expected, staged_pkg) = check_staged(quad, &dir, &staged_release.assets, program, build)?;
     if public_mf {
-        let same = |name: &str| {
-            std::fs::read(pub_dir.join(name)).ok() == std::fs::read(dir.join(name)).ok()
+        let same = |name: &str| match (
+            crate::identity::read_regular_bytes(&pub_dir.join(name), MANIFEST_CAP),
+            crate::identity::read_regular_bytes(&dir.join(name), MANIFEST_CAP),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
         };
         if !same(&mf) {
             return Err(Error::refused(format!(
@@ -485,7 +505,19 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
         quad.index.index_build,
         quad.index.attribution().machine_id
     ));
-    if !opts.dry_run {
+    if !opts.dry_run && !gh_serves(ctx, HostRole::Channel) {
+        let slugs = std::iter::once(ctx.index_slug()).chain(
+            public_repos(&quad)
+                .into_iter()
+                .map(|repo| ctx.public_slug(&repo)),
+        );
+        preflight_each(&*ctx.hosts.channel, slugs).map_err(|(slug, e)| {
+            Error::refused(format!(
+                "publishing needs the public owner's writer on {slug}: {e} (--dry-run plans \
+                 without it)"
+            ))
+        })?;
+    } else if !opts.dry_run {
         match ctx.usable_token(&ctx.tokens.channel) {
             Ok(true) => {}
             Ok(false) => {

@@ -570,6 +570,23 @@ fn a_child_whose_output_and_errors_interleave_still_hands_its_page_and_code_over
 struct SignedOut;
 
 #[cfg(unix)]
+#[test]
+fn unavailable_browser_stops_the_device_driver_without_requesting_a_person() {
+    struct Unavailable;
+    impl Approver for Unavailable {
+        fn approve(&mut self, _: &Handoff<'_>) -> Approval {
+            Approval::NotRun("pinned browser fetch is unavailable".into())
+        }
+    }
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let drove = stand_in_drive_in(tmp.path(), "hold 0", &mut Unavailable);
+    assert_eq!(
+        drove.outcome,
+        Outcome::NotRun("pinned browser fetch is unavailable".into())
+    );
+}
+
+#[cfg(unix)]
 impl Approver for SignedOut {
     fn approve(&mut self, _: &Handoff<'_>) -> Approval {
         Approval::NeedsSignIn("the page waits on a person to sign in".to_owned())

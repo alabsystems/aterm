@@ -534,13 +534,22 @@ pub fn ask_for(want: &Want, purpose: Purpose, host: &str) -> Option<Ask> {
             format!("{label}'s mailbox password is missing"),
             match purpose {
                 Purpose::HarnessSignIn => {
-                    format!(", for the Claude account {label}'s email-code sign-in,")
+                    format!(", for the AI account {label}'s email-code sign-in,")
                 }
                 _ => String::new(),
             },
             Some(format!(
                 "and {label}_totp the same way if the mailbox has 2FA"
             )),
+        ),
+        Want::MailboxComponent(component) => (
+            format!("The {} is missing", component.part().description()),
+            if purpose == Purpose::HarnessSignIn {
+                ", for an AI account's email-code sign-in,".to_owned()
+            } else {
+                String::new()
+            },
+            None,
         ),
         Want::Gh(_) | Want::SiteDeployerKey | Want::Notary => (
             format!("{} is missing", capitalized(&want.title())),

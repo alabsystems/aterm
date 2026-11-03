@@ -255,18 +255,19 @@ impl Accounts {
 
 fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
     use std::io::Read as _;
-    let meta = std::fs::metadata(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = opts.open(path)?;
+    let meta = file.metadata()?;
     if !meta.is_file() || meta.len() > max_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "not a bounded regular file",
-        ));
-    }
-    let file = std::fs::File::open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "not a regular file",
         ));
     }
     let mut bytes = Vec::new();

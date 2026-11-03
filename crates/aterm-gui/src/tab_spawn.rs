@@ -92,7 +92,9 @@ impl TabSpawnThen {
 /// Where a session spawned off the loop lands in its window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SpawnPlace {
-    /// A new last tab, made active.
+    /// A new tab. A worker the ask parks ([`SpawnAsk::parks`]) goes at the end of the parked tabs,
+    /// behind the front. Any other goes at the end of the shown ones, ahead of the parked tabs,
+    /// and is made active unless the ask lands it behind ([`SpawnAsk::background`]).
     Tab,
     /// A new pane splitting the window's focused pane in this direction.
     Split(crate::pane::SplitDir),
@@ -184,8 +186,12 @@ pub(crate) struct AdoptSpare {
     pub(crate) retarget: Arc<OnceLock<String>>,
 }
 
+/// Why the control verb's `split=` lands nowhere beside a worker on show.
+pub(crate) const WORKER_SPLIT_REFUSED: &str = "spawn split= does not land beside a worker under the \
+     Workers tab: choose Move to Tab on its row first, or split a person's tab";
+
 /// Admission facts captured when a spawn is booked on the main thread.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) enum SpawnAdmission {
     #[default]
     Plain,
@@ -195,6 +201,18 @@ pub(crate) enum SpawnAdmission {
     },
     /// Single-flight reservation for `App::summarize_in_new_tab`.
     Summary,
+}
+
+impl SpawnAdmission {
+    /// Whether a worker asked for this way parks, by who asked. A plain ask is `spawn agent=`, the
+    /// disk clean-up worker's or the credit claim worker's: nobody asked to see it. A person's
+    /// Summarize asked for a new tab, and a connected spawn's tab belongs beside its origin.
+    pub(crate) const fn parks_worker(&self) -> bool {
+        match self {
+            Self::Plain => true,
+            Self::Connected { .. } | Self::Summary => false,
+        }
+    }
 }
 
 /// Parameters for an off-loop spawn request.
@@ -223,9 +241,18 @@ pub(crate) struct SpawnAsk {
     pub(crate) unasked: bool,
     /// Explicit session theme (`None` inherits the divided pane's theme on a split).
     pub(crate) theme: Option<crate::session_theme::SessionTheme>,
+    /// The control verb's `split=`: refused where it would land beside a worker on show
+    /// ([`WORKER_SPLIT_REFUSED`]), unlike a person's own split of the pane in front of them.
+    pub(crate) refuses_worker_split: bool,
 }
 
 impl SpawnAsk {
+    /// Whether this ask, landing as a tab, parks ([`crate::tab_model::Tab::parked`]): a worker's,
+    /// asked for by whoever [`SpawnAdmission::parks_worker`] says.
+    pub(crate) const fn parks(&self) -> bool {
+        self.task.is_some() && self.admission.parks_worker()
+    }
+
     /// A remote driver's fresh shell never holds the person's input to its hosting window.
     pub(crate) fn for_fleet_shell(mut self) -> Self {
         self.shell = true;
@@ -390,6 +417,10 @@ struct InFlight {
     admission: SpawnAdmission,
     /// [`SpawnAsk::background`]: a tab lands behind the window's active one.
     background: bool,
+    /// [`SpawnAsk::parks`]: a tab lands parked under the window's Workers tab.
+    parks: bool,
+    /// [`SpawnAsk::refuses_worker_split`].
+    refuses_worker_split: bool,
     /// [`SpawnAsk::unasked`]: the window holds no input for it.
     unasked: bool,
     completion: Arc<TabSpawnCompletion>,
@@ -1213,6 +1244,7 @@ impl App {
                 None
             }
         };
+        let parks = ask.parks();
         let SpawnAsk {
             admission,
             exec_command,
@@ -1224,6 +1256,7 @@ impl App {
             background,
             unasked,
             theme,
+            refuses_worker_split,
         } = ask;
         let theme = theme.or(inherited);
         self.note_update_handoff_activity();
@@ -1317,6 +1350,8 @@ impl App {
             then,
             admission,
             background,
+            parks,
+            refuses_worker_split,
             unasked,
             completion: Arc::clone(&completion),
             theme,
@@ -1619,7 +1654,19 @@ impl App {
             .find(|t| t.id == id)
             .map(|t| t.grid);
         let adopted_spare = spare_grid.is_some();
-        let (place, parent, colors, grid, then, admission, theme, background, unasked) = match self
+        let (
+            place,
+            parent,
+            colors,
+            grid,
+            then,
+            admission,
+            theme,
+            background,
+            parks,
+            refuses_worker_split,
+            unasked,
+        ) = match self
             .tab_spawns
             .in_flight
             .iter()
@@ -1636,6 +1683,8 @@ impl App {
                     t.admission,
                     t.theme,
                     t.background,
+                    t.parks,
+                    t.refuses_worker_split,
                     t.unasked,
                 )
             }
@@ -1647,6 +1696,8 @@ impl App {
                 TabSpawnThen::Nothing,
                 SpawnAdmission::Plain,
                 None,
+                false,
+                false,
                 false,
                 false,
             ),
@@ -1667,10 +1718,13 @@ impl App {
                 if let Err(why) = self.validate_spawn_admission(&admission, host) {
                     break 'land Err(why);
                 }
-                if let SpawnPlace::Split(dir) = place
-                    && let Err(why) = self.split_refusal(window, dir)
-                {
-                    break 'land Err(why);
+                if let SpawnPlace::Split(dir) = place {
+                    if refuses_worker_split && self.worker_on_show(window) {
+                        break 'land Err(WORKER_SPLIT_REFUSED.to_string());
+                    }
+                    if let Err(why) = self.split_refusal(window, dir) {
+                        break 'land Err(why);
+                    }
                 }
                 let attached = match (&reader_gate, self.proxy.clone()) {
                     _ if adopted_spare => {
@@ -1697,6 +1751,9 @@ impl App {
                                     .then(|| self.windows.get(&window)?.tab_set.active_index())
                                     .flatten();
                                 match kept {
+                                    _ if parks => {
+                                        self.install_tab_session_parked(window, session, parent);
+                                    }
                                     Some(index) => {
                                         self.install_tab_session_behind(
                                             window, session, parent, index,
@@ -2066,6 +2123,8 @@ pub(crate) mod test_support {
             then,
             admission: SpawnAdmission::Plain,
             background: false,
+            parks: false,
+            refuses_worker_split: false,
             unasked: false,
             completion: Arc::new(TabSpawnCompletion::default()),
             theme: None,
@@ -2095,6 +2154,8 @@ pub(crate) mod test_support {
         if let Some(booked) = app.tab_spawns.in_flight.iter_mut().find(|t| t.id == id) {
             booked.unasked = ask.unasked;
             booked.background = ask.background;
+            booked.parks = ask.parks();
+            booked.admission = ask.admission.clone();
         }
         id
     }
@@ -2122,6 +2183,8 @@ pub(crate) mod test_support {
             then,
             admission,
             background: false,
+            parks: false,
+            refuses_worker_split: false,
             unasked: false,
             completion: Arc::new(TabSpawnCompletion::default()),
             theme: None,
@@ -2822,6 +2885,8 @@ pub(crate) mod tests {
             },
             admission: SpawnAdmission::Plain,
             background: false,
+            parks: false,
+            refuses_worker_split: false,
             unasked: false,
             completion: Arc::new(TabSpawnCompletion::default()),
             theme: None,
@@ -3020,6 +3085,184 @@ pub(crate) mod tests {
         replay(&mut app, wid, events);
         assert_eq!(app.focused_session_id(wid), Some(second));
         assert_eq!(drain(&pty2), b"k");
+    }
+
+    /// Lands a booked `id` with a stub program.
+    fn land(app: &mut App, wid: WindowId, id: u64) -> std::fs::File {
+        let (session, pty) = piped_session(id);
+        assert!(app.install_spawned_tab(TabSpawned {
+            id,
+            window: wid,
+            session: Ok(session),
+            reader_gate: None
+        }));
+        pty
+    }
+
+    #[test]
+    fn a_worker_ask_lands_parked_and_behind_whichever_tab_shows() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let front = book(&mut app, wid, TabSpawnThen::Nothing);
+        let _front_pty = land(&mut app, wid, front);
+        let worker = SpawnAsk {
+            task: Some(crate::task_launch::TaskSeed::new(b"work".to_vec())),
+            ..SpawnAsk::default()
+        };
+        let id = super::test_support::book_as(&mut app, wid, &worker, TabSpawnThen::Nothing);
+        let _worker_pty = land(&mut app, wid, id);
+        assert!(app.session_is_parked(id), "a task on a tab landing parks");
+        assert_eq!(app.focused_session_id(wid), Some(front), "the front stays");
+
+        // The same landing with no task is a person's tab.
+        let id = book(&mut app, wid, TabSpawnThen::Nothing);
+        let _shown_pty = land(&mut app, wid, id);
+        assert!(!app.session_is_parked(id));
+        assert_eq!(app.focused_session_id(wid), Some(id));
+        assert!(app.windows[&wid].tab_set.invariant_holds(&app.view_store));
+    }
+
+    #[test]
+    fn a_summary_lands_a_persons_tab_and_takes_the_front() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let front = book(&mut app, wid, TabSpawnThen::Nothing);
+        let _front_pty = land(&mut app, wid, front);
+        let summary = SpawnAsk {
+            admission: SpawnAdmission::Summary,
+            task: Some(crate::task_launch::TaskSeed::new(b"summarize".to_vec())),
+            ..SpawnAsk::default()
+        };
+        assert!(!summary.parks(), "the person asked for a new tab");
+        let id = super::test_support::book_as(&mut app, wid, &summary, TabSpawnThen::Nothing);
+        let _pty = land(&mut app, wid, id);
+        assert!(!app.session_is_parked(id));
+        assert_eq!(app.focused_session_id(wid), Some(id), "it takes the front");
+        assert_eq!(app.windows[&wid].tab_set.parked().len(), 0);
+        assert_eq!(app.windows[&wid].tab_set.home(), None, "no list opened");
+    }
+
+    #[test]
+    fn only_a_worker_nobody_asked_to_see_parks_behind_the_front() {
+        use crate::control::control_media::{SpawnBooking, placed_ask};
+        let task = || Some(crate::task_launch::TaskSeed::new(b"work".to_vec()));
+        let booking = |admission, split, raise| SpawnBooking {
+            cwd: None,
+            split,
+            raise,
+            admission,
+        };
+        let plain = placed_ask(
+            SpawnAsk {
+                task: task(),
+                ..SpawnAsk::default()
+            },
+            booking(SpawnAdmission::Plain, None, true),
+        );
+        assert!(plain.parks() && plain.background && plain.unasked);
+
+        let summary = placed_ask(
+            SpawnAsk {
+                task: task(),
+                ..SpawnAsk::default()
+            },
+            crate::summarize::summary_booking(std::path::Path::new("/tmp/summary")),
+        );
+        assert!(!summary.parks());
+        assert!(!summary.background, "it takes the front");
+        assert!(!summary.unasked, "what the person types next goes to it");
+
+        let split = placed_ask(
+            SpawnAsk {
+                task: task(),
+                ..SpawnAsk::default()
+            },
+            booking(
+                SpawnAdmission::Plain,
+                Some(crate::pane::SplitDir::Vertical),
+                true,
+            ),
+        );
+        assert!(!split.background && !split.unasked && split.refuses_worker_split);
+
+        let shell = placed_ask(
+            SpawnAsk::default(),
+            booking(SpawnAdmission::Plain, None, true),
+        );
+        assert!(!shell.parks() && !shell.background && !shell.refuses_worker_split);
+    }
+
+    #[test]
+    fn a_wire_split_landing_where_a_worker_came_to_the_front_is_refused() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let front = book(&mut app, wid, TabSpawnThen::Nothing);
+        let _front_pty = land(&mut app, wid, front);
+        let worker = SpawnAsk {
+            task: Some(crate::task_launch::TaskSeed::new(b"work".to_vec())),
+            ..SpawnAsk::default()
+        };
+        let parked = super::test_support::book_as(&mut app, wid, &worker, TabSpawnThen::Nothing);
+        let _worker_pty = land(&mut app, wid, parked);
+        let (reply, answer) = std::sync::mpsc::channel();
+        let id = book_split(
+            &mut app,
+            wid,
+            crate::pane::SplitDir::Vertical,
+            TabSpawnThen::Run(Box::new(move |_, landed| {
+                let _ = reply.send(landed);
+            })),
+        );
+        app.tab_spawns
+            .in_flight
+            .last_mut()
+            .expect("booked")
+            .refuses_worker_split = true;
+        assert!(app.focus_session_preferring(Some(wid), parked));
+        let (session, _pty) = piped_session(id);
+        assert!(!app.install_spawned_tab(TabSpawned {
+            id,
+            window: wid,
+            session: Ok(session),
+            reader_gate: None
+        }));
+        assert_eq!(
+            answer.recv().expect("answered"),
+            Err(WORKER_SPLIT_REFUSED.to_string())
+        );
+        let ws = &app.windows[&wid];
+        assert_eq!(
+            ws.tab_set.parked()[0].root.leaves().len(),
+            1,
+            "no pane landed"
+        );
+
+        // CONTROL: a person's own split of the worker in front of them lands.
+        let id = book_split(
+            &mut app,
+            wid,
+            crate::pane::SplitDir::Vertical,
+            TabSpawnThen::Nothing,
+        );
+        let _split_pty = land(&mut app, wid, id);
+        assert_eq!(app.windows[&wid].tab_set.parked()[0].root.leaves().len(), 2);
+    }
+
+    #[test]
+    fn a_worker_ask_on_a_split_stays_a_pane_of_the_tab_it_split() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let id = book_split(
+            &mut app,
+            wid,
+            crate::pane::SplitDir::Vertical,
+            TabSpawnThen::Nothing,
+        );
+        app.tab_spawns.in_flight.last_mut().expect("booked").parks = true;
+        let _pty = land(&mut app, wid, id);
+        assert!(!app.session_is_parked(id));
+        assert_eq!(app.windows[&wid].tab_set.parked().len(), 0);
+        assert_eq!(app.focused_session_id(wid), Some(id));
     }
 
     #[test]

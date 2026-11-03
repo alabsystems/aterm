@@ -119,7 +119,7 @@ file `fabric.toml` that `on` writes, else in a running instance's bridge command
                    machine's mint secret (a human's includes `halt`)
   --out <cap>      mint-for: write the cap to <cap> (0600; refuses a symlink or a
                    different cap there); without it the cap goes to stdout and the
-                   guidance to stderr
+                   guidance to stderr, and a file you redirect it into must be 0600
   --expires <N>d|<N>h
                    mint-for: stamp each grant `exp=` so the broker refuses it after that
   halt <reason>    as a human's cap: hold every session on the fleet (`hold=1
@@ -129,7 +129,9 @@ file `fabric.toml` that `on` writes, else in a running instance's bridge command
   post             as a person's cap: send to `@<sid>@<node>` with `kind=ask|answer|task|
                    report|note` (default `note`) and optional `re=<off>`
   --cap-file <c>   halt/inbox/post: the person's cap (`mint-for h-<name> --out <c>`);
-                   brief: read under it instead of the node's cap
+                   brief: read under it instead of the node's cap. A regular file of
+                   yours at 0600 or tighter, in any folder: a wider one, a symlink or a
+                   FIFO is refused at once
 
 `status` and `tail` print no message text (`tail --bodies` does); `status`, `tail`,
 `brief` and a plain `doctor` write nothing. Exit status: 0 healthy (`on`: done, even
@@ -963,6 +965,9 @@ pub struct BrokerView {
     /// ([`astream_broker::BrokerRefusal::is_expired`]): genuine grants whose `exp=` has passed,
     /// at the attach or on the head query.
     pub cap_expired: bool,
+    /// Whether [`Self::error`] is a cap file this report could not read, so it never asked the bus
+    /// anything: the report's own cap warning says why, whole.
+    pub cap_unread: bool,
     /// The pid serving it: the one process of this user holding its listener ([`listener_pid`]).
     pub pid: Option<u32>,
     /// Why the pid serving it is unknown, where [`listener_pid`] could not tell; `None` where it
@@ -1027,6 +1032,15 @@ impl BrokerView {
     #[must_use]
     pub const fn read_ok(&self) -> bool {
         self.reachable && self.attached && self.head.is_some()
+    }
+
+    /// How much of [`Self::error`] a report prints: a cap's refusal whole.
+    const fn error_words(&self) -> usize {
+        if self.cap_unread {
+            CAP_REFUSAL_WORDS
+        } else {
+            256
+        }
     }
 
     /// Whether a process may hold its listener: one is named ([`Self::pid`]), or which one is
@@ -1204,6 +1218,10 @@ fn lapsed(e: &io::Error) -> bool {
     astream_broker::broker_refusal(e).is_some_and(astream_broker::BrokerRefusal::is_expired)
 }
 
+/// How much of a cap file's refusal a report prints: its remedy names the path a second time, so a
+/// long path's `chmod` is not cut off.
+const CAP_REFUSAL_WORDS: usize = 640;
+
 /// The words of `aterm fabric`'s lapsed-ring warning ([`BrokerView::cap_expired`]), by which
 /// `doctor` picks the renewal ([`crate::enable::fix_for`]).
 pub const CAP_LAPSED: &str = "refuses this node's cap as lapsed";
@@ -1297,6 +1315,7 @@ fn reach(cfg: &Config, mut view: BrokerView) -> (BrokerView, Option<Conn>) {
         match read_cap_file(path) {
             Ok(caps) => ring.extend(caps),
             Err(e) => {
+                view.cap_unread = true;
                 view.error = Some(format!("cap file {path}: {e}"));
                 return (view, None);
             }
@@ -1606,7 +1625,7 @@ pub fn summary_of(b: &BrokerView) -> DoctorSummary {
         return warn(
             format!(
             "the broker at {at} answers and {served}, but the bus could not be read ({}) — {fix}",
-            safe(b.error.as_deref().unwrap_or("unknown"), 256)
+            safe(b.error.as_deref().unwrap_or("unknown"), b.error_words())
         ),
             true,
         );
@@ -3151,7 +3170,11 @@ fn warnings(
     }
     for (path, caps) in &r.caps {
         if let Err(e) = caps {
-            w.push(format!("cap file {}: {}", safe(path, 256), safe(e, 256)));
+            w.push(format!(
+                "cap file {}: {}",
+                safe(path, 256),
+                safe(e, CAP_REFUSAL_WORDS)
+            ));
         }
     }
 
@@ -3176,7 +3199,9 @@ fn warnings(
              this node lands and none is delivered to it — {}",
             safe(r.broker.error.as_deref().unwrap_or("unknown"), 256)
         ));
-    } else if !r.broker.read_ok() {
+    } else if !r.broker.read_ok() && !r.broker.cap_unread {
+        // A cap the report could not read is its own warning below (`r.caps`), its fix what that
+        // file needs: nothing is known of the bus, and a second warning would say the bus failed.
         w.push(format!(
             "the broker at {broker} answers but the bus could not be read: {}",
             safe(r.broker.error.as_deref().unwrap_or("unknown"), 256)
@@ -4104,7 +4129,11 @@ pub fn render_text_local(r: &Report, local_at: &dyn Fn(i64) -> Option<i64>) -> S
                     safe(path, 256),
                     if *n == 1 { "" } else { "s" }
                 ),
-                Err(e) => format!("{} (UNREADABLE: {})", safe(path, 256), safe(e, 256)),
+                Err(e) => format!(
+                    "{} (UNREADABLE: {})",
+                    safe(path, 256),
+                    safe(e, CAP_REFUSAL_WORDS)
+                ),
             },
         ));
     }
@@ -4164,7 +4193,7 @@ pub fn render_text_local(r: &Report, local_at: &dyn Fn(i64) -> Option<i64>) -> S
         } else if b.reachable {
             format!(
                 "yes, but the bus cannot be read: {}",
-                safe(b.error.as_deref().unwrap_or("-"), 256)
+                safe(b.error.as_deref().unwrap_or("-"), b.error_words())
             )
         } else {
             format!("NO — {}", safe(b.error.as_deref().unwrap_or("-"), 256))
@@ -6192,7 +6221,7 @@ mod tests {
                 format!("{}\n", astream_cap::capfile::format_line(&c.filter, &c.tag))
             })
             .collect();
-        std::fs::write(&cap, lines).expect("the node's cap");
+        crate::bridge::write_owner_only(&cap, lines);
         let subjects = [
             ("/f/f1/pub/n-b/s-x/presence", true),
             ("/f/f1/in/n-a/s-y/n-b/note", true),
@@ -6349,7 +6378,7 @@ mod tests {
                     format!("{}\n", astream_cap::capfile::format_line(&c.filter, &c.tag))
                 })
                 .collect();
-            std::fs::write(&cap, lines).expect("the two faces' cap");
+            crate::bridge::write_owner_only(&cap, lines);
             Self {
                 _server: server,
                 god,
@@ -7289,6 +7318,51 @@ mod tests {
         warnings(r, &BTreeMap::new(), &[])
     }
 
+    /// A ring this report may not read is one warning, whose fix is the file's and not a re-mint
+    /// `on` will not make, since nothing was asked of the bus. Every line that says why prints the
+    /// refusal whole, where a long path's `chmod` is its last words. Any other failed read keeps
+    /// its own warning, the control.
+    #[test]
+    fn a_refused_ring_is_one_warning_and_every_report_prints_it_whole() {
+        let long = format!("/{}node.cap", "a-folder-with-a-long-name/".repeat(6));
+        let chmod = format!("chmod 600 {long}");
+        let said = format!(
+            "{long} is mode 0644: a secret file must be readable by its owner alone (0600 or \
+             tighter); run `{chmod}` and treat its contents as exposed"
+        );
+        assert!(said.len() > 256 && said.len() < CAP_REFUSAL_WORDS, "{said}");
+        let mut r = healthy();
+        r.caps = vec![(long.clone(), Err(said.clone()))];
+        r.broker.attached = false;
+        r.broker.head = None;
+        r.broker.cap_unread = true;
+        r.broker.error = Some(format!("cap file {long}: {said}"));
+
+        let w = warned(&r);
+        let about: Vec<&String> = w.iter().filter(|l| l.contains(&long)).collect();
+        assert_eq!(about.len(), 1, "{w:#?}");
+        assert!(about[0].contains(&chmod), "{w:#?}");
+        let fix = crate::enable::fix_for(about[0], &crate::enable::Role::default());
+        assert!(fix.contains("chmod 600 <cap>"), "{fix}");
+        assert!(!fix.contains("re-mints"), "{fix}");
+
+        let text = render_text_local(&r, &|_| Some(0));
+        assert_eq!(
+            text.matches(&chmod).count(),
+            2,
+            "its row and BROKER's:\n{text}"
+        );
+        assert!(summary_of(&r.broker).text.contains(&chmod));
+
+        r.broker.cap_unread = false;
+        r.broker.error = Some("head query: refused".to_string());
+        assert!(
+            warned(&r).iter().any(|l| l.contains("could not be read")),
+            "{:#?}",
+            warned(&r)
+        );
+    }
+
     #[cfg(unix)]
     fn unix_config(broker: &std::path::Path) -> Config {
         Config {
@@ -8076,7 +8150,7 @@ mod tests {
                     format!("{}\n", astream_cap::capfile::format_line(&c.filter, &c.tag))
                 })
                 .collect();
-            std::fs::write(&cap, lines).expect("the cap file");
+            crate::bridge::write_owner_only(&cap, lines);
             let (view, _) = reach_broker(&cfg);
             let mut r = healthy();
             r.broker = view;
@@ -8188,7 +8262,7 @@ mod tests {
             .chain(std::iter::once(&"ro:/f/other/pub/>".to_string()))
             .map(|g| format!("{g} {}\n", "00".repeat(32)))
             .collect();
-        std::fs::write(&cap, lines).expect("cap");
+        crate::bridge::write_owner_only(&cap, lines);
         let faces = readable_faces("lab", &[cap.to_string_lossy().into_owned()]);
         assert_eq!(
             faces,

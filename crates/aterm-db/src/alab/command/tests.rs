@@ -11,7 +11,7 @@ use crate::{
     alab::{
         Registry,
         import::tests::{LOGINS_HEADER, Stand, VAULT_HEADER},
-        registry::{ACCOUNT, ADDRESS, MACHINE, MAILBOX, SEAT},
+        registry::{ACCOUNT, ADDRESS, MACHINE, MAILBOX, PREFERENCE},
     },
     table::tests::Lab,
     typed::{
@@ -89,7 +89,8 @@ fn import(
     run(paths, &words(&list), Some(&Stand), &mut open, NOW).unwrap()
 }
 
-/// `import --apply` writes the sheets once: the accounts, addresses, mailbox, machines and seats
+/// `import --apply` writes the sheets once: the accounts, addresses, mailbox, machines and
+/// preferences
 /// are rows, the mailbox key is kept privately on this Mac (no address in it), and a second
 /// `--apply` of the same sheets writes no record.
 /// NEGATIVE CONTROLS: with `cell::import_step` never answering `Unchanged` (`if false &&
@@ -119,7 +120,7 @@ fn import_applies_once_then_a_rerun_writes_nothing() {
     );
     assert_eq!(view.project(&MAILBOX).rows.len(), 1);
     assert!(!view.project(&MACHINE).rows.is_empty());
-    assert!(!view.project(&SEAT).rows.is_empty());
+    assert!(!view.project(&PREFERENCE).rows.is_empty());
     let file = paths.dir.join(MAILBOX_KEYS);
     let text = std::fs::read_to_string(&file).unwrap();
     assert!(!text.contains('@'));
@@ -156,7 +157,7 @@ fn an_import_seeds_the_providers_its_accounts_name() {
     let (_, generic) = checks::lab(&view.cells);
     let dangling: Vec<_> = generic
         .iter()
-        .filter(|f| matches!(f, check::Finding::Dangling { .. }))
+        .filter(|f| matches!(f, crate::typed::check::Finding::Dangling { .. }))
         .collect();
     assert!(dangling.is_empty(), "{dangling:?}");
     assert_eq!(
@@ -229,6 +230,49 @@ fn import_apply_waits_until_this_mac_holds_the_registry() {
     let after = Registry::at(lab.paths[1].clone()).view().unwrap();
     assert_eq!(after.project(&MAILBOX).rows.len(), 1);
     assert!(!lab.paths[1].dir.join(MAILBOX_KEYS).exists());
+    // Even if the second Mac already holds an un-landed local mailbox key (e.g. from an earlier
+    // interrupted run), importing against a registry holding another Mac's mailbox still refuses.
+    let stale_plan = import::plan(
+        &Input {
+            sheets: &[Sheet::parse(
+                SheetKind::Logins,
+                "ai-account-logins.csv",
+                &std::fs::read(&logins).unwrap(),
+            )
+            .unwrap()],
+            macs: &[],
+            vendors: &Stand,
+            keys: MailboxKeys::default(),
+            now_ms: NOW,
+            births: true,
+            unread: &[],
+        },
+        &Default::default(),
+    )
+    .unwrap();
+    aterm_uds::private_file::write_private(
+        &lab.paths[1].dir,
+        MAILBOX_KEYS,
+        &aterm_json::to_vec(&stale_plan.keys.to_json()).unwrap(),
+    )
+    .unwrap();
+    let stale_again = run(
+        &lab.paths[1],
+        &words_for(&["--apply"]),
+        Some(&Stand),
+        &mut never,
+        NOW,
+    );
+    assert!(stale_again.is_err());
+    assert_eq!(
+        Registry::at(lab.paths[1].clone())
+            .view()
+            .unwrap()
+            .project(&MAILBOX)
+            .rows
+            .len(),
+        1
+    );
 }
 
 /// No report shows an address: the dry run's summary and its finding list carry counts, kinds,
@@ -345,58 +389,375 @@ fn import_without_the_harness_reading_refuses() {
     assert!(refused.is_err());
 }
 
-/// `check` reports the lab's rules over converged rows: two home seats for one address, more
-/// than three seats, a seat on a retired machine, a live account whose login is retired, and a
-/// label that is another live machine's alias, each by key, never by value.
-/// NEGATIVE CONTROL: with the home-seat rule never firing in `checks::lab` (`if false &&
-/// homes.len() > 1`), the two homes go unreported: `` two-home-seats: ["account-login-retired",
-/// "seat-on-retired-machine", "too-many-seats"] `` (the assertion's message).
+/// `check` reports the lab's rules over converged rows: a preference on a retired machine or for
+/// a retired account, a live account whose login is retired, an alias link to a retired address or
+/// round a cycle, a preference whose cells say another pair than its key, each by key, never by
+/// value. A mapping has no cap: one account preferred on four
+/// machines and at one rank twice is no finding.
+/// NEGATIVE CONTROL: with the retired-machine rule never firing in `checks::lab` (`if false &&`
+/// on its `if let`), the row goes unreported: this test's `` preference-on-retired-machine: `` message.
 #[test]
 fn check_reports_the_lab_rules() {
-    let m3 = keys::machine_pk("m3");
-    let m4 = keys::machine_pk("m4");
+    let machines: Vec<String> = (3..=7)
+        .map(|n| keys::machine_pk(&format!("m{n}")))
+        .collect();
+    let m4 = &machines[1];
     let ann = keys::address_pk("ann@example.invalid").unwrap();
     let bob = keys::address_pk("bob@example.invalid").unwrap();
+    let cy = keys::address_pk("cy@example.invalid").unwrap();
+    let dee = keys::address_pk("dee@example.invalid").unwrap();
+    let eve = keys::address_pk("eve@example.invalid").unwrap();
+    let live_account = keys::account_pk("claude", "ann@example.invalid").unwrap();
     let account = keys::account_pk("claude", "bob@example.invalid").unwrap();
+    let retired_box = "mb-0000000000000001";
     let mut changes = vec![
-        put(&MACHINE, &m3, "label", json!("m3")),
-        put(&MACHINE, &m3, "status", json!("active")),
-        put(&MACHINE, &m3, "row", json!("live")),
-        put(&MACHINE, &m4, "label", json!("m4")),
-        put(&MACHINE, &m4, "status", json!("active")),
-        put(&MACHINE, &m4, "row", json!("retired")),
-        crate::typed::grid::tests::elem(&MACHINE, &m3, "aliases", "m4"),
+        put(&MAILBOX, retired_box, "row", json!("retired")),
         put(&ADDRESS, &ann, "addr", json!("ann@example.invalid")),
+        put(&ADDRESS, &ann, "mailbox", json!(retired_box)),
         put(&ADDRESS, &ann, "row", json!("live")),
         put(&ADDRESS, &bob, "addr", json!("bob@example.invalid")),
         put(&ADDRESS, &bob, "row", json!("retired")),
+        put(&ADDRESS, &cy, "alias_of", json!(dee)),
+        put(&ADDRESS, &cy, "mailbox_hint", json!(retired_box)),
+        put(&ADDRESS, &cy, "row", json!("live")),
+        put(&ADDRESS, &dee, "alias_of", json!(cy)),
+        put(&ADDRESS, &dee, "row", json!("live")),
+        put(&ADDRESS, &eve, "alias_of", json!(bob)),
+        put(&ADDRESS, &eve, "row", json!("live")),
         put(&ACCOUNT, &account, "login", json!(bob)),
-        put(&ACCOUNT, &account, "row", json!("live")),
+        put(&ACCOUNT, &account, "row", json!("retired")),
+        put(&ACCOUNT, &live_account, "login", json!(bob)),
+        put(&ACCOUNT, &live_account, "identity", json!(bob)),
+        put(&ACCOUNT, &live_account, "row", json!("live")),
     ];
-    for (machine, slot, role) in [
-        (&m3, 1, "home"),
-        (&m3, 2, "home"),
-        (&m3, 3, "warm"),
-        (&m4, 1, "warm"),
-    ] {
-        let seat = keys::seat_pk(machine, slot).unwrap();
-        changes.push(put(&SEAT, &seat, "address", json!(ann)));
-        changes.push(put(&SEAT, &seat, "role", json!(role)));
-        changes.push(put(&SEAT, &seat, "row", json!("live")));
+    for (n, machine) in machines.iter().enumerate() {
+        changes.push(put(
+            &MACHINE,
+            machine,
+            "label",
+            json!(format!("m{}", n + 3)),
+        ));
+        changes.push(put(&MACHINE, machine, "status", json!("active")));
+        let word = if machine == m4 { "retired" } else { "live" };
+        changes.push(put(&MACHINE, machine, "row", json!(word)));
+        let preference = keys::preference_pk(machine, &live_account).unwrap();
+        changes.push(put(&PREFERENCE, &preference, "machine", json!(machine)));
+        changes.push(put(
+            &PREFERENCE,
+            &preference,
+            "account",
+            json!(live_account),
+        ));
+        changes.push(put(&PREFERENCE, &preference, "rank", json!(1)));
+        changes.push(put(&PREFERENCE, &preference, "row", json!("live")));
     }
+    // A row whose cells say another pair than its key: machines[3] under machines[2]'s key.
+    let crossed = keys::preference_pk(&machines[2], &live_account).unwrap();
+    changes.push(put(&PREFERENCE, &crossed, "machine", json!(machines[3])));
+    let retired = keys::preference_pk(&machines[0], &account).unwrap();
+    changes.push(put(&PREFERENCE, &retired, "machine", json!(machines[0])));
+    changes.push(put(&PREFERENCE, &retired, "account", json!(account)));
+    changes.push(put(&PREFERENCE, &retired, "row", json!("live")));
     let mut book = Book::new();
     book.write(1, &[], changes);
     let (lab, _) = checks::lab(&book.cells());
     let kinds: Vec<&str> = lab.iter().map(|f| f.kind).collect();
     for kind in [
-        "two-home-seats",
-        "too-many-seats",
-        "seat-on-retired-machine",
+        "preference-on-retired-machine",
+        "preference-key-mismatch",
+        "preference-for-retired-account",
         "account-login-retired",
+        "account-identity-retired",
+        "address-mailbox-retired",
+        "address-mailbox-hint-retired",
+        "alias-of-retired",
+        "alias-cycle",
     ] {
         assert!(kinds.contains(&kind), "{kind}: {kinds:?}");
     }
-    assert!(!kinds.contains(&"label-ambiguous"), "m4 is retired");
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == "preference-on-retired-machine")
+            .count(),
+        1,
+        "only the row on the retired machine: {kinds:?}"
+    );
     let text = format!("{lab:?}");
     assert!(!text.contains('@'));
+}
+
+/// `prefer` writes the owner's mapping and `unprefer` ends it: by label or legacy label, never by
+/// address. A repeat writes nothing, and a re-prefer brings the same row back. Nothing but the
+/// preference row is written: the account, its status and its login are as they were.
+/// NEGATIVE CONTROL: with `prefer` not skipping a value already held (`if false && current...`),
+/// the repeat rewrites the cells: `` left: Number(4) right: Number(0) `` at the repeat's `written`.
+#[test]
+fn prefer_and_unprefer_write_one_mapping() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let (vault, logins) = sheets(scratch.path());
+    let mut opened = Vec::new();
+    import(paths, &["--apply", "--first"], &vault, &logins, &mut opened);
+    let claude = keys::account_pk("claude", "ann@example.invalid").unwrap();
+    let label = keys::default_account_label("claude", &claude).unwrap();
+    let before = Registry::at(paths.clone())
+        .view()
+        .unwrap()
+        .project(&ACCOUNT);
+    let mut no_review = |_: &Path| Ok(());
+    let mut verb = |list: &[&str]| run(paths, &words(list), None, &mut no_review, NOW);
+    assert!(verb(&["prefer", "m4", "ann@example.invalid"]).is_err());
+    assert!(verb(&["prefer", "m404", &label]).is_err());
+    // A row the import wrote becomes the owner's on the owner's word.
+    let m3 = verb(&["prefer", "m3", &label]).unwrap();
+    let imported = m3["preference"].as_str().unwrap().to_owned();
+    assert_eq!(m3["written"], json!(1));
+    let first = verb(&["prefer", "m4", &label, "--rank", "2"]).unwrap();
+    assert!(first["written"].as_u64().unwrap() > 0, "{first}");
+    let pk = first["preference"].as_str().unwrap().to_owned();
+    let read = || {
+        Registry::at(paths.clone())
+            .view()
+            .unwrap()
+            .project(&PREFERENCE)
+    };
+    assert_eq!(read().rows[&pk].get("rank"), Some(&json!(2)));
+    assert_eq!(read().rows[&pk].get("why"), Some(&json!("owner")));
+    assert_eq!(read().rows[&imported].get("why"), Some(&json!("owner")));
+    let again = verb(&["prefer", "m4", &label, "--rank", "2"]).unwrap();
+    assert_eq!(again["written"], json!(0));
+    verb(&["unprefer", "m4", &label]).unwrap();
+    assert_eq!(read().rows[&pk].lifecycle(), Some("ended"));
+    assert_eq!(
+        verb(&["unprefer", "m4", &label]).unwrap()["written"],
+        json!(0)
+    );
+    verb(&["prefer", "m4", &label]).unwrap();
+    assert!(read().rows[&pk].live());
+    assert_eq!(
+        Registry::at(paths.clone())
+            .view()
+            .unwrap()
+            .project(&ACCOUNT),
+        before
+    );
+    let text = aterm_json::to_string(&first).unwrap();
+    assert!(!text.contains('@'), "{text}");
+}
+
+/// The harness's files are read through `Vendors::stated`: named ones refuse when unreadable,
+/// ones found beside the vault sheet are reported in `unread` and retract nothing, and the warm
+/// list becomes one preference per machine.
+/// NEGATIVE CONTROL: with `harness_sheets` skipping the files it found (`.filter(|_| false)`), the
+/// scratch home's files are not read and there is nothing to import: `` Error("no sheet to import:
+/// give --vault-sheet or --logins, or put the sheets in their places") ``.
+#[test]
+fn harness_files_are_read_and_a_bad_one_is_reported() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let secrets = paths.home.join(".secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::fs::write(
+        secrets.join("ai-pool.toml"),
+        "claude,ann@example.invalid,,m8 m9\n",
+    )
+    .unwrap();
+    std::fs::write(secrets.join("fleet-accounts.toml"), "not rows\n").unwrap();
+    let mut open = |_: &Path| Ok(());
+    let list = words(&["import", "--apply", "--first"]);
+    let report = run(paths, &list, Some(&Stand), &mut open, NOW).unwrap();
+    assert_eq!(report["unread"], json!(["fleet-accounts.toml"]));
+    let view = Registry::at(paths.clone()).view().unwrap();
+    assert_eq!(view.project(&PREFERENCE).rows.len(), 2);
+    // The pool drops m9 while the fleet file still fails: what the failed file may state stands.
+    std::fs::write(
+        secrets.join("ai-pool.toml"),
+        "claude,ann@example.invalid,,m8\n",
+    )
+    .unwrap();
+    let again = words(&["import", "--apply"]);
+    run(paths, &again, Some(&Stand), &mut open, NOW).unwrap();
+    let view = Registry::at(paths.clone()).view().unwrap();
+    assert!(
+        view.project(&PREFERENCE)
+            .rows
+            .values()
+            .all(|row| row.live()),
+        "a run with an unread file ended a preference"
+    );
+    let named = words(&[
+        "import",
+        "--fleet-accounts",
+        secrets.join("fleet-accounts.toml").to_str().unwrap(),
+    ]);
+    let refused = run(paths, &named, Some(&Stand), &mut open, NOW).unwrap_err();
+    assert!(!refused.to_string().contains("not rows"), "{refused}");
+}
+/// `prefer` refuses a retired machine or account even when named by its primary key, while
+/// `unprefer` ends a lingering preference on a retired machine or account by label or key.
+/// NEGATIVE CONTROL: with `named_row` accepting any present `pk` without checking `require_live`
+/// and filtering labels to `row.live()` unconditionally, `prefer` on a retired `pk` succeeds and
+/// `unprefer` by label on a retired machine fails.
+#[test]
+fn prefer_refuses_retired_keys_while_unprefer_ends_preferences_on_retired_labels() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let (vault, logins) = sheets(scratch.path());
+    let mut opened = Vec::new();
+    import(paths, &["--apply", "--first"], &vault, &logins, &mut opened);
+    let claude = keys::account_pk("claude", "ann@example.invalid").unwrap();
+    let label = keys::default_account_label("claude", &claude).unwrap();
+    let m4 = keys::machine_pk("m4");
+    let mut no_review = |_: &Path| Ok(());
+    let mut verb = |list: &[&str]| run(paths, &words(list), None, &mut no_review, NOW);
+
+    let pref = verb(&["prefer", "m4", &label]).unwrap()["preference"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    Registry::at(paths.clone())
+        .write(vec![vec![put(&MACHINE, &m4, "row", json!("retired"))]])
+        .unwrap();
+
+    // `prefer` by retired machine `pk` is refused instead of creating `preference-on-retired-machine`.
+    assert!(verb(&["prefer", &m4, &label]).is_err());
+
+    // `unprefer` by retired machine label still ends the lingering preference.
+    let ended = verb(&["unprefer", "m4", &label]).unwrap();
+    assert_eq!(ended["row"], json!("ended"));
+    assert_eq!(
+        Registry::at(paths.clone())
+            .view()
+            .unwrap()
+            .project(&PREFERENCE)
+            .rows[&pref]
+            .lifecycle(),
+        Some("ended")
+    );
+
+    // Retiring the account also blocks `prefer` by account `pk`.
+    Registry::at(paths.clone())
+        .write(vec![vec![put(&ACCOUNT, &claude, "row", json!("retired"))]])
+        .unwrap();
+    assert!(verb(&["prefer", "m3", &claude]).is_err());
+}
+
+/// `prefer` refuses a retired machine or account even when named by key, while `unprefer` still
+/// ends a lingering preference on a retired row; `import` refuses `--apply --review`, duplicate
+/// single-value flags, and world-readable mailbox key files; and `--rank` requires canonical
+/// digits.
+/// NEGATIVE CONTROL: with `named_row` returning any key present in `rows` without checking
+/// `require_live` (`if rows.rows.contains_key(name) { return Ok(..); }`), `prefer` on a retired
+/// machine key succeeds: `` assertion failed: verb(&["prefer", &m3_pk, &claude]).is_err() ``.
+#[test]
+fn retired_keys_cannot_gain_new_preferences_and_strict_flags_or_open_keys_refuse() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let (vault, logins) = sheets(scratch.path());
+    let mut opened = Vec::new();
+    import(paths, &["--apply", "--first"], &vault, &logins, &mut opened);
+    let claude = keys::account_pk("claude", "ann@example.invalid").unwrap();
+    let m3_pk = keys::machine_pk("m3");
+    let mut no_review = |_: &Path| Ok(());
+    let mut verb = |list: &[&str]| run(paths, &words(list), Some(&Stand), &mut no_review, NOW);
+    for bad in [
+        &["import", "--apply", "--review"][..],
+        &["import", "--vault-sheet", "a.csv", "--vault-sheet", "b.csv"],
+        &["import", "--logins", "a.csv", "--logins", "b.csv"],
+        &["import", "--ai-pool", "a.toml", "--ai-pool", "b.toml"],
+        &["prefer", "m3", &claude, "--rank", "02"],
+        &["prefer", "m3", &claude, "--rank", "+2"],
+        &["prefer", "m3", &claude, "--rank", "1", "--rank", "2"],
+    ] {
+        assert!(verb(bad).is_err(), "{bad:?}");
+    }
+    // Retire m3 in the registry: `prefer` by key refuses, while `unprefer` by key or label ends
+    // the existing preference.
+    Handle::at(paths.clone(), &att::REGISTRY)
+        .commit_derived(false, |_| {
+            Ok((
+                (),
+                vec![vec![
+                    cell::change(
+                        &MACHINE,
+                        CellKey {
+                            pk: &m3_pk,
+                            col: "row",
+                            elem: None,
+                        },
+                        &CellValue::owner(MACHINE.version, json!("retired")),
+                    )
+                    .unwrap(),
+                ]],
+            ))
+        })
+        .unwrap();
+    assert!(verb(&["prefer", &m3_pk, &claude]).is_err());
+    let ended = verb(&["unprefer", "m3", &claude]).unwrap();
+    assert_eq!(ended["row"], json!("ended"));
+    // A world-readable mailbox key file is refused by `read_private`.
+    let key_file = paths.dir.join(MAILBOX_KEYS);
+    std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        verb(&[
+            "import",
+            "--vault-sheet",
+            vault.to_str().unwrap(),
+            "--logins",
+            logins.to_str().unwrap(),
+        ])
+        .is_err()
+    );
+}
+
+/// Denied swarm-roster members are excluded from `known_macs`, so neither `import` nor `adopt`
+/// births or adopts a retired Mac's roster entry.
+/// NEGATIVE CONTROL: with `known_macs` omitting `.filter(|member| !roster.is_member_denied(member))`,
+/// `report["known_macs"]` is `2` and `m2` is born active in `MACHINE`.
+#[test]
+fn denied_roster_macs_are_excluded_from_import_and_adopt() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let paths = &lab.paths[0];
+    let mut roster = aterm_secrets::client::admin_seed_swarm_roster(paths, &[]).unwrap();
+    roster.deny_labels.push("m2".to_owned());
+    let admin = aterm_secrets::client::admin_open(paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        aterm_secrets::swarm_roster::ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    aterm_secrets::client::admin_publish(paths, &admin, &doc).unwrap();
+    aterm_secrets::client::sync(paths, None).unwrap();
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let (vault, logins) = sheets(scratch.path());
+    let mut opened = Vec::new();
+    let report = import(paths, &["--apply", "--first"], &vault, &logins, &mut opened);
+    assert_eq!(report["known_macs"], json!(1), "{report}");
+    let view = Registry::at(paths.clone()).view().unwrap();
+    assert!(
+        !view
+            .project(&MACHINE)
+            .rows
+            .values()
+            .any(|row| row.get("label") == Some(&json!("m2"))),
+        "denied roster member m2 must not birth a machine row"
+    );
+
+    let mut no_review = |_: &Path| Ok(());
+    let adopted = run(
+        paths,
+        &words(&["adopt", "--dry-run"]),
+        None,
+        &mut no_review,
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(adopted["known_macs"], json!(1), "{adopted}");
 }

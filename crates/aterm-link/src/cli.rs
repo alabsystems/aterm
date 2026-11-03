@@ -30,7 +30,10 @@ hands down; run by hand, it needs --sock and --token-file and serves as an obser
 
   --fleet <F>            fleet name (the `/f/<F>/` subtree)
   --broker <socket>      the broker's Unix socket
-  --cap-file <path>      minted capability file (`<grant> <tag-hex>` lines); repeatable
+  --cap-file <path>      minted capability file (`<grant> <tag-hex>` lines); repeatable. A
+                         regular file of yours at 0600 or tighter, in any folder: a wider
+                         one, a symlink or a FIFO is refused at once, including at supervised
+                         startup; the file is left unchanged
   --state <dir>          state dir: node id, incarnation, sequences, watermarks (default
                          `$XDG_STATE_HOME/aterm-link`, else `~/.local/state/aterm-link`)
   --accept-from <p>,...  principals whose task/control arrive undemoted (an `h-` human's
@@ -1127,7 +1130,8 @@ usage: aterm link mint <grant> --secret-file <path>
                        symlink on the file or its dir, a second link to the file, or
                        fewer bytes is refused; a deny entry passes)
 
-Prints one `<grant> <tag-hex>` line: append it to the file `serve --cap-file` reads.
+Prints one `<grant> <tag-hex>` line: append it to the file `serve --cap-file` reads, which
+must be 0600 or tighter (a shell redirect makes a new file 0644: `chmod 600` it).
 ";
     let mut grant: Option<&str> = None;
     let mut secret: Option<&str> = None;

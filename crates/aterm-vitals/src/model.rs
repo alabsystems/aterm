@@ -1143,11 +1143,45 @@ impl RowScope {
     }
 }
 
+/// Raw process CPU accounting, retained separately from interval rates.
+/// Reaped-child totals include descendants and may overlap CPU already observed
+/// while those children were alive; they are not added to the displayed self rate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CpuAccounting {
+    /// The process's own cumulative CPU nanoseconds.
+    pub self_ns: Option<u64>,
+    /// Kernel-reported cumulative CPU of children this process has reaped.
+    pub reaped_children_ns: Option<u64>,
+    /// Whether Darwin may double-charge unwaited children to that counter.
+    pub auto_reaps_children: Option<bool>,
+    /// Monotonic time when these process counters were read.
+    pub sampled_at_ns: Option<u64>,
+    /// Kernel start identity; compare only within one boot.
+    pub start: Option<u64>,
+    /// Darwin process/exec generation, when read.
+    pub exec_version: Option<i32>,
+}
+
+impl From<&ProcSample> for CpuAccounting {
+    fn from(p: &ProcSample) -> Self {
+        Self {
+            self_ns: p.cpu_ns,
+            reaped_children_ns: p.child_cpu_ns,
+            auto_reaps_children: p.reaps_unwaited,
+            sampled_at_ns: p.at_ns,
+            start: p.start,
+            exec_version: p.version,
+        }
+    }
+}
+
 /// One process as `sys procs` and the top rows show it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcView {
     /// Darwin scheduling observations; lifetime QoS counters, not core placement.
     pub scheduling: Option<crate::scheduling::Scheduling>,
+    /// Original counters and identity for interpreting this process's own rate.
+    pub cpu_accounting: CpuAccounting,
     /// The pid.
     pub pid: u32,
     /// Its parent.
@@ -3553,6 +3587,7 @@ impl Vitals {
             }
             rows.push(ProcView {
                 scheduling: p.scheduling,
+                cpu_accounting: CpuAccounting::from(p),
                 pid: p.pid,
                 ppid: p.ppid,
                 pgid: p.pgid,
@@ -4654,6 +4689,53 @@ mod tests {
             "reused PID is not a zero reading of the old job"
         );
         assert!(snapshot.top.is_empty());
+    }
+
+    #[test]
+    fn process_self_rate_keeps_reaped_cpu_and_generation_separate() {
+        let mut p = proc(900, 100, 100, 10, "worker");
+        p.child_cpu_ns = Some(0);
+        p.reaps_unwaited = Some(false);
+        p.version = Some(11);
+        p.at_ns = Some(1_000_000_000);
+        let mut s = Sample {
+            at_ns: 1_000_000_000,
+            self_pid: 100,
+            procs: Some(vec![p.clone()]),
+            ..Sample::default()
+        };
+        let mut vitals = Vitals::new();
+        vitals.absorb(&s);
+        s.at_ns += 1_000_000_000;
+        p.at_ns = Some(s.at_ns);
+        p.cpu_ns = Some(200_000_000);
+        p.child_cpu_ns = Some(5_000_000_000);
+        s.procs = Some(vec![p.clone()]);
+        let snapshot = vitals.absorb(&s);
+        let row = &snapshot.procs[0];
+        assert_eq!(row.cores, Some(0.1));
+        assert_eq!(row.cpu_accounting.self_ns, Some(200_000_000));
+        assert_eq!(row.cpu_accounting.reaped_children_ns, Some(5_000_000_000));
+        assert_eq!(row.cpu_accounting.auto_reaps_children, Some(false));
+        assert_eq!(row.cpu_accounting.sampled_at_ns, Some(s.at_ns));
+        assert_eq!(row.cpu_accounting.exec_version, Some(11));
+
+        s.at_ns += 1_000_000_000;
+        p.start = Some(2);
+        p.version = Some(12);
+        p.cpu_ns = Some(50_000_000);
+        p.child_cpu_ns = None;
+        p.reaps_unwaited = None;
+        p.at_ns = Some(s.at_ns);
+        s.procs = Some(vec![p]);
+        let replacement = vitals.absorb(&s);
+        let row = &replacement.procs[0];
+        assert_eq!(row.cores, None);
+        assert_eq!(row.cpu_accounting.start, Some(2));
+        assert_eq!(row.cpu_accounting.exec_version, Some(12));
+        assert_eq!(row.cpu_accounting.self_ns, Some(50_000_000));
+        assert_eq!(row.cpu_accounting.reaped_children_ns, None);
+        assert_eq!(row.cpu_accounting.auto_reaps_children, None);
     }
 
     #[test]

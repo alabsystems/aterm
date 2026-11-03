@@ -4508,10 +4508,10 @@ impl crate::App {
             let Some(ws) = self.windows.get(wid) else {
                 continue;
             };
-            let n = ws.tab_set.len();
+            let n = ws.tab_set.shown_len();
             let loads: Vec<u8> = ws
                 .tab_set
-                .tabs()
+                .shown()
                 .iter()
                 .map(|tab| self.chip_load(n, tab))
                 .collect();
@@ -4598,6 +4598,7 @@ impl crate::App {
                 let focused = terminal(tab.focus);
                 let in_front = Some(*wid) == front && active == Some(i);
                 let first = tabs.len();
+                let name = self.tab_name(tab, i);
                 for pane in self.tab_sessions(tab) {
                     let Some(s) = self.pool.get(pane) else {
                         continue;
@@ -4615,7 +4616,7 @@ impl crate::App {
                                 key: pane,
                                 tab: pane,
                                 shell_pid,
-                                label: format!("Tab {}", i + 1),
+                                label: name.clone(),
                                 program: tl.agent().program.clone().unwrap_or_default(),
                                 tab_id: Some(tab.id.get()),
                             });
@@ -4737,7 +4738,8 @@ impl crate::App {
         }
     }
 
-    /// This window's front tab: its focused pane's session id and its label (`Tab 2`).
+    /// This window's front tab: its focused pane's session id and its label (`Tab 2`, or for a
+    /// worker `Workers ▸ bench`).
     pub(crate) fn deck_tab(&self, wid: crate::WindowId) -> (Option<u64>, String) {
         let Some(ws) = self.windows.get(&wid) else {
             return (None, "Tab".into());
@@ -4745,15 +4747,14 @@ impl crate::App {
         let Some(i) = ws.tab_set.active_index() else {
             return (None, "Tab".into());
         };
-        let label = format!("Tab {}", i + 1);
-        let key =
-            ws.tab_set
-                .tab_at(i)
-                .and_then(|tab| match self.view_store.get(tab.focus).copied() {
-                    Some(crate::tab_model::View::Terminal(view)) => Some(view.session),
-                    _ => None,
-                });
-        (key, label)
+        let Some(tab) = ws.tab_set.tab_at(i) else {
+            return (None, "Tab".into());
+        };
+        let key = match self.view_store.get(tab.focus).copied() {
+            Some(crate::tab_model::View::Terminal(view)) => Some(view.session),
+            _ => None,
+        };
+        (key, self.tab_name(tab, i))
     }
 
     /// The sessions of this window's front tab ([`Self::tab_sessions`]): the

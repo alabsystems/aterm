@@ -1085,6 +1085,7 @@ fn note_settles_and_the_write(parked: &mut Parked) {
                 });
             },
             sync_on: || false,
+            ask_access: || false,
             fda_granted: || {},
             tools_installed: || {},
             join_phrase: |_, _| false,

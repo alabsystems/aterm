@@ -103,8 +103,26 @@ fn systemctl(args: &[&str]) -> Result<(bool, String), String> {
     ))
 }
 
+const MAX_PROC_OR_ETC_BYTES: usize = 4 * 1024 * 1024;
+
+fn read_regular_utf8(path: &str) -> io::Result<String> {
+    let f = crate::open_regular_nonblock(Path::new(path))?;
+    let cap = u64::try_from(MAX_PROC_OR_ETC_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut text = String::new();
+    let read = f.take(cap).read_to_string(&mut text)?;
+    if read > MAX_PROC_OR_ETC_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {MAX_PROC_OR_ETC_BYTES}-byte limit"),
+        ));
+    }
+    Ok(text)
+}
+
 fn read_trimmed(path: &str) -> String {
-    std::fs::read_to_string(path)
+    read_regular_utf8(path)
         .map(|t| t.trim().to_string())
         .unwrap_or_else(|e| format!("unreadable ({e})"))
 }
@@ -155,7 +173,7 @@ impl System for Guest {
     }
 
     fn uptime_ms(&self) -> u64 {
-        std::fs::read_to_string("/proc/uptime")
+        read_regular_utf8("/proc/uptime")
             .ok()
             .and_then(|t| system::parse_uptime_ms(&t))
             .unwrap_or(0)
@@ -206,12 +224,12 @@ impl System for Guest {
     }
 
     fn mount(&self, shares: &[Share]) -> Result<(), String> {
-        let info = std::fs::read_to_string("/proc/self/mountinfo")
+        let info = read_regular_utf8("/proc/self/mountinfo")
             .map_err(|e| format!("/proc/self/mountinfo: {e}"))?;
         for op in mounts::plan(&mounts::parse(&info), shares)? {
             apply(&op)?;
         }
-        let after = std::fs::read_to_string("/proc/self/mountinfo")
+        let after = read_regular_utf8("/proc/self/mountinfo")
             .map_err(|e| format!("/proc/self/mountinfo: {e}"))?;
         mounts::check(&mounts::parse(&after), shares)
     }
@@ -224,10 +242,8 @@ impl System for Guest {
     }
 
     fn identity(&self) -> Result<Identity, String> {
-        let passwd =
-            std::fs::read_to_string("/etc/passwd").map_err(|e| format!("/etc/passwd: {e}"))?;
-        let group =
-            std::fs::read_to_string("/etc/group").map_err(|e| format!("/etc/group: {e}"))?;
+        let passwd = read_regular_utf8("/etc/passwd").map_err(|e| format!("/etc/passwd: {e}"))?;
+        let group = read_regular_utf8("/etc/group").map_err(|e| format!("/etc/group: {e}"))?;
         user::identity(&passwd, &group)
     }
 }

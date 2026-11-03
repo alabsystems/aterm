@@ -179,7 +179,7 @@ fn sibling_targets() -> Vec<(u32, String)> {
     }
     if let Ok(entries) = std::fs::read_dir(dir.join("graph")) {
         for e in entries.flatten() {
-            let Ok(body) = std::fs::read_to_string(e.path()) else {
+            let Ok(body) = crate::proxy::read_private_text(&e.path()) else {
                 continue;
             };
             let Some(sock) = aterm_types::control_socket::graph_entry_sock(&body) else {

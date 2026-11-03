@@ -326,3 +326,194 @@ fn jq_runs_over_every_page_of_a_listing() {
     assert_eq!(ran.receipt("complete").as_deref(), Some("1"));
     fake.assert_clean();
 }
+
+/// The dev repository every write scenario writes.
+#[cfg(unix)]
+const APP: &str = "fixture-dev/app";
+
+/// A scratch root with the canonical agh.toml, both token files and the canonical repos.
+#[cfg(unix)]
+fn write_world(label: &str) -> (aterm_tempfile::TempDir, FakeGithub) {
+    let root = common::scratch(label);
+    let fake = FakeGithub::start();
+    common::canonical_tokens(root.path(), &fake, true, true);
+    common::write_config(
+        &agh::config::Dirs::under(root.path()),
+        &common::canonical_config(root.path()),
+    );
+    common::canonical_repos(&fake);
+    (root, fake)
+}
+
+/// stdout's reports: an array's items, or the one object.
+#[cfg(unix)]
+fn outcomes(ran: &Ran) -> Vec<String> {
+    let reports = match ran.json() {
+        Value::Array(items) => items,
+        value => vec![value],
+    };
+    reports
+        .iter()
+        .map(|r| r["outcome"].as_str().unwrap_or("?").to_string())
+        .collect()
+}
+
+/// The fake's write requests, as `METHOD path`.
+#[cfg(unix)]
+fn writes(fake: &FakeGithub) -> Vec<agh_fake::Seen> {
+    fake.seen()
+        .into_iter()
+        .filter(|s| s.method != "GET" && s.method != "HEAD")
+        .collect()
+}
+
+/// `intent list REPO --open` exits 0 and lists no intent.
+#[cfg(unix)]
+fn no_open_intent(root: &std::path::Path, fake: &FakeGithub) {
+    let listed = run(root, fake, &["intent", "list", APP, "--open"]);
+    listed.ok();
+    assert_eq!(
+        listed.json().as_array().map(Vec::len),
+        Some(0),
+        "{}",
+        listed.stdout
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_release_is_drafted_uploaded_published_and_waited_for() {
+    let (root, fake) = write_world("golden-release");
+    let root = root.path();
+    let files = root.join("files");
+    std::fs::create_dir_all(&files).expect("the files directory");
+    let a = common::file(&files, "a.bin", b"alpha");
+    let b = common::file(&files, "b.bin", b"beta");
+    let sha = |bytes: &[u8]| aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(bytes));
+
+    let created = run(
+        root,
+        &fake,
+        &["release", "create", APP, "v1", "--draft", "--notes", "n"],
+    );
+    assert_eq!(outcomes(created.ok()), ["created"]);
+
+    let (a, b) = (a.to_str().expect("UTF-8"), b.to_str().expect("UTF-8"));
+    let uploaded = run(root, &fake, &["release", "upload", APP, "v1", a, b]);
+    assert_eq!(outcomes(uploaded.ok()), ["created", "created"]);
+
+    let (expect_a, expect_b) = (
+        format!("a.bin={}", sha(b"alpha")),
+        format!("b.bin={}", sha(b"beta")),
+    );
+    let published = run(
+        root,
+        &fake,
+        &[
+            "release",
+            "publish",
+            APP,
+            "v1",
+            "--expect-asset",
+            &expect_a,
+            "--expect-asset",
+            &expect_b,
+        ],
+    );
+    assert_eq!(outcomes(published.ok()), ["created"]);
+
+    let waited = run(
+        root,
+        &fake,
+        &[
+            "release",
+            "wait",
+            APP,
+            "v1",
+            "published",
+            "asset=a.bin",
+            "asset=b.bin",
+            "--timeout",
+            "30s",
+        ],
+    );
+    let state = waited.ok().json();
+    let holds: Vec<Value> = state["conditions"]
+        .as_array()
+        .expect("conditions")
+        .iter()
+        .map(|c| c["holds"].clone())
+        .collect();
+    assert_eq!(
+        holds,
+        [Value::from(true), Value::from(true), Value::from(true)]
+    );
+
+    let releases = fake.releases_of(APP);
+    assert_eq!(releases.len(), 1, "{releases:?}");
+    assert!(!releases[0].draft, "{releases:?}");
+    let mut names: Vec<&str> = releases[0]
+        .assets
+        .iter()
+        .map(|(_, name, ..)| name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["a.bin", "b.bin"]);
+    let written = writes(&fake);
+    assert!(!written.is_empty());
+    assert!(
+        written
+            .iter()
+            .all(|s| s.as_login.as_deref() == Some("fixture-dev-bot")),
+        "{written:?}"
+    );
+    no_open_intent(root, &fake);
+    fake.assert_clean();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lost_create_is_never_posted_twice_and_a_rerun_settles_it() {
+    use agh_fake::{Change, Fault, Match};
+
+    let (root, fake) = write_world("golden-lost-create");
+    let root = root.path();
+    fake.set_listing_lag(APP, true);
+    fake.fault(
+        Match::api("/repos/fixture-dev/app/releases").method("POST"),
+        Fault::LandThenClose,
+    );
+    let create = ["release", "create", APP, "v1", "--draft"];
+    let posts = |fake: &FakeGithub| {
+        writes(fake)
+            .into_iter()
+            .filter(|s| s.method == "POST")
+            .count()
+    };
+
+    let lost = run(root, &fake, &create);
+    assert_eq!(lost.exit, 13, "{} / {}", lost.stdout, lost.stderr);
+    assert_eq!(outcomes(&lost), ["unknown"]);
+
+    let again = run(root, &fake, &create);
+    assert_eq!(again.exit, 13, "{} / {}", again.stdout, again.stderr);
+    assert_eq!(
+        common::error_json(&again.stderr)["sub"],
+        Value::from("intent_open")
+    );
+    assert_eq!(posts(&fake), 1);
+
+    let hidden = fake
+        .releases_of(APP)
+        .into_iter()
+        .find(|r| r.hidden)
+        .expect("the landed draft, hidden by the listing lag");
+    fake.apply(Change::Reveal {
+        release_id: hidden.id,
+    });
+    let settled = run(root, &fake, &create);
+    assert_eq!(outcomes(settled.ok()), ["converged"]);
+    assert_eq!(posts(&fake), 1);
+    no_open_intent(root, &fake);
+    fake.assert_clean();
+}

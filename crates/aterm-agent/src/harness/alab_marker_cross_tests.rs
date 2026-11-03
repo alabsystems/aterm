@@ -63,7 +63,25 @@ fn atpkg_and_the_harness_give_one_answer_on_every_package_shape() {
             "dot-entry",
             r#"{"layoutVersion":1,"entrypoint":"./bin/codex"}"#,
             Marker::File,
-            true,
+            false,
+        ),
+        (
+            "interior-dot-entry",
+            r#"{"layoutVersion":1,"entrypoint":"bin/./codex"}"#,
+            Marker::File,
+            false,
+        ),
+        (
+            "repeated-separator-entry",
+            r#"{"layoutVersion":1,"entrypoint":"bin//codex"}"#,
+            Marker::File,
+            false,
+        ),
+        (
+            "trailing-slash-entry",
+            r#"{"layoutVersion":1,"entrypoint":"bin/codex/"}"#,
+            Marker::File,
+            false,
         ),
         (
             "empty-entry",
@@ -147,6 +165,46 @@ fn atpkg_and_the_harness_give_one_answer_on_every_package_shape() {
         assert!(
             !atpkg::alab::is_alab_package(&root),
             "linked-in-root-entry: atpkg's root form"
+        );
+
+        let root = dir.join("linked-intermediate-dir-entry");
+        lay(
+            &root,
+            r#"{"layoutVersion":1,"version":"0.164.0-dev.12+gabc","entrypoint":"linked-bin/codex"}"#,
+            Marker::File,
+        );
+        std::os::unix::fs::symlink("bin", root.join("linked-bin")).expect("linked-bin");
+        let exe = root.join("bin/codex");
+        assert!(
+            !cx::alab_bytes(&exe),
+            "linked-intermediate-dir-entry: the harness"
+        );
+        assert!(
+            !atpkg::alab::exe_is_alab(&exe),
+            "linked-intermediate-dir-entry: atpkg's exe form"
+        );
+        assert!(
+            !atpkg::alab::is_alab_package(&root),
+            "linked-intermediate-dir-entry: atpkg's root form"
+        );
+    }
+    {
+        let root = dir.join("oversized-manifest");
+        let mut oversized = good.to_string();
+        oversized.extend(std::iter::repeat_n(
+            ' ',
+            atpkg::alab::MAX_PACKAGE_JSON_BYTES + 1 - oversized.len(),
+        ));
+        lay(&root, &oversized, Marker::File);
+        let exe = root.join("bin/codex");
+        assert!(!cx::alab_bytes(&exe), "oversized-manifest: the harness");
+        assert!(
+            !atpkg::alab::exe_is_alab(&exe),
+            "oversized-manifest: atpkg's exe form"
+        );
+        assert!(
+            !atpkg::alab::is_alab_package(&root),
+            "oversized-manifest: atpkg's root form"
         );
     }
 }

@@ -51,7 +51,7 @@ pub enum Finding {
 /// The file is missing or not TOML, or a ban entry is not an inline table or has no `name`.
 pub fn policy(root: &Path) -> Result<Policy, String> {
     let path = root.join("deny.toml");
-    let text = std::fs::read_to_string(&path)
+    let text = crate::read_regular_text(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     parse_policy(&text).map_err(|e| format!("{}: {e}", path.display()))
 }

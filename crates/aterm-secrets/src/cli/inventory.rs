@@ -99,17 +99,20 @@ mod tests {
             .unwrap();
         crate::fsx::write_atomic(
             &paths.dir.join("state.toml"),
-            b"[manifest]\nrelease-notary = 'metadata-digest'\n",
+            format!(
+                "own = ['{SITE_DEPLOYER_KEY_ENTRY}', 'release-notary']\n[manifest]\nrelease-notary = 'metadata-digest'\n"
+            ).as_bytes(),
             0o600,
         )
         .unwrap();
         assert!(crate::client::status(&paths).is_err());
         let names = crate::client::registered_names(&paths).unwrap();
-        assert_eq!(names, ["release-notary"]);
+        assert_eq!(names, ["release-notary", SITE_DEPLOYER_KEY_ENTRY]);
         let text = listing(&names, true, false).unwrap();
         assert!(text.contains("~/.secrets/release-notary"));
         assert!(!text.contains("metadata-digest"));
         assert!(!text.contains("not an age identity"));
+        assert!(text.contains(SITE_DEPLOYER_KEY_ENTRY));
     }
 
     #[test]

@@ -1023,7 +1023,7 @@ pub(crate) fn extract_tar_zst_tree(
     checksum: FrameChecksum,
 ) -> Result<TreeAccumulator, ExtractError> {
     extract_tar_zst_tree_from(
-        std::fs::File::open(archive)?,
+        crate::metadata_io::open_regular(archive)?,
         dest_root,
         max_total_bytes,
         max_entries,
@@ -1061,7 +1061,10 @@ fn zstd_decoder(
     archive: &Path,
     checksum: FrameChecksum,
 ) -> io::Result<aterm_zstd::Decoder<io::BufReader<std::fs::File>>> {
-    Ok(zstd_reader(std::fs::File::open(archive)?, checksum))
+    Ok(zstd_reader(
+        crate::metadata_io::open_regular(archive)?,
+        checksum,
+    ))
 }
 
 /// The bytes the decoder reads from its input at a time.
@@ -1089,7 +1092,7 @@ pub(crate) fn extract_tar_gz_tree(
     opts: ExtractOptions,
 ) -> Result<TreeAccumulator, ExtractError> {
     extract_tar_gz_tree_from(
-        std::fs::File::open(archive)?,
+        crate::metadata_io::open_regular(archive)?,
         dest_root,
         max_total_bytes,
         max_entries,
@@ -1130,7 +1133,7 @@ pub(crate) fn extract_tar_tree(
     opts: ExtractOptions,
 ) -> Result<TreeAccumulator, ExtractError> {
     folded(extract_stream(
-        std::fs::File::open(archive)?,
+        crate::metadata_io::open_regular(archive)?,
         dest_root,
         max_total_bytes,
         max_entries,
@@ -1511,7 +1514,7 @@ pub(crate) fn stage_tar_gz_member(
     mode: u32,
     max_total_bytes: u64,
 ) -> Result<WrittenFile, ExtractError> {
-    let file = std::fs::File::open(archive).map_err(|e| io_at(e, "open", archive))?;
+    let file = crate::metadata_io::open_regular(archive).map_err(|e| io_at(e, "open", archive))?;
     let budget = Rc::new(Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));
     let mut tar = crate::tarread::Archive::new(CappedReader {
         inner: aterm_codec::inflate::stream::GzipReader::new(file),
@@ -1593,7 +1596,7 @@ pub(crate) fn stage_npm_brotli_binary(
     mode: u32,
     size: u64,
 ) -> Result<NpmBinary, ExtractError> {
-    let file = std::fs::File::open(archive).map_err(|e| io_at(e, "open", archive))?;
+    let file = crate::metadata_io::open_regular(archive).map_err(|e| io_at(e, "open", archive))?;
     let budget = Rc::new(Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));
     let mut tar = crate::tarread::Archive::new(CappedReader {
         inner: aterm_codec::inflate::stream::GzipReader::new(file),

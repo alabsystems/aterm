@@ -193,10 +193,18 @@ pub fn elect_highest_candidate(
     })
 }
 
+fn open_stopped_strict_cold(log_path: &Path) -> io::Result<BrokerLog> {
+    BrokerLog::open_opts(
+        log_path,
+        crate::OpenOptions::new(crate::Durability::Strict).with_resident_budget(0),
+        BrokerLog::prepare_nothing,
+    )
+}
+
 /// Inspect a stopped node log at `log_path` under `Strict` durability and return its
 /// [`ElectionCandidate`] state for [`elect_highest_candidate`].
 pub fn inspect_node_log(node_id: usize, log_path: &Path) -> io::Result<ElectionCandidate> {
-    let mut log = BrokerLog::open(log_path)?;
+    let mut log = open_stopped_strict_cold(log_path)?;
     let cand = ElectionCandidate {
         node_id,
         identity: log.identity(),
@@ -220,7 +228,7 @@ pub fn promote_replica_log(
     log_path: &Path,
     min_cluster_epoch: Option<LogIdentity>,
 ) -> io::Result<PromotedReplica> {
-    let mut log = BrokerLog::open(log_path)?;
+    let mut log = open_stopped_strict_cold(log_path)?;
     let (identity, lineage) = log.promote_replica(min_cluster_epoch)?;
     let head_offset = log.head().0;
     let base_offset = log.base().0;
@@ -247,7 +255,7 @@ pub fn repair_follower_for_leader(
     follower_log_path: &Path,
     common_head: Offset,
 ) -> io::Result<u64> {
-    let mut log = BrokerLog::open(follower_log_path)?;
+    let mut log = open_stopped_strict_cold(follower_log_path)?;
     if !log.is_replica() {
         log.declare_replica()?;
     }
@@ -337,5 +345,46 @@ mod tests {
         assert_eq!(win.highest_epoch, id(0xAA, 1));
         assert_eq!(win.quorum_votes, 2);
         assert_eq!(win.required_quorum, 2);
+    }
+
+    #[test]
+    fn stopped_failover_opens_logs_with_zero_resident_budget_and_repairs_tail() {
+        let root = crate::test_scratch::Scratch::new("failover-cold-open");
+        let leader_path = root.path().join("leader");
+        let replica_path = root.path().join("replica");
+
+        {
+            let mut leader = BrokerLog::open(&leader_path).unwrap();
+            for seq in 1..=64u64 {
+                leader
+                    .publish(7, seq, format!("/f/ev/{seq}"), vec![b'x'; 64])
+                    .unwrap();
+            }
+            leader.close_clean().unwrap();
+        }
+        {
+            let mut replica = BrokerLog::open(&replica_path).unwrap();
+            replica.declare_replica().unwrap();
+            replica.close_clean().unwrap();
+        }
+
+        let cold = open_stopped_strict_cold(&leader_path).unwrap();
+        assert_eq!((cold.residency().0, cold.residency().2), (1, 64));
+        assert!(cold.hot_capacity_for_test() <= 16);
+        drop(cold);
+
+        let cand = inspect_node_log(0, &leader_path).unwrap();
+        assert_eq!(
+            (cand.head_offset, cand.base_offset, cand.diverged),
+            (64, 0, false)
+        );
+
+        let promoted = promote_replica_log(&replica_path, Some(cand.identity)).unwrap();
+        assert!(promoted.identity.generation > cand.identity.generation);
+
+        let dropped = repair_follower_for_leader(&leader_path, Offset(20)).unwrap();
+        assert_eq!(dropped, 44);
+        let repaired = inspect_node_log(0, &leader_path).unwrap();
+        assert_eq!((repaired.head_offset, repaired.diverged), (20, false));
     }
 }

@@ -321,6 +321,8 @@ pub(super) enum Point {
     Publishing,
     Renamed,
     Committed,
+    /// An adoption's receipt is on record, its marker not yet published.
+    Adopted,
 }
 
 #[cfg(all(test, unix))]
@@ -346,7 +348,7 @@ pub(super) mod faults {
 }
 
 #[cfg(unix)]
-fn step(point: Point) -> Option<()> {
+pub(super) fn step(point: Point) -> Option<()> {
     #[cfg(test)]
     {
         faults::at(point)

@@ -29,8 +29,8 @@ use super::policy::reset::{
 };
 use super::policy::sleeps::{FirstLook, SleepBook, SleepStamp};
 use super::policy::turn_end::{
-    AccountAdvice, AccountBad, AccountPoint, AgentResumed, FirstRead, ModelSwitch, PERSON_TYPING,
-    ProbeGate, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_LIMIT_RESUME,
+    AccountAdvice, AccountBad, AccountPoint, AgentResumed, FirstRead, GaveUp, ModelSwitch,
+    PERSON_TYPING, ProbeGate, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_LIMIT_RESUME,
     RULE_OUTAGE_RESUME, Reach, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming,
     WaitKind, is_continue_rule, said_mark,
 };
@@ -708,6 +708,8 @@ pub enum ProbeNo {
     NotJudged,
     /// Account is not due for a fresh probe under the store lock.
     NotDue,
+    /// No turn ran on this session since its last read was claimed: time alone makes no read due.
+    NotUsed,
     /// Probe claim is already held for this account or globally.
     Claimed,
     /// Account store lock remained held past the bounded wait.
@@ -718,12 +720,13 @@ pub enum ProbeNo {
 
 impl ProbeNo {
     /// All probe refusal reasons in [`Self::word`] order.
-    pub const ALL: [ProbeNo; 8] = [
+    pub const ALL: [ProbeNo; 9] = [
         ProbeNo::NoAccounts,
         ProbeNo::Mode,
         ProbeNo::Unread,
         ProbeNo::NotJudged,
         ProbeNo::NotDue,
+        ProbeNo::NotUsed,
         ProbeNo::Claimed,
         ProbeNo::LockHeld,
         ProbeNo::State,
@@ -738,6 +741,7 @@ impl ProbeNo {
             ProbeNo::Unread => "unread",
             ProbeNo::NotJudged => "not-a-stored-login",
             ProbeNo::NotDue => "not-due",
+            ProbeNo::NotUsed => "not-used",
             ProbeNo::Claimed => "claimed",
             ProbeNo::LockHeld => "lock-held",
             ProbeNo::State => "state",
@@ -1277,15 +1281,17 @@ fn seed_done_check(
     state.seed_done_check(owed.rule, owed.cut && !awaited, owed.answered);
 }
 
-/// THE LANDING A LOOP BEFORE THIS ONE NOTED, read back from its journal (newest first): the
-/// mark of its words, when it was first noted, whether the task's own wake kept it, and the
-/// receipt journaled with it (`RECEIPT` with the `DONE` note's seq, §14.9 slice 9b; a receipt
-/// of another seq is not read).
+/// THE END A LOOP BEFORE THIS ONE NOTED, read back from its journal (newest first): the mark of its
+/// words, when it was first noted, whether the task's own wake kept it, the receipt journaled with
+/// it (`RECEIPT` with the `DONE` note's seq, §14.9 slice 9b; a receipt of another seq is not read),
+/// and, for a worker's failed conclusion (a `FAILED` note, which rests as a landing does), how it
+/// ended.
 type EndedBefore = (
     Option<u64>,
     i64,
     bool,
     Option<crate::harness::acts::LandReceipt>,
+    Option<GaveUp>,
 );
 
 fn ended_before(journal: &str, sid: Option<&str>, last_ms: Option<i64>) -> Option<EndedBefore> {
@@ -1298,9 +1304,11 @@ fn ended_before(journal: &str, sid: Option<&str>, last_ms: Option<i64>) -> Optio
     let mut by_wake = false;
     let mut after: Option<(u64, crate::harness::acts::LandReceipt)> = None;
     let mut receipt = None;
+    let mut failed = None;
     let records = journal.lines().rev().filter_map(|text| {
         let end = text.contains("\"line\":\"DONE ")
             || text.contains("\"line\":\"LEFT ")
+            || text.contains("\"line\":\"FAILED ")
             || text.contains(&receipt_line);
         if !end && !text.contains("\"kind\":\"event\"") && !text.contains("\"kind\":\"approved\"") {
             return None;
@@ -1312,7 +1320,7 @@ fn ended_before(journal: &str, sid: Option<&str>, last_ms: Option<i64>) -> Optio
     for rec in records {
         let mut words = rec.line.split(' ');
         let word = words.next().unwrap_or_default();
-        let ends = word == "DONE" || word == "LEFT";
+        let ends = word == "DONE" || word == "LEFT" || word == "FAILED";
         let Some(seq) = note else {
             if !ends {
                 if said_a_point(&rec) {
@@ -1330,8 +1338,14 @@ fn ended_before(journal: &str, sid: Option<&str>, last_ms: Option<i64>) -> Optio
                 .and_then(|w| w.strip_prefix("seq="))
                 .and_then(crate::parse_uint::<u64>);
             let rule = words.next().unwrap_or_default();
-            if word != "DONE" || rule != land || last_ms.is_some_and(|t| t > rec.t) {
+            if !matches!(word, "DONE" | "FAILED")
+                || rule != land
+                || last_ms.is_some_and(|t| t > rec.t)
+            {
                 return None;
+            }
+            if word == "FAILED" {
+                failed = Some(GaveUp::of_journal_line(&rec.line)?);
             }
             noted_ms = rec.ended.map_or(rec.t, |first| first.min(rec.t));
             by_wake = rec.line.contains(super::policy::turn_end::WAKE_KEPT);
@@ -1356,18 +1370,20 @@ fn ended_before(journal: &str, sid: Option<&str>, last_ms: Option<i64>) -> Optio
         return later
             .iter()
             .all(own)
-            .then_some((landing, noted_ms, by_wake, receipt));
+            .then_some((landing, noted_ms, by_wake, receipt, failed));
     }
     let seq = note?;
     later
         .iter()
         .all(|p| !is_box(p) && p.seq.is_some() && p.seq == seq)
-        .then_some((None, noted_ms, by_wake, receipt))
+        .then_some((None, noted_ms, by_wake, receipt, failed))
 }
 
 #[cfg(test)]
 fn landed_before(journal: &str, sid: Option<&str>, last_ms: Option<i64>) -> Option<Option<u64>> {
-    ended_before(journal, sid, last_ms).map(|(words, _, _, _)| words)
+    ended_before(journal, sid, last_ms)
+        .filter(|(_, _, _, _, failed)| failed.is_none())
+        .map(|(words, _, _, _, _)| words)
 }
 
 fn is_box(rec: &super::journal::JournalRecord) -> bool {
@@ -2269,9 +2285,19 @@ pub struct Session<'a, C: Ctl> {
     /// sleep measured since moves it back ([`Self::person_slept`]).
     hand_key: Option<Instant>,
     launch_status: approval_loop::LaunchStatus,
-    /// The content seq of the screen whose acts wait for the worker to draw input, and why
-    /// ([`Self::input_unread`]).
-    input_unread_at: Option<(u64, turn_end_loop::Undrawn)>,
+    /// The content seq of the screen whose acts wait for the worker to read input no write of
+    /// this loop left, and when `status` last read it unread ([`Self::input_unread`]).
+    input_unread_at: Option<(u64, Instant)>,
+    /// The line this loop wrote and gave up on undrawn, held until it settles
+    /// ([`turn_end_loop::Custody`]): one per session, kept past turns it outlasts and new points.
+    custody: Option<turn_end_loop::Custody>,
+    /// The restart in place asked for a line held in custody since the last act submitted
+    /// ([`super::policy::turn_end::Restart::InputLost`]), made or not: a loss after it waits.
+    input_lost: Option<turn_end_loop::LostRestart>,
+    /// What a write's held-text note last read of the input (`(seq, at, word)`: the content seq
+    /// the write left, when, and `status`'s `input=` word), for the custody its echo's give-up may
+    /// take it into ([`Self::note_text_held`]).
+    held_note: Option<(u64, Instant, String)>,
     /// When this process last took or renewed the host's hard hand for a
     /// typed act ([`Self::under_hand`]), while it holds it.
     hand_taken: Option<Instant>,
@@ -2511,6 +2537,7 @@ impl<'a, C: Ctl> Session<'a, C> {
 
     /// Constructs a [`Session`] from an explicit [`SessionSetup`].
     pub fn from_setup(ctl: &'a mut C, setup: SessionSetup) -> Self {
+        let fx = setup.live_fx();
         Self {
             ctl,
             duty: duty::DutyContext::default(),
@@ -2528,7 +2555,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             limit: None,
             retry: None,
             box_ask: None,
-            fx: Fx::os(),
+            fx,
             local_offset: None,
             local_offset_fixed: None,
             zone_offset: limit::zone_offset_at,
@@ -2624,6 +2651,9 @@ impl<'a, C: Ctl> Session<'a, C> {
             hand_key: None,
             launch_status: approval_loop::LaunchStatus::default(),
             input_unread_at: None,
+            custody: None,
+            input_lost: None,
+            held_note: None,
             hand_taken: None,
             launch_used: None,
             draft_seen: None,
@@ -2927,6 +2957,17 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// Replaces the session's external effect seam ([`super::fx::Fx`]).
     pub(crate) fn set_fx(&mut self, fx: Fx) {
         self.fx = fx;
+    }
+
+    /// Reads the clocks of a host that never sleeps from now (`fx::AwakeClock`): a test's loop
+    /// over a real instance then counts none of its machine's sleep, which on a Mac with its lid
+    /// closed would put a wake to settle into every wait. The setup keeps it
+    /// (`SessionSetup::live_fx`), so a loop rebuilt from it, a hosted run's recording one among
+    /// them, reads the same.
+    #[cfg(any(test, debug_assertions))]
+    pub fn set_host_awake(&mut self) {
+        self.setup.host_awake = true;
+        self.fx.awake();
     }
 
     /// Overrides the re-check interval while held for a person in tests.
@@ -4749,13 +4790,16 @@ impl<'a, C: Ctl> Session<'a, C> {
             .as_ref()
             .filter(|s| s.recorded && s.point)
             .map(|s| if s.ran { i64::MAX } else { s.at_ms });
-        if let Some((words, noted_ms, by_wake, receipt)) = journal.as_deref().and_then(|journal| {
+        let ended = journal.as_deref().and_then(|journal| {
             ended_before(
                 journal,
                 self.setup.sid.as_deref(),
                 typed.last().copied().max(since),
             )
-        }) {
+        });
+        if let Some((words, _, _, _, Some(ending))) = ended {
+            self.turn_end.seed_failed(ending, words);
+        } else if let Some((words, noted_ms, by_wake, receipt, None)) = ended {
             self.turn_end.seed_landed(words);
             self.turn_end.seed_noted_at(noted_ms);
             self.land_receipt = receipt;
@@ -5285,6 +5329,9 @@ impl<'a, C: Ctl> Session<'a, C> {
             self.question_done(turn.screen.seq, review)?;
         }
         if worked {
+            // A line held in custody goes with the turn once `status` reads the input clear; one
+            // still unread outlasts it, its text and writer kept for its draw.
+            self.custody_turned(turn.screen.seq, review)?;
             self.left_line = None;
             self.own_line = None;
             self.left_went = None;
@@ -5363,6 +5410,9 @@ impl<'a, C: Ctl> Session<'a, C> {
             }
             if let Some(old) = state.handed_seq.replace(turn.screen.seq) {
                 self.carry_point(old, turn.screen.seq);
+            }
+            if review.unattended() {
+                self.custody_look(&turn, review);
             }
             if review.unattended()
                 && (self.left_line_look(&turn, opts, allow, review)?
@@ -7113,6 +7163,7 @@ impl<C: Ctl> Session<'_, C> {
             || self.unauthoritative_held
             || self.left_line.is_some()
             || self.left_went.is_some()
+            || self.custody.is_some()
         {
             return None;
         }
@@ -7215,6 +7266,9 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(());
         }
         self.turn_end.fact_answered();
+        // A line held in custody is looked at on the break's read first: what settles it at a
+        // point settles it at a break (`Session::custody_at_break`).
+        self.custody_at_break(screen, review)?;
         // The break's read is a look at any line left in the composer, before any door's line.
         self.left_look_at(
             screen,
@@ -7536,7 +7590,8 @@ impl<C: Ctl> Session<'_, C> {
             // the driver's word, as at a break's own write.
             let guards = self.occupancy_guards(self.fx.mono(), &opts.policy, &point.screen.rows);
             let at = IdlePoint {
-                done_under_land: self.autopilot(opts) == Autopilot::Land && self.turn_end.landed(),
+                done_under_land: self.autopilot(opts) == Autopilot::Land
+                    && self.turn_end.concluded(),
                 held: guards.held_host_fact(),
                 theirs: guards.theirs(),
                 carry_only,
@@ -8489,7 +8544,10 @@ pub use setup::SessionSetup;
 mod stall;
 #[path = "task_mark.rs"]
 mod task_mark;
-pub use task_mark::{HELD_HEAD, STARTUP_HEAD, deadline_attention, mark_task_exited};
+pub use task_mark::{
+    COULD_NOT_FINISH_WHY, HELD_HEAD, REPEATED_WHY, STARTUP_HEAD, deadline_attention,
+    mark_task_exited,
+};
 #[path = "turn_end_loop.rs"]
 mod turn_end_loop;
 #[path = "wall_confirm.rs"]

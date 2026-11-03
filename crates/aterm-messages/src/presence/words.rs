@@ -317,6 +317,7 @@ pub fn prompt_kind_words(detail: Option<&str>) -> Option<&str> {
         "goal-resume" => "paused goal",
         "mcp-server" => "MCP server",
         "auto-mode-setup" => "auto-mode setup",
+        "chrome-intro" => "Claude in Chrome intro",
         "trust" => "folder trust",
         "powershell" => "PowerShell",
         other => other,

@@ -754,6 +754,8 @@ impl Supervisor {
         let flag = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
             let mut s = Session::new(&mut ctl, Some(sid));
+            // The loop counts none of this machine's sleep: a closed lid's wakes are no test's.
+            s.set_host_awake();
             s.set_approval_ledger(Some(ledger));
             s.set_supervisor_name(Some("turn-end-live".to_string()));
             s.set_turn_end_timing(timing);

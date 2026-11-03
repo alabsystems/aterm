@@ -35,7 +35,9 @@ fn permission_rows(state: &Path, revision: u64) -> Vec<Row> {
         debugger: access::Debugger::On,
         lan: access::Lan::On,
         accessibility: None,
+        no_sign_out_owed: false,
         opted_out: [None; 5],
+        acquiring: true,
     };
     grants.opted_out = access::opted_out(
         [None; 5],

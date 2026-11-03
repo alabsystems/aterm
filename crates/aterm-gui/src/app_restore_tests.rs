@@ -882,6 +882,7 @@ fn mixed_restore_rebuilds_canonical_order_active_item_and_derived_titles() {
             restore::TabOrderEntry::Native { index: 1 },
         ],
         active_item: Some(2),
+        workers_in_front: false,
         restored_tabs: Vec::new(),
         ..single_leaf_window(bare_leaf())
     };
@@ -1053,6 +1054,7 @@ fn recursive_mixed_restore_keeps_topology_and_substitutes_only_failed_leaf() {
         },
         focused_path: vec![restore::RestoreBranch::Second],
         zoomed: true,
+        parked: false,
     };
     app.restore_into_window(
         wid,
@@ -1134,6 +1136,7 @@ fn a_descending_leaf_run_restores_every_tab_onto_its_own_shell() {
                     root: restored_terminal(0, "ALPHA"),
                     focused_path: Vec::new(),
                     zoomed: false,
+                    parked: false,
                 },
                 restore::RestoredTab {
                     root: restore::RestoredSplitTree::Split {
@@ -1144,11 +1147,13 @@ fn a_descending_leaf_run_restores_every_tab_onto_its_own_shell() {
                     },
                     focused_path: vec![restore::RestoreBranch::Second],
                     zoomed: false,
+                    parked: false,
                 },
                 restore::RestoredTab {
                     root: restored_terminal(2, "CHARLIE"),
                     focused_path: Vec::new(),
                     zoomed: false,
+                    parked: false,
                 },
             ],
             ..single_leaf_window(bare_leaf())
@@ -1540,6 +1545,7 @@ fn reopening_a_restored_document_focuses_its_leaf_before_revealing_a_line() {
                     root: split_of(native_leaf(a), native_leaf(b)),
                     focused_path: vec![restore::RestoreBranch::Second],
                     zoomed,
+                    parked: false,
                 }],
                 ..single_leaf_window(bare_leaf())
             },
@@ -1704,10 +1710,12 @@ fn single_leaf_window(leaf: restore::TerminalLeafRestore) -> restore::WindowLayo
         native_tabs: Vec::new(),
         tab_order: Vec::new(),
         active_item: Some(0),
+        workers_in_front: false,
         restored_tabs: vec![restore::RestoredTab {
             root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(leaf)),
             focused_path: Vec::new(),
             zoomed: false,
+            parked: false,
         }],
     }
 }
@@ -1739,6 +1747,7 @@ fn bare_leaf() -> restore::TerminalLeafRestore {
         claim_ended: false,
         not_claim_worker: false,
         claim_worker: None,
+        task: None,
     }
 }
 
@@ -2031,11 +2040,13 @@ fn a_graft_carries_a_leaf_only_onto_the_shell_that_leaf_names() {
             ),
             focused_path: vec![restore::RestoreBranch::Second],
             zoomed: false,
+            parked: false,
         },
         restore::RestoredTab {
             root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(bare_leaf())),
             focused_path: Vec::new(),
             zoomed: false,
+            parked: false,
         },
     ];
     old.restore_into_window(WindowId(0), layout);
@@ -5107,6 +5118,7 @@ fn window_of(roots: Vec<restore::RestoredSplitTree>) -> restore::WindowLayout {
                 root,
                 focused_path,
                 zoomed: false,
+                parked: false,
             }
         })
         .collect();
@@ -6023,6 +6035,7 @@ fn a_timed_cruise_rides_the_cold_restore_the_reopen_and_the_graft() {
         root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(timed(passed))),
         focused_path: Vec::new(),
         zoomed: false,
+        parked: false,
     });
     app.restore_into_window(WindowId(0), layout);
     let session = timed_session(&app, passed).expect("the spawned shell carries the pair");
@@ -6086,6 +6099,7 @@ fn a_timed_cruise_rides_the_cold_restore_the_reopen_and_the_graft() {
         root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(timed(ahead))),
         focused_path: Vec::new(),
         zoomed: false,
+        parked: false,
     };
     app.restore_closed_tab_into_window(WindowId(0), &record, 1)
         .expect("reopened");
@@ -6103,6 +6117,7 @@ fn a_timed_cruise_rides_the_cold_restore_the_reopen_and_the_graft() {
         root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(timed(passed))),
         focused_path: Vec::new(),
         zoomed: false,
+        parked: false,
     };
     app.restore_closed_tab_into_window(WindowId(0), &record, 1)
         .expect("reopened");
@@ -6236,6 +6251,7 @@ fn the_setter_rides_the_cold_restore_the_reopen_and_the_graft() {
         )))),
         focused_path: Vec::new(),
         zoomed: false,
+        parked: false,
     });
     app.restore_into_window(WindowId(0), layout);
     let session = app
@@ -6277,6 +6293,7 @@ fn the_setter_rides_the_cold_restore_the_reopen_and_the_graft() {
             root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(set(leaf_by))),
             focused_path: Vec::new(),
             zoomed: false,
+            parked: false,
         };
         app.restore_closed_tab_into_window(WindowId(0), &record, 1)
             .expect("reopened");
@@ -6348,6 +6365,7 @@ fn a_setter_beside_a_word_this_build_cannot_read_is_not_stored() {
             root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(leaf(word))),
             focused_path: Vec::new(),
             zoomed: false,
+            parked: false,
         });
         app.restore_into_window(WindowId(0), layout);
         let session = app
@@ -6527,6 +6545,7 @@ fn lineage_tab(local: u64, sid: Option<&str>, lineage: Option<&str>) -> restore:
         )),
         focused_path: Vec::new(),
         zoomed: false,
+        parked: false,
     }
 }
 
@@ -6607,6 +6626,7 @@ fn a_cold_restore_opens_with_prev_and_lineage() {
                     )),
                     focused_path: Vec::new(),
                     zoomed: false,
+                    parked: false,
                 },
             ],
             ..single_leaf_window(bare_leaf())
@@ -8108,5 +8128,479 @@ fn a_reopened_split_tab_fits_each_pane_to_its_share_of_the_window() {
     assert_eq!(
         reopened, laid_out,
         "a layout pass finds every pane at its size"
+    );
+}
+
+#[test]
+fn a_parked_tab_comes_back_parked_behind_the_shown_tabs_with_its_list_opened_again() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let tab = |index, name, parked: bool| restore::RestoredTab {
+        root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+            restore::TerminalLeafRestore {
+                cwd: Some("/tmp".to_string()),
+                title: String::from(name),
+                local_id: Some(index),
+                user_title: Some(String::from(name)),
+                task: parked.then(|| {
+                    "rev=7 state=done from=ctl since=1700000000000 result_bytes=0 attention=0"
+                        .to_owned()
+                }),
+                ..bare_leaf()
+            },
+        )),
+        focused_path: Vec::new(),
+        zoomed: false,
+        parked,
+    };
+    app.restore_into_window(
+        wid,
+        restore::WindowLayout {
+            // A shown tab behind a parked one, as a manifest an older build folded can be.
+            restored_tabs: vec![
+                tab(0, "WORKER", true),
+                tab(1, "SHOWN", false),
+                tab(2, "OTHER", true),
+            ],
+            ..single_leaf_window(bare_leaf())
+        },
+    );
+    app.sync_window(wid);
+    let ws = &app.windows[&wid];
+    assert!(ws.tab_set.invariant_holds(&app.view_store));
+    assert_eq!(ws.tab_set.parked().len(), 2);
+    assert_eq!(ws.tab_set.shown_len(), 2, "the shown tab and its list");
+    assert!(ws.tab_set.home().is_some());
+    let terminals: Vec<u64> = ws
+        .tab_set
+        .tabs()
+        .iter()
+        .filter_map(|tab| {
+            app.view_store
+                .get(tab.focus)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+        })
+        .collect();
+    let projected: Vec<u64> = ws
+        .layouts
+        .iter()
+        .map(crate::pane::PaneTree::focus)
+        .collect();
+    assert_eq!(projected, terminals, "layouts stay in canonical order");
+
+    // A capture says so, and the list itself is no restored tab.
+    let parked = ws
+        .tab_set
+        .parked()
+        .iter()
+        .map(|tab| app.tab_restore_descriptor(tab).expect("captured").parked)
+        .collect::<Vec<_>>();
+    assert_eq!(parked, [true, true]);
+    let home = ws.tab_set.get(ws.tab_set.home().unwrap()).unwrap();
+    assert!(app.tab_restore_descriptor(home).is_none());
+
+    // A capture remembers whether the list was in front, which no restored tab can say.
+    let in_front = |app: &App| app.capture_restore_manifest().windows[0].workers_in_front;
+    assert!(!in_front(&app), "CONTROL: the person's tab is in front");
+    let list = app.windows[&wid]
+        .tab_set
+        .tabs()
+        .iter()
+        .position(|tab| Some(tab.id) == app.windows[&wid].tab_set.home())
+        .expect("the list");
+    app.switch_tab_in(wid, list);
+    assert!(in_front(&app), "the list is in front");
+}
+
+/// A PARKED WORKER KEEPS ITS RECORD ACROSS A COLD RESTART (2026-11-02 review): the manifest carries
+/// the row a seamless update carries, so its row keeps its state, its why and Read Result. A worker
+/// running then reads `working why=restored` where its agent comes back (no startup deadline reads
+/// it as just spawned), and `exited` where it does not. CONTROL: a seamless successor's record
+/// comes by its own road, and a reopened tab is a person's.
+#[test]
+fn a_parked_workers_record_crosses_a_cold_restart() {
+    use crate::task_record::TaskState::{Done, Exited, Working};
+    let state_of = |row: &str, agent: bool, retired: bool, successor: bool| {
+        let leaf = restore::TerminalLeafRestore {
+            local_id: Some(3),
+            task: Some(row.to_owned()),
+            agent: agent.then(|| Box::new(dead_agent())),
+            ..bare_leaf()
+        };
+        let mut app = App::headless_for_test();
+        app.handoff_successor = successor;
+        let shell = crate::stub_session(9);
+        app.carry_restored_identity(
+            &leaf,
+            crate::app_restore::FillingShell::Unregistered(&shell),
+            if retired {
+                crate::app_restore::LeafIds::Retired
+            } else {
+                crate::app_restore::LeafIds::Live
+            },
+        );
+        let timeline = shell.ctx.timeline.lock().unwrap();
+        timeline.task().map(|task| (task.state, task.why, task.rev))
+    };
+    let working = "rev=4 state=working from=ctl since=1700000000000 result_bytes=0 attention=0";
+    let done = "rev=7 state=done from=ctl since=1700000000000 result_bytes=0 attention=0 \
+                why=landed";
+    assert_eq!(
+        state_of(working, true, true, false),
+        Some((Working, Some(crate::task_record::WHY_RESTORED), 4)),
+        "its agent comes back"
+    );
+    assert_eq!(
+        state_of(working, false, true, false),
+        Some((Exited, Some("exit"), 5)),
+        "a quit forgot its agent"
+    );
+    assert_eq!(
+        state_of(done, false, true, false),
+        Some((Done, Some("landed"), 7)),
+        "a finished worker stays as it finished"
+    );
+    assert_eq!(
+        state_of(working, true, false, false),
+        None,
+        "CONTROL: reopened"
+    );
+    assert_eq!(
+        state_of(working, true, true, true),
+        None,
+        "CONTROL: seamless"
+    );
+    assert_eq!(
+        state_of("not a row", true, true, false),
+        None,
+        "a row that does not read seeds nothing"
+    );
+}
+
+/// A RESTORED PARKED TAB WITH NO RECORD UNPARKS: it would have no row to say what it is.
+#[test]
+fn a_restored_parked_tab_keeps_the_bit_only_with_a_record() {
+    let parked_of = |task: Option<&str>| {
+        let record = restore::RestoredTab {
+            root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+                restore::TerminalLeafRestore {
+                    local_id: None,
+                    task: task.map(str::to_owned),
+                    ..bare_leaf()
+                },
+            )),
+            focused_path: Vec::new(),
+            zoomed: false,
+            parked: true,
+        };
+        let mut app = App::headless_for_test();
+        let wid = *app.windows.keys().next().expect("a window");
+        let (tab, _) = app
+            .build_recursive_restore_tab(
+                wid,
+                &record,
+                &mut None,
+                crate::app_restore::LeafIds::Retired,
+            )
+            .expect("built");
+        tab.parked
+    };
+    assert!(parked_of(Some(
+        "rev=7 state=done from=ctl since=1700000000000 result_bytes=0 attention=0"
+    )));
+    assert!(!parked_of(None));
+    assert!(!parked_of(Some("not a row")));
+}
+
+/// A RESTORED WORKER WHOSE AGENT DOES NOT COME BACK READS EXITED, on each path the window sees: no
+/// harness to relaunch it, a held tab (its agent is its holder's), and the harness's word that its
+/// relaunch is over. NEGATIVE CONTROL: a record that moved since (a turn reopened it) stands.
+#[test]
+fn a_restored_worker_whose_agent_does_not_come_back_reads_exited() {
+    use crate::task_record::TaskState::{Exited, Working};
+    let working = "rev=4 state=working from=ctl since=1700000000000 result_bytes=0 attention=0";
+    let restored = |held: bool| {
+        let mut app = App::headless_for_test();
+        let id = app.focused_session_id(WindowId(0)).expect("a session");
+        let owners = crate::fabric::Hold {
+            reason: "review".into(),
+            origin: "local".into(),
+        };
+        let leaf = restore::TerminalLeafRestore {
+            local_id: Some(3),
+            task: Some(working.to_owned()),
+            agent: Some(Box::new(dead_agent())),
+            holds: if held {
+                vec![crate::fabric::render_hold(&owners)]
+            } else {
+                Vec::new()
+            },
+            ..bare_leaf()
+        };
+        app.carry_restored_identity(
+            &leaf,
+            crate::app_restore::FillingShell::Registered(id),
+            crate::app_restore::LeafIds::Retired,
+        );
+        (app, id)
+    };
+    let state = |app: &App, id: u64| {
+        let timeline = app.pool.get(id).expect("live").ctx.timeline.lock().unwrap();
+        timeline.task().map(|task| (task.state, task.why))
+    };
+
+    let (mut app, id) = restored(false);
+    assert!(app.harness.is_none(), "PRECONDITION: no harness");
+    assert_eq!(
+        app.restored_agents.len(),
+        1,
+        "PRECONDITION: its agent is owed"
+    );
+    assert_eq!(
+        state(&app, id),
+        Some((Working, Some(crate::task_record::WHY_RESTORED))),
+        "PRECONDITION: its agent is owed"
+    );
+    app.hand_restored_agents();
+    assert_eq!(state(&app, id), Some((Exited, Some("exit"))), "no harness");
+
+    let (mut app, id) = restored(true);
+    assert_eq!(app.restored_held.len(), 1, "PRECONDITION: held");
+    app.say_restored_held();
+    assert_eq!(state(&app, id), Some((Exited, Some("exit"))), "held");
+
+    let (mut app, id) = restored(false);
+    let sid = app.session_id_text(id).expect("its sid");
+    app.restored_agents.clear();
+    app.note_harness_host(crate::harness_host::HostNote::RestoredOver { sid: sid.clone() });
+    assert_eq!(
+        state(&app, id),
+        Some((Exited, Some("exit"))),
+        "its relaunch is over"
+    );
+
+    // A worker stalled when aterm ended (at a sign-in screen, or held) ends where it stalled.
+    let stalled = "rev=4 state=stalled why=signin from=ctl since=1700000000000 result_bytes=0 \
+                   attention=1";
+    let mut app = App::headless_for_test();
+    let id = app.focused_session_id(WindowId(0)).expect("a session");
+    let leaf = restore::TerminalLeafRestore {
+        local_id: Some(3),
+        task: Some(stalled.to_owned()),
+        agent: Some(Box::new(dead_agent())),
+        ..bare_leaf()
+    };
+    app.carry_restored_identity(
+        &leaf,
+        crate::app_restore::FillingShell::Registered(id),
+        crate::app_restore::LeafIds::Retired,
+    );
+    assert_eq!(
+        state(&app, id).map(|(state, _)| state),
+        Some(crate::task_record::TaskState::Stalled),
+        "PRECONDITION: its stall crossed"
+    );
+    app.restored_agents.clear();
+    app.note_harness_host(crate::harness_host::HostNote::RestoredOver {
+        sid: app.session_id_text(id).expect("its sid"),
+    });
+    assert_eq!(
+        state(&app, id),
+        Some((Exited, Some("exit"))),
+        "a carried stall whose agent did not come back"
+    );
+
+    let (mut app, id) = restored(false);
+    app.restored_agents.clear();
+    let ctx = app.pool.get(id).expect("live").ctx.clone();
+    let mut turn = crate::task_record::TaskMark::new(Working);
+    turn.why = Some("turn");
+    crate::task_record::mark_session_task(&ctx, id, &turn).expect("unfenced");
+    app.note_harness_host(crate::harness_host::HostNote::RestoredOver {
+        sid: app.session_id_text(id).expect("its sid"),
+    });
+    assert_eq!(
+        state(&app, id),
+        Some((Working, Some("turn"))),
+        "CONTROL: a record that moved stands"
+    );
+}
+
+/// THE DISK WORKER IS DISPOSABLE: a cold restart does not relaunch it, and its record reads
+/// exited. NEGATIVE CONTROL: another worker's agent is owed its relaunch, and a disk worker whose
+/// shell came back running keeps working.
+#[test]
+fn a_cold_restart_does_not_resume_the_disk_worker() {
+    use crate::task_record::TaskState::{Exited, Working};
+    let disk = format!(
+        "/state/aterm/{}/{}",
+        aterm_agent::harness::cli::HARNESS,
+        aterm_agent::harness::disk::fence::WORKER_FOLDER
+    );
+    let row = |folder: &str| {
+        format!(
+            "rev=4 state=working from=ctl since=1700000000000 result_bytes=0 attention=0 \
+             trusted_cwd={}",
+            crate::control::pct_encode(folder)
+        )
+    };
+    let restored = |folder: &str| {
+        let mut app = App::headless_for_test();
+        let id = app.focused_session_id(WindowId(0)).expect("a session");
+        let leaf = restore::TerminalLeafRestore {
+            local_id: Some(3),
+            task: Some(row(folder)),
+            agent: Some(Box::new(dead_agent())),
+            ..bare_leaf()
+        };
+        app.carry_restored_identity(
+            &leaf,
+            crate::app_restore::FillingShell::Registered(id),
+            crate::app_restore::LeafIds::Retired,
+        );
+        let record = {
+            let timeline = app.pool.get(id).expect("live").ctx.timeline.lock().unwrap();
+            timeline
+                .task()
+                .map(|task| (task.state, task.why, task.trusted_cwd.clone()))
+        };
+        (record, app.restored_agents.len())
+    };
+    let (record, owed) = restored(&disk);
+    assert_eq!(
+        record,
+        Some((Exited, Some("exit"), Some(disk.clone()))),
+        "PRECONDITION: the row carried its folder, and it reads exited"
+    );
+    assert_eq!(owed, 0, "its agent is not relaunched");
+    let (record, owed) = restored("/Users//me/project");
+    assert_eq!(
+        record.map(|(state, ..)| state),
+        Some(Working),
+        "CONTROL: another worker's agent may come back"
+    );
+    assert_eq!(owed, 1, "CONTROL: owed its relaunch");
+    // A disk worker moved to a tab carries no record: its agent's folder says what it is.
+    let mut app = App::headless_for_test();
+    let id = app.focused_session_id(WindowId(0)).expect("a session");
+    let moved = |cwd: &str| restore::TerminalLeafRestore {
+        local_id: Some(3),
+        agent: Some(Box::new(restore::AgentRestore {
+            cwd: cwd.to_owned(),
+            ..dead_agent()
+        })),
+        ..bare_leaf()
+    };
+    app.carry_restored_identity(
+        &moved(&disk),
+        crate::app_restore::FillingShell::Registered(id),
+        crate::app_restore::LeafIds::Retired,
+    );
+    assert_eq!(
+        app.restored_agents.len(),
+        0,
+        "a moved disk worker is not resumed"
+    );
+    let mut app = App::headless_for_test();
+    let id = app.focused_session_id(WindowId(0)).expect("a session");
+    app.carry_restored_identity(
+        &moved("/Users//me/project"),
+        crate::app_restore::FillingShell::Registered(id),
+        crate::app_restore::LeafIds::Retired,
+    );
+    assert_eq!(
+        app.restored_agents.len(),
+        1,
+        "CONTROL: a person's agent comes back"
+    );
+
+    let shell = crate::stub_session(9);
+    assert!(
+        !crate::task_record::seed_restored(&shell.ctx, &row(&disk), false, true),
+        "CONTROL: a shell that came back running keeps its worker"
+    );
+    assert_eq!(
+        shell.ctx.timeline.lock().unwrap().task().map(|t| t.state),
+        Some(Working)
+    );
+}
+
+/// A COLD RESTART KEEPS A WORKER'S MANAGER: every session comes back with a new sid, and a record
+/// whose `from=` named the manager's old one names its new one, whichever of the two landed first.
+/// NEGATIVE CONTROL: a manager that did not come back keeps the sid it had.
+#[test]
+fn a_cold_restart_keeps_a_workers_manager() {
+    let manager_was = "s-00000000000000000aaa";
+    let row = |from: &str| {
+        format!("rev=4 state=done from={from} since=1700000000000 result_bytes=0 attention=0")
+    };
+    let mut app = App::headless_for_test();
+    let worker = crate::stub_session(91);
+    let gone = crate::stub_session(92);
+    let manager = crate::stub_session(93);
+    let land = |app: &mut App, shell: &crate::Session, was: &str, task: Option<String>| {
+        let leaf = restore::TerminalLeafRestore {
+            sid: Some(was.to_owned()),
+            local_id: Some(1),
+            task,
+            ..bare_leaf()
+        };
+        app.carry_restored_identity(
+            &leaf,
+            crate::app_restore::FillingShell::Unregistered(shell),
+            crate::app_restore::LeafIds::Retired,
+        );
+    };
+    land(
+        &mut app,
+        &worker,
+        "s-00000000000000000bbb",
+        Some(row(manager_was)),
+    );
+    land(
+        &mut app,
+        &gone,
+        "s-00000000000000000ccc",
+        Some(row("s-00000000000000000ddd")),
+    );
+    App::register_session(&app.store, &worker, None);
+    app.pool.insert(worker);
+    land(&mut app, &manager, manager_was, None);
+    let from = |shell: &crate::Session| {
+        shell
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .task()
+            .map(|task| task.from.clone())
+    };
+    let worker = app.pool.get(91).expect("registered");
+    assert_eq!(
+        from(worker),
+        Some(manager.ctx.self_id.as_str().to_owned()),
+        "the manager's new sid"
+    );
+    assert_eq!(
+        from(&gone),
+        Some("s-00000000000000000ddd".to_owned()),
+        "CONTROL: a manager that did not come back"
+    );
+
+    let mut app = App::headless_for_test();
+    let manager = crate::stub_session(94);
+    let worker = crate::stub_session(95);
+    land(&mut app, &manager, manager_was, None);
+    land(
+        &mut app,
+        &worker,
+        "s-00000000000000000eee",
+        Some(row(manager_was)),
+    );
+    assert_eq!(
+        from(&worker),
+        Some(manager.ctx.self_id.as_str().to_owned()),
+        "the manager came back first"
     );
 }

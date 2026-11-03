@@ -65,12 +65,20 @@ impl Pattern {
                  (it reads *, ? and **)"
             ));
         }
-        Ok(Pattern(
-            text.trim_end_matches('/')
-                .split('/')
-                .map(str::to_string)
-                .collect(),
-        ))
+        let trimmed = text.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Err("hosting.ignore holds an empty pattern".into());
+        }
+        let parts: Vec<String> = trimmed.split('/').map(str::to_string).collect();
+        if parts
+            .iter()
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        {
+            return Err(format!(
+                "hosting.ignore pattern {text:?} contains an empty or dot path segment"
+            ));
+        }
+        Ok(Pattern(parts))
     }
 
     /// Whether the pattern matches `path`, a `/`-joined path under `public/`.
@@ -144,6 +152,15 @@ pub fn list(
     ignore: &[Pattern],
     overlay: &BTreeMap<String, Vec<u8>>,
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let root_meta = std::fs::symlink_metadata(public)
+        .map_err(|e| format!("cannot list {}: {e}", public.display()))?;
+    if !root_meta.file_type().is_dir() {
+        return Err(format!(
+            "{} is not a plain directory (a symbolic link or file): ship site deploys the files \
+             under public/ themselves",
+            public.display()
+        ));
+    }
     let ignored = |rel: &str| ignore.iter().any(|p| p.matches(rel));
     let mut found = BTreeMap::new();
     let mut dirs = vec![String::new()];
@@ -299,6 +316,10 @@ mod tests {
             "!keep.html",
             "@(a|b)",
             "/abs",
+            "///",
+            "a//b",
+            "./secret.json",
+            "a/../secret.json",
             "",
             "a\\*",
         ] {
@@ -354,6 +375,13 @@ mod tests {
             why.contains("hosts") && why.contains("not a regular file"),
             "{why}"
         );
+        let root_link = dir.path().join("public-link");
+        std::os::unix::fs::symlink(&public, &root_link).unwrap();
+        let root_why = list(&root_link, &ignore, &BTreeMap::new()).unwrap_err();
+        assert!(
+            root_why.contains("public-link") && root_why.contains("not a plain directory"),
+            "{root_why}"
+        );
     }
 
     /// A service-account key under `public/` is refused by name, wherever it sits and whatever
@@ -408,6 +436,30 @@ mod tests {
             why_overlay.contains("new-key.json") && why_overlay.contains("private key"),
             "{why_overlay}"
         );
+        for (name, secret) in [
+            ("escaped.json", br#"{"private\u005fkey":"secret"}"#.to_vec()),
+            (
+                "nested.json",
+                br#"{"creds":{"private_key":"secret"}}"#.to_vec(),
+            ),
+            (
+                "pem.txt",
+                format!(
+                    "{}\nMIIBVQ==\n{}\n",
+                    concat!("-----BEGIN ", "RSA PRIVATE KEY-----"),
+                    concat!("-----END ", "RSA PRIVATE KEY-----"),
+                )
+                .into_bytes(),
+            ),
+        ] {
+            let mut extra = BTreeMap::new();
+            extra.insert(name.to_string(), secret);
+            let why_extra = list(&public, &[], &extra).unwrap_err();
+            assert!(
+                why_extra.contains(name) && why_extra.contains("private key"),
+                "{why_extra}"
+            );
+        }
     }
 
     /// A file is named by the SHA-256 of its gzip member, and the member is the same bytes

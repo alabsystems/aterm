@@ -21,8 +21,14 @@ use crate::task_record::{TaskMark, TaskState};
 pub(crate) const TASK_MAX: usize = aterm_types::control_verbs::MAX_TASK_BYTES;
 
 /// How long a launcher waiting for its worker's first prompt rests with no ring
-/// ([`await_first_prompt`]): a person's key rings nothing until it echoes.
+/// ([`await_prompt`]): a person's key rings nothing until it echoes.
 const FIRST_PROMPT_LOOK: Duration = Duration::from_secs(1);
+
+/// How long a worker's prompt holds one screen generation before its launcher types its line
+/// again after a redraw of that prompt refused it ([`type_at_prompt`]): a prompt that keeps
+/// repainting gets one attempt per this at most, and one whose clock ticks each second settles
+/// between its ticks.
+pub(crate) const PROMPT_SETTLE: Duration = Duration::from_millis(250);
 
 const VERSION_WAIT: Duration = Duration::from_secs(5);
 
@@ -62,7 +68,9 @@ pub(crate) fn take_frame() -> Option<Vec<u8>> {
 /// The bytes `len=<v>` announces, or the reply to a length the server will not read.
 pub(crate) fn frame_len(v: &str, agent: &str) -> Result<usize, String> {
     if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(crate::control::control_media::spawn_usage());
+        return Err(crate::control::control_media::spawn_refusal(Some(
+            &format!("len={v}"),
+        )));
     }
     match v.parse::<usize>() {
         Ok(n) if n <= TASK_MAX => Ok(n),
@@ -179,9 +187,16 @@ pub(crate) fn fact_line(from: &str, autopilot: Autopilot, agent: aterm_phase::Pr
                 Some(answer) => format!("{defends} and the agent {answer}"),
                 None => defends.to_owned(),
             };
+            // Only aterm's own loop reads this word, in the programs it carries.
+            let or_fails = if land_check_answered(agent).is_some() {
+                "; if you cannot finish it, a reply whose first line starts `Could not finish: <why>` ends \
+                 the work as failed and is returned the same way"
+            } else {
+                ""
+            };
             format!(
                 "under Autopilot Land: the work ends once all of it is on the remote main branch, \
-                 {ends}, and that defense is returned verbatim to `{from}` as your result"
+                 {ends}, and that defense is returned verbatim to `{from}` as your result{or_fails}"
             )
         }
     };
@@ -740,7 +755,7 @@ fn run_worker_launch(work: &Launch) {
             return;
         }
     };
-    let prompt = match await_first_prompt(work) {
+    let prompt = match await_prompt(work, Duration::ZERO) {
         Ok(prompt) => prompt,
         Err(why) => {
             stall(work, &why);
@@ -756,15 +771,11 @@ fn run_worker_launch(work: &Launch) {
         Some(aterm_agent::harness::agy_quota::Pick::Rotate { to, .. }) => Some(to.as_str()),
         _ => work.model.as_deref(),
     };
-    // A disk-free worker starts where every box is raised, whatever the owner's settings say,
-    // so its approval rule fences what it removes (the disk-free design's §8.4); so does a
-    // credit claim worker (`work.chrome`), whose rule fences what it does in the browser.
-    let disk_worker = work
-        .trusted_cwd
-        .as_deref()
-        .is_some_and(|cwd| aterm_agent::harness::disk::fence::is_worker_folder(Path::new(cwd)));
+    // A worker runs with its parent's permissions (owner ruling 2026-11-02), the disk-free worker
+    // included. A credit claim worker (`work.chrome`) starts where every box is raised, whatever
+    // the person's settings say: its rule fences what it does in their own browser.
     let config = crate::app_config::config_path();
-    let mut fresh = worker_fresh(model, here, disk_worker, work.chrome);
+    let mut fresh = worker_fresh(model, here, work.chrome);
     fresh.config = config.as_deref();
     let line = aterm_agent::harness::worker::line(cli, work.dialect, &admitted, &fresh);
     match line {
@@ -773,27 +784,17 @@ fn run_worker_launch(work: &Launch) {
                 stall(work, "its main-thread launch endpoint is gone");
                 return;
             };
-            let written = match crate::control::control_media::call_main(proxy, |reply| {
-                crate::Wake::WorkerLaunch {
+            let typed = type_at_prompt(work, prompt, |prompt| {
+                crate::control::control_media::call_main(proxy, |reply| crate::Wake::WorkerLaunch {
                     sid: work.ctx.self_id.clone(),
                     nonce: work.ctx.nonce,
                     prompt,
                     line: line.clone(),
                     reply,
-                }
-            }) {
-                Ok(Ok(written)) => written,
-                Ok(Err(why)) => {
-                    stall(work, &why);
-                    return;
-                }
-                Err(why) => {
-                    note_launch(
-                        &work.ctx,
-                        format!("outcome not observed ({why}); not retried"),
-                    );
-                    return;
-                }
+                })
+            });
+            let Some(written) = typed else {
+                return;
             };
             let note = format!(
                 "typed ({} B, {written}): {} ({}{}{}){}",
@@ -822,21 +823,20 @@ fn run_worker_launch(work: &Launch) {
 }
 
 /// What a worker's line names beside its program: `model`, its folder trusted where `here`,
-/// and the person's browser where `chrome` ([`TaskOrder::chrome`]). A disk-free worker (the
-/// disk-free design's §8.4) and a credit claim worker, the one `chrome` worker
-/// ([`crate::harness_host::credit_claim`]), start with every box raised (`default`), whatever
-/// the person's settings say, so their approval rules fence what they do.
+/// and the person's browser where `chrome` ([`TaskOrder::chrome`]). A credit claim worker, the
+/// one `chrome` worker ([`crate::harness_host::credit_claim`]), starts with every box raised
+/// (`default`), whatever the person's settings say, so its approval rule fences what it does; any
+/// other worker takes its permissions from its [`Starter`](aterm_agent::harness::worker::Starter).
 pub(crate) fn worker_fresh(
     model: Option<&str>,
     here: bool,
-    disk_worker: bool,
     chrome: bool,
 ) -> aterm_agent::harness::worker::Fresh<'_> {
     aterm_agent::harness::worker::Fresh {
         config: None,
         model,
         trusted_here: here,
-        permission_mode: (disk_worker || chrome).then_some("default"),
+        permission_mode: chrome.then_some("default"),
         chrome,
     }
 }
@@ -1067,13 +1067,16 @@ fn note_launch(ctx: &SessionCtx, note: String) {
         .note_worker_launch(note);
 }
 
-/// The first input-ready prompt of `work`'s shell, waited for as long as its task is `working`.
-/// A shell that is slow to it (a loaded machine, a long rc file) has not failed, so this keeps no
-/// clock: the startup deadline ([`crate::harness_host::STARTUP_DEADLINE`]) judges every worker
-/// that has not started, whatever holds it, and its stall ends this wait as a lead's mark does
-/// ([`task_moved_on`]).
-pub(crate) fn await_first_prompt(work: &Launch) -> Result<PromptFence, String> {
+/// The first input-ready prompt of `work`'s shell that holds one screen generation for `settle`
+/// from the look that first found it ([`Held`]: no time for the launcher's first look,
+/// [`PROMPT_SETTLE`] for its look again after a redraw refused its line), waited for as long as
+/// its task is `working`. A shell that is slow to it (a loaded machine, a long rc file, a prompt
+/// that keeps repainting) has not failed, so this keeps no clock: the startup deadline
+/// ([`crate::harness_host::STARTUP_DEADLINE`]) judges every worker that has not started, whatever
+/// holds it, and its stall ends this wait as a lead's mark does ([`task_moved_on`]).
+pub(crate) fn await_prompt(work: &Launch, settle: Duration) -> Result<PromptFence, String> {
     let sub = crate::session_watch::Subscription::single(&work.ctx.watchers);
+    let mut held = Held::default();
     loop {
         let alive = work
             .store
@@ -1082,7 +1085,7 @@ pub(crate) fn await_first_prompt(work: &Launch) -> Result<PromptFence, String> {
             .by_local(work.local)
             .is_some_and(|h| !matches!(h.state, SessionState::Exited));
         if !alive {
-            return Err("its shell ended before its first prompt".to_string());
+            return Err("its shell ended before its line was typed".to_string());
         }
         if let Some(why) = task_moved_on(&work.ctx) {
             return Err(why);
@@ -1095,10 +1098,44 @@ pub(crate) fn await_first_prompt(work: &Launch) -> Result<PromptFence, String> {
             }
             prompt_fence(&terminal, human)
         };
-        if let Some(prompt) = prompt {
-            return Ok(prompt);
-        }
-        let _ = sub.wait(FIRST_PROMPT_LOOK);
+        let rest = match prompt {
+            Some(prompt) => {
+                let left = held.look(prompt.generation, Instant::now(), settle);
+                if left.is_zero() {
+                    return Ok(prompt);
+                }
+                left
+            }
+            None => {
+                held = Held::default();
+                FIRST_PROMPT_LOOK
+            }
+        };
+        let _ = sub.wait(rest);
+    }
+}
+
+/// The screen generation a launcher's last look found at an input-ready prompt, and since when
+/// ([`await_prompt`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Held(Option<(crate::control::ScreenGen, Instant)>);
+
+impl Held {
+    /// What is left to wait, after a look at `now` that found `generation` at an input-ready
+    /// prompt, before that prompt has held for `settle`: zero once it has. A generation other
+    /// than the last look's counts from `now`.
+    pub(crate) fn look(
+        &mut self,
+        generation: crate::control::ScreenGen,
+        now: Instant,
+        settle: Duration,
+    ) -> Duration {
+        let since = match self.0 {
+            Some((held, since)) if held == generation => since,
+            _ => now,
+        };
+        self.0 = Some((generation, since));
+        settle.saturating_sub(now.saturating_duration_since(since))
     }
 }
 
@@ -1121,16 +1158,83 @@ pub(crate) fn prompt_fence(terminal: &Terminal, human: u64) -> Option<PromptFenc
     })
 }
 
+/// Why [`type_launch_line`] did not type a worker's line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Untyped {
+    /// The prompt the launcher saw was redrawn, or is no longer input-ready, and nothing was
+    /// written: its launcher looks again ([`type_at_prompt`]).
+    Unsettled,
+    /// Why the worker stalls.
+    Refused(String),
+}
+
+/// Type `line` at `prompt`, the input-ready prompt `work`'s launcher saw, through `admit` (the
+/// main thread's [`type_launch_line`]). A refusal that wrote nothing because that prompt was
+/// redrawn first ([`Untyped::Unsettled`]: the new tab's grid settling, an async prompt's or a
+/// right prompt's repaint) is no stall: the launcher looks again, for a prompt that holds one
+/// screen generation for [`PROMPT_SETTLE`] ([`await_prompt`]), and types there, until that look
+/// ends as its first does (the shell ending, a person's use, a task that moved on). Any other
+/// refusal stalls the task. Only a refusal that wrote nothing is tried again, so the line is
+/// typed once at most.
+///
+/// How the line was written; `None` where nothing was typed (the task is stalled) or the main
+/// thread's answer was not observed (noted, not tried again).
+pub(crate) fn type_at_prompt<E: std::fmt::Display>(
+    work: &Launch,
+    mut prompt: PromptFence,
+    mut admit: impl FnMut(PromptFence) -> Result<Result<&'static str, Untyped>, E>,
+) -> Option<&'static str> {
+    loop {
+        match admit(prompt) {
+            Ok(Ok(written)) => return Some(written),
+            Ok(Err(Untyped::Unsettled)) => {
+                aterm_log::info!(
+                    "worker session {}: its prompt was redrawn before its line was typed; \
+                     it is typed at the prompt once that settles",
+                    work.local
+                );
+                note_launch(
+                    &work.ctx,
+                    "not yet typed (its prompt was redrawn first; looking again)".to_string(),
+                );
+                match await_prompt(work, PROMPT_SETTLE) {
+                    Ok(settled) => prompt = settled,
+                    Err(why) => {
+                        stall(work, &why);
+                        return None;
+                    }
+                }
+            }
+            Ok(Err(Untyped::Refused(why))) => {
+                stall(work, &why);
+                return None;
+            }
+            Err(why) => {
+                note_launch(
+                    &work.ctx,
+                    format!("outcome not observed ({why}); not retried"),
+                );
+                return None;
+            }
+        }
+    }
+}
+
 /// Admit and type the worker's initial line ON THE MAIN THREAD.
+///
+/// # Errors
+///
+/// [`Untyped::Unsettled`] where the screen moved off `prompt` before anything was written;
+/// [`Untyped::Refused`] where the launch is gone, its task moved on ([`task_moved_on`]), its
+/// session is parked or halted, a person used it, or the write was not taken.
 pub(crate) fn type_launch_line(
     store: &Store,
     sid: &SessionId,
     nonce: aterm_session::LaunchNonce,
     prompt: PromptFence,
     line: &str,
-) -> Result<&'static str, String> {
-    use crate::control::{GuardedInput, InputFence};
-    use crate::input::Delivery;
+) -> Result<&'static str, Untyped> {
+    use crate::control::InputFence;
     let target = {
         let registry = store.read().unwrap_or_else(|p| p.into_inner());
         registry
@@ -1138,17 +1242,18 @@ pub(crate) fn type_launch_line(
             .filter(|h| h.nonce == nonce && h.state != SessionState::Exited)
             .map(|h| (h.term.clone(), h.ctx.clone()))
     };
+    let refused = |why: &str| Err(Untyped::Refused(why.to_string()));
     let Some((term, ctx)) = target else {
-        return Err("its live launch is gone".to_string());
+        return refused("its live launch is gone");
     };
     if let Some(why) = task_moved_on(&ctx) {
-        return Err(why);
+        return Err(Untyped::Refused(why));
     }
     if ctx.update_parked.is_parked() {
-        return Err("its session is parked for an update".to_string());
+        return refused("its session is parked for an update");
     }
     if let Some(why) = crate::fabric::halt_refusal(ctx.as_ref(), "send") {
-        return Err(why);
+        return Err(Untyped::Refused(why));
     }
     let mut bytes = line.as_bytes().to_vec();
     bytes.push(0x0d);
@@ -1165,15 +1270,27 @@ pub(crate) fn type_launch_line(
         crate::ReadOn::EventLoop,
         None,
     );
+    launch_line_typed(result)
+}
+
+/// What the fenced press of a worker's line ([`type_launch_line`]) did, as its launcher reads it.
+/// Only a refusal the fence made before a byte was written is [`Untyped::Unsettled`], the one
+/// outcome [`type_at_prompt`] tries again, so a line written whole or in part is never typed
+/// twice; a person's use and a write the sink did not take are final.
+pub(crate) fn launch_line_typed(
+    result: crate::control::GuardedInput,
+) -> Result<&'static str, Untyped> {
+    use crate::control::GuardedInput;
+    use crate::input::Delivery;
+    let refused = |why: &str| Err(Untyped::Refused(why.to_string()));
     match result {
-        GuardedInput::Changed | GuardedInput::Skipped => {
-            Err("its startup prompt changed before the launch".to_string())
-        }
-        GuardedInput::Person => Err("a person used its session before the launch".to_string()),
+        // The fence decides both before a byte is written.
+        GuardedInput::Changed | GuardedInput::Skipped => Err(Untyped::Unsettled),
+        GuardedInput::Person => refused("a person used its session before the launch"),
         GuardedInput::Pressed(Delivery::Full) => Ok("written whole"),
         GuardedInput::Pressed(Delivery::PartialInDoubt { .. }) => Ok("written in part"),
-        GuardedInput::Pressed(Delivery::BusyZero) => Err("its input sink is busy".to_string()),
-        GuardedInput::Pressed(Delivery::Failed) => Err("its input write failed".to_string()),
+        GuardedInput::Pressed(Delivery::BusyZero) => refused("its input sink is busy"),
+        GuardedInput::Pressed(Delivery::Failed) => refused("its input write failed"),
     }
 }
 
@@ -1382,33 +1499,71 @@ fn worker_starter_of(
     work: &Launch,
     cli: &aterm_agent::harness::worker::WorkerCli,
 ) -> (aterm_agent::harness::worker::Starter, Found) {
-    let found = work.caller.as_deref().and_then(|ctx| {
-        let (reader, named) = {
-            let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            let agent = timeline.agent();
-            (agent.reader, agent.program_pgid)
-        };
-        let group = starter_group(reader, named, || starter_front(&work.store, ctx), cli.agent)?;
-        let pgid = match group {
-            StarterGroup::Named(g) | StarterGroup::Front(g) => g,
-        };
-        let pid = u32::try_from(pgid).ok().filter(|p| *p > 0)?;
-        let starter =
-            aterm_agent::harness::worker::starter(cli, pid, &aterm_types::dirs::home_dir()?)?;
-        Some((
-            starter,
-            match group {
-                StarterGroup::Named(_) => Found::Named,
-                StarterGroup::Front(_) => Found::Front,
-            },
-        ))
-    });
+    let found = work
+        .caller
+        .as_deref()
+        .and_then(|ctx| agent_of_session(work, ctx, cli));
     let how = found.as_ref().map_or(Found::Plain, |(_, how)| *how);
-    (line_starter(cli, found.map(|(s, _)| s)), how)
+    let mut starter = line_starter(cli, found.map(|(s, _)| s));
+    // A worker no session started (the harness's own, or a spawn from outside a session) has as
+    // its parent the session `ls` names: its program and login stay the worker's own, and its
+    // permissions are that session's (owner ruling 2026-11-02). A claim worker's fence names its
+    // own mode.
+    if work.caller.is_none()
+        && !work.chrome
+        && let Some((parent, _)) =
+            parent_ctx(work).and_then(|ctx| agent_of_session(work, &ctx, cli))
+    {
+        starter.args = parent.args;
+    }
+    (starter, how)
+}
+
+/// The session `ls` names as this worker's parent, which the tab landing recorded.
+fn parent_ctx(work: &Launch) -> Option<Arc<SessionCtx>> {
+    let store = work.store.read().unwrap_or_else(|p| p.into_inner());
+    let parent = store.by_sid(&work.ctx.self_id)?.parent.clone()?;
+    Some(store.by_sid(&parent)?.ctx.clone())
+}
+
+/// What session `ctx`'s agent of `cli`'s kind lends a worker's line, and how it was found, with
+/// the mode its permission pill shows now where it shows one.
+fn agent_of_session(
+    work: &Launch,
+    ctx: &SessionCtx,
+    cli: &aterm_agent::harness::worker::WorkerCli,
+) -> Option<(aterm_agent::harness::worker::Starter, Found)> {
+    let (reader, named) = {
+        let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        let agent = timeline.agent();
+        (agent.reader, agent.program_pgid)
+    };
+    let group = starter_group(reader, named, || starter_front(&work.store, ctx), cli.agent)?;
+    let pgid = match group {
+        StarterGroup::Named(g) | StarterGroup::Front(g) => g,
+    };
+    let pid = u32::try_from(pgid).ok().filter(|p| *p > 0)?;
+    let starter = aterm_agent::harness::worker::starter(cli, pid, &aterm_types::dirs::home_dir()?)?;
+    let starter = match (
+        cli.agent,
+        crate::harness_host::screen_rows(&work.store, ctx.self_id.as_str()),
+    ) {
+        (aterm_phase::Program::Claude, Some(rows)) => {
+            aterm_agent::harness::worker::with_shown_mode(starter, &rows)
+        }
+        _ => starter,
+    };
+    Some((
+        starter,
+        match group {
+            StarterGroup::Named(_) => Found::Named,
+            StarterGroup::Front(_) => Found::Front,
+        },
+    ))
 }
 
 /// `starter` under the login its CLI's pool picks for a launch
-/// ([`aterm_agent::harness::accounts_pool::launch_env`], once each row's usage was read in its
+/// ([`aterm_agent::harness::accounts_pool::launch_env`], reading only the row it starts on, in its
 /// own home on this launcher thread), unless the starter runs on a non-default home, a credential
 /// override, or sets the pool's seam variable to a login outside the bound roster (one that does
 /// runs on a home or credential of its own, which the pool leaves alone; a starter already on a

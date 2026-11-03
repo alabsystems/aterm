@@ -375,3 +375,50 @@ fn a_destination_that_is_not_a_regular_file_is_usage_before_any_request() {
     }
     w.fake.assert_clean();
 }
+
+/// NEGATIVE CONTROL: A live symlink (even pointing to a regular file with matching SHA-256) or a
+/// dangling symlink at `dest` is rejected with `Kind::Usage` before any request is sent, rather
+/// than leaving `dest` as a symlink or overwriting a dangling symlink without `--clobber`.
+#[test]
+fn a_symlink_destination_is_usage_before_any_request() {
+    let w = World::new("dl-symlink-dest");
+    let known = w.asset(AssetSpec::uploaded("b.bin", BYTES));
+    let mut spec = AssetSpec::uploaded("a.bin", BYTES);
+    spec.digest = DigestSpec::Null;
+    let null = w.asset(spec);
+
+    let target = w.dest("outside.bin");
+    std::fs::write(&target, BYTES).expect("target with matching bytes");
+    let live_link = w.dest("live-link.bin");
+    std::os::unix::fs::symlink(&target, &live_link).expect("live symlink");
+
+    let missing_target = w.dest("missing-target.bin");
+    let dangling_link = w.dest("dangling-link.bin");
+    std::os::unix::fs::symlink(&missing_target, &dangling_link).expect("dangling symlink");
+
+    for link in [&live_link, &dangling_link] {
+        for (asset, clobber) in [
+            (&known, false),
+            (&known, true),
+            (&null, false),
+            (&null, true),
+        ] {
+            w.fake.clear_seen();
+            let error = w
+                .file(link, asset, clobber)
+                .expect_err("symlink destination");
+            assert_eq!(error.kind, Kind::Usage, "{}", error.why);
+            assert!(w.fake.seen().is_empty(), "{:?}", w.fake.seen());
+            assert!(!part_path(link).exists());
+            assert!(
+                std::fs::symlink_metadata(link)
+                    .expect("link metadata")
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+    assert!(!missing_target.exists());
+    assert_eq!(std::fs::read(&target).expect("target kept"), BYTES);
+    w.fake.assert_clean();
+}

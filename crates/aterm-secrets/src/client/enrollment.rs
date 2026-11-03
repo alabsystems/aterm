@@ -507,8 +507,8 @@ mod tests {
         (paths, format!("{}#{}", source.display(), created.signer))
     }
 
-    /// `owner` lets `host` in as an open vault's approver does ([`auto_approve_listed`]), and
-    /// `host` joins. Returns the new machine's paths.
+    /// `owner` lets `host` in as an open admission, as `aterm secrets password open` records one
+    /// ([`admin_publish_opened`]), and `host` joins. Returns the new machine's paths.
     fn admitted_open(root: &Path, owner: &Paths, pinned: &str, host: &str) -> Paths {
         let machine = Paths::for_home(&root.join(host));
         let recipient = machine_identity(&machine).unwrap().recipient().to_bech32();

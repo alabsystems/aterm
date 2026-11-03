@@ -79,6 +79,28 @@ fn read_reads_as_text_on_either_side_of_a_selector() {
     }
 }
 
+#[test]
+fn close_takes_its_one_session_after_the_verb_and_nothing_else() {
+    for (typed, sent) in [
+        ("close @s-ab12", "@s-ab12 close"),
+        ("close s-ab12", "@s-ab12 close"),
+        ("close @self", "@self close"),
+        ("close @3", "@3 close"),
+    ] {
+        assert_eq!(rewritten(typed).as_deref(), Some(sent), "{typed}");
+    }
+    for alone in [
+        "close",
+        "close s-foo",
+        "close --help",
+        "close s-ab12 now",
+        "@s-ab12 close",
+        "@s-ab12 close s-cd34",
+    ] {
+        assert_eq!(rewritten(alone), None, "{alone}");
+    }
+}
+
 /// A verb that is no read answered at once keeps its words where they are: the client verbs, a
 /// meta verb (some take a bare sid of their own), a wait, `subscribe` (its targets already
 /// follow it) and a write, whose one spelling stays the protocol's.

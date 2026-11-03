@@ -437,7 +437,7 @@ pub fn reset_in_zone(
 ) -> Option<i64> {
     let (date, hour, minute) = match spec {
         ResetSpec::In(span) => {
-            return Some(now.saturating_add(i64::try_from(span.as_secs()).unwrap_or(0)));
+            return Some(now.saturating_add_unsigned(span.as_secs()));
         }
         ResetSpec::At {
             date, hour, minute, ..
@@ -446,15 +446,20 @@ pub fn reset_in_zone(
     let clock = i64::from(*hour) * 3600 + i64::from(*minute) * 60;
     let now_offset = offset_at(now)?;
     let (y, m, d) = civil(now.saturating_add(now_offset).div_euclid(86_400));
-    let place = |day: i64| -> Option<i64> {
-        let local = day.checked_mul(86_400)?.checked_add(clock)?;
-        local.checked_sub(offset_at(local.saturating_sub(now_offset))?)
-    };
     match date {
         Some((month, day)) => {
             let mut best: Option<i64> = None;
             for year in [y.saturating_sub(1), y, y.saturating_add(1)] {
-                let at = place(days_from_civil(year, *month, *day))?;
+                let instants = day_instants_or_pushed_forward(
+                    days_from_civil(year, *month, *day),
+                    clock,
+                    offset_at,
+                )?;
+                let at = instants
+                    .into_iter()
+                    .flatten()
+                    .find(|&t| t > now)
+                    .or_else(|| instants.into_iter().flatten().next_back())?;
                 if best.is_none_or(|b| at.abs_diff(now) < b.abs_diff(now)) {
                     best = Some(at);
                 }
@@ -463,17 +468,51 @@ pub fn reset_in_zone(
         }
         None => {
             let today_day = days_from_civil(y, m, d);
-            let today = place(today_day)?;
-            if today > now {
-                return Some(today);
+            let prev = sorted_day_instants(today_day.saturating_sub(1), clock, offset_at);
+            let today = day_instants_or_pushed_forward(today_day, clock, offset_at)?;
+            if let Some(upcoming) = prev.into_iter().chain(today).flatten().find(|&t| t > now) {
+                return Some(upcoming);
             }
-            let tomorrow = place(today_day.saturating_add(1))?;
+            let today_passed = today.into_iter().flatten().next_back()?;
+            let tomorrow =
+                day_instants_or_pushed_forward(today_day.saturating_add(1), clock, offset_at)?
+                    .into_iter()
+                    .flatten()
+                    .next()?;
             Some(if tomorrow.saturating_sub(now) < ahead_max {
                 tomorrow
             } else {
-                today
+                today_passed
             })
         }
+    }
+}
+
+fn sorted_day_instants(
+    day: i64,
+    clock: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> [Option<i64>; 2] {
+    match instants_of_clock(day, clock, local_at) {
+        [Some(a), Some(b)] if a == b => [Some(a), None],
+        [Some(a), Some(b)] => [Some(a.min(b)), Some(a.max(b))],
+        [Some(a), None] | [None, Some(a)] => [Some(a), None],
+        [None, None] => [None, None],
+    }
+}
+
+fn day_instants_or_pushed_forward(
+    day: i64,
+    clock: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> Option<[Option<i64>; 2]> {
+    match sorted_day_instants(day, clock, local_at) {
+        [None, None] => {
+            let local = day.checked_mul(86_400)?.checked_add(clock)?;
+            let before = local_at(local.saturating_sub(86_400))?;
+            Some([Some(local.checked_sub(before)?), None])
+        }
+        instants => Some(instants),
     }
 }
 
@@ -532,10 +571,8 @@ pub fn is_a_later_day_of(
     let (Some(then), Some(there)) = (offset(at), offset(named)) else {
         return false;
     };
-    let before = at
-        .saturating_add(then)
-        .saturating_sub(named.saturating_add(there));
-    let days = before.saturating_add(43_200).div_euclid(86_400);
+    let before = (i128::from(at) + i128::from(then)) - (i128::from(named) + i128::from(there));
+    let days = (before + 43_200).div_euclid(86_400);
     days >= 1 && (before - days * 86_400).abs() < 60
 }
 
@@ -805,6 +842,25 @@ pub fn one_line(text: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn relative_reset_keeps_the_full_unsigned_duration() {
+        let large = 1u64 << 63;
+        for (now, seconds, expected) in [
+            (i64::MIN, large, 0),
+            (-1, large, i64::MAX),
+            (i64::MIN, u64::MAX, i64::MAX),
+            (10, u64::MAX, i64::MAX),
+            (i64::MAX, 0, i64::MAX),
+            (10, 60, 70),
+        ] {
+            let spec = parse_reset(&format!("in {seconds}s")).expect("valid unsigned seconds");
+            assert_eq!(
+                reset_in_zone(&spec, now, SESSION_AHEAD_MAX, &|_| None),
+                Some(expected)
+            );
+        }
+    }
+
     /// The test's zone table: what `date` answers on a machine that knows
     /// these two zones, in mid-September (daylight time).
     fn zones(zone: &str) -> Option<i64> {
@@ -951,6 +1007,33 @@ mod tests {
                 }
                 now += 600;
             }
+        }
+    }
+
+    #[test]
+    fn later_day_comparison_preserves_wall_clock_near_timestamp_limits() {
+        let spec = ResetSpec::At {
+            date: None,
+            hour: 0,
+            minute: 0,
+            zone: None,
+        };
+        for (at, named, offset, expected) in [
+            (i64::MAX, i64::MAX - 86_400, 3600, true),
+            (i64::MIN + 86_400, i64::MIN, -3600, true),
+            (i64::MAX, i64::MAX - 90_000, 3600, false),
+            (i64::MIN + 90_000, i64::MIN, -3600, false),
+            // The complete signed span is u64::MAX seconds, with remainder 25,215 in a day.
+            (i64::MAX, i64::MIN + 25_215, 0, true),
+            (i64::MAX, i64::MIN + 25_156, 0, true),
+            (i64::MAX, i64::MIN + 25_155, 0, false),
+            (i64::MIN, i64::MAX, 0, false),
+        ] {
+            assert_eq!(
+                is_a_later_day_of(&spec, at, named, &|_| Some(offset), &|_, _| None),
+                expected,
+                "at={at}, named={named}, offset={offset}"
+            );
         }
     }
 
@@ -1360,6 +1443,89 @@ mod tests {
             "the session rule: today's, passed"
         );
         assert_eq!(reset_in_zone(&nine, day, i64::MAX, &|_| None), None);
+    }
+
+    #[test]
+    fn repeated_and_skipped_dst_clocks_place_at_second_pass_and_pushed_forward_instant() {
+        let no_zone = |_: &str, _: i64| None;
+        for change in [1_793_523_600, 1_805_018_400_i64] {
+            let mut now = change - 48 * 3600;
+            while now <= change + 48 * 3600 {
+                for clock in (0..86_400).step_by(900) {
+                    let spec = ResetSpec::At {
+                        date: None,
+                        hour: u32::try_from(clock / 3600).unwrap(),
+                        minute: u32::try_from(clock % 3600 / 60).unwrap(),
+                        zone: None,
+                    };
+                    if let Some(want) = (1..5 * 60)
+                        .map(|m| now + m * 60)
+                        .find(|&at| clock_at(at) == clock)
+                    {
+                        assert_eq!(
+                            reset_at_local(&spec, now, &la_either_change, &no_zone),
+                            want,
+                            "{clock} s into the day, read at {now}"
+                        );
+                    }
+                }
+                now += 600;
+            }
+        }
+        // Fall-back repeated hour (2026-11-01 02:00 PDT -> 01:00 PST at 09:00Z = 1_793_523_600):
+        // reading `resets 1am` at 01:30 PDT (08:30Z) lands on 01:00 PST (09:00Z), not gone by or tomorrow.
+        let fall_change = 1_793_523_600_i64;
+        let one_am = parse_reset("1am (America/Los_Angeles)").unwrap();
+        assert_eq!(
+            reset_in_zone(&one_am, fall_change - 1800, SESSION_AHEAD_MAX, &la_at),
+            Some(fall_change)
+        );
+        assert_eq!(
+            reset_in_zone(&one_am, fall_change - 1800, i64::MAX, &la_at),
+            Some(fall_change)
+        );
+        assert_eq!(
+            place_reset_local(
+                &one_am,
+                true,
+                fall_change - 1800,
+                Some(fall_change - 2400),
+                &la_at,
+                &|_, t| la_at(t)
+            ),
+            fall_change
+        );
+        let dated_repeat = parse_reset("Nov 1 at 1:15am (America/Los_Angeles)").unwrap();
+        assert_eq!(
+            reset_in_zone(&dated_repeat, fall_change - 1800, SESSION_AHEAD_MAX, &la_at),
+            Some(fall_change + 900)
+        );
+        // Spring-forward skipped hour (2026-03-08 02:00 PST -> 03:00 PDT at 10:00Z = 1_772_964_000):
+        // reading `resets 2:30am` at 01:00 PST (09:00Z) pushes forward to 10:30Z (03:30 PDT), never 09:30Z (01:30 PST).
+        let spring_change = 1_772_964_000_i64;
+        let two_thirty = parse_reset("2:30am (America/Los_Angeles)").unwrap();
+        assert_eq!(
+            reset_in_zone(&two_thirty, spring_change - 3600, SESSION_AHEAD_MAX, &la_at),
+            Some(spring_change + 1800)
+        );
+        let dated_skip = parse_reset("Mar 8 at 2:30am (America/Los_Angeles)").unwrap();
+        assert_eq!(
+            reset_in_zone(&dated_skip, spring_change - 3600, SESSION_AHEAD_MAX, &la_at),
+            Some(spring_change + 1800)
+        );
+        // Nuuk midnight skip (2027-03-27 23:00 -02:00 -> 2027-03-28 00:00 -01:00 at 1_806_195_600):
+        // reading `resets 11:30pm` at 00:15 on 2027-03-28 places tonight's 23:30, not yesterday's skipped hour.
+        let nuuk_change = 1_806_195_600_i64;
+        let nuuk = |t: i64| Some(if t < nuuk_change { -7200 } else { -3600 });
+        let eleven_thirty = parse_reset("11:30pm").unwrap();
+        assert_eq!(
+            reset_in_zone(&eleven_thirty, nuuk_change + 900, i64::MAX, &nuuk),
+            Some(nuuk_change + 84_600)
+        );
+        assert_eq!(
+            reset_in_zone(&eleven_thirty, nuuk_change - 300, i64::MAX, &nuuk),
+            Some(nuuk_change + 1800)
+        );
     }
 
     /// `date` answers a zone's offset at an instant, where the machine has

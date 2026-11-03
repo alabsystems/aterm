@@ -144,16 +144,30 @@ pub(super) fn notary_profile(
     let text = bytes
         .as_str()
         .ok_or_else(|| Error::new("probe release profile is not UTF-8"))?;
+    parse_notary_profile_text(text)
+}
+
+fn parse_notary_profile_text(text: &str) -> Result<String> {
+    let mut found = None;
     for line in text.lines() {
         let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
         if line.starts_with('[') {
             break;
         }
-        let Some((name, _)) = line.split_once('=') else {
-            continue;
+        let Some((name, rhs)) = line.split_once('=') else {
+            return Err(Error::new("probe release profile is malformed"));
         };
-        if name.trim() != "notary_profile" {
+        if rhs.contains("\"\"\"") || rhs.contains("'''") {
+            return Err(Error::new("probe release profile is malformed"));
+        }
+        if name.trim().trim_matches(['"', '\'']) != "notary_profile" {
             continue;
+        }
+        if found.is_some() {
+            return Err(Error::new("probe notary profile name is duplicated"));
         }
         let value: aterm_toml::Value = aterm_toml::from_str(line)
             .map_err(|_| Error::new("probe notary profile name is malformed"))?;
@@ -167,7 +181,36 @@ pub(super) fn notary_profile(
                     && s.bytes().all(|b| b >= 0x20 && b != 0x7f)
             })
             .ok_or_else(|| Error::new("probe notary profile name is invalid"))?;
-        return Ok(profile.to_owned());
+        found = Some(profile.to_owned());
     }
-    Err(Error::new("probe release profile has no notary profile"))
+    found.ok_or_else(|| Error::new("probe release profile has no notary profile"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_notary_profile_text;
+
+    /// NEGATIVE CONTROL: returning on the first `notary_profile` match or skipping lines
+    /// without `=` would accept duplicate top-level keys or multiline-injected assignments.
+    #[test]
+    fn notary_profile_parser_accepts_toml_strings_and_rejects_duplicates_or_multiline_values() {
+        assert_eq!(
+            parse_notary_profile_text(
+                "# comment\nsigning_key = \"x\"\nnotary_profile = 'aterm-notary' # inline\n[extra]\nnotary_profile = \"ignored\"\n"
+            )
+            .unwrap(),
+            "aterm-notary"
+        );
+        for bad in [
+            "signing_key = \"x\"\n",
+            "notary_profile = \"first\"\nnotary_profile = \"second\"\n",
+            "\"notary_profile\" = \"first\"\nnotary_profile = \"second\"\n",
+            "note = \"\"\"\nnotary_profile = \"injected\"\n\"\"\"\n",
+            "signing_key = \"x\"\nbare_word\nnotary_profile = \"aterm\"\n",
+            "notary_profile = \"-flag\"\n",
+            "notary_profile = \"\"\n",
+        ] {
+            assert!(parse_notary_profile_text(bad).is_err(), "{bad}");
+        }
+    }
 }

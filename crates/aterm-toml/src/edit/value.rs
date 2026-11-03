@@ -284,6 +284,12 @@ impl Array {
         self.values.get(index)
     }
 
+    /// The element at `index`, mutably, preserving the array's formatting.
+    #[inline]
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Value> {
+        self.values.get_mut(index)
+    }
+
     /// Append an element.
     #[inline]
     pub fn push(&mut self, value: impl Into<Value>) {

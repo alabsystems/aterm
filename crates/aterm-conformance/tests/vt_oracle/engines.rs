@@ -303,6 +303,7 @@ pub struct MarkPlacement {
     pub col: u16,
     pub continued: bool,
     pub at_left_margin: bool,
+    pub follows_glyph: bool,
 }
 
 /// The production engine, advanced chunk by chunk.
@@ -459,6 +460,20 @@ impl Aterm {
         })
     }
 
+    /// The colour the underline of the cell at `(row, col)` draws in, a palette index resolved.
+    pub fn underline_colour(&self, row: usize, col: usize) -> Option<[u8; 3]> {
+        self.term
+            .render_row(row)
+            .get(col)
+            .and_then(|c| c.underline_color)
+    }
+
+    /// Palette colour `n`, as an underline resolves it.
+    pub fn palette(&self, n: u8) -> [u8; 3] {
+        let c = self.term.color_palette().get(n);
+        [c.r, c.g, c.b]
+    }
+
     /// Where a mark fed now would land, in the terms the placements speak of.
     pub fn mark_placement(&self) -> MarkPlacement {
         let grid = self.term.grid();
@@ -469,6 +484,7 @@ impl Aterm {
             continued: grid.row(cur.row).is_some_and(|row| row.is_wrapped()),
             at_left_margin: grid.has_horizontal_margins()
                 && cur.col == grid.horizontal_margins().left,
+            follows_glyph: grid.cursor_follows_glyph(),
         }
     }
 

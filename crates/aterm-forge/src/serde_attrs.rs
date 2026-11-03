@@ -642,7 +642,7 @@ pub fn inventory(root: &Path, paths: &[std::path::PathBuf]) -> Result<String, St
     };
     let mut inv = Inventory::default();
     for path in files {
-        let src = std::fs::read_to_string(&path)
+        let src = crate::read_regular_text(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let rel = path
             .strip_prefix(root)

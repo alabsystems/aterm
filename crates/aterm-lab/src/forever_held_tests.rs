@@ -75,7 +75,7 @@ fn land_c_journal() -> Vec<(i64, String)> {
 
 /// land-c's chip in front on `b42ae72fc3`, past its hold (END's sweep of that run, +999.1 s): the
 /// hold's words, no stop word.
-const MAIN_LINE: &str = "window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"Autopilot: \
+const MAIN_LINE: &str = "window=2 program=claude face=land drawn=\"⤓\" spoken=\"Autopilot: \
      land.\" description=\"Not landed yet. 1 untracked file. Landing since 11:42, 1 nudge. Last: \
      nudged at 11:46.\" title=\"autopilot: land — not landed yet: 1 untracked file · landing \
      since 11:42, 1 nudge · last: ⤓ nudged 11:46, ⤓ landing 11:42 · click: off · right-click: \
@@ -86,7 +86,7 @@ const MAIN_LINE: &str = "window=2 program=claude face=land drawn=\"⤓ land\" sp
 fn said_line() -> String {
     let [spoken, titled, _] = stop_heads("land", HeldBy::SameReply);
     format!(
-        "window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"Autopilot: land.\" \
+        "window=2 program=claude face=land drawn=\"⤓\" spoken=\"Autopilot: land.\" \
          description=\"{spoken} Not landed yet. 1 untracked file. Landing since 11:42, 1 nudge.\" \
          title=\"{titled} · not landed yet: 1 untracked file · landing since 11:42, 1 nudge · \
          click: off · right-click: more\""
@@ -367,7 +367,7 @@ fn the_wants_fold_into_a_same_reply_chains_last_scenario() {
 #[test]
 fn the_screen_readers_nodes_are_the_tabs_chip_and_the_band_rows() {
     let chrome = "OK 6\n\
-         autopilot sid=s-c window=2 program=claude face=land drawn=\"⤓ land\"\n\
+         autopilot sid=s-c window=2 program=claude face=land drawn=\"⤓\"\n\
          a11y window=2 band row=0 role=Alert label=\"aterm stopped typing\" description=-\n\
          a11y window=2 autopilot sid=s-d role=Button label=\"Autopilot: land.\" description=-\n\
          a11y window=2 autopilot sid=s-c role=Button label=\"Autopilot: land.\" description=\"x\"\n\

@@ -11,6 +11,11 @@ use super::instance::{
 };
 use super::starvation::ShapeVerdict;
 
+#[path = "rewind_cost_diagnostic.rs"]
+mod diagnostic;
+pub use diagnostic::collect as diagnose;
+pub use diagnostic::collect_reference as diagnose_reference;
+
 /// A take's wall-clock limit: every wait and request on its instances ends with it.
 pub const BUDGET_SECS: u64 = 600;
 
@@ -20,13 +25,13 @@ pub const APP_IDLE_TARGET_BYTES: u64 = 25_000_000;
 /// What a cost row measures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CostRow {
-    /// `pairs` ABBA pairs (off, on, on, off) of one pane draining `bytes`, each take a fresh instance: passes when the off arm's median drain time is at least `min_milli` thousandths of the on arm's.
+    /// `pairs` ABBA pairs (off, on, on, off) of one pane draining `bytes`, each take a fresh instance: passes when the off arm's median drain time is at least `min_milli` thousandths of the on arm's and no recording input was dropped.
     Throughput {
         bytes: usize,
         pairs: u32,
         min_milli: u64,
     },
-    /// One idle pane, `pairs` ABBA pairs (off, on, on, off), each take a fresh instance: passes when the on arm's median resident size is at most `max_extra_bytes` over the off arm's and, on a bundle that records by default (one more instance with no `temporal_recording` key says), at most [`APP_IDLE_TARGET_BYTES`] ([`idle_verdict`]). Each take's app memory ([`app_bytes`]) is reported beside it and judges nothing.
+    /// One idle pane, `pairs` ABBA pairs (off, on, on, off), each take a fresh instance: passes when the on arm's median resident size is at most `max_extra_bytes` over the off arm's and, on a bundle that records by default (one more instance with no `temporal_recording` key says), at most [`APP_IDLE_TARGET_BYTES`] ([`idle_verdict`]). Each take's app memory ([`Settled::read`]) is reported beside it and judges nothing.
     IdleRss { pairs: u32, max_extra_bytes: u64 },
     /// `panes` panes each draining `bytes` at once: passes when recording on adds at most `max_extra_bytes` of resident size over recording off and the pool holds no more than its limit.
     BusyRss {
@@ -67,14 +72,26 @@ impl Take {
 
     /// An instance whose config starts with `config_head`, once its first pane is quiet, and whether that pane records.
     fn start(rig: &Rig, config_head: &str, budget: Budget) -> Result<(Self, bool), CouldNotRun> {
+        Self::start_with_diagnostic(rig, config_head, budget, None)
+    }
+
+    fn start_with_diagnostic(
+        rig: &Rig,
+        config_head: &str,
+        budget: Budget,
+        probe: Option<bool>,
+    ) -> Result<(Self, bool), CouldNotRun> {
         let mut scratch = Scratch::new("atcost")
             .map_err(|e| CouldNotRun::Refused(format!("cannot make a scratch world: {e}")))?;
-        if std::env::var_os("ATERM_PAINT_KEEP").is_some() {
+        if probe.is_some() || std::env::var_os("ATERM_PAINT_KEEP").is_some() {
             scratch.keep();
         }
         let world = World::prepare(scratch.path(), config_head)
             .map_err(|e| CouldNotRun::Refused(format!("cannot lay out the scratch world: {e}")))?;
-        let inst = Instance::launch(&rig.aterm, &world, budget)?;
+        let inst = match probe {
+            Some(on) => Instance::launch_recording_cost_diagnostic(&rig.aterm, &world, budget, on)?,
+            None => Instance::launch(&rig.aterm, &world, budget)?,
+        };
         inst.ctl.ok(&["await", "idle", "500", "timeout=60000"])?;
         let status = inst.ctl.ok(&["temporal", "status"])?;
         let recording = match field(&status, "enabled") {
@@ -117,10 +134,34 @@ impl Take {
     /// The microseconds a drain reported into `out`.
     fn drained_us(&self, out: &Path) -> Result<u64, CouldNotRun> {
         self.inst.ctl.await_event("the drain's report", || {
-            std::fs::read_to_string(out)
+            crate::measure::read_regular_text(out)
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
         })
+    }
+
+    /// Validate loss after the PTY is quiet and all recorded work is complete. This wait is
+    /// outside both the producer's drain timing and the diagnostic CPU bracket.
+    fn completed_status(&self, recording: bool) -> Result<String, CouldNotRun> {
+        self.inst
+            .ctl
+            .ok(&["await", "idle", "500", "timeout=60000"])?;
+        if !recording {
+            return self.inst.ctl.ok(&["temporal", "status"]);
+        }
+        self.inst
+            .ctl
+            .await_event("the recording writer's completion", || {
+                let status = match self.inst.ctl.ok(&["temporal", "status"]) {
+                    Ok(status) => status,
+                    Err(error) => return Some(Err(error)),
+                };
+                match writer_finished(&status) {
+                    Ok(true) => Some(Ok(status)),
+                    Ok(false) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })?
     }
 
     /// The instance's resident size in bytes, once its panes are quiet.
@@ -128,53 +169,57 @@ impl Take {
         Ok(self.settled()?.rss)
     }
 
-    /// The instance's resident size and app memory ([`app_bytes`]), once its panes are quiet.
+    /// The instance's resident size and app memory, once its panes are quiet.
     fn settled(&self) -> Result<Settled, CouldNotRun> {
         self.inst
             .ctl
             .ok(&["await", "idle", "2000", "timeout=120000"])?;
         std::thread::sleep(std::time::Duration::from_secs(2));
-        let pid = self.inst.pid();
-        Ok(Settled {
-            rss: rss_bytes(pid)?,
-            app: app_bytes(pid)?,
-        })
+        Settled::read(self.inst.pid(), self.inst.ctl.budget())
     }
 }
 
 /// One settled take's two sizes, in bytes.
 struct Settled {
-    /// `ps`'s resident size ([`rss_bytes`]).
+    /// Its pages in physical memory, including clean file-backed pages.
     rss: u64,
-    /// The app's own memory ([`app_bytes`]).
+    /// Its physical footprint on macOS, or the resident size elsewhere.
     app: u64,
 }
 
-/// The memory `pid` holds for itself, in bytes, which the idle row reports beside `ps`'s resident size. On macOS
-/// that is its physical footprint (`proc_pid_rusage`'s `ri_phys_footprint`, Activity Monitor's
-/// "Memory"): its dirty private pages, compressed ones too, and none of the clean file-backed
-/// pages (aterm's own code, mostly) that `ps`'s resident size also counts, which the kernel
-/// can drop at any time and which move with the rest of the Mac's memory pressure. Elsewhere it
-/// is the resident size.
-#[cfg(target_os = "macos")]
-fn app_bytes(pid: u32) -> Result<u64, CouldNotRun> {
-    super::usage(pid).map(|usage| usage.footprint)
+impl Settled {
+    /// Read both sizes from one kernel usage result, without launching a subprocess.
+    /// The footprint counts dirty private pages, including compressed ones, and excludes
+    /// the clean file-backed pages the resident size counts.
+    #[cfg(target_os = "macos")]
+    fn read(pid: u32, _budget: Budget) -> Result<Self, CouldNotRun> {
+        let usage = super::usage(pid)?;
+        Ok(Self {
+            rss: usage.resident,
+            app: usage.footprint,
+        })
+    }
+
+    /// Where no footprint is available, reuse one budgeted resident-size reading.
+    #[cfg(not(target_os = "macos"))]
+    fn read(pid: u32, budget: Budget) -> Result<Self, CouldNotRun> {
+        let rss = rss_from_ps(pid, budget)?;
+        Ok(Self { rss, app: rss })
+    }
 }
 
-/// The resident size, where the platform names no footprint.
-#[cfg(not(target_os = "macos"))]
-fn app_bytes(pid: u32) -> Result<u64, CouldNotRun> {
-    rss_bytes(pid)
-}
-
-/// `ps`'s resident size of `pid`, in bytes.
-fn rss_bytes(pid: u32) -> Result<u64, CouldNotRun> {
-    let out = aterm_uds::spawnfd::command(Path::new("/bin/ps"))
+/// The portable resident-size collector, also exercised on macOS.
+#[cfg(any(test, not(target_os = "macos")))]
+fn rss_from_ps(pid: u32, budget: Budget) -> Result<u64, CouldNotRun> {
+    let mut command = aterm_uds::spawnfd::command(Path::new("/bin/ps"));
+    command
         .env_clear()
         .args(["-o", "rss=", "-p", &pid.to_string()])
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .output()
-        .map_err(|e| CouldNotRun::Refused(format!("cannot run ps: {e}")))?;
+        .stdin(aterm_uds::spawnfd::Stdio::null());
+    static GATE: aterm_uds::deadline::Gate = aterm_uds::deadline::Gate::new("measure-rss");
+    let out = budget
+        .output(command, &GATE)
+        .map_err(|e| e.map(|why| format!("cannot run ps: {why}")))?;
     String::from_utf8_lossy(&out.stdout)
         .trim()
         .parse::<u64>()
@@ -237,7 +282,8 @@ pub fn idle_verdict(
 
 /// Measure one row.
 /// # Errors
-/// [`CouldNotRun`] when an instance did not start, a request failed, or a drain never reported.
+/// [`CouldNotRun`] when an instance did not start, a request failed, a drain never reported,
+/// the recording writer ended, or required status counters are unavailable.
 pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
     let _one = super::ONE_TAKE
         .lock()
@@ -250,6 +296,7 @@ pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
             min_milli,
         } => {
             let (mut off, mut on) = (Vec::new(), Vec::new());
+            let mut dropped_input = 0_u64;
             for pair in 0..pairs {
                 for (arm, record) in [false, true, true, false].into_iter().enumerate() {
                     let take = Take::launch(rig, record, budget)?;
@@ -265,18 +312,29 @@ pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
                     // Diagnostics bracket the command and report polling as well as the drain.
                     // The verdict still uses only the producer's original drain measurement.
                     let status = take.inst.ctl.ok(&["temporal", "status"])?;
+                    let completed = take.completed_status(record)?;
                     eprintln!(
                         "measure-sample: {}",
                         aterm_json::json!({
                             "schema": 1, "measurement": "recording-throughput", "pair": pair,
                             "arm": arm, "recording": record, "drain_us": us,
                             "sample_wall_us": sample_wall_us, "sample_cpu_ns": used,
-                            "dropped_input": field(&status, "dropped_input"),
+                            "dropped_input": field(&completed, "dropped_input"),
+                            "dropped_input_at_receipt": field(&status, "dropped_input"),
+                            "completion_writer_in_flight": field(&completed, "writer_in_flight"),
+                            "completion_writer_queued_bytes": field(&completed, "writer_queued_bytes"),
                             "writer_in_flight": field(&status, "writer_in_flight"),
                             "writer_queued_bytes": field(&status, "writer_queued_bytes"),
+                            "writer_role_requested": field(&status, "writer_role_requested"),
+                            "writer_qos_observed": field(&status, "writer_qos_observed"),
+                            "writer_urgent_pressure": field(&status, "writer_urgent_pressure"),
+                            "writer_priority_override": field(&status, "writer_priority_override"),
                             "pool_used": field(&status, "pool_used"),
                         })
                     );
+                    if record {
+                        dropped_input = dropped_input.saturating_add(recording_drops(&completed)?);
+                    }
                     if record { &mut on } else { &mut off }.push(us);
                 }
             }
@@ -284,11 +342,12 @@ pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
             Ok(CostReport {
                 line: format!(
                     "COST throughput bytes={bytes} pairs={pairs} off_us={off:?} on_us={on:?} \
-                     off_median_us={} on_median_us={} ratio_milli={milli} min_milli={min_milli}",
+                     off_median_us={} on_median_us={} ratio_milli={milli} min_milli={min_milli} \
+                     dropped_input={dropped_input}",
                     median(&off),
                     median(&on)
                 ),
-                verdict: verdict(milli >= min_milli),
+                verdict: throughput_verdict(milli, min_milli, dropped_input),
             })
         }
         CostRow::IdleRss {
@@ -343,6 +402,39 @@ pub fn measure(rig: &Rig, row: &CostRow) -> Result<CostReport, CouldNotRun> {
             })
         }
     }
+}
+
+/// A missing loss counter cannot establish that the recording kept its input.
+fn recording_drops(status: &str) -> Result<u64, CouldNotRun> {
+    field(status, "dropped_input")
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| {
+            CouldNotRun::Unanswered(format!(
+                "temporal status named no numeric dropped_input= ({status})"
+            ))
+        })
+}
+
+fn writer_finished(status: &str) -> Result<bool, CouldNotRun> {
+    match field(status, "writer_gone") {
+        Some("true") => return could_not_run("the recording writer ended before validation"),
+        Some("false") => {}
+        _ => return unanswered("temporal status named no writer_gone="),
+    }
+    let number = |key| {
+        field(status, key)
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                CouldNotRun::Unanswered(format!(
+                    "temporal status named no numeric {key}= ({status})"
+                ))
+            })
+    };
+    Ok(number("writer_in_flight")? == 0 && number("writer_queued_bytes")? == 0)
+}
+
+const fn throughput_verdict(milli: u64, min_milli: u64, dropped_input: u64) -> ShapeVerdict {
+    verdict(milli >= min_milli && dropped_input == 0)
 }
 
 /// `panes` panes of one instance each draining `bytes` at once: its settled resident size and the pool's `(used, limit)`.
@@ -401,11 +493,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_portable_resident_probe_obeys_the_take_budget() {
+        let pid = std::process::id();
+        assert!(rss_from_ps(pid, Budget::from_now(60)).expect("resident size") > 0);
+        assert!(matches!(
+            rss_from_ps(pid, Budget::from_now(0)),
+            Err(CouldNotRun::Refused(_))
+        ));
+    }
+
+    #[test]
     fn the_ratio_is_the_off_median_over_the_on_median() {
         assert_eq!(median(&[5, 1, 3]), 3);
         assert_eq!(median(&[4, 1, 3, 2]), 2);
         assert_eq!(ratio_milli(&[970, 1000, 990], &[1000, 1000, 1010]), 990);
         assert_eq!(ratio_milli(&[1], &[]), 0, "no on arm passes nothing");
+    }
+
+    #[test]
+    fn a_fast_recording_cannot_pass_by_losing_input() {
+        assert_eq!(throughput_verdict(1000, 970, 0), ShapeVerdict::Pass);
+        assert_eq!(throughput_verdict(1000, 970, 1), ShapeVerdict::Fail);
+        assert_eq!(throughput_verdict(969, 970, 0), ShapeVerdict::Fail);
+        assert_eq!(recording_drops("OK dropped_input=0").unwrap(), 0);
+        assert_eq!(recording_drops("OK dropped_input=2").unwrap(), 2);
+        for status in ["OK", "OK dropped_input=-", "OK dropped_input=bad"] {
+            assert!(matches!(
+                recording_drops(status),
+                Err(CouldNotRun::Unanswered(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn loss_is_checked_only_after_live_writer_completion() {
+        let receipt =
+            "OK writer_gone=false writer_in_flight=1 writer_queued_bytes=8 dropped_input=0";
+        let completed =
+            "OK writer_gone=false writer_in_flight=0 writer_queued_bytes=0 dropped_input=1";
+        assert!(!writer_finished(receipt).unwrap());
+        assert!(writer_finished(completed).unwrap());
+        assert_eq!(
+            throughput_verdict(1000, 970, recording_drops(completed).unwrap()),
+            ShapeVerdict::Fail
+        );
+        assert!(
+            writer_finished("OK writer_gone=false writer_in_flight=0 writer_queued_bytes=0")
+                .unwrap()
+        );
+        assert!(
+            !writer_finished("OK writer_gone=false writer_in_flight=1 writer_queued_bytes=0")
+                .unwrap()
+        );
+        assert!(
+            !writer_finished("OK writer_gone=false writer_in_flight=0 writer_queued_bytes=8")
+                .unwrap()
+        );
+        assert!(matches!(
+            writer_finished("OK writer_gone=true"),
+            Err(CouldNotRun::Refused(_))
+        ));
+        for status in [
+            "OK",
+            "OK writer_gone=false",
+            "OK writer_gone=false writer_in_flight=- writer_queued_bytes=0",
+        ] {
+            assert!(matches!(
+                writer_finished(status),
+                Err(CouldNotRun::Unanswered(_))
+            ));
+        }
     }
 
     /// One pane's Rewind budget, the idle row's bound.
@@ -492,6 +649,7 @@ mod tests {
         const LEN: usize = 64 << 20;
         const PAGE: usize = 16 << 10;
         let pid = std::process::id();
+        let budget = Budget::from_now(60);
         let dir = aterm_tempfile::TempDir::new().expect("a scratch directory");
         let path = dir.path().join("clean.bin");
         {
@@ -503,7 +661,10 @@ mod tests {
             }
         }
         let file = std::fs::File::open(&path).expect("the file");
-        let (rss_0, app_0) = (rss_bytes(pid).expect("rss"), app_bytes(pid).expect("app"));
+        let Settled {
+            rss: rss_0,
+            app: app_0,
+        } = Settled::read(pid, budget).expect("memory");
         // SAFETY: a fresh read-only private mapping of `LEN` bytes of an open file of that
         // length; it is unmapped below and nothing else holds it.
         let map = unsafe {
@@ -523,7 +684,10 @@ mod tests {
             sum += u64::from(unsafe { std::ptr::read_volatile(map.cast::<u8>().add(off)) });
         }
         assert_eq!(sum, 7 * (LEN / PAGE) as u64, "fixture: every page was read");
-        let (rss_1, app_1) = (rss_bytes(pid).expect("rss"), app_bytes(pid).expect("app"));
+        let Settled {
+            rss: rss_1,
+            app: app_1,
+        } = Settled::read(pid, budget).expect("memory");
         // SAFETY: the mapping made above, `LEN` long, unmapped once.
         assert_eq!(unsafe { libc::munmap(map, LEN) }, 0, "the unmap");
         // Fresh anonymous pages (a heap buffer could reuse pages the file's write dirtied).
@@ -543,7 +707,7 @@ mod tests {
             // SAFETY: `off < LEN`, inside the live writable mapping.
             unsafe { std::ptr::write_volatile(anon.cast::<u8>().add(off), 1) };
         }
-        let app_2 = app_bytes(pid).expect("app");
+        let app_2 = Settled::read(pid, budget).expect("memory").app;
         // SAFETY: the anonymous mapping made above, `LEN` long, unmapped once.
         assert_eq!(unsafe { libc::munmap(anon, LEN) }, 0, "the anonymous unmap");
         assert!(

@@ -11,7 +11,9 @@ pub mod tape;
 
 use std::io::Read;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+#[cfg(any(unix, test))]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use astream_effects::{
@@ -23,6 +25,7 @@ use crate::error::{Error, Replay, Result, Sub};
 use crate::policy::{Decision, RouteRequest};
 use crate::redact::Redactor;
 use crate::wire::{Endpoints, Transport, WireError, WireRequest, WireResponse};
+use tape::TapeMode;
 
 /// A GitHub round trip's door: an exchange.
 pub const DOOR_GH: &str = "gh";
@@ -60,6 +63,22 @@ pub enum Mode {
     Replaying,
     /// `--replay OLD --record NEW`.
     Rerecording,
+}
+
+impl Mode {
+    /// Whether a tape is involved: recording, replaying or rerecording.
+    #[inline]
+    #[must_use]
+    pub const fn is_taped(self) -> bool {
+        matches!(self, Mode::Recording | Mode::Replaying | Mode::Rerecording)
+    }
+
+    /// Whether the doors are answered from a tape: replaying or rerecording.
+    #[inline]
+    #[must_use]
+    pub const fn replays(self) -> bool {
+        matches!(self, Mode::Replaying | Mode::Rerecording)
+    }
 }
 
 enum Seam {
@@ -102,6 +121,29 @@ pub struct Fx {
     seam: Seam,
     /// The first divergence or refusal under a tape: every later door answers it (plan §4.6.27).
     latch: Mutex<Option<Error>>,
+    /// The tape header's mode (`Anonymous` live and simulated): `route`, `gh` and `gh_stream`
+    /// read it (plan §14, body 8).
+    tape: TapeMode,
+    /// The endpoints a taped run speaks to (`with_endpoints`): a credentialed streamed
+    /// request's canonical bytes name its origin's role through them.
+    endpoints: Option<Endpoints>,
+    /// The tape a replay or rerecording reads (`with_source`): its streamed bodies are in
+    /// `{source}.d`.
+    #[cfg(unix)]
+    source: Option<std::path::PathBuf>,
+    /// The journal emits taped so far: `emit_journal`'s step.
+    #[cfg(any(unix, test))]
+    journal_steps: AtomicU64,
+    /// The streamed answers taped so far: a recording's partial body file is named by it.
+    #[cfg(unix)]
+    streams: AtomicU64,
+    /// The verdicts of the replayed bodies still streaming (`tape::DigestReader`): `latched`
+    /// moves the first one found into `latch`.
+    stream_verdicts: Mutex<Vec<Arc<Mutex<Option<Error>>>>>,
+    /// Tests: the deadlines of every request `gh` and `gh_stream` were handed, in order
+    /// (`requested_deadlines`), so a test reads the backstop a client was built with.
+    #[cfg(any(test, debug_assertions))]
+    requested: Mutex<Vec<crate::wire::Deadlines>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -113,6 +155,16 @@ fn infallible<T>(read: std::result::Result<T, std::convert::Infallible>) -> T {
         Ok(value) => value,
         Err(never) => match never {},
     }
+}
+
+/// A recording's exchange at `door`: `request` taped with its `reply`.
+fn tape_exchange(
+    seam: &Mutex<RecordingSeam<OsEffects, tape::TapeSink>>,
+    door: &str,
+    request: &[u8],
+    reply: &[u8],
+) {
+    infallible(lock(seam).exchange(door, request, &mut |_| reply.to_vec()));
 }
 
 fn read_whole(
@@ -147,12 +199,42 @@ fn diverged(d: &ReplayDivergence) -> Error {
     Error::replay(Replay::of(d), Redactor::shapes(&d.to_string()))
 }
 
-fn stream_not_taped() -> Error {
+/// `Replay::StreamNotTaped` for a streamed answer under a tape of `mode` that cannot hold it:
+/// an anonymous tape holds whole answers alone; a credentialed one holds it by digest on unix
+/// only, through an `Fx` that `with_endpoints` gave the run's endpoints (`has_endpoints`).
+fn stream_not_taped(mode: TapeMode, has_endpoints: bool) -> Error {
+    let (why, next) = match mode {
+        TapeMode::Anonymous => (
+            "a streamed answer is not taped: an anonymous tape holds whole answers alone",
+            "give --as PROFILE beside --record: a credentialed tape holds a streamed answer by digest",
+        ),
+        TapeMode::Credentialed if !cfg!(unix) => (
+            "a streamed answer is taped on unix only",
+            "run it without --record or --replay on this system",
+        ),
+        TapeMode::Credentialed if !has_endpoints => (
+            "a streamed answer is not taped: this tape's seam was built without the run's \
+             endpoints (Fx::with_endpoints)",
+            "run it without --record or --replay",
+        ),
+        TapeMode::Credentialed => (
+            "a streamed answer is taped only by a recording, a replay or a rerecording",
+            "run it without --record or --replay",
+        ),
+    };
+    Error::replay(Replay::StreamNotTaped, why).with_next(next)
+}
+
+/// `Replay::StreamNotTaped` for a replay or rerecording built without its tape's path, beside
+/// which the streamed bodies are.
+#[cfg(unix)]
+fn stream_without_source() -> Error {
     Error::replay(
         Replay::StreamNotTaped,
-        "a streamed answer is not taped: M1's tapes hold whole answers alone",
+        "a streamed answer is not replayed: this replay was built without its tape's path \
+         (Fx::with_source)",
     )
-    .with_next("run it without --record or --replay: a tape never holds a streamed answer")
+    .with_next("run it without --record or --replay")
 }
 
 fn child_not_taped() -> Error {
@@ -211,22 +293,99 @@ fn live_next(header: &tape::TapeHeader) -> String {
 }
 
 fn not_read(path: &Path, e: &std::io::Error) -> Error {
-    Error::could_not_run(format!(
+    Error::local(format!(
         "the tape {} could not be read: {e}",
         path.display()
     ))
-    .with_sub(Sub::Local)
+}
+
+#[cfg(target_os = "macos")]
+const NONBLOCK_OPEN_FLAG: i32 = 0x0004;
+#[cfg(all(unix, not(target_os = "macos")))]
+const NONBLOCK_OPEN_FLAG: i32 = 0o4000;
+
+#[cfg(unix)]
+const TAPE_STREAM_BUDGET: Duration = Duration::from_secs(5);
+
+#[cfg(unix)]
+fn read_pipe(file: &std::fs::File, budget: Duration) -> std::io::Result<Vec<u8>> {
+    use std::os::fd::AsFd as _;
+    use std::time::Instant;
+
+    aterm_uds::ready::with_nonblocking(file.as_fd(), || {
+        let mut reader = file;
+        let deadline = Instant::now() + budget;
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 8192];
+        let limit = tape::TAPE_MAX.saturating_add(1);
+        while (bytes.len() as u64) < limit {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+            let room = usize::try_from(limit - bytes.len() as u64)
+                .unwrap_or(usize::MAX)
+                .min(chunk.len());
+            match reader.read(&mut chunk[..room]) {
+                Ok(0) => return Ok(bytes),
+                Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    aterm_uds::ready::until(
+                        file.as_fd(),
+                        aterm_uds::ready::Interest::Read,
+                        deadline,
+                    )?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(bytes)
+    })
 }
 
 /// The tape at `path`, read whole (at most `tape::TAPE_MAX` bytes) and parsed.
+/// Unix pipes are nonblocking and must finish within five seconds.
 /// # Errors
 /// CouldNotRun, `Sub::Local`, why `the tape {path} could not be read: {e}`.
 pub(crate) fn read_tape(path: &Path) -> Result<(tape::TapeHeader, Vec<EffectRecord>)> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(NONBLOCK_OPEN_FLAG)
+            .open(path)
+            .map_err(|e| not_read(path, &e))?
+    };
+    #[cfg(not(unix))]
     let file = std::fs::File::open(path).map_err(|e| not_read(path, &e))?;
+    let kind = file.metadata().map_err(|e| not_read(path, &e))?.file_type();
+    #[cfg(unix)]
+    let pipe = {
+        use std::os::unix::fs::FileTypeExt as _;
+        kind.is_fifo()
+    };
+    #[cfg(not(unix))]
+    let pipe = false;
+    if !kind.is_file() && !pipe {
+        return Err(not_read(
+            path,
+            &std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file or pipe",
+            ),
+        ));
+    }
     let mut bytes = Vec::new();
-    file.take(tape::TAPE_MAX.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|e| not_read(path, &e))?;
+    #[cfg(unix)]
+    if pipe {
+        bytes = read_pipe(&file, TAPE_STREAM_BUDGET).map_err(|e| not_read(path, &e))?;
+    }
+    if !pipe {
+        file.take(tape::TAPE_MAX.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|e| not_read(path, &e))?;
+    }
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > tape::TAPE_MAX {
         return Err(Error::replay(
             Replay::Format,
@@ -253,13 +412,83 @@ impl Fx {
         Fx {
             seam,
             latch: Mutex::new(None),
+            tape: TapeMode::Anonymous,
+            endpoints: None,
+            #[cfg(unix)]
+            source: None,
+            #[cfg(any(unix, test))]
+            journal_steps: AtomicU64::new(0),
+            #[cfg(unix)]
+            streams: AtomicU64::new(0),
+            stream_verdicts: Mutex::new(Vec::new()),
+            #[cfg(any(test, debug_assertions))]
+            requested: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The same `Fx`, its taped doors in the tape's `mode`.
+    fn taped(mut self, mode: TapeMode) -> Fx {
+        self.tape = mode;
+        self
+    }
+
+    /// The same `Fx`, speaking to `endpoints`: a credentialed tape's streamed requests name
+    /// their origin's role through them. Without it a credentialed streamed answer is not
+    /// taped (`Replay::StreamNotTaped`).
+    #[must_use]
+    pub(crate) fn with_endpoints(mut self, endpoints: &Endpoints) -> Fx {
+        self.endpoints = Some(endpoints.clone());
+        self
+    }
+
+    /// The same replaying or rerecording `Fx`, reading its streamed bodies from beside the
+    /// tape at `tape` (`{tape}.d`).
+    #[must_use]
+    pub(crate) fn with_source(self, tape: &Path) -> Fx {
+        #[cfg(unix)]
+        {
+            let mut fx = self;
+            fx.source = Some(tape.to_path_buf());
+            fx
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tape;
+            self
+        }
+    }
+
+    /// Tape this run into `path`, which must not exist, as a credentialed tape: every record
+    /// passes `redactor.apply`, whose clone shares the needles the run learns later, and so does
+    /// the header item (`TapeSink::create_redacted`, and again at `finish`).
+    /// # Errors
+    /// As `record`; CouldNotRun, `Sub::Local`, before any file is made, for a command line that
+    /// holds a credential `redactor` has learned.
+    pub(crate) fn record_with(
+        path: &Path,
+        header: &tape::TapeHeader,
+        redactor: Redactor,
+    ) -> Result<Fx> {
+        let sink = tape::TapeSink::create_redacted(path, header, redactor)?;
+        Ok(Fx::over(Seam::Recording {
+            seam: Mutex::new(RecordingSeam::with_sink(OsEffects::new(), sink.clone())),
+            sink,
+        })
+        .taped(header.mode))
     }
 
     /// The shipped seam.
     #[must_use]
     pub fn live() -> Fx {
         Fx::over(Seam::Live(Mutex::new(LiveSeam::new(OsEffects::new()))))
+    }
+
+    /// Tests: the deadlines of every request `gh` and `gh_stream` were handed so far, in order:
+    /// the backstop the client that sent them was built with, read with no clock.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn requested_deadlines(&self) -> Vec<crate::wire::Deadlines> {
+        lock(&self.requested).clone()
     }
 
     /// Tests: `mono` starts at 0 and `wall_secs` at `start_unix_secs`.
@@ -277,7 +506,8 @@ impl Fx {
         Ok(Fx::over(Seam::Recording {
             seam: Mutex::new(RecordingSeam::with_sink(OsEffects::new(), sink.clone())),
             sink,
-        }))
+        })
+        .taped(header.mode))
     }
 
     /// Replay the tape at `path`.
@@ -286,7 +516,7 @@ impl Fx {
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn replay(path: &Path) -> Result<(Fx, tape::TapeHeader)> {
         let (header, records) = read_tape(path)?;
-        Ok((Fx::replay_from(&header, records), header))
+        Ok((Fx::replay_from(&header, records).with_source(path), header))
     }
 
     /// `replay` over a tape's header and records already read (`read_tape`).
@@ -297,6 +527,7 @@ impl Fx {
             len,
             live: live_next(header),
         })
+        .taped(header.mode)
     }
 
     /// Answer every exchange, clock and sleep from `old`, and tape them again, with this run's
@@ -306,7 +537,7 @@ impl Fx {
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn rerecord(old: &Path, new: &Path) -> Result<(Fx, tape::TapeHeader)> {
         let (header, records) = read_tape(old)?;
-        let fx = Fx::rerecord_from(&header, records, new)?;
+        let fx = Fx::rerecord_from(&header, records, new)?.with_source(old);
         Ok((fx, header))
     }
 
@@ -330,7 +561,8 @@ impl Fx {
             len,
             to,
             live: live_next(header),
-        }))
+        })
+        .taped(header.mode))
     }
 
     /// `record`, for the integration tests (plan §1, rule 9): its body is that one call.
@@ -371,6 +603,12 @@ impl Fx {
     }
 
     fn latched(&self) -> Result<()> {
+        let fault = lock(&self.stream_verdicts)
+            .iter()
+            .find_map(|verdict| lock(verdict).clone());
+        if let Some(e) = fault {
+            lock(&self.latch).get_or_insert(e);
+        }
         match &*lock(&self.latch) {
             Some(e) => Err(e.clone()),
             None => Ok(()),
@@ -404,6 +642,41 @@ impl Fx {
 
     fn replayed<T>(&self, answer: std::result::Result<T, ReplayDivergence>) -> Result<T> {
         answer.map_err(|d| self.latch(diverged(&d)))
+    }
+
+    /// A recording that cannot tape this exchange as it was (a request or reply the tape's
+    /// shapes would change): the tape discarded, and `error` latched.
+    fn shaped_out(&self, sink: &tape::TapeSink, error: Error) -> Error {
+        sink.discard();
+        self.latch(error)
+    }
+
+    /// The replaying and rerecording arms of an exchange door (`sleep`, `gh`, `route`,
+    /// `fact`, `git`): the latch, then `from`'s reply at `door` to `request()`, decoded by
+    /// `decode` (a divergence or a decode error latched). Rerecording, `rerecorded` judges the
+    /// decoded reply before the exchange is taped again into the new tape; replaying never
+    /// runs it.
+    fn replay_exchange<T>(
+        &self,
+        from: &Mutex<ReplaySeam>,
+        door: &str,
+        request: impl FnOnce() -> Result<Vec<u8>>,
+        decode: impl FnOnce(&[u8]) -> Result<T>,
+        rerecorded: impl FnOnce(&[u8]) -> Result<()>,
+    ) -> Result<T> {
+        self.latched()?;
+        let request = request()?;
+        let reply = self.replayed(lock(from).exchange(door, &request, &mut |_| Vec::new()))?;
+        let answer = decode(&reply).map_err(|e| self.latch(e))?;
+        if let Seam::Rerecording { to, .. } = &self.seam {
+            rerecorded(&reply)?;
+            to.append(&EffectRecord::Exchange {
+                door: door.to_string(),
+                request,
+                reply,
+            });
+        }
+        Ok(answer)
     }
 
     /// Time since this Fx was made.
@@ -472,21 +745,14 @@ impl Fx {
                 let request = sleep_request(d);
                 infallible(lock(seam).exchange(DOOR_SLEEP, &request, &mut |_| Vec::new()));
             }
-            Seam::Replaying { seam, .. } => {
-                self.latched()?;
-                let request = sleep_request(d);
-                self.replayed(lock(seam).exchange(DOOR_SLEEP, &request, &mut |_| Vec::new()))?;
-            }
-            Seam::Rerecording { from, to, .. } => {
-                self.latched()?;
-                let request = sleep_request(d);
-                let reply =
-                    self.replayed(lock(from).exchange(DOOR_SLEEP, &request, &mut |_| Vec::new()))?;
-                to.append(&EffectRecord::Exchange {
-                    door: DOOR_SLEEP.to_string(),
-                    request,
-                    reply,
-                });
+            Seam::Replaying { seam: from, .. } | Seam::Rerecording { from, .. } => {
+                self.replay_exchange(
+                    from,
+                    DOOR_SLEEP,
+                    || Ok(sleep_request(d)),
+                    |_| Ok(()),
+                    |_| Ok(()),
+                )?;
             }
         }
         Ok(())
@@ -502,6 +768,8 @@ impl Fx {
         req: WireRequest<'_>,
     ) -> Result<std::result::Result<WireResponse, WireError>> {
         let keep = |headers| canon::keep(endpoints, headers);
+        #[cfg(any(test, debug_assertions))]
+        lock(&self.requested).push(req.deadlines);
         match &self.seam {
             Seam::Live(_) => Ok(read_whole(transport, req, keep).map(canon::Reply::into_response)),
             #[cfg(any(test, debug_assertions))]
@@ -510,10 +778,9 @@ impl Fx {
             }
             Seam::Recording { seam, sink } => {
                 self.latched()?;
-                let request = canon::request(&req, endpoints).map_err(|e| self.latch(e))?;
+                let request = self.canonical(&req, endpoints)?;
                 if tape::redacts(&request) {
-                    sink.discard();
-                    return Err(self.latch(shaped_request()));
+                    return Err(self.shaped_out(sink, shaped_request()));
                 }
                 let answer = read_whole(transport, req, keep);
                 let reply = match &answer {
@@ -521,34 +788,25 @@ impl Fx {
                     Err(e) => canon::failure(e),
                 };
                 if tape::redacts_a_reply(&reply) {
-                    sink.discard();
-                    return Err(self.latch(shaped_reply()));
+                    return Err(self.shaped_out(sink, shaped_reply()));
                 }
-                infallible(lock(seam).exchange(DOOR_GH, &request, &mut |_| reply.clone()));
+                tape_exchange(seam, DOOR_GH, &request, &reply);
                 Ok(answer.map(canon::Reply::into_response))
             }
-            Seam::Replaying { seam, .. } => {
-                self.latched()?;
-                let request = canon::request(&req, endpoints).map_err(|e| self.latch(e))?;
-                let reply =
-                    self.replayed(lock(seam).exchange(DOOR_GH, &request, &mut |_| Vec::new()))?;
-                let answer = canon::decode(&reply).map_err(|e| self.latch(e))?;
-                Ok(answer.map(|r| kept_response(endpoints, r)))
-            }
-            Seam::Rerecording { from, to, .. } => {
-                self.latched()?;
-                let request = canon::request(&req, endpoints).map_err(|e| self.latch(e))?;
-                let reply =
-                    self.replayed(lock(from).exchange(DOOR_GH, &request, &mut |_| Vec::new()))?;
-                let answer = canon::decode(&reply).map_err(|e| self.latch(e))?;
-                if tape::redacts_a_reply(&reply) {
-                    return Err(self.latch(shaped_reply()));
-                }
-                to.append(&EffectRecord::Exchange {
-                    door: DOOR_GH.to_string(),
-                    request,
-                    reply,
-                });
+            Seam::Replaying { seam: from, .. } | Seam::Rerecording { from, .. } => {
+                let answer = self.replay_exchange(
+                    from,
+                    DOOR_GH,
+                    || self.canonical(&req, endpoints),
+                    canon::decode,
+                    |reply| {
+                        if tape::redacts_a_reply(reply) {
+                            Err(self.latch(shaped_reply()))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )?;
                 Ok(answer.map(|r| kept_response(endpoints, r)))
             }
         }
@@ -567,21 +825,59 @@ impl Fx {
         self.gh(transport, endpoints, req)
     }
 
+    /// A request's canonical bytes on this tape: `canon::request` under a `mode anonymous`
+    /// tape, `canon::request_credentialed` under a `mode credentialed` one (plan §4.6.19).
+    fn canonical(&self, req: &WireRequest<'_>, endpoints: &Endpoints) -> Result<Vec<u8>> {
+        let canonical = match self.tape {
+            TapeMode::Credentialed => canon::request_credentialed(req, endpoints),
+            _ => canon::request(req, endpoints),
+        };
+        canonical.map_err(|e| self.latch(e))
+    }
+
     /// A streamed round trip (`Github::call_stream`: downloads).
+    ///
+    /// Under a `mode credentialed` tape (unix, with the endpoints `with_endpoints` set), the
+    /// answer is an exchange at `DOOR_GH` whose reply holds its status, its kept headers and
+    /// `body-file sha256:{hex} {len}` (`canon::stream_reply`). Recording, the body is read
+    /// whole inside the door (at most `req.limit + 1` bytes) into `{tape}.d/.partial-{n}`,
+    /// hashed and scanned for a credential or a token shape as it is written, and renamed
+    /// `{tape}.d/{hex}` (`TapeSink::store_body`); the caller streams the file it was written to.
+    /// Replaying, the caller streams `{source}.d/{hex}`, hashed as it is read
+    /// (`tape::DigestReader`). Rerecording, that file is copied, checked, into the new tape's
+    /// `.d` directory under the same name, and the caller streams the copy.
+    ///
     /// # Errors
-    /// Recording, replaying and rerecording: `Replay::StreamNotTaped`, before anything is sent.
+    ///
+    /// Recording, replaying and rerecording an anonymous tape, or a credentialed one off unix:
+    /// `Replay::StreamNotTaped`, before anything is sent. Replaying or rerecording a
+    /// credentialed tape: `Replay::StreamDigest` when the body's file is missing, before any
+    /// byte is given; when its bytes are not the taped digest and length, at their end (the
+    /// read fails, and the run's exit is the latched replay error). A recording whose body
+    /// file cannot be written is could_not_run, `Sub::Local`, and its tape is removed. A body
+    /// that holds a credential or a token shape is `Replay::BodyNotTaped`, recording or
+    /// rerecording, before the caller gets a byte: its tape and the body files it stored are
+    /// removed.
     pub(crate) fn gh_stream(
         &self,
         transport: &dyn Transport,
         req: WireRequest<'_>,
     ) -> Result<std::result::Result<WireResponse, WireError>> {
+        #[cfg(any(test, debug_assertions))]
+        lock(&self.requested).push(req.deadlines);
         match &self.seam {
             Seam::Live(_) => {}
             #[cfg(any(test, debug_assertions))]
             Seam::Simulated(_) => {}
             Seam::Recording { .. } | Seam::Replaying { .. } | Seam::Rerecording { .. } => {
                 self.latched()?;
-                return Err(self.latch(stream_not_taped()));
+                #[cfg(unix)]
+                if self.tape == TapeMode::Credentialed
+                    && let Some(endpoints) = &self.endpoints
+                {
+                    return self.stream_taped(transport, endpoints, req);
+                }
+                return Err(self.latch(stream_not_taped(self.tape, self.endpoints.is_some())));
             }
         }
         Ok(transport.round_trip(req).map(|response| WireResponse {
@@ -590,6 +886,158 @@ impl Fx {
         }))
     }
 
+    /// `gh_stream`'s credentialed tape arms (unix).
+    #[cfg(unix)]
+    fn stream_taped(
+        &self,
+        transport: &dyn Transport,
+        endpoints: &Endpoints,
+        req: WireRequest<'_>,
+    ) -> Result<std::result::Result<WireResponse, WireError>> {
+        let request = self.canonical(&req, endpoints)?;
+        let n = self.streams.fetch_add(1, Ordering::Relaxed);
+        match &self.seam {
+            Seam::Recording { seam, sink } => {
+                if tape::redacts(&request) {
+                    return Err(self.shaped_out(sink, shaped_request()));
+                }
+                let limit = req.limit;
+                let mut response = match transport.round_trip(req) {
+                    Ok(response) => response,
+                    Err(e) => {
+                        let reply = canon::failure(&e);
+                        tape_exchange(seam, DOOR_GH, &request, &reply);
+                        return Ok(Err(e));
+                    }
+                };
+                let stored = match sink.store_body(n, &mut response.body, limit) {
+                    Ok(stored) => stored,
+                    Err(tape::StoreFault::Read(e)) => {
+                        let wire = WireError {
+                            phase: crate::wire::Phase::Answered,
+                            kind: crate::wire::wire_kind_of(&e),
+                            detail: e.to_string(),
+                        };
+                        let reply = canon::failure(&wire);
+                        tape_exchange(seam, DOOR_GH, &request, &reply);
+                        return Ok(Err(wire));
+                    }
+                    Err(tape::StoreFault::Write(e)) => {
+                        sink.discard();
+                        return Err(e);
+                    }
+                    Err(tape::StoreFault::Shaped) => {
+                        return Err(self.shaped_out(sink, shaped_reply()));
+                    }
+                };
+                let headers = canon::cut(response.headers);
+                let kept = canon::keep(endpoints, headers.clone());
+                let reply = canon::stream_reply(response.status, &kept, &stored.hex, stored.len);
+                if tape::redacts(&reply) {
+                    return Err(self.shaped_out(sink, shaped_reply()));
+                }
+                tape_exchange(seam, DOOR_GH, &request, &reply);
+                Ok(Ok(WireResponse {
+                    status: response.status,
+                    headers,
+                    body: Box::new(stored.file),
+                }))
+            }
+            Seam::Replaying { seam, .. } => {
+                let reply =
+                    self.replayed(lock(seam).exchange(DOOR_GH, &request, &mut |_| Vec::new()))?;
+                let head = match canon::stream_decode(&reply).map_err(|e| self.latch(e))? {
+                    Ok(head) => head,
+                    Err(wire) => return Ok(Err(wire)),
+                };
+                let verdict = Arc::new(Mutex::new(None));
+                let body = tape::DigestReader::open(
+                    &self.source_dir()?,
+                    &head.hex,
+                    head.len,
+                    verdict.clone(),
+                )
+                .map_err(|e| self.latch(e))?;
+                lock(&self.stream_verdicts).push(verdict);
+                Ok(Ok(WireResponse {
+                    status: head.status,
+                    headers: canon::keep(endpoints, head.headers),
+                    body: Box::new(body),
+                }))
+            }
+            Seam::Rerecording { from, to, .. } => {
+                let reply =
+                    self.replayed(lock(from).exchange(DOOR_GH, &request, &mut |_| Vec::new()))?;
+                let head = match canon::stream_decode(&reply).map_err(|e| self.latch(e))? {
+                    Ok(head) => head,
+                    Err(wire) => {
+                        to.append(&EffectRecord::Exchange {
+                            door: DOOR_GH.to_string(),
+                            request,
+                            reply,
+                        });
+                        return Ok(Err(wire));
+                    }
+                };
+                if tape::redacts(&reply) {
+                    return Err(self.latch(shaped_reply()));
+                }
+                let old = self.source_dir()?;
+                let verdict = Arc::new(Mutex::new(None));
+                let mut body = tape::DigestReader::open(&old, &head.hex, head.len, verdict.clone())
+                    .map_err(|e| self.latch(e))?;
+                let other = || {
+                    tape::stream_digest(&old, &head.hex, "holds other bytes than the tape names")
+                };
+                // A copy that is not the taped body is the new sink's, which `finish` discards
+                // with the rest of a rerecording that latched.
+                let copy = match to.store_body(n, &mut body, head.len) {
+                    Ok(copy) if copy.hex == head.hex && copy.len == head.len => copy,
+                    Ok(_) => return Err(self.latch(other())),
+                    Err(tape::StoreFault::Read(_)) => {
+                        return Err(self.latch(lock(&verdict).clone().unwrap_or_else(other)));
+                    }
+                    Err(tape::StoreFault::Write(e)) => {
+                        to.discard();
+                        return Err(e);
+                    }
+                    Err(tape::StoreFault::Shaped) => {
+                        to.discard();
+                        return Err(self.latch(shaped_reply()));
+                    }
+                };
+                to.append(&EffectRecord::Exchange {
+                    door: DOOR_GH.to_string(),
+                    request,
+                    reply,
+                });
+                Ok(Ok(WireResponse {
+                    status: head.status,
+                    headers: canon::keep(endpoints, head.headers),
+                    body: Box::new(copy.file),
+                }))
+            }
+            Seam::Live(_) => Err(self.latch(stream_not_taped(self.tape, self.endpoints.is_some()))),
+            #[cfg(any(test, debug_assertions))]
+            Seam::Simulated(_) => {
+                Err(self.latch(stream_not_taped(self.tape, self.endpoints.is_some())))
+            }
+        }
+    }
+
+    /// `{source}.d`, where a replayed tape's streamed bodies are.
+    /// # Errors
+    /// With no source (`with_source` never set it): `Replay::StreamNotTaped`, latched.
+    #[cfg(unix)]
+    fn source_dir(&self) -> Result<std::path::PathBuf> {
+        match &self.source {
+            Some(source) => Ok(tape::sidecar_dir(source)),
+            None => Err(self.latch(stream_without_source())),
+        }
+    }
+}
+
+impl Fx {
     /// `gh_stream`, for the integration tests (plan §1, rule 9): its body is that one call.
     /// # Errors
     /// As `gh_stream`.
@@ -689,14 +1137,126 @@ impl Fx {
     ///
     /// # Errors
     ///
-    /// A replay's divergence, latched.
+    /// A replay's divergence, latched; recording, `Replay::StreamNotTaped`, latched with the
+    /// tape discarded, for a request the tape would change (a token shape); in any taped mode
+    /// of a `mode credentialed` tape, the error an earlier door latched.
     pub(crate) fn route(
         &self,
         req: &RouteRequest,
         decide: &mut dyn FnMut() -> Decision,
     ) -> Result<Decision> {
-        let _ = req;
-        Ok(decide())
+        if self.tape != TapeMode::Credentialed {
+            return Ok(decide());
+        }
+        match &self.seam {
+            Seam::Live(_) => Ok(decide()),
+            #[cfg(any(test, debug_assertions))]
+            Seam::Simulated(_) => Ok(decide()),
+            Seam::Recording { seam, sink } => {
+                self.latched()?;
+                let request = canon::route_request(req);
+                if tape::redacts(&request) {
+                    return Err(self.shaped_out(sink, shaped_request()));
+                }
+                let decision = decide();
+                let reply = canon::route_reply(&decision);
+                tape_exchange(seam, DOOR_ROUTE, &request, &reply);
+                Ok(decision)
+            }
+            Seam::Replaying { seam: from, .. } | Seam::Rerecording { from, .. } => self
+                .replay_exchange(
+                    from,
+                    DOOR_ROUTE,
+                    || Ok(canon::route_request(req)),
+                    canon::route_decode,
+                    |_| Ok(()),
+                ),
+        }
+    }
+
+    /// A routing fact a decision does not carry (`question` about `profile`: whether its
+    /// drafts are vouched, where its token lives), which a replay's empty router cannot read.
+    /// Live and simulated, and under a `mode anonymous` tape: `answer()`. Recording a
+    /// `mode credentialed` tape: `answer()`, taped as an exchange at `DOOR_ROUTE`
+    /// (`canon::fact_request`, `canon::fact_reply`). Replaying one: the tape's answer for the
+    /// same question, and `answer` is never called; another question is `replay.request`.
+    /// Rerecording: as replaying, taped again.
+    ///
+    /// # Errors
+    ///
+    /// A replay's divergence, latched; recording, `Replay::StreamNotTaped`, latched with the
+    /// tape discarded, for a question, profile or answer the tape would change (a token shape,
+    /// a CR or an LF); in any taped mode of a `mode credentialed` tape, the error an earlier
+    /// door latched.
+    pub(crate) fn fact(
+        &self,
+        question: &str,
+        profile: &str,
+        answer: &mut dyn FnMut() -> String,
+    ) -> Result<String> {
+        if self.tape != TapeMode::Credentialed {
+            return Ok(answer());
+        }
+        match &self.seam {
+            Seam::Live(_) => Ok(answer()),
+            #[cfg(any(test, debug_assertions))]
+            Seam::Simulated(_) => Ok(answer()),
+            Seam::Recording { seam, sink } => {
+                self.latched()?;
+                // Judged before `canon` shapes and flattens them: a text the tape would
+                // change could not replay as this run reads it, so the tape is discarded.
+                let raw = answer();
+                let changes =
+                    |text: &str| Redactor::shapes(text) != text || text.contains(['\r', '\n']);
+                if changes(question) || changes(profile) || changes(&raw) {
+                    return Err(self.shaped_out(sink, shaped_request()));
+                }
+                let request = canon::fact_request(question, profile);
+                let reply = canon::fact_reply(&raw);
+                tape_exchange(seam, DOOR_ROUTE, &request, &reply);
+                canon::fact_decode(&reply).map_err(|e| self.latch(e))
+            }
+            Seam::Replaying { seam: from, .. } | Seam::Rerecording { from, .. } => self
+                .replay_exchange(
+                    from,
+                    DOOR_ROUTE,
+                    || Ok(canon::fact_request(question, profile)),
+                    canon::fact_decode,
+                    |_| Ok(()),
+                ),
+        }
+    }
+
+    /// The tape's next journal step: its own count of journal emits, from 0.
+    #[cfg(any(unix, test))]
+    fn next_journal_step(&self) -> u64 {
+        self.journal_steps.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// One emit at `door` under a tape: recorded, compared on replay as stdout is, or taped
+    /// again when rerecording. Live and simulated: nothing.
+    fn emit_taped(&self, door: &str, bytes: &[u8]) -> Result<()> {
+        match &self.seam {
+            Seam::Live(_) => {}
+            #[cfg(any(test, debug_assertions))]
+            Seam::Simulated(_) => {}
+            Seam::Recording { seam, .. } => {
+                self.latched()?;
+                infallible(lock(seam).emit(door, bytes));
+            }
+            Seam::Replaying { seam, .. } => {
+                self.latched()?;
+                self.replayed(lock(seam).emit(door, &tape::shaped(bytes)))?;
+            }
+            Seam::Rerecording { to, .. } => {
+                self.latched()?;
+                to.append(&EffectRecord::Emit {
+                    door: door.to_string(),
+                    bytes: bytes.to_vec(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// One journal record's body. Live and simulated: `Ok(None)`, and the journal writes its
@@ -706,14 +1266,15 @@ impl Fx {
     /// # Errors
     ///
     /// A replay's divergence, latched.
+    #[cfg(any(unix, test))]
     pub(crate) fn emit_journal(&self, body: &[u8]) -> Result<Option<u64>> {
-        let _ = body;
         match &self.seam {
             Seam::Live(_) => Ok(None),
             #[cfg(any(test, debug_assertions))]
             Seam::Simulated(_) => Ok(None),
             Seam::Recording { .. } | Seam::Replaying { .. } | Seam::Rerecording { .. } => {
-                Err(Error::not_yet("the journal door's tape arms", "WP10"))
+                self.emit_taped(DOOR_JOURNAL, body)?;
+                Ok(Some(self.next_journal_step()))
             }
         }
     }
@@ -730,13 +1291,13 @@ impl Fx {
         line: &str,
         send: &mut dyn FnMut() -> crate::notify::Posted,
     ) -> Result<crate::notify::Posted> {
-        let _ = line;
         match &self.seam {
             Seam::Live(_) => Ok(send()),
             #[cfg(any(test, debug_assertions))]
             Seam::Simulated(_) => Ok(send()),
             Seam::Recording { .. } | Seam::Replaying { .. } | Seam::Rerecording { .. } => {
-                Err(Error::not_yet("the fabric door's tape arms", "WP10"))
+                self.emit_taped(DOOR_FABRIC, line.as_bytes())?;
+                Ok(crate::notify::Posted::Skipped("taped".to_string()))
             }
         }
     }
@@ -760,11 +1321,10 @@ impl Fx {
                 child::check(spec)?;
                 clock.log(spec);
                 let Some(scripted) = clock.next_child() else {
-                    return Err(Error::could_not_run(format!(
+                    return Err(Error::local(format!(
                         "{} could not start: no scripted child",
                         spec.program.display()
-                    ))
-                    .with_sub(Sub::Local));
+                    )));
                 };
                 let args: Vec<String> = spec
                     .args
@@ -789,14 +1349,16 @@ impl Fx {
     /// `git` (a simulated test runs the host's git against agh-fake or a local repository;
     /// simulated, `child::check` passes before the spec is logged, as in `child`).
     /// Recording: run, and taped as an exchange at `DOOR_GIT` (`canon::git_request`,
-    /// `canon::git_reply`). Replaying: the tape's answer, and nothing runs. Rerecording: as
-    /// replaying, taped again.
+    /// `canon::git_reply`); a run that ended with no exit is taped as its error
+    /// (`canon::git_failure`). Replaying: the tape's answer, its output or its error
+    /// (`canon::git_answer`), and nothing runs. Rerecording: as replaying, taped again.
     ///
     /// # Errors
     ///
-    /// A replay's divergence, latched; the run's could_not_run.
+    /// A replay's divergence, latched; the run's could_not_run, recorded or replayed (not
+    /// latched: it is the run's own answer, as a gh round trip's failure is).
+    #[cfg(any(unix, test))]
     pub(crate) fn git(&self, spec: &child::ChildSpec, canonical: &[u8]) -> Result<child::ChildOut> {
-        let _ = canonical;
         match &self.seam {
             Seam::Live(_) => child::run(spec),
             #[cfg(any(test, debug_assertions))]
@@ -805,9 +1367,27 @@ impl Fx {
                 clock.log(spec);
                 child::run(spec)
             }
-            Seam::Recording { .. } | Seam::Replaying { .. } | Seam::Rerecording { .. } => {
-                Err(Error::not_yet("the git door's tape arms", "WP10"))
+            Seam::Recording { seam, sink } => {
+                self.latched()?;
+                if tape::redacts(canonical) {
+                    return Err(self.shaped_out(sink, shaped_request()));
+                }
+                let ran = child::run(spec);
+                let reply = match &ran {
+                    Ok(out) => canon::git_reply(out),
+                    Err(e) => canon::git_failure(e),
+                };
+                tape_exchange(seam, DOOR_GIT, canonical, &reply);
+                ran
             }
+            Seam::Replaying { seam: from, .. } | Seam::Rerecording { from, .. } => self
+                .replay_exchange(
+                    from,
+                    DOOR_GIT,
+                    || Ok(canonical.to_vec()),
+                    canon::git_answer,
+                    |_| Ok(()),
+                )?,
         }
     }
 
@@ -852,15 +1432,503 @@ impl std::fmt::Debug for Fx {
     }
 }
 
-/// Names the frozen crate-private doors whose first callers later packages write (WP3's
-/// route, WP4's journal, WP7's git, WP8's child, WP9's fabric), so the plain library's
-/// `dead_code` lint passes at every commit until then (plan §1, rule 14). It runs nothing
-/// and nothing calls it. No package edits it after WP0c; WP14 deletes it.
-#[doc(hidden)]
-pub fn frozen_roots() {
-    let _ = Fx::route;
-    let _ = Fx::emit_journal;
-    let _ = Fx::emit_fabric;
-    let _ = Fx::child;
-    let _ = Fx::git;
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use astream_effects::EffectRecord;
+
+    use super::child::{ChildOut, ChildSpec};
+    use super::tape::{TapeHeader, TapeMode};
+    use super::{DOOR_EXIT, DOOR_FABRIC, DOOR_GIT, DOOR_JOURNAL, DOOR_ROUTE, Fx, canon, read_tape};
+    use crate::error::{Replay, Sub};
+    use crate::notify::Posted;
+    use crate::policy::{Decision, RouteRequest, RouteTarget, Tier};
+    use crate::redact::Redactor;
+    use crate::slug::Slug;
+    use crate::wire::Endpoints;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_writer_that_never_finishes_expires() {
+        use std::io::{ErrorKind, Write as _};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::time::Duration;
+
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"partial tape").expect("partial input");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(super::NONBLOCK_OPEN_FLAG)
+            .open(format!("/dev/fd/{}", reader.as_raw_fd()))
+            .expect("nonblocking pipe");
+        let error = super::read_pipe(&file, Duration::from_millis(10))
+            .expect_err("an open writer cannot hold replay forever");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        drop(writer);
+        drop(reader);
+    }
+
+    fn scratch() -> aterm_tempfile::TempDir {
+        aterm_tempfile::Builder::new()
+            .prefix("agh-fx-")
+            .tempdir()
+            .expect("a scratch directory")
+    }
+
+    /// A streamed asset's GET, as `dev`: the request the streamed-body tests tape.
+    #[cfg(unix)]
+    fn asset_request() -> crate::wire::WireRequest<'static> {
+        let mut req = crate::wire::WireRequest::new(
+            crate::wire::Method::Get,
+            "https://api.github.com/repos/o/r/releases/assets/1",
+            vec![("Accept".to_string(), "application/octet-stream".to_string())],
+            1 << 20,
+            crate::wire::Deadlines::JSON,
+        );
+        req.as_profile = Some("dev");
+        req
+    }
+
+    fn header(mode: TapeMode) -> TapeHeader {
+        let argv: Vec<String> = ["repo", "view", "o/r"].map(String::from).to_vec();
+        TapeHeader {
+            mode,
+            ..TapeHeader::for_run(&argv, &Endpoints::github_com())
+        }
+    }
+
+    fn records(path: &Path) -> Vec<EffectRecord> {
+        read_tape(path).expect("the tape reads").1
+    }
+
+    fn write(path: &Path, mode: TapeMode, records: &[EffectRecord]) {
+        std::fs::write(path, super::tape::render(&header(mode), records)).expect("the tape");
+    }
+
+    fn exit() -> EffectRecord {
+        EffectRecord::Emit {
+            door: DOOR_EXIT.to_string(),
+            bytes: b"0".to_vec(),
+        }
+    }
+
+    fn route() -> RouteRequest {
+        RouteRequest::read(RouteTarget::Repo(Slug::parse("o/r").expect("a slug")))
+            .with_as(Some("dev".to_string()))
+    }
+
+    fn sent() -> Decision {
+        Decision::Send {
+            profile: "dev".to_string(),
+            tier: Tier::Dev,
+        }
+    }
+
+    /// A credentialed recording tapes each decision; its replay answers it, never deciding,
+    /// and another question is a request divergence.
+    #[test]
+    fn a_credentialed_tape_replays_the_route_without_deciding() {
+        let dir = scratch();
+        let path = dir.path().join("t.atape");
+        let fx = Fx::record_with(&path, &header(TapeMode::Credentialed), Redactor::new())
+            .expect("a recording");
+        let mut decided = 0;
+        let decision = fx
+            .route(&route(), &mut || {
+                decided += 1;
+                sent()
+            })
+            .expect("decided");
+        assert_eq!((decision, decided), (sent(), 1));
+        fx.finish(0).expect("the tape is whole");
+        assert_eq!(
+            records(&path),
+            [
+                EffectRecord::Exchange {
+                    door: DOOR_ROUTE.to_string(),
+                    request: canon::route_request(&route()),
+                    reply: b"send dev dev".to_vec(),
+                },
+                exit()
+            ]
+        );
+
+        let (replay, _) = Fx::replay(&path).expect("a replay");
+        let never = &mut || -> Decision { panic!("a replay never decides") };
+        assert_eq!(replay.route(&route(), never).expect("taped"), sent());
+        replay.finish(0).expect("replayed whole");
+
+        let (other, _) = Fx::replay(&path).expect("a replay");
+        let refused = other
+            .route(&route().with_as(None), never)
+            .expect_err("another question");
+        assert_eq!(refused.sub, Sub::Replay(Replay::RequestDiverged));
+
+        let again = dir.path().join("again.atape");
+        let (rerecord, _) = Fx::rerecord(&path, &again).expect("a rerecording");
+        assert_eq!(rerecord.route(&route(), never).expect("taped"), sent());
+        rerecord.finish(0).expect("rerecorded whole");
+        assert_eq!(records(&again), records(&path));
+    }
+
+    /// An anonymous tape decides every time and tapes no route record, in every tape mode.
+    #[test]
+    fn an_anonymous_tape_never_tapes_the_route() {
+        let dir = scratch();
+        let path = dir.path().join("t.atape");
+        let fx = Fx::record(&path, &header(TapeMode::Anonymous)).expect("a recording");
+        assert_eq!(fx.route(&route(), &mut sent).expect("decided"), sent());
+        fx.finish(0).expect("whole");
+        assert_eq!(records(&path), [exit()]);
+        let (replay, _) = Fx::replay(&path).expect("a replay");
+        assert_eq!(replay.route(&route(), &mut sent).expect("decided"), sent());
+        replay.finish(0).expect("replayed whole");
+    }
+
+    /// The journal's and the fabric's doors are emits under a tape: the journal's step is the
+    /// tape's own count from 0, the fabric's `send` never runs, and a replay compares both.
+    #[test]
+    fn the_journal_and_fabric_doors_emit_under_a_tape() {
+        let dir = scratch();
+        let path = dir.path().join("t.atape");
+        let line = "@self post to=say:agh.write kind=note key=agh-1 -- v=1";
+        let unsent = &mut || -> Posted { panic!("a tape never posts") };
+        let fx = Fx::record(&path, &header(TapeMode::Anonymous)).expect("a recording");
+        assert_eq!(fx.emit_journal(b"{\"intent\":1}").expect("taped"), Some(0));
+        assert_eq!(fx.emit_journal(b"{\"outcome\":1}").expect("taped"), Some(1));
+        assert_eq!(
+            fx.emit_fabric(line, unsent).expect("taped"),
+            Posted::Skipped("taped".to_string())
+        );
+        fx.finish(0).expect("whole");
+        let emit = |door: &str, bytes: &[u8]| EffectRecord::Emit {
+            door: door.to_string(),
+            bytes: bytes.to_vec(),
+        };
+        assert_eq!(
+            records(&path),
+            [
+                emit(DOOR_JOURNAL, b"{\"intent\":1}"),
+                emit(DOOR_JOURNAL, b"{\"outcome\":1}"),
+                emit(DOOR_FABRIC, line.as_bytes()),
+                exit()
+            ]
+        );
+
+        let (replay, _) = Fx::replay(&path).expect("a replay");
+        assert_eq!(
+            replay.emit_journal(b"{\"intent\":1}").expect("same"),
+            Some(0)
+        );
+        assert_eq!(
+            replay.emit_journal(b"{\"outcome\":1}").expect("same"),
+            Some(1)
+        );
+        assert_eq!(
+            replay.emit_fabric(line, unsent).expect("same"),
+            Posted::Skipped("taped".to_string())
+        );
+        replay.finish(0).expect("replayed whole");
+
+        let (other, _) = Fx::replay(&path).expect("a replay");
+        let refused = other
+            .emit_journal(b"{\"intent\":2}")
+            .expect_err("another body");
+        assert!(matches!(refused.sub, Sub::Replay(_)), "{refused:?}");
+
+        let simulated = Fx::simulated(0);
+        assert_eq!(simulated.emit_journal(b"x").expect("untaped"), None);
+        let mut posted = 0;
+        let answer = simulated
+            .emit_fabric(line, &mut || {
+                posted += 1;
+                Posted::Sent("1".to_string())
+            })
+            .expect("sent");
+        assert_eq!((answer, posted), (Posted::Sent("1".to_string()), 1));
+    }
+
+    /// A replayed git run is the tape's answer and runs nothing: the spec names the bare `git`,
+    /// which `child::check` would refuse. A recording that cannot run tapes its failure, which
+    /// replays as the same error.
+    #[test]
+    fn the_git_door_replays_with_nothing_run() {
+        let dir = scratch();
+        let path = dir.path().join("t.atape");
+        let out = ChildOut {
+            code: Some(0),
+            stdout: b"0123\trefs/tags/v1\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        let canonical = b"git ls-remote o/r\nref refs/tags/v1";
+        let exchange = EffectRecord::Exchange {
+            door: DOOR_GIT.to_string(),
+            request: canonical.to_vec(),
+            reply: canon::git_reply(&out),
+        };
+        write(&path, TapeMode::Credentialed, &[exchange.clone(), exit()]);
+        let bare = ChildSpec::new(Path::new("git"));
+
+        let (replay, _) = Fx::replay(&path).expect("a replay");
+        assert_eq!(replay.git(&bare, canonical).expect("taped"), out);
+        replay.finish(0).expect("replayed whole");
+
+        let (other, _) = Fx::replay(&path).expect("a replay");
+        let refused = other
+            .git(&bare, b"git ls-remote o/r")
+            .expect_err("another run");
+        assert_eq!(refused.sub, Sub::Replay(Replay::RequestDiverged));
+
+        let again = dir.path().join("again.atape");
+        let (rerecord, _) = Fx::rerecord(&path, &again).expect("a rerecording");
+        assert_eq!(rerecord.git(&bare, canonical).expect("taped"), out);
+        rerecord.finish(0).expect("rerecorded whole");
+        assert_eq!(records(&again), [exchange, exit()]);
+
+        let unrun = dir.path().join("unrun.atape");
+        let fx = Fx::record(&unrun, &header(TapeMode::Credentialed)).expect("a recording");
+        let refused = fx.git(&bare, canonical).expect_err("a relative git");
+        assert_eq!(refused.sub, Sub::Local);
+        fx.finish(1).expect("whole");
+        let unrun_records = records(&unrun);
+        let failed = EffectRecord::Exchange {
+            door: DOOR_GIT.to_string(),
+            request: canonical.to_vec(),
+            reply: canon::git_failure(&refused),
+        };
+        assert_eq!(unrun_records.first(), Some(&failed), "{unrun_records:?}");
+        let (replay, _) = Fx::replay(&unrun).expect("a replay");
+        let replayed = replay.git(&bare, canonical).expect_err("the taped failure");
+        assert_eq!(
+            (
+                replayed.kind,
+                replayed.sub.clone(),
+                replayed.side_effect,
+                replayed.why.clone()
+            ),
+            (
+                refused.kind,
+                refused.sub.clone(),
+                refused.side_effect,
+                refused.why.clone()
+            )
+        );
+        replay.finish(1).expect("replayed whole");
+    }
+
+    /// A routing fact whose answer holds a token shape is never taped: the recording refuses
+    /// it, latches, and discards the tape, whose fact would replay `[redacted]`.
+    #[test]
+    fn a_shaped_fact_discards_the_recording() {
+        let dir = scratch();
+        let path = dir.path().join("t.atape");
+        let fx = Fx::record_with(&path, &header(TapeMode::Credentialed), Redactor::new())
+            .expect("a recording");
+        let token = agh_fake::token("fact");
+        let refused = fx
+            .fact("login", "dev", &mut || token.clone())
+            .expect_err("a shaped answer");
+        assert_eq!(refused.sub, Sub::Replay(Replay::StreamNotTaped));
+        let mut plain = || "fixture-dev-bot".to_string();
+        assert!(fx.fact("login", "dev", &mut plain).is_err(), "latched");
+        assert!(fx.finish(0).is_err(), "a discarded tape is not whole");
+        assert!(!path.exists(), "the tape is removed");
+    }
+
+    /// A child is never taped, in any tape mode.
+    #[test]
+    fn a_child_is_never_taped() {
+        let dir = scratch();
+        let path = dir.path().join("t.atape");
+        let fx = Fx::record_with(&path, &header(TapeMode::Credentialed), Redactor::new())
+            .expect("a recording");
+        let refused = fx
+            .child(&ChildSpec::new(Path::new("/bin/gh")))
+            .expect_err("not taped");
+        assert_eq!(refused.sub, Sub::Replay(Replay::StreamNotTaped));
+    }
+
+    /// A credentialed streamed answer is taped by its digest: a 0600 file in a 0700
+    /// `{tape}.d`, a `body-file` line on the tape, a replay that streams the same bytes, a
+    /// rerecording that copies the file, and `Replay::StreamDigest` for a file that is
+    /// missing or holds other bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_streamed_body_is_taped_by_its_digest() {
+        use std::io::Read as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::wire::scripted::ScriptedTransport;
+
+        let e = Endpoints::github_com();
+        let request = asset_request;
+        let body = b"the bytes of one asset".to_vec();
+        let hex = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&body));
+        let read = |fx: &Fx, transport: &ScriptedTransport| {
+            let mut answer = fx
+                .gh_stream(transport, request())
+                .expect("the door")
+                .expect("an answer");
+            let mut got = Vec::new();
+            answer.body.read_to_end(&mut got).map(|_| got)
+        };
+
+        let dir = scratch();
+        let path = dir.path().join("t.atape");
+        let sidecars = super::tape::sidecar_dir(&path);
+        // A partial file a killed recording left is in the way of nothing.
+        aterm_uds::private_file::create_private_dir(&sidecars).expect("the body directory");
+        std::fs::write(sidecars.join(".partial-0"), b"a killed run's").expect("a stale partial");
+        let transport = ScriptedTransport::new();
+        transport.answer(200, &[("Content-Type", "application/octet-stream")], &body);
+        let fx = Fx::record_with(&path, &header(TapeMode::Credentialed), Redactor::new())
+            .expect("a recording")
+            .with_endpoints(&e);
+        assert_eq!(read(&fx, &transport).expect("streams"), body);
+        fx.finish(0).expect("whole");
+
+        let mode = |p: &Path| std::fs::metadata(p).expect("there").permissions().mode() & 0o777;
+        assert_eq!(mode(&sidecars), 0o700);
+        assert_eq!(mode(&sidecars.join(&hex)), 0o600);
+        assert_eq!(
+            std::fs::read_dir(&sidecars).expect("the directory").count(),
+            1,
+            "no partial file is left"
+        );
+        let taped = records(&path);
+        let Some(EffectRecord::Exchange { reply, .. }) = taped.first() else {
+            panic!("an exchange first: {taped:?}");
+        };
+        let reply = String::from_utf8(reply.clone()).expect("UTF-8");
+        assert!(
+            reply.ends_with(&format!("\nbody-file sha256:{hex} {}", body.len())),
+            "{reply}"
+        );
+
+        let silent = ScriptedTransport::new();
+        let (replay, _) = Fx::replay(&path).expect("a replay");
+        assert_eq!(
+            read(&replay.with_endpoints(&e), &silent).expect("streams"),
+            body
+        );
+
+        let again = dir.path().join("again.atape");
+        let (rerecord, _) = Fx::rerecord(&path, &again).expect("a rerecording");
+        let rerecord = rerecord.with_endpoints(&e);
+        assert_eq!(read(&rerecord, &silent).expect("streams"), body);
+        rerecord.finish(0).expect("rerecorded whole");
+        assert_eq!(
+            std::fs::read(super::tape::sidecar_dir(&again).join(&hex)).expect("the copy"),
+            body
+        );
+        assert!(silent.requests().is_empty());
+
+        let mut other = body.clone();
+        other[0] ^= 1;
+        std::fs::write(sidecars.join(&hex), &other).expect("a changed body");
+        let (replay, _) = Fx::replay(&path).expect("a replay");
+        let replay = replay.with_endpoints(&e);
+        assert!(read(&replay, &silent).is_err(), "the read fails at its end");
+        let refused = replay.finish(0).expect_err("the latched digest");
+        assert_eq!(refused.sub, Sub::Replay(Replay::StreamDigest));
+
+        std::fs::remove_file(sidecars.join(&hex)).expect("removed");
+        let (replay, _) = Fx::replay(&path).expect("a replay");
+        let refused = replay
+            .with_endpoints(&e)
+            .gh_stream(&silent, request())
+            .expect_err("no body file");
+        assert_eq!(refused.sub, Sub::Replay(Replay::StreamDigest));
+
+        // A link in its place is not followed, even to the taped bytes.
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, &body).expect("the bytes elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, sidecars.join(&hex)).expect("a link");
+        let (replay, _) = Fx::replay(&path).expect("a replay");
+        let refused = replay
+            .with_endpoints(&e)
+            .gh_stream(&silent, request())
+            .expect_err("a link is no body file");
+        assert_eq!(refused.sub, Sub::Replay(Replay::StreamDigest));
+        assert!(silent.requests().is_empty());
+    }
+
+    /// A streamed body that holds a credential the run learned, or a token shape, is not
+    /// taped: the recording stops with `Replay::BodyNotTaped` before its caller reads a byte,
+    /// and removes its tape and every body file it stored, `{tape}.d` with them.
+    #[cfg(unix)]
+    #[test]
+    fn a_streamed_body_holding_a_credential_is_not_taped() {
+        use crate::wire::scripted::ScriptedTransport;
+
+        let e = Endpoints::github_com();
+        let request = asset_request;
+        let learned = b"a-learned-credential-of-no-shape".to_vec();
+        let shaped = agh_fake::token("streamed-body");
+        let mut far = vec![b'x'; 70_000];
+        far.extend_from_slice(shaped.as_bytes());
+        for (label, body) in [
+            (
+                "learned",
+                [b"head ".as_slice(), learned.as_slice(), b" tail".as_slice()].concat(),
+            ),
+            ("a shape past the first read", far),
+        ] {
+            let dir = scratch();
+            let path = dir.path().join("t.atape");
+            let redactor = Redactor::new();
+            redactor.learn(&learned);
+            let transport = ScriptedTransport::new();
+            transport.answer(
+                200,
+                &[("Content-Type", "application/octet-stream")],
+                b"first",
+            );
+            transport.answer(200, &[("Content-Type", "application/octet-stream")], &body);
+            let fx = Fx::record_with(&path, &header(TapeMode::Credentialed), redactor)
+                .expect("a recording")
+                .with_endpoints(&e);
+            let mut first = fx
+                .gh_stream(&transport, request())
+                .expect("the door")
+                .expect("an answer");
+            let mut got = Vec::new();
+            std::io::Read::read_to_end(&mut first.body, &mut got).expect("the first body");
+            assert!(super::tape::sidecar_dir(&path).exists(), "{label}");
+            let refused = fx.gh_stream(&transport, request()).expect_err("not taped");
+            assert_eq!(refused.sub, Sub::Replay(Replay::BodyNotTaped), "{label}");
+            assert!(fx.finish(0).is_err(), "{label}");
+            assert!(!path.exists(), "{label}: the tape is removed");
+            assert!(
+                !super::tape::sidecar_dir(&path).exists(),
+                "{label}: its bodies are removed"
+            );
+        }
+    }
+
+    /// An anonymous tape keeps M1's refusal of a streamed answer.
+    #[test]
+    fn an_anonymous_tape_never_streams() {
+        use crate::wire::scripted::ScriptedTransport;
+        use crate::wire::{Deadlines, Method, WireRequest};
+
+        let dir = scratch();
+        let path = dir.path().join("t.atape");
+        let fx = Fx::record(&path, &header(TapeMode::Anonymous))
+            .expect("a recording")
+            .with_endpoints(&Endpoints::github_com());
+        let transport = ScriptedTransport::new();
+        let req = WireRequest::new(
+            Method::Get,
+            "https://api.github.com/repos/o/r/releases/assets/1",
+            Vec::new(),
+            1 << 20,
+            Deadlines::JSON,
+        );
+        let refused = fx.gh_stream(&transport, req).expect_err("not taped");
+        assert_eq!(refused.sub, Sub::Replay(Replay::StreamNotTaped));
+        assert!(transport.requests().is_empty());
+    }
 }

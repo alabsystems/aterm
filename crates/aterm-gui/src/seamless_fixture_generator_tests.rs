@@ -348,6 +348,7 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
         claim_ended: false,
         not_claim_worker: false,
         claim_worker: None,
+        task: None,
     }))
 }
 
@@ -428,6 +429,7 @@ fn fx_tab(root: crate::restore::RestoredSplitTree) -> crate::restore::RestoredTa
         root,
         focused_path,
         zoomed: false,
+        parked: false,
     }
 }
 
@@ -558,6 +560,7 @@ fn fx_window_in(
         native_tabs,
         tab_order,
         active_item: Some(0),
+        workers_in_front: false,
         restored_tabs: tabs,
     }
 }
@@ -734,6 +737,7 @@ fn fx_park_policy(
         policy: adopted,
         known: true,
         grant_chunks: true,
+        grant_empty: false,
     };
     assert_eq!(
         park.carry_ceiling(),
@@ -3897,6 +3901,14 @@ fn fx_carried_state_desk() -> FxDesk {
         leaf.agent = Some(Box::new(agent));
     });
     let worker_sid = sessions[2].record.sid.clone();
+    // The worker is a parked tab (docs/DESIGN-workers-tab-2026-11-02.md): its leaf carries its
+    // task record's row, as its session does, it sits behind the window's shown tabs, and the
+    // window showed its Workers list when captured.
+    let worker_task = format!(
+        "rev=3 state=working from=ctl since={} result_bytes=0 attention=0",
+        release_ms + 3_000_000
+    );
+    sessions[2].record.task = Some(worker_task.clone());
     let worker = leaf_of(2, "claude", &|leaf| {
         let mut agent = fx_agent(
             51_200,
@@ -3910,6 +3922,7 @@ fn fx_carried_state_desk() -> FxDesk {
         agent.login = Some(String::new());
         agent.tab = Some(worker_sid.clone());
         leaf.supervised = Some(Box::new(agent));
+        leaf.task = Some(worker_task.clone());
     });
     let lost = leaf_of(7, "zsh", &|leaf| {
         leaf.lost = Some(Box::new(LostRestore {
@@ -3931,11 +3944,15 @@ fn fx_carried_state_desk() -> FxDesk {
     );
     front.inner_px = inner_px;
     let co_view = leaf_of(0, "zsh", &|leaf| leaf.theme = Some("Nord".to_string()));
+    let mut parked_worker = fx_tab(worker);
+    parked_worker.parked = true;
     let mut behind = fx_window(
         ROWS,
         COLS,
-        vec![fx_tab(co_view), fx_tab(worker), fx_tab(lost)],
+        vec![fx_tab(co_view), fx_tab(lost), parked_worker],
     );
+    behind.workers_in_front = true;
+    behind.active_item = None;
     if behind.show.z_order.is_some() {
         behind.show.z_order = Some(1);
         behind.show.key = Some(false);
@@ -4088,6 +4105,14 @@ fn fx_engine_state_desk() -> FxDesk {
     vim.process(b"\x1b[2 ");
     assert_eq!(vim.partial_sequence_state(), Some("CsiIntermediate"));
     shells.push(("vim", vim, "/home/dev/src"));
+
+    let mut vsplit = fx_shell(ROWS, COLS, 6, cwd, 7);
+    vsplit.process("vim -O a b\r\n\x1b[?1049h\x1b[?69h\x1b[51;100s\x1b[1;50H│".as_bytes());
+    assert!(
+        vsplit.grid().cursor_follows_glyph(),
+        "the bar vim drew up to its split's margin is still the glyph before the cursor"
+    );
+    shells.push(("vim", vsplit, cwd));
 
     let mut imgcat = fx_shell(ROWS, COLS, 40, cwd, 5);
     imgcat.process(b"imgcat plot.png\r\n\x1b]1337;File=name=cGxvdC5wbmc=;size=6144;inline=1:");
@@ -4370,6 +4395,7 @@ fn fx_variants_desk() -> FxDesk {
                 root: fx_split(SplitKind::Vertical, retired, leaf),
                 focused_path: vec![RestoreBranch::Second],
                 zoomed: false,
+                parked: false,
             }
         } else {
             fx_tab(leaf)

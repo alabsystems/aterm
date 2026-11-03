@@ -13,6 +13,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const HANG: Duration = Duration::from_secs(60);
 
+#[path = "fleet_member_tests/self_entry.rs"]
+mod self_entry;
+
 #[test]
 fn signed_primary_names_keep_temporary_aliases_and_reject_tampering() {
     let node = "0123456789abcdef0123456789abcdef";
@@ -49,6 +52,98 @@ fn conflicting_primary_names_refuse_ambiguous_resolution() {
     let shadow = Peer::own(&b, (&temporary_name(a.node()), 7100, "0.148.0"), 11);
     assert_eq!(
         find(&[peers[0].clone(), shadow], &temporary_name(a.node())).unwrap(),
+        Some(0)
+    );
+}
+
+#[test]
+fn a_signed_name_enriches_the_same_descriptor_after_a_legacy_copy_arrives_first() {
+    let me = NodeIdentity::from_seed("0123456789abcdef0123456789abcdef", &[7; 32]).unwrap();
+    let plain = Peer::own(&me, ("192.168.1.2", 7100, "0.149.0"), 10);
+    let named = plain.clone().with_primary_name(&me, Some("m62"));
+    let mut book = vec![plain.clone()];
+    assert_eq!(record(&mut book, named.clone()), Ok(Recorded::Updated));
+    assert_eq!(book[0].primary_name(), Some("m62"));
+    assert!(book[0].answers_to(&temporary_name(me.node())));
+
+    let mut later_plain = plain.clone();
+    later_plain.seen_ms = Some(11);
+    record(&mut book, later_plain).unwrap();
+    assert_eq!(
+        book[0].primary_name(),
+        Some("m62"),
+        "a relay cannot strip the name"
+    );
+    assert_eq!(book[0].seen_ms, Some(11));
+
+    let conflicting = plain.clone().with_primary_name(&me, Some("other"));
+    record(&mut book, conflicting).unwrap();
+    assert_eq!(book[0].primary_name(), Some("m62"));
+
+    let newer = Peer::own(&me, ("192.168.1.2", 7100, "0.149.0"), 12);
+    record(&mut book, newer).unwrap();
+    assert_eq!(
+        book[0].primary_name(),
+        None,
+        "a new signed version may clear a name"
+    );
+}
+
+#[test]
+fn name_enrichment_requires_a_valid_signature_for_the_same_descriptor_version() {
+    let me = NodeIdentity::from_seed("0123456789abcdef0123456789abcdef", &[7; 32]).unwrap();
+    let plain = Peer::own(&me, ("192.168.1.2", 7100, "0.149.0"), 10);
+    let named = plain.clone().with_primary_name(&me, Some("m62"));
+    let mut damaged = named.clone();
+    damaged.signed.as_mut().unwrap().name.as_mut().unwrap().sig[0] ^= 1;
+    let mut changed_endpoint = named;
+    changed_endpoint.host = "192.168.1.3".into();
+    let older =
+        Peer::own(&me, ("192.168.1.2", 7100, "0.149.0"), 9).with_primary_name(&me, Some("old"));
+    for incoming in [damaged, changed_endpoint, older] {
+        let mut book = vec![plain.clone()];
+        record(&mut book, incoming).unwrap();
+        assert_eq!(book[0].primary_name(), None);
+        assert_eq!(book[0].host, "192.168.1.2");
+        assert_eq!(book[0].signed, plain.signed);
+    }
+}
+
+#[test]
+fn a_named_registration_repairs_a_relay_copy_and_survives_a_book_read() {
+    let state = State::new("named-registration-enrichment");
+    issue(state.dir());
+    let me = NodeIdentity::from_seed("0123456789abcdef0123456789abcdef", &[7; 32]).unwrap();
+    let seq = 1_760_000_000_000;
+    let plain = Peer::own(&me, ("127.0.0.1", 7101, "0.149.0"), seq);
+    write_private(state.dir(), PEERS_FILE, book_text(&[plain]).as_bytes()).unwrap();
+    let server = Issuing::start(secret(5), state.dir(), issuer(0x11));
+    let reg = Registration {
+        node: me.node().to_owned(),
+        host: "127.0.0.1".into(),
+        port: 7101,
+        version: "0.149.0".into(),
+        key: None,
+        signed: None,
+    }
+    .signed_by(&me, seq)
+    .with_primary_name(&me, Some("m62"));
+    join_as(server.port, (&secret(5), Some(&me)), &reg)
+        .0
+        .unwrap();
+    assert_eq!(
+        read_peers(state.dir()).unwrap()[0].primary_name(),
+        Some("m62")
+    );
+    let book = fetch_book(
+        &target_of(&issuer_entry(0x11, server.port)),
+        (&secret(5), None),
+        (Instant::now() + HANG, HANG),
+    )
+    .unwrap();
+    assert_eq!(find(&book.peers, "m62").unwrap(), Some(0));
+    assert_eq!(
+        find(&book.peers, &temporary_name(me.node())).unwrap(),
         Some(0)
     );
 }
@@ -599,6 +694,18 @@ fn node_of(byte: u8) -> String {
 
 fn identity(node: &str, seed: u8) -> NodeIdentity {
     NodeIdentity::from_seed(node, &[seed; 32]).unwrap()
+}
+
+fn keep_identity(dir: &Path, who: &NodeIdentity, seed: u8) {
+    assert_eq!(identity(who.node(), seed).key(), who.key());
+    let _lock = BookLock::take(dir, HANG).unwrap();
+    write_private(dir, NODE_FILE, format!("{}\n", who.node()).as_bytes()).unwrap();
+    write_private(
+        dir,
+        NODE_KEY_FILE,
+        format!("{}\n", aterm_codec::hex::encode_lower(&[seed; 32])).as_bytes(),
+    )
+    .unwrap();
 }
 
 fn proof(node: &str, key: NodeKey) -> NodeProof {
@@ -1458,6 +1565,94 @@ fn an_all_member_grant_still_requires_an_issuer_binding() {
         DriveGrant::admitting(std::slice::from_ref(&named), member.node(), rekeyed),
         None
     );
+}
+
+#[test]
+fn signed_administrative_records_require_signature_current_grant_and_live_membership() {
+    let state = State::new("signed-service-repair-authority");
+    let driver = identity(&node_of(0xe7), 41);
+    let claimant = identity(driver.node(), 42);
+    let proof = proof(driver.node(), driver.key());
+    let domain = "service-repair-v1";
+    let body = b"node=target job=server old=image-a desired=image-b nonce=one";
+    let signature = driver.sign_record(domain, body);
+    let grants = [DriveGrant {
+        node: driver.node().to_owned(),
+        key: driver.key(),
+    }];
+    write_book(
+        state.dir(),
+        &[keyed(0xe7, driver.key(), [10, 0, 0, 7], 7100)],
+    );
+    let membership: MemberKeys = [(driver.key(), Standing::Member)].into_iter().collect();
+    let verify = |body: &[u8],
+                  domain: &str,
+                  signature: &[u8; SIG_LEN],
+                  grants: &[DriveGrant],
+                  log: &MemberKeys| {
+        signed_record_driver(
+            &proof,
+            domain,
+            body,
+            signature,
+            state.dir(),
+            grants,
+            Some(log),
+        )
+    };
+    assert_eq!(
+        verify(body, domain, &signature, &grants, &membership),
+        Ok(driver.node().to_owned())
+    );
+    assert!(
+        verify(
+            b"node=target job=server old=image-a desired=evil nonce=one",
+            domain,
+            &signature,
+            &grants,
+            &membership
+        )
+        .is_err()
+    );
+    assert!(
+        verify(
+            body,
+            "another-administrative-operation",
+            &signature,
+            &grants,
+            &membership
+        )
+        .is_err()
+    );
+    assert!(
+        verify(
+            body,
+            domain,
+            &claimant.sign_record(domain, body),
+            &grants,
+            &membership
+        )
+        .is_err()
+    );
+    assert!(verify(body, domain, &signature, &[], &membership).is_err());
+    let wrong_key = [DriveGrant {
+        node: driver.node().to_owned(),
+        key: claimant.key(),
+    }];
+    assert!(verify(body, domain, &signature, &wrong_key, &membership).is_err());
+    let revoked: MemberKeys = [(driver.key(), Standing::Out("membership revoked".to_owned()))]
+        .into_iter()
+        .collect();
+    assert!(verify(body, domain, &signature, &grants, &revoked).is_err());
+    assert_eq!(
+        verify(body, domain, &signature, &grants, &membership),
+        Ok(driver.node().to_owned())
+    );
+    write_book(
+        state.dir(),
+        &[keyed(0xe7, claimant.key(), [10, 0, 0, 7], 7100)],
+    );
+    assert!(verify(body, domain, &signature, &grants, &membership).is_err());
 }
 
 #[test]
@@ -2871,6 +3066,57 @@ fn a_test_binarys_default_port_is_none_an_aterm_here_serves_and_refuses_a_dial()
     );
 }
 
+/// A place that names [`DEFAULT_PORT`] itself, as a book, a `[fleet] listen` or a word can, comes
+/// by no [`default_port`]: the person's aterm answers there, under another secret, so a test
+/// binary's dial stops before its connect. The heartbeat's dial of a member its book holds there
+/// is one (`reach_node` for a join: an aterm_gui test binary's node job dialled 127.0.0.1:7100 and
+/// then its member's name there, 2026-11-02). The cut answers any dial past that, so this test
+/// reaches that aterm with the guard gone too.
+#[test]
+fn a_test_binary_dials_no_default_port_however_the_place_is_named() {
+    let me = identity(&node_of(0x3a), 8);
+    let at = SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_PORT));
+    let cut = format!("{at}\n[::1]:{DEFAULT_PORT}\n");
+    let target = Target {
+        host: "localhost".to_owned(),
+        addr: Some(at.ip()),
+        port: at.port(),
+        node: Some(me.node().to_owned()),
+        key: Some(me.key()),
+    };
+    let reads = aterm_uds::partition::cut_here(&cut, || {
+        [
+            dial_ask("127.0.0.1", None, at.port(), HANG).map(|_| ()),
+            dial_ask("127.0.0.1", Some(at.ip()), at.port(), HANG).map(|_| ()),
+            dial(
+                "localhost",
+                None,
+                at.port(),
+                (&secret(6), Some(&me)),
+                FleetOp::Book,
+                HANG,
+            )
+            .map(|_| ()),
+            proves_itself(&target, &Keyring::default(), (&secret(6), &me), HANG).map(|_| ()),
+            reach_node(
+                &target,
+                &Keyring::default(),
+                (&secret(6), &me),
+                FleetOp::Join,
+                (deadline_after(HANG), HANG),
+            )
+            .map(|_| ()),
+        ]
+    });
+    for read in reads {
+        let why = read.expect_err("no dial");
+        assert!(
+            matches!(&why, Unreached::Local(said) if said.contains(&format!(":{DEFAULT_PORT}"))),
+            "{why:?}"
+        );
+    }
+}
+
 #[test]
 fn every_member_serves_its_book_with_or_without_a_code() {
     let state = State::new("book");
@@ -2912,7 +3158,7 @@ fn every_member_serves_its_book_with_or_without_a_code() {
     assert!(
         matches!(
             fetch_book(&someone_else, (&secret(5), None), deadline()),
-            Err(BookUnread::OtherNode(_, node)) if node == issuer(0x11).node
+            Err(BookUnread::OtherNode { said, .. }) if said == issuer(0x11).node
         ),
         "another node's book is no book of this member's issuer"
     );
@@ -4791,7 +5037,7 @@ fn the_loopback_guard_skips_what_leaves_the_loopback_before_its_connect_or_looku
         let mut dialled = Vec::new();
         let walked = crate::loopback::forced(on, || {
             walk(
-                (host, addr, 7100),
+                (host, addr, 7101),
                 (Instant::now() + HANG, HANG),
                 (&[], asked),
                 |to| {
@@ -4829,14 +5075,14 @@ fn the_loopback_guard_skips_what_leaves_the_loopback_before_its_connect_or_looku
     }
     let private = IpAddr::from([10, 0, 0, 1]);
     let (walked, dialled, names) = walk_as(true, "10.0.0.1", Some(private), true);
-    assert!(guard(&walked, "a dial of 10.0.0.1:7100"), "{walked:?}");
+    assert!(guard(&walked, "a dial of 10.0.0.1:7101"), "{walked:?}");
     assert!(
         dialled.is_empty() && names.is_empty(),
         "{dialled:?} {names:?}"
     );
     let (walked, dialled, _) = walk_as(false, "10.0.0.1", Some(private), true);
     assert!(walked.is_ok(), "the control: {walked:?}");
-    assert_eq!(dialled, [SocketAddr::new(private, 7100)]);
+    assert_eq!(dialled, [SocketAddr::new(private, 7101)]);
     for (host, unguarded) in [
         ("guard-peer.invalid", vec!["guard-peer.invalid"]),
         ("guard-mac", vec!["guard-mac", "guard-mac.local"]),
@@ -4854,7 +5100,7 @@ fn the_loopback_guard_skips_what_leaves_the_loopback_before_its_connect_or_looku
     let loopback = IpAddr::from([127, 0, 0, 1]);
     let (walked, dialled, names) = walk_as(true, "guard-mac", Some(loopback), false);
     assert!(
-        matches!(walked, Err(Unreached::Connect(at, _)) if at == SocketAddr::new(loopback, 7100)),
+        matches!(walked, Err(Unreached::Connect(at, _)) if at == SocketAddr::new(loopback, 7101)),
         "the loopback's answer stands over the lookup the guard skipped: {walked:?}"
     );
     assert!(
@@ -4874,7 +5120,7 @@ fn the_loopback_guard_skips_what_leaves_the_loopback_before_its_connect_or_looku
     assert_eq!(names, ["localhost", "localhost.local"], "the control");
     let (walked, dialled, _) = walk_as(true, "127.0.0.1", Some(loopback), true);
     assert!(walked.is_ok(), "{walked:?}");
-    assert_eq!(dialled, [SocketAddr::new(loopback, 7100)]);
+    assert_eq!(dialled, [SocketAddr::new(loopback, 7101)]);
 }
 
 #[test]
@@ -6176,12 +6422,15 @@ fn a_drives_further_passes_end_the_same_way_into_any_deadline() {
 /// connect failure: the listener at the name's address is not reported and this fails.
 #[test]
 fn a_dead_address_does_not_hide_a_listener_that_could_serve_later() {
-    let port = 7100;
+    // Not the default port: a test binary's walk refuses that one before any attempt.
+    let port = 7101;
     let at = SocketAddr::from(([127, 0, 0, 1], port));
     let walked: Result<(), _> = walk(
         ("localhost", Some(Ipv4Addr::LOCALHOST.into()), port),
         (Instant::now() + HANG, HANG),
-        (&[], |_, _| vec![SocketAddr::from(([127, 0, 0, 2], 7100))]),
+        (&[], |_, port| {
+            vec![SocketAddr::from(([127, 0, 0, 2], port))]
+        }),
         |to| {
             AtAddr::Passed(if to == at {
                 Unreached::Connect(to, io::ErrorKind::ConnectionRefused.into())
@@ -7273,6 +7522,12 @@ fn c19_denied_node_and_unproved_peer_refused_with_valid_fleet_secret() {
     let _ = server.join();
 }
 
+/// The member this Mac joined through, while it serves no entry it signed (an aterm before
+/// 0.147), is asked past a round's three answers though no dial of it missed: its book is its
+/// members' only view of the fleet, and this Mac's entry there goes stale with no registration
+/// of its own.
+/// NEGATIVE CONTROL: past the three, pass over every member not marked missed, the issuer too:
+/// the round answered A, C and D alone ("past them the issuer whose entry is unsigned").
 #[test]
 fn an_issuer_that_signs_no_entry_is_heartbeat_past_the_three() {
     let secret_bytes = [0x56; SECRET_LEN];
@@ -7283,6 +7538,7 @@ fn an_issuer_that_signs_no_entry_is_heartbeat_past_the_three() {
         .into_iter()
         .collect();
     let b_state = State::new("hb3-b");
+    keep_identity(b_state.dir(), &b, 0x02);
     write_key(b_state.dir(), &secret_bytes).unwrap();
     let serving: Vec<(Issuing, State)> =
         [(&a, "hb3-a"), (&c, "hb3-c"), (&d, "hb3-d"), (&e, "hb3-e")]
@@ -7311,14 +7567,16 @@ fn an_issuer_that_signs_no_entry_is_heartbeat_past_the_three() {
             entry(&d, serving[2].0.port, Via::Joined),
         ],
     );
-    // The three joined members answered last, and the round's last dial of the issuer missed, so
-    // the joined members are the round's three.
+    // A answered last, and the issuer since C and D, so the round's three are A, C and D, and
+    // the issuer, not marked missed, comes behind them.
     hold_book(b_state.dir())
         .unwrap()
-        .note_stamps(
-            &[a.node(), c.node(), d.node()].map(|node| (format!("node={node}"), 5_000)),
-            &[(format!("node={}", e.node()), 6_000)],
-        )
+        .note_answered(&[
+            (format!("node={}", a.node()), 7_000),
+            (format!("node={}", c.node()), 5_000),
+            (format!("node={}", d.node()), 5_000),
+            (format!("node={}", e.node()), 6_000),
+        ])
         .unwrap();
     let reg = Registration {
         node: b.node().to_owned(),
@@ -7356,9 +7614,13 @@ fn an_issuer_that_signs_no_entry_is_heartbeat_past_the_three() {
 /// Heartbeats go to the members that answer, the issuer dark or not; and this Mac's network place
 /// hears each member that proved its key, where it answered, every round with how many answered,
 /// and the book's admitted members (`note_place`), so the place reads the ALab LAN from proven
-/// answers only.
-/// NEGATIVE CONTROL: dropping the `note_place` call leaves the place's evidence empty, and this
-/// test fails at "the place heard each member that proved its key".
+/// answers only. Each answer a round under the membership log heard is marked logged, and a
+/// round with no log (an isolated job's, which reads no vault and denies no one) marks its
+/// answers unlogged, so the vault's admission never counts them.
+/// NEGATIVE CONTROLS: dropping the `note_place` call leaves the place's evidence empty, and this
+/// test fails at "the place heard each member that proved its key"; marking every round logged
+/// (`log.is_some()` → `true` at the `note_place` call) fails at "a round with no log notes its
+/// answers unlogged".
 #[test]
 fn heartbeats_go_to_the_members_that_answer_with_the_issuer_dark() {
     let secret_bytes = [0x55; SECRET_LEN];
@@ -7374,6 +7636,7 @@ fn heartbeats_go_to_the_members_that_answer_with_the_issuer_dark() {
     let b = identity(&node_of(0x02), 0x02);
     let c = identity(&node_of(0x03), 0x03);
     let stranger = identity(&node_of(0x04), 0x04);
+    keep_identity(b_state.dir(), &b, 0x02);
     let log: MemberKeys = [&a, &b, &c]
         .map(|who| (who.key(), Standing::Member))
         .into_iter()
@@ -7480,6 +7743,10 @@ fn heartbeats_go_to_the_members_that_answer_with_the_issuer_dark() {
             .all(|answer| answer.addr == Some(IpAddr::from([127, 0, 0, 1]))),
         "{heard:?}"
     );
+    assert!(
+        heard.answers.iter().all(|answer| answer.logged),
+        "a round under the log notes its answers logged: {heard:?}"
+    );
     assert_eq!(
         heard
             .rounds
@@ -7509,6 +7776,30 @@ fn heartbeats_go_to_the_members_that_answer_with_the_issuer_dark() {
             .iter()
             .any(|peer| peer.node.as_deref() == Some(c.node()) && peer.signature_holds()),
         "C's own signed entry, merged from its book"
+    );
+
+    // The same Mac's round run as an isolated job (its own state, no log): the members its book
+    // binds answer, and the place hears them, never as evidence for the vault.
+    let isolated = State::new("hb-b-isolated");
+    held(&isolated);
+    keep_identity(isolated.dir(), &b, 0x02);
+    write_book(
+        isolated.dir(),
+        &[
+            entry(&a, a_at.port, Via::Issuer),
+            entry(&c, c_at.port, Via::Joined),
+        ],
+    );
+    let answered = heartbeat_members(isolated.dir(), (&secret, &b), &reg, HANG, (None, &Vec::new))
+        .expect("the book reads");
+    assert!(
+        !answered.is_empty(),
+        "PRECONDITION: the isolated round reached a member"
+    );
+    let unlogged = aterm_netplace::heard::read(&aterm_netplace::record::dir(isolated.dir()));
+    assert!(
+        !unlogged.answers.is_empty() && unlogged.answers.iter().all(|answer| !answer.logged),
+        "a round with no log notes its answers unlogged: {unlogged:?}"
     );
 
     // The issuer goes dark: the round goes to the member that answers.
@@ -7575,6 +7866,7 @@ fn away_a_heartbeat_round_passes_over_the_members_behind_the_alab_lan() {
     let a = identity(&node_of(0x21), 0x21);
     let b = identity(&node_of(0x22), 0x22);
     let behind = identity(&node_of(0x23), 0x23);
+    keep_identity(b_state.dir(), &b, 0x22);
     let log: MemberKeys = [&a, &b, &behind]
         .map(|who| (who.key(), Standing::Member))
         .into_iter()
@@ -7677,6 +7969,7 @@ fn a_heartbeat_round_asks_a_member_it_never_asked_before_ones_it_asked_lately() 
         .into_iter()
         .collect();
     let b_state = State::new("rotate-b");
+    keep_identity(b_state.dir(), &b, 0x41);
     write_key(b_state.dir(), &secret_bytes).unwrap();
     let serving: Vec<(Issuing, State)> = [
         (&c1, "rotate-c1"),
@@ -7753,21 +8046,25 @@ fn a_heartbeat_round_asks_a_member_it_never_asked_before_ones_it_asked_lately() 
 
 /// A member a round's dial missed since it last answered waits behind the members that answer,
 /// and a dial of it takes no more than its share of the round: a member gone dark (a laptop left)
-/// that answered last no longer spends every round's time and its hints, round after round.
+/// that answered last no longer spends every round's time and its hints, round after round. Past
+/// its three answers a round dials such members, the one missed longest ago first, only until one
+/// misses again: two gone dark cost a round one dial, by its share.
 /// NEGATIVE CONTROL: order the round by when each member last answered, and dial each by the
 /// round's deadline (F17 as landed): D's dial carries the whole round, and the next round dials D
-/// first again.
+/// first again. Go on past the three answers through every member marked missed: the second round
+/// dials D after E ("the round stops at its first miss past its three answers").
 #[test]
 fn a_member_gone_dark_waits_behind_the_members_that_answer_and_spends_only_its_share() {
     let secret_bytes = [0x5a; SECRET_LEN];
     let secret = FleetSecret::new(&secret_bytes).unwrap();
-    let [b, d, c1, c2, c3] =
-        [0x51, 0x52, 0x53, 0x54, 0x55].map(|seed| identity(&node_of(seed), seed));
-    let log: MemberKeys = [&b, &d, &c1, &c2, &c3]
+    let [b, d, c1, c2, c3, e] =
+        [0x51, 0x52, 0x53, 0x54, 0x55, 0x56].map(|seed| identity(&node_of(seed), seed));
+    let log: MemberKeys = [&b, &d, &c1, &c2, &c3, &e]
         .map(|who| (who.key(), Standing::Member))
         .into_iter()
         .collect();
     let b_state = State::new("dark-b");
+    keep_identity(b_state.dir(), &b, 0x51);
     write_key(b_state.dir(), &secret_bytes).unwrap();
     let serving: Vec<(Issuing, State)> = [(&c1, "dark-c1"), (&c2, "dark-c2"), (&c3, "dark-c3")]
         .into_iter()
@@ -7834,28 +8131,708 @@ fn a_member_gone_dark_waits_behind_the_members_that_answer_and_spends_only_its_s
     );
     drop(held);
 
-    // The next round, with members that answer: D, which answered last but missed since, waits
-    // behind them, and the round fills before it.
+    // E, gone dark too, answered after the three and missed a round before D did.
+    let e_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let e_at = e_listener.local_addr().unwrap();
+    let e_key = format!("node={}", e.node());
+    hold_book(b_state.dir())
+        .unwrap()
+        .note_stamps(&[(e_key.clone(), 8_000)], (&[(e_key, 8_500)], &[]))
+        .unwrap();
+
+    // The next round, with members that answer: D and E, which answered last but missed since,
+    // wait behind them, and the round fills before either; past its three answers it dials E,
+    // missed longest ago, by its share, and stops at that miss.
     write_book(
         b_state.dir(),
         &[
             entry(&d, d_at.port()),
+            entry(&e, e_at.port()),
             entry(&c1, serving[0].0.port),
             entry(&c2, serving[1].0.port),
             entry(&c3, serving[2].0.port),
         ],
     );
-    let held = HeldSilent::at(d_at);
+    let (held, held_e) = (HeldSilent::at(d_at), HeldSilent::at(e_at));
     let answered = round();
     let mut nodes: Vec<&str> = answered.iter().map(|done| done.node.as_str()).collect();
     nodes.sort_unstable();
     assert_eq!(nodes, [c1.node(), c2.node(), c3.node()]);
+    let bound = held_e
+        .overrode()
+        .expect("past its three answers the round dials E, missed longest ago");
+    assert!(
+        bound <= share,
+        "E's dial carried {bound:?}, past its share of the round ({share:?})"
+    );
     assert_eq!(
         held.overrode(),
         None,
-        "D, gone dark, was dialled before the members that answer"
+        "the round stops at its first miss past its three answers, and D, gone dark, was not \
+         dialled before the members that answer"
     );
-    drop(d_listener);
+    drop((d_listener, e_listener));
+}
+
+/// After a cut heals, a heartbeat round that three members answer goes on through the members
+/// marked missed (their dials missed in the cut), those heard from since their last miss first,
+/// then the one missed longest ago first, until one of them misses again: each member back
+/// answers within a round, and one still dark costs the round one dial past its three answers,
+/// by its share, and goes behind the rest of them (`docs/DESIGN-fluid-swarm-2026-10-28.md`
+/// §4.2, the heal rows of `lab swarm partition`). G's dial missed first and G is still dark; D1's,
+/// D2's and D3's missed after it, and they are back, D1 registered here since. The first round
+/// reaches D1 and stops at G; the second reaches D2 and D3 and stops at G again.
+/// NEGATIVE CONTROLS: the round as it was (it ended at three answers, every member marked missed
+/// behind them): the first round answers C1, C2 and C3 alone, and D1 is never asked ("D1, missed
+/// in the cut and heard from since, answers the first round"). The members marked missed in miss
+/// order alone, heard or not: the first round dials G first and stops there, the same failure.
+#[test]
+fn after_a_heal_each_member_missed_in_the_cut_answers_within_a_round_while_three_others_answer() {
+    let secret_bytes = [0x5b; SECRET_LEN];
+    let secret = FleetSecret::new(&secret_bytes).unwrap();
+    let [b, c1, c2, c3, d1, d2, d3, g] =
+        [0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68].map(|seed| identity(&node_of(seed), seed));
+    let log: MemberKeys = [&b, &c1, &c2, &c3, &d1, &d2, &d3, &g]
+        .map(|who| (who.key(), Standing::Member))
+        .into_iter()
+        .collect();
+    let b_state = State::new("heal-b");
+    keep_identity(b_state.dir(), &b, 0x61);
+    write_key(b_state.dir(), &secret_bytes).unwrap();
+    let serving: Vec<(Issuing, State)> = [
+        (&c1, "heal-c1"),
+        (&c2, "heal-c2"),
+        (&c3, "heal-c3"),
+        (&d1, "heal-d1"),
+        (&d2, "heal-d2"),
+        (&d3, "heal-d3"),
+    ]
+    .into_iter()
+    .map(|(who, tag)| {
+        let state = State::new(tag);
+        write_key(state.dir(), &secret_bytes).unwrap();
+        let at = Issuing::member(secret.clone(), state.dir(), who.clone(), log.clone());
+        (at, state)
+    })
+    .collect();
+    // G takes connections and never answers: a Mac still on the far side of the cut.
+    let g_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let g_at = g_listener.local_addr().unwrap();
+    // Every member answered ten minutes ago, before the cut, and was last heard from then; C1, C2
+    // and C3 answered in it. The dials of G, D1, D2 and D3 missed in it, in that order, and D1
+    // registered here since. Each was heard from within the last ten minutes, so no round prunes
+    // an entry as expired.
+    let now = unix_ms_now().expect("the clock reads");
+    let ago = |ms: u64| now - ms;
+    let entry = |who: &NodeIdentity, port: u16, seen: u64| Peer {
+        node: Some(who.node().to_owned()),
+        host: "127.0.0.1".to_owned(),
+        via: Via::Joined,
+        seen_ms: Some(seen),
+        ..keyed(0, who.key(), [127, 0, 0, 1], port)
+    };
+    let heard = [
+        ago(120_000),
+        ago(120_000),
+        ago(120_000),
+        ago(60_000),
+        ago(600_000),
+        ago(600_000),
+    ];
+    let mut book: Vec<Peer> = [&c1, &c2, &c3, &d1, &d2, &d3]
+        .into_iter()
+        .zip(&serving)
+        .zip(heard)
+        .map(|((who, (at, _)), seen)| entry(who, at.port, seen))
+        .collect();
+    book.push(entry(&g, g_at.port(), ago(600_000)));
+    write_book(b_state.dir(), &book);
+    let key = |who: &NodeIdentity| format!("node={}", who.node());
+    hold_book(b_state.dir())
+        .unwrap()
+        .note_stamps(
+            &[
+                (key(&d1), ago(600_000)),
+                (key(&d2), ago(600_000)),
+                (key(&d3), ago(600_000)),
+                (key(&g), ago(600_000)),
+                (key(&c1), ago(120_000)),
+                (key(&c2), ago(120_000)),
+                (key(&c3), ago(120_000)),
+            ],
+            (
+                &[
+                    (key(&g), ago(300_000)),
+                    (key(&d1), ago(240_000)),
+                    (key(&d2), ago(180_000)),
+                    (key(&d3), ago(150_000)),
+                ],
+                &[],
+            ),
+        )
+        .unwrap();
+    let reg = Registration {
+        node: b.node().to_owned(),
+        host: "m12.local".to_owned(),
+        port: 7199,
+        version: "0.148.0".to_owned(),
+        key: None,
+        signed: None,
+    };
+    let round = || {
+        let mut nodes: Vec<String> = heartbeat_members(
+            b_state.dir(),
+            (&secret, &b),
+            &reg,
+            HANG,
+            (Some(&log), &Vec::new),
+        )
+        .expect("the book reads")
+        .into_iter()
+        .map(|done| done.node)
+        .collect();
+        nodes.sort_unstable();
+        nodes
+    };
+    let marked = || {
+        let (answered, missed) = (read_answered(b_state.dir()), read_missed(b_state.dir()));
+        let mut marked: Vec<String> = [&c1, &c2, &c3, &d1, &d2, &d3, &g]
+            .into_iter()
+            .filter(|who| missed.get(&key(who)) > answered.get(&key(who)))
+            .map(|who| who.node().to_owned())
+            .collect();
+        marked.sort_unstable();
+        marked
+    };
+    let sorted = |nodes: &[&NodeIdentity]| {
+        let mut nodes: Vec<String> = nodes.iter().map(|who| who.node().to_owned()).collect();
+        nodes.sort_unstable();
+        nodes
+    };
+    let share = HANG / u32::try_from(HEARTBEAT_MEMBERS + 1).unwrap();
+
+    let held = HeldSilent::at(g_at);
+    let first = round();
+    assert_eq!(
+        first,
+        sorted(&[&c1, &c2, &c3, &d1]),
+        "D1, missed in the cut and heard from since, answers the first round, and the round stops \
+         at G"
+    );
+    let bound = held.overrode().expect("the first round dialled G");
+    assert!(
+        bound <= share,
+        "G's dial carried {bound:?}, past its share ({share:?})"
+    );
+    assert_eq!(marked(), sorted(&[&d2, &d3, &g]));
+    drop(held);
+
+    let held = HeldSilent::at(g_at);
+    let second = round();
+    for back in [&d2, &d3] {
+        assert!(
+            second.iter().any(|node| node == back.node()),
+            "{} answers the second round, before G, which missed again since: {second:?}",
+            back.node()
+        );
+    }
+    assert_eq!(
+        second.len(),
+        HEARTBEAT_MEMBERS + 2,
+        "three members not marked missed, then D2 and D3: {second:?}"
+    );
+    let bound = held.overrode().expect("the second round dialled G");
+    assert!(
+        bound <= share,
+        "G's dial carried {bound:?}, past its share ({share:?})"
+    );
+    assert_eq!(marked(), sorted(&[&g]), "G alone is still marked missed");
+    for (_, state) in &serving[3..] {
+        assert!(
+            read_peers(state.dir())
+                .unwrap()
+                .iter()
+                .any(|peer| peer.node.as_deref() == Some(b.node())),
+            "each member back holds B's registration"
+        );
+    }
+    drop(g_listener);
+}
+
+/// A heal that brings back more members marked missed than a round takes past its three answers
+/// costs that round [`HEARTBEAT_ANSWERS_MAX`] answers, and the rest answer the round after: an
+/// 86-Mac LAN that a switch split in half does not register, read and push facts with some 43
+/// members per Mac in the first round after the heal. D1 to D4 missed in the cut, in that order,
+/// and are back; nobody heard from them since. The first round answers C1 to C3, then D1 to D3,
+/// missed longest ago, and stops at its sixth answer; the second answers D4.
+/// NEGATIVE CONTROL: no cap (the round goes on through the members marked missed until one
+/// misses, as `5daeab6c68` landed): the first round answers D4 too ("the first round stops at
+/// its sixth answer").
+#[test]
+fn a_heal_that_brings_back_many_members_costs_a_round_at_most_three_answers_more() {
+    let secret_bytes = [0x5c; SECRET_LEN];
+    let secret = FleetSecret::new(&secret_bytes).unwrap();
+    let [b, c1, c2, c3, d1, d2, d3, d4] =
+        [0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78].map(|seed| identity(&node_of(seed), seed));
+    let log: MemberKeys = [&b, &c1, &c2, &c3, &d1, &d2, &d3, &d4]
+        .map(|who| (who.key(), Standing::Member))
+        .into_iter()
+        .collect();
+    let b_state = State::new("many-b");
+    keep_identity(b_state.dir(), &b, 0x71);
+    write_key(b_state.dir(), &secret_bytes).unwrap();
+    let members = [&c1, &c2, &c3, &d1, &d2, &d3, &d4];
+    let serving: Vec<(Issuing, State)> = members
+        .into_iter()
+        .enumerate()
+        .map(|(at, who)| {
+            let state = State::new(&format!("many-{at}"));
+            write_key(state.dir(), &secret_bytes).unwrap();
+            let at = Issuing::member(secret.clone(), state.dir(), who.clone(), log.clone());
+            (at, state)
+        })
+        .collect();
+    // Every member answered ten minutes ago and was last heard from then; C1, C2 and C3 answered
+    // in the cut, and the dials of D1, D2, D3 and D4 missed in it, in that order.
+    let now = unix_ms_now().expect("the clock reads");
+    let ago = |ms: u64| now - ms;
+    let book: Vec<Peer> = members
+        .into_iter()
+        .zip(&serving)
+        .map(|(who, (at, _))| Peer {
+            node: Some(who.node().to_owned()),
+            host: "127.0.0.1".to_owned(),
+            via: Via::Joined,
+            seen_ms: Some(ago(600_000)),
+            ..keyed(0, who.key(), [127, 0, 0, 1], at.port)
+        })
+        .collect();
+    write_book(b_state.dir(), &book);
+    let key = |who: &NodeIdentity| format!("node={}", who.node());
+    let back = [&d1, &d2, &d3, &d4];
+    let answers: Vec<(String, u64)> = back
+        .into_iter()
+        .map(|who| (key(who), ago(600_000)))
+        .chain([&c1, &c2, &c3].map(|who| (key(who), ago(120_000))))
+        .collect();
+    let misses: Vec<(String, u64)> = back
+        .into_iter()
+        .zip([300_000, 240_000, 180_000, 150_000])
+        .map(|(who, ms)| (key(who), ago(ms)))
+        .collect();
+    hold_book(b_state.dir())
+        .unwrap()
+        .note_stamps(&answers, (&misses, &[]))
+        .unwrap();
+    let reg = Registration {
+        node: b.node().to_owned(),
+        host: "m12.local".to_owned(),
+        port: 7199,
+        version: "0.149.0".to_owned(),
+        key: None,
+        signed: None,
+    };
+    let round = || {
+        let mut nodes: Vec<String> = heartbeat_members(
+            b_state.dir(),
+            (&secret, &b),
+            &reg,
+            HANG,
+            (Some(&log), &Vec::new),
+        )
+        .expect("the book reads")
+        .into_iter()
+        .map(|done| done.node)
+        .collect();
+        nodes.sort_unstable();
+        nodes
+    };
+    let sorted = |nodes: &[&NodeIdentity]| {
+        let mut nodes: Vec<String> = nodes.iter().map(|who| who.node().to_owned()).collect();
+        nodes.sort_unstable();
+        nodes
+    };
+    let marked = || {
+        let (answered, missed) = (read_answered(b_state.dir()), read_missed(b_state.dir()));
+        let mut marked: Vec<String> = members
+            .into_iter()
+            .filter(|who| missed.get(&key(who)) > answered.get(&key(who)))
+            .map(|who| who.node().to_owned())
+            .collect();
+        marked.sort_unstable();
+        marked
+    };
+
+    assert_eq!(
+        round(),
+        sorted(&[&c1, &c2, &c3, &d1, &d2, &d3]),
+        "the first round stops at its sixth answer, D1 to D3 missed longest ago"
+    );
+    assert_eq!(HEARTBEAT_ANSWERS_MAX, 2 * HEARTBEAT_MEMBERS);
+    assert_eq!(marked(), sorted(&[&d4]), "D4 was not dialled");
+    let second = round();
+    assert!(
+        second.iter().any(|node| node == d4.node()),
+        "D4 answers the second round: {second:?}"
+    );
+    assert_eq!(marked(), Vec::<String>::new());
+}
+
+/// The member this Mac joined through, gone dark while it served no entry it signed (an aterm
+/// before 0.147), is a member marked missed like any other: past a round's three answers it costs
+/// the round at most the one dial that misses, never a second dial of it or of another member
+/// marked missed. I, that issuer, missed first and E after it, both still dark: the first round
+/// dials I once and stops, the second dials E and stops.
+/// NEGATIVE CONTROL: the issuer asked past the three in a block of its own after the loop, by
+/// whether it answered alone (as `b493367cc5` held it): the first round dialled I twice ("the
+/// first round dials I once", left `(2, 0)`).
+#[test]
+fn a_dark_issuer_that_signs_no_entry_costs_a_round_one_dial_past_its_answers() {
+    let secret_bytes = [0x5d; SECRET_LEN];
+    let secret = FleetSecret::new(&secret_bytes).unwrap();
+    let [b, c1, c2, c3, i, e] =
+        [0x81, 0x82, 0x83, 0x84, 0x85, 0x86].map(|seed| identity(&node_of(seed), seed));
+    let log: MemberKeys = [&b, &c1, &c2, &c3, &i, &e]
+        .map(|who| (who.key(), Standing::Member))
+        .into_iter()
+        .collect();
+    let b_state = State::new("dark-issuer-b");
+    keep_identity(b_state.dir(), &b, 0x81);
+    write_key(b_state.dir(), &secret_bytes).unwrap();
+    let serving: Vec<(Issuing, State)> = [(&c1, "di-c1"), (&c2, "di-c2"), (&c3, "di-c3")]
+        .into_iter()
+        .map(|(who, tag)| {
+            let state = State::new(tag);
+            write_key(state.dir(), &secret_bytes).unwrap();
+            let at = Issuing::member(secret.clone(), state.dir(), who.clone(), log.clone());
+            (at, state)
+        })
+        .collect();
+    // I and E take connections and never answer.
+    let i_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let e_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let (i_at, e_at) = (
+        i_listener.local_addr().unwrap(),
+        e_listener.local_addr().unwrap(),
+    );
+    let now = unix_ms_now().expect("the clock reads");
+    let ago = |ms: u64| now - ms;
+    // The issuer's entry carries no signature, as one an aterm before 0.147 answered with.
+    let entry = |who: &NodeIdentity, port: u16, via: Via| Peer {
+        node: Some(who.node().to_owned()),
+        host: "127.0.0.1".to_owned(),
+        via,
+        seen_ms: Some(ago(600_000)),
+        ..keyed(0, who.key(), [127, 0, 0, 1], port)
+    };
+    let mut book: Vec<Peer> = [&c1, &c2, &c3]
+        .into_iter()
+        .zip(&serving)
+        .map(|(who, (at, _))| entry(who, at.port, Via::Joined))
+        .collect();
+    book.push(entry(&i, i_at.port(), Via::Issuer));
+    book.push(entry(&e, e_at.port(), Via::Joined));
+    write_book(b_state.dir(), &book);
+    let key = |who: &NodeIdentity| format!("node={}", who.node());
+    hold_book(b_state.dir())
+        .unwrap()
+        .note_stamps(
+            &[
+                (key(&i), ago(600_000)),
+                (key(&e), ago(600_000)),
+                (key(&c1), ago(120_000)),
+                (key(&c2), ago(120_000)),
+                (key(&c3), ago(120_000)),
+            ],
+            (&[(key(&i), ago(300_000)), (key(&e), ago(240_000))], &[]),
+        )
+        .unwrap();
+    let reg = Registration {
+        node: b.node().to_owned(),
+        host: "m12.local".to_owned(),
+        port: 7199,
+        version: "0.149.0".to_owned(),
+        key: None,
+        signed: None,
+    };
+    let round = || {
+        let mut nodes: Vec<String> = heartbeat_members(
+            b_state.dir(),
+            (&secret, &b),
+            &reg,
+            HANG,
+            (Some(&log), &Vec::new),
+        )
+        .expect("the book reads")
+        .into_iter()
+        .map(|done| done.node)
+        .collect();
+        nodes.sort_unstable();
+        nodes
+    };
+    let mut three: Vec<String> = [&c1, &c2, &c3]
+        .map(|who| who.node().to_owned())
+        .into_iter()
+        .collect();
+    three.sort_unstable();
+
+    let (held_i, held_e) = (HeldSilent::at(i_at), HeldSilent::at(e_at));
+    assert_eq!(round(), three);
+    assert_eq!(
+        (held_i.dials(), held_e.dials()),
+        (1, 0),
+        "the first round dials I once, missed longest ago, and stops at that miss"
+    );
+    drop((held_i, held_e));
+
+    let (held_i, held_e) = (HeldSilent::at(i_at), HeldSilent::at(e_at));
+    assert_eq!(round(), three);
+    assert_eq!(
+        (held_i.dials(), held_e.dials()),
+        (0, 1),
+        "the second round dials E, missed longest ago now, and stops at that miss"
+    );
+    drop((held_i, held_e, i_listener, e_listener));
+}
+
+/// Past a round's three answers a dial of a member marked missed takes its share whole: its
+/// registration and book read end with it, so a member that proves its node and never answers
+/// the registration (a listener wedged after the handshake) holds the round no longer than one
+/// gone dark. M, marked missed, proves itself and never registers.
+/// NEGATIVE CONTROL: register past three answers by the round's deadline, or a second from now
+/// where that comes later, as before three: M's registration carried the rest of the round's
+/// minute ("M's registration carried 59.9318295s, past its share of the round (15s)").
+#[test]
+fn past_its_three_answers_a_member_that_proves_and_never_registers_costs_only_its_share() {
+    let secret_bytes = [0x5e; SECRET_LEN];
+    let secret = FleetSecret::new(&secret_bytes).unwrap();
+    let [b, c1, c2, c3, m] =
+        [0x91, 0x92, 0x93, 0x94, 0x95].map(|seed| identity(&node_of(seed), seed));
+    let log: MemberKeys = [&b, &c1, &c2, &c3, &m]
+        .map(|who| (who.key(), Standing::Member))
+        .into_iter()
+        .collect();
+    let b_state = State::new("wedged-b");
+    keep_identity(b_state.dir(), &b, 0x91);
+    write_key(b_state.dir(), &secret_bytes).unwrap();
+    let members = [&c1, &c2, &c3, &m];
+    let serving: Vec<(Issuing, State)> = members
+        .into_iter()
+        .enumerate()
+        .map(|(at, who)| {
+            let state = State::new(&format!("wedged-{at}"));
+            write_key(state.dir(), &secret_bytes).unwrap();
+            let at = Issuing::member(secret.clone(), state.dir(), who.clone(), log.clone());
+            (at, state)
+        })
+        .collect();
+    let now = unix_ms_now().expect("the clock reads");
+    let ago = |ms: u64| now - ms;
+    let book: Vec<Peer> = members
+        .into_iter()
+        .zip(&serving)
+        .map(|(who, (at, _))| Peer {
+            node: Some(who.node().to_owned()),
+            host: "127.0.0.1".to_owned(),
+            via: Via::Joined,
+            seen_ms: Some(ago(600_000)),
+            ..keyed(0, who.key(), [127, 0, 0, 1], at.port)
+        })
+        .collect();
+    write_book(b_state.dir(), &book);
+    let key = |who: &NodeIdentity| format!("node={}", who.node());
+    hold_book(b_state.dir())
+        .unwrap()
+        .note_stamps(
+            &[
+                (key(&m), ago(600_000)),
+                (key(&c1), ago(120_000)),
+                (key(&c2), ago(120_000)),
+                (key(&c3), ago(120_000)),
+            ],
+            (&[(key(&m), ago(300_000))], &[]),
+        )
+        .unwrap();
+    let reg = Registration {
+        node: b.node().to_owned(),
+        host: "m12.local".to_owned(),
+        port: 7199,
+        version: "0.149.0".to_owned(),
+        key: None,
+        signed: None,
+    };
+    let m_at = SocketAddr::from((Ipv4Addr::LOCALHOST, serving[3].0.port));
+    let held = HeldSilent::after_proof(m_at);
+    let mut nodes: Vec<String> = heartbeat_members(
+        b_state.dir(),
+        (&secret, &b),
+        &reg,
+        HANG,
+        (Some(&log), &Vec::new),
+    )
+    .expect("the book reads")
+    .into_iter()
+    .map(|done| done.node)
+    .collect();
+    nodes.sort_unstable();
+    let mut three: Vec<String> = [&c1, &c2, &c3]
+        .map(|who| who.node().to_owned())
+        .into_iter()
+        .collect();
+    three.sort_unstable();
+    assert_eq!(nodes, three);
+    assert_eq!(held.dials(), 1, "past its three answers the round dials M");
+    let share = HANG / u32::try_from(HEARTBEAT_MEMBERS + 1).unwrap();
+    let bound = held
+        .overrode()
+        .expect("M proved itself, and its registration was held");
+    assert!(
+        bound <= share,
+        "M's registration carried {bound:?}, past its share of the round ({share:?})"
+    );
+    assert!(
+        read_missed(b_state.dir()).get(&key(&m)) > read_answered(b_state.dir()).get(&key(&m)),
+        "M is still marked missed"
+    );
+}
+
+/// A member heard from every round that this Mac's dial never reaches (a path that works one way
+/// only) takes the first place among the members marked missed once, then waits its turn by its
+/// misses: it does not take every round's one dial past the three answers, and a member back
+/// that nobody heard from (its own heartbeat skips its rounds) is reached within a round or two.
+/// Y registers here between rounds and never answers a dial; Z is back and nobody heard from it.
+/// The first round dials Y, heard from, and stops; Y registers again; the second round reaches
+/// Z, and Y's miss there comes after.
+/// NEGATIVE CONTROL: put first every member marked missed heard from since its miss, whether
+/// that miss too came while it was heard from (no `missed-heard` check in `round_order`): the
+/// second round dialled Y first again and stopped there ("Z answers the second round").
+#[test]
+fn a_member_heard_from_that_this_mac_never_reaches_takes_the_first_place_once() {
+    let secret_bytes = [0x5f; SECRET_LEN];
+    let secret = FleetSecret::new(&secret_bytes).unwrap();
+    let [b, c1, c2, c3, y, z] =
+        [0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6].map(|seed| identity(&node_of(seed), seed));
+    let log: MemberKeys = [&b, &c1, &c2, &c3, &y, &z]
+        .map(|who| (who.key(), Standing::Member))
+        .into_iter()
+        .collect();
+    let b_state = State::new("oneway-b");
+    keep_identity(b_state.dir(), &b, 0xa1);
+    write_key(b_state.dir(), &secret_bytes).unwrap();
+    let answering = [&c1, &c2, &c3, &z];
+    let serving: Vec<(Issuing, State)> = answering
+        .into_iter()
+        .enumerate()
+        .map(|(at, who)| {
+            let state = State::new(&format!("oneway-{at}"));
+            write_key(state.dir(), &secret_bytes).unwrap();
+            let at = Issuing::member(secret.clone(), state.dir(), who.clone(), log.clone());
+            (at, state)
+        })
+        .collect();
+    // Y takes connections and never answers this Mac's dial.
+    let y_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let y_at = y_listener.local_addr().unwrap();
+    // Every member answered ten minutes ago; C1, C2 and C3 since. The dials of Y and Z missed
+    // since, Y's first; Y was heard from a minute ago, and Z not since it answered.
+    let now = unix_ms_now().expect("the clock reads");
+    let ago = |ms: u64| now - ms;
+    let entry = |who: &NodeIdentity, port: u16, seen: u64| Peer {
+        node: Some(who.node().to_owned()),
+        host: "127.0.0.1".to_owned(),
+        via: Via::Joined,
+        seen_ms: Some(seen),
+        ..keyed(0, who.key(), [127, 0, 0, 1], port)
+    };
+    let mut book: Vec<Peer> = answering
+        .into_iter()
+        .zip(&serving)
+        .map(|(who, (at, _))| entry(who, at.port, ago(600_000)))
+        .collect();
+    book.push(entry(&y, y_at.port(), ago(60_000)));
+    write_book(b_state.dir(), &book);
+    let key = |who: &NodeIdentity| format!("node={}", who.node());
+    hold_book(b_state.dir())
+        .unwrap()
+        .note_stamps(
+            &[
+                (key(&y), ago(600_000)),
+                (key(&z), ago(600_000)),
+                (key(&c1), ago(120_000)),
+                (key(&c2), ago(120_000)),
+                (key(&c3), ago(120_000)),
+            ],
+            (&[(key(&y), ago(300_000)), (key(&z), ago(240_000))], &[]),
+        )
+        .unwrap();
+    let reg = Registration {
+        node: b.node().to_owned(),
+        host: "m12.local".to_owned(),
+        port: 7199,
+        version: "0.149.0".to_owned(),
+        key: None,
+        signed: None,
+    };
+    let round = || {
+        let mut nodes: Vec<String> = heartbeat_members(
+            b_state.dir(),
+            (&secret, &b),
+            &reg,
+            HANG,
+            (Some(&log), &Vec::new),
+        )
+        .expect("the book reads")
+        .into_iter()
+        .map(|done| done.node)
+        .collect();
+        nodes.sort_unstable();
+        nodes
+    };
+    let mut three: Vec<String> = [&c1, &c2, &c3]
+        .map(|who| who.node().to_owned())
+        .into_iter()
+        .collect();
+    three.sort_unstable();
+
+    let held = HeldSilent::at(y_at);
+    assert_eq!(round(), three, "the first round stops at Y's miss");
+    assert_eq!(
+        held.dials(),
+        1,
+        "the first round dials Y, heard from since its miss"
+    );
+    assert_eq!(
+        read_missed_heard(b_state.dir()).get(&key(&y)),
+        read_missed(b_state.dir()).get(&key(&y)),
+        "Y's miss came while it was heard from"
+    );
+    drop(held);
+
+    // Y registers here again since that miss.
+    let y_missed = read_missed(b_state.dir())[&key(&y)];
+    let mut book = read_peers(b_state.dir()).unwrap();
+    book.iter_mut()
+        .filter(|peer| peer.node.as_deref() == Some(y.node()))
+        .for_each(|peer| peer.seen_ms = Some(y_missed + 1));
+    write_book(b_state.dir(), &book);
+
+    let held = HeldSilent::at(y_at);
+    let second = round();
+    assert!(
+        second.iter().any(|node| node == z.node()),
+        "Z answers the second round, before Y: {second:?}"
+    );
+    assert_eq!(
+        held.dials(),
+        1,
+        "the second round dials Y after Z, and stops at its miss"
+    );
+    let (answered, missed) = (read_answered(b_state.dir()), read_missed(b_state.dir()));
+    assert!(
+        answered.get(&key(&z)) > missed.get(&key(&z)),
+        "Z is marked missed no more"
+    );
+    drop((held, y_listener));
 }
 
 /// With no membership log yet (no genesis on this Mac), a heartbeat that reaches the member this
@@ -7877,6 +8854,7 @@ fn with_no_log_a_heartbeat_binds_the_members_its_issuer_recorded() {
     let c = identity(&node_of(0x13), 0x13);
     let x = identity(&node_of(0x14), 0x14);
     let claimant = identity(x.node(), 0x15);
+    keep_identity(b_state.dir(), &b, 0x12);
     // A recorded C's join, and a claim of X's node under another key.
     write_book(
         a_state.dir(),
@@ -7971,6 +8949,8 @@ fn with_no_log_a_mac_that_joined_at_a_member_reaches_every_book_member_to_member
         write_key(state.dir(), &secret_bytes).unwrap();
     }
     let [a, b, c, d, e] = [0x31, 0x32, 0x33, 0x34, 0x35].map(|seed| identity(&node_of(seed), seed));
+    keep_identity(b_state.dir(), &b, 0x32);
+    keep_identity(e_state.dir(), &e, 0x35);
     let listen = |who: &NodeIdentity, state: &State| {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let named = Issuer {
@@ -8081,6 +9061,7 @@ fn with_no_log_the_issuer_takes_in_a_mac_that_joined_at_a_member() {
     let a = identity(&node_of(0x21), 0x21);
     let b = identity(&node_of(0x22), 0x22);
     let d = identity(&node_of(0x23), 0x23);
+    keep_identity(a_state.dir(), &a, 0x21);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let b_port = listener.local_addr().unwrap().port();
     // B joined through A, and recorded D's join while A was away.
@@ -8188,7 +9169,7 @@ fn the_answered_file_keeps_each_members_latest_answer_and_drops_the_oldest_past_
     // A heartbeat's miss is no answer, and an answer's note keeps it.
     hold_book(dir)
         .unwrap()
-        .note_stamps(&[], &[(answer_key(&one), 6_000)])
+        .note_stamps(&[], (&[(answer_key(&one), 6_000)], &[]))
         .unwrap();
     note(&[(answer_key(&named), 8_000)]).unwrap();
     assert_eq!(read_answered(dir).get(&answer_key(&one)), Some(&5_000));
@@ -8306,6 +9287,7 @@ fn a_heartbeat_round_leaves_a_copy_another_read_kept_meanwhile() {
     let a = identity(&node_of(0x41), 0x41);
     let b = identity(&node_of(0x42), 0x42);
     let served = identity(&node_of(0x43), 0x43);
+    keep_identity(b_state.dir(), &b, 0x42);
     let kept = identity(&node_of(0x44), 0x44);
     let log: MemberKeys = [&a, &b, &served, &kept]
         .into_iter()
@@ -8415,6 +9397,7 @@ fn a_heartbeat_round_merges_back_no_member_dropped_meanwhile() {
     let a = identity(&node_of(0x51), 0x51);
     let b = identity(&node_of(0x52), 0x52);
     let listed = identity(&node_of(0x53), 0x53);
+    keep_identity(b_state.dir(), &b, 0x52);
     let log: MemberKeys = [&a, &b, &listed]
         .into_iter()
         .map(|id| (id.key(), Standing::Member))
@@ -8513,6 +9496,7 @@ fn heartbeat_and_book_sharing_omit_denied_and_log_held_out_members() {
     }
     let a = identity(&node_of(0x31), 0x31);
     let b = identity(&node_of(0x32), 0x32);
+    keep_identity(b_state.dir(), &b, 0x32);
     let denied_peer = identity(&node_of(0x33), 0x33);
     let removed_peer = identity(&node_of(0x34), 0x34);
     let good_peer = identity(&node_of(0x35), 0x35);
@@ -10277,6 +11261,82 @@ fn a_check_reads_which_instance_answered_from_its_instance_line() {
     );
 }
 
+/// Two nodes whose ids share their first eight characters never print alike in one message: each
+/// is named by the shortest head no other node it is named beside shares, up to its whole id.
+///
+/// NEGATIVE CONTROL: name every node by its first eight characters again, and the two twins below
+/// print as `c0ffee34` alike, in the head, the misnamed and the other-node lines, a book read's
+/// and a refusal.
+#[test]
+fn a_node_is_named_by_the_shortest_head_no_other_node_shares() {
+    let a = "c0ffee34a18b0000000000000000000a";
+    let b = "c0ffee34a27c0000000000000000000b";
+    let c = "26c4dc354c6726da031051adc10bc1bd";
+    assert_eq!(node_head(c, &[a, b, c]), "26c4dc35");
+    assert_eq!(node_head(a, &[a, b, c]), "c0ffee34a1");
+    assert_eq!(node_head(b, &[a, b]), "c0ffee34a2");
+    assert_eq!(node_head(a, &[] as &[&str]), "c0ffee34");
+    let twin = format!("{}f", &a[..31]);
+    assert_eq!(
+        node_head(a, &[twin]),
+        a,
+        "the whole id where every shorter head is shared"
+    );
+    let at = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
+    let misnamed = Unreached::Misnamed {
+        at,
+        proved: a.to_owned(),
+        claimed: b.to_owned(),
+    };
+    assert!(
+        misnamed
+            .to_string()
+            .contains("proved node c0ffee34a1, its survey says node c0ffee34a2"),
+        "{misnamed}"
+    );
+    let other = Unreached::OtherNode {
+        at,
+        said: a.to_owned(),
+        want: b.to_owned(),
+    };
+    assert!(
+        other.to_string().starts_with(
+            "127.0.0.1 is node c0ffee34a1 now: rejoin this peer, or `aterm fleet peers rm \
+             c0ffee34a2`"
+        ),
+        "{other}"
+    );
+    // A book read answered at the issuer's address by a node whose id begins as the issuer's.
+    let book = BookUnread::OtherNode {
+        at,
+        said: a.to_owned(),
+        want: b.to_owned(),
+    };
+    assert_eq!(
+        book.to_string(),
+        "127.0.0.1:1 answered as node c0ffee34a1, not this Mac's issuer"
+    );
+    for (refusal, head) in [
+        (
+            Undriven::Unlisted(a.to_owned()),
+            "node c0ffee34a1 is not one the dialled Mac lets drive it",
+        ),
+        (
+            Undriven::Unproven(Unproven::Unbound(a.to_owned())),
+            "node c0ffee34a1 is bound to no key",
+        ),
+    ] {
+        let said = refusal.said(&[a, b]);
+        assert!(said.starts_with(head), "{said}");
+        assert!(
+            refusal
+                .to_string()
+                .starts_with(&head.replace("c0ffee34a1", "c0ffee34")),
+            "with no other node known, eight: {refusal}"
+        );
+    }
+}
+
 /// `addresses_within` hands back what a dial's lookup walks: an IP literal as itself, and nothing
 /// for a name the loopback guard refuses or no time is left to look up.
 #[test]
@@ -10289,3 +11349,12 @@ fn addresses_within_is_the_dials_lookup() {
     let guarded = crate::loopback::forced(true, || addresses_within("m22.local", HANG));
     assert!(guarded.is_empty(), "{guarded:?}");
 }
+
+#[path = "fleet_member_tests/address_fallback.rs"]
+mod address_fallback;
+
+#[path = "fleet_member_tests/heartbeat_descriptor.rs"]
+mod heartbeat_descriptor;
+
+#[path = "fleet_member_tests/book_fallback.rs"]
+mod book_fallback;

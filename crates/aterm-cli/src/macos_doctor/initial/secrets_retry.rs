@@ -354,7 +354,7 @@ struct Attempt {
 
 impl Attempt {
     fn load(root: &Path) -> Option<Self> {
-        let bytes = std::fs::read(root.join(RECORD)).ok()?;
+        let bytes = crate::macos_doctor::read_record_bytes(&root.join(RECORD)).ok()?;
         let record: Value = aterm_json::from_slice(&bytes).ok()?;
         if record["profile"].as_str() != Some(PROFILE) {
             return None;

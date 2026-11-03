@@ -6,8 +6,8 @@ use super::super::policy::WorkerEnv;
 use super::super::policy::approval::RULE_RM_BREAKER_WARN;
 use super::super::policy::approval::{
     AnswerTarget, ApprovalCtx, Choice, DeclineStep, QuestionPriority, RULE_AUTO_MODE_SETUP,
-    RULE_AUTOCOMPACT_OFFER, RULE_LIMIT_RESET, RULE_LIMIT_WAIT, RULE_TRUST_ANY, RULE_TRUST_DIALOG,
-    decide, proof_would_lift, reads_from_stand, unvoiced_tools,
+    RULE_AUTOCOMPACT_OFFER, RULE_CHROME_INTRO, RULE_LIMIT_RESET, RULE_LIMIT_WAIT, RULE_TRUST_ANY,
+    RULE_TRUST_DIALOG, decide, proof_would_lift, reads_from_stand, unvoiced_tools,
 };
 use super::super::policy::box_call;
 use super::super::policy::box_facts::{BoxFacts, QuestionFacts};
@@ -67,8 +67,8 @@ fn person_grace(opts: &SuperviseOpts) -> Duration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dialog {
     /// A choice that grants nothing and spends nothing (a question, a plan-mode switch, a goal, a
-    /// model or effort switch, the autocompact offer, the auto-mode setup offer):
-    /// [`QUESTION_PERSON_GRACE`] at most.
+    /// model or effort switch, the autocompact offer, the auto-mode setup offer, the Claude in
+    /// Chrome intro): [`QUESTION_PERSON_GRACE`] at most.
     Choice,
     /// A permission box, which grants a command, a tool, a file, the network, a folder, an app or
     /// a server its reach: [`QUESTION_PERSON_GRACE`] at most while nobody has touched it since it
@@ -93,7 +93,8 @@ impl Dialog {
             | PromptKind::GoalProposal
             | PromptKind::ModelSwitch
             | PromptKind::AutocompactOffer
-            | PromptKind::AutoModeSetup => Self::Choice,
+            | PromptKind::AutoModeSetup
+            | PromptKind::ChromeIntro => Self::Choice,
             PromptKind::Bash
             | PromptKind::Edit
             | PromptKind::Write
@@ -1341,6 +1342,7 @@ impl<C: Ctl> Session<'_, C> {
                 &decision,
                 Decision::Approve { rule_id, .. }
                     if *rule_id == RULE_AUTOCOMPACT_OFFER
+                        || *rule_id == RULE_CHROME_INTRO
                         || *rule_id == super::super::policy::login::RULE_LOGIN_METHOD
                         || *rule_id == super::super::policy::login::RULE_LOGIN_BACK_OUT
             ) {
@@ -2390,6 +2392,7 @@ impl<C: Ctl> Session<'_, C> {
                         reset
                             || p.kind == PromptKind::Trust
                             || p.kind == PromptKind::AutocompactOffer
+                            || p.kind == PromptKind::ChromeIntro
                             || rule_id == super::super::policy::login::RULE_LOGIN_METHOD
                             || is_muse(&self.reader(&turn.screen.rows).program())
                     })
@@ -2719,6 +2722,7 @@ impl<C: Ctl> Session<'_, C> {
                 || rule_id == RULE_LIMIT_RESET
                 || rule_id == RULE_AUTOCOMPACT_OFFER
                 || rule_id == RULE_AUTO_MODE_SETUP
+                || rule_id == RULE_CHROME_INTRO
                 || rule_id == super::super::policy::login::RULE_LOGIN_METHOD
                 || rule_id == super::super::policy::login::RULE_LOGIN_BACK_OUT)
     }

@@ -5716,6 +5716,7 @@ impl SessionTimeline {
             Some(
                 aterm_agent::harness::acts::TaskFace::Open
                     | aterm_agent::harness::acts::TaskFace::Theirs
+                    | aterm_agent::harness::acts::TaskFace::Failed
             )
         ) {
             // A RECEIPT NEVER OUTLIVES ITS LANDING (§14.9, slice 9b).

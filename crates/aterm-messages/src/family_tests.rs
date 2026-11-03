@@ -217,6 +217,7 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
             Family::HugeDir,
             Family::ServiceMemory,
             Family::Secrets,
+            Family::Agh,
             Family::Join,
             Family::NetworkPlace
         ]
@@ -478,16 +479,19 @@ fn a_grant_after_the_owners_answer_makes_the_next_regression_news() {
     let now = t0();
     let mut c = fresh(now);
     let id = c.post(fda(), stamp(), now).id;
+    assert!(c.has_unresolved_exception("privacy.fda.needed"));
     assert!(
         c.act_digest(id, ActionIndex(0), stamp(), now + ms(1_000))
             .is_some()
     );
     assert!(c.digest().is_empty(), "answered: closed");
+    assert!(c.has_unresolved_exception("privacy.fda.needed"));
     let quiet = c.post(fda(), stamp(), now + ms(2_000));
     assert_ne!(quiet.outcome, PostOutcome::New);
     assert!(c.digest().is_empty());
     assert!(!c.clear_digest("privacy.fda.needed", now + ms(3_000)));
     assert!(c.forget_filing("privacy.fda.needed", stamp(), now + ms(3_000)));
+    assert!(!c.has_unresolved_exception("privacy.fda.needed"));
     assert!(
         !c.forget_filing("privacy.fda.needed", stamp(), now + ms(3_500)),
         "once: the latest word is a resolution now"

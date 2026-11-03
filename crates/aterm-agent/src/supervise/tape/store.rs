@@ -330,8 +330,9 @@ pub fn forget(store: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
 
 /// The door a hosted run reads its world through, recording to a new tape
 /// in the store beside its approval ledger — after the
-/// store's retention has run — or the shipped live door, said to `warn`,
-/// when the run keeps no ledger or its tape cannot be made.
+/// store's retention has run — or the setup's live door
+/// ([`SessionSetup::live_fx`]), said to `warn`, when the run keeps no ledger
+/// or its tape cannot be made.
 fn hosted_fx(
     setup: &SessionSetup,
     opts: &SuperviseOpts,
@@ -344,11 +345,11 @@ fn hosted_fx(
             "aterm harness: tape: the loop keeps no approval ledger, so its tapes have no \
              store — the loop goes on without one"
         );
-        return Fx::os();
+        return setup.live_fx();
     };
     let (Some(drive), Some(state)) = (ledger.parent(), ledger.parent().and_then(Path::parent))
     else {
-        return Fx::os();
+        return setup.live_fx();
     };
     let store = drive.join("tapes");
     let store = match custody::Store::open(&store, true) {
@@ -358,7 +359,7 @@ fn hosted_fx(
                 warn,
                 "aterm harness: tape store refused: {e} — the loop goes on without one"
             );
-            return Fx::os();
+            return setup.live_fx();
         }
     };
     if let Err(e) = sweep_held(&store, now, KEEP_BYTES, KEEP_AGE) {
@@ -366,7 +367,7 @@ fn hosted_fx(
             warn,
             "aterm harness: tape inventory refused: {e} — the loop goes on without one"
         );
-        return Fx::os();
+        return setup.live_fx();
     }
     let tape = tape_id();
     let header = Header::capture(tape.clone(), Entry::Hosted, Some(state), setup, opts);
@@ -379,7 +380,7 @@ fn hosted_fx(
                 warn,
                 "aterm harness: tape cannot be made: {e} — the loop goes on without one"
             );
-            return Fx::os();
+            return setup.live_fx();
         }
     };
     if let Some((what, _)) = beside
@@ -391,7 +392,7 @@ fn hosted_fx(
             warn,
             "aterm harness: tape is the run's {what} too; cleanup {cleanup:?} — the loop goes on without one"
         );
-        return Fx::os();
+        return setup.live_fx();
     }
     let writer = TapeWriter::start(
         Box::new(held::HeldTape::hold(made.file)),
@@ -399,7 +400,7 @@ fn hosted_fx(
         &header.encode(),
         warn,
     );
-    let fx = Fx::os();
+    let fx = setup.live_fx();
     let (origin, _) = fx.peek();
     fx.recording(TapeCore::start(
         writer,
@@ -475,6 +476,49 @@ mod tests {
             .open(path)
             .expect("open");
         file.set_modified(now - ago).expect("mtime");
+    }
+
+    /// A HOSTED RUN'S DOOR READS ITS SETUP'S HOST: recording to a new tape, or live when the run
+    /// keeps no ledger, the door of a setup whose host never sleeps
+    /// (`Session::set_host_awake`) reads that host's full wake, and a setup without it the
+    /// system's, of which a test build's power manager says nothing.
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_hosted_runs_door_reads_its_setups_host() {
+        struct Unasked;
+        impl Ctl for Unasked {
+            fn call(&mut self, args: &[&str]) -> Result<crate::supervise::run::CtlReply, String> {
+                panic!("a door test sent {args:?}");
+            }
+        }
+        let guard = crate::supervise::ScratchDir::new("tape-store", "awake");
+        let state = guard.canonicalize().expect("owned canonical fixture");
+        let ledger = crate::supervise::approvals::path_under(&state, Some("@s-1"))
+            .expect("the ledger's drive/");
+        let taped = SuperviseOpts {
+            ledger: Some(ledger),
+            ..SuperviseOpts::hosted()
+        };
+        let untaped = SuperviseOpts::hosted();
+        for awake in [false, true] {
+            let mut ctl = Unasked;
+            let mut session = Session::new(&mut ctl, Some("@s-1".to_string()));
+            if awake {
+                session.set_host_awake();
+            }
+            let setup = session.setup().clone();
+            for opts in [&taped, &untaped] {
+                let fx = hosted_fx(&setup, opts, Box::new(std::io::sink()), SystemTime::now());
+                let recorded = opts.ledger.is_some();
+                assert_eq!(fx.tape().is_some(), recorded);
+                assert_eq!(
+                    fx.full_wake(),
+                    awake.then_some(true),
+                    "awake {awake}, recorded {recorded}"
+                );
+                fx.finish(End::Suspended);
+            }
+        }
     }
 
     /// A hosted tape's name is the run's start in UTC and its tape's first

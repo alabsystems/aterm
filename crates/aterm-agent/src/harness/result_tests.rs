@@ -1440,6 +1440,42 @@ fn past_the_bound_the_snapshot_is_read_as_it_stands() {
     assert_eq!((read.tail, read.waits, read.ended), (whole, 0, true));
 }
 
+/// A FAILED RESULT THAT MISSED ITS SNAPSHOT IS READ AGAIN BY ITS OWN RULE ([`DoneBy::Failed`]): the
+/// turn the land check opened answers `Could not finish:`, which that check's rule reads as no
+/// report. NEGATIVE CONTROL: a snapshot taken by [`DoneBy::Turn`] over the same rows reads nothing.
+#[test]
+fn a_failed_result_that_missed_its_snapshot_is_read_again_by_its_own_rule() {
+    const SAID: &str = "Could not finish: the grammar is gone.";
+    let root = ScratchDir::new("result", "reread-failed");
+    let tasks = root.join("tasks");
+    let transcript = root.join(format!("{SESSION}.jsonl"));
+    let opened = vec![
+        user("u-task", "Fix it."),
+        says("a-1", "msg_1", "Reading the grammar."),
+        turn_duration(),
+        user("u-check", DONE_CHECK),
+        said("a-call", "msg_2", &format!("[{}]", tool_use())),
+        tool_result("u-result"),
+    ];
+    let first = jsonl(&opened);
+    std::fs::write(&transcript, &first).expect("transcript");
+    let read_again = |stem: &str, by: DoneBy| {
+        let snap = snapshot(&tasks, stem, Some((&transcript, &first)), by).expect("written");
+        assert_eq!(snap.unavailable, Some("no-reply"), "{stem}");
+        snap
+    };
+    let failed = read_again("s-1-1", DoneBy::Failed);
+    let turn = read_again("s-1-2", DoneBy::Turn);
+    let mut whole = opened.clone();
+    whole.extend([says("a-reply", "msg_3", SAID), turn_duration()]);
+    std::fs::write(&transcript, jsonl(&whole)).expect("transcript");
+    assert_eq!(
+        reread(&failed.path).map(|r| r.report.text),
+        Some(SAID.to_string())
+    );
+    assert_eq!(reread(&turn.path), None, "the check's rule");
+}
+
 #[test]
 fn result_reads_a_lagged_turn_again_and_never_a_later_one() {
     let root = ScratchDir::new("result", "reread");
@@ -3058,4 +3094,37 @@ fn an_older_codex_snapshot_reads_as_it_did_and_a_new_one_reads_in_an_older_reade
         Source::parse(&format!("source=none why=Not%20a%20word thread={THREAD}")),
         None
     );
+}
+
+/// A FAILED CONCLUSION'S RESULT IS THE REPLY THAT SAID SO, whatever act opened its turn: the check
+/// rule ([`read_items`]) would read a land check's answer as no report at all. NEGATIVE CONTROL:
+/// [`DoneBy::Turn`] over the same rows takes the check's rule.
+#[test]
+fn a_failed_conclusion_reads_its_own_reply_whatever_opened_the_turn() {
+    const SAID: &str = "Could not finish: the grammar is gone.";
+    for opener in [DONE_CHECK, LAND_NUDGE, LAND] {
+        let rows = [
+            user("u-task", "Fix it."),
+            says("a-1", "msg_1", "Reading the grammar."),
+            user("u-act", opener),
+            says("a-reply", "msg_2", SAID),
+        ];
+        assert_eq!(
+            report(&jsonl(&rows), DoneBy::Failed).map(|r| (r.text, r.uuid)),
+            Ok((SAID.to_string(), "a-reply".to_string())),
+            "{opener}"
+        );
+    }
+    let checked = [
+        user("u-task", "Fix it."),
+        says("a-1", "msg_1", "Reading the grammar."),
+        user("u-check", DONE_CHECK),
+        says("a-reply", "msg_2", SAID),
+    ];
+    assert_ne!(
+        read_items(&items(&jsonl(&checked)), DoneBy::Turn).0,
+        DoneBy::Failed,
+        "another rule never reads as this one"
+    );
+    assert_eq!(DoneBy::of_word(DoneBy::Failed.word()), Some(DoneBy::Failed));
 }

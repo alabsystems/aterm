@@ -344,13 +344,6 @@ pub(crate) struct StatsMark {
     pub(crate) frac: f32,
 }
 
-impl StatsMark {
-    /// The words a text surface and a reader say: `2 quiet`.
-    pub(crate) fn words(self) -> String {
-        format!("{} {}", self.count, self.kind.word())
-    }
-}
-
 /// Default `◔` arc for a quiet row or job whose `φ` was not read.
 pub(crate) const QUIET_ARC: f32 = 0.25;
 

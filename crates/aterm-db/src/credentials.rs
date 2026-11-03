@@ -952,8 +952,9 @@ fn decision_for(thread: &Thread, need: &Need) -> Option<Decision> {
 /// home holds a file. It stats the path and never reads it.
 fn holds(paths: &Paths, want: &Want) -> bool {
     want.hold_path(&paths.home).is_some_and(|path| {
-        std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
-    })
+        aterm_secrets::fsx::has_private_nonempty(&path, need::transfer::MAX_VALUE)
+    }) || matches!(want, Want::MailboxComponent(component)
+            if client::mailbox_component_held(paths, *component).unwrap_or(false))
 }
 
 /// One member's pass over `credentials/requests/1` (§9.1, §9.2): post this Mac's needs, take

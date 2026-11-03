@@ -392,7 +392,7 @@ pub(super) fn extract(
     max_entries: u64,
     opts: ExtractOptions,
 ) -> Result<TreeAccumulator, ExtractError> {
-    let mut file = File::open(archive)?;
+    let mut file = crate::metadata_io::open_regular(archive)?;
     let len = file.metadata()?.len();
     let cd = locate(&mut file, len)?;
     let budget = Rc::new(Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));

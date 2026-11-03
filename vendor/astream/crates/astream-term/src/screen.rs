@@ -32,8 +32,9 @@
 //! designations other than the G0/G1 ones below, `ESC =`/`ESC >`) and CSI
 //! sequences outside it (any with an intermediate byte, or a private marker
 //! other than `?`) are skipped whole;
-//! CMY/CMYK SGR (`38;3;…`, `38;4;…`) and truncated extended-colour forms are
-//! consumed *with* their sub-parameters and leave the pen unchanged; DEL, and C1 controls arriving
+//! CMY/CMYK SGR (`38;3;…`, `38;4;…`, `38:3:…`, `38;3:…`) and truncated extended-colour
+//! forms are consumed *with* their values and leave the pen unchanged, and so is the underline
+//! colour (58) in every spelling; DEL, and C1 controls arriving
 //! as UTF-8 (U+0080..U+009F), are ignored; malformed UTF-8 (overlong,
 //! surrogate, truncated, a stray continuation or 8-bit byte) yields one U+FFFD
 //! per maximal subpart (Unicode 3.9) — a control character never lands in a
@@ -71,8 +72,8 @@
 //!   wrap. The cursor is otherwise shared between the buffers and never moved
 //!   by a switch.
 //! * **24-bit truecolour SGR** (`38;2;r;g;b`, `48;2;r;g;b`, `38:2::r:g:b`,
-//!   `38:2:cs:r:g:b`, `38:2:r:g:b`, and their `48:2:…` counterparts) resolves
-//!   onto [`Cell::fg_rgb`] / [`Cell::bg_rgb`] (including `bce` erases and DECSC/DECRC),
+//!   `38:2:cs:r:g:b`, `38:2:r:g:b`, the same groups after `38;`, and their `48` counterparts)
+//!   resolves onto [`Cell::fg_rgb`] / [`Cell::bg_rgb`] (including `bce` erases and DECSC/DECRC),
 //!   while palette/default SGR codes clear the corresponding RGB override. A channel
 //!   past 255 is clamped to 255, as aterm clamps it; the standards leave it undefined,
 //!   xterm's `parse_extended_colors` drops the colour and Ghostty truncates the value.
@@ -174,7 +175,9 @@
 //!   one left of the cursor, a wide glyph's lead rather than its spacer. At
 //!   column 0 or the left margin none precedes it, even on a row that continues
 //!   the one above, so it takes the cursor's own cell (xterm's `char_was_written`
-//!   cleared by CR or a motion, Alacritty), the lead if that cell is a spacer.
+//!   cleared by CR or a motion, Alacritty), the lead if that cell is a spacer; a
+//!   glyph printed up to the left margin from outside it still precedes the cursor
+//!   until a motion comes ([`Screen::stepped_onto_margin`](Screen)).
 //!   After a motion elsewhere the cell left of the cursor is still the one, as in
 //!   aterm and Ghostty (xterm takes the cursor's own there). A glyph aterm joins to
 //!   the cluster before it attaches the same way: a skin-tone modifier after a wide
@@ -1303,6 +1306,11 @@ pub struct Screen {
     /// after anything else starts a cell of its own, even beside a cell whose last mark is a
     /// joiner, as aterm's `last_combining_was_zwj` has it.
     joiner_open: bool,
+    /// The cursor stands on the left margin past column 0 because printing the glyph left of it
+    /// put it there, from outside the margin: that glyph still takes a mark, where a cursor a
+    /// motion put there has none before it. A print sets it and every motion clears it, as
+    /// aterm's `follows_glyph` has it (xterm's `char_was_written` on this one column).
+    stepped_onto_margin: bool,
 }
 
 /// Maximum byte length of a sanitized `OSC 0` / `OSC 2` window title retained on [`Folder`].
@@ -1606,6 +1614,7 @@ impl Screen {
             bracketed_paste: false,
             synchronized_output: false,
             joiner_open: false,
+            stepped_onto_margin: false,
         }
     }
 
@@ -1878,7 +1887,8 @@ impl Screen {
             | ((self.focus_events as u8) << 1)
             | ((self.bracketed_paste as u8) << 2)
             | ((self.synchronized_output as u8) << 3)
-            | ((self.joiner_open as u8) << 4);
+            | ((self.joiner_open as u8) << 4)
+            | ((self.stepped_onto_margin as u8) << 5);
         if ext_modes != 0 {
             out.extend_from_slice(&[4, ext_modes]);
         }
@@ -1917,6 +1927,7 @@ impl Screen {
             self.col = last_col;
         }
         self.margin_wrap = false;
+        self.stepped_onto_margin = false;
     }
 
     /// Leave a wrap pending with the cursor on column `col`, in the one
@@ -1973,14 +1984,23 @@ impl Screen {
         }
     }
 
+    /// Whether a glyph precedes the cursor for a cluster to continue: one parked
+    /// under a pending wrap, or the one left of the cursor. Column 0 has none, and
+    /// a left margin none unless a print stepped onto it
+    /// ([`Self::stepped_onto_margin`]).
+    const fn has_active_base(&self) -> bool {
+        self.wrap_pending() || (self.col > 0 && (self.col != self.left || self.stepped_onto_margin))
+    }
+
     /// The cell a zero-width mark, or a glyph joining a cluster after a
     /// `U+200D`, attaches to: the parked glyph under a pending wrap, else the
-    /// one left of the cursor (the cursor's own cell at column 0 or the left
-    /// margin), and a wide glyph's lead rather than its spacer.
+    /// one left of the cursor (the cursor's own cell where
+    /// [`Self::has_active_base`] finds none), and a wide glyph's lead rather
+    /// than its spacer.
     fn active_base_col(&self) -> u16 {
         let prev_col = if self.wrap_pending() {
             self.grid_col()
-        } else if self.col != self.left && self.col > 0 {
+        } else if self.has_active_base() {
             self.col.saturating_sub(1)
         } else {
             self.col
@@ -2028,8 +2048,7 @@ impl Screen {
     /// columns when `U+FE0F` (VS16) attaches (`Astream.Term.TlaVariationWidth::WidenVs16`),
     /// matching `aterm`'s `widen_previous_cell_for_vs16` and `GridColumns::step`.
     fn try_widen_vs16(&mut self) -> bool {
-        let has_active_base = self.wrap_pending() || (self.col != self.left && self.col > 0);
-        if !has_active_base || self.cols < 2 {
+        if !self.has_active_base() || self.cols < 2 {
             return false;
         }
         let target_col = self.active_base_col();
@@ -2077,6 +2096,7 @@ impl Screen {
             self.col =
                 vs_cursor_advance_clamp(spacer_col.saturating_add(1) as u64, end as u64) as u16;
             self.margin_wrap = false;
+            self.note_print_end();
         }
         true
     }
@@ -2085,8 +2105,7 @@ impl Screen {
     /// (`Astream.Term.TlaVariationWidth::NarrowVs15`), matching `aterm`'s
     /// `narrow_previous_cell_for_vs15` and `GridColumns::step`.
     fn try_narrow_vs15(&mut self) -> bool {
-        let has_active_base = self.wrap_pending() || (self.col != self.left && self.col > 0);
-        if !has_active_base {
+        if !self.has_active_base() {
             return false;
         }
         let target_col = self.active_base_col();
@@ -2139,7 +2158,7 @@ impl Screen {
         // A glyph that continues the grapheme cluster before it attaches to
         // that cell without advancing the cursor or resolving a pending wrap
         // ([`joins_cluster`]).
-        if self.wrap_pending() || (self.col != self.left && self.col > 0) {
+        if self.has_active_base() {
             let joiner_open = self.joiner_open;
             let base_idx = self.idx(self.row, self.active_base_col());
             if let Some(base) = self.grid.get_mut(base_idx) {
@@ -2213,6 +2232,13 @@ impl Screen {
         } else {
             self.col = last.saturating_add(1);
         }
+        self.note_print_end();
+    }
+
+    /// A print moved the cursor: onto the left margin past column 0 only from outside it, with
+    /// the glyph it printed left of the cursor.
+    const fn note_print_end(&mut self) {
+        self.stepped_onto_margin = self.left > 0 && self.col == self.left;
     }
 
     /// xterm `WrapLine`: an index from the column the wrap was pending on
@@ -2491,6 +2517,7 @@ impl Screen {
             return;
         }
         self.margin_wrap = false;
+        self.stepped_onto_margin = false;
         self.col = self.left;
         let n = n.min(
             self.scroll_bottom
@@ -2524,6 +2551,7 @@ impl Screen {
     /// the corner of the margins under origin mode. Resolves a wrap.
     const fn home(&mut self) {
         self.margin_wrap = false;
+        self.stepped_onto_margin = false;
         if self.origin {
             self.row = self.scroll_top;
             self.col = self.left;
@@ -2621,6 +2649,7 @@ impl Screen {
     }
 
     const fn tab(&mut self) {
+        self.stepped_onto_margin = false;
         // Advance to the next 8-column tab stop, not past the line's end: the
         // right margin, or the screen's edge for a cursor already past it (as
         // aterm and Ghostty; xterm's TabToNextStop pulls such a cursor back
@@ -2653,6 +2682,7 @@ impl Screen {
         let last_row = self.rows.saturating_sub(1);
         let last_col = self.cols.saturating_sub(1);
         self.margin_wrap = false;
+        self.stepped_onto_margin = false;
         self.row = if row < last_row { row } else { last_row };
         self.col = if col < last_col { col } else { last_col };
     }
@@ -2788,8 +2818,17 @@ impl Screen {
 
     /// Apply an SGR parameter list. `sub[i]` marks `params[i]` as a `:`
     /// sub-parameter of the preceding parameter (`38:5:196`, `38:2::r:g:b`) rather than a
-    /// `;`-separated parameter of its own; a colon group is handled as one unit so
-    /// a sub-parameter is never re-dispatched as a top-level code.
+    /// `;`-separated parameter of its own; a colon group is handled as one unit, and a
+    /// sub-parameter is never a code: one a semicolon colour's values stopped short of
+    /// (`38;5;9:4`) is skipped, where xterm runs it as a code. An empty last element is an
+    /// element (`38:2:cs:r:g:` has a blue of 0, as in xterm's `CASE_ESC_COLON`), and aterm's
+    /// parser delivers it alike.
+    ///
+    /// **One rule for 38, 48 and 58, aterm's `handle_sgr_with_subparams` too.** A colon on
+    /// the code or on the selector makes a group that is all the colour's (`38:2:…`,
+    /// `38;2:…`: "after the first colon, colons must be used", xterm's ctlseqs), and the
+    /// group is read by [`parse_colon_colour`]. Otherwise it is all semicolons, read by
+    /// [`parse_extended`].
     fn sgr(&mut self, params: &[u16], sub: &[bool]) {
         if params.is_empty() {
             self.pen = Pen::reset();
@@ -2797,9 +2836,10 @@ impl Screen {
         }
         let mut i = 0;
         while let Some(&param) = params.get(i) {
-            let mut end = i.saturating_add(1);
-            while end < params.len() && matches!(sub.get(end), Some(&true)) {
-                end = end.saturating_add(1);
+            let end = colon_group_end(sub, i, params.len());
+            if matches!(sub.get(i), Some(&true)) {
+                i = end;
+                continue;
             }
             if end > i.saturating_add(1) {
                 if let Some(group) = params.get(i..end) {
@@ -2833,16 +2873,20 @@ impl Screen {
                 49 => self.pen.set_bg_color(Color::Default),
                 90..=97 => self.pen.set_fg_color(sgr_fg_bright(param)),
                 100..=107 => self.pen.set_bg_color(sgr_bg_bright(param)),
-                38 => match parse_extended(params, &mut i) {
+                38 => match parse_extended(params, sub, &mut i) {
                     Some(ExtendedColor::Palette(idx)) => self.pen.set_fg_color(Color::Indexed(idx)),
                     Some(ExtendedColor::Rgb(r, g, b)) => self.pen.set_fg_rgb(r, g, b),
                     None => {}
                 },
-                48 => match parse_extended(params, &mut i) {
+                48 => match parse_extended(params, sub, &mut i) {
                     Some(ExtendedColor::Palette(idx)) => self.pen.set_bg_color(Color::Indexed(idx)),
                     Some(ExtendedColor::Rgb(r, g, b)) => self.pen.set_bg_rgb(r, g, b),
                     None => {}
                 },
+                // The underline colour is not modelled; its arguments are still its own.
+                58 => {
+                    let _ = parse_extended(params, sub, &mut i);
+                }
                 _ => {}
             }
             i = i.saturating_add(1);
@@ -2973,6 +3017,7 @@ impl Screen {
         };
         self.inactive = Some(std::mem::replace(&mut self.grid, alt));
         self.altscreen = true;
+        self.stepped_onto_margin = false;
     }
 
     /// Swap the main buffer back (xterm `FromAlternate`), keeping the alternate
@@ -2985,6 +3030,7 @@ impl Screen {
             self.inactive = Some(std::mem::replace(&mut self.grid, main));
         }
         self.altscreen = false;
+        self.stepped_onto_margin = false;
     }
 
     /// xterm's `ClearScreen` (util.c): reset the pending wrap and fill the
@@ -3071,6 +3117,7 @@ impl Screen {
         };
         self.col = saved_col;
         self.margin_wrap = false;
+        self.stepped_onto_margin = false;
         if saved.col >= self.cols || saved.margin_wrap {
             self.set_wrap_at(saved_col);
         }
@@ -3132,6 +3179,7 @@ impl Screen {
         self.scroll_bottom = rows.saturating_sub(1);
         self.left = 0;
         self.right = cols.saturating_sub(1);
+        self.stepped_onto_margin = false;
     }
 }
 
@@ -3528,16 +3576,37 @@ fn reflow(old: &[Cell], old_cols: u16, old_rows: u16, new_cols: u16, new_rows: u
     g
 }
 
-/// Parse the `;`-form extended colour selector after a `38`/`48` at `params[*i]`,
-/// advancing `i` past everything it consumed. `;5;n` selects a palette colour;
-/// `;2;r;g;b` selects a 24-bit RGB colour (or leaves the pen unchanged if truncated).
-/// CMY `;3;c;m;y` and CMYK `;4;c;m;y;k` are consumed *with* their sub-parameters
-/// and leave the pen unchanged; any other selector consumes itself.
+/// One past the last sub-parameter of the colon group that starts at `params[start]`.
+fn colon_group_end(sub: &[bool], start: usize, len: usize) -> usize {
+    let mut end = start.saturating_add(1);
+    while end < len && matches!(sub.get(end), Some(&true)) {
+        end = end.saturating_add(1);
+    }
+    end
+}
+
+/// Parse the colour after a `38`/`48`/`58` at `params[*i]` that carries no colon of its own,
+/// advancing `i` to the last parameter it consumed.
+///
+/// A selector that opens a colon group (`;2:cs:r:g:b`, `;5:n`) is that group, read as
+/// [`parse_colon_colour`] reads the same group after `38:`, and it ends the colour.
+///
+/// Otherwise it is all semicolons, a form T.416 does not have and konsole gave programs: `;5;n`
+/// selects a palette colour; `;2;r;g;b` selects a 24-bit RGB colour with no id (or leaves the pen
+/// unchanged if truncated). CMY `;3;c;m;y` and CMYK `;4;c;m;y;k` are consumed *with* their values
+/// and leave the pen unchanged, where xterm consumes the selector and runs the values as SGR
+/// codes: nothing renders these colours and a colour's values are not attributes. Any other
+/// selector consumes itself.
 #[allow(clippy::manual_map)]
-fn parse_extended(params: &[u16], i: &mut usize) -> Option<ExtendedColor> {
+fn parse_extended(params: &[u16], sub: &[bool], i: &mut usize) -> Option<ExtendedColor> {
     let last = params.len().saturating_sub(1);
     let i1 = i.saturating_add(1);
     let i2 = i.saturating_add(2);
+    let group_end = colon_group_end(sub, i1, params.len());
+    if group_end > i2 {
+        *i = group_end.saturating_sub(1);
+        return params.get(i1..group_end).and_then(parse_colon_colour);
+    }
     let (after_selector, colour) = match params.get(i1) {
         None => return None,
         Some(5) => {
@@ -3604,9 +3673,13 @@ const fn sgr_bg_bright(param: u16) -> Color {
     }
 }
 
-/// The `:`-form colour sub-parameters after `38`/`48`: `5:n` selects a palette
-/// colour; `2:cs:r:g:b` (ITU T.416 with optional colour-space id, including `2::r:g:b`)
-/// and `2:r:g:b` select a 24-bit RGB colour; truncated forms leave the pen unchanged.
+/// A colour's colon group, its selector first, wherever the first colon fell (`38:2:…`, `38;2:…`).
+/// `5:n` selects a palette colour. `2:cs:r:g:b` selects a 24-bit RGB colour, the second element
+/// the colour-space id (ITU T.416 13.1.8, empty in `2::r:g:b`) and any past the blue its elements
+/// 6 to 8, none of which means anything here. `2:r:g:b`, which programs emit, has no id slot: only
+/// the count tells them apart, four values or three, as in xterm's `parse_extended_colors`,
+/// Ghostty, kitty and iTerm2. A shorter group, and any other selector (CMY `3:cs:c:m:y`, CMYK
+/// `4:cs:c:m:y:k`), leaves the pen unchanged.
 const fn parse_colon_colour(sub: &[u16]) -> Option<ExtendedColor> {
     match *sub {
         [5, n, ..] => Some(ExtendedColor::Palette(

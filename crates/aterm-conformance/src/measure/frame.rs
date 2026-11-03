@@ -74,7 +74,7 @@ impl Frame {
     /// # Errors
     /// The file cannot be read, or is not a PNG.
     pub fn load(path: &Path) -> Result<Self, FrameError> {
-        Self::decode_png(&std::fs::read(path).map_err(FrameError::Io)?)
+        Self::decode_png(&crate::measure::read_regular_file(path).map_err(FrameError::Io)?)
     }
 
     /// Set the pixel at `(x, y)`.

@@ -257,8 +257,8 @@ pub(crate) fn held_refusal_text(
     )
 }
 
-/// Whether a `turn` re-press would only queue another Enter behind input the program has not read yet.
-pub(crate) fn repress_would_queue(sink: &SinkWriter) -> bool {
+/// Whether the session holds input its program has not read yet.
+pub(crate) fn input_unread(sink: &SinkWriter) -> bool {
     sink.input_backlog().is_some_and(|b| b.unread() > 0)
 }
 
@@ -3532,29 +3532,32 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "macos")]
     fn pty_job(script: &str) -> (i32, i32, ReapJob, i32) {
-        use aterm_uds::spawnfd::InheritNothing as _;
-        use std::os::fd::BorrowedFd;
-        use std::os::unix::process::CommandExt;
-        let (master, slave) = raw_pty_pair();
-        // SAFETY: `slave` is an open PTY slave fd owned by this test.
-        let slave_fd = unsafe { BorrowedFd::borrow_raw(slave) };
-        let stdio = || std::process::Stdio::from(slave_fd.try_clone_to_owned().expect("dup slave"));
-        let mut job = std::process::Command::new("/bin/sh");
-        job.inherit_nothing()
-            .args(["-c", script])
-            .stdin(stdio())
-            .stdout(stdio())
-            .stderr(stdio());
-        // SAFETY: pre-exec child closure calls only async-signal-safe `setsid` and `ioctl(TIOCSCTTY)`.
-        unsafe {
-            job.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let job = ReapJob(job.spawn().expect("spawn the job"));
+        use std::os::fd::{AsRawFd as _, IntoRawFd as _};
+        let (master, slave, child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
+            // SAFETY: zeroed `termios` is valid and filled by `tcgetattr` on the open slave fd.
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: `slave` is open and `t` is a valid out-param.
+            if unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut t) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `t` is an initialized termios.
+            unsafe { libc::cfmakeraw(&mut t) };
+            t.c_cc[libc::VMIN] = 1;
+            t.c_cc[libc::VTIME] = 0;
+            // SAFETY: `t` is a valid termios for the open slave.
+            if unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &t) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut job = std::process::Command::new("/bin/sh");
+            job.args(["-c", script])
+                .stdout(std::process::Stdio::from(slave.try_clone()?))
+                .stderr(std::process::Stdio::from(slave.try_clone()?));
+            Ok(job)
+        })
+        .expect("spawn the job");
+        let (master, slave) = (master.into_raw_fd(), slave.into_raw_fd());
+        aterm_pty::set_nonblocking(master, true).expect("nonblocking master");
+        let job = ReapJob(child);
         let leader = libc::pid_t::try_from(job.0.id()).expect("pid");
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         // SAFETY: `tcgetpgrp` only reads the live master's foreground group.

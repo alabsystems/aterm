@@ -100,6 +100,33 @@ const fn text(rows: &'static [&'static str], cursor: (u16, u16)) -> Want {
 
 pub const EXCLUSIONS: &[Exclusion] = &[
     Exclusion {
+        case: "sgr_past_the_parameter_cap",
+        triage: Triage::ByDesign { diverges: |_| true },
+        want: Want {
+            rows: &["XY"],
+            cursor: (0, 2),
+            wrap: false,
+            alt: false,
+            inks: &[(
+                0,
+                0,
+                2,
+                Ink {
+                    reverse: true,
+                    ..Ink::PLAIN
+                },
+            )],
+        },
+        why: "aterm's parser keeps 24 parameters (`aterm_parser::MAX_PARAMS`) and drops the rest; \
+              the fold caps a list at 128 bytes and keeps every value in them, so the fold draws \
+              the (10, 20, 9) and the bold that aterm drops. xterm drops too, past its NPARAM of \
+              30 (charproc.c `CASE_ESC_COLON`, `CASE_ESC_SEMI`). What aterm holds to is that a \
+              colon group the cap cut names no colour rather than a wrong one: the parser marks \
+              the mask's bit 24 when it drops a sub-parameter, and the id is never read as red \
+              (colours.rs `a_colour_the_parameter_cap_cuts_is_never_misread`). The generator \
+              keeps each SGR to 24 parameters, and reaches exactly 24.",
+    },
+    Exclusion {
         case: "decrc_under_origin_mode_above_the_region",
         triage: Triage::ByDesign {
             diverges: |c| c.origin_mode,

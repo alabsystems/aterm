@@ -1478,14 +1478,14 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "harness.stall_term_after_s",
-        "Seconds a frozen agent stands before a warning",
+        "Seconds a frozen agent stands before it is restarted",
         ConfigSchemaKind::Scalar(EditKind::Integer),
         &["supervisor", "frozen", "stall", "relaunch"],
         true,
     ),
     manual(
         "harness.stall_term",
-        "Restart a frozen agent instead of warning",
+        "Restart a frozen agent",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &[
             "supervisor",
@@ -5706,11 +5706,9 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         "harness.model_fallback" => {
             " · Claude Code only, for that session alone · none: wait for the reset"
         }
-        "harness.stall_term_after_s" => {
-            " · with stall_term on, the agent is restarted instead · 0: never"
-        }
+        "harness.stall_term_after_s" => " · with stall_term off, a warning instead · 0: never",
         "harness.stall_term" => {
-            " · restarted as aterm ctl restart does, for its relaunch, once it has stood stall_term_after_s"
+            " · restarted as aterm ctl restart does, for its relaunch, once it has stood stall_term_after_s · off: a warning instead"
         }
         "harness.memory_ceiling" => {
             " · auto, off or a number of GiB · the agent is restarted only when the Mac is short of memory and it holds the most"
@@ -5719,7 +5717,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · once each time a call stops making progress, and once while macOS's program check holds programs of its calls, on a prompt aterm types anyway, only when it fits whole · off: none"
         }
         "harness.stuck_break_note" => {
-            " · off by default · on: one line of aterm's own at a break of the agent's background work, once each time a call stops making progress, and once while macOS's program check holds programs of its calls"
+            " · on: one line of aterm's own at a break of the agent's background work, once each time a call stops making progress, and once while macOS's program check holds programs of its calls"
         }
         "harness.upgrade_ask" => {
             " · asks the agent to reach a stopping point and answer READY first · off: a session moves only when it is idle"
@@ -5755,7 +5753,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · default true: while the harness carries a Claude Code session (Autopilot cruise or land, its claim this window's), its launch card wears a rainbow border, a pixel-art kitty riding a rainbow with stars, and the line `✦ enhanced by alab claude harness <harness version> · alab.systems` (the site's name a link), and under Autopilot off the same card in white; banners over Claude Code's update notice and its startup announcement name and link alab.systems — glass only; false leaves the card bare · read live"
         }
         "keeper.enabled" => {
-            " · read at launch; on, every terminal is registered with this build's PTY keeper (`aterm keeper start` runs one) and a launch after a crash or kill reattaches the shells it held · macOS only"
+            " · default true · read at launch; on, a window of an app bundle starts this build's PTY keeper if none runs, every terminal is registered with it, and a launch after a crash or kill reattaches the shells it held; off: `aterm keeper stop` ends the one running · macOS only"
         }
         "fleet.peers.host" => {
             " · host[:port] or [IPv6]:port, the port 7100 when none is written; listed and checked by `aterm fleet peers`"

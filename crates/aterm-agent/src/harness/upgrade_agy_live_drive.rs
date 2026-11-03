@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use super::super::super::upgrade_agy_live::{self as live, Look, Message, Open};
 use super::super::build_start;
-use super::super::upgrade::{Agent, Phase};
+use super::super::upgrade::{Agent, Phase, same_build};
 use super::super::{
-    Client, Due, Hand, LiveTab, Opts, Report, St, Terminated, connect, held, load,
+    Client, Due, Hand, LiveTab, Opts, Report, SAME_PROGRAM, St, Terminated, connect, held, load,
     managed_agent_twin, now_s, restore, said, save, save_checked, screen, store_version, terminate,
 };
 use super::{AgyKernel, ag, carry_in_flight_with, key, ledger, plan, relaunch_held};
@@ -47,9 +47,7 @@ pub(super) struct Move {
 /// A store build's version as its record names it, only where the record
 /// and the build's directory agree ([`live::build_version`]).
 fn build_record(exe: &Path) -> Option<String> {
-    let version = store_version(exe)?;
-    let dir = exe.parent()?.parent()?.file_name()?.to_str()?;
-    live::build_version(&version, Some(dir)).map(|_| version)
+    ag::store_build(exe).then(|| store_version(exe)).flatten()
 }
 
 /// The executable a managed twin's wrapper names.
@@ -642,7 +640,7 @@ pub(super) fn upgrade_visit(
     let Some(exe) = k.exe(pid) else {
         return Some(said(r, format!("wait:{}", super::super::UNREAD_PROCESS)));
     };
-    let (mv, rotation) = match behind(&exe, twin.clone()) {
+    let (mut mv, rotation) = match behind(&exe, twin.clone()) {
         Ok(Some(mv)) => {
             let rot = wall_screen_model(opts, &tab).and_then(|screen_model| {
                 rotation_due_at(
@@ -713,18 +711,29 @@ pub(super) fn upgrade_visit(
     let (Some(lock), Some(conversation)) = (run.lock.clone(), snap.session.clone()) else {
         return Some(said(r, "wait:no-session"));
     };
+    let held_word = prior.as_ref().and_then(|st| {
+        st.held_managed_move(
+            Agent::Agy,
+            &tab,
+            &conversation,
+            (&mv.running, &mv.target),
+            now_s(),
+        )
+    });
     if rotation.is_none()
-        && let Some(word) = prior.as_ref().and_then(|st| {
-            st.held_managed_move(
-                Agent::Agy,
-                &tab,
-                &conversation,
-                (&mv.running, &mv.target),
-                now_s(),
-            )
-        })
+        && let Some(word) = held_word
     {
         return Some(said(r, format!("wait:{word}")));
+    }
+    let move_held = rotation.is_some()
+        && !same_build(Agent::Agy, &mv.running, &mv.target)
+        && held_word.is_some();
+    if move_held {
+        mv = Move {
+            running: mv.running.clone(),
+            target: mv.running,
+            twin: exe.clone(),
+        };
     }
     let (config, started_ms) = (run.config.clone(), run.started_ms);
     let Ok(mut c) = connect(opts, &tab) else {
@@ -757,6 +766,16 @@ pub(super) fn upgrade_visit(
         st.argv = ag::with_model(&st.argv, &rot.to);
         st.cause = format!("{}{}", super::super::super::relaunch::CAUSE_MODEL, rot.to);
         st.quiet = !at_wall;
+        if move_held {
+            st.source = SAME_PROGRAM.to_string();
+        }
+    }
+    if let Some(prior) = prior.as_ref() {
+        if !st.is_upgrade() && same_build(Agent::Agy, &st.from, &st.to) {
+            prior.kept_by_restart(&tab, &mut st);
+        } else {
+            prior.retried_by(&mut st);
+        }
     }
     match plan(opts, &st, k) {
         Ok(_) => {}

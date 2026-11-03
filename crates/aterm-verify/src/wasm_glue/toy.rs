@@ -80,7 +80,7 @@ fn run(
 ) -> Result<(), Refused> {
     let failed = Refused::Failed;
     let module = build(root, rustup, work, log).map_err(failed)?;
-    let bytes = std::fs::read(&module)
+    let bytes = crate::read_regular(&module)
         .map_err(|e| failed(format!("could not read {}: {e}", module.display())))?;
     let found = host_paths(&bytes, root);
     if !found.is_empty() {
@@ -110,7 +110,7 @@ fn run(
                 .map_err(|e| failed(format!("could not write {}: {e}", path.display())))?;
             continue;
         }
-        let want = std::fs::read_to_string(&path).map_err(|e| {
+        let want = crate::read_regular_text(&path).map_err(|e| {
             failed(format!(
                 "no golden {} ({e}): run `targo --unverified verify glue --record-toy` and \
                  review it",
@@ -138,7 +138,7 @@ fn run(
         .map_err(|e| failed(format!("could not create {}: {e}", planted.display())))?;
     for entry in std::fs::read_dir(&out).map_err(|e| failed(format!("{}: {e}", out.display())))? {
         let entry = entry.map_err(|e| failed(e.to_string()))?;
-        let mut contents = std::fs::read(entry.path()).map_err(|e| failed(e.to_string()))?;
+        let mut contents = crate::read_regular(entry.path()).map_err(|e| failed(e.to_string()))?;
         if entry.file_name().to_string_lossy().ends_with(".js") {
             let text = String::from_utf8_lossy(&contents);
             if !text.contains("return ret$ >>> 0;") {
@@ -227,7 +227,7 @@ pub(super) fn stage(root: &Path, dir: &Path) -> Result<PathBuf, String> {
         std::fs::copy(from.join("Cargo.toml"), to.join("Cargo.toml"))
             .map_err(|e| format!("could not copy {name}'s manifest: {e}"))?;
     }
-    let ws = std::fs::read_to_string(root.join("Cargo.toml"))
+    let ws = crate::read_regular_text(root.join("Cargo.toml"))
         .map_err(|e| format!("could not read the workspace manifest: {e}"))?;
     let mut deps = String::from("[workspace.dependencies]\n");
     for line in tables(&ws, "[workspace.dependencies]").lines() {
@@ -249,7 +249,7 @@ pub(super) fn stage(root: &Path, dir: &Path) -> Result<PathBuf, String> {
         tables(&ws, "[workspace.package]"),
         tables(&ws, "[workspace.lints"),
     );
-    let manifest = std::fs::read_to_string(toy.join("Cargo.toml"))
+    let manifest = crate::read_regular_text(toy.join("Cargo.toml"))
         .map_err(|e| format!("could not read the toy's manifest: {e}"))?;
     if !manifest.contains("path = \"../..\"") || !manifest.contains("\n[workspace]\n") {
         return Err(

@@ -2649,7 +2649,7 @@ fn dedicated(lane: &Lane<'_>, v: &mut Verdict) -> Result<(), Fail> {
     let why = why(lane)?;
     let head = format!("worker: @{wsid} over at ");
     let tail = format!(
-        "(finished); free space rose {} while it ran",
+        "free space rose {} while it ran",
         aterm_agent::harness::disk::human_bytes(rose)
     );
     v.check(
@@ -2658,7 +2658,9 @@ fn dedicated(lane: &Lane<'_>, v: &mut Verdict) -> Result<(), Fail> {
             && why
                 .1
                 .iter()
-                .any(|l| l.contains(&head) && l.contains(&tail)),
+                .any(|l| l.contains(&head)
+                    && l.contains("(finished: it finished its task)")
+                    && l.contains(&tail)),
         || why.1.join("\n"),
     );
     received_as(lane, v, &none);
@@ -3345,12 +3347,12 @@ mod tests {
         let rows = ask_rows(concat!(
             "{\"ts\":\"t1\",\"kind\":\"free-ask\",\"said\":\"worker\",\"sid\":\"\"}\n",
             "{\"ts\":\"t2\",\"kind\":\"free-ask\",\"said\":\"worker-started\",\"sid\":\"s-w\"}\n",
-            "{\"ts\":\"t3\",\"kind\":\"free-ask\",\"said\":\"worker-over\",\"sid\":\"s-w\",\"why\":\"stalled:startup\"}\n",
+            "{\"ts\":\"t3\",\"kind\":\"free-ask\",\"said\":\"worker-over\",\"sid\":\"s-w\",\"why\":\"failed:could-not-finish\"}\n",
         ));
         assert_eq!(count(&rows, "worker", ""), 1, "only the claim");
         assert_eq!(
             (rows[2].said.as_str(), rows[2].why.as_str()),
-            ("worker-over", "stalled:startup")
+            ("worker-over", "failed:could-not-finish")
         );
         assert_eq!(worker_sids(&rows, 0), ["s-w"]);
         assert!(worker_sids(&rows, 3).is_empty());

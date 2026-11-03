@@ -64,14 +64,17 @@ pub(crate) const fn landing_mark(
 /// THE WORK FLOOR OF AN END (§11.2.3, items 1 and 3): a landing marks the tab only after this much of the agent's busy time since its task opened — the kitty's own line between a quick success and a build (`kitty_pet::CHEER_BIG_MS`), kept apart and named for what it guards: a cold restore's first point, a move from open over whatever busy time this process saw of the session, arms nothing for a reply under it.
 pub(crate) const END_WORK_MS: u64 = 30_000;
 
-/// THE ONE END (§11.2.3, item 1): the move from `was` to `face`, after `worked_ms` of the agent's busy time since the task opened, is a task that CAME DOWN — under Autopilot Cruise / Land only a landing: `face` is landed, `was` a face the window knew (open, theirs; never "unknown", `None`, the host's word between loop runs and a new process's first, whose next face is a restatement: [`is_an_end`]'s rule), and the work at least [`END_WORK_MS`].
+/// THE ONE END (§11.2.3, item 1): the move from `was` to `face`, after `worked_ms` of the agent's busy time since the task opened, is a task that CAME DOWN — under Autopilot Cruise / Land only a landing: `face` is landed, `was` a face the window knew (open, theirs, failed; never "unknown", `None`, the host's word between loop runs and a new process's first, whose next face is a restatement: [`is_an_end`]'s rule), and the work at least [`END_WORK_MS`].
 #[must_use]
 pub(crate) fn is_a_task_end(
     was: Option<TaskFace>,
     face: TaskFace,
     worked_ms: u64,
 ) -> Option<EndFace> {
-    let known = matches!(was, Some(TaskFace::Open | TaskFace::Theirs));
+    let known = matches!(
+        was,
+        Some(TaskFace::Open | TaskFace::Theirs | TaskFace::Failed)
+    );
     EndFace::of(face).filter(|_| known && worked_ms >= END_WORK_MS)
 }
 
@@ -274,19 +277,170 @@ impl App {
         let Some(face) = end else {
             return;
         };
-        let Some(sid) = self
-            .pool
-            .get(session)
-            .map(|s| s.ctx.self_id.as_str().to_string())
-        else {
+        let Some((sid, own_report)) = self.pool.get(session).map(|s| {
+            let own_report = s
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .task()
+                .is_some_and(|task| {
+                    crate::task_record::reports_its_own_end(task.trusted_cwd.as_deref())
+                });
+            (s.ctx.self_id.as_str().to_string(), own_report)
+        }) else {
             return;
         };
+        // A worker with its own report of its end has that one alone, a landing too: a claim
+        // worker's record, which may have waited for this landing's receipt, is told now.
+        if own_report {
+            self.note_worker_conclusion(session);
+            return;
+        }
         let place = self.upgrade_place(&sid);
         let line_place = self.session_place(&sid);
         if let Some(record) = task_record(&sid, &place, &line_place, face, receipt) {
             self.record_message(record);
         }
     }
+}
+
+impl crate::App {
+    /// A WORKER'S FAILED CONCLUSION, TOLD ONCE at the record's move, by whatever moved it (the
+    /// worker's own word, its exit, an Autopilot Off, an expiry): a record in Messages always, and,
+    /// where nobody waits on it (`from=ctl`, or a manager this window saw close,
+    /// [`Self::note_manager_gone`]), a fact for the owner's later look. A live manager hears through
+    /// `await task`, and a `from` this window does not know may be a manager on another Mac, so it
+    /// is not said to be nobody. Never an alert (a concluded worker needs nobody now), and a stall
+    /// keeps its need instead. A person who turned it Off did it themselves, and a worker with its
+    /// own report of its end has only that ([`crate::task_record::reports_its_own_end`]): a credit
+    /// claim's worker gets its claim-worker record here, finished or not, and the disk worker its
+    /// disk-worker record from the disk watch. A record a restart carried was told by the process
+    /// that moved it. The entry goes when no failed conclusion stands, whichever process raised it.
+    pub(crate) fn note_worker_conclusion(&mut self, session: u64) {
+        let Some(ctx) = self.pool.get(session).map(|s| s.ctx.clone()) else {
+            return;
+        };
+        let record = ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .task()
+            .cloned();
+        let sid = ctx.self_id.as_str().to_string();
+        let claim = record.as_ref().is_some_and(|r| {
+            r.trusted_cwd.as_deref().is_some_and(|folder| {
+                aterm_agent::harness::credit_offers::is_claim_folder(std::path::Path::new(folder))
+            })
+        });
+        let told = record.as_ref().filter(|r| {
+            if claim {
+                r.conclusion().is_some() && r.state != TaskState::Stalled
+            } else {
+                told_as_failed(r)
+            }
+        });
+        let Some(record) = told else {
+            self.worker_end_told.remove(&session);
+            self.except_end(&crate::message_reporters::worker_failed_key(&sid));
+            return;
+        };
+        // A claim worker's landing is told with what its reply said, which its face's move brings
+        // ([`Self::harness_task_moved`] tells it then), so a record that moved first waits for it.
+        let said = claim
+            .then(|| {
+                let timeline = ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                timeline.land_receipt().map(|receipt| {
+                    aterm_agent::supervise::mode_words::said_within(
+                        receipt,
+                        aterm_messages::DETAIL_LINE_CAP,
+                    )
+                })
+            })
+            .flatten();
+        if claim && record.why == Some(crate::task_record::WHY_LANDED) && said.is_none() {
+            return;
+        }
+        if self.worker_end_told.insert(session, record.entered) == Some(record.entered)
+            || record.carried_entered == Some(record.entered)
+        {
+            return;
+        }
+        if claim {
+            let failed = (record.conclusion() == Some(crate::task_record::Conclusion::Failed))
+                .then(|| crate::task_record::failed_words(record.state, record.why));
+            let place = self.upgrade_place(&sid);
+            self.record_message(crate::message_reporters::credit_claim_worker_record(
+                &sid,
+                &place,
+                failed.as_deref(),
+                said.as_deref(),
+            ));
+            return;
+        }
+        if crate::task_record::reports_its_own_end(record.trusted_cwd.as_deref()) {
+            return;
+        }
+        let words = crate::task_record::failed_words(record.state, record.why);
+        let place = self.upgrade_place(&sid);
+        self.record_message(crate::message_reporters::worker_failed_record(
+            &sid, &place, &words,
+        ));
+        if record.from == crate::task_record::FROM_CTL || self.managers_gone.contains(&record.from)
+        {
+            self.raise_worker_failed_fact(&sid, record);
+        }
+    }
+
+    /// THE FACT THAT NOBODY WAITS ON A FAILED WORKER ([`Self::note_worker_conclusion`]).
+    fn raise_worker_failed_fact(&mut self, sid: &str, record: &TaskRecord) {
+        if record.why == Some(crate::task_record::WHY_OFF) {
+            return;
+        }
+        let words = crate::task_record::failed_words(record.state, record.why);
+        let spot = self.upgrade_spot(sid);
+        let entry = crate::message_reporters::worker_failed_entry(sid, &spot, &words);
+        self.except(&entry);
+    }
+
+    /// THE MANAGER `manager` (a session of this window, by its sid) CLOSED: its workers that already
+    /// failed have nobody waiting on them now, and a worker of its that fails later has nobody
+    /// either ([`Self::note_worker_conclusion`]).
+    pub(crate) fn note_manager_gone(&mut self, manager: &str) {
+        let workers: Vec<(String, TaskRecord)> = self
+            .pool
+            .iter()
+            .filter_map(|s| {
+                let timeline = s
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let record = timeline.task().filter(|r| r.from == manager)?.clone();
+                Some((s.ctx.self_id.as_str().to_string(), record))
+            })
+            .collect();
+        if workers.is_empty() {
+            return;
+        }
+        self.managers_gone.insert(manager.to_string());
+        for (sid, record) in &workers {
+            if told_as_failed(record)
+                && !crate::task_record::reports_its_own_end(record.trusted_cwd.as_deref())
+            {
+                self.raise_worker_failed_fact(sid, record);
+            }
+        }
+    }
+}
+
+/// Whether `record` is a failed conclusion the owner is told of: a stall keeps its need instead.
+fn told_as_failed(record: &TaskRecord) -> bool {
+    record.conclusion() == Some(crate::task_record::Conclusion::Failed)
+        && record.state != TaskState::Stalled
 }
 
 /// Whether `record` is a worker's task still open to a landing: `working`, or stalled by a deadline (`startup`, `held`), as aterm's own loop reads one at its done edge.
@@ -473,12 +627,13 @@ fn reopen_self_claim_task(ctx: &crate::SessionCtx, local: u64) {
 ///   right after unknown restates a landing an earlier loop or process made, so every new
 ///   landing is a move from a face its loop told first.
 ///
-/// No other move is an end.
+/// No other move is an end: a move to [`TaskFace::Failed`] is the loop's failed conclusion, which
+/// the worker's task record tells ([`crate::App::note_worker_conclusion`]), never a landing.
 #[must_use]
 pub(crate) const fn is_an_end(was: Option<TaskFace>, face: TaskFace) -> bool {
     match face {
         TaskFace::Landed => was.is_some(),
-        TaskFace::Open | TaskFace::Theirs => false,
+        TaskFace::Open | TaskFace::Theirs | TaskFace::Failed => false,
     }
 }
 
@@ -494,7 +649,7 @@ pub(crate) fn task_record(
     use aterm_agent::supervise::mode_words;
     let head = match face {
         TaskFace::Landed => "Autopilot landed",
-        TaskFace::Open | TaskFace::Theirs => return None,
+        TaskFace::Open | TaskFace::Theirs | TaskFace::Failed => return None,
     };
     let line =
         |text: &str| atpkg::progress::sanitize_for_tty(text, aterm_messages::DETAIL_LINE_CAP);

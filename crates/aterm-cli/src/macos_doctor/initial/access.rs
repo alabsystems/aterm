@@ -13,8 +13,8 @@ use super::{HeldLock, Row, WAITING};
 use aterm_json::{Value, json};
 use aterm_types::macos_setup::opt_out::OptOut;
 use aterm_types::macos_setup::{
-    Access, AccessOutcome, LOCAL_NETWORK_ASKED, LOCAL_NETWORK_UNTOLD, Observation, Selection,
-    Setting, Standing, Subject, access_record, opt_out,
+    ACCESS_OFFERED, Access, AccessOutcome, LOCAL_NETWORK_ASKED, LOCAL_NETWORK_UNTOLD, Observation,
+    Selection, Setting, Standing, Subject, access_record, opt_out,
 };
 use std::path::Path;
 use std::sync::Mutex;
@@ -435,8 +435,14 @@ pub(super) struct Grants {
     pub lan: Lan,
     /// AXIsProcessTrusted, read only while a sign-out is managed.
     pub accessibility: Option<bool>,
+    /// The sign-outs' plan read and found no Messages or FaceTime account to sign out, so nothing
+    /// here waits on Accessibility.
+    pub no_sign_out_owed: bool,
     /// Why the person opted each grant out, in [`Access::ALL`] order ([`opted_out`]).
     pub opted_out: [Option<&'static str>; 5],
+    /// A person asked for macOS's grants ([`super::note_person_asked_for_access`]). Otherwise a
+    /// grant left to a person is on offer: it reads calm and holds nothing back.
+    pub acquiring: bool,
 }
 
 /// A row's description after a Not now in this approval: a new approval
@@ -509,6 +515,13 @@ pub(super) fn read(selection: Selection, records: &[(Access, AccessOutcome)]) ->
                 .ok()
         })
         .flatten();
+    // Asked only where the answer could take a need down; a plan that cannot read leaves the row
+    // as it reads.
+    let no_sign_out_owed = accessibility == Some(false)
+        && aterm_machines::init_accounts::accessibility_needed_selected(
+            &aterm_machines::port::Live::new(),
+            selection,
+        ) == Ok(false);
     let mut grants = Grants {
         fda,
         stable: !matches!(privacy.dr, DrClass::Cdhash | DrClass::Unsigned),
@@ -516,7 +529,9 @@ pub(super) fn read(selection: Selection, records: &[(Access, AccessOutcome)]) ->
         debugger,
         lan: Lan::of(last_answer(), records),
         accessibility,
+        no_sign_out_owed,
         opted_out: [None; 5],
+        acquiring: super::state_root().is_ok_and(|root| super::person_access_admits(&root)),
     };
     grants.opted_out = opted_out(
         Access::ALL.map(opt_out::get),
@@ -669,6 +684,12 @@ pub(super) fn observation(access: Access, grants: &Grants, selection: Selection)
                 None,
                 Some("Only the Messages and FaceTime sign-outs need it."),
             ),
+            Access::Accessibility if grants.no_sign_out_owed => (
+                Standing::NotNeeded,
+                None,
+                None,
+                Some("No Messages or FaceTime account here to sign out."),
+            ),
             Access::Accessibility => match grants.accessibility {
                 Some(true) => (Standing::InPlace, Some("On"), None, None),
                 Some(false) => (
@@ -680,6 +701,20 @@ pub(super) fn observation(access: Access, grants: &Grants, selection: Selection)
                 None => (Standing::Unknown, None, None, None),
             },
         };
+    // Nobody asked for macOS's grants: what only a person can give is offered, never waited on.
+    // The sign-outs' Accessibility stays their own stage's, which waits for a person by design,
+    // and a grant the person opted out of or refused reads as they chose ([`honor_opt_out`]),
+    // never offered again.
+    let (standing, note) = if managed
+        && !grants.acquiring
+        && access != Access::Accessibility
+        && opted(grants, access).is_none()
+        && matches!(standing, Standing::NeedsYou | Standing::Waiting)
+    {
+        (Standing::NotNeeded, Some(ACCESS_OFFERED))
+    } else {
+        (standing, note)
+    };
     let subject = Subject::Access(access);
     let seen = Observation {
         subject,
@@ -758,6 +793,9 @@ pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -
                 }
                 _ => (true, "on".to_owned()),
             },
+            (Standing::NotNeeded, _) if seen.note.as_deref() == Some(ACCESS_OFFERED) => {
+                (true, ACCESS_OFFERED.to_owned())
+            }
             (Standing::NotNeeded, _) => (
                 true,
                 format!(
@@ -791,6 +829,9 @@ pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -
                         .to_owned(),
                 )
             }
+            // Nobody asked for the steps, so none is coming: Local Network, which macOS tells
+            // nothing of, is asked by the first LAN use and holds this stage for nothing.
+            (_, None) if !grants.acquiring => (true, "macOS asks at the first use".to_owned()),
             (_, Some(outcome)) => (
                 true,
                 match outcome {
@@ -844,12 +885,76 @@ mod tests {
             debugger: Debugger::Off,
             lan: Lan::Untold,
             accessibility: Some(false),
+            no_sign_out_owed: false,
             opted_out: [None; 5],
+            acquiring: true,
         }
     }
 
     fn managed() -> Selection {
         Selection::all()
+    }
+
+    /// With nobody asking, what only a person can give is on offer and the stage completes: the
+    /// run finishes by itself. Negative control: a person's ask parks on the same grants.
+    #[test]
+    fn a_grant_nobody_asked_for_is_offered_and_completes_the_stage() {
+        let offered = Grants {
+            acquiring: false,
+            ..grants()
+        };
+        for access in [
+            Access::FullDiskAccess,
+            Access::DeveloperTools,
+            Access::Debugger,
+        ] {
+            let seen = observation(access, &offered, managed());
+            assert_eq!(seen.standing, Standing::NotNeeded, "{access:?}");
+            assert_eq!(seen.note.as_deref(), Some(ACCESS_OFFERED), "{access:?}");
+        }
+        assert_eq!(
+            observation(Access::Accessibility, &offered, managed()).standing,
+            Standing::NeedsYou,
+            "the sign-outs' own stage still waits for a person"
+        );
+        let rows = stage_rows(&offered, &[]);
+        assert!(rows.iter().all(|row| row.status == "ok"), "{rows:?}");
+        let asked = stage_rows(&grants(), &[]);
+        assert!(
+            asked.iter().any(|row| row.status == WAITING),
+            "CONTROL: {asked:?}"
+        );
+    }
+
+    /// A grant the person refused or opted out of reads as they chose with nobody asking, never
+    /// as offered again. Negative control: the same grant with no opt-out is on offer.
+    #[test]
+    fn a_grant_the_person_refused_is_not_offered_again() {
+        let mut refused = Grants {
+            acquiring: false,
+            lan: Lan::Off,
+            ..grants()
+        };
+        let slot = Access::ALL
+            .iter()
+            .position(|row| *row == Access::LocalNetwork)
+            .unwrap();
+        refused.opted_out[slot] = Some("You chose Don't Allow.");
+        let seen = observation(Access::LocalNetwork, &refused, managed());
+        assert_ne!(seen.note.as_deref(), Some(ACCESS_OFFERED), "{seen:?}");
+        assert_eq!(seen.detail.as_deref(), Some("You chose Don't Allow."));
+        assert!(matches!(
+            seen.standing,
+            Standing::InPlace | Standing::NotNeeded
+        ));
+        refused.opted_out[slot] = None;
+        assert_eq!(
+            observation(Access::LocalNetwork, &refused, managed())
+                .note
+                .as_deref(),
+            Some(ACCESS_OFFERED),
+            "CONTROL: no opt-out, on offer"
+        );
     }
 
     #[test]
@@ -882,6 +987,29 @@ mod tests {
         for access in Access::ALL {
             assert_eq!(observation(access, &g, managed()).wanted, "On");
         }
+    }
+
+    /// Accessibility is off and the sign-outs are selected, but their plan found no account: the
+    /// page asks for nothing it would not use.
+    #[test]
+    fn accessibility_is_no_need_while_no_account_waits_to_be_signed_out() {
+        let owed = grants();
+        assert_eq!(owed.accessibility, Some(false));
+        assert_ne!(
+            observation(Access::Accessibility, &owed, Selection::all()).standing,
+            Standing::NotNeeded,
+            "CONTROL: an account to sign out keeps the need"
+        );
+        let none_owed = Grants {
+            no_sign_out_owed: true,
+            ..owed
+        };
+        let row = observation(Access::Accessibility, &none_owed, Selection::all());
+        assert_eq!(row.standing, Standing::NotNeeded);
+        assert_eq!(
+            row.detail.as_deref(),
+            Some("No Messages or FaceTime account here to sign out.")
+        );
     }
 
     #[test]

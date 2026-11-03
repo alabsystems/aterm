@@ -134,6 +134,10 @@ pub struct FleetRoster {
     /// machine or none ([`carry_conflicting`]). Never written or said: [`Self::conflicts`] names
     /// the rows.
     pub(crate) conflicting: BTreeMap<String, SheetConflict>,
+    /// This Mac's machine label, where the lab registry's preferences made this fleet
+    /// ([`super::alab_roster::fleet_for`]): a sync then keeps every row it has
+    /// ([`super::alab_roster::retain`]) and writes no fleet file beside the roster.
+    pub alab: Option<String>,
 }
 
 impl FleetRoster {
@@ -551,10 +555,6 @@ fn parse_computer_cell(cell: &str) -> Option<(Vec<String>, Option<u32>)> {
     } else {
         Some((machines, slot))
     }
-}
-
-fn machines_from_email_hint(email: &str) -> Vec<String> {
-    email_machines_and_slot(email).0
 }
 
 pub(super) fn csv_records(mut text: &str) -> impl Iterator<Item = Result<&str, &'static str>> {
@@ -1304,6 +1304,7 @@ fn parse_sheet(csv_text: &str, source: &str, cli: Cli) -> Result<Sheet, String> 
             accounts,
             conflicts: conflicting.values().cloned().collect(),
             conflicting,
+            alab: None,
         },
         held,
     })
@@ -1311,7 +1312,7 @@ fn parse_sheet(csv_text: &str, source: &str, cli: Cli) -> Result<Sheet, String> 
 
 fn config_machine_id(config: Option<&Path>) -> Option<String> {
     let cfg_path = config?;
-    let text = fs::read_to_string(cfg_path).ok()?;
+    let text = super::ai_pool::read_bounded_text(cfg_path, 2 * 1024 * 1024)?;
     let table = aterm_toml::from_str::<aterm_toml::Table>(&text).ok()?;
     for section in ["ai", "fleet", "harness"] {
         if let Some(m) = table
@@ -1333,19 +1334,11 @@ thread_local! {
     static HOST_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn machine_record_id(home: &Path) -> Option<String> {
-    let text = fs::read_to_string(home.join(".aterm/machine.toml")).ok()?;
-    let table = aterm_toml::from_str::<aterm_toml::Table>(&text).ok()?;
-    table
-        .get("id")
-        .and_then(aterm_toml::Value::as_str)
-        .and_then(normalize_machine_id)
-}
-
-/// Detect this machine's canonical ID from an override, config file, or system hostname, and last
-/// the home's `~/.aterm/machine.toml`. This crate's tests read neither the host's names nor the
-/// person's home: they name the machine by an override or a config, as `ai_pool`'s host names
-/// are none in them.
+/// Detect this machine's canonical ID from an override, config file, or system hostname. Never
+/// from `~/.aterm/machine.toml`: the vault hands every Mac the same file, whose `id` names a
+/// release machine, so a Mac with a default hostname would take that machine's accounts. This
+/// crate's tests read neither the host's names nor the person's home: they name the machine by an
+/// override or a config, as `ai_pool`'s host names are none in them.
 #[must_use]
 pub fn detect_machine_id(override_machine: Option<&str>, config: Option<&Path>) -> Option<String> {
     if let Some(m) = override_machine {
@@ -1375,22 +1368,16 @@ pub fn detect_machine_id(override_machine: Option<&str>, config: Option<&Path>) 
             None
         }
     });
-    machine_id_among(names, || {
-        aterm_types::dirs::home_dir().and_then(|home| machine_record_id(&home))
-    })
+    machine_id_among(names)
 }
 
 /// [`detect_machine_id`]'s choice past an override and a config: the first of `names` (the
 /// host's, each asked only once those before it named no machine) that [`normalize_machine_id`]
-/// reads as one, else `record`'s, the home's machine record.
-fn machine_id_among(
-    names: impl IntoIterator<Item = String>,
-    record: impl FnOnce() -> Option<String>,
-) -> Option<String> {
+/// reads as one.
+fn machine_id_among(names: impl IntoIterator<Item = String>) -> Option<String> {
     names
         .into_iter()
         .find_map(|name| normalize_machine_id(&name))
-        .or_else(record)
 }
 
 fn read_default_profile_email(env: &Env) -> Option<String> {
@@ -2280,7 +2267,7 @@ fn retained_login_row<'a>(existing: Option<&'a Roster>, email: &str) -> Option<&
 /// same one, the identity [`super::accounts_pool::check_login_identity`] holds a launch to. A
 /// login address can change while the identity stays (a source that lists an alias's account by
 /// the address the provider names it by).
-fn same_account(was: &Row, now: &Row) -> bool {
+pub(super) fn same_account(was: &Row, now: &Row) -> bool {
     was.expected_identity_email()
         .zip(now.expected_identity_email())
         .is_some_and(|(was, now)| accounts::email_matches(was, now))
@@ -2613,6 +2600,9 @@ pub fn configured_source(config: Option<&Path>, roster: Option<&Path>) -> Option
 /// where `accounts add` or `adopt-default` lists a row so that the next sync keeps it ([`fleet_origin`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FleetOrigin {
+    /// The lab registry's preferences ([`super::alab_roster`]): every row this machine has stays,
+    /// and the accounts it prefers join.
+    Alab,
     /// No fleet file and no source: `accounts.toml` is the list, as it was written.
     Roster,
     /// Fleet files on this machine that a sync reads and writes back as they hold: the one
@@ -2643,6 +2633,7 @@ impl FleetOrigin {
     #[must_use]
     pub const fn word(&self) -> &'static str {
         match self {
+            Self::Alab => "alab",
             Self::Roster => "roster",
             Self::Local {
                 opt_in: Some(OptIn::Discovered),
@@ -2662,6 +2653,7 @@ impl FleetOrigin {
     #[must_use]
     pub fn source(&self) -> Option<String> {
         match self {
+            Self::Alab => Some(super::alab_roster::SOURCE.to_owned()),
             Self::Roster => None,
             Self::Local { files, .. } => files.first().map(|f| f.display().to_string()),
             Self::Key(source) => Some(source.clone()),
@@ -2674,6 +2666,9 @@ impl FleetOrigin {
     pub fn words(&self) -> String {
         let source = self.source().unwrap_or_default();
         match self {
+            Self::Alab => {
+                "the lab registry's preferences for this Mac; every row it has stays".to_owned()
+            }
             Self::Roster => "as written here (no fleet source names these accounts)".to_owned(),
             Self::Local {
                 opt_in: Some(OptIn::Discovered),
@@ -2698,6 +2693,12 @@ impl FleetOrigin {
 /// [`FleetOrigin`] of the roster at `roster`, for `home` and the config file `config`.
 #[must_use]
 pub fn fleet_origin(home: Option<&Path>, config: Option<&Path>, roster: &Path) -> FleetOrigin {
+    if matches!(
+        super::alab_roster::chosen(Cli::Claude, Some(roster), None, config),
+        Ok(Some(_))
+    ) {
+        return FleetOrigin::Alab;
+    }
     let beside = fleet_file_beside(roster).filter(|fleet| source_entry_present(fleet));
     let beside_opt_in = beside.as_deref().and_then(fleet_file_opt_in);
     let beside_opts_in = beside_opt_in.is_some_and(OptIn::opts_in_by_file);
@@ -2737,7 +2738,7 @@ pub fn fleet_origin(home: Option<&Path>, config: Option<&Path>, roster: &Path) -
         // init reads them.
         if own
             && let Some(sheet) = sheet
-            && sheet_names_this_machine(home, config, &sheet)
+            && sheet_names_this_machine(config, &sheet)
         {
             return FleetOrigin::Vault(sheet);
         }
@@ -2859,18 +2860,16 @@ fn vault_delivered(home: &Path) -> Option<BTreeSet<PathBuf>> {
 }
 
 /// Whether the sheet at `sheet` gives this machine rows, the machine a sync from init takes them
-/// for ([`sync_machine`]: `config`'s `[fleet] machine`, else this host's id, else the machine of
-/// the row the default login at `home` holds). An unreadable or refused sheet counts as giving
-/// them, so the sync that reads it says why.
-fn sheet_names_this_machine(home: &Path, config: Option<&Path>, sheet: &Path) -> bool {
+/// for ([`machine_for`]: an explicit local configuration, else this host's id). An unreadable
+/// or refused sheet counts as giving them, so the sync that reads it says why.
+fn sheet_names_this_machine(config: Option<&Path>, sheet: &Path) -> bool {
     let Ok(fleet) = read_local_source_text(sheet)
         .map_err(|why| why.to_string())
         .and_then(|text| parse_accounting_csv(&text, ACCOUNTS_CSV_FILE))
     else {
         return true;
     };
-    let default_email = home_default_email(home);
-    machine_for(config, &fleet, default_email.as_deref(), None)
+    machine_for(config, None)
         .is_some_and(|machine| !fleet.accounts_for_machine(&machine).is_empty())
 }
 
@@ -2914,8 +2913,8 @@ fn fleet_takes_discovered(
     }
 }
 
-fn source_key(config: &Path) -> Option<String> {
-    let text = fs::read_to_string(config).ok()?;
+pub(super) fn source_key(config: &Path) -> Option<String> {
+    let text = super::ai_pool::read_bounded_text(config, 2 * 1024 * 1024)?;
     let table: aterm_toml::Table = aterm_toml::from_str(&text).ok()?;
     table
         .get(SOURCE_TABLE)?
@@ -3027,6 +3026,14 @@ fn load_fleet_source_for_machine(
 ) -> Result<(FleetRoster, OptIn, Option<PoolSyncCtx>), String> {
     let normalized = source_env(env)?;
     let env = &normalized;
+    if let Some(fleet) = super::alab_roster::chosen(
+        Cli::Claude,
+        env.accounts_roster().as_deref(),
+        source,
+        env.config.as_deref(),
+    )? {
+        return Ok((fleet, OptIn::Named, None));
+    }
     let (chosen, opt_in) = match source.map(str::trim).filter(|s| !s.is_empty()) {
         Some(named) => (named.to_owned(), OptIn::Named),
         None => {
@@ -3291,34 +3298,6 @@ fn local_shows(env: &Env) -> Shown {
     shown
 }
 
-/// [`discovered_fleet`]'s machine past a config: `host`, this Mac's id, where one of `emails`
-/// names no machine or names it (or none of them, nor the default login's `default_email`, hints
-/// at one), else the machine the default login's email hints at, else the first one `emails`
-/// hint at.
-fn discovery_machine(
-    host: Option<String>,
-    emails: &BTreeSet<String>,
-    default_email: impl Fn() -> Option<String>,
-) -> Option<String> {
-    let email_hint_machine = || {
-        default_email()
-            .as_deref()
-            .and_then(|de| machines_from_email_hint(de).into_iter().next())
-            .or_else(|| {
-                emails
-                    .iter()
-                    .find_map(|em| machines_from_email_hint(em).into_iter().next())
-            })
-    };
-    host.filter(|host_m| {
-        emails.iter().any(|em| {
-            let (machines, _) = email_machines_and_slot(em);
-            machines.is_empty() || machines.contains(host_m)
-        }) || email_hint_machine().is_none()
-    })
-    .or_else(email_hint_machine)
-}
-
 /// The fleet discovery makes of what `shown` holds ([`Shown::all`]) for `env`'s machine, where
 /// it lists at least `min_accounts`.
 fn discovered_fleet(env: &Env, shown: &Shown, min_accounts: usize) -> Option<FleetRoster> {
@@ -3326,18 +3305,14 @@ fn discovered_fleet(env: &Env, shown: &Shown, min_accounts: usize) -> Option<Fle
     if emails.is_empty() {
         return None;
     }
-    let fallback_machine = config_machine_id(env.config.as_deref()).or_else(|| {
-        discovery_machine(detect_machine_id(None, None), &emails, || {
-            read_default_profile_email(env)
-        })
-    })?;
+    let machine = machine_for(env.config.as_deref(), None)?;
     let mut rows_with_slot: Vec<(Option<u32>, Vec<String>, String)> = Vec::new();
     for email in emails {
         let (mut machines, slot) = email_machines_and_slot(&email);
         if machines.is_empty() {
-            machines.push(fallback_machine.clone());
+            machines.push(machine.clone());
         }
-        if !machines.contains(&fallback_machine) {
+        if !machines.contains(&machine) {
             continue;
         }
         rows_with_slot.push((slot, machines, email));
@@ -4363,6 +4338,7 @@ fn retain_shared_rows(
     next: &mut Roster,
     existing: &Roster,
     logins: &accounts::Logins,
+    class_derived: bool,
 ) -> Result<(), String> {
     for row in &existing.rows {
         if logins.shared.required(row)?.is_none() {
@@ -4378,6 +4354,11 @@ fn retain_shared_rows(
             // Warm-set ownership is refreshed by the pool independently of
             // the retained provider configuration.
             expected.held_by.clone_from(&proposed.held_by);
+            // Under the lab a row's class is derived from the preferences and only orders the
+            // roster (`alab_roster::retain`), so it is no part of the retained configuration.
+            if class_derived {
+                expected.class = proposed.class;
+            }
             if proposed != &expected {
                 return Err("source would change a locally retained shared account".into());
             }
@@ -4500,7 +4481,18 @@ fn persist_accounts_sync_with_pool(
     if let Some(ctx) = pool_ctx {
         roster = apply_pool_to_claude_roster(roster, &existing, store, ctx);
     }
-    retain_shared_rows(&mut roster, &existing, &store.load_logins(now)?.0)?;
+    // The lab's preferences order a pool and never limit it: every row this Mac has stays.
+    if fleet.alab.is_some() {
+        let lab = super::alab_roster::current();
+        roster =
+            super::alab_roster::retain(roster, &existing, lab.as_deref(), Cli::Claude, machine);
+    }
+    retain_shared_rows(
+        &mut roster,
+        &existing,
+        &store.load_logins(now)?.0,
+        fleet.alab.is_some(),
+    )?;
     if let Some(expected) = default_identity_hint(Some(&existing), default_email)
         && !roster
             .row_for_login(None)
@@ -4536,7 +4528,16 @@ fn persist_accounts_sync_with_pool(
             .iter()
             .map(|found| (found.from.clone(), found.to.clone())),
     );
-    let departed = departed_labels(&existing, &roster);
+    let mut departed = departed_labels(&existing, &roster);
+    if fleet.alab.is_some() {
+        // A row `alab_roster::retain` kept that names no address is known by its label alone:
+        // it has not departed. A label another account now holds has.
+        departed.retain(|label| {
+            !existing.row(label).is_some_and(|was| {
+                was.expected_identity_email().is_none() && roster.row(label).is_some()
+            })
+        });
+    }
     // A row's login directory goes by whose login it holds, as its profile says. Each row moved
     // after the default login keeps its own where that holds nothing or its own account's login,
     // or takes its new label's where that is free; every other row given a directory by its label
@@ -4687,7 +4688,7 @@ fn persist_accounts_sync_with_pool(
         super::upgrade_models::write_atomic_mode(path, text, mode)
             .map_err(|why| format!("could not write {}: {why}", path.display()))
     };
-    let fleet_held = fs::read(&fleet_write_to).ok();
+    let fleet_held = super::ai_pool::read_bounded_bytes(&fleet_write_to, 4 * 1024 * 1024);
     let mut state_changed = false;
     let mut copy_removed = false;
     // The login directories under the store that moved rows leave and nothing names any longer.
@@ -4895,7 +4896,9 @@ fn persist_accounts_sync_with_pool(
                         .map_err(|why| format!("could not create {dir}: {why}"))?;
                 }
             }
-            publish_if_changed(&fleet_write_to, fleet_held.as_deref(), &fleet_toml, fleet_mode)?;
+            if fleet.alab.is_none() {
+                publish_if_changed(&fleet_write_to, fleet_held.as_deref(), &fleet_toml, fleet_mode)?;
+            }
             for expected in fleet_snapshots {
                 match expected.publish {
                     Publish::No => {}
@@ -5055,13 +5058,24 @@ fn sync_accounts_with(
         .ok_or("no config directory is known (set HOME or XDG_CONFIG_HOME)")?;
     let store = env.accounts_store();
     let recovered_commit = store.recover_sync_within(how.ladder, &roster_path)?;
+    super::alab_roster::migrate_before_sync(
+        Cli::Claude,
+        &store,
+        (&roster_path, env.config.as_deref()),
+        source,
+        env.now,
+        how.ladder,
+    )?;
     let (fleet, opt_in, pool_ctx) =
         load_fleet_source_for_machine(env, source, machine_override, how.fetch)?;
     let default_email = read_default_profile_email(env);
     let machine = if let Some(ctx) = &pool_ctx {
         ctx.identity.primary.clone()
+    } else if let Some(me) = &fleet.alab {
+        // The machine this Mac's facts row binds: the lab's identity, never a host name.
+        me.clone()
     } else {
-        sync_machine(env, &fleet, default_email.as_deref(), machine_override)
+        machine_for(env.config.as_deref(), machine_override)
             .ok_or("could not determine machine id (`m<N>`); pass `--machine m8`")?
     };
     let fleet_accounts = pool_ctx.as_ref().map_or(fleet.accounts.len(), |ctx| {
@@ -5095,7 +5109,8 @@ fn sync_accounts_with(
             .unwrap_or_else(|| PathBuf::from(FLEET_ROSTER_FILE));
         let (fleet_write_to, fleet_mode) = super::cli::roster_target(&fleet_path)?;
         let fleet_toml = fleet.to_toml_for(Some(opt_in));
-        let fleet_wrote = if fs::read(&fleet_write_to).ok().as_deref()
+        let fleet_wrote = if super::ai_pool::read_bounded_bytes(&fleet_write_to, 4 * 1024 * 1024)
+            .as_deref()
             != Some(fleet_toml.as_bytes())
         {
             super::upgrade_models::write_atomic_mode(&fleet_write_to, &fleet_toml, fleet_mode)
@@ -5386,60 +5401,18 @@ fn write_sync_report(
     ExitCode::SUCCESS
 }
 
-/// The machine a sync takes `fleet`'s rows for: `machine_override`, else `[fleet] machine`, else
-/// this host's id where the fleet lists it (or the default login, `default_email`, holds no fleet
-/// row), else the first machine of the fleet row the default login holds.
-fn sync_machine(
-    env: &Env,
-    fleet: &FleetRoster,
-    default_email: Option<&str>,
-    machine_override: Option<&str>,
-) -> Option<String> {
-    machine_for(
-        env.config.as_deref(),
-        fleet,
-        default_email,
-        machine_override,
-    )
-}
-
-/// [`sync_machine`], for the config file `config`. The host's id is read once per process
-/// ([`detected_machine`]): [`fleet_origin`] reads it through here on every look of the window's.
-fn machine_for(
-    config: Option<&Path>,
-    fleet: &FleetRoster,
-    default_email: Option<&str>,
-    machine_override: Option<&str>,
-) -> Option<String> {
+/// The local machine for account sync and discovery: an explicit override, local configuration,
+/// or this host's name. Account assignments and provider logins supply no machine identity.
+/// The host's id is read once per process ([`detected_machine`]).
+fn machine_for(config: Option<&Path>, machine_override: Option<&str>) -> Option<String> {
     machine_override
         .and_then(normalize_machine_id)
         .or_else(|| config_machine_id(config))
-        .or_else(|| host_or_login_machine(detected_machine(), fleet, default_email))
-}
-
-/// [`machine_for`]'s choice past an override and a config: `host`, this Mac's id, where `fleet`
-/// lists it or the default login (`default_email`) holds no fleet row, else the first machine of
-/// the row it holds.
-fn host_or_login_machine(
-    host: Option<String>,
-    fleet: &FleetRoster,
-    default_email: Option<&str>,
-) -> Option<String> {
-    let email_machine = || {
-        default_email.and_then(|de| {
-            fleet
-                .accounts
-                .iter()
-                .find(|a| accounts::email_matches(&a.email, de))
-                .and_then(|a| a.machines.first().cloned())
-        })
-    };
-    host.filter(|m| !fleet.accounts_for_machine(m).is_empty() || email_machine().is_none())
-        .or_else(email_machine)
+        .or_else(detected_machine)
 }
 
 /// The text each fleet file of `files` ([`FleetOrigin::Local`]) holds with `row` listed as one
-/// more account of this machine ([`sync_machine`]), which the next sync then keeps; a file that
+/// more account of this machine ([`machine_for`]), which the next sync then keeps; a file that
 /// lists it already is left out. Nothing is written here: `accounts add` or `adopt-default` writes them, under the
 /// accounts lock, before the roster.
 /// # Errors
@@ -5460,19 +5433,17 @@ pub(super) fn list_in_local_fleet(
                 .map_or_else(|| FLEET_ROSTER_FILE.to_owned(), |f| f.display().to_string())
         )
     })?;
-    let default_email = read_default_profile_email(env);
     let mut texts = Vec::new();
     for file in files {
         let text = read_local_source_text(file)
             .map_err(|why| format!("{}: {why}; nothing was written", file.display()))?;
         let mut fleet = FleetRoster::from_toml(&text, &file.display().to_string())
             .map_err(|why| format!("{why}; nothing was written"))?;
-        let machine =
-            sync_machine(env, &fleet, default_email.as_deref(), None).ok_or_else(|| {
-                "could not determine this machine's id (`m<N>`) for the fleet row: set `[fleet] \
+        let machine = machine_for(env.config.as_deref(), None).ok_or_else(|| {
+            "could not determine this machine's id (`m<N>`) for the fleet row: set `[fleet] \
              machine` in aterm.toml; nothing was written"
-                    .to_owned()
-            })?;
+                .to_owned()
+        })?;
         let same_email = |acct: &FleetAccount| accounts::email_matches(&acct.email, email);
         if let Some(listed) = fleet.accounts.iter().find(|a| a.label == row.label) {
             if same_email(listed) && listed.machines.contains(&machine) {
@@ -5716,7 +5687,6 @@ pub enum Upkept {
 struct UpkeepEffects<'a> {
     fetch: &'a Fetch<'a>,
     spawn_renewal: &'a SpawnRenewal,
-    quota_refresh: &'a RefreshQuota,
     sync_cooldown: &'a std::sync::Mutex<Option<Instant>>,
     /// When the upkeep last caught its roster up with this machine's own logins
     /// ([`rediscover_due`], [`default_login_unlisted`]).
@@ -5743,7 +5713,6 @@ struct UpkeepEffects<'a> {
 }
 
 type SpawnRenewal = dyn Fn(Box<dyn FnOnce() + Send>) -> io::Result<()> + Sync;
-type RefreshQuota = dyn Fn(&Path, &Path, &Path, i64) + Sync;
 
 /// [`UpkeepEffects::mailbox`]: what the configured mailbox offers `row` for `home` and `store`,
 /// and its masked login where it has one ([`mailbox_offer`]).
@@ -6020,80 +5989,6 @@ fn heal_default_login_now(
     Some((healed, default_heal_line(&heal, &found, healed)))
 }
 
-/// The Kimi account whose quota [`refresh_kimi_quota`] reads afresh at `now`: the active row (or
-/// the roster's default row) once its sample or its monthly window is due and no probe holds it;
-/// `None` when the records cannot be read, no row stands, or the observation is still fresh.
-fn kimi_quota_label(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) -> Option<String> {
-    let store = accounts::Store::at_for(state_dir, Cli::Kimi, home);
-    let records = store.read_account_records(Some(roster_path), now).ok()?;
-    let label = records.state.active.as_deref().or_else(|| {
-        records
-            .roster
-            .row_for_login(None)
-            .map(|row| row.label.as_str())
-    })?;
-    let account = records.state.accounts.get(label);
-    let sample_due = account.is_none_or(|account| accounts::probe_due(account, now));
-    let monthly_due = account.is_none_or(|account| {
-        account.windows.get("monthly").is_none_or(|window| {
-            now.saturating_sub(window.at) >= super::accounts_pool::USAGE_FRESH_S
-        })
-    });
-    if (!sample_due && !monthly_due) || accounts::probe_held(&records.state, label, now) {
-        return None;
-    }
-    Some(label.to_owned())
-}
-
-/// The live [`UpkeepEffects::quota_refresh`]: a fresh Kimi `/usage` panel in a temporary tab,
-/// at most once the account's sample is due ([`kimi_quota_label`]), and never inline with roster
-/// upkeep.
-fn refresh_kimi_quota(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) {
-    let Some(label) = kimi_quota_label(home, state_dir, roster_path, now) else {
-        return;
-    };
-    let Some(exe) = std::env::current_exe().ok().filter(|exe| {
-        exe.file_stem()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name == "aterm")
-    }) else {
-        return;
-    };
-    let store = accounts::Store::at_for(state_dir, Cli::Kimi, home);
-    let claimed = store
-        .transact(now, &mut None, |state| {
-            Ok(accounts::claim_probe(state, &label, "quota-upkeep", now)
-                .into_iter()
-                .collect())
-        })
-        .is_ok_and(|events: Vec<accounts::Event>| events.len() == 1);
-    if !claimed {
-        return;
-    }
-    let home = home.to_path_buf();
-    let state_dir = state_dir.to_path_buf();
-    let spawned = spawn_renewal_thread(Box::new(move || {
-        let mut cmd = aterm_uds::spawnfd::command(&exe);
-        cmd.args(["harness", "--state"])
-            .arg(&state_dir)
-            .args(["accounts", "refresh", "--cli", "kimi"])
-            .env("HOME", &home);
-        match super::align::capture_bounded(cmd, Duration::from_secs(150), 16 * 1024) {
-            Ok(ran) if ran.code == Some(0) => {
-                log_sign_in("Kimi quota refreshed from its /usage panel")
-            }
-            Ok(_) => log_sign_in("Kimi quota refresh failed; the previous observation is kept"),
-            Err(why) => log_sign_in(&format!(
-                "Kimi quota refresh could not run: {}; the previous observation is kept",
-                super::one_line(&why, 200)
-            )),
-        }
-    }));
-    if spawned.is_err() {
-        log_sign_in("Kimi quota refresh could not start a background reader");
-    }
-}
-
 /// The live [`UpkeepEffects::mailbox`]: the mailbox `row`'s sign-in reads, from the process's
 /// environment ([`super::open_url::MAILBOX_ENV`] and its kin) and the mailbox files.
 fn ladder_mailbox_live(
@@ -6133,9 +6028,10 @@ fn ladder_mailbox_files(
 /// What a mailbox read offers `row`, and the masked login of the mailbox its email's codes are
 /// read from (through its `[[mailboxes]]` entry where one receives it): a mailbox folder
 /// (`dir_found`) or a configuration that reads its inbox over a folder, HTTP or IMAP is ready;
-/// one that names only a webmail inbox needs a headless browser; an entry with no password yet
-/// is named as such and never tried (the email's own entry, which the lab may be asked for, or
-/// a shared one, which it is not); none for the row is none.
+/// one that names only a webmail inbox needs a headless browser, and says whether it holds the
+/// row's password; an entry with no password yet is named as such and never tried (the email's
+/// own entry, which the lab may be asked for, or a shared one, which it is not); none for the
+/// row is none.
 pub(super) fn mailbox_offer(
     dir_found: bool,
     cfg: Option<super::headless_oauth::MailboxConfig>,
@@ -6166,8 +6062,10 @@ pub(super) fn mailbox_offer(
         || (view.relay_enabled && email.is_some())
     {
         (Mailbox::Ready, login)
-    } else {
+    } else if cfg.password_for(email).is_some() {
         (Mailbox::WebmailOnly, login)
+    } else {
+        (Mailbox::WebmailNoPassword, login)
     }
 }
 
@@ -6223,7 +6121,6 @@ fn live_effects() -> UpkeepEffects<'static> {
     UpkeepEffects {
         fetch: &fetch_source_text,
         spawn_renewal: &spawn_renewal_thread,
-        quota_refresh: &refresh_kimi_quota,
         sync_cooldown: &AUTO_SYNC_COOLDOWN,
         rediscovery: &REDISCOVERY,
         renew_guard: &AUTO_RENEW_GUARD,
@@ -6425,7 +6322,12 @@ fn sheet_conflicts_look(home: &Path, config: &Path) -> SheetLook {
     };
     let secrets = home.join(".secrets");
     let sheet = secrets.join(ACCOUNTS_CSV_FILE);
-    if accounts_sync_off(Some(config)) || !source_entry_present(&sheet) {
+    // Where the lab registry names this Mac, the sheet is the importer's input alone: upkeep
+    // reads the lab, and no sheet conflict is this Mac's to report.
+    if accounts_sync_off(Some(config))
+        || !source_entry_present(&sheet)
+        || super::alab_roster::current().is_some_and(|lab| lab.me.is_some())
+    {
         return unread;
     }
     let Ok(text) = read_local_source_text(&sheet) else {
@@ -7098,7 +7000,7 @@ fn init_sync_needed(
             // aterm's own copy holds the fleet file's accounts, so a sync reads nothing new from
             // it; beside a sheet that gives this machine rows, a sync reads the sheet and
             // removes the copy.
-            if has_secrets_csv && sheet_names_this_machine(home, Some(&config_path), &secrets_csv) {
+            if has_secrets_csv && sheet_names_this_machine(Some(&config_path), &secrets_csv) {
                 return true;
             }
         } else if !matches!(
@@ -7363,7 +7265,7 @@ fn sync_accounts_for_init_with(
     let own_copy = source_entry_present(&secrets_fleet)
         && source_entry_present(&secrets_sheet)
         && own_secrets_copy(home, &secrets_fleet, &fleet_path)
-        && sheet_names_this_machine(home, env.config.as_deref(), &secrets_sheet);
+        && sheet_names_this_machine(env.config.as_deref(), &secrets_sheet);
     let superseded = superseded_secrets_copy(home, &secrets_fleet, &fleet_path);
     let secrets_source = pool_entry_present(&secrets_pool)
         .then_some(&secrets_pool)
@@ -7953,6 +7855,24 @@ fn load_cli_fleet_source(
     machine_override: Option<&str>,
     fetch: &Fetch<'_>,
 ) -> Result<Option<LoadedFleet>, String> {
+    let roster = env
+        .config
+        .as_deref()
+        .and_then(|config| accounts::roster_beside_for(config, cli));
+    if let Some(roster) =
+        super::alab_roster::chosen(cli, roster.as_deref(), source, env.config.as_deref())?
+    {
+        let machine = roster.alab.clone();
+        return Ok(Some((
+            CliFleet {
+                cli,
+                roster,
+                held: Vec::new(),
+            },
+            None,
+            machine,
+        )));
+    }
     let (chosen, raw) = match source.map(str::trim).filter(|s| !s.is_empty()) {
         Some(named) => (named.to_owned(), fetch(env, named)?),
         None => {
@@ -8012,13 +7932,69 @@ fn load_cli_fleet_source(
     } else {
         parse_accounting_csv_for(cli, &raw, &chosen)?
     };
-    let machine = match env.config.as_deref() {
-        Some(config) => cli_sync_machine(config, machine_override),
-        None => machine_override
-            .and_then(normalize_machine_id)
-            .or_else(|| detect_machine_id(None, None)),
-    };
+    let machine = machine_for(env.config.as_deref(), machine_override);
     Ok(Some((fleet, None, machine)))
+}
+
+/// A local source snapshot for missing default-login metadata. Keep complete pool bytes:
+/// projecting only warm rows would lose cold-account holds and policy-only changes.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct CodexCompletionSource {
+    pub fleet: Option<CliFleet>,
+    pub held_by: Option<String>,
+    pool_text: Option<String>,
+}
+
+/// Read only native local source files; no network or source publication is permitted.
+pub(super) fn codex_completion_source(
+    env: &Env,
+    row: &Row,
+) -> Result<CodexCompletionSource, String> {
+    let home = env.home.as_deref().ok_or("no home directory")?;
+    let path = home.join(".secrets").join(super::ai_pool::AI_POOL_FILE);
+    if pool_entry_present(&path) {
+        let raw = read_local_source_text(&path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let pool = super::ai_pool::Pool::from_toml(&raw, &path.display().to_string())?;
+        let identity =
+            super::ai_pool::resolve_local_pool_identity(Some(home), env.config.as_deref(), None);
+        let matched = pool.accounts.iter().find(|account| {
+            account.provider == Cli::Codex
+                && row
+                    .expected_identity_email()
+                    .is_some_and(|email| accounts::email_matches(email, &account.email))
+        });
+        let held_by = matched.and_then(|account| {
+            if identity
+                .as_ref()
+                .is_some_and(|identity| account.is_warm_for(identity))
+            {
+                None
+            } else {
+                Some(account.holder_word().to_owned())
+            }
+        });
+        let fleet = CliFleet {
+            cli: Cli::Codex,
+            roster: project_pool_fleet(&pool, Cli::Codex, identity.as_ref()),
+            held: Vec::new(),
+        };
+        return Ok(CodexCompletionSource {
+            fleet: Some(fleet),
+            held_by,
+            pool_text: Some(raw),
+        });
+    }
+    // No named source: this branch reads only bounded local source files. Never put a
+    // network fetch under the caller's native-login/writer locks, including on recheck.
+    let no_network =
+        |_: &Env, _: &str| Err("metadata completion cannot fetch a remote source".to_owned());
+    let loaded = load_cli_fleet_source(Cli::Codex, env, home, None, None, &no_network)?;
+    Ok(CodexCompletionSource {
+        fleet: loaded.map(|(fleet, _, _)| fleet),
+        held_by: None,
+        pool_text: None,
+    })
 }
 
 /// Read one pool's complete source table, including rows held before sign-in.
@@ -8119,6 +8095,14 @@ fn sync_cli_with_replan(
     }
     let store = accounts::Store::at_for(state_dir, cli, home);
     let recovered_commit = store.recover_sync_within(ladder, &roster_path)?;
+    super::alab_roster::migrate_before_sync(
+        cli,
+        &store,
+        (&roster_path, Some(config)),
+        source,
+        now,
+        ladder,
+    )?;
     let env = quiet_env(home, state_dir, config, now);
     let Some((fleet, pool_ctx, machine)) =
         load_cli_fleet_source(cli, &env, home, source, machine_override, fetch)?
@@ -8231,6 +8215,12 @@ fn sync_cli_with_replan(
                         held_changed = true;
                     }
                 }
+            }
+        } else if fleet.roster.alab.is_some() {
+            // Under the lab nothing limits who runs an account: a hold an old pool file set
+            // would otherwise outlive its source.
+            for row in &mut merged_existing {
+                held_changed |= row.held_by.take().is_some();
             }
         }
         let mut total = merged_existing.len() + rows.len();
@@ -8629,15 +8619,6 @@ fn run_cli_accounts_sync_with(
     ExitCode::SUCCESS
 }
 
-/// This machine's id for a sync of another CLI's pool: `machine_override`, else `[ai]`,
-/// `[fleet]` or `[harness] machine` in `config`, else the host's name ([`detect_machine_id`]).
-fn cli_sync_machine(config: &Path, machine_override: Option<&str>) -> Option<String> {
-    machine_override
-        .and_then(normalize_machine_id)
-        .or_else(|| config_machine_id(Some(config)))
-        .or_else(|| detect_machine_id(None, None))
-}
-
 /// THE DEFAULT SYNC'S ADMISSION, for a pool syncing by default ([`syncs_by_default`]) with no
 /// roster of it here and no source named: `machine`, where the sync takes rows for it, or what
 /// the sync is instead. That is [`CliSync::Unlisted`] where `fleet` lists no row of this
@@ -8750,6 +8731,17 @@ fn sync_cli_accounts_with(
                 now,
                 (fetch, &ladder),
             );
+            let synced = if cli == Cli::Codex && synced.is_ok() {
+                let env = quiet_env(home, state_dir, &config, now);
+                super::cli::default_completion::complete(
+                    &env,
+                    None,
+                    super::codex_app_login::read_account_email,
+                )
+                .and(synced)
+            } else {
+                synced
+            };
             (cli, synced)
         })
         .collect()
@@ -8864,8 +8856,13 @@ fn upkeep_pools(
         if !path.is_file() {
             continue;
         }
-        if cli == Cli::Kimi {
-            (fx.quota_refresh)(home, state_dir, &path, now);
+        if cli == Cli::Codex && sign_ins_on(&config, cli) {
+            let env = quiet_env(home, state_dir, &config, now);
+            let _ = super::cli::default_completion::complete(
+                &env,
+                None,
+                super::codex_app_login::read_account_email,
+            );
         }
         let renews = step.renews() && sign_ins_on(&config, cli);
         if let Some(pending) = step
@@ -8903,7 +8900,7 @@ fn cli_sync_inputs(cli: Cli, home: &Path, config: &Path) -> [u8; 32] {
     });
     for read in fleet
         .into_iter()
-        .chain([fs::read(config).ok()])
+        .chain([super::ai_pool::read_bounded_bytes(config, 2 * 1024 * 1024)])
         .chain(pool_identity)
     {
         match read {
@@ -9124,6 +9121,8 @@ struct LoginOwner {
     observed_at: i64,
     token: std::sync::Arc<()>,
     success_generation: Option<(u64, u64)>,
+    diagnostic: Option<LoginDiagnostic>,
+    identity: Option<LoginIdentity>,
 }
 
 impl LoginOwner {
@@ -9135,6 +9134,8 @@ impl LoginOwner {
             observed_at,
             token: std::sync::Arc::new(()),
             success_generation: None,
+            diagnostic: None,
+            identity: None,
         }
     }
 
@@ -9149,6 +9150,11 @@ impl LoginOwner {
                 .copied()
                 .unwrap_or(0),
         ));
+        self
+    }
+
+    fn for_row(mut self, row: &accounts::Row) -> Self {
+        self.identity = Some(LoginIdentity::of(row));
         self
     }
 
@@ -9196,6 +9202,115 @@ pub struct LoginActivity {
     pub active: bool,
     pub observed_at: i64,
     pub next_at: Option<i64>,
+    /// A prior provider invocation, independent of active work and retry policy.
+    pub diagnostic: Option<LoginDiagnostic>,
+    /// Exact observed roster identity; absent means the label alone is unconfirmed.
+    pub identity: Option<LoginIdentity>,
+}
+
+/// The complete roster row captured by an activity owner. Its contents are not
+/// diagnostics: readers can compare them without disclosing login paths or addresses.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LoginIdentity {
+    row: accounts::Row,
+}
+
+impl std::fmt::Debug for LoginIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginIdentity").finish_non_exhaustive()
+    }
+}
+
+impl std::hash::Hash for LoginIdentity {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.row.label.hash(state);
+    }
+}
+
+impl LoginIdentity {
+    fn of(row: &accounts::Row) -> Self {
+        Self { row: row.clone() }
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn for_test(row: &accounts::Row) -> Self {
+        Self::of(row)
+    }
+}
+
+impl LoginActivity {
+    /// A retained or live observation belongs only to this exact captured row.
+    #[must_use]
+    pub fn matches_row(&self, row: &accounts::Row) -> bool {
+        self.label == row.label
+            && self
+                .identity
+                .as_ref()
+                .is_some_and(|identity| identity.row == *row)
+    }
+}
+
+/// A safe historical provider observation bound to the exact captured roster row.
+/// No provider output, URL, credential or filesystem path is exposed by its formatter.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LoginDiagnostic {
+    pub completed_at: i64,
+    row: accounts::Row,
+    observation: super::cli::RenewalObservation,
+}
+
+impl std::fmt::Debug for LoginDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginDiagnostic")
+            .field("completed_at", &self.completed_at)
+            .field("observation", &self.observation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::hash::Hash for LoginDiagnostic {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.completed_at.hash(state);
+        self.row.label.hash(state);
+        self.observation.hash(state);
+    }
+}
+
+impl LoginDiagnostic {
+    /// The account label captured by this historical attempt.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.row.label
+    }
+
+    #[must_use]
+    pub fn words(&self) -> String {
+        self.observation.words()
+    }
+
+    /// A same-label replacement is not the account this invocation observed.
+    #[must_use]
+    pub fn matches_row(&self, row: &accounts::Row) -> bool {
+        &self.row == row
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn from_exit_for_test(
+        row: &accounts::Row,
+        completed_at: i64,
+        code: i32,
+        met: Option<super::open_url::Met>,
+    ) -> Self {
+        Self {
+            completed_at,
+            row: row.clone(),
+            observation: super::cli::RenewalObservation::from_outcome(&Ok(
+                super::cli::RenewalExit { code, met },
+            )),
+        }
+    }
 }
 
 /// Read only this process's attributed work for the exact store and CLI. No filesystem
@@ -9218,7 +9333,7 @@ fn login_activity_of(
     now: i64,
     clock: Instant,
 ) -> Vec<LoginActivity> {
-    let mut rows = BTreeMap::<String, LoginActivity>::new();
+    let mut rows = Vec::<LoginActivity>::new();
     let mut add = |owner: &LoginOwner, until: Option<Instant>| {
         if !owner.matches(store, cli) {
             return;
@@ -9231,17 +9346,17 @@ fn login_activity_of(
             .as_secs()
             .saturating_add(u64::from(remaining.subsec_nanos() > 0));
         let next = now.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX));
-        let row = rows
-            .entry(owner.label.clone())
-            .or_insert_with(|| LoginActivity {
-                label: owner.label.clone(),
-                route: None,
-                active: false,
-                observed_at: owner.observed_at,
-                next_at: None,
-            });
+        let row = activity_row(&mut rows, owner);
         row.observed_at = row.observed_at.max(owner.observed_at);
         row.next_at = Some(row.next_at.map_or(next, |held| held.min(next)));
+        if let Some(diagnostic) = &owner.diagnostic
+            && row
+                .diagnostic
+                .as_ref()
+                .is_none_or(|old| old.completed_at <= diagnostic.completed_at)
+        {
+            row.diagnostic = Some(diagnostic.clone());
+        }
     };
     for (key, owner) in &guard.activity_owners {
         // A claim is refused while any of these holds stands, so the row's next try is at the
@@ -9265,25 +9380,40 @@ fn login_activity_of(
     if let Some(active) = &guard.active_login
         && active.owner.matches(store, cli)
     {
-        let row = rows
-            .entry(active.owner.label.clone())
-            .or_insert_with(|| LoginActivity {
-                label: active.owner.label.clone(),
-                route: None,
-                active: true,
-                observed_at: active.owner.observed_at,
-                next_at: None,
-            });
+        let row = activity_row(&mut rows, &active.owner);
         row.active = true;
         row.route.clone_from(&active.route);
         row.observed_at = active.owner.observed_at;
     }
-    rows.into_values().collect()
+    rows.sort_by(|a, b| a.label.cmp(&b.label));
+    rows
+}
+
+fn activity_row<'a>(rows: &'a mut Vec<LoginActivity>, owner: &LoginOwner) -> &'a mut LoginActivity {
+    // A label may be reused while its previous worker or retry remains. Never merge
+    // different identities into one apparently current activity or retry deadline.
+    let at = rows
+        .iter()
+        .position(|row| row.label == owner.label && row.identity == owner.identity)
+        .unwrap_or_else(|| {
+            rows.push(LoginActivity {
+                label: owner.label.clone(),
+                route: None,
+                active: false,
+                observed_at: owner.observed_at,
+                next_at: None,
+                diagnostic: None,
+                identity: owner.identity.clone(),
+            });
+            rows.len() - 1
+        });
+    &mut rows[at]
 }
 
 struct LoginActivityGuard {
     guard: std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     token: std::sync::Arc<()>,
+    owner_token: Option<std::sync::Arc<()>>,
 }
 
 /// Who hears that this process's [`login_activity`] moved ([`watch_login_activity`]).
@@ -9442,6 +9572,7 @@ fn observe_committed_logins(
 }
 
 impl LoginActivityGuard {
+    #[cfg(test)]
     fn begin(
         guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
         store: &accounts::Store,
@@ -9449,20 +9580,93 @@ impl LoginActivityGuard {
         label: &str,
         route: Option<&str>,
     ) -> Self {
+        Self::begin_with_identity(guard, store, cli, label, None, route)
+    }
+
+    fn begin_row(
+        guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+        store: &accounts::Store,
+        cli: Cli,
+        row: &accounts::Row,
+        route: Option<&str>,
+    ) -> Self {
+        Self::begin_with_identity(
+            guard,
+            store,
+            cli,
+            &row.label,
+            Some(LoginIdentity::of(row)),
+            route,
+        )
+    }
+
+    fn begin_with_identity(
+        guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+        store: &accounts::Store,
+        cli: Cli,
+        label: &str,
+        identity: Option<LoginIdentity>,
+        route: Option<&str>,
+    ) -> Self {
         let token = std::sync::Arc::new(());
-        guard
+        let mut state = guard
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active_login = Some(ActiveLogin {
-            owner: LoginOwner::new(store, cli, label, crate::supervise::limit::unix_now()),
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owner_token = state
+            .activity_owners
+            .get_mut(label)
+            .filter(|owner| owner.matches(store, cli) && owner.identity == identity)
+            .map(|owner| {
+                owner.diagnostic = None;
+                owner.token.clone()
+            });
+        let mut owner = LoginOwner::new(store, cli, label, crate::supervise::limit::unix_now());
+        owner.identity = identity;
+        state.active_login = Some(ActiveLogin {
+            owner,
             route: route.map(str::to_owned),
             token: token.clone(),
         });
+        drop(state);
         login_activity_moved();
         Self {
             guard: guard.clone(),
             token,
+            owner_token,
         }
+    }
+
+    fn complete(
+        &self,
+        row: &accounts::Row,
+        completed_at: i64,
+        observation: super::cli::RenewalObservation,
+    ) {
+        let mut state = self
+            .guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(active) = state.active_login.as_ref().filter(|active| {
+            std::sync::Arc::ptr_eq(&active.token, &self.token) && active.owner.label == row.label
+        }) else {
+            return;
+        };
+        let Some(owner_token) = &self.owner_token else {
+            return;
+        };
+        let key = active.owner.label.clone();
+        let Some(owner) = state
+            .activity_owners
+            .get_mut(&key)
+            .filter(|owner| std::sync::Arc::ptr_eq(&owner.token, owner_token))
+        else {
+            return;
+        };
+        owner.diagnostic = Some(LoginDiagnostic {
+            completed_at,
+            row: row.clone(),
+            observation,
+        });
     }
 }
 
@@ -10222,6 +10426,7 @@ impl AutoRenewPermit {
         })
     }
 
+    #[cfg(test)]
     fn attribute(
         &self,
         store: &accounts::Store,
@@ -10230,14 +10435,30 @@ impl AutoRenewPermit {
         now: i64,
         logins: &accounts::Logins,
     ) {
+        self.attribute_owner(LoginOwner::new(store, cli, label, now).observing(logins));
+    }
+
+    fn attribute_row(
+        &self,
+        store: &accounts::Store,
+        cli: Cli,
+        row: &accounts::Row,
+        now: i64,
+        logins: &accounts::Logins,
+    ) {
+        self.attribute_owner(
+            LoginOwner::new(store, cli, &row.label, now)
+                .observing(logins)
+                .for_row(row),
+        );
+    }
+
+    fn attribute_owner(&self, owner: LoginOwner) {
         self.guard
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .activity_owners
-            .insert(
-                self.key.clone(),
-                LoginOwner::new(store, cli, label, now).observing(logins),
-            );
+            .insert(self.key.clone(), owner);
     }
 }
 
@@ -10623,7 +10844,7 @@ fn rank_renewal_candidates(
     let wants_sign_in = |row: &accounts::Row| {
         let is_enr = row.dir.is_none() || enrolled.contains(&row.label);
         row.held_by.is_none()
-            && row.email.is_some()
+            && (row.email.is_some() || cli == Cli::Kimi)
             && matches!(
                 accounts::condition(row, state, is_enr, now),
                 accounts::Condition::NotEnrolled | accounts::Condition::SignedOut
@@ -10703,7 +10924,7 @@ fn rank_renewal_candidates(
                 })
                 && let Some(me_row) = roster.row(me_label).cloned()
                 && me_row.held_by.is_none()
-                && me_row.email.is_some()
+                && (me_row.email.is_some() || cli == Cli::Kimi)
                 && seen.insert(me_row.label.clone())
             {
                 tiered.push((0, me_row));
@@ -12518,12 +12739,12 @@ fn ladder_route_in_context(
         }
         read.vault = Some(vault);
     }
+    if read.holds_mailbox()
+        && let Some(line) = mailbox_need(home, &row.label, true)
+    {
+        (ctx.log)(&format!("{}: its mailbox need: {line}", row.label));
+    }
     if let Some(route) = read.route() {
-        if read.mailbox == super::sign_in_ladder::Mailbox::Ready
-            && let Some(line) = mailbox_need(home, &row.label, true)
-        {
-            (ctx.log)(&format!("{}: its mailbox need: {line}", row.label));
-        }
         return LadderStep::Go {
             route,
             read,
@@ -12553,7 +12774,9 @@ fn ladder_route_in_context(
         let wait = guard.ladder.failed(&row.label, &inputs, at);
         guard.ladder_owners.insert(
             row.label.clone(),
-            LoginOwner::new(store, Cli::Claude, &row.label, now).observing(logins),
+            LoginOwner::new(store, Cli::Claude, &row.label, now)
+                .observing(logins)
+                .for_row(row),
         );
         wait
     };
@@ -12829,7 +13052,7 @@ fn spawn_row_renewal(
     if let Err(why) = store.check_signin_state(now) {
         return RenewalDispatch::store_refusal(&why);
     }
-    if next_row.email.is_none() {
+    if next_row.email.is_none() && cli != Cli::Kimi {
         return RenewalDispatch::Failed;
     }
     let mut shared_preparation = None;
@@ -12953,8 +13176,10 @@ fn spawn_row_renewal(
             }
         };
     let next_label = next_row.label.clone();
-    let Some(next_email) = next_row.email.clone() else {
-        return RenewalDispatch::Failed;
+    let next_email = match next_row.email.clone() {
+        Some(email) => email,
+        None if cli == Cli::Kimi && shared_preparation.is_none() => String::new(),
+        None => return RenewalDispatch::Failed,
     };
     let mailbox_mtime = latest_mailbox_mtime_with(&reads.var, Some(home), &store);
     if pin_request.is_none()
@@ -12995,7 +13220,7 @@ fn spawn_row_renewal(
         return RenewalDispatch::Held;
     };
     permit.wake_pending = Some(state_dir.to_path_buf());
-    permit.attribute(&store, cli, &next_label, now, logins);
+    permit.attribute_row(&store, cli, &next_row, now, logins);
     let home_owned = home.to_path_buf();
     let state_owned = state_dir.to_path_buf();
     let roster_owned = roster_path.to_path_buf();
@@ -13040,6 +13265,9 @@ fn spawn_row_renewal(
             // Why the last run could not be started or read, where it gave no ending of its own.
             let cause: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
             let attempt_snapshot = std::cell::RefCell::new(None);
+            // Diagnostic facts only. Shared custody must not enter the ordinary attempt
+            // snapshot or the met cell used by retry/blocked policy below.
+            let shared_observation = std::cell::RefCell::new(None);
             let publication_claims = LoginClaims::capture(&ladder_guard);
             let live_attempt = |browser: &super::cli::RenewBrowser,
                                 force_headless: bool,
@@ -13115,6 +13343,7 @@ fn spawn_row_renewal(
                 )
             };
             let run_attempt = |browser: &super::cli::RenewBrowser, force_headless: bool| {
+                shared_observation.replace(None);
                 let snapshot = &captured_logins;
                 let route = if force_headless && has_headless_profile {
                     "profile"
@@ -13135,11 +13364,11 @@ fn spawn_row_renewal(
                         mailbox: mailbox_dir.as_deref(),
                         headless: force_headless,
                     };
-                    let _activity = LoginActivityGuard::begin(
+                    let activity = LoginActivityGuard::begin_row(
                         &ladder_guard,
                         &store,
                         cli,
-                        &next_label,
+                        &next_row,
                         Some(route),
                     );
                     let result = super::cli::shared_renewal::background(
@@ -13158,10 +13387,23 @@ fn spawn_row_renewal(
                         browser,
                         authority,
                     );
-                    if matches!(result, Renewal::Busy | Renewal::Deferred) {
+                    if result.renewal != Renewal::Renewed
+                        && let Some(observation) = result.observation.as_ref()
+                    {
+                        activity.complete(
+                            &next_row,
+                            shared_host
+                                .as_deref()
+                                .map_or_else(crate::supervise::limit::unix_now, |host| host.now())
+                                .max(now),
+                            observation.clone(),
+                        );
+                    }
+                    shared_observation.replace(result.observation);
+                    if matches!(result.renewal, Renewal::Busy | Renewal::Deferred) {
                         deferred.set(true);
                     }
-                    return result;
+                    return result.renewal;
                 }
                 if !store
                     .admit_renewal_attempt(
@@ -13184,11 +13426,11 @@ fn spawn_row_renewal(
                 met.replace(None);
                 cause.replace(None);
                 let result = {
-                    let _activity = LoginActivityGuard::begin(
+                    let _activity = LoginActivityGuard::begin_row(
                         &ladder_guard,
                         &store,
                         cli,
-                        &next_label,
+                        &next_row,
                         Some(route),
                     );
                     match &run_seam {
@@ -13216,6 +13458,15 @@ fn spawn_row_renewal(
                 }
             };
             let how = |renewal: Renewal| {
+                if renewal != Renewal::Renewed
+                    && let Some(observation) = shared_observation.borrow().as_ref()
+                {
+                    return format!(
+                        "{}; {}",
+                        super::sign_in_ladder::how_it_ended(renewal, None, None),
+                        observation.words()
+                    );
+                }
                 super::sign_in_ladder::how_it_ended_because(
                     renewal,
                     exited.get(),
@@ -13345,12 +13596,14 @@ fn spawn_row_renewal(
                     }
                     guard.ladder_owners.insert(
                         next_label.clone(),
-                        LoginOwner::new(&store, cli, &next_label, now_done).observing(
-                            attempt_snapshot
-                                .borrow()
-                                .as_ref()
-                                .unwrap_or(&captured_logins),
-                        ),
+                        LoginOwner::new(&store, cli, &next_label, now_done)
+                            .for_row(&next_row)
+                            .observing(
+                                attempt_snapshot
+                                    .borrow()
+                                    .as_ref()
+                                    .unwrap_or(&captured_logins),
+                            ),
                     );
                     drop(guard);
                     login_activity_moved();
@@ -13449,7 +13702,7 @@ fn spawn_vendor_renewal_with(
         return RenewalDispatch::Failed;
     }
     let reads = guard_reads(renew_guard);
-    if next_row.email.is_none()
+    if next_row.email.is_none() && cli != Cli::Kimi
         || cli.accounts().signin.as_ref().is_none()
         || !reads.has_browser(home)
     {
@@ -13532,7 +13785,7 @@ fn spawn_vendor_renewal_with(
         return RenewalDispatch::Held;
     };
     permit.wake_pending = Some(state_dir.to_path_buf());
-    permit.attribute(&store, cli, &next_row.label, now, logins);
+    permit.attribute_row(&store, cli, &next_row, now, logins);
     let own_dir = file_roster.row(&next_row.label).and_then(|r| r.dir.clone());
     let roster_path = roster_path.to_path_buf();
     let parker = std::sync::Arc::clone(renew_guard);
@@ -13556,7 +13809,7 @@ fn spawn_vendor_renewal_with(
             let publication_claims = LoginClaims::capture(&parker);
             let renewal = {
                 let _activity =
-                    LoginActivityGuard::begin(&parker, &store, cli, &next_row.label, None);
+                    LoginActivityGuard::begin_row(&parker, &store, cli, &next_row, None);
                 super::cli::renew_one_for(
                     cli,
                     now,
@@ -15287,7 +15540,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
     }
 
     #[test]
-    fn this_macs_id_is_its_first_host_name_that_names_a_machine_and_its_record_last() {
+    fn this_macs_id_is_its_first_host_name_that_names_a_machine_or_none() {
         let names = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
         let past_the_match = std::iter::once_with(|| -> String {
             panic!("a host name named the machine, so no later one is asked")
@@ -15297,84 +15550,11 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 names(&["MacBook-Pro-M4-Max.local\n", "m15-MacBook-M5-Max\n"])
                     .into_iter()
                     .chain(past_the_match),
-                || panic!("a host name named the machine, so the record is not read"),
             ),
             Some("m15".to_owned())
         );
-        assert_eq!(
-            machine_id_among(names(&["MacBook-Pro-M4-Max.local"]), || Some(
-                "m9".to_owned()
-            )),
-            Some("m9".to_owned())
-        );
-        assert_eq!(machine_id_among(names(&[]), || None), None);
-    }
-
-    #[test]
-    fn a_sync_keeps_a_host_the_fleet_lists_and_else_takes_the_default_logins_row() {
-        let account = |label: &str, email: &str| FleetAccount {
-            label: label.to_owned(),
-            machines: vec![label.to_owned()],
-            class: Class::Dedicated,
-            email: email.to_owned(),
-            browser: None,
-            vendor: Default::default(),
-        };
-        let fleet = FleetRoster {
-            source: "test".to_owned(),
-            accounts: vec![account("m27", "sol@x.test"), account("m28", "luna@x.test")],
-            ..FleetRoster::default()
-        };
-        let pick = |host: Option<&str>, default_email| {
-            host_or_login_machine(host.map(str::to_owned), &fleet, default_email)
-        };
-        let m = |id: &str| Some(id.to_owned());
-        assert_eq!(
-            pick(Some("m30"), Some("sol@x.test")),
-            m("m27"),
-            "an unlisted host gives way"
-        );
-        assert_eq!(
-            pick(Some("m28"), Some("sol@x.test")),
-            m("m28"),
-            "a listed host stays"
-        );
-        assert_eq!(pick(Some("m30"), None), m("m30"), "no login holds a row");
-        assert_eq!(pick(Some("m30"), Some("nobody@x.test")), m("m30"));
-        assert_eq!(pick(None, Some("sol@x.test")), m("m27"));
-    }
-
-    #[test]
-    fn discovery_keeps_a_host_one_shown_email_admits_and_else_takes_an_email_hint() {
-        let emails = |emails: &[&str]| emails.iter().map(|e| (*e).to_owned()).collect();
-        let pick = |host: Option<&str>, shown: &[&str], default_email: Option<&str>| {
-            discovery_machine(host.map(str::to_owned), &emails(shown), || {
-                default_email.map(str::to_owned)
-            })
-        };
-        let m = |id: &str| Some(id.to_owned());
-        assert_eq!(
-            pick(Some("m30"), &["sol-m27@x.test"], None),
-            m("m27"),
-            "no email admits m30"
-        );
-        assert_eq!(pick(Some("m27"), &["sol-m27@x.test"], None), m("m27"));
-        assert_eq!(
-            pick(Some("m30"), &["alice@x.test", "sol-m27@x.test"], None),
-            m("m30"),
-            "an email that names no machine admits the host"
-        );
-        assert_eq!(
-            pick(Some("m27"), &["luna-m28@x.test", "sol-m27@x.test"], None),
-            m("m27"),
-            "an email that names the host admits it over the first email's hint"
-        );
-        assert_eq!(pick(None, &["alice@x.test"], None), None);
-        assert_eq!(
-            pick(Some("m30"), &["sol-m27@x.test"], Some("luna-m28@x.test")),
-            m("m28"),
-            "the default login's hint comes before the shown emails'"
-        );
+        assert_eq!(machine_id_among(names(&["MacBook-Pro-M4-Max.local"])), None);
+        assert_eq!(machine_id_among(names(&[])), None);
     }
 
     #[test]
@@ -16144,7 +16324,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             UpkeepEffects {
                 fetch: &*self.fetch,
                 spawn_renewal: &*self.spawn,
-                quota_refresh: &|_, _, _, _| {},
                 sync_cooldown: &self.cooldown,
                 rediscovery: &self.rediscovery,
                 renew_guard: &self.guard,
@@ -16183,61 +16362,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         fleet_file_ignored: false,
         renewal: false,
     };
-
-    #[test]
-    fn a_fresh_kimi_quota_observation_starts_no_refresh_or_claim() {
-        let tmp = aterm_tempfile::Builder::new()
-            .prefix("aterm-kimi-quota-fresh-")
-            .tempdir()
-            .unwrap();
-        let home = tmp.path().join("home");
-        let state_dir = tmp.path().join("state");
-        let roster = tmp.path().join("accounts-kimi.toml");
-        fs::write(
-            &roster,
-            accounts::append_row("", "kimi-m22", Class::Dedicated, None).unwrap(),
-        )
-        .unwrap();
-        let store = accounts::Store::at_for(&state_dir, Cli::Kimi, &home);
-        store
-            .transact(UPKEEP_NOW, &mut None, |state| {
-                let mut events = accounts::note_sample(
-                    state,
-                    "kimi-m22",
-                    accounts::Sample {
-                        session_pct: Some(36),
-                        session_reset: Some(UPKEEP_NOW + 1500),
-                        at: UPKEEP_NOW,
-                        ..accounts::Sample::default()
-                    },
-                    UPKEEP_NOW,
-                );
-                events.extend(accounts::note_panel_window(
-                    state,
-                    "kimi-m22",
-                    "monthly",
-                    13,
-                    Some(UPKEEP_NOW + 2_000_000),
-                    UPKEEP_NOW,
-                ));
-                Ok(events)
-            })
-            .unwrap();
-        assert_eq!(
-            kimi_quota_label(&home, &state_dir, &roster, UPKEEP_NOW + 60),
-            None
-        );
-        assert_eq!(
-            kimi_quota_label(
-                &home,
-                &state_dir,
-                &roster,
-                UPKEEP_NOW + super::super::accounts_pool::USAGE_FRESH_S
-            ),
-            Some("kimi-m22".to_owned()),
-            "CONTROL: a stale monthly window is due"
-        );
-    }
 
     #[test]
     fn an_unconfigured_upkeep_fetches_nothing_and_starts_nothing() {
@@ -17955,7 +18079,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         let fx = UpkeepEffects {
             fetch: &fetch,
             spawn_renewal: &spawn,
-            quota_refresh: &|_, _, _, _| {},
             sync_cooldown: &cooldown,
             rediscovery: &Mutex::new(Rediscovery::default()),
             renew_guard: &guard,
@@ -19635,10 +19758,11 @@ totp = "JBSWY3DPEHPK3PXP"
         assert_eq!(recovered_m27_3.dir.as_deref(), Some(use_staging_text));
         assert_eq!(recovered_m27_3.renewed_at, Some(UPKEEP_NOW + 50));
 
-        // A single-account machine with only a per-account `~/.secrets/m27_password` file
+        // An identified single-account machine with only a per-account `~/.secrets/m27_password` file
         // (and no `ai-mailbox.toml` or `fleet-accounts.toml`) must be recognized by
         // `has_init_accounts_source` and converged by `sync_accounts_for_init`.
         let single_w = World::new();
+        single_w.write_config("[fleet]\nmachine = \"m27\"\n");
         fs::write(
             single_w.home.join(".claude.json"),
             "{\"oauthAccount\":{\"emailAddress\":\"sol-m27@example.test\"}}\n",
@@ -20668,24 +20792,79 @@ totp = "JBSWY3DPEHPK3PXP"
 
     /// A row with no mailbox, on a vault member whose refresh gave none, asks the lab for the
     /// row's mailbox password through the need ledger at its no-route outcome; the refresh that
-    /// brings the mailbox meets the need, so its ask comes down.
+    /// brings the mailbox meets the need, so its ask comes down: a mailbox read over HTTP, and a
+    /// webmail-only one with a password, whether or not a headless browser is here to read it,
+    /// the row's own `m29_password` (the lab's answer) included. A webmail file with no password
+    /// is tried beside a browser but leaves the ask standing. NEGATIVE CONTROL on main: the
+    /// webmail cases with a password keep the ask (m2's, measured 2026-11-02: `NEEDS YOU: m2-3's
+    /// mailbox password` stood beside the webmail mailbox its every sign-in used).
     #[cfg(unix)]
     #[test]
     fn a_row_with_no_mailbox_asks_the_lab_for_it_and_its_arrival_meets_the_need() {
         use super::super::sign_in_ladder::Vault;
-        use aterm_secrets::need::{self, Purpose, Want};
-        fn nothing_new(_: &Path) -> Vault {
-            Vault::Unchanged(3)
-        }
-        fn brings_a_mailbox(home: &Path) -> Vault {
+        fn brings(home: &Path, mailbox: &str) -> Vault {
             let secrets = home.join(".secrets");
             fs::create_dir_all(&secrets).unwrap();
             fs::write(
                 secrets.join(super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
-                "http_url = \"http://127.0.0.1:9/inbox\"\n",
+                mailbox,
             )
             .unwrap();
             Vault::Applied(4)
+        }
+        fn brings_an_http_mailbox(home: &Path) -> Vault {
+            brings(home, "http_url = \"http://127.0.0.1:9/inbox\"\n")
+        }
+        fn brings_a_webmail_mailbox(home: &Path) -> Vault {
+            brings(
+                home,
+                "webmail_url = \"https://mail.example.test/inbox\"\n\
+                 user = \"m29@example.test\"\npassword = \"p\"\n",
+            )
+        }
+        fn brings_a_webmail_mailbox_with_no_password(home: &Path) -> Vault {
+            brings(
+                home,
+                "webmail_url = \"https://mail.example.test/inbox\"\nuser = \"m29@example.test\"\n",
+            )
+        }
+        /// The lab's own answer to `mailbox:m29`: the `m29_password` entry, beside a webmail
+        /// file that names no password.
+        fn brings_the_rows_password_beside_webmail(home: &Path) -> Vault {
+            brings_a_webmail_mailbox_with_no_password(home);
+            fs::write(home.join(".secrets/m29_password"), "p\n").unwrap();
+            Vault::Applied(4)
+        }
+        for (brought, browser, routed, meets) in [
+            (
+                brings_an_http_mailbox as fn(&Path) -> Vault,
+                false,
+                true,
+                true,
+            ),
+            (brings_a_webmail_mailbox, true, true, true),
+            (brings_a_webmail_mailbox, false, false, true),
+            (brings_a_webmail_mailbox_with_no_password, true, true, false),
+            (brings_the_rows_password_beside_webmail, true, true, true),
+        ] {
+            its_arrival_meets_the_need(brought, browser, routed, meets);
+        }
+    }
+
+    /// [`a_row_with_no_mailbox_asks_the_lab_for_it_and_its_arrival_meets_the_need`] with the
+    /// mailbox the vault `brought`, beside a headless browser or none, `routed` saying whether
+    /// that is a route and `meets` whether it ends the ask.
+    #[cfg(unix)]
+    fn its_arrival_meets_the_need(
+        brought: fn(&Path) -> super::super::sign_in_ladder::Vault,
+        browser: bool,
+        routed: bool,
+        meets: bool,
+    ) {
+        use super::super::sign_in_ladder::Vault;
+        use aterm_secrets::need::{self, Purpose, Want};
+        fn nothing_new(_: &Path) -> Vault {
+            Vault::Unchanged(3)
         }
         let w = World::new();
         let store = accounts::Store::at(&w.state);
@@ -20744,24 +20923,37 @@ totp = "JBSWY3DPEHPK3PXP"
         );
 
         let wit = Witness {
-            vault_sync: brings_a_mailbox,
+            vault_sync: brought,
+            browser: Box::new(move |_: &Path| browser),
             ..Witness::answering("")
         };
-        assert!(pass(&wit), "the mailbox the vault brought is a route");
+        assert_eq!(
+            pass(&wit),
+            routed,
+            "the mailbox the vault brought is a route only where it can be read (browser {browser})"
+        );
         let met = need::peek(&paths).unwrap();
         let met = met.iter().find(|need| need.want == mailbox).unwrap();
-        assert!(
+        assert_eq!(
             met.state.ended(),
-            "the mailbox's arrival meets the need: {}",
+            meets,
+            "the mailbox's arrival ends the need only where it holds the password \
+             (browser {browser}, routed {routed}): {}",
             met.line
         );
-        assert!(need::exceptions(&need::peek(&paths).unwrap()).is_empty());
+        if meets {
+            assert!(need::exceptions(&need::peek(&paths).unwrap()).is_empty());
+        }
     }
 }
 
 #[cfg(test)]
 #[path = "accounts_sync_cli_tests.rs"]
 mod cli_pool_tests;
+
+#[cfg(test)]
+#[path = "accounts_sync_alab_tests.rs"]
+mod alab_tests;
 
 #[cfg(test)]
 #[path = "accounts_sync_login_tests.rs"]

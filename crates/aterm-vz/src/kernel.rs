@@ -145,7 +145,7 @@ pub fn gunzip_image(gz: impl Read, mut out: impl Write, expect: &Expect<'_>) -> 
 /// [`Error::Input`]: `from` cannot be read, or is not `expect`'s. [`Error::Io`]: `out`
 /// refused a write or the flush.
 fn copy_checked(from: &Path, mut out: impl Write, expect: &Expect<'_>) -> Result<(), Error> {
-    let file = std::fs::File::open(from)
+    let file = crate::open_regular_nonblock(from)
         .map_err(|e| Error::Input(format!("could not open {}: {e}", from.display())))?;
     let mut reader = file.take(expect.bytes.saturating_add(1));
     let mut hash = aterm_digest::Sha256::new();
@@ -186,8 +186,13 @@ fn copy_checked(from: &Path, mut out: impl Write, expect: &Expect<'_>) -> Result
 /// is never a crash's truncation; their sha256 was held when they were laid, and they are
 /// 0444.
 fn whole(kernel: &Kernel, want: &Want<'_>) -> bool {
+    let real_parent = |path: &Path| {
+        path.parent()
+            .is_some_and(|dir| std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_dir()))
+    };
     let sized = |path: &Path, bytes: u64| {
-        std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() == bytes)
+        real_parent(path)
+            && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() == bytes)
     };
     sized(&kernel.image, want.image.bytes) && sized(&kernel.initrd, want.initrd.bytes)
 }
@@ -218,6 +223,14 @@ fn write_durably(
 /// [`Error::Input`] when a file is missing or is not its pin's (nothing is laid),
 /// [`Error::Io`] when the directory cannot be written (a full volume among them).
 pub fn lay(dir: &Path, vmlinuz: &Path, initrd: &Path, want: &Want<'_>) -> Result<Kernel, Error> {
+    if let Ok(meta) = std::fs::symlink_metadata(dir)
+        && !meta.file_type().is_dir()
+    {
+        return Err(Error::Io(format!(
+            "could not create {}: not a real directory",
+            dir.display()
+        )));
+    }
     let dest = dir.join(want.key());
     let kernel = Kernel {
         image: dest.join(IMAGE),
@@ -225,11 +238,21 @@ pub fn lay(dir: &Path, vmlinuz: &Path, initrd: &Path, want: &Want<'_>) -> Result
     };
     if !whole(&kernel, want) {
         std::fs::create_dir_all(dir).map_err(|e| io("create", dir, &e))?;
+        if !std::fs::symlink_metadata(dir)
+            .map_err(|e| io("read", dir, &e))?
+            .file_type()
+            .is_dir()
+        {
+            return Err(Error::Io(format!(
+                "could not create {}: not a real directory",
+                dir.display()
+            )));
+        }
         let scratch = aterm_tempfile::Builder::new()
             .prefix(SCRATCH)
             .tempdir_in(dir)
             .map_err(|e| io("create a scratch in", dir, &e))?;
-        let gz = std::fs::File::open(vmlinuz)
+        let gz = crate::open_regular_nonblock(vmlinuz)
             .map_err(|e| Error::Input(format!("{}: {e}", vmlinuz.display())))?;
         let image = scratch.path().join(IMAGE);
         write_durably(&image, |out| {
@@ -642,5 +665,50 @@ mod tests {
                 &pins::INITRD.sha256[..16]
             )
         );
+    }
+
+    /// NEGATIVE CONTROL: `lay` refuses symlinked kernel roots and symlinked input files without
+    /// following them, and replaces a symlinked key directory instead of trusting files behind it.
+    #[cfg(unix)]
+    #[test]
+    fn lay_refuses_symlinked_roots_and_inputs_and_replaces_symlinked_key_dir() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let p = Pinned::new(scratch.path());
+        let want = p.want();
+
+        let outside = scratch.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"keep").unwrap();
+        let linked_root = scratch.path().join("linked-kernel");
+        std::os::unix::fs::symlink(&outside, &linked_root).unwrap();
+        assert!(matches!(
+            lay(&linked_root, &p.vmlinuz, &p.initrd, &want),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(names(&outside), ["keep"]);
+
+        let linked_vmlinuz = scratch.path().join("vmlinuz-link");
+        std::os::unix::fs::symlink(&p.vmlinuz, &linked_vmlinuz).unwrap();
+        let real_dir = scratch.path().join("real-kernel");
+        assert!(matches!(
+            lay(&real_dir, &linked_vmlinuz, &p.initrd, &want),
+            Err(Error::Input(_))
+        ));
+
+        // Plant a symlink at `<real_dir>/<key>` pointing at `outside` populated with pin-sized files:
+        // `whole` must reject the symlinked parent and `lay` must replace the symlink cleanly.
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::write(outside.join(IMAGE), &p.kernel).unwrap();
+        std::fs::write(outside.join(INITRD), &p.initrd_bytes).unwrap();
+        std::os::unix::fs::symlink(&outside, real_dir.join(want.key())).unwrap();
+        let laid = lay(&real_dir, &p.vmlinuz, &p.initrd, &want).unwrap();
+        assert!(
+            std::fs::symlink_metadata(real_dir.join(want.key()))
+                .unwrap()
+                .file_type()
+                .is_dir()
+        );
+        assert_eq!(std::fs::read(&laid.image).unwrap(), p.kernel);
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"keep");
     }
 }

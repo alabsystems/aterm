@@ -51,6 +51,7 @@ fn every_host_answer_reads_back_as_written() {
     for typed in [
         None,
         Some(HostTurn::Notice),
+        Some(HostTurn::Restore),
         Some(HostTurn::CarryOn),
         Some(HostTurn::Check),
         Some(HostTurn::Fact),
@@ -65,6 +66,7 @@ fn every_host_answer_reads_back_as_written() {
     same(None::<(String, HostTurn)>);
     for turn in [
         HostTurn::Notice,
+        HostTurn::Restore,
         HostTurn::CarryOn,
         HostTurn::Check,
         HostTurn::Fact,
@@ -1650,7 +1652,7 @@ fn booked_wakes() -> WakesSeen {
             },
             WakeSeen {
                 ord: 3,
-                class: Declarer::Owner,
+                class: Declarer::Agent,
                 prio: Prio::Critical,
                 state: WakeState::Answered { at_ms: 9_000 },
                 declared_ms: 2_000,

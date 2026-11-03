@@ -267,7 +267,14 @@ fn main() {
     );
 
     let mut out = String::new();
-    let lit = |path: &Path| format!("include_str!({:?})", path.display().to_string());
+    // Emit literals: checksum dep-info omits hashes for include_str! paths containing spaces,
+    // making this crate and its dependents dirty at every build. The build script already
+    // watches each input through rerun-if-changed.
+    let lit = |path: &Path| {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("{}: not readable text: {e}", path.display()));
+        format!("{text:?}")
+    };
     rows.sort_by(|a, b| {
         a.cols[0]
             .to_ascii_lowercase()

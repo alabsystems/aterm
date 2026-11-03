@@ -15,6 +15,8 @@ mod imp;
 #[cfg(windows)]
 #[path = "windows.rs"]
 mod imp;
+#[cfg(any(windows, test))]
+mod job_fold;
 
 /// The effect a capability authorizes here.
 pub enum Sandbox {}

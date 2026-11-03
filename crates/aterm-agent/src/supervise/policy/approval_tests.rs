@@ -9565,6 +9565,130 @@ fn a_look_alike_of_the_auto_mode_setup_offer_is_not_pressed_by_its_rule() {
     assert!(reason(&decide(&reading, &rows, &full())).contains("reader vouches for"));
 }
 
+/// Every measured screen of Claude Code's `Claude in Chrome` intro: the incident's, and the
+/// real-Claude lab's in both renderers, down to 20 columns and in its extension-found form.
+fn chrome_intro_screens() -> Vec<&'static str> {
+    let mut out = vec![phase_fixtures::CHROME_INTRO];
+    out.extend(phase_fixtures::CHROME_INTRO_INLINE.map(|(_, text)| text));
+    out.extend(phase_fixtures::CHROME_INTRO_FULLSCREEN.map(|(_, text)| text));
+    out.extend(phase_fixtures::CHROME_INTRO_EXTENSION_FOUND.map(|(_, text)| text));
+    out
+}
+
+/// The intro is confirmed with its footer's Enter at `safe` and `all`, under the guard of the
+/// title's first row; under `approve = "none"` it is the owner's.
+#[test]
+fn the_chrome_intro_is_confirmed_with_its_enter_at_safe_and_all() {
+    for text in chrome_intro_screens() {
+        let rows = phase_fixtures::screen(text);
+        let p = aterm_phase::parse_prompt_v2(&rows).expect("the intro");
+        assert_eq!(p.kind, PromptKind::ChromeIntro);
+        let title = &rows[p.span.0];
+        assert!(title.trim().starts_with("Claude in"), "{title:?}");
+        let guard = crate::supervise::policy::row_guard(title);
+        for c in [ctx(), full()] {
+            let d = on_screen(&rows, &c);
+            let Decision::Approve {
+                rule_id,
+                choice,
+                guard: g,
+                subject,
+                unproven,
+            } = &d
+            else {
+                panic!("{:?}: {d:?}", c.approve);
+            };
+            assert_eq!(*rule_id, RULE_CHROME_INTRO, "{:?}", c.approve);
+            assert_eq!(
+                *choice,
+                Choice::Focus {
+                    steps: 0,
+                    label: "Enter to confirm".to_string(),
+                },
+                "{:?}",
+                c.approve
+            );
+            assert_eq!(*g, guard);
+            assert_eq!(subject, "Claude in Chrome => Enter to confirm");
+            assert_eq!(*unproven, None);
+            let m = aterm_observe::row_matcher(g).expect("compiles");
+            assert!(m.matches(title), "{g}");
+        }
+        let d = on_screen(&rows, &none(full()));
+        assert_eq!(approved(&d), None, "{d:?}");
+        assert!(reason(&d).contains("approve = \"none\""), "{d:?}");
+    }
+}
+
+/// The negative control: a look-alike of the intro (one word changed, another footer, an answer
+/// list added) is never confirmed by its rule, and at `safe` and `none` nothing presses it; a
+/// reading another program's reader made, or one the reader does not vouch for, is a person's.
+#[test]
+fn a_look_alike_of_the_chrome_intro_is_not_pressed_by_its_rule() {
+    for text in [
+        phase_fixtures::CHROME_INTRO,
+        phase_fixtures::CHROME_INTRO_FULLSCREEN[0].1,
+    ] {
+        let rows = phase_fixtures::screen(text);
+        let alike = |from: &str, to: &str| -> Vec<String> {
+            let out: Vec<String> = rows.iter().map(|r| r.replace(from, to)).collect();
+            assert_ne!(out, rows, "{from:?} is on the screen");
+            out
+        };
+        let footer = rows
+            .iter()
+            .rposition(|r| r.trim() == "Enter to confirm · Esc to cancel")
+            .expect("the footer");
+        let mut answers = rows.clone();
+        answers.splice(
+            footer..footer,
+            ["  ❯ 1. Yes", "    2. No", ""].map(str::to_string),
+        );
+        for (what, screen) in [
+            (
+                "one word of the body changed",
+                alike("to let you control your", "to let you steer your"),
+            ),
+            (
+                "another link",
+                alike("https://claude.ai/chrome", "https://claude.ai/edge"),
+            ),
+            (
+                "another footer",
+                alike(
+                    "Enter to confirm · Esc to cancel",
+                    "Enter to select · Esc to cancel",
+                ),
+            ),
+            ("a numbered answer list added", answers),
+        ] {
+            for c in [ctx(), full(), none(full())] {
+                let Some(d) = decide_screen(Some("claude"), &screen, &c) else {
+                    continue;
+                };
+                assert_ne!(
+                    approved(&d),
+                    Some(RULE_CHROME_INTRO),
+                    "{what} {:?}: {d:?}",
+                    c.approve
+                );
+                if c.approve != Approve::All {
+                    assert_eq!(approved(&d), None, "{what} {:?}: {d:?}", c.approve);
+                }
+            }
+        }
+    }
+    let rows = phase_fixtures::screen(phase_fixtures::CHROME_INTRO);
+    if let Some(d) = decide_screen(Some("codex"), &rows, &full()) {
+        assert!(approved(&d).is_none(), "{d:?}");
+    }
+    let reading = aterm_phase::Reading {
+        phase_authoritative: false,
+        ..aterm_phase::read(Some("claude"), &rows, None)
+    };
+    assert!(reason(&decide(&reading, &rows, &full())).contains("reader vouches for"));
+}
+
 #[test]
 fn muses_several_questions_multi_select_and_review_are_a_persons() {
     use aterm_phase::muse::fixtures as u;

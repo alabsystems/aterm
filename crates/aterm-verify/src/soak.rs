@@ -13,7 +13,7 @@ use crate::exit;
 /// `verify soak`'s usage.
 pub const USAGE: &str = "targo --unverified verify soak [--ledger PATH]
 
-The crash restore's soak: keeper P4's precondition, judged from this machine's
+The crash restore's soak: how the on-by-default keeper does, judged from this machine's
 recovery ledger (the installed app's; --ledger reads another file). It judges the
 machine, not the tree: the days the keeper link has been on without a break, the
 launches that recovered sessions after a kill, the share of those sessions that came
@@ -67,7 +67,7 @@ pub fn run(args: &[String]) -> i32 {
     };
     let soak = judge(&rows, now, &P4);
     println!(
-        "=== verify soak: the crash restore (keeper P4's precondition) — {} rows of {} ===",
+        "=== verify soak: the crash restore (the on-by-default keeper) — {} rows of {} ===",
         soak.rows,
         path.display()
     );

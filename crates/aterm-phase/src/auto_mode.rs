@@ -26,8 +26,9 @@ fn is_footer(row: &str) -> bool {
 /// up from `end` while each row continues the one above it ([`crate::prompt::wraps_onto`]) until
 /// the rows, rejoined, say the footer's words or more than it holds. Measured on Claude Code
 /// 2.1.310, the footer takes two rows in a pane 35 columns wide or narrower down to 20, three at
-/// 19 and 17, and four at 16, the narrowest pane a split leaves.
-fn footer_from(rows: &[String], end: usize) -> Option<usize> {
+/// 19 and 17, and four at 16, the narrowest pane a split leaves. The `Claude in Chrome` intro
+/// draws the same footer in the same dialog frame ([`crate::chrome_intro`]).
+pub(crate) fn footer_from(rows: &[String], end: usize) -> Option<usize> {
     let most = crate::anchor!("prompt.confirm").len()
         + " · ".len()
         + crate::anchor!("prompt.cancel").len();

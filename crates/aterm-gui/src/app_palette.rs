@@ -391,7 +391,7 @@ impl App {
         let maximized = window
             .and_then(|ws| ws.os_window.as_ref())
             .is_some_and(|w| w.is_maximized());
-        let multi_tab = window.is_some_and(|ws| ws.tab_set.len() >= 2);
+        let multi_tab = window.is_some_and(|ws| ws.tab_set.shown_len() >= 2);
         let native_tab_active = wid.is_some_and(|wid| self.active_native_view(wid).is_some());
         let staged = self.relaunch.as_ref().map(|r| (r.build, r.version.clone()));
         let staged_trouble = staged
@@ -518,7 +518,7 @@ impl App {
             can_save: content_window.is_some_and(|wid| self.can_save_document(wid)),
             can_find: content_window.is_some_and(|wid| self.can_find(wid)),
             can_find_again: content_window.is_some_and(|wid| self.can_find_again(wid)),
-            multi_tab: self.front().is_some_and(|ws| ws.tab_set.len() >= 2),
+            multi_tab: self.front().is_some_and(|ws| ws.tab_set.shown_len() >= 2),
             can_reopen_closed_tab: self.can_reopen_closed_tab(),
             can_reopen_closed_view: self.can_reopen_closed_view(),
             serious_mode: self.serious_mode_enabled(),

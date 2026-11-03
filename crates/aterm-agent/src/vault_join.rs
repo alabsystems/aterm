@@ -4,7 +4,7 @@
 //! `vault-join` ([`FleetOp::VaultJoin`]): a Mac that is ALab's already but whose vault key changed
 //! proves itself to a member over the fleet's own channel and is let back into the vault with
 //! nobody's Allow (`aterm_secrets::client::readmit`,
-//! `docs/DESIGN-automatic-alab-lan-admission-2026-10-29.md` "Re-admission by proof").
+//! `docs/DESIGN-automatic-lan-admission-2026-11-02.md` "Re-admission by proof").
 //!
 //! The channel (`atf/2`) proved the fleet secret the listener holds and the dialer's node key,
 //! bound to this connection's TLS exporter, so the proof is fresh. On it the member's desk then
@@ -14,8 +14,8 @@
 //! current fleet code (a removal rotates it, so a removed Mac's copy proves nothing) and this
 //! Mac's own drive admission takes the node, so the vault is never easier to enter than the fleet.
 //! The joining Mac's side is [`prove_over_fleet`].
-//! A new Mac with no fleet secret uses [`AutomaticJoins`] on the node job's anonymous `ask`
-//! channel: its signed request reaches the existing vault queue without opening a window.
+//! A new Mac with no fleet secret proves itself (`prove`) on the node job's anonymous `ask`
+//! channel ([`AutomaticJoins`]) and is let in from the home ALab LAN with no window open.
 
 use aterm_net::fleet::{FleetMark, FleetOp, FleetSecret, NodeIdentity, NodeKey, NodeProof};
 use aterm_net::fleet_member::{MemberKeys, Peer};
@@ -52,13 +52,40 @@ pub const READS_MOVED_SEATS: (u64, u64) = (0, 148);
 /// weeks, past which its updater has had its chance.
 pub const HEARD_WITHIN_MS: u64 = 14 * 24 * 60 * 60 * 1000;
 
+/// Canonical decimal integer with no leading zeros (except `"0"`).
+fn canonical_u64(part: &str) -> Option<u64> {
+    if part.is_empty() || (part.len() > 1 && part.starts_with('0')) {
+        return None;
+    }
+    if !part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    part.parse().ok()
+}
+
 /// Whether `version` (a book entry's, `0.148.0` or `0.148.0+g<sha>`) is [`READS_MOVED_SEATS`] or
 /// later; a version this cannot read is not.
 fn reads_moved_seats(version: &str) -> bool {
-    let mut parts = version.split(['.', '+', '-']);
-    let mut number = || parts.next().and_then(|part| part.parse::<u64>().ok());
-    match (number(), number()) {
-        (Some(major), Some(minor)) => (major, minor) >= READS_MOVED_SEATS,
+    let core = match version.split_once('+') {
+        Some((_, meta))
+            if meta.is_empty()
+                || !meta
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-')) =>
+        {
+            return false;
+        }
+        Some((core, _)) => core,
+        None => version,
+    };
+    let mut parts = core.split('.');
+    match (
+        parts.next().and_then(canonical_u64),
+        parts.next().and_then(canonical_u64),
+        parts.next().and_then(canonical_u64),
+        parts.next(),
+    ) {
+        (Some(major), Some(minor), Some(_patch), None) => (major, minor) >= READS_MOVED_SEATS,
         _ => false,
     }
 }
@@ -238,7 +265,10 @@ fn serve_deciding(
         Some(desk::Proof {
             decide,
             refuses,
-            fleet: judged.fleet.then_some(judged.node),
+            fleet: Some(desk::Fleet {
+                node: judged.node,
+                current: judged.fleet,
+            }),
         }),
     )
     .map(drop)
@@ -247,10 +277,45 @@ fn serve_deciding(
 /// How long one `vault-join` dial and exchange may take.
 pub const VAULT_JOIN_WITHIN: Duration = Duration::from_secs(20);
 
+/// How a proof reaches the member at an address, its dial (connect and handshake) within the
+/// time given ([`dial_until`]).
+pub(crate) type DialWithin<'a> =
+    dyn Fn(&str, Duration) -> aterm_secrets::Result<Box<dyn Stream>> + Sync + 'a;
+
+/// What a proof that tries members one after another ([`join::prove_first`]) reaches the member
+/// at an address by: `dial` with that member's address and how long its dial (connect and
+/// handshake) may take, `within` at most and never past `until`. Once `until` has passed it
+/// dials no member and refuses at once: nothing went to that member, so nothing was signed, and
+/// the proof reads as one no member let in (the plain ask follows). A member already reached
+/// keeps its exchange's own bounds, since cutting one short after the possession answer reads
+/// as a member that may have signed. With no `until`, every member is dialed within `within`.
+pub(crate) fn dial_until<'a>(
+    until: Option<std::time::Instant>,
+    within: Duration,
+    dial: &'a DialWithin<'a>,
+) -> impl Fn(&str) -> aterm_secrets::Result<Box<dyn Stream>> + Sync + 'a {
+    move |at| {
+        let within = match until {
+            None => within,
+            Some(until) => {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Err(aterm_secrets::Error::new(
+                        "this run's time to prove this Mac ran out before this member, so it \
+                         asks plainly; its vault subscriber proves again",
+                    ));
+                }
+                left.min(within)
+            }
+        };
+        dial(at, within)
+    }
+}
+
 /// The joining Mac's side: prove this Mac to the fleet's members (its book's peers, `peers`, each
 /// `(host, addr, port)`), over [`FleetOp::VaultJoin`] with the fleet `secret` and node `me`, one
 /// after another ([`join::prove_first`]): the first that lets it in hands the log bundle, which
-/// this Mac writes.
+/// this Mac writes. No member is dialed once `until` has passed ([`dial_until`]).
 ///
 /// # Errors
 /// No member let it in ([`join::Missed`]).
@@ -259,12 +324,13 @@ pub fn prove_over_fleet(
     joining: &Joining<'_>,
     (secret, me): (&FleetSecret, &NodeIdentity),
     peers: &[(String, Option<IpAddr>, u16)],
+    until: Option<std::time::Instant>,
 ) -> Result<join::Joined, join::Missed> {
     let ats: Vec<String> = peers
         .iter()
         .map(|(host, _, port)| aterm_net::fleet_member::host_port(host, *port))
         .collect();
-    let dial = |at: &str| -> aterm_secrets::Result<Box<dyn Stream>> {
+    let reach = |at: &str, within: Duration| -> aterm_secrets::Result<Box<dyn Stream>> {
         let (host, addr, port) = peers
             .iter()
             .find(|(host, _, port)| aterm_net::fleet_member::host_port(host, *port) == at)
@@ -275,7 +341,7 @@ pub fn prove_over_fleet(
             *port,
             (secret, Some(me)),
             FleetOp::VaultJoin,
-            VAULT_JOIN_WITHIN,
+            within,
         )
         .map_err(|error| aterm_secrets::Error::new(error.to_string()))?;
         let stream = reached.transport.into_stream();
@@ -283,6 +349,7 @@ pub fn prove_over_fleet(
         stream.sock.set_write_timeout(Some(VAULT_JOIN_WITHIN))?;
         Ok(Box::new(stream))
     };
+    let dial = dial_until(until, VAULT_JOIN_WITHIN, &reach);
     let dial: &Dial<'_> = &dial;
     let sign_node = |message: &[u8]| -> [u8; 64] { me.sign_record(desk::PROVE_RECORD, message) };
     join::prove_first(paths, dial, joining, &sign_node, &ats)

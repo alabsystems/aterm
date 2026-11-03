@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! An admin Mac's record of each Mac asking to join the secrets vault that its approver leaves
-//! to a person (`aterm_secrets::client::asking`): no proof of the join password, one that did
-//! not match, or no home ALab LAN observation. Each one is an Info entry in the digest
+//! to a person (`aterm_secrets::client::asking`): no proof of the join password, or one that
+//! did not match. Each one is an Info entry in the digest
 //! ([`crate::join_entries`], never an alert on screen) naming the asking Mac and its code, and
 //! its Approve lets exactly that Mac in (`aterm_secrets::client::approve_request`). Approve is
 //! never a row's primary or default button ([`Intent::never_default`]): a person compares the
@@ -132,7 +132,6 @@ mod tests {
             host: host.to_string(),
             code: "ABCD-EFGH-JKMN-PQRS".to_string(),
             at: None,
-            home: None,
             allowed: None,
             proof: None,
         };

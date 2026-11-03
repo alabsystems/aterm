@@ -11,7 +11,7 @@ use aterm_json::{Map, Value};
 
 use super::args::{Format, Invocation};
 use super::verbs::Noun;
-use super::write_out::WriteReport;
+use super::write_out::{self, ReportOutcome, WriteReport};
 use super::{Answer, Completeness, Ctx, Outcome, Receipt};
 use crate::error::{Error, Kind, Result, SideEffect, Sub};
 use crate::github::raw::RawSend;
@@ -355,9 +355,8 @@ impl Begun<'_> {
 
     /// The journal, or could_not_run when this write opened none.
     fn journal(&self) -> Result<&dyn IntentStore> {
-        self.journal.ok_or_else(|| {
-            Error::could_not_run("a PATCH, PUT or DELETE is not journaled").with_sub(Sub::Local)
-        })
+        self.journal
+            .ok_or_else(|| Error::local("a PATCH, PUT or DELETE is not journaled"))
     }
 }
 
@@ -388,24 +387,6 @@ impl IntentStore for Begun<'_> {
     }
 }
 
-/// The outcome a write's error prints in its report: `unknown` when the kind is
-/// OutcomeUnknown or `side_effect` is unknown or applied (a settle that failed after a 2xx:
-/// GitHub took the write, so it is not `refused`), `not_sent` when agh could not run and
-/// nothing was written, `refused` for anything else. It is WP6's `outcome_of` rule as WP3
-/// amends it (plan §7, the sixth pass; §10 body 1.5); once `write_out::outcome_of` lands,
-/// `agh api` calls it and this copy goes.
-fn outcome_word(error: &Error) -> &'static str {
-    if error.kind == Kind::OutcomeUnknown
-        || matches!(error.side_effect, SideEffect::Unknown | SideEffect::Applied)
-    {
-        "unknown"
-    } else if error.kind == Kind::CouldNotRun {
-        "not_sent"
-    } else {
-        "refused"
-    }
-}
-
 /// `agh api` with `POST`, `PATCH`, `PUT` or `DELETE` (design §9.4, plan §7 body 8). The
 /// repository is the literal the typed PATH holds, a `DELETE` needs `--confirm PATH` typed
 /// again, and `--dry-run` routes and mints the permit and sends and journals nothing. Off
@@ -415,10 +396,11 @@ fn outcome_word(error: &Error) -> &'static str {
 /// # Errors
 ///
 /// Usage for `--all`, a path outside `/repos/{owner}/{repo}/…`, and the read path's path and
-/// field rules; Refused (exit 1) for a DELETE without its `--confirm`; the permit's refusal;
-/// `Raw::send`'s Usage. Every other error of the journal or `Raw::send` is a refused,
-/// unknown or not-sent write, which prints its report and exits 1 (an answered 401, 403 or
-/// 429 its own 4, 5 or 11), 13 or 3, or the error's own exit.
+/// field rules; Refused (exit 1) for a DELETE without its `--confirm`; the permit's Usage
+/// refusal (`--anonymous`, an unknown or unscoped `--as`) and `Raw::send`'s Usage, exit 2 with
+/// no report. The permit's other refusals and every other error of the journal or
+/// `Raw::send` are a refused, unknown or not-sent write, which prints its report and exits 1
+/// (an answered 401, 403 or 429 its own 4, 5 or 11), 13 or 3, or the error's own exit.
 fn api_write(ctx: &mut Ctx, inv: &Invocation, method: Method) -> Result<Outcome> {
     if inv.has("--all") {
         return Err(inv.usage("--all pages a read"));
@@ -449,13 +431,31 @@ fn api_write(ctx: &mut Ctx, inv: &Invocation, method: Method) -> Result<Outcome>
         .with_anonymous(inv.global.anonymous)
         .with_as(inv.global.as_profile.clone())
         .with_named(named);
-    let permit = gh.permit(&route)?;
     let key = crate::github::raw::journal_key(method, &path);
-    let report = |outcome: &str| WriteReport::new(outcome, WriteOp::Api, &slug, &key);
+    // Every report of a dry run says so, its refusals included, as `Write::report` marks them.
+    let dry = inv.has("--dry-run");
+    let report = |outcome: ReportOutcome| {
+        let report = WriteReport::new(outcome.slug(), WriteOp::Api, &slug, &key);
+        if dry { report.dry_run() } else { report }
+    };
     let receipt = |gh: &crate::client::Github| {
         let mut receipt = Receipt::new(&inv.verb_name()).metered(&gh.meter());
         receipt.repo = Some(slug.to_string());
         receipt
+    };
+    // The permit's refusal prints the write's report, as every other write verb's does
+    // (plan §4.6.20): outcome `refused`, with the refusal's own exit. A Usage refusal
+    // (`--anonymous`, an unknown or unscoped `--as`) prints none, as `Write::finish` and
+    // `Raw::send`'s arm below answer it (plan §10 body 1.5).
+    let permit = match gh.permit(&route) {
+        Ok(permit) => permit,
+        Err(error) if error.kind == Kind::Usage => return Err(error),
+        Err(error) => {
+            return Ok(Outcome {
+                answer: write_out::failed(report(ReportOutcome::of(&error)), error),
+                receipt: receipt(&gh),
+            });
+        }
     };
     // Off unix every write answers `write::unix_only()` before anything is journaled or sent
     // (`Raw::send`'s and `gh.journal`'s first step), so a dry run answers it too: it
@@ -463,14 +463,14 @@ fn api_write(ctx: &mut Ctx, inv: &Invocation, method: Method) -> Result<Outcome>
     if cfg!(not(unix)) {
         return Ok(Outcome {
             answer: Answer::FailedWith {
-                value: report("not_sent").to_value(),
+                value: report(ReportOutcome::NotSent).to_value(),
                 error: crate::write::unix_only(),
             },
             receipt: receipt(&gh),
         });
     }
-    if inv.has("--dry-run") {
-        let value = report("would_send").dry_run().to_value();
+    if dry {
+        let value = report(ReportOutcome::WouldSend).to_value();
         return Ok(Outcome {
             answer: Answer::Object {
                 noun: Noun::Write,
@@ -518,7 +518,7 @@ fn api_write(ctx: &mut Ctx, inv: &Invocation, method: Method) -> Result<Outcome>
                 .iter()
                 .find_map(|name| object.get(name).and_then(Value::as_str))
                 .map(str::to_string);
-            let report = report("created")
+            let report = report(ReportOutcome::Created)
                 .with_object(id, url.as_deref())
                 .with_intent(intent.as_ref())
                 .with_answer(Some(value));
@@ -528,7 +528,7 @@ fn api_write(ctx: &mut Ctx, inv: &Invocation, method: Method) -> Result<Outcome>
             }
         }
         Ok(WriteOutcome::NeverSent(error)) => Answer::FailedWith {
-            value: report("not_sent").to_value(),
+            value: report(ReportOutcome::NotSent).to_value(),
             error,
         },
         Ok(WriteOutcome::Refused(error)) => {
@@ -544,19 +544,18 @@ fn api_write(ctx: &mut Ctx, inv: &Invocation, method: Method) -> Result<Outcome>
                 error.recast(Kind::Refused, why)
             };
             Answer::FailedWith {
-                value: report("refused").to_value(),
+                value: report(ReportOutcome::Refused).to_value(),
                 error,
             }
         }
         Ok(WriteOutcome::Unknown { intent, error }) => {
-            let value = report("unknown").with_intent(Some(&intent)).to_value();
-            // `into_result` of an Unknown is always its OutcomeUnknown error (exit 13).
-            let unknown = WriteOutcome::<()>::Unknown { intent, error }.into_result();
+            let value = report(ReportOutcome::Unknown)
+                .with_intent(Some(&intent))
+                .to_value();
             Answer::FailedWith {
                 value,
-                error: unknown.err().unwrap_or_else(|| {
-                    Error::new(Kind::OutcomeUnknown, "the write's outcome is unknown")
-                }),
+                // Its OutcomeUnknown error (exit 13).
+                error: crate::write::unknown_error(&intent, error),
             }
         }
         // A PATCH, PUT or DELETE that may have landed has no intent: it is OutcomeUnknown
@@ -572,7 +571,7 @@ fn api_write(ctx: &mut Ctx, inv: &Invocation, method: Method) -> Result<Outcome>
                 error.with_next(format!("agh api {path}"))
             };
             Answer::FailedWith {
-                value: report("unknown")
+                value: report(ReportOutcome::Unknown)
                     .with_intent(begun.id().as_ref())
                     .to_value(),
                 error,
@@ -589,7 +588,7 @@ fn api_write(ctx: &mut Ctx, inv: &Invocation, method: Method) -> Result<Outcome>
                 _ => begun.id(),
             };
             Answer::FailedWith {
-                value: report(outcome_word(&error))
+                value: report(ReportOutcome::of(&error))
                     .with_intent(intent.as_ref())
                     .to_value(),
                 error,
@@ -597,35 +596,4 @@ fn api_write(ctx: &mut Ctx, inv: &Invocation, method: Method) -> Result<Outcome>
         }
     };
     Ok(Outcome { answer, receipt })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::outcome_word;
-    use crate::error::{Error, Kind, SideEffect, Sub};
-
-    /// Each row of the outcome rule: a settle that failed after a 2xx (could_not_run, side
-    /// effect applied) is `unknown`, not `refused`, and not `not_sent`.
-    #[test]
-    fn the_outcome_rule_row_by_row() {
-        let after_a_2xx = Error::could_not_run("GitHub answered 201, and the journal could not")
-            .with_sub(Sub::Local)
-            .with_side_effect(SideEffect::Applied);
-        let rows = [
-            (after_a_2xx, "unknown"),
-            (
-                Error::could_not_run("no answer").with_side_effect(SideEffect::Unknown),
-                "unknown",
-            ),
-            (
-                Error::new(Kind::OutcomeUnknown, "an open intent"),
-                "unknown",
-            ),
-            (crate::write::unix_only(), "not_sent"),
-            (Error::refused("a refusal"), "refused"),
-        ];
-        for (error, word) in rows {
-            assert_eq!(outcome_word(&error), word, "{error:?}");
-        }
-    }
 }

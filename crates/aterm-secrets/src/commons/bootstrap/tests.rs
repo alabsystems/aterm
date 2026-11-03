@@ -847,7 +847,7 @@ fn bootstrap_revalidates_source_after_device_and_control_waits() {
         let target = home.path().join("other.vault");
         let waited = Rc::new(Cell::new(0));
         let observed = waited.clone();
-        let error = aterm_uds::private_file::with_lock_wait_observer(
+        let error = aterm_uds::file_lock::with_lock_wait_observer(
             move |_| {
                 observed.set(observed.get() + 1);
                 switch_source(&changed_paths, &target);

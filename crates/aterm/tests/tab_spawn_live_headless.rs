@@ -102,7 +102,7 @@ fn a_held_split_tab_new_or_connected_tab_leaves_the_loop_answering() {
     let reply = held_round(&inst, &boot_sid, &["tab", "new"]);
     assert_eq!(
         reply.split_whitespace().collect::<Vec<_>>(),
-        ["OK", "1", "2"],
+        ["OK", "2", "2"],
         "the new second tab is active: {reply}"
     );
 

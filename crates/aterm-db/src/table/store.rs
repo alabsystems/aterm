@@ -25,6 +25,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+mod append_tests;
 pub mod custody;
 mod directory;
 #[cfg(test)]
@@ -149,7 +151,7 @@ impl Region {
             Self::Recovery => b"ATSR",
         }
     }
-    fn claims(self, session: &Session<'_>) -> Result<PathBuf> {
+    pub(crate) fn claims(self, session: &Session<'_>) -> Result<PathBuf> {
         let primary = claim_dir(session)?;
         match self {
             Self::Primary => Ok(primary),
@@ -818,29 +820,28 @@ impl Store {
         ))
     }
     fn admit(&self, header: &Header, bytes: usize) -> Result<()> {
-        if self.records.len() >= self.capacity.operations
+        self.admit_records(header.actor, 1, bytes)
+    }
+    fn admit_records(&self, actor: Actor, records: usize, bytes: usize) -> Result<()> {
+        if self.records.len().saturating_add(records) > self.capacity.operations
             || self.operation_bytes.saturating_add(bytes) > self.capacity.bytes
         {
             return Err(Error::new(
                 "table operation capacity exhausted; conflict space is reserved",
             ));
         }
-        let mut count = 0;
+        let mut count = records;
         let mut size = bytes;
-        for stored in self
-            .records
-            .values()
-            .filter(|r| r.header.actor == header.actor)
-        {
+        for stored in self.records.values().filter(|r| r.header.actor == actor) {
             count += 1;
             size = size.saturating_add(stored.wire.len());
         }
-        let records = if self.scope == crate::catalog::scope(self.scope.trust()) {
+        let writer_limit = if self.scope == crate::catalog::scope(self.scope.trust()) {
             crate::catalog::RECORDS_PER_CREATOR
         } else {
             WRITER_RECORDS
         };
-        if count >= records || size > WRITER_BYTES {
+        if count > writer_limit || size > WRITER_BYTES {
             return Err(Error::new("table writer evidence quota exhausted"));
         }
         Ok(())
@@ -1196,30 +1197,76 @@ impl Store {
 
     /// Join a wide frontier using application no-ops before committing the edit.
     /// The payload factory must produce a command with no application effects.
-    /// Each merge is independently durable; an interrupted caller can resume
-    /// from the reduced frontier without repeating a completed application edit.
+    /// Prepare every record and admit its aggregate record and byte quotas
+    /// before writing. Each accepted merge is independently durable; an
+    /// interrupted write can resume from the reduced frontier without repeating
+    /// a completed application edit.
     pub(crate) fn commit_catalog_with_merges(
         &mut self,
         session: &Session<'_>,
         payload: &[u8],
         mut merge: impl FnMut() -> Result<Vec<u8>>,
     ) -> Result<Receipt> {
-        loop {
-            let projection = self.catalog_projection(session)?;
-            let fits = self.catalog_append_bound(&projection) == 1;
+        let projection = self.catalog_projection(session)?;
+        if self.catalog_append_bound(&projection) == 1 {
             let parents = if self.scope == crate::catalog::scope(self.scope.trust()) {
                 BTreeSet::new()
             } else {
                 projection.heads
             };
-            if fits {
-                return self.commit_from(session, payload, &projection.ordered, parents);
-            }
+            return self.commit_from(session, payload, &projection.ordered, parents);
+        }
+        let mut previous = self
+            .authoring_predecessor(session, &projection.ordered)?
+            .cloned();
+        let mut heads = projection.heads;
+        let mut proposed = self.index.clone();
+        let mut prepared = Vec::new();
+        let mut bytes = 0usize;
+        // Admit the exact sealed sizes and headers, including the final edit.
+        // A conservative merge count can refuse a batch that would fit.
+        let final_wire = loop {
+            let fits = heads.len()
+                + usize::from(previous.as_ref().is_some_and(|p| !heads.contains(&p.id)))
+                <= MAX_PARENTS;
             // commit_from also names this writer's predecessor. Reserve one
             // parent for it even when another head already descends from it.
-            let joined = parents.into_iter().take(MAX_PARENTS - 1).collect();
-            self.commit_from(session, &merge()?, &projection.ordered, joined)?;
+            let parents = if fits {
+                heads.clone()
+            } else {
+                heads.iter().copied().take(MAX_PARENTS - 1).collect()
+            };
+            let merge_payload;
+            let next = if fits {
+                payload
+            } else {
+                merge_payload = merge()?;
+                &merge_payload
+            };
+            let wire = self.seal_after(session, next, previous.as_ref(), parents)?;
+            let record = session.authenticate(self.scope, &wire)?;
+            operation_policy(self.scope, record.header(), record.payload().len())?;
+            bytes = bytes.saturating_add(wire.len());
+            self.admit_records(self.actor, prepared.len() + 1, bytes)?;
+            proposed
+                .insert(record.header().clone())
+                .map_err(|_| Error::new("table index refused header or capacity"))?;
+            if fits {
+                break wire;
+            }
+            // Each prepared merge extends this writer's complete admitted chain
+            // and replaces its named visible heads. Nothing is durable yet.
+            for parent in &record.header().parents {
+                heads.remove(parent);
+            }
+            heads.insert(record.header().id);
+            previous = Some(record.header().clone());
+            prepared.push(wire);
+        };
+        for wire in prepared {
+            self.ingest(session, &wire)?;
         }
+        self.ingest(session, &final_wire)
     }
 
     /// Reserve the final record and enough joins for any generated record ids.
@@ -1343,6 +1390,22 @@ impl Store {
     ///
     /// # Errors
     /// As `commit_catalog`, except that a wide frontier never refuses the append.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AlabJournal",
+            action = "FlushCurrent",
+            project = "aterm_db::alab::journal::model_tests::commons_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AlabJournal",
+            action = "FlushNext",
+            project = "aterm_db::alab::journal::model_tests::commons_transition"
+        )
+    )]
     pub(crate) fn commit_own(&mut self, session: &Session<'_>, payload: &[u8]) -> Result<Receipt> {
         let projection = self.catalog_projection(session)?;
         self.commit_from(session, payload, &projection.ordered, BTreeSet::new())
@@ -1409,8 +1472,17 @@ impl Store {
         session: &Session<'_>,
         payload: &[u8],
         retained: &[Digest],
-        mut parents: BTreeSet<Digest>,
+        parents: BTreeSet<Digest>,
     ) -> Result<Receipt> {
+        let previous = self.authoring_predecessor(session, retained)?;
+        let wire = self.seal_after(session, payload, previous, parents)?;
+        self.ingest(session, &wire)
+    }
+    fn authoring_predecessor(
+        &self,
+        session: &Session<'_>,
+        retained: &[Digest],
+    ) -> Result<Option<&Header>> {
         self.check(session)?;
         if self.region == Region::Recovery {
             return Err(Error::new(
@@ -1462,6 +1534,18 @@ impl Store {
         }) {
             return Err(Error::new("local table writer is cut off in this table"));
         }
+        Ok(previous)
+    }
+    fn seal_after(
+        &self,
+        session: &Session<'_>,
+        payload: &[u8],
+        previous: Option<&Header>,
+        mut parents: BTreeSet<Digest>,
+    ) -> Result<Vec<u8>> {
+        let sequence = previous
+            .map_or(Some(1), |h| h.sequence.checked_add(1))
+            .ok_or_else(|| Error::new("table writer sequence exhausted"))?;
         let previous = previous.map(|h| h.id);
         if let Some(id) = previous {
             parents.insert(id);
@@ -1474,7 +1558,7 @@ impl Store {
         let parents: Vec<_> = parents.into_iter().collect();
         // No sealed bytes escape before the local acknowledgement. After a crash
         // an unacknowledged suffix is archived, so reuse cannot publish two forks.
-        let wire = session.seal(
+        session.seal(
             self.scope,
             Causal {
                 sequence,
@@ -1482,8 +1566,7 @@ impl Store {
                 parents: &parents,
             },
             payload,
-        )?;
-        self.ingest(session, &wire)
+        )
     }
     fn catalog_projection(&self, session: &Session<'_>) -> Result<Projection> {
         self.check(session)?;
@@ -1972,8 +2055,15 @@ fn operation_policy(scope: Scope, header: &Header, payload: usize) -> Result<()>
 }
 /// The directory that holds each enrolled table's independent claim, beside Commons custody.
 pub(crate) fn claim_dir(session: &Session<'_>) -> Result<PathBuf> {
-    session
-        .bootstrap
+    claim_dir_of(session.bootstrap)
+}
+
+/// [`claim_dir`] of `bootstrap`'s custody, for a reader with no session (the runtime's clock
+/// store, `crate::clock`).
+pub(crate) fn claim_dir_of(
+    bootstrap: &aterm_secrets::commons::bootstrap::Bootstrap,
+) -> Result<PathBuf> {
+    bootstrap
         .journal_dir()
         .parent()
         .map(|p| p.join("table-claims"))

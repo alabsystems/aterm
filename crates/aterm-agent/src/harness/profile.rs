@@ -863,6 +863,35 @@ pub fn account_of(env: &[String], user_home: &Path) -> Option<AccountKey> {
     .flatten()
 }
 
+/// The provider key in an attributed login's retained profile, if its address matches.
+/// A named login uses its own directory; the default login uses the process's profile
+/// selectors. The caller supplies the attributed row's identity address. This observes
+/// local identity metadata, not provider authentication.
+#[must_use]
+pub fn account_for_login(
+    env: &[String],
+    user_home: &Path,
+    login: Option<&str>,
+    expected_email: &str,
+) -> Option<AccountKey> {
+    let path = match login.filter(|login| !login.is_empty()) {
+        Some(login) => {
+            let home = Path::new(login);
+            if !home.is_absolute() {
+                return None;
+            }
+            profile_in_home(home)
+        }
+        None => effective_of(env, user_home)?,
+    };
+    let selected = read_with(&path, parse_selected).ok()?;
+    selected
+        .email
+        .as_deref()
+        .filter(|email| super::accounts::email_matches(email, expected_email))?;
+    selected.profile.key
+}
+
 /// Full-width identity of the exact Claude profile at `path`. Unlike the short
 /// display `AccountKey`, this digest may bind local authorization state. The
 /// caller must first prove a successful login in this same staging home; a
@@ -944,6 +973,12 @@ pub struct SubscriptionDisplay {
     /// [`Self::weekly_figure`] is. `None` where the profile names none, and for Muse Code and
     /// `agy` ([`agy_subscription_for`]), whose weeks are not a Claude plan's.
     pub account: Option<AccountKey>,
+    /// This session's footer has had its one usage read on this account: it asked the provider,
+    /// or found a current figure that served. A pass that skipped its read (the store's lock
+    /// held, no program found, another fetch in flight) leaves it false for the next pass, so
+    /// only a read that happened is spent. Muse Code's and `agy`'s footers; the owner's no-polling
+    /// rule ([`super::provider_read`]).
+    pub usage_read: bool,
 }
 
 /// One weekly figure, whichever source read it (Claude Code's `/usage` cache, this process's usage
@@ -1176,6 +1211,12 @@ fn muse_usage_attempt_recent(entry: Option<&MuseUsageEntry>, now: i64) -> bool {
     entry.is_some_and(|entry| now.saturating_sub(entry.attempted_at) < MUSE_USAGE_RETRY_S)
 }
 
+/// Whether a Muse footer pass reads usage: once per session on an account (`read_here`, its
+/// [`SubscriptionDisplay::usage_read`]), and not while a figure is current or a fetch just ran.
+fn muse_usage_owed(entry: Option<&MuseUsageEntry>, read_here: bool, now: i64) -> bool {
+    !read_here && !muse_usage_fresh(entry, now) && !muse_usage_attempt_recent(entry, now)
+}
+
 static MUSE_USAGE_CACHE: std::sync::Mutex<Option<MuseUsageCacheMap>> = std::sync::Mutex::new(None);
 
 /// One Muse usage fetch at a time ([`super::muse_usage::fetch`]): the mint is bounded
@@ -1274,12 +1315,14 @@ pub fn muse_subscription_for(
     // The fetch never runs on this (the footer's one resolver) thread: a hung
     // `muse serve` would stall every session's facts behind its budget. A stale
     // cache kicks a fetch thread and serves what it has; the landed reading shows
-    // at the next resolver pass.
-    if !muse_usage_fresh(cached.as_ref(), now)
-        && !muse_usage_attempt_recent(cached.as_ref(), now)
+    // at the next resolver pass. An explicit `muse_usage_forget` clears `cached`
+    // so the person's fact-menu refresh mints one fresh figure.
+    let read_here = same_email && prev.usage_read && cached.is_some();
+    let mut usage_read = read_here || muse_usage_fresh(cached.as_ref(), now);
+    if muse_usage_owed(cached.as_ref(), read_here, now)
         && let Some(exe) = muse_exe_for(argv, env, user_home)
     {
-        kick_muse_usage_fetch(
+        usage_read = kick_muse_usage_fetch(
             key.clone(),
             exe,
             muse_serve_env(env, &home_dir),
@@ -1303,6 +1346,7 @@ pub fn muse_subscription_for(
         weekly,
         weekly_figure: figure,
         weekly_reset: same_email.then(|| prev.weekly_reset.clone()).flatten(),
+        usage_read,
         ..SubscriptionDisplay::default()
     })
 }
@@ -1310,30 +1354,32 @@ pub fn muse_subscription_for(
 /// Kicks the one in-flight Muse usage fetch (`MUSE_USAGE_FETCHING`) on its own
 /// thread for `key`, marking the attempt now so the reads behind it serve the
 /// cache instead of kicking again. A landed reading replaces the cache's; a
-/// failed one only moves the attempt stamp, keeping the last good reading.
+/// failed one only moves the attempt stamp, keeping the last good reading. Returns whether a
+/// fetch started.
 fn kick_muse_usage_fetch(
     key: MuseUsageCacheKey,
     exe: PathBuf,
     serve_env: Vec<(&'static str, std::ffi::OsString)>,
     home_dir: PathBuf,
     now: i64,
-) {
+) -> bool {
     if MUSE_USAGE_FETCHING.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        return;
+        return false;
     }
-    {
+    let previous = {
         let mut guard = MUSE_USAGE_CACHE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let slot = guard
-            .get_or_insert_with(std::collections::HashMap::new)
-            .entry(key.clone())
-            .or_insert(MuseUsageEntry {
-                attempted_at: now,
-                reading: None,
-            });
+        let map = guard.get_or_insert_with(std::collections::HashMap::new);
+        let prev = map.get(&key).cloned();
+        let slot = map.entry(key.clone()).or_insert(MuseUsageEntry {
+            attempted_at: now,
+            reading: None,
+        });
         slot.attempted_at = now;
-    }
+        prev
+    };
+    let spawned_key = key.clone();
     let spawned = std::thread::Builder::new()
         .name("aterm-muse-usage".to_string())
         .spawn(move || {
@@ -1353,13 +1399,36 @@ fn kick_muse_usage_fetch(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             land_muse_usage(
                 guard.get_or_insert_with(std::collections::HashMap::new),
-                &key,
+                &spawned_key,
                 reading,
                 done,
             );
         });
-    if spawned.is_err() {
+    if spawned.is_ok() {
+        super::provider_read::note(&super::provider_read::ProbeEvent {
+            at: now,
+            read: super::provider_read::Read::MuseUsage,
+            account: None,
+            login: super::journal::realm_key("meta", &key.1),
+            why: super::provider_read::InUse::LiveSession,
+        });
+        true
+    } else {
+        let mut guard = MUSE_USAGE_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(map) = guard.as_mut() {
+            match previous {
+                Some(entry) => {
+                    map.insert(key, entry);
+                }
+                None => {
+                    map.remove(&key);
+                }
+            }
+        }
         MUSE_USAGE_FETCHING.store(false, std::sync::atomic::Ordering::Release);
+        false
     }
 }
 
@@ -2429,8 +2498,12 @@ fn agy_subscription_with_store_in_dir(
     let prev_figure = (same_email && !from_other_bucket)
         .then_some(prev.weekly_figure)
         .flatten();
+    let mut usage_read = same_email && prev.usage_read;
     let figure = match cached {
-        Some((_, Some(fig))) if fig.current(now) => Some(fig),
+        Some((_, Some(fig))) if fig.current(now) => {
+            usage_read = true;
+            Some(fig)
+        }
         _ => {
             let store_reading = store
                 .filter(|_| !account_switched)
@@ -2453,8 +2526,10 @@ fn agy_subscription_with_store_in_dir(
                 if let Some(other_fig) = store_other {
                     map.insert(other_key, (other_fig.at, Some(other_fig)));
                 }
+                usage_read = true;
                 Some(fig)
-            } else if matches!(cached, Some((at, None)) if now.saturating_sub(at) < AGY_USAGE_RETRY_S)
+            } else if usage_read
+                || matches!(cached, Some((at, None)) if now.saturating_sub(at) < AGY_USAGE_RETRY_S)
                 || (!account_switched && store.is_some_and(|s| s.recent_failure(now).is_some()))
             {
                 fallback
@@ -2463,6 +2538,14 @@ fn agy_subscription_with_store_in_dir(
                 if matches!(lock, Some(None)) {
                     fallback
                 } else if let Some(exe) = agy_exe_for(argv, env, user_home) {
+                    usage_read = true;
+                    super::provider_read::note(&super::provider_read::ProbeEvent {
+                        at: now,
+                        read: super::provider_read::Read::AgyUsage,
+                        account: None,
+                        login: super::journal::realm_key("google", &email),
+                        why: super::provider_read::InUse::LiveSession,
+                    });
                     let bytes = fetch_agy_usage_doc(
                         &exe,
                         argv,
@@ -2476,15 +2559,19 @@ fn agy_subscription_with_store_in_dir(
                     let other_fetched = bytes
                         .as_deref()
                         .and_then(|b| parse_agy_usage_json(b, !third_party, now));
-                    if let (Some(store), Some(bytes)) = (store, bytes)
-                        && let Ok(doc) = String::from_utf8(bytes)
-                        && let Ok(quota) = super::agy_quota::parse(&doc)
-                    {
-                        let _ = store.keep(&super::agy_quota_store::Reading {
-                            as_of: now,
-                            quota,
-                            doc,
-                        });
+                    if let Some(store) = store {
+                        if let Some(bytes) = bytes
+                            && let Ok(doc) = String::from_utf8(bytes)
+                            && let Ok(quota) = super::agy_quota::parse(&doc)
+                        {
+                            let _ = store.keep(&super::agy_quota_store::Reading {
+                                as_of: now,
+                                quota,
+                                doc,
+                            });
+                        } else {
+                            store.note_failure("footer usage read failed", now);
+                        }
                     }
                     let mut guard = AGY_USAGE_CACHE
                         .lock()
@@ -2513,6 +2600,7 @@ fn agy_subscription_with_store_in_dir(
         weekly,
         weekly_figure: figure,
         weekly_reset: same_email.then(|| prev.weekly_reset.clone()).flatten(),
+        usage_read,
         ..SubscriptionDisplay::default()
     })
 }
@@ -2637,6 +2725,7 @@ impl Selected {
             label: None,
             weekly_reset: None,
             account: self.profile.key,
+            usage_read: false,
         }
     }
 

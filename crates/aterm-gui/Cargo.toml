@@ -132,6 +132,16 @@ path = "examples/objc_ime_drive.rs"
 name = "objc_toolbar_drive"
 path = "examples/objc_toolbar_drive.rs"
 
+# The native confirmation driver: checks owner and general menu alerts through the runtime
+# adapter, including words, buttons, clicks, Return/keypad Enter defaults and Escape. It answers in process
+# through the main queue, since aterm drops a control client's keys at a confirmation.
+# DECLARED like its siblings (`aterm-verify`'s `OBJC_DRIVES`). Run by `targo --unverified
+# verify appkit`; by hand it is
+# `targo --unverified run -p aterm-gui --example objc_confirm_drive`.
+[[example]]
+name = "objc_confirm_drive"
+path = "examples/objc_confirm_drive.rs"
+
 # The Developer Tools helper panel's driver: builds `devtools_helper::live`'s views as
 # the live arm does, in no window and under the Prohibited activation policy, so it may
 # run beside a person; captures every state to PNG in the directory given as its
@@ -505,7 +515,7 @@ aterm-win32 = { workspace = true }
 # oracle, aterm-dirfd's and then the rustix 0.38 facade's, until it left the
 # lock at linux-windowing LW.7.)
 aterm-dirfd = { workspace = true }
-# The PTY keeper's client (opt-in, `[keeper] enabled`): `keeper_link.rs` registers each
+# The PTY keeper's client (on by default, `[keeper] enabled`): `keeper_link.rs` registers each
 # master with the keeper and takes its offers at boot. The keeper itself links no GUI
 # framework (census guards `keeper-gui`, `keeper-gui-deps`).
 aterm-keeper = { workspace = true }

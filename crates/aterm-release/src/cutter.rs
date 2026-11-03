@@ -426,7 +426,7 @@ fn stale_fix(exe: &Path, root: &Path, since: Since) -> String {
 /// inputs judged from `since`, and a stale one's remedy as [`stale_fix`] gives it for `since`.
 fn judge(exe: &Path, built_in: &Path, since: Since) -> Stamp {
     let dep_info = exe.with_extension("d");
-    let text = fs::read_to_string(&dep_info).map_err(|e| {
+    let text = crate::durable::read_text(&dep_info).map_err(|e| {
         NotOwn::new(
             format!(
                 "cannot read {} ({e}), the dep-info cargo writes beside a binary it links",
@@ -435,7 +435,7 @@ fn judge(exe: &Path, built_in: &Path, since: Since) -> Stamp {
             RELINK,
         )
     })?;
-    let sources = dep_info_sources(&text, exe).ok_or_else(|| {
+    let (output, sources) = dep_info_sources(&text, exe).ok_or_else(|| {
         NotOwn::new(
             format!("{} does not describe {}", dep_info.display(), exe.display()),
             RELINK,
@@ -464,8 +464,19 @@ fn judge(exe: &Path, built_in: &Path, since: Since) -> Stamp {
             ),
         ));
     }
-    let target_root = exe.parent().and_then(Path::parent).unwrap_or(&root);
-    let edited = checkout_sources(sources, &root, target_root);
+    let resolved_exe = fs::canonicalize(exe).map_err(|e| {
+        NotOwn::new(
+            format!("cannot resolve cutter {} ({e})", exe.display()),
+            RELINK,
+        )
+    })?;
+    // Dep-info and the running image may spell the same output through different
+    // root or target-directory aliases. Only these proved output paths define exclusions.
+    let targets: Vec<&Path> = [exe, output.as_path(), resolved_exe.as_path()]
+        .into_iter()
+        .filter_map(|exe| exe.parent().and_then(Path::parent))
+        .collect();
+    let edited = checkout_sources(sources, &root, &targets);
     let resolved = fs::canonicalize(&root)
         .map_err(|e| NotOwn::new(format!("cannot resolve {} ({e})", root.display()), RELINK))?;
     let outside = |input: &Path| {
@@ -483,16 +494,36 @@ fn judge(exe: &Path, built_in: &Path, since: Since) -> Stamp {
             ),
         )
     };
-    let mut walked = Vec::new();
-    let mut compiled = BTreeSet::new();
+    let mut inputs = CompiledInputs::default();
     let mut absent = Vec::new();
     for source in &edited {
-        for (path, name) in from_root(source, &resolved).ok_or_else(|| outside(source))? {
-            walked.push(path);
-            compiled.insert(name);
-        }
+        inputs
+            .read(source, &resolved)
+            .map_err(|error| match error {
+                InputError::Outside(path) => outside(&path),
+                InputError::Read(path, error) => NotOwn::new(
+                    format!(
+                        "cannot enumerate compiled input {} ({error})",
+                        path.display()
+                    ),
+                    RELINK,
+                ),
+                InputError::Cycle(path) => NotOwn::new(
+                    format!(
+                        "compiled input directory {} contains a symbolic-link cycle",
+                        path.display()
+                    ),
+                    format!("remove the directory cycle, then {RELINK}"),
+                ),
+            })?;
     }
-    for input in build_inputs(&edited, &root) {
+    let CompiledInputs {
+        mut walked,
+        mut files,
+        directories,
+        ..
+    } = inputs;
+    for input in build_inputs(&walked, &resolved) {
         let mut read = from_root(&input, &resolved).ok_or_else(|| outside(&input))?;
         if read
             .last()
@@ -502,7 +533,7 @@ fn judge(exe: &Path, built_in: &Path, since: Since) -> Stamp {
         }
         for (path, name) in read {
             walked.push(path);
-            compiled.insert(name);
+            files.insert(name);
         }
     }
     let changed = changed_after(&walked, since)
@@ -520,10 +551,20 @@ fn judge(exe: &Path, built_in: &Path, since: Since) -> Stamp {
         )
     };
     let tracked = crate::clean::tracked_files(&root).ok_or_else(unlisted)?;
-    if let Some(untracked) = compiled.iter().find(|path| !tracked.contains(*path)) {
+    let trees = tracked_directories(&tracked);
+    let untracked = files
+        .iter()
+        .find(|path| !tracked.contains(*path))
+        .or_else(|| directories.iter().find(|path| !trees.contains(*path)));
+    if let Some(untracked) = untracked {
+        let kind = if directories.contains(untracked) {
+            "directory"
+        } else {
+            "file"
+        };
         return Err(NotOwn::new(
             format!(
-                "it reads {untracked}, which {} does not track (an untracked or ignored file, \
+                "it reads {untracked}, which {} does not track (an untracked or ignored {kind}, \
                  which no commit holds)",
                 root.display()
             ),
@@ -536,7 +577,14 @@ fn judge(exe: &Path, built_in: &Path, since: Since) -> Stamp {
     let dirty: Vec<String> = crate::clean::dirty_against_head(&root)
         .ok_or_else(unlisted)?
         .into_keys()
-        .filter(|path| is_source_input(path) || compiled.contains(path))
+        .filter(|path| {
+            is_source_input(path)
+                || files.contains(path)
+                || directories.iter().any(|dir| {
+                    path.strip_prefix(dir)
+                        .is_some_and(|rest| rest.starts_with('/'))
+                })
+        })
         .collect();
     if !dirty.is_empty() {
         return Err(NotOwn::new(
@@ -593,13 +641,28 @@ fn head(git: &dyn GitRunner) -> Option<String> {
     aterm_codec::hex::is_lower(&commit, 40).then_some(commit)
 }
 
-fn dep_info_sources(text: &str, target: &Path) -> Option<Vec<PathBuf>> {
-    let same = |a: &Path| a == target || fs::canonicalize(a).ok() == fs::canonicalize(target).ok();
+fn dep_info_sources(text: &str, target: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
+    let same = |a: &Path| {
+        matches!(
+            (fs::canonicalize(a), fs::canonicalize(target)),
+            (Ok(a), Ok(target)) if a == target
+        )
+    };
     text.lines().find_map(|line| {
         let words = split_escaped(line);
         let (first, rest) = words.split_first()?;
         let out = first.strip_suffix(':')?;
-        same(Path::new(out)).then(|| rest.iter().map(PathBuf::from).collect())
+        same(Path::new(out))
+            .then(|| {
+                let output = PathBuf::from(out);
+                let output = if output.is_absolute() {
+                    output
+                } else {
+                    std::env::current_dir().ok()?.join(output)
+                };
+                Some((output, rest.iter().map(PathBuf::from).collect()))
+            })
+            .flatten()
     })
 }
 
@@ -635,13 +698,35 @@ fn checkout_of(sources: &[PathBuf]) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn checkout_sources(sources: Vec<PathBuf>, root: &Path, target_root: &Path) -> Vec<PathBuf> {
+fn checkout_sources(sources: Vec<PathBuf>, root: &Path, targets: &[&Path]) -> Vec<PathBuf> {
+    let resolved = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    // Align only the checkout root. Descendant source links must still reach
+    // from_root intact, where their own tracking and containment are checked.
+    let align = |path: &Path| {
+        path.strip_prefix(root)
+            .or_else(|_| path.strip_prefix(&resolved))
+            .ok()
+            .map(|rest| resolved.join(rest))
+    };
+    let targets: Vec<PathBuf> = targets
+        .iter()
+        .map(|path| align(path).unwrap_or_else(|| path.to_path_buf()))
+        .filter(|path| !resolved.starts_with(path))
+        .collect();
     sources
         .into_iter()
         .filter(|source| {
-            source.starts_with(root)
-                && !source.starts_with(target_root)
-                && !source.components().any(|c| c.as_os_str() == ".git")
+            let input = match align(source) {
+                Some(source) => !targets.iter().any(|target| source.starts_with(target)),
+                // Unknown root aliases may identify checkout inputs too. This
+                // can only include an input, never exclude one as generated.
+                // Keep the original spelling for link and containment checks.
+                None => source
+                    .ancestors()
+                    .find_map(|path| fs::canonicalize(path).ok())
+                    .is_some_and(|path| path.starts_with(&resolved)),
+            };
+            input && !source.components().any(|c| c.as_os_str() == ".git")
         })
         .collect()
 }
@@ -677,9 +762,74 @@ fn build_inputs(sources: &[PathBuf], root: &Path) -> Vec<PathBuf> {
     inputs.into_iter().collect()
 }
 
+#[derive(Default)]
+struct CompiledInputs {
+    walked: Vec<PathBuf>,
+    files: BTreeSet<String>,
+    directories: BTreeSet<String>,
+    expanding: BTreeSet<PathBuf>,
+    expanded: BTreeSet<PathBuf>,
+}
+
+enum InputError {
+    Outside(PathBuf),
+    Read(PathBuf, std::io::Error),
+    Cycle(PathBuf),
+}
+
+impl CompiledInputs {
+    /// A directory dependency includes its names and every descendant, even those ignored
+    /// by Git. Keep every link in the original path and inspect the resolved directory once;
+    /// only a completed expansion may be reused, so a link back into the active walk refuses.
+    fn read(&mut self, input: &Path, resolved: &Path) -> Result<(), InputError> {
+        let read = from_root(input, resolved).ok_or_else(|| InputError::Outside(input.into()))?;
+        for (path, name) in read {
+            self.walked.push(path.clone());
+            if !fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                self.files.insert(name);
+                continue;
+            }
+            self.directories.insert(name);
+            if self.expanding.contains(&path) {
+                return Err(InputError::Cycle(path));
+            }
+            if self.expanded.contains(&path) {
+                continue;
+            }
+            self.expanding.insert(path.clone());
+            let mut entries = fs::read_dir(&path)
+                .map_err(|error| InputError::Read(path.clone(), error))?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| InputError::Read(path.clone(), error))?;
+            entries.sort();
+            for entry in entries {
+                self.read(&entry, resolved)?;
+            }
+            self.expanding.remove(&path);
+            self.expanded.insert(path);
+        }
+        Ok(())
+    }
+}
+
+/// Git records files and gitlinks, not directory entries. Their ancestors are the
+/// directory trees a tracked input can establish; empty untracked directories establish none.
+fn tracked_directories(files: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut directories = BTreeSet::new();
+    for file in files {
+        let mut below = file.as_str();
+        while let Some((parent, _)) = below.rsplit_once('/') {
+            directories.insert(parent.to_owned());
+            below = parent;
+        }
+    }
+    directories
+}
+
 /// What reading `path` reads in the checkout at `resolved`, its resolved root: each symbolic
 /// link inside `resolved` that `path` passes through, in a folder or as its last part, then the
-/// file it ends at, each beside the name git gives it there (its parts from `resolved`, joined by
+/// entry it ends at, each beside the name git gives it there (its parts from `resolved`, joined by
 /// `/`). So a link and the file it leads to must each be one a commit holds. `path` is resolved
 /// part by part as the kernel resolves it: a link's target from the link's folder, a `..` after
 /// the links before it; it ends at its first part that is not there, as nothing below that is.
@@ -1000,6 +1150,143 @@ mod tests {
             format!("{}: {}\n", escaped(&b.exe), words.join(" ")),
         )
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    mod directory_inputs {
+        use super::*;
+
+        const WATCH: &str = "fixtures/steps";
+        const CHILD: &str = "fixtures/steps/nested/b.jsonl";
+
+        fn fixture() -> (Built, String) {
+            let b = built();
+            let old = linked(&b) - Duration::from_secs(60);
+            place(&b, "fixtures/steps/a.jsonl", "first\n", old);
+            place(&b, CHILD, "nested\n", old);
+            place(
+                &b,
+                ".gitignore",
+                "fixtures/steps/ignored.jsonl\nfixtures/steps/ignored-dir/\n",
+                old,
+            );
+            let head = commit(&b.work, "tracked directory inputs");
+            compiled(&b, &[WATCH]);
+            backdate(&b.work, old);
+            (b, head)
+        }
+
+        #[test]
+        fn a_directory_dep_info_entry_accepts_its_tracked_tree() {
+            let (b, head) = fixture();
+            assert_eq!(judged(&b), Ok(head));
+        }
+
+        #[test]
+        fn directory_inputs_reject_nested_edits_and_removals_outside_source_prefixes() {
+            for remove in [false, true] {
+                let (b, _) = fixture();
+                let old = linked(&b) - Duration::from_secs(60);
+                if remove {
+                    fs::remove_file(b.work.join(CHILD)).unwrap();
+                } else {
+                    place(&b, CHILD, "different\n", old);
+                }
+                backdate(&b.work, old);
+                let not = judged(&b).expect_err("changed descendant is a compiled input");
+                assert!(
+                    not.why.contains("uncommitted cutter sources") && not.why.contains(CHILD),
+                    "{not:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn directory_input_freshness_retains_directory_entry_changes() {
+            let (b, _) = fixture();
+            let nested = b.work.join("fixtures/steps/nested");
+            let transient = nested.join("removed.jsonl");
+            fs::write(&transient, "added then removed\n").unwrap();
+            fs::remove_file(transient).unwrap();
+            set_folder_modified(&nested, linked(&b) + Duration::from_secs(1));
+            let not = judged(&b).expect_err("a removed entry still changes the directory");
+            assert!(
+                not.why.contains("fixtures/steps/nested changed after"),
+                "{not:?}"
+            );
+        }
+
+        #[test]
+        fn directory_inputs_reject_untracked_ignored_and_empty_entries() {
+            for (name, directory) in [
+                ("loose.jsonl", false),
+                ("ignored.jsonl", false),
+                ("empty", true),
+                ("ignored-dir", true),
+            ] {
+                let (b, _) = fixture();
+                let path = b.work.join(WATCH).join(name);
+                if directory {
+                    fs::create_dir(&path).unwrap();
+                } else {
+                    fs::write(&path, "not committed\n").unwrap();
+                }
+                backdate(&b.work, linked(&b) - Duration::from_secs(60));
+                let not = judged(&b).expect_err("untracked directory input");
+                assert!(
+                    not.why.contains(name) && not.why.contains("does not track"),
+                    "{not:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn directory_inputs_keep_internal_links_and_their_targets_in_the_proof() {
+            let (b, _) = fixture();
+            let old = linked(&b) - Duration::from_secs(60);
+            place(&b, "fixtures/target.jsonl", "target\n", old);
+            let alias = b.work.join(WATCH).join("alias.jsonl");
+            std::os::unix::fs::symlink("../target.jsonl", &alias).unwrap();
+            std::os::unix::fs::symlink("nested", b.work.join(WATCH).join("nested-alias")).unwrap();
+            let head = commit(&b.work, "internal file and directory links");
+            backdate(&b.work, old);
+            assert_eq!(judged(&b), Ok(head.clone()));
+
+            place(&b, "fixtures/target.jsonl", "target changed\n", old);
+            let not =
+                judged(&b).expect_err("linked target outside watched directory still checked");
+            assert!(not.why.contains("fixtures/target.jsonl"), "{not:?}");
+            place(&b, "fixtures/target.jsonl", "target\n", old);
+            assert_eq!(judged(&b), Ok(head));
+
+            fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink("nested/b.jsonl", &alias).unwrap();
+            let not = judged(&b).expect_err("link identity itself remains checked");
+            assert!(not.why.contains("fixtures/steps/alias.jsonl"), "{not:?}");
+        }
+
+        #[test]
+        fn directory_inputs_refuse_escape_and_cycles() {
+            for cycle in [false, true] {
+                let (b, _) = fixture();
+                let old = linked(&b) - Duration::from_secs(60);
+                let link = b.work.join(WATCH).join("link");
+                let target = if cycle { "." } else { "../../../outside" };
+                fs::write(b.work.with_file_name("outside"), "outside\n").unwrap();
+                std::os::unix::fs::symlink(target, &link).unwrap();
+                commit(&b.work, "a directory input link");
+                backdate(&b.work, old);
+                let not = judged(&b).expect_err("escaping and cyclic directory walks refuse");
+                assert!(
+                    not.why.contains(if cycle {
+                        "symbolic-link cycle"
+                    } else {
+                        "resolves outside"
+                    }),
+                    "{not:?}"
+                );
+            }
+        }
     }
 
     /// A commit that changes only a build input dep-info does not list (the lockfile, a crate's
@@ -1398,11 +1685,162 @@ mod tests {
                 PathBuf::from("/r/s/.git/HEAD"),
             ],
             Path::new("/r/s"),
-            Path::new("/r/s/target"),
+            &[Path::new("/r/s/target")],
         );
         assert_eq!(kept, [PathBuf::from("/r/s/crates/a.rs")]);
         assert!(is_source_input("crates/a/b.rs") && is_source_input("Cargo.lock"));
         assert!(!is_source_input("cratesx/a.rs") && !is_source_input("docs/a.md"));
+        assert!(
+            dep_info_sources(
+                "/missing-other-output: /source.rs",
+                Path::new("/missing-output")
+            )
+            .is_none()
+        );
+        assert!(
+            dep_info_sources("/missing-output: /source.rs", Path::new("/missing-output")).is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_root_aliases_keep_generated_outputs_out_and_real_inputs_in() {
+        use std::os::unix::fs::symlink;
+        let b = built();
+        let alias = b._dir.path().join("checkout-alias");
+        symlink(&b.work, &alias).unwrap();
+        let output = b.work.join("artifact-output/gate/aterm-release");
+        fs::create_dir_all(output.parent().unwrap()).unwrap();
+        fs::write(&output, "linked").unwrap();
+        set_modified(&output, linked(&b));
+        let generated = alias.join("artifact-output/gate/build/fixture/out/generated.rs");
+        fs::create_dir_all(generated.parent().unwrap()).unwrap();
+        fs::write(&generated, "generated").unwrap();
+        let write_deps = |extra: &Path| {
+            let escaped = |p: &Path| p.display().to_string().replace(' ', "\\ ");
+            fs::write(
+                output.with_extension("d"),
+                format!(
+                    "{}: {} {}\n",
+                    escaped(&output),
+                    escaped(&alias.join(OWN_MAIN)),
+                    escaped(extra)
+                ),
+            )
+            .unwrap();
+        };
+        let verdict = || judge(&output, &alias.join(OWN_CRATE), Since::Link(linked(&b)));
+        write_deps(&generated);
+        assert_eq!(verdict(), Ok(b.head.clone()));
+        let untracked = b.work.join("crates/aterm-release/src/untracked.rs");
+        fs::write(&untracked, "real input").unwrap();
+        write_deps(&untracked);
+        let refused = verdict().expect_err("canonical-spelled real source must still be attested");
+        assert!(refused.why.contains("untracked.rs"), "{refused:?}");
+        fs::remove_file(untracked).unwrap();
+        let source_alias = alias.join("crates/aterm-release/src/output-alias.rs");
+        symlink(&generated, &source_alias).unwrap();
+        git(
+            &b.work,
+            &["add", "--", "crates/aterm-release/src/output-alias.rs"],
+        );
+        git(&b.work, &["commit", "-qm", "tracked input link"]);
+        write_deps(&source_alias);
+        assert!(
+            verdict().is_err(),
+            "a source link into generated output is still an input"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_matched_binary_output_namespace_may_use_a_target_directory_alias() {
+        use std::os::unix::fs::symlink;
+        let b = built();
+        let physical = b._dir.path().join("build-output");
+        let alias = b.work.join("output-alias");
+        fs::create_dir_all(physical.join("gate/build/fixture/out")).unwrap();
+        symlink(&physical, &alias).unwrap();
+        let output = physical.join("gate/aterm-release");
+        fs::write(&output, "linked").unwrap();
+        set_modified(&output, linked(&b));
+        let generated = alias.join("gate/build/fixture/out/generated.rs");
+        fs::write(&generated, "generated").unwrap();
+        let write_deps = |extra: &Path| {
+            let escaped = |p: &Path| p.display().to_string().replace(' ', "\\ ");
+            fs::write(
+                output.with_extension("d"),
+                format!(
+                    "{}: {} {}\n",
+                    escaped(&alias.join("gate/aterm-release")),
+                    escaped(&b.work.join(OWN_MAIN)),
+                    escaped(extra)
+                ),
+            )
+            .unwrap();
+        };
+        let verdict = || judge(&output, &b.work.join(OWN_CRATE), Since::Link(linked(&b)));
+        write_deps(&generated);
+        assert_eq!(verdict(), Ok(b.head.clone()));
+        let source_alias = b.work.join("crates/aterm-release/src/aliased-input.rs");
+        symlink(&generated, &source_alias).unwrap();
+        git(
+            &b.work,
+            &["add", "--", "crates/aterm-release/src/aliased-input.rs"],
+        );
+        git(&b.work, &["commit", "-qm", "tracked input link"]);
+        write_deps(&source_alias);
+        assert!(
+            verdict().is_err(),
+            "a non-output source link must not be canonicalized away"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_third_checkout_alias_cannot_hide_untracked_or_removed_inputs() {
+        use std::os::unix::fs::symlink;
+        let b = built();
+        let alias = b._dir.path().join("third-checkout-alias");
+        symlink(&b.work, &alias).unwrap();
+        let old = linked(&b) - Duration::from_secs(60);
+        place(&b, "fixtures/material.txt", "compiled input", old);
+        let write_deps = |extra: &Path| {
+            let escaped = |p: &Path| p.display().to_string().replace(' ', "\\ ");
+            fs::write(
+                b.exe.with_extension("d"),
+                format!(
+                    "{}: {} {}\n",
+                    escaped(&b.exe),
+                    escaped(&b.work.join(OWN_MAIN)),
+                    escaped(extra)
+                ),
+            )
+            .unwrap();
+        };
+        let input = alias.join("fixtures/material.txt");
+        write_deps(&input);
+        let untracked = judged(&b).expect_err("an alias must not hide an untracked input");
+        assert!(
+            untracked.why.contains("fixtures/material.txt"),
+            "{untracked:?}"
+        );
+        let head = commit(&b.work, "tracked compiled fixture");
+        assert_eq!(judged(&b), Ok(head.clone()));
+
+        let external = b._dir.path().join("external-dependency.rs");
+        fs::write(&external, "outside dependency").unwrap();
+        write_deps(&external);
+        assert_eq!(judged(&b), Ok(head));
+
+        write_deps(&input);
+        fs::remove_file(b.work.join("fixtures/material.txt")).unwrap();
+        set_folder_modified(
+            &b.work.join("fixtures"),
+            linked(&b) + Duration::from_secs(1),
+        );
+        let removed = judged(&b).expect_err("a missing aliased leaf must remain an input");
+        assert!(removed.why.contains("material.txt"), "{removed:?}");
     }
 
     #[cfg(unix)]

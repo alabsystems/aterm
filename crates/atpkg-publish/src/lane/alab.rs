@@ -16,7 +16,7 @@ use crate::api::{Baseline, Build, Delta, IndexRequest, Indexer, PackRequest, Pac
 use crate::artifact::{pkgdoc, upload};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
-use crate::host::{Probe, Release};
+use crate::host::{HostRef, HostRole, Probe, Release, Slug, gh_serves, preflight_each};
 use crate::programs::{self, Hello, ProgramDef, Shape};
 use crate::quad::{self, VerifiedQuad};
 use crate::triple::{AARCH64_APPLE_DARWIN, Os, Triple};
@@ -371,8 +371,8 @@ pub fn run(ctx: &Ctx, opts: &Options, deps: &Deps<'_>, tx: &Transcript) -> Resul
             if let Some(started) = state.stalled_since(ctx.now_unix) {
                 let msg = format!(
                     "the run holding {} started {}, more than {}h ago — a stalled run (a hung \
-                     build? a prompt?); find it with `pgrep -fl 'atpkg-publish lane run alab'` \
-                     and kill it",
+                     build? a prompt?); find it with `pgrep -fl \
+                     'atpkg-publish( --host [a-z-]+)? lane run alab'` and kill it",
                     state.lock.display(),
                     aterm_types::rfc3339::format_rfc3339(u64::try_from(started).unwrap_or(0)),
                     super::state::STALLED_AFTER_SECS / 3600
@@ -805,10 +805,37 @@ fn preflight(ctx: &Ctx, deps: &Deps<'_>) -> Result<()> {
             ctx.shown(&ctx.identity.record)
         )));
     }
-    for (what, path) in [
-        ("channel", &ctx.tokens.channel),
-        ("staging", &ctx.tokens.staging),
+    for (what, path, role) in [
+        ("channel", &ctx.tokens.channel, HostRole::Channel),
+        ("staging", &ctx.tokens.staging, HostRole::Staging),
     ] {
+        if !gh_serves(ctx, role) {
+            // Each tracked program's repository too: the lane clones and stages each one's
+            // staging repository and publishes its packs to its public one, and under agh both
+            // push and a release-tier grant are per repository.
+            let tracked = programs::PROGRAMS.iter().filter(|d| d.lane_tracked());
+            let (host, slugs): (&HostRef, Vec<Slug>) = match role {
+                HostRole::Channel => (
+                    &ctx.hosts.channel,
+                    std::iter::once(ctx.index_slug())
+                        .chain(tracked.map(|d| ctx.public_slug(d.repo)))
+                        .collect(),
+                ),
+                HostRole::Staging => (
+                    &ctx.hosts.staging,
+                    std::iter::once(ctx.staging_slug(atpkg::manifest::INDEX_REPO))
+                        .chain(tracked.map(|d| ctx.staging_slug(d.repo)))
+                        .collect(),
+                ),
+            };
+            preflight_each(&**host, slugs).map_err(|(slug, e)| {
+                Error::cannot_run(format!(
+                    "{what} writer unavailable on {slug}: {e} — the unattended lane writes only \
+                     through agh.toml's writers"
+                ))
+            })?;
+            continue;
+        }
         match ctx.usable_token(path) {
             Ok(true) => {}
             Ok(false) => {
@@ -981,7 +1008,7 @@ fn signed_release(
     def: &ProgramDef,
 ) -> std::result::Result<SignedRelease, ReleaseGap> {
     let slug = ctx.public_slug(def.repo);
-    let releases = ctx.hosts.channel.releases(&slug).map_err(|e| {
+    let releases = ctx.hosts.channel.published_releases(&slug).map_err(|e| {
         ReleaseGap::NoTag(format!("no signed vX.Y.Z release readable on {slug} ({e})"))
     })?;
     let tag = newest_signed_tag(&releases)
@@ -1057,11 +1084,22 @@ fn signed_commit(
             Probe::Absent => return Err(format!("{f} of {slug} {tag} is not published")),
             Probe::Unknown(why) => return Err(format!("{f} of {slug} {tag}: {why}")),
         }
-        bytes.push(std::fs::read(dir.join(f)).map_err(|e| format!("read {f}: {e}"))?);
+        bytes.push(
+            crate::identity::read_regular_bytes(&dir.join(f), SUMS_CAP)
+                .map_err(|e| format!("read {f}: {e}"))?,
+        );
     }
     let [_, _, roster_file, roster_sig_file] = quad::QUAD_FILES;
-    let roster = std::fs::read(head.file(roster_file)).map_err(|e| e.to_string())?;
-    let roster_sig = std::fs::read(head.file(roster_sig_file)).map_err(|e| e.to_string())?;
+    let roster = crate::identity::read_regular_bytes(
+        &head.file(roster_file),
+        crate::identity::MAX_META_BYTES,
+    )
+    .map_err(|e| e.to_string())?;
+    let roster_sig = crate::identity::read_regular_bytes(
+        &head.file(roster_sig_file),
+        crate::identity::MAX_META_BYTES,
+    )
+    .map_err(|e| e.to_string())?;
     let anchor: Vec<&str> = ctx.anchor.iter().map(String::as_str).collect();
     atpkg_keys::verify_signed(
         &anchor,
@@ -1100,7 +1138,7 @@ fn resolve_dev(
     clone: &Path,
 ) -> std::result::Result<String, String> {
     let short = &public_commit[..public_commit.len().min(12)];
-    let text = std::fs::read_to_string(ledger).map_err(|_| {
+    let text = crate::identity::read_regular_text(ledger, SUMS_CAP).map_err(|_| {
         format!(
             "no engine ledger at {} to map the signed commit {short} to a dev commit",
             ctx.shown(ledger)

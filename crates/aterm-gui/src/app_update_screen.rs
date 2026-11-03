@@ -348,8 +348,8 @@ impl App {
                 lapses: manual.retry_at.is_some(),
             };
         }
-        if self.kept_image_waits_for_terminal() {
-            return P::WaitsForTerminal;
+        if self.kept_image_installs_at_next_launch() {
+            return P::AtNextLaunch;
         }
         P::Automatic
     }

@@ -29,6 +29,28 @@ struct Case {
 
 const CASES: &[Case] = &[
     Case {
+        name: "a resize to the same width keeps the glyph printed up to a left margin",
+        cols: 10,
+        rows: 2,
+        steps: &[
+            Out(b"\x1b[?69h\x1b[3;6s\x1b[1;2He"),
+            Width(10),
+            Out("\u{301}X".as_bytes()),
+        ],
+        rows_after: &[" e\u{301}X", ""],
+    },
+    Case {
+        name: "a width change resets the margins and the glyph is simply left of the cursor",
+        cols: 10,
+        rows: 2,
+        steps: &[
+            Out(b"\x1b[?69h\x1b[3;6s\x1b[1;2He"),
+            Width(12),
+            Out("\u{301}X".as_bytes()),
+        ],
+        rows_after: &[" e\u{301}X", ""],
+    },
+    Case {
         name: "a wrap pending at the edge takes the next column on a widening",
         cols: 5,
         rows: 2,

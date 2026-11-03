@@ -1004,16 +1004,21 @@ impl Lexicon {
         {
             return;
         }
+        let matched_key = if hit.form_id.variant_byte() == 0 {
+            folded.as_str()
+        } else {
+            candidate_folded.as_str()
+        };
         if hit.class == Class::Feline
             && !opts.allow_bare_cat
-            && char_count_le_3(folded)
+            && char_count_le_3(matched_key)
             && !hit.marks_required
         {
             return;
         }
         if hit.class == Class::Emphasis
-            && char_count_le_3(folded)
-            && !self.user_surfaces.contains(folded.as_str())
+            && char_count_le_3(matched_key)
+            && !self.user_surfaces.contains(matched_key)
         {
             return;
         }

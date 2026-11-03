@@ -155,11 +155,13 @@ pub(crate) struct Looker {
 #[cfg(target_vendor = "apple")]
 impl Looker {
     /// `stat` the contended number by its `/dev/fd` path, which the caller holds open now, counting
-    /// a failure as a race.
-    pub(crate) fn probe(&self) {
-        if std::fs::metadata(&self.path).is_err() {
+    /// a failure as a race and returning whether this lookup raced.
+    pub(crate) fn probe(&self) -> bool {
+        let raced = std::fs::metadata(&self.path).is_err();
+        if raced {
             self.raced.set(self.raced.get() + 1);
         }
+        raced
     }
 }
 

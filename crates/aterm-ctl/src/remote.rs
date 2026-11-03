@@ -317,26 +317,29 @@ pub(crate) fn run(
 
 /// A plain remote shell carries no task or command and names its one destination folder.
 fn shell_spawn_head(args: &[String]) -> io::Result<String> {
-    let usage = || {
-        refused(
-            "a plain fleet shell is spawn cwd=/absolute [raise=false]; no task, command or other options",
-        )
+    const FORM: &str = "a plain fleet shell is spawn cwd=/absolute [raise=false]; no task, \
+                        command or other options";
+    let not = |arg: &str| {
+        refused(format!(
+            "{FORM}; not `{}`",
+            aterm_codec::tty::one_line(arg, 32)
+        ))
     };
     let mut cwd = None;
     let mut raised = false;
     for arg in args {
         if let Some(dir) = arg.strip_prefix("cwd=") {
             if !dir.starts_with('/') || cwd.replace(dir).is_some() {
-                return Err(usage());
+                return Err(not(arg));
             }
         } else if arg == "raise=false" && !raised {
             raised = true;
         } else {
-            return Err(usage());
+            return Err(not(arg));
         }
     }
     if cwd.is_none() {
-        return Err(usage());
+        return Err(refused(format!("{FORM}: it names no cwd=")));
     }
     let mut parts = vec!["spawn".to_owned()];
     parts.extend(args.iter().cloned());
@@ -381,7 +384,7 @@ fn exchange_with_retry(
 
 /// How `--host any` is used ([`any_host_node`]).
 const ANY_USAGE: &str = "aterm ctl --host any spawn agent=<claude|codex> [model=<m>] \
-                         [cwd=<absolute folder there>] - < task";
+                         [autopilot=<land|cruise>] [cwd=<absolute folder there>] - < task";
 
 /// The node a `--host any` spawn (its words after `spawn`, `args`) goes to ([`any_host`]): one
 /// survey of every member within the call's `--timeout` (`total`) where that is shorter than a
@@ -491,8 +494,10 @@ fn refuse_local_selector(parts: &[String]) -> io::Result<()> {
 
 /// Whether `word` is a global session id (`s-<hex>`).
 fn is_sid(word: &str) -> bool {
-    word.strip_prefix("s-")
-        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+    word.len() <= 64
+        && word
+            .strip_prefix("s-")
+            .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// The options the server's dispatch takes off a `turn` before the turn's
@@ -567,7 +572,7 @@ fn spawn_head(args: &[String], starter: Option<&str>) -> io::Result<String> {
     let usage = |why: &str| {
         refused(format!(
             "spawn agent= over the fleet: {why} (aterm ctl --host <h> spawn agent=<word> \
-             [model=<m>] [cwd=<absolute folder there>] - < task)"
+             [model=<m>] [autopilot=<land|cruise>] [cwd=<absolute folder there>] - < task)"
         ))
     };
     if !args.iter().any(|a| a.starts_with("agent=")) {
@@ -692,34 +697,66 @@ fn any_target_sid<'a>(
     ))
 }
 
-const MAX_ANY_HOSTS_BYTES: u64 = 64 * 1024;
+const MAX_ANY_HOSTS_BYTES: usize = 256 * 1024;
+const MAX_ANY_HOST_LEN: usize = 255;
+
+fn valid_any_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= MAX_ANY_HOST_LEN
+        && host.trim() == host
+        && !is_any_host(host)
+        && !host.chars().any(char::is_control)
+}
 
 fn read_any_sid_hosts() -> Vec<(String, String)> {
     let Some(path) = any_hosts_path() else {
         return Vec::new();
     };
-    let Ok((text, _)) = crate::read_bounded_regular_utf8(&path, MAX_ANY_HOSTS_BYTES) else {
+    #[cfg(unix)]
+    let text = {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+        else {
+            return Vec::new();
+        };
+        let Ok(bytes) = aterm_uds::private_file::read_private(parent, name, MAX_ANY_HOSTS_BYTES)
+        else {
+            return Vec::new();
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            return Vec::new();
+        };
+        text
+    };
+    #[cfg(not(unix))]
+    let Ok((text, _)) = crate::read_bounded_regular_utf8(&path, MAX_ANY_HOSTS_BYTES as u64) else {
         return Vec::new();
     };
     text.lines()
         .filter_map(|line| {
             let (sid, host) = line.split_once('\t')?;
             let (sid, host) = (sid.trim(), host.trim());
-            (is_sid(sid) && !host.is_empty()).then(|| (sid.to_owned(), host.to_owned()))
+            (is_sid(sid) && valid_any_host(host)).then(|| (sid.to_owned(), host.to_owned()))
         })
         .collect()
 }
 
-pub(crate) fn record_any_sid_host(sid: &str, host: &str) {
-    if !is_sid(sid) || host.is_empty() {
+fn record_any_sid_hosts(entries: &[(&str, &str)]) {
+    let valid: Vec<(&str, &str)> = entries
+        .iter()
+        .copied()
+        .filter(|(sid, host)| is_sid(sid) && valid_any_host(host))
+        .collect();
+    if valid.is_empty() {
         return;
     }
     let Some(path) = any_hosts_path() else {
         return;
     };
     let mut rows = read_any_sid_hosts();
-    rows.retain(|(existing_sid, _)| existing_sid != sid);
-    rows.push((sid.to_owned(), host.to_owned()));
+    for (sid, host) in valid {
+        rows.retain(|(existing_sid, _)| existing_sid != sid);
+        rows.push((sid.to_owned(), host.to_owned()));
+    }
     if rows.len() > ANY_HOSTS_MAX {
         let drop_n = rows.len() - ANY_HOSTS_MAX;
         rows.drain(..drop_n);
@@ -744,6 +781,10 @@ pub(crate) fn record_any_sid_host(sid: &str, host: &str) {
         }
         let _ = std::fs::write(&path, body.as_bytes());
     }
+}
+
+pub(crate) fn record_any_sid_host(sid: &str, host: &str) {
+    record_any_sid_hosts(&[(sid, host)]);
 }
 
 fn survey_within_for_any(total: Option<Option<Duration>>) -> Duration {
@@ -772,6 +813,8 @@ pub(crate) fn resolve_any_sid_hosts(
             .find(|(s, _)| s == target)
             .map(|(_, h)| h.clone())
     };
+    let mut discovered: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     if sids.iter().any(|sid| lookup(&table, sid).is_none()) {
         let Some(survey_fn) = survey_fn else {
             return Err(io::Error::new(
@@ -789,7 +832,7 @@ pub(crate) fn resolve_any_sid_hosts(
             if peer.unproven {
                 continue;
             }
-            let Some(node) = peer.node.as_deref() else {
+            let Some(node) = peer.node.as_deref().filter(|n| valid_any_host(n)) else {
                 continue;
             };
             let Ok(lines) = &peer.answer else {
@@ -801,23 +844,42 @@ pub(crate) fn resolve_any_sid_hosts(
             for session in &survey.sessions {
                 if let Some(found_sid) = session.get("sid") {
                     let clean = found_sid.trim_start_matches('@');
-                    if is_sid(clean) {
-                        record_any_sid_host(clean, node);
-                        table.push((clean.to_owned(), node.to_owned()));
+                    if is_sid(clean) && lookup(&table, clean).is_none() {
+                        let nodes = discovered.entry(clean.to_owned()).or_default();
+                        if !nodes.iter().any(|existing| existing == node) {
+                            nodes.push(node.to_owned());
+                        }
                     }
                 }
             }
+        }
+        let unique: Vec<(&str, &str)> = discovered
+            .iter()
+            .filter_map(|(sid, nodes)| {
+                (nodes.len() == 1).then_some((sid.as_str(), nodes[0].as_str()))
+            })
+            .collect();
+        record_any_sid_hosts(&unique);
+        for (sid, node) in unique {
+            table.push((sid.to_owned(), node.to_owned()));
         }
     }
 
     let mut out = Vec::with_capacity(sids.len());
     for &sid in sids {
-        let Some(host) = lookup(&table, sid) else {
+        if let Some(host) = lookup(&table, sid) {
+            out.push(host);
+            continue;
+        }
+        if let Some(nodes) = discovered.get(sid).filter(|nodes| nodes.len() > 1) {
             return Err(io::Error::other(format!(
-                "--host any found no live fleet peer hosting @{sid}"
+                "--host any found @{sid} on multiple fleet peers ({})",
+                nodes.join(", ")
             )));
-        };
-        out.push(host);
+        }
+        return Err(io::Error::other(format!(
+            "--host any found no live fleet peer hosting @{sid}"
+        )));
     }
     Ok(out)
 }

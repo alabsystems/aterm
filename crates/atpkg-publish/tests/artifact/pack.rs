@@ -165,9 +165,13 @@ fn cargo(checkout: &Path, meta: String, bins: Vec<(&'static str, Vec<u8>)>, fail
         out.push_str(&format!(
             "{{\"reason\":\"compiler-artifact\",\"manifest_path\":\"{}\",\"target\":{{\"kind\":\
              [\"lib\"]}},\"executable\":null}}\n\
+             {{\"reason\":\"compiler-artifact\",\"manifest_path\":\"{}\",\"target\":{{\"kind\":\
+             [\"bin\"],\"name\":\"test-bin\"}},\"profile\":{{\"test\":true}},\
+             \"executable\":\"/elsewhere/dep/test-bin\"}}\n\
              {{\"reason\":\"compiler-artifact\",\"manifest_path\":\"/elsewhere/dep/Cargo.toml\",\
              \"target\":{{\"kind\":[\"bin\"]}},\"executable\":\"/elsewhere/dep/tool\"}}\n\
              {{\"reason\":\"build-finished\",\"success\":true}}\n",
+            manifest.display(),
             manifest.display()
         ));
         Some(ran(0, &out, "    Finished `release` profile"))
@@ -1591,6 +1595,29 @@ fn a_harness_tree_is_a_fresh_clones_whatever_gits_config_hides() {
         git(&["update-index", "--no-assume-unchanged", "--", "Cargo.toml"]);
         git(&["update-index", "--no-skip-worktree", "--", "Cargo.toml"]);
     }
+    let dirty_co = co.clone();
+    let base_answer = cargo(&co, meta.clone(), arm_bins(&["muse-alab"]), false);
+    let mut dirty_tools = FakeTools::new("aarch64-apple-darwin");
+    dirty_tools.answer = Box::new(move |run| {
+        let res = base_answer(run);
+        if run.argv().iter().any(|a| a == "build") {
+            put(
+                &dirty_co.join("during-build.txt"),
+                b"dirtied during build\n",
+            );
+        }
+        res
+    });
+    let err = pack::pack_with(&w.ctx, &harness_request(&w, "muse-alab", &co), &dirty_tools)
+        .expect_err("a source change during build is refused");
+    assert!(
+        err.to_string()
+            .contains("the harness source changed during the build; refusing its artifact"),
+        "{err}"
+    );
+    assert!(w.written(".toml").is_empty());
+    std::fs::remove_file(co.join("during-build.txt")).expect("rm during-build.txt");
+
     put(&co.join("target/release/muse-alab"), b"an earlier build\n");
     let out = attempt().0.expect("only target/ is ignored: it packs");
     assert_eq!(out.build, 1);
@@ -1671,6 +1698,14 @@ fn a_release_line_is_major_minor_zero_and_a_dev_version_adds_the_short_sha() {
     assert!(
         pack::dev_version("0.1.0", "ABCDEF012").is_err(),
         "lowercase only"
+    );
+    assert!(
+        pack::dev_version("0.1.0", &"a".repeat(40)).is_ok(),
+        "40 hex is accepted"
+    );
+    assert!(
+        pack::dev_version("0.1.0", &"a".repeat(41)).is_err(),
+        "41 hex is too long"
     );
     assert!(pack::dev_version("0.1.2", "abcdef012").is_err());
 }

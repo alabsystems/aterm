@@ -411,7 +411,8 @@ const OPENERS: &[&str] = &["open", "xdg-open", "gio", "sensible-browser", "www-b
 pub fn env_interpreter(program: &Path) -> Option<String> {
     use std::io::Read as _;
     let mut head = [0_u8; 256];
-    let n = std::fs::File::open(program).ok()?.read(&mut head).ok()?;
+    let (mut file, _) = super::disk::versions::open_regular_file(program).ok()?;
+    let n = file.read(&mut head).ok()?;
     let head = &head[..n];
     let line = head.strip_prefix(b"#!")?;
     let line = &line[..line.iter().position(|b| *b == b'\n').unwrap_or(line.len())];
@@ -481,7 +482,9 @@ pub fn program_of(cli: Cli, home: &Path) -> PathBuf {
     }
     let id = cli.id();
     if let Some(twin) = super::upgrade_drive::managed_agent_twin(id)
-        && let Ok(text) = std::fs::read_to_string(&twin)
+        && let Some(text) = super::accounts::read_bounded(&twin, 64 * 1024)
+            .ok()
+            .flatten()
         && let Some(exe) = super::upgrade_catalog::twin_binary(&text)
         && exe.is_file()
     {
@@ -521,6 +524,10 @@ pub enum Approval {
         /// The page showed the row's email.
         page: bool,
     },
+    /// Approval could not run (for example, browser preparation failed or its
+    /// login lifetime ended). This is recorded for automatic recovery, never
+    /// turned into a request for a person to approve the sign-in.
+    NotRun(String),
     /// It stopped where only the person can go on (an identity provider, a sign-up page, no
     /// mailbox): why, without the URL or code.
     NeedsYou(String),
@@ -772,6 +779,13 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
                     if status.is_some() {
                         exited_at = Some(Instant::now());
                     }
+                }
+                Approval::NotRun(why) => {
+                    end(&mut child);
+                    return Drove {
+                        outcome: Outcome::NotRun(why),
+                        host,
+                    };
                 }
                 Approval::NeedsYou(why) => {
                     end(&mut child);

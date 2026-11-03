@@ -742,6 +742,84 @@ fn a_try_is_timed_from_its_own_wall_on_its_rung() {
     );
 }
 
+/// A TRY MAY WAIT OUT A SETTLE ON THE MAC'S WAKE, AND NO MORE (design §14.17.5.5): with its lid
+/// closed a Mac's first decision can wait out one settle, as the 2026-11-02 O1 run's did, its first
+/// try on a 45 s rung decided at +46.7 s, a settle journaled and the try typed at +75.6 s. Here the
+/// wall is +23.0 s, the due +68.0 s and the try +96.9 s. NEGATIVE CONTROLS: the same try with no
+/// settle journaled, with one decided past the try's allowance, with one longer than a settle, with
+/// one whose due the try came well past, with one before the wall and with another wait in its place;
+/// and a try that a second settle put off further.
+#[test]
+fn a_try_may_wait_out_a_settle_on_the_macs_wake_and_no_more() {
+    fn settled(n: u32, wall: i64, _: i64) -> (i64, i64) {
+        let due = wall + outage::rung_ms(n, outage::SCALE);
+        (due, if n == 1 { due + 28_900 } else { due + 100 })
+    }
+    let with_settle = |at: i64, due: i64| {
+        let mut s = cruise_outage_by(settled);
+        let next = s
+            .journal
+            .iter()
+            .position(|(t, _)| *t > T0 + at)
+            .expect("a line after the settle");
+        let until = stamp(due);
+        s.journal.insert(
+            next,
+            j(
+                at,
+                &format!("WAITING seq=2 until={until} the Mac woke: deciding again"),
+            ),
+        );
+        s
+    };
+    let late = "try 1 at +96.9 s LATE";
+    fails(o2(&cruise_outage_by(settled)), late);
+    let (w, why) = o2(&with_settle(68_700, 96_800));
+    assert_eq!(w, "PASS", "{why}");
+    fails(o2(&with_settle(91_000, 96_800)), late);
+    fails(o2(&with_settle(68_700, 159_700)), late);
+    fails(o2(&with_settle(68_700, 70_000)), late);
+    fails(o2(&with_settle(22_500, 96_800)), late);
+    let other_wait = |line: &str| {
+        let mut s = cruise_outage_by(settled);
+        let next = s
+            .journal
+            .iter()
+            .position(|(t, _)| *t > T0 + 68_700)
+            .expect("a line after the wait");
+        s.journal.insert(next, j(68_700, line));
+        s
+    };
+    let until = stamp(96_800);
+    fails(
+        o2(&other_wait(&format!(
+            "WAITING seq=2 until={until} the worker to take the outage-resume@v1 act"
+        ))),
+        late,
+    );
+    fn twice(n: u32, wall: i64, _: i64) -> (i64, i64) {
+        let due = wall + outage::rung_ms(n, outage::SCALE);
+        (due, if n == 1 { due + 170_000 } else { due + 100 })
+    }
+    let mut s = cruise_outage_by(twice);
+    for (at, due) in [(68_700, 150_000), (150_500, 238_000)] {
+        let next = s
+            .journal
+            .iter()
+            .position(|(t, _)| *t > T0 + at)
+            .expect("a line after the settle");
+        let until = stamp(due);
+        s.journal.insert(
+            next,
+            j(
+                at,
+                &format!("WAITING seq=2 until={until} the Mac woke: deciding again"),
+            ),
+        );
+    }
+    fails(o2(&s), "try 1 at +238.0 s LATE");
+}
+
 /// A TRY IS COUNTED FROM THE OUTAGE'S FIRST READING WHERE THE MODE'S OWN ACT MET IT (the
 /// 2026-10-27 O2 run): the loop read the outage half a second after Cruise's act, waited out the
 /// act's take window, then waited on the outage until its rung from that reading. NEGATIVE

@@ -56,12 +56,9 @@ aterm-uds = { workspace = true }
 # getuid(2), fsync(2), and the open flags and errno values std does not name.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
-
-# The Linux arm of `hash::sha256_file` (docs/AUDIT-third-party-2026-10-15.md,
-# CT.2): first-party, zero-dependency SHA-256 in place of `ring::digest`. The
-# macOS arm hashes on ring (above), whose SHA-256 runs on the CPU's instructions
-# where the scalar loop would not; Windows runs its system hash command.
-[target.'cfg(target_os = "linux")'.dependencies]
+# Complete-image hashing on Unix, and the Linux arm of `hash::sha256_file`:
+# first-party SHA-256. macOS file contents still hash with ring's CPU instructions;
+# the image digest binds those file hashes, paths and modes into one stream.
 aterm-digest = { workspace = true }
 
 [dev-dependencies]

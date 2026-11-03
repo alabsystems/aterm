@@ -409,11 +409,20 @@ pub enum TaskFace {
     Landed,
     /// A person's own exchange.
     Theirs,
+    /// The work ended unfinished by the loop's own conclusion: the worker's `Could not finish:`
+    /// reply, or the same reply again with no work (`why=repeated`). Nothing is typed until
+    /// someone else's turn.
+    Failed,
 }
 
 impl TaskFace {
     /// Every face, in display order.
-    pub const ALL: [TaskFace; 3] = [TaskFace::Open, TaskFace::Landed, TaskFace::Theirs];
+    pub const ALL: [TaskFace; 4] = [
+        TaskFace::Open,
+        TaskFace::Landed,
+        TaskFace::Theirs,
+        TaskFace::Failed,
+    ];
 
     /// The word `status` and `ls` print for it (`task=`).
     #[must_use]
@@ -422,6 +431,7 @@ impl TaskFace {
             TaskFace::Open => "open",
             TaskFace::Landed => "landed",
             TaskFace::Theirs => "theirs",
+            TaskFace::Failed => "failed",
         }
     }
 }
@@ -996,7 +1006,7 @@ mod tests {
             TaskFace::ALL.iter().map(|f| f.status()).collect();
         assert_eq!(
             words.into_iter().collect::<Vec<_>>(),
-            ["landed", "open", "theirs"]
+            ["failed", "landed", "open", "theirs"]
         );
     }
 

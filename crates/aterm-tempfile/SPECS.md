@@ -137,7 +137,7 @@ crates/aterm-tempfile/src/lib.rs	windows_os_random_succeeds	(none; §4)
 |---|---|---|
 | crates/aterm-tempfile/src/lib.rs::windows_os_random_succeeds | It is a `cfg(windows)` smoke check of the BCryptGenRandom FFI (without the former probabilistic `assert_ne!`). It belongs in the FFI assumption channel as an axiom on `read_os_random` (gap 8). | **move-to-bench**: move it to a Windows environment check, outside the unit-test suite, and record the OS-RNG success assumption as the FFI contract of `read_os_random`. |
 
-## 5. Proof order (easiest, high value first)
+## 5. Implied specs that look wrong, or disagree with the code
 
 1. **Resolved — `unique_name` doc.** Updated `unique_name`'s doc to state intra-process injectivity via the
    atomic counter and cross-process collision retry in `TempDir::made_in`.

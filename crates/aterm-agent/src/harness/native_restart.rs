@@ -77,7 +77,12 @@ fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
     }
     st.native = None;
     st.native_prepare.clear();
-    st.native_rollback = false;
+    // Completion retains the phase of the command that actually ran. The
+    // renewal caller and durable observation must distinguish a live rollback
+    // vendor from a successful forward replacement after this capability closes.
+    if outcome != Recovery::Completed {
+        st.native_rollback = false;
+    }
     if outcome == Recovery::Completed
         && !matches!(
             st.phase,
@@ -418,18 +423,44 @@ pub(super) fn resume(
     }
 }
 
-pub(super) fn complete(client: &mut Client, tab: &str, st: &mut St) -> bool {
-    let phase = phase(st);
+pub(super) fn complete(
+    opts: &Opts,
+    session: &str,
+    client: &mut Client,
+    tab: &str,
+    st: &mut St,
+) -> bool {
     let Some(binding) = st.native.clone() else {
         return st.native_prepare.is_empty();
     };
-    if let Ok(reply) = native_act::exchange(client, tab, &Request::Query(binding.clone()))
-        && let Some(outcome) = terminal_reply(st, &reply)
-    {
-        if outcome == Recovery::Cancelled {
-            st.stop("native-cancelled-before-mutation", upgrade_drive::now_s());
+    if let Ok(reply) = native_act::exchange(client, tab, &Request::Query(binding.clone())) {
+        if let Some(outcome) = terminal_reply(st, &reply) {
+            if outcome == Recovery::Cancelled {
+                st.stop("native-cancelled-before-mutation", upgrade_drive::now_s());
+            }
+            return outcome == Recovery::Completed;
         }
-        return outcome == Recovery::Completed;
+        match reply {
+            Reply::Resumed(ImagePhase::Rollback) => {
+                // The exact host operation can have accepted Rollback before
+                // its Resume ACK was lost. Observe its phase; never re-signal.
+                if !matches!(Request::parse(&st.native_prepare), Some(Request::Prepare(prepare))
+                    if matches!(prepare.plan, NativePlan::Restart { rollback: Some(_), .. }))
+                {
+                    return false;
+                }
+                st.native_rollback = true;
+            }
+            Reply::Resumed(ImagePhase::Forward) if st.native_rollback => return false,
+            _ => {}
+        }
+    }
+    let phase = phase(st);
+    // A stack or ACK can disappear after the host commits. Persist the exact
+    // observed phase first, so a terminal Query without phase words cannot
+    // relabel that already completed Rollback as Forward on the next sweep.
+    if upgrade_drive::save_checked(opts, session, st).is_err() {
+        return false;
     }
     // Precommit may be Unknown because an earlier identical Commit was received but its
     // kernel observation failed. Replaying the same sealed phase/version only completes it;
@@ -538,6 +569,37 @@ mod tests {
             st, original,
             "Unknown cannot erase the original id/deadline or restore an unsent mutator"
         );
+    }
+
+    #[test]
+    fn terminal_completion_keeps_the_actual_phase_but_retirement_and_cancellation_clear_it() {
+        for rollback in [false, true] {
+            let (mut st, _) = pending();
+            st.native_rollback = rollback;
+            assert_eq!(
+                terminal_reply(&mut st, &Reply::Committed(ClaimOutcome::Builtin)),
+                Some(Recovery::Completed)
+            );
+            assert_eq!(st.native_rollback, rollback);
+            assert!(st.native.is_none() && st.native_prepare.is_empty());
+            assert_eq!(
+                terminal_reply(&mut st, &Reply::Committed(ClaimOutcome::Builtin)),
+                Some(Recovery::Completed)
+            );
+            assert_eq!(
+                st.native_rollback, rollback,
+                "lost completion ACK preserves the observed phase"
+            );
+        }
+        for decision in [
+            Decision::ProvenNotCommittedRollbackSafe,
+            Decision::Retired(super::super::native_act::Retirement::Exited),
+        ] {
+            let (mut st, _) = pending();
+            st.native_rollback = true;
+            terminal_reply(&mut st, &Reply::Decision(decision));
+            assert!(!st.native_rollback);
+        }
     }
 
     #[test]

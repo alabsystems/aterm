@@ -462,7 +462,7 @@ pub fn is_test_file(path: &Path) -> bool {
         || s.ends_with("_tests.rs")
         || path
             .file_name()
-            .is_some_and(|n| n.to_string_lossy().starts_with("tests_"))
+            .is_some_and(|n| n == "tests.rs" || n.to_string_lossy().starts_with("tests_"))
         || s.contains("/benches/")
         || s.ends_with("/proofs.rs")
         || s.contains("proofs_")
@@ -1426,6 +1426,23 @@ mod tests {
         assert!(!test("crates/aterm-pty/src/lib.rs"));
         assert!(!test("crates/aterm-pty/src/latests_seen.rs"));
         assert!(!test("crates/aterm-pty/src/tests_dir/lib.rs"));
+    }
+
+    #[test]
+    fn a_standalone_tests_module_is_a_test_file() {
+        for path in [
+            "tests.rs",
+            "crates/aterm-agent/src/vault_join/automatic/tests.rs",
+        ] {
+            assert!(is_test_file(Path::new(path)), "{path}");
+        }
+        for path in [
+            "test.rs",
+            "crates/aterm-agent/src/contest.rs",
+            "crates/aterm-agent/src/automatic.rs",
+        ] {
+            assert!(!is_test_file(Path::new(path)), "{path}");
+        }
     }
 
     fn empty_files(name: &str, files: &[&str]) -> crate::tree::memory::Tree {

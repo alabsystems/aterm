@@ -11,6 +11,9 @@ pub const NEEDS_YOU: &str = "NEEDS YOU:";
 /// The head of the worker's defense that nothing is left to do.
 pub const NOTHING_LEFT: &str = "Nothing left:";
 
+/// The head of a managed worker's reply that says its work ends unfinished ([`could_not_finish`]).
+pub const COULD_NOT_FINISH: &str = "Could not finish:";
+
 /// The restart instruction shared by the continuations and needs acknowledgements.
 macro_rules! restart_hint {
     () => {
@@ -341,6 +344,110 @@ const MENTION_NOUNS: &[&str] = &[
 
 const MENTION_ARTICLES: &[&str] = &["a", "an", "the", "each", "every", "any", "one", "that"];
 
+/// The demonstratives: behind one, as behind an article, NEEDS YOU is a noun (`This NEEDS YOU
+/// (…) is cleared`).
+const DEMONSTRATIVES: &[&str] = &["this", "these", "those"];
+
+/// The possessive determiners behind which NEEDS YOU is a noun (`its NEEDS YOU (…) came back`,
+/// `your NEEDS YOU (sign in) is stale`). The writer's own `my` and `our` are not among them: a
+/// head behind one is the report's own, read as behind any other word (`Here is my NEEDS YOU
+/// (owner) approve the release`).
+const POSSESSIVES: &[&str] = &["your", "its", "their", "his", "her", "whose"];
+
+/// The determiners no clause ends on, as `one`, `that`, `any`, a demonstrative, `his` and `her`
+/// can (`I checked each one`, `I told her`): a row that ends on one, or on a genitive, leaves its
+/// clause open for the row the screen wrapped under it ([`wrapped_into`]).
+const OPEN_DETERMINERS: &[&str] = &[
+    "a", "an", "the", "each", "every", "your", "its", "their", "whose",
+];
+
+/// The words whose `'s` is a contracted `is` or `has` (`it's`, `here's`), not a genitive.
+const CONTRACTED: &[&str] = &[
+    "it", "he", "she", "that", "here", "there", "what", "who", "where", "how", "let",
+];
+
+/// The word the words `lead` before a head end on, emphasis and ticks aside (`1's` in `Tab 1's
+/// **NEEDS YOU**`), or `None` where they end on a mark (`Done.`, `(`, `` `ship`: ``, the `'` that
+/// closes a quote: `said 'all checks pass'`) or on nothing. A plural genitive's apostrophe (`the
+/// workers'`) is its word's. Behind a word the head sits inside the clause that word is in;
+/// behind a mark it opens a clause of its own.
+fn clause_word(lead: &str) -> Option<&str> {
+    let lead = lead.trim_end().trim_end_matches(['*', '_', '`']).trim_end();
+    let word = lead
+        .rsplit(char::is_whitespace)
+        .next()?
+        .trim_start_matches(|c: char| !c.is_alphanumeric());
+    if word.ends_with(char::is_alphanumeric) {
+        return Some(word);
+    }
+    let mark = word.chars().next_back()?;
+    (genitive(word) && !quote_open(&lead[..lead.len() - mark.len_utf8()])).then_some(word)
+}
+
+/// Whether a single quote `text` opens is still open at its end. A `‘`, or a `'` with no letter
+/// or digit before it and a mark or word after it (`'all`, `='%s`), opens one; a `'` or `’` after
+/// a letter or digit with none after it (`pass'`) closes one. An apostrophe inside a word (`it's`,
+/// `Tab 1's`) is no quote mark.
+fn quote_open(text: &str) -> bool {
+    let mut open = 0_usize;
+    let mut prev: Option<char> = None;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let after_word = prev.is_some_and(char::is_alphanumeric);
+        let next = chars.peek().copied();
+        match c {
+            '‘' => open += 1,
+            '\'' if !after_word && next.is_some_and(|n| !n.is_whitespace()) => open += 1,
+            '\'' | '’' if after_word && !next.is_some_and(char::is_alphanumeric) => {
+                open = open.saturating_sub(1);
+            }
+            _ => {}
+        }
+        prev = Some(c);
+    }
+    open > 0
+}
+
+/// Whether `word` is a genitive (`Tab 1's`, `the worker’s`, `the workers'`), not a contraction
+/// ([`CONTRACTED`]: `it's`, `here's`). Whether a plural's `'` closes a quote instead is for the
+/// words before it to say ([`clause_word`]).
+fn genitive(word: &str) -> bool {
+    let word = word.to_lowercase().replace('’', "'");
+    match word.strip_suffix("'s") {
+        Some(stem) => !stem.is_empty() && !CONTRACTED.contains(&stem),
+        None => word.strip_suffix("s'").is_some_and(|stem| !stem.is_empty()),
+    }
+}
+
+/// Whether `word` ([`clause_word`]) is a determiner: an article or a quantifier
+/// ([`MENTION_ARTICLES`]), a demonstrative, a possessive ([`POSSESSIVES`]) or a genitive. A
+/// NEEDS YOU behind one is a noun of the clause the determiner is in.
+fn determiner(word: &str) -> bool {
+    let lower = word.to_lowercase();
+    let w = lower.as_str();
+    MENTION_ARTICLES.contains(&w)
+        || DEMONSTRATIVES.contains(&w)
+        || POSSESSIVES.contains(&w)
+        || genitive(word)
+}
+
+/// Whether `row` may be the rest of `above`'s line, the screen having wrapped it: `above` is
+/// prose that ends on a word, not a heading (`## Owner's`), a fence, or a closing emphasis or
+/// mark (`**Andrew's**`, `answered 'Yes'`), and `row` opens on its words, not on a list item's,
+/// a checkbox's or a heading's mark of its own.
+fn wrapped_into(above: &str, row: &str) -> bool {
+    let above = unquoted(above).trim_end();
+    let row = unquoted(row);
+    let ends_on_word = above.ends_with(char::is_alphanumeric)
+        || (above.ends_with(['\'', '’']) && clause_word(above).is_some());
+    ends_on_word
+        && !past_heading(above).1
+        && !fence(above)
+        && past_marker(row).is_none()
+        && past_checkbox(row).is_none()
+        && !past_heading(row).1
+}
+
 const HEAD_NAMING: &[&str] = &[
     "starting",
     "starts",
@@ -492,10 +599,21 @@ fn need_separator(rest: &str, capitals: bool) -> Option<&str> {
 }
 
 fn need_rest(line: &str) -> Option<&str> {
-    head_from(past_need_lead(unquoted(line)), false)
+    head_from(past_need_lead(unquoted(line)), false, false)
 }
 
-fn head_from(t: &str, named: bool) -> Option<&str> {
+/// The words of the need the head that opens `t` names (empty where its row names none), or
+/// `None` where `t` opens no head. `named`: words before the head may name it as a thing (an
+/// article, a quote mark), so a mention noun after it (`line`, `head`) makes it no head.
+/// `inside`: the head is a noun behind a determiner of the clause it sits in ([`determiner`]:
+/// `The NEEDS YOU (…) was raised`, `Tab 1's NEEDS YOU, the release go, is cleared`), so its
+/// need's words are its own only past a separator that ends that clause (`Tab 1's NEEDS YOU:
+/// approve the release`), as [`mid_head`] holds `NEEDS YOU` itself to a closing mark. A qualifier
+/// in brackets, or a name after a comma, ends no clause: words after them that no separator
+/// opens go on with the clause the head sits in, and a qualifier with none after it names the
+/// noun (`No session has a NEEDS YOU (checked all six tabs).`); neither is a need, unless the
+/// qualifier says none (`the NEEDS YOU (none)`).
+fn head_from(t: &str, named: bool, inside: bool) -> Option<&str> {
     let wrap = t.chars().next().filter(|c| matches!(c, '[' | '|' | '`'));
     let t = match wrap {
         Some(c) => past_need_lead(&t[c.len_utf8()..]),
@@ -575,7 +693,7 @@ fn head_from(t: &str, named: bool) -> Option<&str> {
                 qualifier = Some(who);
                 rest = emphasis(inner[end..].trim_start());
             }
-            None if capitals => {
+            None if capitals && !inside => {
                 rest = emphasis(inner);
                 separated = true;
             }
@@ -609,6 +727,9 @@ fn head_from(t: &str, named: bool) -> Option<&str> {
     }
     if qualifier.is_some() && !separated && rest.chars().all(|c| c == '.') {
         rest = "";
+    }
+    if inside && !separated && (!rest.is_empty() || qualifier.is_some_and(|q| !says_none(q))) {
+        return None;
     }
     match qualifier {
         Some(q) if rest.is_empty() && says_none(q) => Some(q),
@@ -1080,15 +1201,26 @@ const MID_OPENS: &[char] = &['*', '_', '`', '['];
 
 const MID_QUOTES: &[char] = &['"', '“', '‘', '\''];
 
-fn mid_head<'a>(row: &'a str, above: &str, below: &[&str]) -> Option<(usize, &'a str)> {
+/// The head `row` opens past its start (`Done. NEEDS YOU: rotate the key`), at byte `from` or
+/// later: where the words before it end, and its need's words. A head here is a capitalised
+/// `NEEDS YOU` a closing mark ends (`:`, `—`, `(`, …). Behind a determiner ([`clause_word`],
+/// [`determiner`]: `Tab 1's NEEDS YOU (…) is cleared`) it is a noun inside that determiner's
+/// clause ([`head_from`]'s `inside`).
+fn mid_head<'a>(
+    row: &'a str,
+    above: &str,
+    below: &[&str],
+    from: usize,
+) -> Option<(usize, &'a str)> {
     if unquoted(row).starts_with('⎿') {
         return None;
     }
     row.match_indices("NEED").find_map(|(at, _)| {
-        if row[..at]
-            .chars()
-            .next_back()
-            .is_some_and(char::is_alphanumeric)
+        if at < from
+            || row[..at]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
         {
             return None;
         }
@@ -1125,10 +1257,14 @@ fn mid_head<'a>(row: &'a str, above: &str, below: &[&str]) -> Option<(usize, &'a
         let cut = lead.trim_end().len();
         let own =
             lead.trim_end().is_empty() || lead.trim_end().ends_with(['.', ';', '!', '?', '—', '–']);
-        head_from(past_need_lead(&row[start..]), quoted || article)
-            .filter(|rest| !cut_instruction(rest, below))
-            .filter(|rest| own || rest.chars().any(char::is_alphanumeric))
-            .map(|rest| (cut, rest))
+        head_from(
+            past_need_lead(&row[start..]),
+            quoted || article,
+            clause_word(lead).is_some_and(determiner),
+        )
+        .filter(|rest| !cut_instruction(rest, below))
+        .filter(|rest| own || rest.chars().any(char::is_alphanumeric))
+        .map(|rest| (cut, rest))
     })
 }
 
@@ -1197,13 +1333,23 @@ fn needs_lines_by(tail: &str, by: &NoneWords<'_>, join: Join) -> NeedLines {
             continue;
         }
         let head = i;
-        let named_above = above
-            .rsplit(|c: char| !c.is_alphanumeric())
-            .find(|w| !w.is_empty())
-            .is_some_and(|w| MENTION_ARTICLES.contains(&w.to_lowercase().as_str()))
-            && above.trim_end().ends_with(char::is_alphanumeric);
-        let opens = if named_above {
-            head_from(past_need_lead(unquoted(row)), true)
+        // A row the screen wrapped out of the row above's line ([`wrapped_into`]) reads on in
+        // that line's clause: past an article the head is named (`… a` above `NEEDS YOU: line
+        // …`), and past a determiner no clause ends on, a genitive among them, it is a noun
+        // inside the row above's clause (`… Tab 1's` above `NEEDS YOU (…) is cleared`). A head
+        // that is no head so is a mention, and a later head on its row is still read past it.
+        let wrapped = wrapped_into(above, row);
+        let named_above = wrapped
+            && above
+                .rsplit(|c: char| !c.is_alphanumeric())
+                .find(|w| !w.is_empty())
+                .is_some_and(|w| MENTION_ARTICLES.contains(&w.to_lowercase().as_str()));
+        let inside_above = wrapped
+            && clause_word(above).is_some_and(|w| {
+                OPEN_DETERMINERS.contains(&w.to_lowercase().as_str()) || genitive(w)
+            });
+        let opens = if named_above || inside_above {
+            head_from(past_need_lead(unquoted(row)), named_above, inside_above)
         } else {
             need_rest(row)
         };
@@ -1212,20 +1358,23 @@ fn needs_lines_by(tail: &str, by: &NoneWords<'_>, join: Join) -> NeedLines {
                 out.lines.push(i);
                 rest
             }
-            None if named_above && need_rest(row).is_some() => {
-                i += 1;
-                continue;
+            None => {
+                let from = if need_rest(row).is_some() {
+                    row.len() - past_need_lead(unquoted(row)).len() + "NEED".len()
+                } else {
+                    0
+                };
+                match mid_head(row, above, &rows[i + 1..], from) {
+                    Some((cut, rest)) => {
+                        out.cuts.push((i, cut));
+                        rest
+                    }
+                    None => {
+                        i += 1;
+                        continue;
+                    }
+                }
             }
-            None => match mid_head(row, above, &rows[i + 1..]) {
-                Some((cut, rest)) => {
-                    out.cuts.push((i, cut));
-                    rest
-                }
-                None => {
-                    i += 1;
-                    continue;
-                }
-            },
         };
         i += 1;
         if rest.is_empty() {
@@ -1586,6 +1735,25 @@ fn defense_at(tail: &str) -> Option<(&str, std::str::Lines<'_>)> {
 #[must_use]
 pub fn defense_line(tail: &str) -> Option<&str> {
     defense_at(tail).map(|(line, _)| line)
+}
+
+/// THE WORKER'S OWN WORD THAT ITS WORK ENDS UNFINISHED: what it wrote after a `Could not finish:`
+/// head that starts the reply (`tail`'s first non-blank line), trimmed. The same words further down,
+/// or as an item of a list, are a report on the way to more work: only a reply that starts with the
+/// head ends anything. `None` for a head with no reason after it, for the placeholder a task's own
+/// wording spells (`<why>`), and for a reply that also defends the work with `Nothing left:`, since
+/// the two contradict each other and Land's check is what settles that.
+#[must_use]
+pub fn could_not_finish(tail: &str) -> Option<&str> {
+    if defense_line(tail).is_some() {
+        return None;
+    }
+    tail.lines()
+        .find(|line| !line.trim().is_empty())
+        .filter(|line| past_marker(line.trim_start()).is_none())
+        .and_then(|line| head_rest(line, COULD_NOT_FINISH))
+        .map(str::trim)
+        .filter(|why| !why.is_empty() && !(why.starts_with('<') && why.ends_with('>')))
 }
 
 /// The worker's defense line ([`defense_line`]) and every non-blank line after it, each trimmed;

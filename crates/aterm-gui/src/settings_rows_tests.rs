@@ -3369,10 +3369,74 @@ fn a_press_never_moves_a_whole_control_and_brings_a_cut_one_whole() {
     );
 }
 
+#[derive(Default)]
+struct LastCuts {
+    sizes: Vec<(f32, f32)>,
+    feasible: usize,
+    impossible: usize,
+    unknown: usize,
+}
+
+/// Measure cuts that keep the minimum live control and its first name line.
+/// Some fonts put that line at the control's top, leaving no valid interval.
+fn last_screen_cuts(route: SettingsRoute, sizes: &[(f32, f32)]) -> LastCuts {
+    let mut cuts = LastCuts::default();
+    for &(width, height) in sizes {
+        let mut lab = Lab::new("");
+        lab.state_mut().navigate(route);
+        let screen = to_the_last_screen(&mut lab, width, height);
+        let (plan, _) = lab.state().scroll_shown().expect("a list");
+        let (list, _) = compiled_list(&screen, &plan).expect("the list");
+        for switch in screen.paint.iter().filter(|node| {
+            matches!(node.content, UiContent::Switch(_))
+                && node.key.as_str().starts_with("settings/control/")
+                && node.rect.bottom() > list.y
+                && node.rect.y < list.y + plan.room()
+        }) {
+            let minimum = switch.rect.height.min(crate::native_ui::LIST_PEEK_MIN);
+            let lower = switch.rect.y + 0.5;
+            if switch.rect.bottom() - minimum <= lower {
+                cuts.impossible += 1;
+                continue;
+            }
+            let setting = switch.key.as_str().strip_prefix("settings/control/");
+            let name = setting.and_then(|setting| {
+                let prefix = format!("settings/label/{setting}/");
+                screen.paint.iter().find(|node| {
+                    node.key.as_str().starts_with(&prefix)
+                        && node.key.as_str().ends_with("/line-0")
+                        && matches!(node.content, UiContent::Text(_))
+                })
+            });
+            let Some(name) = name else {
+                cuts.unknown += 1;
+                continue;
+            };
+            let upper = (switch.rect.bottom() - minimum).min(name.rect.y);
+            if upper <= lower {
+                cuts.impossible += 1;
+                continue;
+            }
+            let cut = (lower + upper) / 2.0;
+            let height = height - (cut - list.y);
+            if height >= least_view(settings_text_scale()).1 {
+                cuts.feasible += 1;
+                cuts.sizes.push((width, height));
+            } else {
+                cuts.impossible += 1;
+            }
+        }
+    }
+    cuts
+}
+
 #[test]
 fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
     let mut pressed = [0, 0];
     let mut veils = Vec::new();
+    let mut last_feasible = 0;
+    let mut last_impossible = 0;
+    let mut last_unknown = 0;
     for route in [
         SettingsRoute::Terminal,
         SettingsRoute::Security,
@@ -3383,10 +3447,7 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
         SettingsRoute::TextFonts,
         SettingsRoute::CursorMotion,
     ] {
-        // The last three end on a switch cut at their top, drawn with its name (Cursor &
-        // Motion's Serious Mode, Security's Secure Keyboard Entry, Keyboard & Input's paste
-        // check): a stop a last screen would draw nothing of is given up instead.
-        for (width, height) in [
+        let mut sizes = vec![
             (584.0, 348.0),
             (584.0, 376.0),
             (738.0, 418.0),
@@ -3396,11 +3457,17 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
             (584.0, 391.0),
             (738.0, 430.0),
             (1_074.0, 443.0),
-            // Last screens that cut a switch at their top as rows hold Changed in their names.
+            // Candidate last screens; measured names decide whether a cut is feasible.
             (584.0, 685.0),
             (738.0, 565.0),
             (1_074.0, 451.0),
-        ] {
+        ];
+        let cuts = last_screen_cuts(route, &sizes);
+        last_feasible += cuts.feasible;
+        last_impossible += cuts.impossible;
+        last_unknown += cuts.unknown;
+        sizes.extend(cuts.sizes);
+        for (width, height) in sizes {
             for last in [false, true] {
                 let mut lab = Lab::new("");
                 lab.state_mut().navigate(route);
@@ -3443,6 +3510,7 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
                     Some((key, top, bottom, fade)) => {
                         let live = before
                             .semantic(&UiKey::new(format!("settings/control/{key}")))
+                            .filter(|node| !node.offscreen)
                             .map(|node| node.value.clone());
                         (key, top, bottom, fade, live)
                     }
@@ -3453,7 +3521,7 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
                         if let Some((key, top, bottom)) = veiled() {
                             veils.push(format!(
                                 "{route:?} {width}×{height}: {key} veiled at the top \
-                                 ({top}..{bottom})"
+                                 ({top}..{bottom}); plan={plan:#?}"
                             ));
                         }
                         continue;
@@ -3462,11 +3530,18 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
                 };
                 let control = UiKey::new(format!("settings/control/{key}"));
                 let was_picture = live.is_none();
+                if !was_picture {
+                    assert!(
+                        shows_name_of(&before, &key),
+                        "{route:?} {width}x{height} last={last}: live {key} has its name"
+                    );
+                }
                 let on = if last && live.is_none() {
                     lab.dispatch(AppEvent::PressListPicture(control.clone()));
                     match lab
                         .compile(width, height)
                         .semantic(&control)
+                        .filter(|node| !node.offscreen)
                         .map(|node| node.value.clone())
                     {
                         Some(crate::native_ui::SemanticValue::Bool(on)) => on,
@@ -3543,10 +3618,28 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
         }
     }
     assert!(veils.is_empty(), "{}", veils.join("\n"));
-    assert!(
-        pressed.iter().all(|count| *count > 0),
-        "some screens cut a switch at each edge: {pressed:?}"
+    eprintln!(
+        "cut-control coverage {pressed:?}: last intervals feasible={last_feasible} impossible={last_impossible} unknown={last_unknown}"
     );
+    assert!(
+        pressed[0] > 0,
+        "some first screens cut a switch: {pressed:?}"
+    );
+    assert!(
+        last_feasible + last_impossible > 0,
+        "measured last-screen switches"
+    );
+    if last_feasible + last_unknown == 0 {
+        assert_eq!(
+            pressed[1], 0,
+            "no cut can keep the control and its first name line"
+        );
+    } else {
+        assert!(
+            pressed[1] > 0,
+            "last-edge coverage: {pressed:?}; feasible={last_feasible} impossible={last_impossible} unknown={last_unknown}"
+        );
+    }
 }
 
 #[test]
@@ -3554,6 +3647,9 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
     let mut checked = [0, 0];
     let mut held = [0, 0];
     let mut revealed_whole = 0;
+    let mut last_feasible = 0;
+    let mut last_impossible = 0;
+    let mut last_unknown = 0;
     for route in [
         SettingsRoute::Terminal,
         SettingsRoute::Security,
@@ -3564,10 +3660,7 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
         SettingsRoute::TextFonts,
         SettingsRoute::CursorMotion,
     ] {
-        // The last three end on a switch cut at their top, drawn with its name (Cursor &
-        // Motion's Serious Mode, Security's Secure Keyboard Entry, Keyboard & Input's paste
-        // check): a stop a last screen would draw nothing of is given up instead.
-        for (width, height) in [
+        let mut sizes = vec![
             (584.0, 348.0),
             (584.0, 376.0),
             (738.0, 418.0),
@@ -3577,11 +3670,17 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
             (584.0, 391.0),
             (738.0, 430.0),
             (1_074.0, 443.0),
-            // Last screens that cut a switch at their top as rows hold Changed in their names.
+            // Candidate last screens; measured names decide whether a cut is feasible.
             (584.0, 685.0),
             (738.0, 565.0),
             (1_074.0, 451.0),
-        ] {
+        ];
+        let cuts = last_screen_cuts(route, &sizes);
+        last_feasible += cuts.feasible;
+        last_impossible += cuts.impossible;
+        last_unknown += cuts.unknown;
+        sizes.extend(cuts.sizes);
+        for (width, height) in sizes {
             for last in [false, true] {
                 let switches = |compiled: &crate::native_ui::CompiledUi| {
                     compiled
@@ -3830,14 +3929,30 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
             }
         }
     }
-    assert!(
-        checked.iter().all(|count| *count > 0),
-        "some screens nudge a cut switch at each edge: {checked:?}"
+    eprintln!(
+        "nudge coverage {checked:?}, held {held:?}: last intervals \
+         feasible={last_feasible} impossible={last_impossible} unknown={last_unknown}"
     );
     assert!(
-        held.iter().all(|count| *count > 0),
-        "the keyboard held some nudge at each edge: {held:?} ({revealed_whole} showed a cut stop)"
+        checked[0] > 0 && held[0] > 0,
+        "first-edge nudges: {checked:?} {held:?}"
     );
+    assert!(
+        last_feasible + last_impossible > 0,
+        "measured last-screen switches"
+    );
+    if last_feasible + last_unknown == 0 {
+        assert_eq!(
+            (checked[1], held[1]),
+            (0, 0),
+            "no named last cut is feasible"
+        );
+    } else {
+        assert!(
+            checked[1] > 0 && held[1] > 0,
+            "last-edge nudges: {checked:?} {held:?}; {revealed_whole} showed a cut stop"
+        );
+    }
 }
 
 #[test]
@@ -8699,9 +8814,40 @@ fn a_least_windows_switch_and_segment_show_with_their_name() {
                             && node.clip == node.rect
                     });
                     if !named {
+                        let state = lab.state();
+                        let plan = state.scroll_plan();
+                        let top = state
+                            .scroll_record
+                            .borrow()
+                            .as_ref()
+                            .map(scroll::ScrollRecord::top);
+                        let nodes = after
+                            .paint
+                            .iter()
+                            .filter(|node| {
+                                node.key == target
+                                    || node
+                                        .key
+                                        .as_str()
+                                        .starts_with(&format!("settings/label/{setting}/"))
+                                    || node
+                                        .key
+                                        .as_str()
+                                        .starts_with(&format!("settings/row-caption/{setting}/"))
+                            })
+                            .take(12)
+                            .collect::<Vec<_>>();
                         faults.push(format!(
-                            "{route:?} {width}x{height}: {} without its name",
-                            target.as_str()
+                            "{route:?} {width}x{height}: {} without its name; \
+                             room={:?} top={top:?} target_stop={:?} chrome={:?} \
+                             focus={:?} reveal={:?} nodes={nodes:#?}",
+                            target.as_str(),
+                            plan.as_ref().map(scroll::ScrollPlan::room),
+                            plan.as_ref()
+                                .and_then(|plan| plan.stop_of_identity(&target)),
+                            state.page_chrome.get(),
+                            state.common.last_focus,
+                            state.page_reveal,
                         ));
                     }
                 }
@@ -9038,10 +9184,22 @@ fn a_tab_lands_on_the_nearest_screen_that_shows_the_control_with_its_name() {
         for &(_, route, (from, to), (width, height)) in
             cases.iter().filter(|(at, ..)| (at - scale).abs() < 0.01)
         {
-            let context =
-                format!("{route:?} {width}x{height} at {scale}x, Tab from {from} to {to}");
             let mut lab = Lab::new("");
             lab.state_mut().navigate(route);
+            // The declarations order the controls independently of the focus chain. A field
+            // unavailable here contributes no control: Background material follows Faint
+            // opacity where Background opacity is unavailable.
+            let to = lab
+                .state()
+                .legacy
+                .fields
+                .iter()
+                .skip_while(|field| field.key != to)
+                .find(|field| settings_field_is_visible(lab.state(), field.key, false, false))
+                .expect("a declared available destination")
+                .key;
+            let context =
+                format!("{route:?} {width}x{height} at {scale}x, Tab from {from} to {to}");
             let control = |setting: &str| UiKey::new(format!("settings/control/{setting}"));
             let mut seen = std::collections::HashSet::new();
             let reached = std::iter::from_fn(|| tab(&mut lab, false, width, height))

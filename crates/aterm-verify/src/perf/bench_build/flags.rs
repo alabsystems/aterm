@@ -84,7 +84,13 @@ pub(crate) fn config_sources(
 }
 
 /// The codegen options the plan resolves per unit, which a rustflag must not set again.
-const RESOLVED: [&str; 3] = ["opt-level", "debug-assertions", "overflow-checks"];
+const RESOLVED: [&str; 5] = [
+    "opt-level",
+    "debug-assertions",
+    "overflow-checks",
+    "lto",
+    "codegen-units",
+];
 
 /// The flags in `flags` that set what the plan resolved.
 pub(crate) fn overrides(flags: &[String]) -> Vec<String> {
@@ -146,7 +152,7 @@ pub(crate) fn refusal(sources: &[Source]) -> Option<String> {
     (!found.is_empty()).then(|| {
         format!(
             "cargo config passes rustc flags that override what the plan resolved, so the plan's \
-             opt-level and checks would not be what trustc compiled: {} (remove them, or move \
+             code generation would not be what trustc compiled: {} (remove them, or move \
              them under a profile)",
             found.join("; ")
         )
@@ -194,6 +200,10 @@ mod tests {
             "--codegen",
             "overflow_checks=on",
             "--codegen=opt-level=s",
+            "-Clto=thin",
+            "--codegen",
+            "codegen_units=8",
+            "--codegen=codegen-units=4",
             "-O",
             "-C",
             "target-cpu=native",
@@ -206,6 +216,9 @@ mod tests {
                 "-Cdebug-assertions=off",
                 "--codegen overflow_checks=on",
                 "--codegen=opt-level=s",
+                "-Clto=thin",
+                "--codegen codegen_units=8",
+                "--codegen=codegen-units=4",
                 "-O",
             ])
         );

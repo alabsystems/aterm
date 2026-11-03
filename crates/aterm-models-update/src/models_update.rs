@@ -258,9 +258,23 @@ pub fn native_update_admission_model() -> Model {
                     attempt_count
                 };
             }
-            action BlockKeptImageWithoutTerminal when (
+            // seamless_available is the overlap handoff's availability at any session
+            // count, none included: a kept image is blocked only where that handoff is
+            // unavailable, never to wait for a terminal tab.
+            action BlockKeptImageWithoutHandoff when (
                 phase == 0 && decision == 0 && verified == 1 &&
                 unsafe_native_state == 0 && seamless_available == 0 &&
+                foreground_job == 0 && image_kept == 1
+            ) {
+                phase = 3;
+                decision = 3;
+                retry_eligible = 1;
+            }
+            // 0.145.0, 2026-11-02: the facts called the handoff incapable at zero live
+            // sessions, so a kept image was refused every 60 s until a tab opened.
+            action BlockKeptImageDespiteSeamless when (
+                Buggy == 1 && phase == 0 && decision == 0 && verified == 1 &&
+                unsafe_native_state == 0 && seamless_available == 1 &&
                 foreground_job == 0 && image_kept == 1
             ) {
                 phase = 3;
@@ -407,6 +421,14 @@ pub fn native_update_admission_model() -> Model {
             invariant KeptImageNeverReexecsCold:
                 if image_kept == 1 {
                     decision <= 1 || decision == 3
+                } else {
+                    decision <= 3
+                };
+            invariant KeptImageWithSeamlessIsNeverBlocked:
+                if phase == 3 && verified == 1 && image_kept == 1 &&
+                    foreground_job == 0 && unsafe_native_state == 0 &&
+                    seamless_available == 1 {
+                    decision <= 2
                 } else {
                     decision <= 3
                 };

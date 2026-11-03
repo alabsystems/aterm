@@ -66,11 +66,16 @@ impl Bucket {
 
     #[inline]
     fn add(&mut self, v: f64, over: bool) {
+        if !v.is_finite() {
+            return;
+        }
         self.max = if self.n == 0 { v } else { self.max.max(v) };
-        self.sum += v;
-        self.n = self.n.saturating_add(1);
-        if over {
-            self.over_n = self.over_n.saturating_add(1);
+        if self.n < u16::MAX {
+            self.sum += v;
+            self.n += 1;
+            if over {
+                self.over_n = self.over_n.saturating_add(1);
+            }
         }
     }
 }
@@ -94,11 +99,11 @@ impl Cell {
         let mut n = 0u32;
         let mut out = Cell::default();
         for c in cells {
-            if let Some(m) = c.mean {
+            if let Some(m) = c.mean.filter(|m| m.is_finite()) {
                 sum += m;
                 n += 1;
             }
-            if let Some(x) = c.max {
+            if let Some(x) = c.max.filter(|x| x.is_finite()) {
                 out.max = Some(out.max.map_or(x, |o| o.max(x)));
             }
             out.over |= c.over;
@@ -117,11 +122,11 @@ impl Cell {
             if w <= 0 {
                 continue;
             }
-            if let Some(m) = c.mean {
+            if let Some(m) = c.mean.filter(|m| m.is_finite()) {
                 sum += m * w as f64;
                 weight += w as f64;
             }
-            if let Some(x) = c.max {
+            if let Some(x) = c.max.filter(|x| x.is_finite()) {
                 out.max = Some(out.max.map_or(x, |o| o.max(x)));
             }
             out.over |= c.over;
@@ -1875,6 +1880,40 @@ mod tests {
             )
             .len(),
             MultiScaleSpec::FULL_6H.slot_count()
+        );
+    }
+
+    /// NEGATIVE CONTROL: `Bucket::add` saturating `n` at `u16::MAX` must not keep adding into
+    /// `sum` or `over_n`, and `Cell::merge` / `Cell::merge_weighted` ignore non-finite values.
+    #[test]
+    fn bucket_saturation_and_cell_merge_preserve_bounded_finite_means() {
+        let mut bucket = Bucket {
+            sum: f64::from(u16::MAX) * 0.5,
+            n: u16::MAX,
+            max: 0.5,
+            over_n: 0,
+        };
+        bucket.add(0.9, true);
+        bucket.add(f64::NAN, true);
+        assert_eq!(bucket.n, u16::MAX);
+        assert_eq!(bucket.over_n, 0);
+        assert_eq!(bucket.max, 0.9);
+        assert_eq!(bucket.value(), Some(0.5));
+
+        let nan_cell = Cell {
+            mean: Some(f64::NAN),
+            max: Some(f64::INFINITY),
+            over: false,
+        };
+        let finite_cell = Cell {
+            mean: Some(0.25),
+            max: Some(0.75),
+            over: true,
+        };
+        assert_eq!(Cell::merge([nan_cell, finite_cell]), finite_cell);
+        assert_eq!(
+            Cell::merge_weighted([(nan_cell, 10), (finite_cell, 10)]),
+            finite_cell
         );
     }
 }

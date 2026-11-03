@@ -816,7 +816,7 @@ fn scan_file(
     admitted: &str,
     hash: bool,
 ) -> std::io::Result<(BTreeMap<Evidence, usize>, Option<String>)> {
-    let f = std::fs::File::open(path)?;
+    let f = crate::metadata_io::open_regular(path)?;
     let len = f.metadata()?.len();
     let chunk = usize::try_from(len).map_or(CHUNK, |n| n.saturating_add(1).clamp(TAIL * 2, CHUNK));
     scan_stream(f, admitted, hash, chunk)

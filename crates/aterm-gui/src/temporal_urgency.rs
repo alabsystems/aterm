@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::thread::Thread;
+use std::thread::{JoinHandle, Thread};
 
 use crate::qos::{Role, RoleObservation};
 
@@ -34,6 +34,15 @@ pub(super) struct Demands {
     observed: Mutex<Option<RoleObservation>>,
     /// The writer these demands are for, once it has adopted them ([`Self::adopt_writer`]).
     writer: OnceLock<Thread>,
+    /// Keep the unjoined worker handle valid while another thread donates priority.
+    priority: Mutex<WriterPriority>,
+}
+
+#[derive(Default)]
+struct WriterPriority {
+    // Fields drop in declaration order: end the override before releasing its thread handle.
+    boost: Option<crate::qos::Boost>,
+    worker: Option<Arc<JoinHandle<()>>>,
 }
 
 impl Demands {
@@ -43,6 +52,7 @@ impl Demands {
             counts: std::array::from_fn(|_| AtomicUsize::new(0)),
             observed: Mutex::new(None),
             writer: OnceLock::new(),
+            priority: Mutex::new(WriterPriority::default()),
         })
     }
 
@@ -54,17 +64,56 @@ impl Demands {
         let _ = self.writer.set(writer);
     }
 
+    /// Publish the owned handle before readers can send work. A demand may predate startup.
+    pub(super) fn adopt_worker(&self, worker: Arc<JoinHandle<()>>) {
+        let mut priority = self.priority.lock().unwrap_or_else(PoisonError::into_inner);
+        if priority.worker.is_none() {
+            priority.worker = Some(worker);
+        }
+        self.refresh_priority(&mut priority);
+    }
+
+    fn refresh_priority(&self, priority: &mut WriterPriority) {
+        if self.is_urgent() {
+            if priority.boost.is_none()
+                && let Some(worker) = &priority.worker
+            {
+                priority.boost = Some(crate::qos::Boost::start(Some(worker)));
+            }
+        } else {
+            drop(priority.boost.take());
+        }
+    }
+
+    fn priority_changed(&self) {
+        let mut priority = self.priority.lock().unwrap_or_else(PoisonError::into_inner);
+        self.refresh_priority(&mut priority);
+    }
+
     pub(super) fn acquire(self: &Arc<Self>, reason: Reason) -> Demand {
+        self.acquire_with(reason, Thread::unpark)
+    }
+
+    /// Inject the wake operation at the adopted-writer boundary.
+    pub(super) fn acquire_with(
+        self: &Arc<Self>,
+        reason: Reason,
+        wake: impl FnOnce(&Thread),
+    ) -> Demand {
         // Publish urgency before its diagnostic reason, so a handoff between
         // different reason counters cannot produce a false idle observation.
-        self.total
+        let previous = self
+            .total
             .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_add(1)
             })
             .expect("recorder urgency count exhausted");
         self.counts[reason.index()].fetch_add(1, Ordering::AcqRel);
+        if previous == 0 {
+            self.priority_changed();
+        }
         if let Some(writer) = self.writer.get() {
-            writer.unpark();
+            wake(writer);
         }
         Demand {
             owner: self.clone(),
@@ -86,6 +135,22 @@ impl Demands {
         Snapshot {
             counts: std::array::from_fn(|i| self.counts[i].load(Ordering::Acquire)),
             observation: *self.observed.lock().unwrap_or_else(PoisonError::into_inner),
+            priority_override: {
+                #[cfg(target_os = "macos")]
+                {
+                    let priority = self.priority.lock().unwrap_or_else(PoisonError::into_inner);
+                    priority.worker.as_ref().map(|_| {
+                        priority
+                            .boost
+                            .as_ref()
+                            .is_some_and(crate::qos::Boost::armed)
+                    })
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    None
+                }
+            },
         }
     }
 }
@@ -102,6 +167,9 @@ impl Drop for Demand {
         debug_assert!(previous != 0, "unbalanced recorder urgency");
         let previous = self.owner.total.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous != 0, "unbalanced aggregate recorder urgency");
+        if previous == 1 {
+            self.owner.priority_changed();
+        }
     }
 }
 
@@ -165,6 +233,7 @@ impl WriterRole {
 pub(super) struct Snapshot {
     pub(super) counts: [usize; 3],
     pub(super) observation: Option<RoleObservation>,
+    pub(super) priority_override: Option<bool>,
 }
 
 impl Snapshot {
@@ -193,8 +262,16 @@ impl Snapshot {
             " writer_role_requested={requested} writer_qos_observed={observed} \
              writer_qos_class={class} writer_qos_set_errno={set_errno} \
              writer_qos_read_errno={read_errno} writer_urgent_drain={} \
-             writer_urgent_view={} writer_urgent_pressure={}",
-            self.counts[0], self.counts[1], self.counts[2]
+             writer_urgent_view={} writer_urgent_pressure={} writer_priority_override={}",
+            self.counts[0],
+            self.counts[1],
+            self.counts[2],
+            self.priority_override
+                .map_or("unavailable", |active| if active {
+                    "active"
+                } else {
+                    "inactive"
+                })
         )
     }
 }

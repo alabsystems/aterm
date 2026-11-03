@@ -109,7 +109,7 @@ fn an_alab_build_is_kept_asked_or_not_and_no_vendor_head_is_read() {
     assert_ne!(active(&l), Some(B));
 }
 
-/// Recording a vendor choice allows an explicit install to replace the ALab build with the vendor head.
+/// Recording a vendor choice allows an install or update pass to replace the ALab build with the vendor head.
 #[test]
 fn a_persons_vendor_choice_is_the_one_way_back_to_the_vendor() {
     let l = world::layout("alab-chosen");
@@ -117,13 +117,13 @@ fn a_persons_vendor_choice_is_the_one_way_back_to_the_vendor() {
     let f = Fake::default();
     f.publish_codex_default("0.165.0");
     crate::alab::choose_vendor(&l, "codex").unwrap();
+    assert_eq!(legacy_root_owed(&l, "codex", Some(B)), None);
     let (policy, trust) = (Policy::default(), world::trust());
-    let o = install_one(&lane(&l, &f, &policy, &trust, true), codex(), false);
+    let o = install_one(&lane(&l, &f, &policy, &trust, false), codex(), false);
     assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
-    assert_eq!(
-        active(&l),
-        Some(Version::parse("0.165.0").unwrap().build_id())
-    );
+    let vendor_id = Version::parse("0.165.0").unwrap().build_id();
+    assert_eq!(active(&l), Some(vendor_id));
+    assert_eq!(legacy_root_owed(&l, "codex", Some(vendor_id)), None);
 }
 
 /// A yanked ALab build rolls back only to an unrevoked ALab build, tombstoning if none remains.
@@ -279,6 +279,31 @@ fn a_rollback_by_hand_from_an_alab_build_lands_on_alab_builds_only() {
     alab_codex(&only, B, true);
     roll_back_by_hand(&only, &Policy::default(), codex()).expect_err("no older ALab build");
     assert_eq!(active(&only), Some(B));
+
+    let from_vendor = world::layout("alab-byhand-from-vendor");
+    alab_codex(&from_vendor, B, true);
+    let alab_env = crate::shim_env::ShimEnv::admit(&["FROM_ALAB=1".to_string()]).unwrap();
+    crate::shim_env::write_sidecar(&from_vendor.build_dir("codex", B), &alab_env).unwrap();
+    crate::alab::choose_vendor(&from_vendor, "codex").unwrap();
+    let f = Fake::default();
+    f.publish_codex_default("0.165.0");
+    let (policy, trust) = (Policy::default(), world::trust());
+    let o = install_one(
+        &alab_lane(&from_vendor, &f, &policy, &trust, true),
+        codex(),
+        false,
+    );
+    assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+    let moved =
+        roll_back_by_hand(&from_vendor, &Policy::default(), codex()).expect("retained ALab build");
+    assert_eq!(moved.from, "0.165.0");
+    assert_eq!(moved.to_build, B);
+    assert_eq!(moved.to, crate::alab::build_words(&from_vendor, "codex", B));
+    assert_eq!(
+        crate::shim_env::read_sidecar(&from_vendor.build_dir("codex", B)),
+        alab_env,
+        "rolling back from vendor onto an ALab build preserves the ALab build's .shim-env"
+    );
 }
 
 /// A filesystem error while restoring a missing ALab shim reports a failed outcome.

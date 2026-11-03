@@ -245,17 +245,22 @@ pub fn bump(root: &Path, git: &dyn GitRunner, released: (&str, &str)) -> Result<
     let (release, released_commit) = released;
     let head_changed = changed_between(git, released_commit, "HEAD")?;
     let mut changed = head_changed;
-    for p in git_ok(git, &["diff", "--name-only", "-z", "HEAD"])?
-        .stdout_utf8()
-        .split('\0')
-        .filter(|p| !p.is_empty())
-    {
-        if !changed.iter().any(|c| c == p) {
-            changed.push(p.to_string());
+    for args in [
+        &["diff", "--name-only", "-z", "HEAD"][..],
+        &["ls-files", "-z", "--others", "--exclude-standard"][..],
+    ] {
+        for p in git_ok(git, args)?
+            .stdout_utf8()
+            .split('\0')
+            .filter(|p| !p.is_empty())
+        {
+            if !changed.iter().any(|c| c == p) {
+                changed.push(p.to_string());
+            }
         }
     }
     let read = |path: &str| {
-        std::fs::read_to_string(root.join(path))
+        crate::durable::read_text(&root.join(path))
             .map_err(|e| Error::new(format!("cannot read {path}: {e}")))
     };
     let owed = owed(
@@ -275,16 +280,23 @@ pub fn bump(root: &Path, git: &dyn GitRunner, released: (&str, &str)) -> Result<
     if !owed.is_empty() {
         let path = crate::changelog::CHANGELOG_FILE;
         let text = read(path)?;
-        let names: Vec<String> = owed
-            .iter()
-            .map(|o| format!("`alab {} harness {}.{}`", o.harness.cli(), o.to.0, o.to.1))
-            .collect();
+        let mut names = Vec::new();
+        for h in CliHarness::ALL {
+            if let Some(then) = text_at(git, released_commit, h.version_file())?
+                .as_deref()
+                .and_then(declared)
+                && let Some(now) = declared(&read(h.version_file())?)
+                && now > then
+            {
+                names.push(format!("`alab {} harness {}.{}`", h.cli(), now.0, now.1));
+            }
+        }
         let entry = format!(
             "- **Harness versions since v{release}: {}.** Each harness's minor moves once per \
              release in which it changed.",
             names.join(", ")
         );
-        let new = with_unreleased_entry(&text, &entry).ok_or_else(|| {
+        let new = upsert_unreleased_harness_entry(&text, release, &entry).ok_or_else(|| {
             Error::new(format!(
                 "harness-bump: {path} has no `## [Unreleased]` section"
             ))
@@ -295,28 +307,68 @@ pub fn bump(root: &Path, git: &dyn GitRunner, released: (&str, &str)) -> Result<
     Ok(owed)
 }
 
+fn upsert_unreleased_harness_entry(text: &str, release: &str, entry: &str) -> Option<String> {
+    let head = "## [Unreleased]";
+    let mut offset = 0;
+    let (at, head_len) = text.split_inclusive('\n').find_map(|line| {
+        let start = offset;
+        offset += line.len();
+        (line.trim_end() == head).then_some((start, line.trim_end_matches(['\r', '\n']).len()))
+    })?;
+    let body_start = at + head_len;
+    let body_end = text[body_start..]
+        .find("\n## ")
+        .map_or(text.len(), |p| body_start + p + 1);
+    let prefix = format!("- **Harness versions since v{release}: ");
+    let mut body_offset = body_start;
+    for line in text[body_start..body_end].split_inclusive('\n') {
+        let start = body_offset;
+        body_offset += line.len();
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.starts_with(&prefix) {
+            let ending = &line[trimmed.len()..];
+            let mut out = String::with_capacity(text.len() + entry.len());
+            out.push_str(&text[..start]);
+            out.push_str(entry);
+            out.push_str(ending);
+            out.push_str(&text[body_offset..]);
+            return Some(out);
+        }
+    }
+    with_unreleased_entry(text, entry)
+}
+
 /// `text` with `entry` added first under `[Unreleased]`'s `### Changed` (made where missing);
 /// `None` where `text` has no `## [Unreleased]`.
 #[must_use]
 pub fn with_unreleased_entry(text: &str, entry: &str) -> Option<String> {
     let head = "## [Unreleased]";
     let mut offset = 0;
-    let at = text.split_inclusive('\n').find_map(|line| {
+    let (at, head_len) = text.split_inclusive('\n').find_map(|line| {
         let start = offset;
         offset += line.len();
-        (line.trim_end() == head).then_some(start)
+        (line.trim_end() == head).then_some((start, line.trim_end_matches(['\r', '\n']).len()))
     })?;
-    let body_start = at + head.len();
+    let body_start = at + head_len;
     let body_end = text[body_start..]
-        .find("\n## [")
+        .find("\n## ")
         .map_or(text.len(), |p| body_start + p + 1);
     let body = &text[body_start..body_end];
     let mut out = String::with_capacity(text.len() + entry.len() + 32);
     out.push_str(&text[..body_start]);
-    match body.find("\n### Changed\n") {
-        Some(p) => {
-            let after = body_start + p + "\n### Changed\n".len();
+    let mut body_offset = 0;
+    let changed_line = body.split_inclusive('\n').find_map(|line| {
+        let start = body_offset;
+        body_offset += line.len();
+        (line.trim_end() == "### Changed").then_some((start, body_offset, line.ends_with('\n')))
+    });
+    match changed_line {
+        Some((_, line_end, has_nl)) => {
+            let after = body_start + line_end;
             out.push_str(&text[body_start..after]);
+            if !has_nl {
+                out.push('\n');
+            }
             out.push('\n');
             out.push_str(entry);
             out.push('\n');
@@ -378,9 +430,9 @@ fn bump_base_release(
 /// The checkout's ledger, tags or files cannot be read, or no public release precedes it.
 pub fn run(root: &Path) -> Result<()> {
     let git = crate::ledger::GitCli::new(root);
-    let ledger_text = std::fs::read_to_string(root.join(crate::ledger::LEDGER_FILE))
+    let ledger_text = crate::durable::read_text(&root.join(crate::ledger::LEDGER_FILE))
         .map_err(|e| Error::new(format!("cannot read {}: {e}", crate::ledger::LEDGER_FILE)))?;
-    let manifest = std::fs::read_to_string(root.join("Cargo.toml"))
+    let manifest = crate::durable::read_text(&root.join("Cargo.toml"))
         .map_err(|e| Error::new(format!("cannot read Cargo.toml: {e}")))?;
     let version = crate::publish::release_version_from_workspace(
         &crate::publish::workspace_version(&manifest)?,
@@ -718,6 +770,49 @@ fn read() {}
         run(&["commit", "-qam", "bump"]);
         let head = crate::ledger::rev_parse(&git, "HEAD").unwrap();
         assert!(gate(&git, ("0.1.0", &released), &head).is_ok());
+
+        // NEGATIVE CONTROL: when another harness moves later in the same release window (including
+        // an untracked file under a harness source directory), `ship harness-bump` updates the
+        // existing `Harness versions since v0.1.0:` bullet in place with all bumped harnesses in
+        // canonical order rather than inserting a second duplicate bullet.
+        let dir_prefix = CliHarness::ALL.iter().find_map(|h| {
+            h.sources()
+                .iter()
+                .find(|s| s.ends_with('/'))
+                .map(|s| (*h, *s))
+        });
+        if let Some((dir_harness, prefix)) = dir_prefix
+            && !matches!(dir_harness, CliHarness::ClaudeCode | CliHarness::Muse)
+        {
+            let untracked = tmp.path().join(format!("{prefix}new_untracked_helper.rs"));
+            std::fs::create_dir_all(untracked.parent().unwrap()).unwrap();
+            std::fs::write(&untracked, "fn helper() {}\n").unwrap();
+            let third = bump(tmp.path(), &git, ("0.1.0", &released)).unwrap();
+            assert_eq!(third.len(), 1);
+            assert_eq!(third[0].harness, dir_harness);
+        } else {
+            let agy_src = tmp
+                .path()
+                .join("crates/aterm-agent/src/harness/upgrade_agy.rs");
+            std::fs::write(&agy_src, "fn agy() {}\n").unwrap();
+            run(&["add", "crates/aterm-agent/src/harness/upgrade_agy.rs"]);
+            let third = bump(tmp.path(), &git, ("0.1.0", &released)).unwrap();
+            assert_eq!(third.len(), 1);
+            assert_eq!(third[0].harness, CliHarness::Agy);
+        }
+        let updated_log = std::fs::read_to_string(tmp.path().join("CHANGELOG.md")).unwrap();
+        assert_eq!(
+            updated_log
+                .matches("Harness versions since v0.1.0:")
+                .count(),
+            1,
+            "must update existing bullet in place: {updated_log}"
+        );
+        assert!(
+            updated_log.contains("`alab claude harness 0.2`")
+                && updated_log.contains("`alab muse harness 0.2`"),
+            "{updated_log}"
+        );
     }
 
     /// A LEDGER NONE OF WHOSE RELEASES SHIPPED IS REFUSED BY THIS GATE, BY NAME: its error says

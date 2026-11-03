@@ -951,11 +951,14 @@ impl Github {
         let mut slept = Duration::ZERO;
         let mut secondary_retried = false;
         let mut attempt = 1u32;
+        // What the attempts so far may have done: an error after a retry says at least that,
+        // so a later attempt that sent nothing never hides an earlier one that may have landed.
+        let mut earlier = SideEffect::None;
         loop {
-            if let Some(answered) = guard(attempt)? {
+            if let Some(answered) = guard(attempt).map_err(|e| at_least(e, earlier))? {
                 return Ok(answered);
             }
-            self.pace()?;
+            self.pace().map_err(|e| at_least(e, earlier))?;
             let failure = match self.write_attempt(call, permit, &decided, consult_book) {
                 Ok(mut answered) => {
                     answered.requests = attempt;
@@ -970,17 +973,92 @@ impl Github {
                 &failure,
                 secondary_retried,
             ) else {
-                return Err(failure);
+                return Err(at_least(failure, earlier));
             };
             if budget.is_some_and(|budget| slept.saturating_add(pause) > budget) {
-                return Err(failure);
+                return Err(at_least(failure, earlier));
             }
+            earlier = stronger(earlier, failure.side_effect);
             if failure.sub == Sub::Secondary {
                 secondary_retried = true;
             }
-            self.inner.fx.sleep(pause)?;
+            self.inner
+                .fx
+                .sleep(pause)
+                .map_err(|e| at_least(e, earlier))?;
             slept = slept.saturating_add(pause);
             attempt = attempt.saturating_add(1);
+        }
+    }
+
+    /// A Converging write's attempts (design §7.4): one `call_write_guarded` attempt at a
+    /// time under `how`'s retry policy (the client's when it names none) and sleep budget, so
+    /// what each failed attempt may have done is known between them. `guard` runs before every
+    /// attempt with the `Look` it is asked for: `Ok(Some(answered))` ends the loop with that
+    /// answer (the state is already right, nothing sent), `Ok(None)` sends, `Err` ends it. An
+    /// attempt may have landed exactly when its error's side effect is unknown (`write_attempt`
+    /// records it: sent with no answer, a 5xx, or an unreadable 2xx); the latest such error
+    /// is kept to the end (`ConvergingAttempts::lost`). Resources build their own ending on what
+    /// this returns: `Releases::converge` and the key writes.
+    pub(crate) fn converging(
+        &self,
+        call: &Call,
+        permit: &Permit,
+        how: &How,
+        guard: &mut dyn FnMut(Look) -> Result<Option<Answered>>,
+    ) -> ConvergingAttempts {
+        let policy = how.retry.unwrap_or_else(|| self.retry_policy());
+        let once = How::write().retry_policy(RetryPolicy::NONE);
+        let budget = how.sleep_budget;
+        let mut slept = Duration::ZERO;
+        let mut secondary_retried = false;
+        let mut so_far = Progress {
+            lost: None,
+            previous: None,
+            earlier: false,
+            attempt: 1,
+        };
+        loop {
+            let look = Look {
+                attempt: so_far.attempt,
+                lost: so_far.lost.is_some(),
+                last: false,
+            };
+            let mut guard_failed = false;
+            let result = self.call_write_guarded(call, permit, &once, &mut |_| {
+                guard(look).inspect_err(|_| guard_failed = true)
+            });
+            let failure = match result {
+                Ok(answered) => return so_far.end(Ok(answered), Ended::Answered),
+                Err(read) if guard_failed => return so_far.end(Err(read), Ended::Guard),
+                Err(failure) => failure,
+            };
+            // The latest attempt that lost its answer is kept: a later attempt answered with a
+            // 4xx, or never sent, does not undo what it may have done.
+            if failure.side_effect == SideEffect::Unknown {
+                so_far.lost = Some(failure.clone());
+            }
+            let pause = should_retry(
+                &policy,
+                Idempotency::Converging,
+                so_far.attempt,
+                &failure,
+                secondary_retried,
+            )
+            .filter(|pause| budget.is_none_or(|budget| slept.saturating_add(*pause) <= budget));
+            let Some(pause) = pause else {
+                return so_far.end(Err(failure), Ended::Attempt);
+            };
+            if failure.sub == Sub::Secondary {
+                secondary_retried = true;
+            }
+            so_far.earlier |= failure.side_effect == SideEffect::Unknown;
+            so_far.previous = Some(failure);
+            if let Err(paused) = self.inner.fx.sleep(pause) {
+                return so_far.end(Err(paused), Ended::Pause);
+            }
+            slept = slept.saturating_add(pause);
+            so_far.attempt = so_far.attempt.saturating_add(1);
         }
     }
 
@@ -1088,8 +1166,7 @@ impl Github {
                 "GitHub answered {status}, and the journal could not record it: {}; intent {id} stays open",
                 e.why
             );
-            return Err(Error::could_not_run(self.redactor().apply(&why))
-                .with_sub(Sub::Local)
+            return Err(Error::local(self.redactor().apply(&why))
                 .with_side_effect(side_effect)
                 .with_next(format!("agh intent show {} {id}", draft.slug))
                 .with_repo(draft.slug.to_string()));
@@ -1131,16 +1208,12 @@ impl Github {
         if let Some(dirs) = &self.inner.dirs {
             return Journal::open(dirs, slug, fx);
         }
-        if matches!(
-            fx.mode(),
-            Mode::Recording | Mode::Replaying | Mode::Rerecording
-        ) {
+        if fx.mode().is_taped() {
             return Ok(Journal::taped(slug, fx));
         }
-        Err(
-            Error::could_not_run("no journal: a one-shot write needs agh's state directory")
-                .with_sub(Sub::Local),
-        )
+        Err(Error::local(
+            "no journal: a one-shot write needs agh's state directory",
+        ))
     }
 
     /// The notifier `How::notify` posts through (`NoNotifier` unless the builder set one).
@@ -1294,10 +1367,9 @@ impl Got {
             Body::Whole(bytes) => bytes,
             Body::Stream(mut reader) => {
                 let mut bytes = Vec::new();
-                reader.read_to_end(&mut bytes).map_err(|e| {
-                    Error::could_not_run(format!("the answer could not be read: {e}"))
-                        .with_sub(Sub::Local)
-                })?;
+                reader
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| Error::local(format!("the answer could not be read: {e}")))?;
                 bytes
             }
         };
@@ -1341,6 +1413,10 @@ struct Decided {
 
 /// The fingerprint a taped run names in place of a credential's (plan §4.6.19).
 const TAPED: &str = "taped";
+
+/// The routing fact `decided_as` asks: whether a profile covers every repository
+/// (`true` or `false`).
+const COVERS: &str = "covers";
 
 /// The pause between two write attempts of one client (design §7.4).
 const PACE: Duration = Duration::from_secs(1);
@@ -1550,13 +1626,99 @@ fn not_loaded(profile: &str) -> Error {
 
 /// CouldNotRun `Sub::Local` about the upload file at `path`.
 fn file_error(path: &std::path::Path, what: &str) -> Error {
-    Error::could_not_run(format!("{} {what}", path.display())).with_sub(Sub::Local)
+    Error::local(format!("{} {what}", path.display()))
+}
+
+/// How a Converging write's guard is asked to look before an attempt (`Github::converging`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Look {
+    /// The attempt about to be sent (from 1).
+    pub(crate) attempt: u32,
+    /// Whether an earlier attempt of this call lost its answer (`side_effect` unknown).
+    pub(crate) lost: bool,
+    /// The read after a lost answer the loop will not retry: nothing is sent after it, so
+    /// the guard only says whether the state is already right. `Github::converging` never asks
+    /// it; `Releases::converge` does, after the loop.
+    pub(crate) last: bool,
+}
+
+/// What ended a Converging write's attempts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ended {
+    /// An attempt was answered with a 2xx, or the guard found the state right.
+    Answered,
+    /// The guard's own error.
+    Guard,
+    /// An attempt's error the policy does not retry.
+    Attempt,
+    /// The pause before a retry failed.
+    Pause,
+}
+
+/// What a Converging write's attempts came to (`Github::converging`).
+pub(crate) struct ConvergingAttempts {
+    /// The answer, or the error that ended the loop (`ended` says whose).
+    pub(crate) result: Result<Answered>,
+    /// What ended the loop.
+    pub(crate) ended: Ended,
+    /// The error of the latest attempt that lost its answer (side effect unknown), kept to
+    /// the end.
+    pub(crate) lost: Option<Error>,
+    /// The failure of the last attempt the loop retried past: the one before the attempt that
+    /// ended it, or, for `Ended::Pause`, the one the failed pause followed.
+    pub(crate) previous: Option<Error>,
+    /// Whether an attempt the loop retried past may have landed (its side effect unknown).
+    pub(crate) earlier: bool,
+    /// The attempt the loop ended at.
+    pub(crate) attempt: u32,
+}
+
+/// `Github::converging`'s state between attempts.
+struct Progress {
+    lost: Option<Error>,
+    previous: Option<Error>,
+    earlier: bool,
+    attempt: u32,
+}
+
+impl Progress {
+    /// The attempts, ended by `ended` with `result`.
+    fn end(self, result: Result<Answered>, ended: Ended) -> ConvergingAttempts {
+        ConvergingAttempts {
+            result,
+            ended,
+            lost: self.lost,
+            previous: self.previous,
+            earlier: self.earlier,
+            attempt: self.attempt,
+        }
+    }
+}
+
+/// The stronger of two side effects: `Applied` over `Unknown` over `None`.
+const fn stronger(a: SideEffect, b: SideEffect) -> SideEffect {
+    match (a, b) {
+        (SideEffect::Applied, _) | (_, SideEffect::Applied) => SideEffect::Applied,
+        (SideEffect::Unknown, _) | (_, SideEffect::Unknown) => SideEffect::Unknown,
+        (SideEffect::None, SideEffect::None) => SideEffect::None,
+    }
+}
+
+/// `error`, saying at least what an earlier attempt of the same write may have done.
+fn at_least(error: Error, earlier: SideEffect) -> Error {
+    let side_effect = stronger(error.side_effect, earlier);
+    if side_effect == error.side_effect {
+        error
+    } else {
+        error.with_side_effect(side_effect)
+    }
 }
 
 /// The file at `path`, opened again for this attempt, when it still holds `len` bytes: a
-/// file that changed is could_not_run before any byte leaves.
+/// file that changed is could_not_run before any byte leaves. The open never waits (a FIFO put in
+/// the file's place is refused on the handle, not waited on).
 fn open_unchanged(path: &std::path::Path, len: u64) -> Result<std::fs::File> {
-    let file = std::fs::File::open(path)
+    let file = crate::download::open_nonblocking(path)
         .map_err(|e| file_error(path, &format!("could not be opened: {e}")))?;
     let meta = file
         .metadata()
@@ -1704,25 +1866,28 @@ impl Github {
 
     /// Whether this run replays a tape: then no credential is loaded or sent.
     fn replays(&self) -> bool {
-        matches!(self.inner.fx.mode(), Mode::Replaying | Mode::Rerecording)
+        self.inner.fx.mode().replays()
     }
 
     /// Whether this run is under any tape.
     fn taped(&self) -> bool {
-        matches!(
-            self.inner.fx.mode(),
-            Mode::Recording | Mode::Replaying | Mode::Rerecording
-        )
+        self.inner.fx.mode().is_taped()
     }
 
     /// What a Send as `profile` speaks with: its loaded credential, or, under a replay, no
     /// credential and the fingerprint `taped`.
     fn decided_as(&self, profile: &str) -> Result<Decided> {
-        let covers_all_repos = self
-            .inner
-            .router
-            .profile(profile)
-            .is_some_and(|p| p.covers_all_repos);
+        // A replay's router is empty, so the flag is a routing fact: a recording reads it off
+        // the live router as the untaped run does and tapes it, and a replay reads it back.
+        let covers = self.inner.fx.fact(COVERS, profile, &mut || {
+            let covers = self
+                .inner
+                .router
+                .profile(profile)
+                .is_some_and(|p| p.covers_all_repos);
+            covers.to_string()
+        })?;
+        let covers_all_repos = covers == "true";
         if self.replays() {
             return Ok(Decided {
                 identity: IdentityRef::Profile {

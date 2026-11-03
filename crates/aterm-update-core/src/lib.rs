@@ -41,6 +41,7 @@ pub mod pkg_check;
 pub mod pointer;
 pub mod roster;
 pub mod seal_guard;
+pub mod service_image;
 pub mod settings;
 pub mod tag;
 

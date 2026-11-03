@@ -156,6 +156,19 @@ const fn hardware(name: &'static str, what: &'static str, why: &'static str) -> 
 
 /// Every outside program aterm runs, and why.
 pub const TOOLS: &[Tool] = &[
+    workspace(
+        "openssl-signing",
+        When::Release,
+        Some(Pin {
+            package: "openssl-signing",
+            version: "3.5.9",
+            exe: "bin/openssl",
+            built: true,
+            hosts: &["macos-aarch64", "macos-x86_64"],
+        }),
+        &[],
+        "OpenSSL 3 for Ed25519 source attestations on a release host; separate from Apple's certificate tools",
+    ),
     os(
         "sh",
         &["/bin/sh"],

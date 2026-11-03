@@ -467,6 +467,129 @@ fn a_removed_mac_asking_again_shows_as_removed_not_new() {
     macs.server.stop();
 }
 
+#[test]
+fn an_older_restore_cannot_undo_the_current_rosters_later_removal() {
+    use crate::members::desk::Handing;
+
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+    admin_seed_swarm_roster(&macs.m22, &[]).unwrap();
+    sync(&macs.m7, None).unwrap();
+    let paths = &macs.m7;
+    let (newcomer, request, allowed) = asker(macs.root.path(), paths, "m40", "m40");
+    let (bundle, logged) = hand(paths, &request, &allowed, true);
+    assert!(logged);
+    write_from_log_bundle(&newcomer, &bundle).unwrap();
+    let actor = request.binding().actor();
+    let label = log_of(paths)
+        .membership()
+        .get(&actor)
+        .unwrap()
+        .label
+        .clone();
+    remove_member(paths, &label, false).unwrap();
+    let restored = hand_over(
+        paths,
+        &Handing {
+            request: &request,
+            node: [0x40; 32],
+            name: "m40",
+            allowed: &allowed,
+            reads_log: true,
+            restore: true,
+            held: None,
+        },
+    )
+    .unwrap();
+    assert!(restored.logged);
+    let before_second_removal = log_of(paths);
+    assert!(
+        roster::restored_by_log(&before_second_removal)
+            .0
+            .contains(&label)
+    );
+    let admitted = log_entries::local_swarm_roster_for_log(paths, &before_second_removal)
+        .unwrap()
+        .unwrap();
+    assert!(
+        admitted
+            .member_by_label_or_alias(&label)
+            .is_some_and(|member| !admitted.is_member_denied(member))
+    );
+
+    remove_member(paths, &label, false).unwrap();
+    let current = swarm_roster(paths).unwrap().unwrap();
+    assert!(current.is_label_denied(&label));
+    assert!(
+        current
+            .member_by_label_or_alias(&label)
+            .is_none_or(|member| current.is_member_denied(member))
+    );
+    let stale = log_entries::local_swarm_roster_for_log(paths, &before_second_removal);
+    let stale_admits = stale.as_ref().is_ok_and(|roster| {
+        roster.as_ref().is_some_and(|roster| {
+            !roster.is_label_denied(&label)
+                && roster
+                    .member_by_label_or_alias(&label)
+                    .is_some_and(|member| !roster.is_member_denied(member))
+        })
+    });
+    macs.server.stop();
+    assert!(
+        !stale_admits,
+        "an older restoration overrode the later removal"
+    );
+}
+
+#[test]
+fn a_signed_draft_extending_the_current_log_can_project_its_new_member() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+    let paths = &macs.m7;
+    let current = log_of(paths);
+    let heads = current.heads();
+    let (bootstrap, actor, incarnation) = member_key(paths);
+    let identity = read_identity(paths).unwrap().unwrap();
+    let opened = current.open_audience_entries(&identity).unwrap().unwrap();
+    let audiences = crate::membership_log::admission_audiences(&opened);
+    let (_newcomer, request, _allowed) = asker(macs.root.path(), paths, "m40", "m40");
+    let recipient = request.binding().recipient().to_bech32();
+    let entrant = crate::membership_log::Entrant {
+        request,
+        node_key: [0x40; 32],
+        name: "m40".to_owned(),
+        label: "m40".to_owned(),
+    };
+    let authored_ms = current.records().map(Record::authored_ms).max().unwrap() + 1;
+    let mut draft = current.clone();
+    let minted = bootstrap
+        .device()
+        .with_seed(|seed| {
+            draft.admit_with(
+                &crate::membership_log::Signer {
+                    actor: &actor,
+                    seed,
+                    incarnation,
+                },
+                entrant,
+                crate::membership_log::Evidence::Phrase,
+                &opened,
+                &audiences,
+                authored_ms,
+            )
+        })
+        .unwrap();
+    assert!(!minted.is_empty());
+    assert_ne!(draft.heads(), heads);
+    assert!(heads.iter().all(|head| draft.get(head).is_some()));
+    let projected = log_entries::local_swarm_roster_for_log(paths, &draft)
+        .unwrap()
+        .unwrap();
+    let member = projected.member_by_recipient(&recipient).unwrap();
+    assert_eq!(member.label, "m40");
+    assert!(!projected.is_member_denied(member));
+    assert_eq!(log_of(paths).heads(), heads, "the draft was not committed");
+    macs.server.stop();
+}
+
 /// F16 retires the admin-only revoke where a trusted log exists: a plain member, which holds no
 /// admin key, removes by the log as the admin does, and `aterm secrets revoke` takes that path on
 /// either.
@@ -1144,6 +1267,7 @@ fn stolen_member_removal_denies_node_keys_and_expires_steward_lease() {
         vault_name: "m40".to_owned(),
         recipient: rec.to_bech32(),
         hint: None,
+        hw_hint: None,
         admitted_ms: 0,
         node_id: None,
         node_key: Some(roster_node_key.clone()),
@@ -1883,6 +2007,7 @@ fn removed_labels_overlay_and_local_label_resolution_enforce_node_and_recipient_
                 label: "m1".to_owned(),
                 aliases: Vec::new(),
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 0,
                 claimed_label: None,
                 claimed_at_ms: None,
@@ -1895,6 +2020,7 @@ fn removed_labels_overlay_and_local_label_resolution_enforce_node_and_recipient_
                 label: "m42".to_owned(),
                 aliases: Vec::new(),
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 0,
                 claimed_label: None,
                 claimed_at_ms: None,

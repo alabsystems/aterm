@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::super::relaunch::{
-    Continued, ExitCause, NO_SHELL, NO_SHELL_DETAIL, WAIT_HAND_LIFTS, exit_clock, first_idle,
-    hand_waits_out,
+    Continued, ExitCause, NO_SHELL, NO_SHELL_DETAIL, WAIT_HAND_LIFTS, cannot_step, exit_clock,
+    first_idle, hand_waits_out,
 };
 use super::super::upgrade_agy::{self as ag, ExitKind};
 use super::upgrade::{Agent, Dialect, Phase};
@@ -64,9 +64,10 @@ pub(super) trait AgyKernel: Kernel {
     fn prompts_since(&self, st: &St, since: u64) -> Option<Vec<String>> {
         live::prompts_look(Path::new(&st.agy_config), &st.thread, since)
     }
-    /// What agy's quota rotation makes of a launch on `model` (its `--model`; `None`: agy's
-    /// default) as `exe` under the relaunch's `env` and config `flags`
-    /// ([`crate::harness::agy_quota_store::rotate_worker`]); `None` in a kernel that reads no quota.
+    /// What the reading on record makes of a running agy's `model` (its `--model`; `None`: agy's
+    /// default) as `exe` under the relaunch's `env` and config `flags`, asking agy nothing
+    /// ([`crate::harness::agy_quota_store::rotate_worker_on_record`]); `None` in a kernel that
+    /// reads no quota.
     fn quota_pick(
         &self,
         _model: Option<&str>,
@@ -77,8 +78,8 @@ pub(super) trait AgyKernel: Kernel {
         None
     }
 
-    /// [`Self::quota_pick`] with `at_wall` (`true` when `agy` is stopped at a quota wall on
-    /// screen: [`crate::harness::agy_quota_store::rotate_worker_at`]).
+    /// [`Self::quota_pick`], or with `at_wall` (`agy` is stopped at a quota wall on screen) the
+    /// wall's read ([`crate::harness::agy_quota_store::rotate_worker_at_wall`]).
     fn quota_pick_at(
         &self,
         model: Option<&str>,
@@ -103,7 +104,14 @@ impl AgyKernel for Live {
         env: &[(String, String)],
         flags: &[String],
     ) -> Option<crate::harness::agy_quota::Pick> {
-        self.quota_pick_at(model, exe, env, flags, false)
+        let _ = exe;
+        crate::harness::agy_quota_store::rotate_worker_on_record(
+            model,
+            env,
+            flags,
+            crate::supervise::limit::unix_now(),
+        )
+        .map(|l| l.pick)
     }
 
     fn quota_pick_at(
@@ -114,13 +122,15 @@ impl AgyKernel for Live {
         flags: &[String],
         at_wall: bool,
     ) -> Option<crate::harness::agy_quota::Pick> {
-        crate::harness::agy_quota_store::rotate_worker_at(
+        if !at_wall {
+            return self.quota_pick(model, exe, env, flags);
+        }
+        crate::harness::agy_quota_store::rotate_worker_at_wall(
             model,
             exe,
             env,
             flags,
             crate::supervise::limit::unix_now(),
-            at_wall,
         )
         .map(|l| l.pick)
     }
@@ -562,10 +572,14 @@ pub(super) fn after_exit_onto(
         }
         closed = Some(st);
     }
-    if let Some(earlier) = closed.or(prior).filter(|st| typed_for_exit(st, snap)) {
+    if let Some(earlier) = closed
+        .as_ref()
+        .or(prior.as_ref())
+        .filter(|st| typed_for_exit(st, snap))
+    {
         let line = connect(opts, &tab)
             .ok()
-            .and_then(|mut c| line_word(&mut c, &earlier, k));
+            .and_then(|mut c| line_word(&mut c, earlier, k));
         let stop = match line {
             Some(ExitKind::Crashed) => None,
             Some(ExitKind::Refused) => Some((
@@ -597,7 +611,9 @@ pub(super) fn after_exit_onto(
         ExitRecord::Crashed => Some(ExitKind::Crashed),
         ExitRecord::Removed => Some(ExitKind::Clean),
         ExitRecord::Refused => Some(ExitKind::Refused),
-        ExitRecord::Unread | ExitRecord::Survived(_) if cause == ExitCause::Exit => {
+        ExitRecord::Unread | ExitRecord::Survived(_)
+            if matches!(cause, ExitCause::Exit | ExitCause::Carried) =>
+        {
             if relaunched_before {
                 Some(ExitKind::Crashed)
             } else {
@@ -609,14 +625,21 @@ pub(super) fn after_exit_onto(
         }
         ExitRecord::Unread | ExitRecord::Survived(_) => None,
     };
-    if cause == ExitCause::Exit {
-        match word {
-            Some(ExitKind::Crashed) => {}
-            Some(ExitKind::Clean) => return said(r, "ended:graceful-exit"),
-            Some(ExitKind::Refused) => return said(r, "ended:refused-start"),
-            Some(ExitKind::Stopped) => return said(r, "ended:stopped"),
-            Some(ExitKind::Unwitnessed) | None => return said(r, "ended:exit-unwitnessed"),
+    match (cause, word) {
+        (ExitCause::Exit, Some(ExitKind::Crashed)) => {}
+        (ExitCause::Exit, Some(ExitKind::Clean)) => return said(r, "ended:graceful-exit"),
+        (ExitCause::Exit, Some(ExitKind::Unwitnessed) | None) => {
+            return said(r, "ended:exit-unwitnessed");
         }
+        // An exit an Autopilot carries comes back however it ended, save a start the agent
+        // refused (typed again, it would refuse again) and a stop, which leaves it alive.
+        (ExitCause::Exit | ExitCause::Carried, Some(ExitKind::Refused)) => {
+            return said(r, cannot_step(cause, "refused-start"));
+        }
+        (ExitCause::Exit | ExitCause::Carried, Some(ExitKind::Stopped)) => {
+            return said(r, "ended:stopped");
+        }
+        _ => {}
     }
     if snap.shell == NO_SHELL {
         return said(r, "refused:not-a-shell-job");
@@ -625,14 +648,14 @@ pub(super) fn after_exit_onto(
         return said(r, "refused:shell-gone");
     }
     let Some(conversation) = snap.session.clone().filter(|c| ag::is_conversation_uuid(c)) else {
-        return said(r, "ended:no-conversation");
+        return said(r, cannot_step(cause, "no-conversation"));
     };
     let lock = run
         .lock
         .clone()
         .unwrap_or_else(|| ag::presence_lock(&run.config, &conversation));
     if !lock.is_file() {
-        return said(r, "ended:conversation-gone");
+        return said(r, cannot_step(cause, "conversation-gone"));
     }
     let program = match relaunch_program(&snap.program, twin) {
         Ok(p) => p,
@@ -678,7 +701,7 @@ pub(super) fn after_exit_onto(
             ExitCause::Stall => CAUSE_STALL,
             ExitCause::Asked => CAUSE_ASKED,
             ExitCause::HostEnded => CAUSE_HOST,
-            ExitCause::Exit => CAUSE_EXIT,
+            ExitCause::Exit | ExitCause::Carried => CAUSE_EXIT,
         }
         .to_string(),
         salt: now,
@@ -686,6 +709,13 @@ pub(super) fn after_exit_onto(
         phase: Phase::Exiting { at_s: now },
         ..St::default()
     };
+    if let Some(prior) = prior.as_ref() {
+        if upgrade::same_build(Agent::Agy, &st.from, &st.to) {
+            prior.kept_by_restart(&tab, &mut st);
+        } else {
+            prior.retried_by(&mut st);
+        }
+    }
     save(opts, &session_key, &st);
     super::super::relaunch::consume_stamp(opts, snap, cause);
     ledger(
@@ -1531,28 +1561,44 @@ pub(super) fn holders(
     if !sessions.iter().any(|s| Agent::Agy.record_tab(s).is_some()) {
         return Vec::new();
     }
-    let procs = table();
-    let tab_of = |pid: u32| -> Option<String> {
-        match live_tabs {
-            Some(tabs) => tabs
-                .iter()
-                .find(|t| t.fgpgid == Some(i64::from(pid)))
-                .map(|t| t.sid.clone()),
-            None => atpkg::caller_shell::process_args(pid)
-                .and_then(|a| a.env_var("ATERM_PARENT_SESSION_ID").map(str::to_owned)),
-        }
-    };
-    procs
-        .iter()
+    let pids: Vec<u32> = table()
+        .into_iter()
         .filter(|(_, _, name)| name == ag::PROGRAM)
-        .filter_map(|(pid, _, _)| {
-            let tab = tab_of(*pid)?;
+        .map(|(pid, _, _)| pid)
+        .collect();
+    holders_in(sessions, live_tabs, &pids, &Live)
+}
+
+pub(super) fn holders_in(
+    sessions: &BTreeSet<String>,
+    live_tabs: Option<&[LiveTab]>,
+    pids: &[u32],
+    k: &dyn AgyKernel,
+) -> Vec<super::upgrade_status::Holder> {
+    if !sessions.iter().any(|s| Agent::Agy.record_tab(s).is_some()) {
+        return Vec::new();
+    }
+    pids.iter()
+        .filter_map(|pid| {
+            let args = k.args(*pid)?;
+            if !ag::is_tui_argv(&args.argv) {
+                return None;
+            }
+            let tab = match live_tabs {
+                Some(tabs) => tabs
+                    .iter()
+                    .find(|t| t.fgpgid == Some(i64::from(*pid)))
+                    .map(|t| t.sid.clone()),
+                None => args.env_var("ATERM_PARENT_SESSION_ID").map(str::to_owned),
+            }?;
             let session = key(&tab);
             sessions
                 .contains(&session)
                 .then(|| super::upgrade_status::Holder {
+                    pid: *pid,
                     session,
-                    version: exe_of(*pid)
+                    version: k
+                        .exe(*pid)
                         .and_then(|exe| store_version(&exe))
                         .unwrap_or_default(),
                     tab: Some(tab),

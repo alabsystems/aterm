@@ -355,6 +355,39 @@ fn the_test_clocks_count_a_sleep_only_where_a_test_counts() {
     );
 }
 
+/// A HOST THAT NEVER SLEEPS READS NONE: made an hour behind the system's wall clock, as a sleep
+/// leaves the loop's last read of it, its wall clock moves on the monotonic clock alone, so the
+/// measure the loop finds a sleep by ([`super::super::run::slept_through`]) finds the hour on the
+/// system's clock and nothing on the door's; and its machine counts no sleep, records none, and is
+/// in a full wake.
+#[test]
+fn an_awake_host_reads_no_sleep() {
+    let origin = Instant::now();
+    let hour_ago = super::super::limit::unix_now_ms() - 3_600_000;
+    let fx = Fx::over(ClockSource::Awake(AwakeClock {
+        origin,
+        wall_origin_ms: hour_ago,
+    }));
+    let (mono, wall) = fx.peek();
+    let ran = i64::try_from(mono.duration_since(origin).as_millis()).expect("ms");
+    assert_eq!(wall, hour_ago + ran, "the monotonic clock's pace");
+    let slept = |wall_now: i64| {
+        super::super::run::slept_through((wall_now - hour_ago).div_euclid(1000), ran / 1000)
+    };
+    assert!(slept(super::super::limit::unix_now_ms()), "the system's");
+    assert!(!slept(wall), "the door's");
+
+    let mut fx = Fx::os();
+    fx.awake();
+    let none = SleepStamp {
+        asleep: Duration::ZERO,
+        boot: Some(Boot::kernel(TEST_BOOT)),
+    };
+    assert_eq!(fx.asleep(), Some(none.clone()));
+    assert_eq!(fx.asleep_for_ledger(), (Some(none), None));
+    assert_eq!((fx.last_sleep(), fx.full_wake()), (None, Some(true)));
+}
+
 /// `since` saturates to zero for an instant ahead of the clock.
 #[test]
 fn since_saturates_like_elapsed() {

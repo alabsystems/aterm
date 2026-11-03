@@ -1000,6 +1000,13 @@ fn a_proven_claim_names_its_codex_alab_only_when_proven() {
         "OK supervisor=- supervisor_proven=1",
         "OK supervisor=aterm-harness%401 supervisor_proven=1",
         "OK supervisor=codex-alab@x supervisor_proven=1",
+        "OK supervisor=codex-alab@0 supervisor_proven=1",
+        "OK supervisor=codex-alab@1 supervisor_proven=1",
+        "OK supervisor=codex-alab@04242 supervisor_proven=1",
+        "OK supervisor=codex-alab%4004242 supervisor_proven=1",
+        "OK supervisor=codex-alab@+4242 supervisor_proven=1",
+        "OK supervisor=codex-alab@+04242 supervisor_proven=1",
+        "OK supervisor=codex-alab%40+4242 supervisor_proven=1",
         "ERR no such session supervisor=codex-alab@4242 supervisor_proven=1",
     ] {
         assert_eq!(proven_pid(status), None, "{status}");

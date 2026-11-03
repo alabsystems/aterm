@@ -132,7 +132,8 @@ pub(crate) fn rc_hook_wired(home: &Path, shell: &str) -> Option<(bool, &'static 
         if crate::protected::under_protected_root(&canonical_home, &real) {
             return false;
         }
-        fs::read_to_string(&real).is_ok_and(|body| body.contains(RC_BEGIN) || body.contains(hook))
+        crate::metadata_io::read_bounded_regular_utf8(&real, 1024 * 1024)
+            .is_ok_and(|body| body.contains(RC_BEGIN) || body.contains(hook))
     });
     Some((wired, hook))
 }
@@ -1128,7 +1129,7 @@ fn sources_shell_d(rc: &str) -> bool {
         .any(|l| !l.starts_with('#') && l.contains("/.aterm/shell.d/"))
 }
 
-/// Put `aterm`, `atpkg` and `amacs` in `~/.local/bin` when we are running from an app
+/// Put `aterm`, `atpkg`, `amacs` and `agh` in `~/.local/bin` when we are running from an app
 /// bundle ([`COMMAND_LINKS`]).
 #[cfg(unix)]
 fn ensure_command_links(home: &Path) {
@@ -1217,8 +1218,10 @@ fn link_act(
 }
 
 /// The names the command-link pass lays in `~/.local/bin`, in the order it lays them.
+/// `agh`, aterm's GitHub client, is owned as `aterm` is and comes last; a bundle from before
+/// agh has no `Contents/MacOS/agh`, so it lays no link to one.
 #[cfg(unix)]
-pub(crate) const COMMAND_LINKS: [&str; 3] = ["aterm", "atpkg", "amacs"];
+pub(crate) const COMMAND_LINKS: [&str; 4] = ["aterm", "atpkg", "amacs", "agh"];
 
 /// `Contents/MacOS` directory from which canonical `exe` may lay command links.
 #[cfg(unix)]
@@ -2490,7 +2493,7 @@ mod tests {
         let bundle = |app: &str| -> PathBuf {
             let macos = root.join("Applications").join(app).join("Contents/MacOS");
             fs::create_dir_all(&macos).unwrap();
-            for name in ["aterm", "atpkg"] {
+            for name in ["aterm", "atpkg", "agh"] {
                 let p = macos.join(name);
                 fs::write(&p, b"#!/bin/sh\nexit 0\n").unwrap();
                 fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2509,10 +2512,12 @@ mod tests {
         ensure_command_links_from(&home, &dev.join("aterm"));
         assert_eq!(target("aterm"), None, "a dev bundle plants no `aterm`");
         assert_eq!(target("atpkg"), None, "a dev bundle plants no `atpkg`");
+        assert_eq!(target("agh"), None, "a dev bundle plants no `agh`");
 
         ensure_command_links_from(&home, &release.join("aterm"));
         assert_eq!(target("aterm"), Some(release.join("aterm")));
         assert_eq!(target("atpkg"), Some(release.join("atpkg")));
+        assert_eq!(target("agh"), Some(release.join("agh")));
 
         ensure_command_links_from(&home, &dev.join("aterm"));
         assert_eq!(
@@ -2525,19 +2530,29 @@ mod tests {
             Some(release.join("atpkg")),
             "a dev bundle's launch must not take the release's `atpkg`"
         );
+        assert_eq!(
+            target("agh"),
+            Some(release.join("agh")),
+            "a dev bundle's launch must not take the release's `agh`"
+        );
 
         set("aterm", &old_release.join("aterm"));
+        set("agh", &old_release.join("agh"));
         ensure_command_links_from(&home, &release.join("aterm"));
         assert_eq!(target("aterm"), Some(release.join("aterm")));
+        assert_eq!(target("agh"), Some(release.join("agh")));
 
         set("aterm", &dev.join("aterm"));
+        set("agh", &dev.join("agh"));
         ensure_command_links_from(&home, &release.join("aterm"));
         assert_eq!(target("aterm"), Some(dev.join("aterm")));
+        assert_eq!(target("agh"), Some(dev.join("agh")));
 
         set("atpkg", &dev.join("atpkg"));
         ensure_command_links_from(&home, &release.join("aterm"));
         assert_eq!(target("atpkg"), Some(release.join("atpkg")));
         assert_eq!(target("aterm"), Some(dev.join("aterm")));
+        assert_eq!(target("agh"), Some(dev.join("agh")));
 
         assert!(in_release_bundle(&release.join("aterm")));
         assert!(!in_release_bundle(&dev.join("aterm")));
@@ -2572,8 +2587,8 @@ mod tests {
             macos
         };
         let before = bundle("Old/aterm.app", &["atpkg"]);
-        let release = bundle("Applications/aterm.app", &["atpkg", "amacs"]);
-        let dev = bundle("Applications/aterm (dev).app", &["atpkg", "amacs"]);
+        let release = bundle("Applications/aterm.app", &["atpkg", "amacs", "agh"]);
+        let dev = bundle("Applications/aterm (dev).app", &["atpkg", "amacs", "agh"]);
         let bin = home.join(".local/bin");
         let target = |name: &str| fs::read_link(bin.join(name)).ok();
 
@@ -2645,6 +2660,65 @@ mod tests {
                 "moved, not deleted"
             );
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `agh` JOINS THE COMMAND LINKS (`docs/DESIGN-agh-2026-10-19.md` §20), owned as `aterm`
+    /// is: a release bundle from before agh lays the other three names and nothing at
+    /// `~/.local/bin/agh`, a release bundle with agh points it into itself, and a regular
+    /// file at the name is left byte-identical.
+    #[cfg(unix)]
+    #[test]
+    fn command_links_skip_agh_where_the_bundle_lacks_it() {
+        use std::os::unix::fs::symlink;
+        let scratch = tmp("cmdlink-agh");
+        let root = scratch.canonicalize().unwrap();
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let bundle = |app: &str, aliases: &[&str]| -> PathBuf {
+            let macos = root.join(app).join("Contents/MacOS");
+            fs::create_dir_all(&macos).unwrap();
+            let aterm = macos.join("aterm");
+            fs::write(&aterm, b"#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&aterm, fs::Permissions::from_mode(0o755)).unwrap();
+            for alias in aliases {
+                symlink("aterm", macos.join(alias)).unwrap();
+            }
+            macos
+        };
+        let before = bundle("Old/aterm.app", &["atpkg", "amacs"]);
+        let release = bundle("Applications/aterm.app", &["atpkg", "amacs", "agh"]);
+        let bin = home.join(".local/bin");
+        let target = |name: &str| fs::read_link(bin.join(name)).ok();
+
+        ensure_command_links_from(&home, &before.join("aterm"));
+        for name in ["aterm", "atpkg", "amacs"] {
+            assert_eq!(target(name), Some(before.join(name)), "{name}");
+        }
+        assert!(
+            fs::symlink_metadata(bin.join("agh")).is_err(),
+            "a bundle without agh lays nothing at its name"
+        );
+
+        ensure_command_links_from(&home, &release.join("aterm"));
+        assert_eq!(target("agh"), Some(release.join("agh")));
+        assert_eq!(
+            fs::canonicalize(bin.join("agh")).unwrap(),
+            release.join("aterm")
+        );
+
+        fs::remove_file(bin.join("agh")).unwrap();
+        fs::write(bin.join("agh"), b"someone's own").unwrap();
+        ensure_command_links_from(&home, &release.join("aterm"));
+        assert_eq!(fs::read(bin.join("agh")).unwrap(), b"someone's own");
+        assert_eq!(
+            copied_command_links(&home),
+            if cfg!(target_os = "macos") {
+                vec![bin.join("agh")]
+            } else {
+                Vec::new()
+            }
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

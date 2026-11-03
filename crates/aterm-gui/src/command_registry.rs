@@ -103,6 +103,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
             C::Terminal,
         ),
         M::Overview => spec("view.overview", S::App, A::Owner, C::Any),
+        M::Workers => spec("view.workers", S::App, A::Owner, C::Any),
         M::CloseTab => spec("view.close_focused", S::View, A::LocalUi, C::Any),
         M::Copy => spec("selection.copy", S::View, A::Clipboard, C::Any),
         M::CopySessionId => spec("session.copy_id", S::Tab, A::Clipboard, C::Terminal),

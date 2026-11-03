@@ -20,6 +20,8 @@ pub enum Unavailable {
     MissingStateLock,
     MissingCache,
     PendingApply,
+    /// Current trusted epochs omit this already known recipient from Commons.
+    ControlExcluded,
     ControlNotVisible,
 }
 
@@ -52,6 +54,7 @@ impl Unavailable {
             Self::MissingStateLock => "vault-state-lock-missing",
             Self::MissingCache => "vault-cache-missing",
             Self::PendingApply => "vault-apply-pending",
+            Self::ControlExcluded => "control-excluded",
             Self::ControlNotVisible => "control-not-visible",
         }
     }
@@ -81,6 +84,9 @@ impl Unavailable {
             }
             Self::PendingApply => {
                 "the cached vault version is not fully applied; sync the configured vault"
+            }
+            Self::ControlExcluded => {
+                "the current signed Commons epochs exclude this installation from control"
             }
             Self::ControlNotVisible => {
                 "no Commons control entry is visible to this installation; it may be unconfigured or addressed to other recipients"

@@ -27,7 +27,7 @@ use crate::proto::{
 };
 use crate::proto::{Gap, NonceExt, ServedInfo};
 use astream_wire::frame::decode_frame_header_bytes;
-use astream_wire::{Frame, FrameError, HEADER_SIZE};
+use astream_wire::{crc32_ieee, FrameError, HEADER_SIZE};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(unix)]
@@ -1383,15 +1383,56 @@ impl<S: Read + Write> Client<S> {
     /// a frame arrived stays in `rx` for the next read. A close is `UnexpectedEof`, and
     /// every failure latches the client.
     fn try_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
-        match self.rx.buffered_frame() {
-            Ok(Some(payload)) => return Ok(Some(payload)),
-            Ok(None) => {}
-            Err(e) => return Err(self.lose(e)),
+        let held = self.rx.buf.get(self.rx.start..self.rx.end).unwrap_or(&[]);
+        if let Some(hdr) = held.first_chunk::<HEADER_SIZE>() {
+            match decode_frame_header_bytes(hdr) {
+                Ok((len, expected_crc)) => {
+                    let consumed = HEADER_SIZE.saturating_add(len);
+                    if let Some(payload_slice) = held.get(HEADER_SIZE..consumed) {
+                        if crc32_ieee(payload_slice) != expected_crc {
+                            self.rx.reset();
+                            return Err(self.lose(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "corrupt frame",
+                            )));
+                        }
+                        let mut payload = Vec::new();
+                        payload.extend_from_slice(payload_slice);
+                        self.rx.start = self.rx.start.saturating_add(consumed);
+                        if self.rx.start == self.rx.end {
+                            self.rx.reset();
+                        }
+                        return Ok(Some(payload));
+                    }
+                }
+                Err(e) => {
+                    self.rx.reset();
+                    let msg = match e {
+                        FrameError::TooLarge => "frame exceeds cap",
+                        _ => "corrupt frame",
+                    };
+                    return Err(self.lose(io::Error::new(io::ErrorKind::InvalidData, msg)));
+                }
+            }
         }
         if let Err(e) = self.set_nowait(true) {
             return Err(self.lose(e));
         }
-        let read = self.read_nowait();
+        // Read through `rx`, which keeps the bytes of a frame the stream stopped
+        // part-way through. (Its negative control reads with `proto::read_frame`,
+        // which drops them.)
+        let read = {
+            #[cfg(test)]
+            if self.try_mutant == TryMutant::Torn {
+                read_frame(&mut self.stream)
+            } else {
+                self.rx.next_frame(&mut self.stream)
+            }
+            #[cfg(not(test))]
+            {
+                self.rx.next_frame(&mut self.stream)
+            }
+        };
         // Back to blocking BEFORE the read is judged, whatever it answered: a client
         // left non-blocking would fail its next blocking read at once.
         if let Err(e) = self.set_nowait(false) {
@@ -1407,17 +1448,6 @@ impl<S: Read + Write> Client<S> {
             Err(e) if self.nowait.not_yet(&e) => Ok(None),
             Err(e) => Err(self.lose(e)),
         }
-    }
-
-    /// The read under [`try_frame`](Self::try_frame): through [`rx`](Client::rx), which
-    /// keeps the bytes of a frame the stream stopped part-way through. (Its negative
-    /// control reads with `proto::read_frame`, which drops them.)
-    fn read_nowait(&mut self) -> io::Result<Option<Vec<u8>>> {
-        #[cfg(test)]
-        if self.try_mutant == TryMutant::Torn {
-            return read_frame(&mut self.stream);
-        }
-        self.rx.next_frame(&mut self.stream)
     }
 
     /// Put the socket under the stream into non-blocking mode (`on`), or back into
@@ -3394,8 +3424,41 @@ impl RecvBuf {
     /// error discards it, since the stream cannot be resumed past one.
     pub(crate) fn next_frame(&mut self, stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
         loop {
-            if let Some(payload) = self.buffered_frame()? {
-                return Ok(Some(payload));
+            // Decode the next frame if the buffer already holds all of it, reading
+            // nothing; `Ok(None)` when it holds less (nothing at all included). A frame
+            // that can never decode — a bad header, a length over the cap — empties the
+            // buffer and is `InvalidData`.
+            let held = self.buf.get(self.start..self.end).unwrap_or(&[]);
+            if let Some(hdr) = held.first_chunk::<HEADER_SIZE>() {
+                match decode_frame_header_bytes(hdr) {
+                    Ok((len, expected_crc)) => {
+                        let consumed = HEADER_SIZE.saturating_add(len);
+                        if let Some(payload_slice) = held.get(HEADER_SIZE..consumed) {
+                            if crc32_ieee(payload_slice) != expected_crc {
+                                self.reset();
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "corrupt frame",
+                                ));
+                            }
+                            let mut payload = Vec::new();
+                            payload.extend_from_slice(payload_slice);
+                            self.start = self.start.saturating_add(consumed);
+                            if self.start == self.end {
+                                self.reset();
+                            }
+                            return Ok(Some(payload));
+                        }
+                    }
+                    Err(e) => {
+                        self.reset();
+                        let msg = match e {
+                            FrameError::TooLarge => "frame exceeds cap",
+                            _ => "corrupt frame",
+                        };
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+                    }
+                }
             }
             if self.end == self.buf.len() {
                 // Full: slide the unfinished frame to the front, and grow only when it
@@ -3462,31 +3525,6 @@ impl RecvBuf {
                     }
                     return Err(e);
                 }
-            }
-        }
-    }
-
-    /// The payload of the next frame if the buffer already holds all of it, reading
-    /// nothing; `Ok(None)` when it holds less (nothing at all included). A frame that
-    /// can never decode — a bad header, a length over the cap — empties the buffer and
-    /// is `InvalidData`, as in [`next_frame`](Self::next_frame).
-    fn buffered_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
-        match Frame::decode(self.buf.get(self.start..self.end).unwrap_or(&[])) {
-            Ok(Some(d)) => {
-                self.start = self.start.saturating_add(d.consumed);
-                if self.start == self.end {
-                    self.reset();
-                }
-                Ok(Some(d.frame.payload))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => {
-                self.reset();
-                let msg = match e {
-                    FrameError::TooLarge => "frame exceeds cap",
-                    _ => "corrupt frame",
-                };
-                Err(io::Error::new(io::ErrorKind::InvalidData, msg))
             }
         }
     }

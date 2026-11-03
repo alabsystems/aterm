@@ -10,14 +10,15 @@ pub(crate) use macos::{
     ToolbarHandle, begin_tab_rename, can_present_tab_rename, end_tab_rename,
     install_window_toolbar, native_selected_pill_rgb, read_tab_chrome, read_tab_menus,
     reflow_window_tabs, rename_editor_edit, rename_editor_text, set_active_tab_color,
-    set_chip_loads, set_strip_accent, set_strip_dark, set_window_pill, set_window_tabs,
+    set_app_tiles, set_chip_loads, set_strip_accent, set_strip_dark, set_window_pill,
+    set_window_tabs, tab_frame_lines,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) use non_macos::{
     ToolbarHandle, install_window_toolbar, native_selected_pill_rgb, read_tab_chrome,
-    read_tab_menus, set_active_tab_color, set_chip_loads, set_strip_accent, set_strip_dark,
-    set_window_tabs,
+    read_tab_menus, set_active_tab_color, set_app_tiles, set_chip_loads, set_strip_accent,
+    set_strip_dark, set_window_tabs,
 };
 
 use crate::tab_bar::TabStripMetadata;
@@ -438,6 +439,26 @@ mod shared_tests {
     }
 
     #[test]
+    fn system_state_help_names_system_state_not_settings() {
+        let help = tab_help(
+            "System State",
+            None,
+            TabStripMetadata {
+                icon: Some(crate::tab_bar::TabIconKind::SystemState),
+                dirty: false,
+                busy: false,
+                attention: crate::tab_bar::ChipLevel::Off,
+                conn: None,
+                closable: true,
+                team: crate::tab_bar::TabTeam::NONE,
+                load: 0,
+            },
+            0,
+        );
+        assert!(!help.contains("Settings"), "{help}");
+    }
+
+    #[test]
     fn terminal_help_and_chrome_have_no_phantom_app_icon() {
         let terminal = TabStripMetadata::from_presentation(
             &crate::tab_model::TabPresentation::terminal("build-server"),
@@ -696,6 +717,9 @@ mod non_macos {
 
     /// No-op off macOS.
     pub(crate) fn set_active_tab_color(_handle: &ToolbarHandle, _color: Option<[u8; 3]>) {}
+
+    /// No-op off macOS.
+    pub(crate) fn set_app_tiles(_handle: &ToolbarHandle, _inks: crate::tab_bar::AppTileInks) {}
 
     /// No-op off macOS.
     pub(crate) fn set_strip_accent(_handle: &ToolbarHandle, _accent: Option<[u8; 3]>) {}
@@ -1125,6 +1149,8 @@ mod macos {
         /// Proxy and window id for building each rebuilt [`TabView`]'s relays.
         proxy: EventLoopProxy<Wake>,
         window: WindowId,
+        /// The application tile's inks ([`set_app_tiles`]), which every chip built later takes; until the theme publishes them an application's glyph stands bare.
+        app_tiles: Cell<Option<crate::tab_bar::AppTileInks>>,
         /// The live [`TabView`]s in tab order: the source for [`read_tab_chrome`] and
         /// the set [`set_window_tabs`] replaces on rebuild.
         tabs: RefCell<Vec<aterm_objc::Retained<TabView>>>,
@@ -1837,6 +1863,8 @@ mod macos {
         /// The identity captured when the context menu popped, which
         /// `tabMenuAction:` posts.
         menu_tab: Cell<Option<TabId>>,
+        /// The tab this chip's menu rows act on where it is not the chip's own ([`TabChromeExt::menu_tab`]).
+        menu_subject: Cell<Option<TabId>>,
         /// Whether this is the active tab: drives the accent in `drawRect:`.
         active: Cell<bool>,
         /// The canonical icon/status/close facts, pushed whole by `set_metadata`:
@@ -1874,6 +1902,7 @@ mod macos {
         /// Where `TabView::paint_identity` draws the app icon and status canvas, set
         /// by `TabView::relayout`.
         icon_rect: Cell<Option<[f64; 4]>>,
+        app_tiles: Cell<Option<crate::tab_bar::AppTileInks>>,
         status_rect: Cell<Option<[f64; 4]>>,
         /// The retained close `NSButton` and title `NSTextField`, so the view can
         /// show/hide the × on hover and so the handle keeps them alive.
@@ -1965,7 +1994,10 @@ mod macos {
                     } else if ivars.hovered.get() {
                         appkit::send_v(with_alpha(ns_color(sel!(labelColor)), 0.07), sel!(set));
                         appkit::send_v(rounded_rect(pill, TAB_PILL_RADIUS), sel!(fill));
-                    } else if ivars.separator.get() {
+                    } else if ivars.separator.get()
+                        && !(ivars.metadata.get().is_app_tab() && ivars.icon_rect.get().is_none())
+                    {
+                        // A chip too narrow for its tile wears a spine there, which already divides it from its neighbour.
                         appkit::send_v(ns_color(sel!(separatorColor)), sel!(set));
                         let rule = rect(
                             bounds.origin.x,
@@ -2261,6 +2293,61 @@ mod macos {
                     ns_color(sel!(secondaryLabelColor))
                 };
                 appkit::send_v(ink, sel!(set));
+                let published = ivars.app_tiles.get().filter(|_| metadata.is_app_tab());
+                let tile = published.map(|inks| {
+                    // A lone chip is also the active one, but no pill is drawn under it.
+                    if ivars.solo.get() {
+                        inks.solo
+                    } else if ivars.active.get() {
+                        inks.active
+                    } else {
+                        inks.quiet
+                    }
+                });
+                let layout_icon = match (tile, layout_icon) {
+                    (Some(tile), Some(icon)) => {
+                        let side = icon[2] + 2.0 * APP_TILE_OUTSET_PT;
+                        let frame = rect(
+                            icon[0] - APP_TILE_OUTSET_PT,
+                            icon[1] - APP_TILE_OUTSET_PT,
+                            side,
+                            side,
+                        );
+                        appkit::send_v(srgb_of(tile.fill), sel!(set));
+                        appkit::send_v(
+                            rounded_rect(
+                                frame,
+                                side * f64::from(crate::tab_bar::APP_TILE_RADIUS_SHARE),
+                            ),
+                            sel!(fill),
+                        );
+                        appkit::send_v(srgb_of(tile.glyph), sel!(set));
+                        let glyph = side * f64::from(crate::tab_bar::APP_TILE_GLYPH_SHARE);
+                        Some([
+                            icon[0] + (icon[2] - glyph) * 0.5,
+                            icon[1] + (icon[3] - glyph) * 0.5,
+                            glyph,
+                            glyph,
+                        ])
+                    }
+                    (Some(tile), None) => {
+                        if !ivars.solo.get()
+                            && !(ivars.hovered.get() && ivars.close_available.get())
+                        {
+                            let (w, h) = (
+                                f64::from(crate::tab_bar::APP_SPINE_W_PT),
+                                f64::from(crate::tab_bar::APP_SPINE_H_PT),
+                            );
+                            let spine =
+                                rect(TAB_PILL_INSET_X + 1.0, ivars.center_y.get() - h * 0.5, w, h);
+                            let color = crate::tab_bar::app_spine_color(tile, ivars.active.get());
+                            appkit::send_v(srgb_of(color), sel!(set));
+                            appkit::send_v(rounded_rect(spine, w * 0.5), sel!(fill));
+                        }
+                        None
+                    }
+                    (None, icon) => icon,
+                };
                 if let (Some(kind), Some(icon)) = (metadata.icon, layout_icon) {
                     let scale = (icon[2] / f64::from(TAB_ICON_DESIGN_SIZE))
                         .min(icon[3] / f64::from(TAB_ICON_DESIGN_SIZE));
@@ -2322,6 +2409,7 @@ mod macos {
                         }
                     }
                 }
+                appkit::send_v(ink, sel!(set));
                 if let Some(status) = layout_status {
                     let count = metadata.status_count();
                     let mut ordinal = 0usize;
@@ -2431,6 +2519,7 @@ mod macos {
                 origin: Cell::new(origin),
                 drag_origin: Cell::new(None),
                 menu_tab: Cell::new(None),
+                menu_subject: Cell::new(None),
                 active: Cell::new(active),
                 metadata: Cell::new(metadata),
                 hovered: Cell::new(false),
@@ -2442,6 +2531,7 @@ mod macos {
                 separator: Cell::new(geometry.separator),
                 close_available: Cell::new(false),
                 icon_rect: Cell::new(None),
+                app_tiles: Cell::new(None),
                 status_rect: Cell::new(None),
                 close_btn: RefCell::new(None),
                 label: RefCell::new(None),
@@ -2580,7 +2670,11 @@ mod macos {
                         consts::NS_TEXT_ALIGNMENT_CENTER,
                     );
                     appkit::send_v_id(lbl.id(), sel!(setTextColor:), color);
-                    appkit::send_v_id(lbl.id(), sel!(setFont:), system_font(12.0, active));
+                    appkit::send_v_id(
+                        lbl.id(),
+                        sel!(setFont:),
+                        system_font(12.0, active || metadata.is_app_tab()),
+                    );
                     if let Some(text) = appkit::nsstring(&tab_display_label(
                         &title,
                         ivars.index.get(),
@@ -2645,7 +2739,11 @@ mod macos {
                         sel!(setAlignment:),
                         consts::NS_TEXT_ALIGNMENT_LEFT,
                     );
-                    appkit::send_v_id(lbl.id(), sel!(setFont:), system_font(13.0, false));
+                    appkit::send_v_id(
+                        lbl.id(),
+                        sel!(setFont:),
+                        system_font(13.0, metadata.is_app_tab()),
+                    );
                     appkit::send_v_id(lbl.id(), sel!(setTextColor:), ns_color(sel!(labelColor)));
                     if let Some(text) = appkit::nsstring(title) {
                         appkit::send_v_id(lbl.id(), sel!(setStringValue:), text.id());
@@ -2806,6 +2904,7 @@ mod macos {
             if *ivars.menu_entries.borrow() != ext.menu {
                 *ivars.menu_entries.borrow_mut() = ext.menu.clone();
             }
+            ivars.menu_subject.set(ext.menu_tab);
         }
 
         fn set_tab_origin(&self, origin: TabStripOrigin) {
@@ -2828,7 +2927,12 @@ mod macos {
             if entries.is_empty() {
                 return;
             }
-            self.ivars().menu_tab.set(Some(self.tab_id()));
+            self.ivars().menu_tab.set(Some(
+                self.ivars()
+                    .menu_subject
+                    .get()
+                    .unwrap_or_else(|| self.tab_id()),
+            ));
             *self.ivars().menu_session_actions.borrow_mut() = entries
                 .iter()
                 .filter_map(|entry| match entry {
@@ -2992,6 +3096,16 @@ mod macos {
                 &self.ivars().menu_entries.borrow(),
                 crate::turn_ledger::now_ms(),
             )
+        }
+
+        /// Take new application tile inks, repainting an application's chip when they moved.
+        fn set_app_tiles(&self, inks: crate::tab_bar::AppTileInks) {
+            let ivars = self.ivars();
+            if ivars.app_tiles.replace(Some(inks)) != Some(inks)
+                && ivars.metadata.get().is_app_tab()
+            {
+                mark_dirty(self.as_id());
+            }
         }
 
         /// Diff icon, status, and close metadata in place.
@@ -3324,6 +3438,7 @@ mod macos {
         };
 
         Some(ToolbarHandle {
+            app_tiles: Cell::new(None),
             _delegate: delegate,
             _toolbar: toolbar,
             container,
@@ -3388,6 +3503,64 @@ mod macos {
         }
         for (tab, &load) in tabs.iter().zip(loads) {
             tab.set_load(load, inks_moved);
+        }
+    }
+
+    /// How far an application's tile stands out past its icon's rect (points).
+    const APP_TILE_OUTSET_PT: f64 = 1.0;
+
+    /// An opaque `NSColor` of `[r, g, b]`.
+    /// # Safety
+    /// Must be called on the main thread.
+    unsafe fn srgb_of(c: [u8; 3]) -> Id {
+        // SAFETY: a plain colour constructor on the main thread.
+        unsafe {
+            srgb(
+                f64::from(c[0]) / 255.0,
+                f64::from(c[1]) / 255.0,
+                f64::from(c[2]) / 255.0,
+                1.0,
+            )
+        }
+    }
+
+    /// One `tab-frame` line per chip of `handle`, in `to_backing`'s pixels, for a rig that crops a captured window.
+    pub(crate) fn tab_frame_lines(
+        handle: &ToolbarHandle,
+        mut to_backing: impl FnMut(Id, [f64; 4]) -> [f64; 4],
+    ) -> Vec<String> {
+        let tabs = handle.tabs.borrow();
+        tabs.iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let ivars = tab.ivars();
+                // SAFETY: `-bounds` is a side-effect-free getter on a live chip, on the main thread.
+                let b = unsafe { appkit::send_rect(tab.as_id(), sel!(bounds)) };
+                let [x, y, w, h] = to_backing(
+                    tab.as_id(),
+                    [b.origin.x, b.origin.y, b.size.width, b.size.height],
+                );
+                let surface = if ivars.metadata.get().is_app_tab() { "app" } else { "terminal" };
+                let icon = ivars.icon_rect.get().map_or_else(
+                    || "-".to_string(),
+                    |i| {
+                        let [x, y, w, h] = to_backing(tab.as_id(), i);
+                        format!("{x:.0},{y:.0},{w:.0},{h:.0}")
+                    },
+                );
+                format!(
+                    "tab-frame index={index} surface={surface} selected={} x={x:.0} y={y:.0} w={w:.0} h={h:.0} icon={icon}",
+                    ivars.active.get()
+                )
+            })
+            .collect()
+    }
+
+    /// Set this window's application tile inks; the state sits on the handle so a second window's push is never mistaken for no change.
+    pub(crate) fn set_app_tiles(handle: &ToolbarHandle, inks: crate::tab_bar::AppTileInks) {
+        handle.app_tiles.set(Some(inks));
+        for tab in handle.tabs.borrow().iter() {
+            tab.set_app_tiles(inks);
         }
     }
 
@@ -3644,6 +3817,9 @@ mod macos {
                 geometry_at(i, cx),
             );
             let Some(tab) = tab else { continue };
+            if let Some(inks) = handle.app_tiles.get() {
+                tab.set_app_tiles(inks);
+            }
             // SAFETY: `addSubview:` on the live container, main thread.
             unsafe { appkit::send_v_id(container, sel!(addSubview:), tab.as_id()) };
             new_tabs.push(tab);

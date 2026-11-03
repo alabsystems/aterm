@@ -22,7 +22,7 @@ const STATUS: &[&str] = &["pending", "active", "paused", "broken", "banned"];
 const SAFE_FIRST: &[&str] = &["banned", "broken", "paused", "pending", "active"];
 
 crate::att_collection!(
-    ACCOUNT = Collection {
+    pub(super) ACCOUNT = Collection {
         name: "account",
         version: 2,
         kind: Kind::Cells,
@@ -38,7 +38,7 @@ crate::att_collection!(
                 Ty::Set(&Ty::Enum(&["codex", "chatgpt", "claude-code"]))
             ),
             Column::new("note", Ty::Text(512)).null(),
-            Column::new("seats", Ty::Uint)
+            Column::new("units", Ty::Uint)
                 .null()
                 .on_conflict(OnConflict::Max),
             Column::new("hold", Ty::Uint)
@@ -59,7 +59,7 @@ crate::att_collection!(
 
 crate::att_collection!(
     /// The same collection as a build from before version 2 compiled it.
-    ACCOUNT_V1 = Collection {
+    pub(super) ACCOUNT_V1 = Collection {
     name: "account",
     version: 1,
     kind: Kind::Cells,
@@ -72,7 +72,7 @@ crate::att_collection!(
         Column::new("plan", Ty::Ref("plan")).null(),
         Column::new("services", Ty::Set(&Ty::Enum(&["codex", "chatgpt", "claude-code"]))),
         Column::new("note", Ty::Text(512)).null(),
-        Column::new("seats", Ty::Uint).null(),
+        Column::new("units", Ty::Uint).null(),
         Column::new("hold", Ty::Uint).null(),
         Column::new("vault_ref", Ty::SecretRef).null(),
         Column::new("src", Ty::SrcRef).null(),
@@ -84,7 +84,7 @@ crate::att_collection!(
 });
 
 crate::att_collection!(
-    ADDRESS = Collection {
+    pub(super) ADDRESS = Collection {
         name: "address",
         version: 1,
         kind: Kind::Cells,
@@ -101,7 +101,7 @@ crate::att_collection!(
 );
 
 crate::att_collection!(
-    FACTS = Collection {
+    pub(super) FACTS = Collection {
         name: "facts",
         version: 1,
         kind: Kind::Owned,
@@ -142,7 +142,7 @@ crate::att_collection!(
     }
 );
 
-const TABLE: Table = Table {
+pub(super) const TABLE: Table = Table {
     application: "att-test",
     role: "registry",
     collections: &[&ACCOUNT, &ADDRESS, &FACTS, &OBS],
@@ -152,26 +152,26 @@ const TABLE: Table = Table {
 
 /// A hand-built causal history: each write names the writes it observed.
 #[derive(Default)]
-struct Book {
+pub(super) struct Book {
     index: Option<Index>,
     next: u64,
-    heads: BTreeMap<u8, (u64, Digest)>,
+    pub(super) heads: BTreeMap<u8, (u64, Digest)>,
     ops: Vec<(Digest, u8, u64, Vec<Change>)>,
 }
 
-fn actor(n: u8) -> Actor {
+pub(super) fn actor(n: u8) -> Actor {
     [n; 48]
 }
 
 impl Book {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             index: Some(Index::new(1024)),
             ..Self::default()
         }
     }
     /// Append `changes` by `writer`, observing its own previous write and `seen`.
-    fn write(&mut self, writer: u8, seen: &[Digest], changes: Vec<Change>) -> Digest {
+    pub(super) fn write(&mut self, writer: u8, seen: &[Digest], changes: Vec<Change>) -> Digest {
         self.next += 1;
         let mut id = [0; 32];
         id[..8].copy_from_slice(&self.next.to_be_bytes());
@@ -206,7 +206,7 @@ impl Book {
         }
         cells
     }
-    fn cells(&self) -> Cells {
+    pub(super) fn cells(&self) -> Cells {
         self.cells_without(&BTreeSet::new())
     }
     fn ops(&self, period: u64) -> Vec<Op> {
@@ -225,7 +225,7 @@ impl Book {
     }
 }
 
-fn put(collection: &Collection, pk: &str, col: &str, x: Value) -> Change {
+pub(super) fn put(collection: &Collection, pk: &str, col: &str, x: Value) -> Change {
     cell::change(
         collection,
         CellKey {
@@ -238,7 +238,13 @@ fn put(collection: &Collection, pk: &str, col: &str, x: Value) -> Change {
     .unwrap()
 }
 
-fn elem(collection: &Collection, pk: &str, col: &str, elem: &str, present: bool) -> Change {
+pub(super) fn elem(
+    collection: &Collection,
+    pk: &str,
+    col: &str,
+    elem: &str,
+    present: bool,
+) -> Change {
     cell::change(
         collection,
         CellKey {
@@ -251,7 +257,7 @@ fn elem(collection: &Collection, pk: &str, col: &str, elem: &str, present: bool)
     .unwrap()
 }
 
-const PK: &str = "ac-0123456789abcdef";
+pub(super) const PK: &str = "ac-0123456789abcdef";
 
 /// NEGATIVE CONTROL: with `CellKey::parse` accepting a fourth part (its `parts.next().is_some()`
 /// check removed), `a.b.c.d` parses and this fails.
@@ -369,14 +375,14 @@ fn concurrent_edits_to_different_columns_both_survive() {
 fn equal_values_collapse_and_conflicts_follow_the_column_rule() {
     let mut book = Book::new();
     let birth = book.write(1, &[], vec![put(&ACCOUNT, PK, "row", json!("live"))]);
-    for (writer, status, seats, hold) in [(1, "active", 2, 5), (2, "banned", 3, 6)] {
+    for (writer, status, units, hold) in [(1, "active", 2, 5), (2, "banned", 3, 6)] {
         book.write(
             writer,
             &[birth],
             vec![
                 put(&ACCOUNT, PK, "plan", json!("anthropic-max20")),
                 put(&ACCOUNT, PK, "status", json!(status)),
-                put(&ACCOUNT, PK, "seats", json!(seats)),
+                put(&ACCOUNT, PK, "units", json!(units)),
                 put(&ACCOUNT, PK, "hold", json!(hold)),
             ],
         );
@@ -389,7 +395,7 @@ fn equal_values_collapse_and_conflicts_follow_the_column_rule() {
     assert_eq!(row.get("plan"), Some(&json!("anthropic-max20")));
     assert!(row.fields["status"].conflicted());
     assert_eq!(row.get("status"), Some(&json!("banned")));
-    assert_eq!(row.get("seats"), Some(&json!(3)));
+    assert_eq!(row.get("units"), Some(&json!(3)));
     assert!(row.fields["hold"].conflicted());
     assert_eq!(row.get("hold"), None);
 }
@@ -650,7 +656,7 @@ fn phone_numbers_stay_out_of_every_cell() {
         "host 192.168.1.20",
         "MacBook Pro (14-inch, 2024)",
         "moved from m27-2 on 0.147.0",
-        "seat sr-ee08c551e4729096",
+        "from sr-ee08c551e4729096",
         "1,000,000 tokens a week",
     ] {
         assert!(note(fine).is_ok(), "{fine}");
@@ -722,10 +728,10 @@ fn secret_named_columns_must_be_vault_references() {
     assert_eq!(ADDRESS.schema_row()["x"]["columns"][0]["pii"], json!(true));
 }
 
-const M1: [u8; 16] = [0x11; 16];
-const M2: [u8; 16] = [0x22; 16];
+pub(super) const M1: [u8; 16] = [0x11; 16];
+pub(super) const M2: [u8; 16] = [0x22; 16];
 
-fn machine_of(_: &Digest, actor: &Actor) -> Option<[u8; 16]> {
+pub(super) fn machine_of(_: &Digest, actor: &Actor) -> Option<[u8; 16]> {
     match actor[0] {
         1 => Some(M1),
         2 => Some(M2),
@@ -733,7 +739,7 @@ fn machine_of(_: &Digest, actor: &Actor) -> Option<[u8; 16]> {
     }
 }
 
-fn owned_change(collection: &Collection, key: &str, n: u64) -> Change {
+pub(super) fn owned_change(collection: &Collection, key: &str, n: u64) -> Change {
     Change {
         collection: collection.name.to_owned(),
         key: key.to_owned(),
@@ -912,7 +918,7 @@ fn automatic_records_past_the_quota_never_project() {
         book.write(2, &[], vec![birth(pk)]);
     }
     for n in 0..4 {
-        book.write(1, &[], vec![put(&ACCOUNT, PK, "seats", json!(n))]);
+        book.write(1, &[], vec![put(&ACCOUNT, PK, "units", json!(n))]);
     }
     let quota = owned::quota(&TABLE, &book.ops(0), &[]);
     assert_eq!(quota.spent.get(&actor(2)), Some(&3));
@@ -923,7 +929,7 @@ fn automatic_records_past_the_quota_never_project() {
         ["ad-1", "ad-2"]
     );
     let accounts = cell::project(&ACCOUNT, &book.cells_without(&quota.over)).rows;
-    assert_eq!(accounts[PK].get("seats"), Some(&json!(3)));
+    assert_eq!(accounts[PK].get("units"), Some(&json!(3)));
 }
 
 /// A writer's automatic record costs the merges it needed too: the causal-only joins its
@@ -952,7 +958,7 @@ fn merges_before_an_automatic_record_count_against_the_quota() {
     book.write(2, &[], vec![]);
     book.write(2, &[], vec![birth("ad-2")]);
     book.write(1, &[], vec![]);
-    book.write(1, &[], vec![put(&ACCOUNT, PK, "seats", json!(1))]);
+    book.write(1, &[], vec![put(&ACCOUNT, PK, "units", json!(1))]);
     let mut ops = book.ops(0);
     let merges: Vec<(Actor, u64)> = ops
         .iter()
@@ -1018,7 +1024,7 @@ fn every_key_fits_the_grammar() {
         machine.clone(),
         keys::address_pk("a@example.invalid").unwrap(),
         keys::subaccount_pk(&account, "0123456789ab").unwrap(),
-        keys::seat_pk(&machine, 99).unwrap(),
+        keys::preference_pk(&machine, &account).unwrap(),
         keys::source_pk(b"sheet"),
         keys::model_pk("Mac16,8").unwrap(),
         keys::random_pk(keys::Random::Phone).unwrap(),
@@ -1036,8 +1042,7 @@ fn every_key_fits_the_grammar() {
         };
         assert!(key.encode().is_ok(), "{pk}");
     }
-    assert!(keys::seat_pk(&machine, 0).is_err());
-    assert!(keys::seat_pk(&machine, 100).is_err());
+    assert!(keys::preference_pk(&account, &machine).is_err());
     assert!(keys::auth_route_pk(&account, "carrier-pigeon").is_err());
     assert_ne!(
         keys::random_pk(keys::Random::Phone).unwrap(),
@@ -1457,4 +1462,235 @@ fn a_lifecycle_conflict_never_reads_as_live() {
     let newer = concurrent("live", "paused");
     assert!(newer.fields[LIFECYCLE].conflicted());
     assert!(!newer.live());
+}
+
+/// An account's label names no machine, in any spelling a machine has, and is free text past
+/// that: the guards still hold, and the default label passes for every realm. A preference's key
+/// is the pair alone, and names no rank.
+/// NEGATIVE CONTROL: with `guard::account_label` skipping `machine_shaped`, the first spelling is
+/// stored: `` called `Result::unwrap_err()` on an `Ok` value: () `` at `m2`.
+#[test]
+fn an_account_label_names_no_machine() {
+    let label = crate::alab::registry::ACCOUNT.column("label").unwrap();
+    let write = |text: &str| {
+        cell::validate(&crate::alab::registry::ACCOUNT, label, &json!(text)).map_err(|e| e.0)
+    };
+    for shaped in [
+        "m2",
+        "M109",
+        "m2.3",
+        "m27-2",
+        "m106-m38",
+        "kimi-m16",
+        "m2 spare",
+        "m4max",
+        "claude.m8",
+    ] {
+        let why = write(shaped).unwrap_err();
+        assert!(why.contains("names no machine"), "{shaped}: {why}");
+        assert!(!why.contains(shaped), "{why}");
+    }
+    for fine in ["research", "max-plan", "muse-1", "team a", "m", "mac mini"] {
+        assert!(write(fine).is_ok(), "{fine}");
+    }
+    for refused in ["", "  ", "a@example.test", &"x".repeat(33)] {
+        assert!(write(refused).is_err(), "{refused}");
+    }
+    let account = keys::account_pk("claude", "a@example.test").unwrap();
+    for realm in [
+        "claude",
+        "codex",
+        "grok",
+        "kimi:global",
+        "kimi:mainland-cn",
+        "google",
+        "meta",
+    ] {
+        let label = keys::default_account_label(realm, &account).unwrap();
+        assert!(write(&label).is_ok(), "{label}");
+        assert_eq!(label.rsplit('-').next().unwrap(), &account[3..9]);
+    }
+    assert!(keys::default_account_label("carrier", &account).is_err());
+    assert!(keys::default_account_label("claude", "m8").is_err());
+    let machine = keys::machine_pk("m8");
+    let pk = keys::preference_pk(&machine, &account).unwrap();
+    assert!(pk.starts_with("pf-") && pk.len() == 25, "{pk}");
+    assert_ne!(
+        pk,
+        keys::preference_pk(&keys::machine_pk("m9"), &account).unwrap()
+    );
+}
+
+/// A note cell an import would copy lab-wide refuses what says or reads like a sign-in secret,
+/// including what `guard::text` lets a person type, and keeps ordinary prose.
+/// NEGATIVE CONTROL: with `note_cell` returning `text(value, max)` alone, `pass: Hunter2!` is
+/// accepted: this test's `` refused: pass: Hunter2! `` message; with `NOTE_WORDS` unread,
+/// `login pass plainword` is.
+#[test]
+fn a_copied_note_refuses_what_reads_as_a_secret() {
+    for text in [
+        "pass: Hunter2!",
+        "pw Hunter2!",
+        "login pass plainword",
+        "seed phrase apple pear",
+        "PIN 4821",
+        "token abc",
+        "Hunter2!",
+        "abc123",
+        "hun!ter",
+    ] {
+        assert!(guard::note_cell(text, 512).is_err(), "refused: {text}");
+    }
+    for text in [
+        "phone required",
+        "compass bypass passed",
+        "claude banned",
+        "moved to m106-m38, then m3.2",
+        "gpt-5.5 at $200/mo",
+        "it's banned! (again)",
+        "2026-11-01: paused",
+    ] {
+        assert_eq!(guard::note_cell(text, 512), Ok(()), "kept: {text}");
+    }
+    assert!(guard::text("pass: Hunter2!", 512).is_ok());
+}
+
+/// Vault references, foreign keys, set elements and cell primary keys enforce the credential
+/// and inner-type guards without rejecting legitimate vault entry names (`mailbox-password`,
+/// `ai-mailbox.toml`, `totp`) or 16-digit hex digest keys (`mc-0000000000000009`).
+/// NEGATIVE CONTROLS: with `Ty::SecretRef` checking only `crypto::name`, a token pasted into
+/// `"entry"` is accepted; with `check_elem` passing every `pk_grammar` word, `"abcd"` is
+/// accepted in a `Ty::Set(&Ty::Digits(4))` column and a token is accepted in `clis`.
+#[test]
+fn vault_refs_foreign_keys_and_set_elements_enforce_credential_and_type_guards() {
+    let token = concat!("ghp", "_cccccccccccccccccccccc");
+    let seed = concat!("JBSWY3DP", "EHPK3PXP");
+    let oauth = concat!("ya", "29.a0AfH6SMBx1y2z3w4v5u6t7s8r9q");
+
+    // Legitimate vault entry names that name secret kinds stay valid.
+    for entry in [
+        "ai-mailbox.toml",
+        "mailbox-password",
+        "totp",
+        "mailbox-mb-0011223344556677",
+    ] {
+        let ok = cell::change(
+            &ACCOUNT,
+            CellKey {
+                pk: PK,
+                col: "vault_ref",
+                elem: None,
+            },
+            &CellValue::owner(2, json!({"vault": "alab", "entry": entry, "item": "totp"})),
+        );
+        assert!(ok.is_ok(), "{entry}: {ok:?}");
+    }
+    // Credential shapes in vault, entry or item are refused without quoting them.
+    for bad in [
+        json!({"vault": token, "entry": "ai-mailbox.toml"}),
+        json!({"vault": "alab", "entry": oauth}),
+        json!({"vault": "alab", "entry": "ai-mailbox.toml", "item": seed}),
+    ] {
+        let why = cell::change(
+            &ACCOUNT,
+            CellKey {
+                pk: PK,
+                col: "vault_ref",
+                elem: None,
+            },
+            &CellValue::owner(2, bad),
+        )
+        .unwrap_err()
+        .0;
+        assert!(
+            !why.contains("ghp") && !why.contains("JBSW") && !why.contains("ya29"),
+            "{why}"
+        );
+    }
+
+    // Foreign-key references accept 16-digit decimal-hex keys and refuse credential shapes.
+    assert!(
+        cell::change(
+            &ACCOUNT,
+            CellKey {
+                pk: "ac-0000000000000009",
+                col: "login",
+                elem: None,
+            },
+            &CellValue::owner(2, json!("ad-0000000000000009")),
+        )
+        .is_ok()
+    );
+    for bad in [token, seed] {
+        assert!(
+            cell::change(
+                &ACCOUNT,
+                CellKey {
+                    pk: PK,
+                    col: "login",
+                    elem: None,
+                },
+                &CellValue::owner(2, json!(bad)),
+            )
+            .is_err()
+        );
+        assert!(
+            cell::change(
+                &ACCOUNT,
+                CellKey {
+                    pk: bad,
+                    col: "row",
+                    elem: None,
+                },
+                &CellValue::owner(2, json!("live")),
+            )
+            .is_err()
+        );
+        assert!(
+            cell::change(
+                &crate::alab::registry::MACHINE,
+                CellKey {
+                    pk: "mc-0000000000000009",
+                    col: "clis",
+                    elem: Some(bad),
+                },
+                &CellValue::owner(1, json!(true)),
+            )
+            .is_err()
+        );
+    }
+
+    // `check_elem` enforces the set's inner scalar type, not only `pk_grammar`.
+    const PINS: Collection = Collection {
+        name: "pin",
+        columns: &[
+            Column::new("codes", Ty::Set(&Ty::Digits(4))),
+            Column::new("row", Ty::Enum(LIFE)),
+        ],
+        ..ADDRESS
+    };
+    assert!(
+        cell::change(
+            &PINS,
+            CellKey {
+                pk: "ph-0011223344556677",
+                col: "codes",
+                elem: Some("0101"),
+            },
+            &CellValue::owner(1, json!(true)),
+        )
+        .is_ok()
+    );
+    assert!(
+        cell::change(
+            &PINS,
+            CellKey {
+                pk: "ph-0011223344556677",
+                col: "codes",
+                elem: Some("abcd"),
+            },
+            &CellValue::owner(1, json!(true)),
+        )
+        .is_err()
+    );
 }

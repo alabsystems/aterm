@@ -109,6 +109,16 @@ impl Budget {
         ))
     }
 
+    /// Collect a command within this take's remaining budget.
+    #[cfg(any(test, not(target_os = "macos")))]
+    pub(super) fn output(
+        &self,
+        command: spawnfd::Command,
+        gate: &'static aterm_uds::deadline::Gate,
+    ) -> Result<std::process::Output, CouldNotRun> {
+        command_until(command, self.ends, gate)
+    }
+
     /// Poll `probe` until it answers `Some`: for at most [`MUST_HAPPEN`], and never past the budget.
     /// # Errors
     /// [`CouldNotRun`] naming `what` once the minute or the budget is gone.
@@ -137,14 +147,49 @@ impl Budget {
     }
 }
 
-/// Run `program --version` once, unclocked: a fresh binary's first exec waits on the system's code check, which no take's timeline should carry.
-pub fn first_exec(program: &Path) {
-    let _ = spawnfd::command(program)
-        .arg("--version")
-        .stdin(spawnfd::Stdio::null())
-        .stdout(spawnfd::Stdio::null())
-        .stderr(spawnfd::Stdio::null())
-        .status();
+/// Run `program --version` outside the measured timeline, bounded by the hang detector.
+/// Completion is sufficient for warming the system's code check; the measured take judges behavior.
+/// # Errors
+/// The warm-up service is unavailable, or the program cannot start, cannot be waited for,
+/// or does not finish within [`MUST_HAPPEN`].
+pub fn first_exec(program: &Path) -> Result<(), CouldNotRun> {
+    let mut command = spawnfd::command(program);
+    command.arg("--version");
+    first_exec_until(command, Instant::now() + MUST_HAPPEN)
+        .map_err(|error| error.map(|why| format!("first exec of {}: {why}", program.display())))
+}
+
+fn first_exec_until(command: spawnfd::Command, deadline: Instant) -> Result<(), CouldNotRun> {
+    static GATE: aterm_uds::deadline::Gate = aterm_uds::deadline::Gate::new("measure-first-exec");
+    command_until(command, deadline, &GATE).map(|_| ())
+}
+
+/// Bound the caller's wait, including startup and cleanup, by its absolute deadline.
+/// The helper retains ownership if a kernel operation outlives the wait.
+fn command_until(
+    mut command: spawnfd::Command,
+    deadline: Instant,
+    gate: &'static aterm_uds::deadline::Gate,
+) -> Result<std::process::Output, CouldNotRun> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return could_not_run("the command deadline expired");
+    }
+    gate.run(left, left, move || {
+        if Instant::now() >= deadline {
+            return could_not_run("the command deadline expired before startup");
+        }
+        aterm_uds::deadline::output_until(&mut command, deadline)
+            .map_err(|error| CouldNotRun::Refused(error.to_string()))
+    })
+    .map_err(|error| match error {
+        aterm_uds::deadline::Refused::Unanswered => {
+            CouldNotRun::Refused("the command service did not answer".into())
+        }
+        aterm_uds::deadline::Refused::Failed(why) => {
+            CouldNotRun::Refused(format!("command service failed: {why}"))
+        }
+    })?
 }
 
 /// A private `0700` directory under `/tmp` itself, removed on drop unless kept for a
@@ -179,8 +224,10 @@ impl Scratch {
     }
 
     /// Leave the directory behind when this is dropped.
-    pub const fn keep(&mut self) {
-        std::mem::forget(self.dir.take());
+    pub fn keep(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            self.path = dir.keep();
+        }
     }
 }
 
@@ -277,6 +324,30 @@ pub enum Band {
 }
 
 impl Band {
+    /// Read a process's actual Darwin role without changing it; unknown off Darwin or on error.
+    #[must_use]
+    pub fn observed_role(pid: u32) -> (Option<i32>, Option<i32>) {
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: Darwin's errno pointer is this thread's valid TLS cell; getpriority takes no pointers.
+            unsafe {
+                *libc::__error() = 0;
+                let role = libc::getpriority(PRIO_DARWIN_ROLE, pid);
+                let error = *libc::__error();
+                if error == 0 {
+                    (Some(role), None)
+                } else {
+                    (None, Some(error))
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = pid;
+            (None, None)
+        }
+    }
+
     /// Give `pid`, a child of this process, aterm.app's band.
     #[must_use]
     pub fn take(pid: u32) -> Self {
@@ -344,7 +415,21 @@ impl Instance {
     /// # Errors
     /// The launch failed, the instance exited before it listened (its log tail is in the reason), or it never listened.
     pub fn launch(bin: &Path, world: &World, budget: Budget) -> Result<Self, CouldNotRun> {
-        Self::start(bin, world, budget, Face::Headless)
+        Self::start(bin, world, budget, Face::Headless, false)
+    }
+
+    /// Canonical headless launch with an explicitly requested read-only recording diagnostic.
+    /// This alone adds the cost flag after the ordinary cleared environment; normal launches
+    /// never forward a parent's cost flag.
+    /// # Errors
+    /// As [`Self::launch`].
+    pub fn launch_recording_cost_diagnostic(
+        bin: &Path,
+        world: &World,
+        budget: Budget,
+        cost_probe: bool,
+    ) -> Result<Self, CouldNotRun> {
+        Self::start(bin, world, budget, Face::Headless, cost_probe)
     }
 
     /// [`Instance::launch`] with a window: AppKit's loop and its proxies, which `--headless`
@@ -356,10 +441,16 @@ impl Instance {
     /// # Errors
     /// As [`Instance::launch`].
     pub fn launch_windowed(bin: &Path, world: &World, budget: Budget) -> Result<Self, CouldNotRun> {
-        Self::start(bin, world, budget, Face::Windowed)
+        Self::start(bin, world, budget, Face::Windowed, false)
     }
 
-    fn start(bin: &Path, world: &World, budget: Budget, face: Face) -> Result<Self, CouldNotRun> {
+    fn start(
+        bin: &Path,
+        world: &World,
+        budget: Budget,
+        face: Face,
+        cost_probe: bool,
+    ) -> Result<Self, CouldNotRun> {
         let log = std::fs::File::create(&world.log).map_err(|e| {
             CouldNotRun::Refused(format!("cannot create {}: {e}", world.log.display()))
         })?;
@@ -372,6 +463,9 @@ impl Instance {
             .current_dir(&world.home)
             .stdout(log)
             .stderr(err);
+        if cost_probe {
+            cmd.env("ATERM_TRACE_RECORDING_COST", "1");
+        }
         let lifeline = match face {
             Face::Headless => {
                 let (lifeline, far) =
@@ -407,11 +501,12 @@ impl Instance {
             band,
         };
         let sock = world.sock.clone();
+        let connect_deadline = (Instant::now() + MUST_HAPPEN).min(budget.ends);
         budget.await_event("the control socket listening", || {
             if let Ok(Some(status)) = inst.child.try_wait() {
                 return Some(Err(status));
             }
-            std::os::unix::net::UnixStream::connect(&sock)
+            aterm_uds::connect::until(&sock, connect_deadline)
                 .is_ok()
                 .then_some(Ok(()))
         })?
@@ -431,12 +526,41 @@ impl Instance {
         self.child.id()
     }
 
-    /// The last lines of the instance log, for a reason.
+    /// The last 30 lines from at most 64 KiB of the instance log, for a reason.
     #[must_use]
     pub fn log_tail(&self) -> String {
-        let body = std::fs::read_to_string(&self.log).unwrap_or_default();
-        let lines: Vec<&str> = body.lines().collect();
-        lines[lines.len().saturating_sub(30)..].join("\n")
+        read_log_tail(&self.log)
+    }
+}
+
+/// Raw bytes retained for a failed instance's diagnostic, even when one line is enormous.
+const LOG_TAIL_BYTES: u64 = 64 * 1024;
+
+/// Read a bounded suffix; a malformed byte must not erase the failure's entire diagnostic.
+fn read_log_tail(path: &Path) -> String {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let read = || -> std::io::Result<(Vec<u8>, bool)> {
+        let mut file = crate::measure::open_regular_file(path)?;
+        let len = file.metadata()?.len();
+        let start = len.saturating_sub(LOG_TAIL_BYTES);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.take(LOG_TAIL_BYTES).read_to_end(&mut bytes)?;
+        Ok((bytes, start != 0))
+    };
+    let (bytes, truncated) = match read() {
+        Ok(read) => read,
+        Err(error) => return format!("[cannot read instance log: {error}]"),
+    };
+    let body = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<&str> = body.lines().rev().take(30).collect();
+    lines.reverse();
+    let tail = lines.join("\n");
+    if truncated {
+        format!("[instance log truncated to its last {LOG_TAIL_BYTES} bytes]\n{tail}")
+    } else {
+        tail
     }
 }
 
@@ -449,19 +573,31 @@ impl Drop for Instance {
 /// How long a helper an instance left has after its `SIGTERM` before its `SIGKILL`.
 const HELPER_GRACE: Duration = Duration::from_secs(2);
 
-/// Kill and reap `child`, an instance this process launched, then end the children it had in this
-/// process's group. Once launchd adopts them they outlive it: a window's consent sentinel
+/// Kill and attempt to reap `child`, an instance this process launched, then end its helpers in
+/// this process's group. Once launchd adopts them they outlive it: a window's consent sentinel
 /// (`log stream … --timeout 15m`) would run for a quarter of an hour, and the stage's group sweep
-/// names it. Each child is listed with its identity while the instance lives, and ended once the
-/// instance is reaped through [`aterm_uds::process::end_proven`], which re-reads the identity
+/// names it. Each helper is listed with its identity while the instance's pid is pinned. After
+/// the kill-and-reap attempt, helpers are ended through [`aterm_uds::process::end_proven`], which re-reads the identity
 /// before each signal and signals only a process still in this group, so a pid reused meanwhile is
 /// never signalled. A child that set up a group of its own (a session's shell) is not this
 /// process's to end. One the instance starts between the listing and its kill is not listed; the
-/// stage's sweep names it.
+/// stage's sweep names it. A child already reaped has released its pid, so no helper listing is
+/// attempted for it. A child still held by the kernel after the hang detector is left to its
+/// handle's reaper on drop.
 fn end_with_helpers(child: &mut spawnfd::Child) {
-    let helpers = children_of(child.id());
-    let _ = child.kill();
-    let _ = child.wait();
+    end_with_helpers_using(child, children_of);
+}
+
+/// The helper lister is injected so a released pid can be tested without forcing pid reuse.
+fn end_with_helpers_using(
+    child: &mut spawnfd::Child,
+    list: impl FnOnce(u32) -> Vec<aterm_uds::process::Identity>,
+) {
+    let helpers = match child.try_wait() {
+        Ok(None) => list(child.id()),
+        Ok(Some(_)) | Err(_) => Vec::new(),
+    };
+    aterm_uds::deadline::kill_within(child, MUST_HAPPEN);
     for helper in helpers {
         let _ = aterm_uds::process::end_proven(
             helper,
@@ -546,7 +682,12 @@ pub struct Ctl {
 }
 
 impl Ctl {
-    /// Run `bin ctl --sock <sock> --timeout <secs> <args…>` and collect it.
+    /// This client's take-wide deadline.
+    pub(super) fn budget(&self) -> Budget {
+        self.budget
+    }
+
+    /// Run `bin ctl --sock <sock> --timeout <secs> <args…>` and collect it within the take's budget.
     #[must_use]
     pub fn call(&self, args: &[&str]) -> Reply {
         let Some(left) = self.budget.left() else {
@@ -560,7 +701,8 @@ impl Ctl {
             };
         };
         let timeout = left.as_secs().saturating_add(1).min(CTL_TIMEOUT_SECS);
-        let out = spawnfd::command(&self.bin)
+        let mut command = spawnfd::command(&self.bin);
+        command
             .env_clear()
             .env("HOME", &self.home)
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
@@ -570,8 +712,9 @@ impl Ctl {
             .arg("--timeout")
             .arg(timeout.to_string())
             .args(args)
-            .stdin(spawnfd::Stdio::null())
-            .output();
+            .stdin(spawnfd::Stdio::null());
+        static GATE: aterm_uds::deadline::Gate = aterm_uds::deadline::Gate::new("measure-ctl");
+        let out = command_until(command, self.budget.ends, &GATE);
         match out {
             Ok(out) => Reply {
                 code: out.status.code(),
@@ -668,6 +811,88 @@ pub fn uint_field(line: &str, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reaped_instance_never_lists_helpers_under_its_released_pid() {
+        let program = aterm_uds::deadline::stand_in(Path::new("/usr/bin/true"));
+        let mut child = spawnfd::command(program)
+            .spawn()
+            .expect("start the stand-in");
+        aterm_uds::deadline::kill_within(&mut child, MUST_HAPPEN);
+        assert!(child.try_wait().expect("the exit status").is_some());
+        end_with_helpers_using(&mut child, |_| panic!("the pid no longer proves ownership"));
+    }
+
+    #[test]
+    fn a_log_tail_keeps_recent_lines_and_malformed_bytes() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let path = dir.path().join("instance.log");
+        let mut bytes = (0..40)
+            .map(|n| format!("line {n}\n"))
+            .collect::<String>()
+            .into_bytes();
+        bytes.extend_from_slice(b"failure: \xff\n");
+        std::fs::write(&path, bytes).expect("write log");
+        let tail = read_log_tail(&path);
+        assert_eq!(tail.lines().count(), 30);
+        assert!(tail.starts_with("line 11\n"), "{tail}");
+        assert!(tail.ends_with("failure: \u{fffd}"), "{tail}");
+    }
+
+    #[test]
+    fn a_log_tail_bounds_a_single_oversized_line() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let path = dir.path().join("instance.log");
+        let mut bytes = vec![b'x'; 128 * 1024];
+        bytes.extend_from_slice(b"failure at the end");
+        std::fs::write(&path, bytes).expect("write log");
+        let tail = read_log_tail(&path);
+        assert!(tail.ends_with("failure at the end"));
+        assert!(
+            tail.len() < 65 * 1024,
+            "a long line must not escape the bound"
+        );
+    }
+
+    #[test]
+    fn an_overdue_command_service_refuses_new_work() {
+        static GATE: aterm_uds::deadline::Gate =
+            aterm_uds::deadline::Gate::new("measure-command-overdue-test");
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let pending = GATE
+            .start(Duration::ZERO, move || held.recv())
+            .expect("start a held operation");
+        let program = aterm_uds::deadline::stand_in(Path::new("/usr/bin/true"));
+        let result = command_until(
+            spawnfd::command(program),
+            Instant::now() + MUST_HAPPEN,
+            &GATE,
+        );
+        drop(release);
+        assert!(pending.wait(MUST_HAPPEN).is_ok(), "release the helper");
+        assert!(matches!(result, Err(CouldNotRun::Refused(_))), "{result:?}");
+    }
+
+    #[test]
+    fn first_exec_rejects_an_expired_warmup_deadline() {
+        let program = aterm_uds::deadline::stand_in(Path::new("/bin/echo"));
+        let command = spawnfd::command(program);
+        assert!(matches!(
+            first_exec_until(command, Instant::now()),
+            Err(CouldNotRun::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn first_exec_accepts_completion_and_reports_a_missing_program() {
+        let program = aterm_uds::deadline::stand_in(Path::new("/usr/bin/false"));
+        assert!(first_exec(&program).is_ok(), "warm-up accepts completion");
+        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        assert!(matches!(
+            first_exec(&scratch.path().join("missing")),
+            Err(CouldNotRun::Refused(_))
+        ));
+    }
 
     #[test]
     fn a_spent_budget_gives_up_at_once_but_still_asks_the_probe_once() {

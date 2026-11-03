@@ -1322,6 +1322,44 @@ fn scratch(name: &str) -> ScratchDir {
     ScratchDir::new("upgrade", name)
 }
 
+/// The models report's settings read never waits on or swallows whatever stands at
+/// `.claude/settings.json`: an ordinary file parses; an oversized file and a fifo read
+/// as no settings (the fifo is the control — an unbounded read would not return).
+#[test]
+fn the_models_reports_settings_read_is_bounded() {
+    let dir = scratch("models-report-settings");
+    let home = dir.join("home");
+    let claude = home.join(".claude");
+    std::fs::create_dir_all(&claude).expect("the config dir");
+    assert_eq!(
+        user_settings(&home),
+        models::UserModelSettings::default(),
+        "absent"
+    );
+    std::fs::write(claude.join("settings.json"), r#"{"model":"opus"}"#).expect("settings");
+    assert_eq!(user_settings(&home).default.as_deref(), Some("opus"));
+    std::fs::write(claude.join("settings.json"), "x".repeat(1024 * 1024 + 1)).expect("oversized");
+    assert_eq!(
+        user_settings(&home),
+        models::UserModelSettings::default(),
+        "oversized"
+    );
+    #[cfg(unix)]
+    {
+        let fifo = claude.join("settings.json");
+        std::fs::remove_file(&fifo).expect("clear the file");
+        let name = std::ffi::CString::new(fifo.to_str().expect("a name")).expect("nul-free");
+        // SAFETY: a live NUL-terminated scratch path; mkfifo retains no pointer.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            user_settings(&home),
+            models::UserModelSettings::default(),
+            "a fifo is not waited on"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The home's model caches are not read while two or more accounts are listed
 /// ([`Opts::several_logins`]).
 #[test]
@@ -1839,6 +1877,10 @@ fn a_drain_a_person_holds_past_its_bound_voids_the_answer_and_asks_again() {
 /// The tab every stand-in agent names: no instance has it, and every test here
 /// points its sweep at a socket that does not exist, so nothing can be typed.
 const TAB: &str = "s-feedfacefeedfacefeed";
+/// No process has this pid: a relaunch line's shell that the bash probe
+/// (`caller_shell::process_args`) cannot read, so the line is typed as a fenced turn whatever
+/// runs on the host. A small made-up pid can name a live bash there.
+const NO_PID: u32 = 0x7fff_fff0;
 
 /// A conversation id the stand-in agents hold.
 const SESSION: &str = "0badf00d-1111-2222-3333-444455556666";
@@ -7903,7 +7945,7 @@ fn a_step_names_the_turn_it_typed() {
     }
     assert_eq!(
         host_turn("continued:restore"),
-        Some(HostTurn::Notice),
+        Some(HostTurn::Restore),
         "the restore line"
     );
     assert!(upgrade::restore_prompt(None, true).contains("Nothing else is asked"));
@@ -9670,6 +9712,44 @@ fn a_crash_read_at_its_exit_is_relaunched_whatever_removes_its_record_later() {
         },
     );
     assert_eq!(a.attempt(&ExitRecord::Unread), "would-relaunch");
+}
+
+/// An exit an Autopilot carries ([`super::super::relaunch::Carried::Yes`]) comes back on its own
+/// conversation though it removed its record, as Claude Code's own end on a `SIGTERM` nobody in
+/// aterm sent does; one that cannot is a refusal the owner hears, never a launch's own end.
+#[test]
+fn an_exit_an_autopilot_carries_comes_back_whatever_it_left_of_its_record() {
+    use super::super::relaunch::{Outcome, after_carried_exit, outcome};
+    let a = DeadAgent::new("carried-exit");
+    assert_eq!(
+        a.attempt(&ExitRecord::Removed),
+        "ended:graceful-exit",
+        "the control: an exit someone may own is left as its own end"
+    );
+    for left in [ExitRecord::Removed, ExitRecord::Unread] {
+        let r = after_carried_exit(&a.opts, &a.snap, &left, true);
+        assert_eq!(
+            (r.step.as_str(), r.session.as_str()),
+            ("would-relaunch", SESSION),
+            "{left:?}: on its own conversation"
+        );
+    }
+    let nameless = Snapshot {
+        session: None,
+        ..a.snap.clone()
+    };
+    assert_eq!(
+        after_exit(&a.opts, &nameless, &ExitRecord::Removed, true, None).step,
+        "ended:no-conversation",
+        "the control: said to nobody"
+    );
+    let step = after_carried_exit(&a.opts, &nameless, &ExitRecord::Removed, true).step;
+    assert_eq!(step, "refused:no-conversation");
+    assert_eq!(
+        outcome(&step),
+        Outcome::Cannot("no-conversation".to_string()),
+        "the owner hears it"
+    );
 }
 
 /// An exit the harness's own restart made (a graceful end, its record removed) is never read as
@@ -16634,11 +16714,11 @@ impl Drop for TtyChild {
     }
 }
 
-/// What is left of a test's pty slave, said where a program on it failed to start or ended
-/// early. XNU can remove a new pty's node (`/dev/ttys…`) under it while another process's pty
-/// that held the same minor finishes tearing down; from then on the slave is dead (`fstat`
-/// fails, `TIOCSCTTY` says ENOENT, a write fails) though its master stays open. Measured under
-/// heavy pty churn, several test suites at once (ATERM-KI-1028-4): no test can retry it.
+/// What is left of a test's pty slave, said where a program on it ended early after `exec`.
+/// XNU can remove a new pty's node (`/dev/ttys…`) under it while another process's pty that
+/// held the same minor finishes tearing down; pre-`exec` deaths are guarded and replaced once
+/// by [`aterm_pty::spawn_session_leader_on_pty`], while post-`exec` deaths leave the slave dead
+/// (`fstat` fails, writes fail) though its master stays open (`ATERM-KI-1028-4`).
 #[cfg(unix)]
 fn slave_left(slave: &std::os::fd::OwnedFd) -> String {
     match slave
@@ -16655,40 +16735,25 @@ fn slave_left(slave: &std::os::fd::OwnedFd) -> String {
 /// relaunch waits to hold its terminal again.
 #[cfg(unix)]
 fn tty_zsh() -> TtyChild {
-    use aterm_uds::spawnfd::InheritNothing as _;
-    use std::os::fd::{FromRawFd as _, OwnedFd};
-    use std::os::unix::process::CommandExt as _;
-    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-    // SAFETY: both descriptors were just opened above and are owned exclusively here.
-    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-    let tty = |fd: &OwnedFd| std::process::Stdio::from(fd.try_clone().expect("dup"));
     let image = zsh_image();
     let exe = image.path().join("zsh");
     let proof = image.path().join("ran");
     let sleeper = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
-    let mut zsh = std::process::Command::new(&exe);
-    zsh.inherit_nothing()
-        .args(["-f", "-c", "printf 'ran\\n' > \"$1\"; \"$2\" 60; :", "zsh"])
-        .arg(&proof)
-        .arg(sleeper)
-        .stdin(tty(&slave))
-        .stdout(tty(&slave))
-        .stderr(tty(&slave));
-    // SAFETY: calls only async-signal-safe `setsid`/`ioctl` between fork and exec.
-    unsafe {
-        zsh.pre_exec(|| {
-            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let child = zsh.spawn().unwrap_or_else(|err| {
+    let (master, slave, child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
+        let tty = || slave.try_clone().map(std::process::Stdio::from);
+        let mut zsh = std::process::Command::new(&exe);
+        zsh.args(["-f", "-c", "printf 'ran\\n' > \"$1\"; \"$2\" 60; :", "zsh"])
+            .arg(&proof)
+            .arg(&sleeper)
+            .stdout(tty()?)
+            .stderr(tty()?);
+        Ok(zsh)
+    })
+    .unwrap_or_else(|err| {
         panic!(
-            "zsh spawn failed: {err:?}; exe={} ({:?}); {}",
+            "zsh spawn failed: {err:?}; exe={} ({:?})",
             exe.display(),
             std::fs::symlink_metadata(&exe).map(|m| (m.file_type(), m.len())),
-            slave_left(&slave),
         )
     });
     drop(slave);
@@ -16733,10 +16798,7 @@ const PTY_HOST_ENV: &str = "UPGRADE_DRIVE_TEST_PTY_HOST";
 #[cfg(unix)]
 #[test]
 fn host_a_pty_when_asked() {
-    use aterm_uds::spawnfd::InheritNothing as _;
-    use std::os::fd::{FromRawFd as _, OwnedFd};
     use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::process::CommandExt as _;
     let Some(argv) = std::env::var_os(PTY_HOST_ENV) else {
         return;
     };
@@ -16746,32 +16808,19 @@ fn host_a_pty_when_asked() {
         .map(std::ffi::OsStr::from_bytes)
         .collect();
     let (program, args) = words.split_first().expect("a program to host");
-    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-    // SAFETY: both descriptors were just opened above and are owned exclusively here.
-    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-    let tty = |fd: &OwnedFd| std::process::Stdio::from(fd.try_clone().expect("dup"));
-    let mut hosted = std::process::Command::new(program);
-    hosted
-        .inherit_nothing()
-        .args(args)
-        .env_remove(PTY_HOST_ENV)
-        .stdin(tty(&slave))
-        .stdout(tty(&slave))
-        .stderr(tty(&slave));
-    // SAFETY: calls only async-signal-safe `setsid`/`ioctl` between fork and exec.
-    unsafe {
-        hosted.pre_exec(|| {
-            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
     // SAFETY: getppid takes nothing and cannot fail.
     let parent = unsafe { libc::getppid() };
-    let mut child = hosted
-        .spawn()
-        .unwrap_or_else(|e| panic!("the hosted program: {e}; {}", slave_left(&slave)));
+    let (master, slave, mut child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
+        let tty = || slave.try_clone().map(std::process::Stdio::from);
+        let mut hosted = std::process::Command::new(program);
+        hosted
+            .args(args)
+            .env_remove(PTY_HOST_ENV)
+            .stdout(tty()?)
+            .stderr(tty()?);
+        Ok(hosted)
+    })
+    .unwrap_or_else(|e| panic!("the hosted program: {e}"));
     let mut master = std::fs::File::from(master);
     // What the hosted program (or a shell's job) writes on the pty, written again to this
     // host's stderr: the log a test reads once the host has ended ([`host_lives`]).
@@ -16879,44 +16928,29 @@ fn ps_name(pid: u32) -> Option<String> {
 /// fgpgid=<pid>`) claims it ([`host_candidates`]).
 #[cfg(unix)]
 fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> TtyChild {
-    use aterm_uds::spawnfd::InheritNothing as _;
-    use std::os::fd::{FromRawFd as _, OwnedFd};
-    use std::os::unix::process::CommandExt as _;
-    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-    // SAFETY: both descriptors were just opened above and are owned exclusively here.
-    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-    let tty = |fd: &OwnedFd| std::process::Stdio::from(fd.try_clone().expect("dup"));
     let me = std::env::current_exe().expect("exe");
-    let mut agent = std::process::Command::new(&me);
-    agent
-        .inherit_nothing()
-        .args(PARK)
-        .env(PARK_ENV, "1")
-        .env("ATERM_PARENT_SESSION_ID", TAB)
-        .env_remove(crate::harness::accounts::LOGIN_ENV)
-        .env_remove(crate::harness::accounts::HOME_ENV)
-        .env_remove("HOME")
-        .stdin(tty(&slave))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    for (key, value) in env {
-        agent.env(key, value);
-    }
-    if let Some(cwd) = cwd {
-        agent.current_dir(cwd);
-    }
-    // SAFETY: calls only async-signal-safe `setsid`/`ioctl` between fork and exec.
-    unsafe {
-        agent.pre_exec(|| {
-            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let child = agent.spawn().unwrap_or_else(|err| {
+    let (master, slave, child) = aterm_pty::spawn_session_leader_on_pty(|_slave| {
+        let mut agent = std::process::Command::new(&me);
+        agent
+            .args(PARK)
+            .env(PARK_ENV, "1")
+            .env("ATERM_PARENT_SESSION_ID", TAB)
+            .env_remove(crate::harness::accounts::LOGIN_ENV)
+            .env_remove(crate::harness::accounts::HOME_ENV)
+            .env_remove("HOME")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        for (key, value) in env {
+            agent.env(key, value);
+        }
+        if let Some(cwd) = cwd {
+            agent.current_dir(cwd);
+        }
+        Ok(agent)
+    })
+    .unwrap_or_else(|err| {
         panic!(
-            "agent spawn failed: {err:?}; exe={} ({:?}); cwd={:?}; process_cwd={:?}; {}",
+            "agent spawn failed: {err:?}; exe={} ({:?}); cwd={:?}; process_cwd={:?}",
             me.display(),
             std::fs::symlink_metadata(&me).map(|m| (m.file_type(), m.len())),
             cwd.map(|p| (
@@ -16927,7 +16961,6 @@ fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> TtyChild {
                 p.display().to_string(),
                 std::fs::symlink_metadata(&p).map(|m| m.file_type()),
             )),
-            slave_left(&slave),
         )
     });
     drop(slave);
@@ -17094,7 +17127,7 @@ fn only_the_agents_own_words_are_pressed_where_the_host_takes_cap() {
     let got = type_relaunch_line_with(
         &opts,
         &mut c,
-        4242,
+        NO_PID,
         TAB,
         line,
         None,
@@ -18511,7 +18544,7 @@ fn the_relaunch_line_carries_a_rekey_and_never_waits_on_one() {
         let got = type_relaunch_line_with(
             &opts,
             &mut c,
-            4242,
+            NO_PID,
             TAB,
             line,
             dialect,
@@ -18537,7 +18570,10 @@ fn the_relaunch_line_carries_a_rekey_and_never_waits_on_one() {
 
     let (got, asked) = run("rekey-issued", ISSUED, SETTLED, Some(Dialect::Zsh), line);
     assert_eq!(got, Ok(()));
-    assert_eq!(of(&asked, " rekey "), [format!("@{TAB} rekey shell=4242")]);
+    assert_eq!(
+        of(&asked, " rekey "),
+        [format!("@{TAB} rekey shell={NO_PID}")]
+    );
     let typed = of(&asked, " turn ");
     assert_eq!(typed.len(), 1, "{typed:#?}");
     assert!(typed[0].ends_with(&healed), "{typed:#?}");

@@ -31,12 +31,12 @@ pub use initial::{
     initial_setup_keeps_vault_sync, initial_setup_observation, initial_setup_owes_secrets_stage,
     initial_setup_park_mark, initial_setup_permission_steps, initial_setup_review_revision,
     initial_setup_revision, initial_setup_snapshot, local_network_first_use, local_network_heard,
-    look_for_the_alab_vault, note_setup_interrupted, observe_initial_setup,
-    probe_local_network_again, provisional_setup_widened, provisional_setup_widens,
-    put_back_held_initial_setup, request_initial_setup_stop, restart_initial_setup,
-    restart_initial_setup_observed, retry_parked_setup_stages, run_initial_setup_pass,
-    set_aside_unreadable_setup, set_aside_unreadable_setup_observing, setup_is_newer,
-    setup_ledger_environment, setup_records_held, take_back_setup_interrupted,
+    look_for_the_alab_vault, note_person_asked_for_access, note_setup_interrupted,
+    observe_initial_setup, probe_local_network_again, provisional_setup_widened,
+    provisional_setup_widens, put_back_held_initial_setup, request_initial_setup_stop,
+    restart_initial_setup, restart_initial_setup_observed, retry_parked_setup_stages,
+    run_initial_setup_pass, set_aside_unreadable_setup, set_aside_unreadable_setup_observing,
+    setup_is_newer, setup_ledger_environment, setup_records_held, take_back_setup_interrupted,
     validate_initial_setup_plan, vault_config_unread, with_initial_setup_vault_sync,
 };
 #[cfg(any(test, debug_assertions))]
@@ -948,12 +948,21 @@ fn authorized_selection(root: &Path) -> Result<Option<Selection>, String> {
     authorized_selection_with_flush(root, durable_name)
 }
 
+pub(in crate::macos_doctor) fn read_record_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    aterm_uds::atomic_file::read_regular(path, aterm_uds::atomic_file::MAX_CONFIG_BYTES)
+        .map(|(bytes, _)| bytes)
+}
+
+pub(in crate::macos_doctor) fn read_record_text(path: &Path) -> std::io::Result<String> {
+    aterm_uds::atomic_file::read_regular_text(path, aterm_uds::atomic_file::MAX_CONFIG_BYTES)
+}
+
 fn authorized_selection_with_flush(
     root: &Path,
     flush: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<Option<Selection>, String> {
     let path = root.join("automatic-plan.json");
-    let bytes = match std::fs::read(&path) {
+    let bytes = match read_record_bytes(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("{}: {error}", path.display())),
@@ -1225,7 +1234,7 @@ fn first_run_complete_with_flush(
     flush: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<bool, String> {
     let path = root.join("first-run.json");
-    let bytes = match std::fs::read(&path) {
+    let bytes = match read_record_bytes(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(format!("{}: {e}", path.display())),
@@ -1250,11 +1259,13 @@ fn automatic_retry_due(
     now: std::time::SystemTime,
 ) -> Result<bool, String> {
     let path = root.join("automatic-attempt.json");
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
+    let (bytes, meta) =
+        match aterm_uds::atomic_file::read_regular(&path, aterm_uds::atomic_file::MAX_CONFIG_BYTES)
+        {
+            Ok(pair) => pair,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
     let marker: Value =
         aterm_json::from_slice(&bytes).map_err(|e| format!("automatic attempt: {e}"))?;
     if marker["profile"].as_str() != Some(PROFILE) {
@@ -1264,8 +1275,7 @@ fn automatic_retry_due(
         return Ok(true);
     }
     let age = now.duration_since(
-        std::fs::metadata(&path)
-            .and_then(|m| m.modified())
+        meta.modified()
             .map_err(|e| format!("{}: {e}", path.display()))?,
     );
     Ok(age.map_or(true, |age| age >= std::time::Duration::from_secs(60)))
@@ -1549,7 +1559,7 @@ struct Failed {
 impl Automatic {
     fn load(root: &Path, revision: u64) -> Result<Self, String> {
         let path = root.join(HELD_RECORD);
-        let bytes = match std::fs::read(&path) {
+        let bytes = match read_record_bytes(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(format!("{}: {e}", path.display())),
@@ -2536,7 +2546,7 @@ struct Saved {
 }
 
 fn load_backup(path: &Path) -> Result<Vec<Saved>, String> {
-    let bytes = match std::fs::read(path) {
+    let bytes = match read_record_bytes(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("{}: {e}", path.display())),
@@ -3246,7 +3256,7 @@ fn load_withheld_reading_revision(
     revision: impl FnOnce() -> Result<u64, String>,
 ) -> Result<Withheld, String> {
     let path = root.join(WITHHELD_RECORD);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match read_record_bytes(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Withheld::default()),
         Err(e) => return Err(format!("{}: {e}", path.display())),
@@ -3963,7 +3973,7 @@ fn pending_refresh(root: &Path) -> Result<Vec<Target>, String> {
 /// The keys a record of `name` lists, `what` naming it in an error; none when it is absent.
 fn targets_record(root: &Path, name: &str, what: &str) -> Result<Vec<Target>, String> {
     let path = root.join(name);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match read_record_bytes(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("{}: {e}", path.display())),

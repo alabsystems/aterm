@@ -89,6 +89,8 @@ impl Origins {
 /// A request's body.
 #[derive(Clone, Copy)]
 pub enum Body<'a> {
+    /// No request body, as required by read-only GET endpoints.
+    Empty,
     /// JSON, from a file in the client's private scratch directory.
     Json(&'a Value),
     /// Bytes to upload, from a file in the scratch directory.
@@ -325,6 +327,7 @@ impl Client {
                 .ok_or_else(|| Unanswered::Unsent(format!("{} is not UTF-8", path.display())))
         };
         let timed = match body {
+            Body::Empty => true,
             Body::Json(json) => {
                 let bytes = aterm_json::to_vec(json)
                     .map_err(|e| Unanswered::Unsent(format!("cannot write the request: {e}")))?;

@@ -507,6 +507,19 @@ fn each_rule_switched_off_is_caught() {
             36,
         ),
         (
+            "a session's exit moves the roster's count",
+            Box::new(|s| {
+                let mut o = Opts::seed(s);
+                o.ep = EpRules {
+                    exit_moves_roster: false,
+                    ..EpRules::default()
+                };
+                o
+            }),
+            "routing:",
+            12,
+        ),
+        (
             "a ghost row is swept",
             Box::new(|s| Opts::seed(s).with(Mutant::NoGhostSweep)),
             "presence:",
@@ -570,7 +583,7 @@ fn each_rule_switched_off_is_caught() {
             "an attach delivers on a new log only once its witness is written",
             Box::new(|s| both_ways(s).with(Mutant::AttachPastAnUnwrittenWitness)),
             "dup delivery",
-            1324,
+            5085,
         ),
         (
             "a run whose recovery is owed makes no clean stop",
@@ -1084,6 +1097,14 @@ const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[
     // still); the first seed of this world that reaches it with its rule off.
     (
         735,
+        400,
+        "a move an `auto` mirror met before its hello left its pinned batch to recover",
+    ),
+    // Critic item C13's mirror burst, which carries the inbox commit a round holds or would
+    // hold, moved 6751's, 7755's and 735's trajectories off this bug; the first seed of a
+    // search to 60,000 that reaches it with its rule off.
+    (
+        2270,
         400,
         "a move an `auto` mirror met before its hello left its pinned batch to recover",
     ),
@@ -3569,6 +3590,31 @@ fn the_round_refines_its_exactly_once_model() {
     }
 }
 
+/// An aterm that names no roster count (`EpRules::names_roster`, an older build) is read before
+/// every drain as it always was, and every law holds against it.
+#[test]
+fn an_aterm_that_names_no_roster_count_holds_every_law() {
+    let older = |s| {
+        let mut o = Opts::seed(s);
+        o.ep = EpRules {
+            names_roster: false,
+            ..EpRules::default()
+        };
+        o
+    };
+    let broke: Vec<String> = run_all(&older, 1..=SEEDS)
+        .iter()
+        .filter(|out| !out.violations.is_empty())
+        .map(report)
+        .collect();
+    assert!(
+        broke.is_empty(),
+        "{} of {SEEDS} seeds broke a law:\n{}",
+        broke.len(),
+        broke.join("\n")
+    );
+}
+
 /// The sessions the reclaim scenario opens beside aterm's two.
 const RECLAIM_SESSIONS: u64 = 8;
 
@@ -3668,4 +3714,45 @@ fn a_session_revived_between_the_read_and_the_retire_keeps_its_row_and_its_mail(
         "CONTROL RetireUnconditionally: the successor's live row was not given back: {:#?}",
         off.violations
     );
+}
+
+/// **A RESERVATION A POWER CUT LEFT HOLDS NOTHING BACK PAST THE NEXT BOOT** (item C14): a
+/// session's post is pinned and lands, and the power goes before its retire does; the next
+/// boot's first start retires the reservation of that session, which no drain will retire, so
+/// once the reclaim's wait has passed the node has given back both sessions' exited presence
+/// rows and the lanes it wrote to them, that post's lane among them
+/// ([`super::world::run_reclaim_across_a_cut`]); every law of a world holds. NEGATIVE
+/// CONTROL: a sweep that retires no reservation ([`Mutant::KeepEarlierBootReservations`])
+/// keeps every one of them charged.
+#[test]
+fn a_reservation_a_power_cut_left_holds_nothing_back_past_the_next_boot() {
+    let fixed = super::world::run_reclaim_across_a_cut(&Opts::reclaiming(7, Tier::Strict));
+    let control = super::world::run_reclaim_across_a_cut(
+        &Opts::reclaiming(7, Tier::Strict).with(Mutant::KeepEarlierBootReservations),
+    );
+    for (arm, out, held_after) in [("fixed", &fixed, false), ("CONTROL", &control, true)] {
+        assert!(
+            out.violations.is_empty(),
+            "{arm}: {:#?}\n{}",
+            out.violations,
+            out.trace.join("\n")
+        );
+        assert!(
+            out.pinned_at_the_cut,
+            "{arm}: the post was not reserved, on the bus and unretired when the power went:\n{}",
+            out.trace.join("\n")
+        );
+        for (subject, then, now) in &out.subjects {
+            assert!(
+                *then,
+                "{arm}: {subject} was not charged when the power went"
+            );
+            assert_eq!(
+                *now,
+                held_after,
+                "{arm}: {subject} once the next boot's reclaim was due:\n{}",
+                out.trace.join("\n")
+            );
+        }
+    }
 }

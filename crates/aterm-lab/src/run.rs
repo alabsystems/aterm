@@ -75,6 +75,9 @@ pub struct Run {
     pub codex_mode: String,
     /// The aterm under test, resolved once at `up`.
     pub aterm: String,
+    /// The build the private instance runs, as it named it once its socket came up
+    /// ([`crate::lab::start_instance`]): `0.150.0+g859f55cf4a7e`, `?` when it named none.
+    pub aterm_build: String,
     /// The jail's mark ([`crate::procs::jail_members`]).
     pub mark: String,
     /// `LAB_INSTANCE_ENV` as `up` took it (`K=V K=V`, checked by [`crate::lab::instance_env`]).
@@ -155,6 +158,7 @@ impl Run {
             ),
             ("CODEX_MODE", self.codex_mode.clone()),
             ("ATERM", self.aterm.clone()),
+            ("ATERM_BUILD", self.aterm_build.clone()),
             ("LAB_MARK", self.mark.clone()),
             ("INSTANCE_ENV", self.instance_env.clone()),
             ("CLOCK", self.clock.clone()),
@@ -219,6 +223,7 @@ impl Run {
                 "AGENT" => r.agent = v,
                 "CODEX_MODE" => r.codex_mode = v,
                 "ATERM" => r.aterm = v,
+                "ATERM_BUILD" => r.aterm_build = v,
                 "LAB_MARK" => r.mark = v,
                 "INSTANCE_ENV" => r.instance_env = v,
                 "CLOCK" => r.clock = v,
@@ -440,6 +445,7 @@ mod tests {
             agent: "codex".into(),
             codex_mode: "chatgpt".into(),
             aterm: "/Users//o/Developer/aterm/target/debug/aterm".into(),
+            aterm_build: "0.150.0+g859f55cf4a7e-dirty".into(),
             mark: "lab.jail.t1.0123456789abcdef".into(),
             instance_env: "TMPDIR=/tmp ATERM_DEBUG_PASTE_FILE=/s/runs/t1/paste.txt".into(),
             clock: "1".into(),

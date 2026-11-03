@@ -41,6 +41,41 @@ fn independent_demands_keep_every_reason_until_its_last_owner_leaves() {
     assert_eq!(demands.snapshot().counts, [0, 0, 0]);
 }
 
+/// The writer cannot promote itself until it runs. A producer must donate priority while
+/// the writer is still waiting, and retain that donation through overlapping demands.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_demand_donates_priority_before_the_writer_runs_again() {
+    let (ready, started) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    let worker = Arc::new(std::thread::spawn(move || {
+        crate::qos::set_self(Role::Background);
+        ready.send(()).unwrap();
+        held.recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap();
+    }));
+    started
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .unwrap();
+    let demands = Demands::new();
+    let pressure = demands.acquire(Reason::Pressure);
+    assert_eq!(demands.snapshot().priority_override, None);
+    demands.adopt_worker(worker.clone());
+    assert_eq!(demands.snapshot().priority_override, Some(true));
+    let view = demands.acquire(Reason::View);
+    drop(pressure);
+    assert_eq!(demands.snapshot().priority_override, Some(true));
+    drop(view);
+    assert_eq!(demands.snapshot().priority_override, Some(false));
+    let drain = demands.acquire(Reason::Drain);
+    assert_eq!(demands.snapshot().priority_override, Some(true));
+    drop(drain);
+    assert_eq!(demands.snapshot().priority_override, Some(false));
+    drop(demands);
+    release.send(()).unwrap();
+    Arc::try_unwrap(worker).unwrap().join().unwrap();
+}
+
 #[test]
 fn writer_changes_role_only_when_the_combined_demand_changes() {
     let demands = Demands::new();

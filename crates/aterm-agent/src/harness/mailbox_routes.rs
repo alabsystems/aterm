@@ -243,23 +243,44 @@ pub fn resolve<'a>(
     resolve_index(routes, target_email).map(|at| &routes[at])
 }
 
-/// [`resolve`]'s entry, as its index in `routes`.
+/// [`resolve`]'s entry, as its index in `routes`. Where no pattern names the target or its base
+/// address, the addresses the lab registry says it is an alias of
+/// ([`super::alab_roster::mail_targets`], nearest first) are tried for an address or base match
+/// before a `*@domain` or `*` entry: an alias's auth codes arrive where its linked address's do.
 #[must_use]
 pub fn resolve_index(routes: &[MailboxRoute], target_email: Option<&str>) -> Option<usize> {
     let target = target_email
         .map(|t| t.trim().to_ascii_lowercase())
         .filter(|t| !t.is_empty());
+    let best = best_route(routes, target.as_deref());
+    if best.is_some_and(|(tier, _)| tier <= Tier::Base) {
+        return best.map(|(_, at)| at);
+    }
+    let linked = target
+        .as_deref()
+        .map(super::alab_roster::mail_targets)
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|linked| {
+            best_route(routes, Some(&linked.to_ascii_lowercase()))
+                .filter(|(tier, _)| *tier <= Tier::Base)
+        });
+    linked.or(best).map(|(_, at)| at)
+}
+
+/// The closest pattern of `routes` for `target` and its entry's index.
+fn best_route(routes: &[MailboxRoute], target: Option<&str>) -> Option<(Tier, usize)> {
     let mut best: Option<(Tier, usize)> = None;
     for (at, route) in routes.iter().enumerate() {
         for pattern in &route.receives {
-            if let Some(tier) = match_tier(pattern, target.as_deref())
+            if let Some(tier) = match_tier(pattern, target)
                 && best.is_none_or(|(held, _)| tier < held)
             {
                 best = Some((tier, at));
             }
         }
     }
-    best.map(|(_, at)| at)
+    best
 }
 
 /// A mailbox login (or any address) as aterm prints it: at most its first two characters, then

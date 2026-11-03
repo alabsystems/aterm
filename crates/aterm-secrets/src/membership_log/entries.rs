@@ -547,6 +547,11 @@ fn seal_aead(
     Ok((salt, buf))
 }
 
+#[cfg(test)]
+thread_local! {
+    static ENTRY_AEAD_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn open_aead(
     epoch_key: &[u8; 32],
     record: &Record,
@@ -555,6 +560,8 @@ fn open_aead(
     salt: &[u8; 32],
     ciphertext: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>> {
+    #[cfg(test)]
+    ENTRY_AEAD_READS.with(|reads| reads.set(reads.get() + 1));
     let key = derive_entry_key(
         epoch_key,
         salt,
@@ -639,8 +646,233 @@ fn open_wrap(
 
 #[derive(Clone)]
 enum DecodedOp {
-    Put(Entry),
+    Put(EntryMeta),
     Delete,
+}
+
+/// Selection facts for a valid Put. Its value stays in the immutable original record.
+#[derive(Clone)]
+struct EntryMeta {
+    index: usize,
+    name: String,
+    if_absent: bool,
+    anchor: Option<String>,
+    value_class: usize,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct ValueDigest([u8; 32]);
+
+impl Drop for ValueDigest {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+#[derive(Default)]
+struct ValueClasses {
+    representatives: BTreeMap<(usize, ValueDigest), Vec<usize>>,
+}
+
+impl ValueClasses {
+    fn intern(
+        &mut self,
+        opening: &EntryOpening<'_>,
+        index: usize,
+        value: &[u8],
+        digest: fn(&[u8]) -> [u8; 32],
+    ) -> Result<usize> {
+        let bucket = self
+            .representatives
+            .entry((value.len(), ValueDigest(digest(value))))
+            .or_default();
+        for &representative in bucket.iter() {
+            let previous = opening.text_put(representative)?;
+            if aterm_digest::ct_eq(value, previous.value.as_slice()) {
+                return Ok(representative);
+            }
+        }
+        bucket.push(index);
+        Ok(index)
+    }
+}
+
+type EpochKeys = BTreeMap<RecordId, Zeroizing<[u8; 32]>>;
+
+struct EntryOpening<'a> {
+    log: &'a Log,
+    unwrapped: &'a EpochKeys,
+    keyed: &'a EpochKeys,
+    effective: &'a eval::Effective,
+}
+
+impl EntryOpening<'_> {
+    fn text_put(&self, index: usize) -> Result<Entry> {
+        let record = &self.log.order[index];
+        let Body::Put {
+            audience,
+            epoch,
+            salt,
+            ciphertext,
+        } = record.body()
+        else {
+            return Err(Error::new("entry reference is not a Put"));
+        };
+        let Some(text_audience) = audience.as_text_audience() else {
+            return Err(Error::new("entry reference is not a text audience"));
+        };
+        let key = self
+            .log
+            .op_key(index, epoch, self.unwrapped, self.keyed, self.effective)
+            .ok_or_else(|| Error::new("entry reference has no readable epoch"))?;
+        let plain = open_aead(key, record, audience, epoch, salt, ciphertext)?;
+        decode_put_plaintext(&text_audience, &plain)
+    }
+
+    fn commons_put(&self, index: usize) -> Result<SecretBytes> {
+        let record = &self.log.order[index];
+        let Body::Put {
+            audience: audience @ EpochAudience::Commons,
+            epoch,
+            salt,
+            ciphertext,
+        } = record.body()
+        else {
+            return Err(Error::new("entry reference is not a Commons Put"));
+        };
+        let key = self
+            .log
+            .op_key(index, epoch, self.unwrapped, self.keyed, self.effective)
+            .ok_or_else(|| Error::new("entry reference has no readable epoch"))?;
+        let plain = open_aead(key, record, audience, epoch, salt, ciphertext)?;
+        decode_commons_put_plaintext(&plain)
+    }
+}
+
+struct ResolvedEntries {
+    summary: OpenedAudienceEntries,
+    entries: BTreeMap<Audience, BTreeMap<String, EntryMeta>>,
+    commons: Option<usize>,
+}
+
+impl ResolvedEntries {
+    fn into_full(self, log: &Log) -> Result<OpenedAudienceEntries> {
+        let Self {
+            mut summary,
+            entries,
+            commons,
+        } = self;
+        let opening = EntryOpening {
+            log,
+            unwrapped: &summary.unwrapped_keys,
+            keyed: &summary.keyed_keys,
+            effective: log.effective(),
+        };
+        let mut by_audience = BTreeMap::new();
+        for (audience, entries) in entries {
+            let mut values = BTreeMap::new();
+            for (name, entry) in entries {
+                values.insert(name, opening.text_put(entry.index)?);
+            }
+            by_audience.insert(audience, values);
+        }
+        let control = commons
+            .map(|index| opening.commons_put(index))
+            .transpose()?;
+        summary.by_audience = by_audience;
+        summary.commons_control = control;
+        Ok(summary)
+    }
+
+    #[cfg(any(unix, test))]
+    fn into_named(self, log: &Log, names: &[&str]) -> Result<Vec<Entry>> {
+        let Self {
+            summary,
+            entries,
+            commons,
+        } = self;
+        let opening = EntryOpening {
+            log,
+            unwrapped: &summary.unwrapped_keys,
+            keyed: &summary.keyed_keys,
+            effective: log.effective(),
+        };
+        let mut selected = BTreeMap::new();
+        for (name, entry) in merge_visible_entries(entries, &summary.winning_host_audience) {
+            if names.contains(&name.as_str()) {
+                selected.insert(name, opening.text_put(entry.index)?);
+            }
+        }
+        if names.contains(&crate::commons::ENTRY)
+            && let Some(index) = commons
+        {
+            selected.insert(
+                crate::commons::ENTRY.to_owned(),
+                Entry {
+                    name: crate::commons::ENTRY.to_owned(),
+                    value: opening.commons_put(index)?,
+                    audience: Audience::Everyone,
+                    if_absent: false,
+                    anchor: None,
+                },
+            );
+        }
+        Ok(selected.into_values().collect())
+    }
+
+    #[cfg(any(unix, test))]
+    fn into_audience_named(
+        self,
+        log: &Log,
+        audience: &Audience,
+        names: &[&str],
+    ) -> Result<Vec<Entry>> {
+        let Self {
+            summary,
+            mut entries,
+            ..
+        } = self;
+        let opening = EntryOpening {
+            log,
+            unwrapped: &summary.unwrapped_keys,
+            keyed: &summary.keyed_keys,
+            effective: log.effective(),
+        };
+        entries
+            .remove(audience)
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| names.contains(&name.as_str()))
+            .map(|(_, entry)| opening.text_put(entry.index))
+            .collect()
+    }
+}
+
+fn merge_visible_entries<T>(
+    by_audience: BTreeMap<Audience, BTreeMap<String, T>>,
+    winning_host_audience: &BTreeMap<String, Audience>,
+) -> BTreeMap<String, T> {
+    let mut everyone = BTreeMap::new();
+    let mut hosts = BTreeMap::new();
+    for (audience, entries) in by_audience {
+        for (name, entry) in entries {
+            match &audience {
+                Audience::Everyone => {
+                    everyone.insert(name, entry);
+                }
+                Audience::Hosts(_) if winning_host_audience.get(&name) == Some(&audience) => {
+                    hosts.insert(name, entry);
+                }
+                Audience::Hosts(_) => {}
+            }
+        }
+    }
+    everyone.extend(hosts);
+    everyone
+}
+
+fn value_digest(value: &[u8]) -> [u8; 32] {
+    Sha256::digest(value)
 }
 
 struct CandidateOp {
@@ -656,9 +888,7 @@ fn same_op(a: &DecodedOp, b: &DecodedOp) -> bool {
     match (a, b) {
         (DecodedOp::Delete, DecodedOp::Delete) => true,
         (DecodedOp::Put(a), DecodedOp::Put(b)) => {
-            a.if_absent == b.if_absent
-                && a.anchor == b.anchor
-                && aterm_digest::ct_eq(a.value.as_slice(), b.value.as_slice())
+            a.if_absent == b.if_absent && a.anchor == b.anchor && a.value_class == b.value_class
         }
         _ => false,
     }
@@ -672,7 +902,7 @@ fn same_op(a: &DecodedOp, b: &DecodedOp) -> bool {
 /// a set stays or goes whole. A view is `[everyone]`, or `[everyone]` under each host's winning
 /// host-list entries, as [`Log::open_entry_set`] merges them.
 fn drop_dangling_anchors(
-    by_audience: &mut BTreeMap<Audience, BTreeMap<String, Entry>>,
+    by_audience: &mut BTreeMap<Audience, BTreeMap<String, EntryMeta>>,
     winning_host_audience: &mut BTreeMap<String, Audience>,
 ) {
     loop {
@@ -686,7 +916,7 @@ fn drop_dangling_anchors(
             .collect();
         let mut dangling: BTreeSet<(Audience, String)> = BTreeSet::new();
         for host in std::iter::once(None).chain(hosts.iter().map(Some)) {
-            let mut view: BTreeMap<&str, (&Audience, &Entry)> = BTreeMap::new();
+            let mut view: BTreeMap<&str, (&Audience, &EntryMeta)> = BTreeMap::new();
             if let Some((audience, map)) = by_audience.get_key_value(&Audience::Everyone) {
                 for (name, entry) in map {
                     view.insert(name, (audience, entry));
@@ -705,7 +935,9 @@ fn drop_dangling_anchors(
                 }
             }
             for (name, (audience, entry)) in &view {
-                if !text::anchor_received(entry, |anchor| view.get(anchor).map(|(_, e)| *e)) {
+                if !text::anchor_received_fields(&entry.name, entry.anchor.as_deref(), |anchor| {
+                    view.get(anchor).map(|(_, entry)| entry.if_absent)
+                }) {
                     dangling.insert(((*audience).clone(), (*name).to_owned()));
                 }
             }
@@ -822,8 +1054,13 @@ impl<'a> Register<'a> {
 struct CommonsControlOp {
     index: usize,
     record_id: RecordId,
-    epoch: RecordId,
     value: SecretBytes,
+}
+
+struct ControlRef {
+    index: usize,
+    record_id: RecordId,
+    epoch: RecordId,
 }
 
 impl Log {
@@ -1689,7 +1926,8 @@ impl Log {
     }
 
     /// The coverage rule of §3.3.7 alone (keychain "Epochs"): whether the member `my_recipient`,
-    /// among `active_recipients`, holds an [`EpochAudience::Commons`] or `[everyone]` epoch whose
+    /// among `active_recipients`, has a wrap for every newest [`EpochAudience::Commons`] or
+    /// `[everyone]` epoch whose
     /// audience has two or more causally newest epochs (concurrent removals on two sides of a
     /// split) or a newest epoch still wrapped to a Mac this log removed (a quorum `Remove` voided
     /// the remover's rotation, or a removal reached it before its new epoch), so the next writer
@@ -1781,12 +2019,13 @@ impl Log {
                 }
             }
             let removed = self.removed_recipients();
-            let holds_any_commons = commons_epochs.iter().any(|(_, id)| {
-                wrapped
-                    .get(id)
-                    .is_some_and(|set| set.contains(my_recipient))
-            });
-            if holds_any_commons
+            let can_open_all_max_commons = !maximal_commons.is_empty()
+                && maximal_commons.iter().all(|id| {
+                    wrapped
+                        .get(id)
+                        .is_some_and(|set| set.contains(my_recipient))
+                });
+            if can_open_all_max_commons
                 && (maximal_commons.len() > 1
                     || (!removed.is_empty()
                         && maximal_commons.iter().any(|id| {
@@ -1797,17 +2036,11 @@ impl Log {
             {
                 return true;
             }
-            let holds_any_everyone = everyone_epochs.iter().any(|(_, id)| {
-                wrapped
-                    .get(id)
-                    .is_some_and(|set| set.contains(my_recipient))
-            });
             let can_open_all_max_everyone = !maximal_everyone.is_empty()
-                && holds_any_everyone
                 && maximal_everyone.iter().all(|id| {
-                    wrapped.get(id).is_none_or(|set| {
-                        set.contains(my_recipient) || set.is_disjoint(active_recipients)
-                    })
+                    wrapped
+                        .get(id)
+                        .is_some_and(|set| set.contains(my_recipient))
                 });
             if can_open_all_max_everyone
                 && (maximal_everyone.len() > 1
@@ -2180,7 +2413,6 @@ impl Log {
                 candidates.push(CommonsControlOp {
                     index: i,
                     record_id: *record.id(),
-                    epoch: *epoch,
                     value,
                 });
             }
@@ -2206,11 +2438,107 @@ impl Log {
     ///
     /// # Errors
     /// Any addressed [`Body::Wrap`], [`Body::Put`] or [`Body::Delete`] fails authentication or
-    /// validation.
+    /// validation. Values are validated during shared selection and winning values are opened
+    /// again for the result; discarded revisions are not retained as plaintext.
     pub fn open_audience_entries(
         &self,
         identity: &Identity,
     ) -> Result<Option<OpenedAudienceEntries>> {
+        self.resolve_audience_entries(identity, value_digest)?
+            .map(|resolved| resolved.into_full(self))
+            .transpose()
+    }
+
+    /// Open selected winners within one exact text audience after the same complete
+    /// validation and global host/anchor closure as [`Log::open_audience_entries`].
+    /// Unlike [`Log::open_entries`], this neither merges host values over Everyone nor
+    /// requires a current epoch key. An unavailable reader is `None`; a visible resolution
+    /// without requested winners is `Some(empty)`.
+    #[cfg(any(unix, test))]
+    pub(crate) fn open_audience_entries_named(
+        &self,
+        identity: &Identity,
+        audience: &Audience,
+        names: &[&str],
+    ) -> Result<Option<Vec<Entry>>> {
+        self.resolve_audience_entries(identity, value_digest)?
+            .map(|resolved| resolved.into_audience_named(self, audience, names))
+            .transpose()
+    }
+
+    /// Whether a member with no envelope locker can follow this log. Validate all eligible
+    /// payloads without materializing their values; a concurrent epoch's wrap gap is not removal.
+    #[cfg(unix)]
+    pub(crate) fn admits_without_locker(&self, identity: &Identity) -> Result<bool> {
+        let me = identity.recipient();
+        if self.recipient_is_removed(&me)
+            || self.audience_left_out_recipient(&EpochAudience::Everyone, &me)
+        {
+            return Ok(false);
+        }
+        let membership = self.membership();
+        let has_active_seat = membership.members().values().any(|member| {
+            member.binding.recipient() == me && !membership.member_node_removed(member)
+        });
+        let has_unproved_seat = !has_active_seat
+            && membership.unproved().iter().any(|founder| {
+                founder.recipient == me
+                    && !founder.node_key.is_some_and(|node| {
+                        node != [0; 32]
+                            && matches!(membership.node(&node), super::NodeStanding::Removed(_))
+                    })
+            });
+        if !has_active_seat && !has_unproved_seat {
+            return Ok(false);
+        }
+        let Some(resolved) = self.resolve_audience_entries(identity, value_digest)? else {
+            return Ok(false);
+        };
+        if has_active_seat {
+            return Ok(membership.members().iter().any(|(actor, member)| {
+                member.binding.recipient() == me
+                    && !membership.member_node_removed(member)
+                    && !self.left_out(&resolved.summary, &EpochAudience::Everyone, actor)
+            }));
+        }
+        Ok(true)
+    }
+
+    /// Open selected names only after the same complete validation, register selection,
+    /// host precedence and anchor closure as [`Log::open_entries`]. A readable view with
+    /// none of the names is `Some(empty)`; reader or current-key unavailability is `None`.
+    #[cfg(any(unix, test))]
+    pub(crate) fn open_entries_named(
+        &self,
+        identity: &Identity,
+        names: &[&str],
+    ) -> Result<Option<Vec<Entry>>> {
+        self.open_entries_named_with_digest(identity, names, value_digest)
+    }
+
+    #[cfg(any(unix, test))]
+    fn open_entries_named_with_digest(
+        &self,
+        identity: &Identity,
+        names: &[&str],
+        digest: fn(&[u8]) -> [u8; 32],
+    ) -> Result<Option<Vec<Entry>>> {
+        let Some(resolved) = self.resolve_audience_entries(identity, digest)? else {
+            return Ok(None);
+        };
+        if resolved.summary.unwrapped_keys.is_empty()
+            || self.audience_left_out_recipient(&EpochAudience::Everyone, &identity.recipient())
+        {
+            return Ok(None);
+        }
+        Ok(Some(resolved.into_named(self, names)?))
+    }
+
+    fn resolve_audience_entries(
+        &self,
+        identity: &Identity,
+        digest: fn(&[u8]) -> [u8; 32],
+    ) -> Result<Option<ResolvedEntries>> {
         let my_recipient = identity.recipient();
         if self.recipient_is_removed(&my_recipient) {
             return Ok(None);
@@ -2311,7 +2639,14 @@ impl Log {
         }
 
         let mut registers: BTreeMap<(Audience, String), Vec<CandidateOp>> = BTreeMap::new();
-        let mut commons_candidates: Vec<CommonsControlOp> = Vec::new();
+        let mut commons_candidates: Vec<ControlRef> = Vec::new();
+        let mut value_classes = ValueClasses::default();
+        let opening = EntryOpening {
+            log: self,
+            unwrapped: &unwrapped,
+            keyed: &keyed_keys,
+            effective,
+        };
         for (i, record) in self.order.iter().enumerate().skip(1) {
             if !effective.counts(i) {
                 continue;
@@ -2333,6 +2668,15 @@ impl Log {
                     let plain = open_aead(epoch_key, record, audience, epoch, salt, ciphertext)?;
                     if let Some(text_aud) = audience.as_text_audience() {
                         let entry = decode_put_plaintext(&text_aud, &plain)?;
+                        let value_class =
+                            value_classes.intern(&opening, i, entry.value.as_slice(), digest)?;
+                        let entry = EntryMeta {
+                            index: i,
+                            name: entry.name,
+                            if_absent: entry.if_absent,
+                            anchor: entry.anchor,
+                            value_class,
+                        };
                         registers
                             .entry((text_aud, entry.name.clone()))
                             .or_default()
@@ -2343,12 +2687,11 @@ impl Log {
                                 op: DecodedOp::Put(entry),
                             });
                     } else {
-                        let value = decode_commons_put_plaintext(&plain)?;
-                        commons_candidates.push(CommonsControlOp {
+                        let _ = decode_commons_put_plaintext(&plain)?;
+                        commons_candidates.push(ControlRef {
                             index: i,
                             record_id: *record.id(),
                             epoch: *epoch,
-                            value,
                         });
                     }
                 }
@@ -2387,7 +2730,7 @@ impl Log {
         }
 
         let mut conflicts = BTreeSet::new();
-        let mut by_audience: BTreeMap<Audience, BTreeMap<String, Entry>> = BTreeMap::new();
+        let mut by_audience: BTreeMap<Audience, BTreeMap<String, EntryMeta>> = BTreeMap::new();
         let mut winning_epochs: BTreeMap<EpochAudience, BTreeSet<RecordId>> = BTreeMap::new();
         let mut keyed_winning: BTreeMap<EpochAudience, BTreeSet<RecordId>> = BTreeMap::new();
         let mut keyed_deletes: BTreeMap<Audience, BTreeSet<String>> = BTreeMap::new();
@@ -2443,7 +2786,7 @@ impl Log {
 
         let mut commons_control = None;
         if !commons_candidates.is_empty() {
-            let siblings: Vec<&CommonsControlOp> = commons_candidates
+            let siblings: Vec<&ControlRef> = commons_candidates
                 .iter()
                 .filter(|a| {
                     !commons_candidates
@@ -2452,7 +2795,7 @@ impl Log {
                 })
                 .collect();
             if let Some(winner) = siblings.into_iter().min_by_key(|c| c.record_id) {
-                commons_control = Some(winner.value.clone());
+                commons_control = Some(winner.index);
                 let winners = if keyed_keys.contains_key(&winner.epoch) {
                     &mut keyed_winning
                 } else {
@@ -2491,24 +2834,28 @@ impl Log {
                 .is_some_and(|entries| entries.contains_key(name))
         });
 
-        Ok(Some(OpenedAudienceEntries {
-            by_audience,
-            commons_control,
-            winning_host_audience,
-            winning_epochs,
-            keyed_winning,
-            maximal_epochs,
-            max_generation,
-            wrapped_recipients,
-            conflicts,
-            unwrapped_keys: unwrapped,
-            keyed_keys,
-            uncovered_keyed,
-            keyed_deletes,
-            winning_ops,
-            fully_unwrapped_audiences,
-            hidden_epochs,
-            keyless_keyed,
+        Ok(Some(ResolvedEntries {
+            entries: by_audience,
+            commons: commons_control,
+            summary: OpenedAudienceEntries {
+                by_audience: BTreeMap::new(),
+                commons_control: None,
+                winning_host_audience,
+                winning_epochs,
+                keyed_winning,
+                maximal_epochs,
+                max_generation,
+                wrapped_recipients,
+                conflicts,
+                unwrapped_keys: unwrapped,
+                keyed_keys,
+                uncovered_keyed,
+                keyed_deletes,
+                winning_ops,
+                fully_unwrapped_audiences,
+                hidden_epochs,
+                keyless_keyed,
+            },
         }))
     }
 
@@ -2635,23 +2982,7 @@ impl Log {
         {
             return Ok(None);
         }
-        let mut everyone: BTreeMap<String, Entry> = BTreeMap::new();
-        let mut hosts: BTreeMap<String, Entry> = BTreeMap::new();
-        for (audience, map) in opened.by_audience {
-            for (name, entry) in map {
-                match &audience {
-                    Audience::Everyone => {
-                        everyone.insert(name, entry);
-                    }
-                    Audience::Hosts(_) => {
-                        if opened.winning_host_audience.get(&name) == Some(&audience) {
-                            hosts.insert(name, entry);
-                        }
-                    }
-                }
-            }
-        }
-        everyone.extend(hosts);
+        let mut everyone = merge_visible_entries(opened.by_audience, &opened.winning_host_audience);
         if let Some(value) = opened.commons_control {
             everyone.insert(
                 crate::commons::ENTRY.to_owned(),
@@ -2681,6 +3012,10 @@ impl Log {
         Ok(self.open_entry_set(identity)?.map(|opened| opened.entries))
     }
 }
+
+#[cfg(test)]
+#[path = "entries/selective_tests.rs"]
+mod selective_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2858,6 +3193,11 @@ mod tests {
             .expect("sign remove");
         log.insert(rem).expect("insert remove");
         assert_eq!(log.open_entries(&id2).expect("removed m2"), None);
+        assert_eq!(
+            log.open_audience_entries_named(&id2, &Audience::Everyone, &["api-key"])
+                .expect("removed m2 audience"),
+            None
+        );
     }
 
     /// A three-member log (m1 founds, admits m2 and m9) whose `[everyone]` epoch is wrapped to all
@@ -4513,9 +4853,10 @@ mod tests {
 
     /// F21's rule 6 carries a `Delete` only when every live op in its past is a `Delete`: one
     /// that settles a `Put`/`Delete` conflict writes. m1 puts `U=a` while m2 deletes `U`, and m2's
-    /// `Delete` wins that conflict: it is redrafted, a fresh salt each time, until its record id
-    /// sorts below the `Put`'s, so the tie-break goes its way on every run. Once both sides hold
-    /// both, m1 deletes `U` while m2, unaware, puts `U=b`, and every Mac reads that as a conflict.
+    /// `Delete` wins that conflict: the pair is redrafted, fresh salts in both each time, until
+    /// the `Delete`'s record id sorts below the `Put`'s, so the tie-break goes its way on every
+    /// run. Once both sides hold both, m1 deletes `U` while m2, unaware, puts `U=b`, and every Mac
+    /// reads that as a conflict.
     ///
     /// NEGATIVE CONTROL: with `Register::classify` carrying a `Delete` whenever its past's winner
     /// is a `Delete`, this fails "m1's Delete read as a carry on m1".
@@ -4528,21 +4869,24 @@ mod tests {
             .unwrap();
         hold(&mut base, draft, &t.w1, t.inc1);
         let conflict = (Audience::Everyone, "U".to_owned());
-        let mut side_a = base.clone();
-        let draft = side_a
-            .draft_put(&t.m1, 1_550, t.epoch, &t.key, &put("U", b"a"))
-            .unwrap();
-        let put_a = hold(&mut side_a, draft, &t.w1, t.inc1);
-        let delete = (0..64)
+        // One fresh pair in two sorts the `Delete` first, so 64 pairs all miss once in 2^64 runs.
+        // Redrafting the `Delete` alone against one `Put` missed all 64 times one run in 65 on
+        // average: a `Put` whose id falls low in the space has few ids below it.
+        let (mut side_a, delete) = (0..64)
             .find_map(|_| {
+                let mut side_a = base.clone();
+                let draft = side_a
+                    .draft_put(&t.m1, 1_550, t.epoch, &t.key, &put("U", b"a"))
+                    .unwrap();
+                let put_a = hold(&mut side_a, draft, &t.w1, t.inc1);
                 let record = base
                     .draft_delete(&t.m2, 1_600, t.epoch, &t.key, "U")
                     .unwrap()
                     .sign(&t.w2, t.inc2)
                     .unwrap();
-                (*record.id() < put_a).then_some(record)
+                (*record.id() < put_a).then_some((side_a, record))
             })
-            .expect("one of 64 fresh salts sorts m2's Delete below m1's Put");
+            .expect("one of 64 fresh pairs sorts m2's Delete below m1's Put");
         let mut side_b = base.clone();
         side_b.insert(delete).unwrap();
         side_a.merge(&side_b).unwrap();

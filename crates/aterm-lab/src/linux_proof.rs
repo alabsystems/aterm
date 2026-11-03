@@ -913,7 +913,15 @@ impl Gui<'_> {
                 None,
             ),
             (
-                vec!["tee".into(), format!("{d}/cfg/aterm/aterm.toml")],
+                // The GUI refuses a group/world-writable config, and the
+                // guest umask would make `tee` hand it one (mode 664).
+                vec![
+                    "install".into(),
+                    "-m".into(),
+                    "600".into(),
+                    "/dev/stdin".into(),
+                    format!("{d}/cfg/aterm/aterm.toml"),
+                ],
                 Some(config.as_str()),
             ),
             (
@@ -2247,7 +2255,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
         // The GUI rows that follow are timed: they run on the quiet machine, from here to the
         // end of this arch ([`crate::admission`]).
         let quiet = if built {
-            crate::admission::quiet(&format!("{tag} GUI rows"))
+            crate::admission::quiet(&format!("{tag} GUI rows")).map(Some)
         } else {
             Ok(None)
         };

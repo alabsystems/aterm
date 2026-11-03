@@ -96,6 +96,33 @@ pub struct Token {
     pub chunks: Vec<Vec<u8>>,
 }
 
+impl Token {
+    /// Chunk `c` as text, when no chunk of this token holds an escape sequence: a split can leave
+    /// the tail of one (`6s` of `ESC[3;6s`) looking like text, in the chunk after its `ESC`.
+    fn plain_text(&self, c: usize) -> Option<&str> {
+        if self.chunks.iter().any(|chunk| chunk.contains(&0x1b)) {
+            return None;
+        }
+        std::str::from_utf8(self.chunks.get(c)?).ok()
+    }
+}
+
+/// The shrinker's glyph pass cuts text, never the tail of an escape sequence a split left apart.
+#[test]
+fn a_split_escape_sequence_is_not_text() {
+    let token = |chunks: &[&[u8]]| Token {
+        kind: Kind::Plain,
+        chunks: chunks.iter().map(|c| c.to_vec()).collect(),
+    };
+    let split = token(&[b"\x1b[3;", b"6s"]);
+    assert_eq!(split.plain_text(0), None);
+    assert_eq!(split.plain_text(1), None, "the tail has no ESC of its own");
+    // Negative control: text split the same way is text, on both sides of the split.
+    let text = token(&[b"ab", b"6s"]);
+    assert_eq!(text.plain_text(0), Some("ab"));
+    assert_eq!(text.plain_text(1), Some("6s"));
+}
+
 /// One generated program.
 #[derive(Clone, Debug)]
 pub struct Program {
@@ -395,16 +422,136 @@ fn channel(r: &mut Rng) -> u64 {
     }
 }
 
-/// A 24-bit colour SGR for `code` (38 or 48) in one of its spellings: `;2;r;g;b`, or the colon
-/// forms `:2::r:g:b`, `:2:r:g:b` and `:2:cs:r:g:b` with a colour-space id.
+/// A 24-bit colour SGR for `code` (38, 48 or 58) in one of its spellings: `;2;r;g;b`, or a colon
+/// group on the code or on the selector, `:2::r:g:b`, `:2:r:g:b` and `:2:cs:r:g:b` with a
+/// colour-space id, and each of those after `;`; T.416's elements past the blue; a sub-parameter
+/// after the all-semicolon form, which is no code.
 fn rgb(r: &mut Rng, code: u16) -> String {
     let (red, green, blue) = (channel(r), channel(r), channel(r));
-    match r.below(4) {
+    let sep = if r.chance(1, 2) { ':' } else { ';' };
+    match r.below(6) {
         0 => format!("{code};2;{red};{green};{blue}"),
-        1 => format!("{code}:2::{red}:{green}:{blue}"),
-        2 => format!("{code}:2:{red}:{green}:{blue}"),
-        _ => format!("{code}:2:{}:{red}:{green}:{blue}", r.below(3)),
+        1 => format!("{code}{sep}2::{red}:{green}:{blue}"),
+        2 => format!("{code}{sep}2:{red}:{green}:{blue}"),
+        3 => format!("{code}{sep}2:{}:{red}:{green}:{blue}", r.below(3)),
+        4 => format!(
+            "{code}{sep}2:{}:{red}:{green}:{blue}:{}:{}:{}",
+            r.below(3),
+            r.below(10),
+            r.below(10),
+            r.below(10)
+        ),
+        _ => format!("{code};2;{red};{green};{blue}:{}", r.below(10)),
     }
+}
+
+/// An extended colour SGR for `code` in any spelling the oracle compares: direct ([`rgb`]), a
+/// palette index, the CMY and CMYK that consume their values and change nothing, a group too short
+/// for its selector, and a selector nothing knows, each of the last with a colon and without. Every
+/// value is one a misreading runs as a code: nothing but the engines' rule keeps it from showing.
+fn extended(r: &mut Rng, code: u16) -> String {
+    let sep = if r.chance(1, 2) { ':' } else { ';' };
+    let cs = r.below(3);
+    let (a, b, c, d) = (channel(r), channel(r), channel(r), channel(r));
+    let x = r.below(10);
+    match r.below(12) {
+        0..=2 => rgb(r, code),
+        3 => match r.below(3) {
+            0 => format!("{code};5;{a}"),
+            1 => format!("{code}{sep}5:{a}:{x}"),
+            _ => format!("{code};5;{a}:{x}"),
+        },
+        4 => format!("{code}{sep}5:{a}"),
+        5 => match r.below(4) {
+            0 => format!("{code};3;{a};{b};{c}"),
+            1 => format!("{code}{sep}3:{cs}:{a}:{b}:{c}"),
+            2 => format!("{code}{sep}3::{a}:{b}:{c}"),
+            _ => format!("{code};3;{a};{b};{c}:{x}"),
+        },
+        6 => match r.below(4) {
+            0 => format!("{code};4;{a};{b};{c};{d}"),
+            1 => format!("{code}{sep}4:{cs}:{a}:{b}:{c}:{d}"),
+            2 => format!("{code}{sep}4::{a}:{b}:{c}:{d}"),
+            _ => format!("{code};4;{a};{b};{c};{d}:{x}"),
+        },
+        7 => format!("{code}{sep}2:{a}:{b}"),
+        8 => format!("{code}{sep}7:{a}"),
+        9 => format!("{code}{sep}{}", r.pick(&[0, 1, 7])),
+        10 => format!("{code}:{}", r.pick(&[2, 5])),
+        _ => open_ended(r, code),
+    }
+}
+
+/// A colour group a trailing colon leaves open, whose empty last element is an element: it is the
+/// blue of each direct form, and the count sees it.
+fn open_ended(r: &mut Rng, code: u16) -> String {
+    let sep = if r.chance(1, 2) { ':' } else { ';' };
+    let (a, b, c) = (channel(r), channel(r), channel(r));
+    match r.below(8) {
+        0 => format!("{code}{sep}2::{a}:{b}:"),
+        1 => format!("{code}{sep}2:{}:{a}:{b}:", r.below(3)),
+        2 => format!("{code}{sep}2:{a}:{b}:"),
+        3 => format!("{code}{sep}2:{a}:{b}:{c}:"),
+        4..=6 => format!("{code}{sep}5:"),
+        _ => format!("{code}:"),
+    }
+}
+
+/// A colon group on a code that takes none, which each engine ignores with the code, and on 4,
+/// whose first sub-parameter is its style and whose others are nothing.
+fn group_on_a_plain_code(r: &mut Rng) -> String {
+    let x = r.below(10);
+    match r.below(8) {
+        0 => format!("1:{x}"),
+        1 => format!("3:{x}:{}", r.below(10)),
+        2 => format!("0:{x}"),
+        3 => format!("22:{x}"),
+        4 => format!("4:{}:{x}", r.below(6)),
+        5 => r.pick(&["1:", "3:", "0:", "22:"]).to_string(),
+        6 => "4:".to_string(),
+        _ => format!("7;1:{x}"),
+    }
+}
+
+/// A semicolon colour with fewer values than its selector takes, which only the end of a list can
+/// spell: any parameter after it would be taken for the missing value.
+fn cut_short(r: &mut Rng, code: u16) -> String {
+    let (a, b, c) = (channel(r), channel(r), channel(r));
+    match r.below(7) {
+        0 => format!("{code};2;{a};{b}"),
+        1 => format!("{code};2;{a}"),
+        2 => format!("{code};2"),
+        3 => format!("{code};5"),
+        4 => format!("{code};3;{a};{b}"),
+        5 => format!("{code};4;{a};{b};{c}"),
+        _ => code.to_string(),
+    }
+}
+
+/// aterm's `aterm_parser::MAX_PARAMS`. Past it the engines differ by design (the corpus's
+/// `sgr_past_the_parameter_cap`), so no SGR here goes past it, and [`at_the_cap`] ends at it.
+pub const SGR_PARAMS: usize = 24;
+
+/// How many parameters aterm's parser counts in a parameter list.
+pub fn sgr_params(list: &str) -> usize {
+    list.split([';', ':']).count()
+}
+
+/// An SGR that fills the parameter list exactly, ending in a colour: the fold's cap of 128 bytes is
+/// not near (a channel takes at most four digits), and aterm has dropped nothing.
+fn at_the_cap(r: &mut Rng, code: u16) -> String {
+    let (red, green, blue) = (channel(r), channel(r), channel(r));
+    let colour = match r.below(4) {
+        0 => format!("{code}:2:{red}:{green}:{blue}"),
+        1 => format!("{code};2:{}:{red}:{green}:{blue}", r.below(3)),
+        2 => format!("{code};2;{red};{green};{blue}"),
+        _ => format!("{code}:5:{red}"),
+    };
+    let mut parts: Vec<String> = (sgr_params(&colour)..SGR_PARAMS)
+        .map(|_| r.pick(&["1", "4", "7", "22", "24", "27"]).to_string())
+        .collect();
+    parts.push(colour);
+    parts.join(";")
 }
 
 fn sgr(r: &mut Rng, caps: Caps) -> Vec<u8> {
@@ -417,9 +564,21 @@ fn sgr(r: &mut Rng, caps: Caps) -> Vec<u8> {
             csi(";", 'm')
         };
     }
+    let colour_code = |r: &mut Rng| {
+        if caps.bce_on_scroll {
+            r.pick(&[38, 48, 58])
+        } else {
+            r.pick(&[38, 58])
+        }
+    };
+    if caps.truecolour && r.chance(1, 40) {
+        let code = colour_code(r);
+        return csi(&at_the_cap(r, code), 'm');
+    }
     for _ in 0..n {
         let fg_or_attr = |r: &mut Rng| -> String {
-            match r.below(9 + u64::from(caps.sgr_attrs) + u64::from(caps.truecolour)) {
+            let attrs = u64::from(caps.sgr_attrs);
+            match r.below(9 + attrs + 4 * u64::from(caps.truecolour)) {
                 0 => r.pick(&["0", "1", "4", "7", "22", "24", "27"]).to_string(),
                 1 | 2 => (30 + r.below(8)).to_string(),
                 3 => "39".to_string(),
@@ -429,7 +588,11 @@ fn sgr(r: &mut Rng, caps: Caps) -> Vec<u8> {
                 7 => format!("4:{}", r.below(6)),
                 8 => r.pick(&["1", "4", "7"]).to_string(),
                 9 if caps.sgr_attrs => r.pick(MORE_ATTRS).to_string(),
-                _ => rgb(r, 38),
+                n if n == 9 + attrs => group_on_a_plain_code(r),
+                _ => {
+                    let code = if r.chance(1, 2) { 58 } else { 38 };
+                    extended(r, code)
+                }
             }
         };
         let p = if caps.bce_on_scroll && r.chance(1, 3) {
@@ -438,12 +601,21 @@ fn sgr(r: &mut Rng, caps: Caps) -> Vec<u8> {
                 2 => (100 + r.below(8)).to_string(),
                 3 => format!("48;5;{}", r.below(256)),
                 4 => "49".to_string(),
-                _ => rgb(r, 48),
+                _ => extended(r, 48),
             }
         } else {
             fg_or_attr(r)
         };
         parts.push(p);
+    }
+    if caps.truecolour && r.chance(1, 8) {
+        let code = colour_code(r);
+        parts.push(cut_short(r, code));
+    }
+    // A long spelling, or three of them, can overrun the list: drop parts rather than the end of
+    // one, which is what a cap would do and what the corpus excludes.
+    while sgr_params(&parts.join(";")) > SGR_PARAMS {
+        parts.pop();
     }
     csi(&parts.join(";"), 'm')
 }
@@ -494,6 +666,71 @@ struct Gen {
     rows: u16,
     caps: Caps,
     track: Track,
+    /// A token the last one owes: what continues a cluster it left open, fed as its own token so
+    /// the shrinker can drop it and [`MarkReach`] can see it.
+    owed: Option<Vec<u8>>,
+}
+
+/// What can follow a glyph printed up to a left margin without ending its cluster, or end it: a
+/// motion, an edit or a rendition change that the two engines must agree on.
+const BESIDE_A_CLUSTER: &[&[u8]] = &[
+    b"\r",
+    b"\x08",
+    b"\t",
+    b"\x1b[D",
+    b"\x1b[C",
+    b"\x1b[A",
+    b"\x1b[K",
+    b"\x1b[X",
+    b"\x1b[@",
+    b"\x1b[P",
+    b"\x1b[L",
+    b"\x1b[M",
+    b"\x1b[S",
+    b"\x1b[T",
+    b"\x1b[31m",
+    b"\x1b[0m",
+];
+
+/// A DECSLRM past column 0 and a glyph printed up to it from outside, on a screen of `cols >= 4`,
+/// and the token that continues the glyph's cluster, now and then past something beside it.
+fn up_to_a_left_margin(r: &mut Rng, cols: u16, rows: u16, caps: Caps) -> (Vec<u8>, Vec<u8>) {
+    // 1-based, as the sequences spell them: left in 2..cols, right in left+1..=cols.
+    let left = 2 + r.below(u64::from(cols - 2)) as u16;
+    let right = left + 1 + r.below(u64::from(cols - left)) as u16;
+    let mut glyph = String::new();
+    let two_left = r.chance(1, 2) && left >= 3;
+    glyph.push(if two_left {
+        r.pick(&[
+            '\u{2600}',
+            '\u{261d}',
+            '\u{1f600}',
+            '\u{1f44d}',
+            '\u{1f468}',
+            '\u{1f1fa}',
+            '\u{4e2d}',
+        ])
+    } else {
+        r.pick(&['e', 'a', '\u{e9}', '\u{2600}', '\u{261d}', '\u{2713}'])
+    });
+    // A wide glyph two left of the margin lands on it, and so does a narrow one a VS16 widens.
+    let at = if two_left { left - 2 } else { left - 1 };
+    let row = 1 + r.below(u64::from(rows));
+    let mut first = csi(&format!("{left};{right}"), 's');
+    first.extend(csi(&format!("{row};{at}"), 'H'));
+    first.extend(glyph.bytes());
+    let mut next = Vec::new();
+    if r.chance(1, 4) {
+        next.extend_from_slice(r.pick(BESIDE_A_CLUSTER));
+    }
+    let mut cont = String::new();
+    if caps.clusters && r.chance(1, 2) {
+        cont.push(r.pick(CLUSTER_PIECES));
+    } else {
+        push_marks(r, &mut cont);
+    }
+    next.extend(cont.bytes());
+    (first, next)
 }
 
 impl Gen {
@@ -531,6 +768,9 @@ impl Gen {
     }
 
     fn token(&mut self) -> (Kind, Vec<u8>) {
+        if let Some(owed) = self.owed.take() {
+            return (Kind::Plain, owed);
+        }
         let (cols, rows, caps) = (self.cols, self.rows, self.caps);
         let lim = cols.max(rows);
         let r = &mut self.r;
@@ -667,6 +907,11 @@ impl Gen {
             // is on, DECSLRM with valid, empty, inverted and overlong pairs and
             // the bare reset, all as `num` draws them.
             36 | 37 if caps.lr_margins => {
+                if self.track.lrmm && cols >= 4 && caps.combining_marks && r.chance(1, 3) {
+                    let (first, next) = up_to_a_left_margin(r, cols, rows, caps);
+                    self.owed = Some(next);
+                    return (Kind::Margins, first);
+                }
                 return if self.track.lrmm && r.chance(3, 4) {
                     let t = match r.below(4) {
                         0 => csi("", 's'),
@@ -722,6 +967,7 @@ pub fn program(seed: u64, caps: Caps) -> Program {
         rows,
         caps,
         track: Track::default(),
+        owed: None,
     };
     let mut tokens = Vec::with_capacity(n);
     for _ in 0..n {
@@ -782,8 +1028,10 @@ pub struct MarkReach {
     pub at_column_0: u64,
     /// A mark fed at column 0 of a row that continues the one above.
     pub at_wrapped_column_0: u64,
-    /// A mark fed at a left margin past column 0.
+    /// A mark fed at a left margin past column 0 a motion put the cursor on.
     pub at_left_margin: u64,
+    /// A mark fed at a left margin past column 0 a print stepped onto from outside it.
+    pub stepped_onto_margin: u64,
     /// Chunks after which a cell holds as many marks as it can.
     pub at_cap: u64,
     /// Width changes applied with a mark on the screen.
@@ -813,7 +1061,11 @@ impl MarkReach {
                 self.at_column_0 += 1;
             }
         } else if p.at_left_margin {
-            self.at_left_margin += 1;
+            if p.follows_glyph {
+                self.stepped_onto_margin += 1;
+            } else {
+                self.at_left_margin += 1;
+            }
         } else {
             self.left_of_cursor += 1;
         }
@@ -971,10 +1223,7 @@ pub fn shrink(p: &Program, first: &Mismatch, caps: Caps) -> (Program, Mismatch) 
     // the program stays in the subset.
     for i in 0..best.tokens.len() {
         for c in 0..best.tokens[i].chunks.len() {
-            let Some(text) = std::str::from_utf8(&best.tokens[i].chunks[c])
-                .ok()
-                .filter(|t| !t.contains('\x1b'))
-            else {
+            let Some(text) = best.tokens[i].plain_text(c) else {
                 continue;
             };
             let mut glyphs: Vec<char> = text.chars().collect();

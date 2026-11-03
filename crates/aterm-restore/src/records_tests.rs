@@ -110,6 +110,18 @@ fn a_bad_tail_record_is_refused_not_guessed() {
         decode_tail_payload(&header(KIND_BYTES, 0, 0, 2), b"x"),
         Err(TailFault::BadLength)
     );
+    let oversized_len = (MAX_BYTES_PAYLOAD + 1) as u32;
+    assert_eq!(
+        validate_tail_header(&header(KIND_BYTES, 0, 0, oversized_len)),
+        Err(TailFault::BadLength)
+    );
+    assert_eq!(
+        decode_tail_payload(
+            &header(KIND_BYTES, 0, 0, oversized_len),
+            &vec![b'x'; MAX_BYTES_PAYLOAD + 1],
+        ),
+        Err(TailFault::BadLength)
+    );
     assert_eq!(
         decode_tail_payload(&header(KIND_RESIZE, 2, 0, 24), &[0; 24]),
         Err(TailFault::BadFlags),

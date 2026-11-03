@@ -16,6 +16,7 @@ use crate::{
 };
 use astream_wire::sync::Digest;
 use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
+use std::collections::BTreeSet;
 
 pub use crate::documents::log::{Operation, Snapshot};
 use crate::documents::{application, log::Log};
@@ -257,7 +258,7 @@ impl Proposals {
             if let Some(id) = log.revert_retry(session.actor(), request, operation)? {
                 return receipt(session, store, &id);
             }
-            let command = log.compensate(request, operation)?;
+            let command = log.compensate(request, operation, &BTreeSet::new())?;
             application::append(session, store, &encode(&command)?)
         })
     }

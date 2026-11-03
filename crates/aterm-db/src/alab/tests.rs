@@ -6,7 +6,8 @@
 
 use super::{
     registry::{
-        self, ACCOUNT, ADDRESS, COLLECTIONS, MACHINE_FACTS, MAILBOX, MODEL, PHONE, PROVIDER,
+        self, ACCOUNT, ADDRESS, COLLECTIONS, MACHINE, MACHINE_FACTS, MAILBOX, MODEL, PHONE,
+        PROVIDER,
     },
     seeds, *,
 };
@@ -14,7 +15,11 @@ use crate::{
     database::{Change, MAX_WRITES},
     table::{
         Session,
-        tests::{Lab, repair_commons},
+        tests::{
+            Lab,
+            frontier::{receive, wide_lab, wires},
+            repair_commons,
+        },
     },
     typed::{
         Derive, Kind, SCHEMA, Ty,
@@ -23,7 +28,7 @@ use crate::{
         owned::SchemaState,
     },
 };
-use astream_wire::sync::{Digest, Header, Index};
+use astream_wire::sync::{Digest, Header, Index, MAX_PARENTS};
 use aterm_json::{Value, json};
 use aterm_secrets::commons::roster::Role;
 
@@ -100,7 +105,7 @@ fn registry_schemas_keep_secrets_and_addresses_out() {
 }
 
 /// Apply `records` as one writer's chain to `cells`, as the Commons projection does.
-fn apply(records: &[Vec<Change>]) -> Cells {
+pub(super) fn apply(records: &[Vec<Change>]) -> Cells {
     let mut index = Index::new(1024);
     let mut cells = Cells::new();
     let mut previous = None;
@@ -229,15 +234,8 @@ fn seeds_go_only_into_cells_a_complete_scan_found_absent() {
 }
 
 /// This Mac's Commons machine uuid.
-fn machine_of(lab: &Lab, n: usize) -> [u8; 16] {
-    let bootstrap = lab.bootstrap(n);
-    let session = Session::observe(&bootstrap).unwrap();
-    *session
-        .members()
-        .iter()
-        .find(|binding| binding.actor() == session.actor())
-        .unwrap()
-        .machine()
+pub(super) fn machine_of(lab: &Lab, n: usize) -> [u8; 16] {
+    lab.machine(n)
 }
 
 /// A Mac model's birth: one automatic cell.
@@ -254,6 +252,96 @@ fn birth(model: &str) -> Vec<Change> {
         )
         .unwrap(),
     ]
+}
+
+/// One remaining automatic slot cannot hold a causal join and a seed record. Refusal
+/// appends neither; another writer with room still seeds the registry and shares its rows.
+/// NEGATIVE CONTROLS: counting only the seed grows 87 retained records to 89 on refusal;
+/// reserving new joins but ignoring pending ones grows 89 to 90 on the interrupted retry.
+#[test]
+fn seeding_reserves_causal_joins_within_the_remaining_automatic_quota() {
+    let lab = wide_lab(MAX_PARENTS + 1);
+    let first = Registry::at(lab.paths[0].clone());
+    let scope = first.open().unwrap();
+    first
+        .write(
+            (0..registry::SELF_QUOTA - 1)
+                .map(|n| birth(&format!("vm-first-{n}")))
+                .collect(),
+        )
+        .unwrap();
+    for (n, paths) in lab.paths.iter().enumerate().skip(1) {
+        Registry::at(paths.clone())
+            .write(vec![birth(&format!("vm-peer-{n}"))])
+            .unwrap();
+    }
+    let originals: Vec<_> = (0..lab.paths.len())
+        .flat_map(|n| wires(&lab, n, scope))
+        .collect();
+    for n in 0..2 {
+        receive(&lab, n, scope, &originals);
+    }
+    let actor = {
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::observe(&bootstrap).unwrap();
+        let directory = crate::catalog::Directory::new(&lab.paths[0], bootstrap.trust());
+        let store =
+            crate::table::store::Store::observe(&session, &directory.path(scope).unwrap(), scope)
+                .unwrap();
+        let (_, needed) = store.metadata_with_append_bound(&session).unwrap();
+        assert!(needed > 1, "this seed needs a causal join as well as data");
+        session.actor()
+    };
+    assert_eq!(
+        first.view().unwrap().quota.spent[&actor],
+        registry::SELF_QUOTA - 1
+    );
+    let before = wires(&lab, 0, scope);
+    assert!(first.seed().is_err());
+    let after = wires(&lab, 0, scope);
+    assert_eq!(after.len(), before.len(), "a refused seed appends nothing");
+    assert!(after == before, "all retained records stay unchanged");
+
+    // An interrupted append can leave joins with no following business record. They
+    // will be charged to the next automatic record even though they are retained already.
+    {
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let directory = crate::catalog::Directory::new(&lab.paths[0], bootstrap.trust());
+        let mut store =
+            crate::table::store::Store::open(&session, &directory.path(scope).unwrap(), scope)
+                .unwrap();
+        let merge = crate::database::Command::Merge { request: [83; 16] };
+        crate::documents::application::append(&session, &mut store, &merge.encode().unwrap())
+            .unwrap();
+        assert_eq!(store.metadata_with_append_bound(&session).unwrap().1, 1);
+    }
+    assert_eq!(
+        first.view().unwrap().quota.spent[&actor],
+        registry::SELF_QUOTA - 1
+    );
+    let interrupted = wires(&lab, 0, scope);
+    assert!(interrupted.len() > before.len());
+    assert!(first.seed().is_err());
+    let retried = wires(&lab, 0, scope);
+    assert_eq!(
+        retried.len(),
+        interrupted.len(),
+        "a retry reserves prior joins"
+    );
+    assert!(retried == interrupted, "the retry appends no seed");
+
+    let second = Registry::at(lab.paths[1].clone());
+    assert!(second.seed().unwrap().records > 0);
+    let view = second.view().unwrap();
+    assert!(view.quota.over.is_empty());
+    assert_eq!(view.project(&PROVIDER).rows.len(), seeds::PROVIDERS.len());
+    assert_eq!(second.seed().unwrap(), Seeded::default());
+    receive(&lab, 0, scope, &wires(&lab, 1, scope));
+    let recovered = first.view().unwrap();
+    assert_eq!(recovered.cells, view.cells);
+    assert!(recovered.quota.over.is_empty());
+    assert_eq!(first.seed().unwrap(), Seeded::default());
 }
 
 /// A writer's automatic records past its quota never project: of 26 automatic records (24 model
@@ -360,4 +448,53 @@ fn schema_rows_are_published_once_and_never_below_a_visible_version() {
     );
     let address = view.schema(ADDRESS.name);
     assert!(matches!(address, SchemaState::One { version: 1, .. }));
+}
+
+/// A new grid row of a preference is born under the key of its machine and account, whichever
+/// way round the columns come, and refuses without both; the registry names no machine slot; and
+/// an account reads as its label, else its default, which names no machine.
+/// NEGATIVE CONTROL: with the `preference` arm removed from `registry::birth`, the grid refuses
+/// the row: `` called `Result::unwrap()` on an `Err` value: Error("preference: the grid adds no
+/// rows here; a lab verb or the importer keys them") ``.
+#[test]
+fn a_preference_is_born_from_its_pair_and_an_account_reads_its_label() {
+    let machine = keys::machine_pk("m8");
+    let account = keys::account_pk("claude", "ann@example.test").unwrap();
+    let values = std::collections::BTreeMap::from([
+        ("machine".to_owned(), json!(machine)),
+        ("account".to_owned(), json!(account)),
+    ]);
+    assert_eq!(
+        registry::birth(&registry::PREFERENCE, &values, &Cells::new()).unwrap(),
+        keys::preference_pk(&machine, &account).unwrap()
+    );
+    let partial = std::collections::BTreeMap::from([("machine".to_owned(), json!(machine))]);
+    assert!(registry::birth(&registry::PREFERENCE, &partial, &Cells::new()).is_err());
+    assert_eq!(registry::REGISTRY.ends, ["preference"]);
+    assert!(MACHINE.column("max_seats").is_none());
+    assert!(ACCOUNT.column("class").is_none());
+    let change = |col: &str, x: Value| {
+        cell::change(
+            &ACCOUNT,
+            CellKey {
+                pk: &account,
+                col,
+                elem: None,
+            },
+            &CellValue::owner(1, x),
+        )
+        .unwrap()
+    };
+    let unnamed = apply(&[vec![change("realm", json!("claude"))]]);
+    let row = cell::project(&ACCOUNT, &unnamed).rows[&account].clone();
+    assert_eq!(
+        registry::account_label(&account, &row),
+        Some(keys::default_account_label("claude", &account).unwrap())
+    );
+    let named = apply(&[vec![change("label", json!("research"))]]);
+    let row = cell::project(&ACCOUNT, &named).rows[&account].clone();
+    assert_eq!(
+        registry::account_label(&account, &row).as_deref(),
+        Some("research")
+    );
 }

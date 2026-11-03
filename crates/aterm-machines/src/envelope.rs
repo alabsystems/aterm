@@ -361,6 +361,13 @@ pub fn seal_batch(
         }
     };
     for (i, body) in bodies.iter().enumerate() {
+        if body.expires < body.issued {
+            cleanup(&files);
+            return Err(format!(
+                "envelope: expires {} is before issued {}",
+                body.expires, body.issued
+            ));
+        }
         let text = body_text(body)?;
         let path = scratch.join(format!("aterm-envelope-{tag}-{i}.toml"));
         let _ = sys.remove(&sig_path(&path));
@@ -534,7 +541,10 @@ pub fn open_in(
         });
     }
     let now = sys.now();
-    if envelope.issued > now.saturating_add(SKEW_SECS) || now > envelope.expires {
+    if envelope.expires < envelope.issued
+        || envelope.issued > now.saturating_add(SKEW_SECS)
+        || now > envelope.expires
+    {
         return Err(Refusal::Expired {
             issued: envelope.issued,
             expires: envelope.expires,
@@ -1249,5 +1259,68 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
             let opened = keys.open(wire, &format!("H{}", i + 1), 0).unwrap();
             assert_eq!(opened.envelope, bodies[i]);
         }
+    }
+
+    /// INVERTED VALIDITY WINDOW IS REFUSED WITHIN CLOCK SKEW: an envelope with `expires < issued`
+    /// cannot slip through `open_in` when `now <= expires < issued <= now + SKEW_SECS`, nor can
+    /// `seal_batch` sign it.
+    /// NEGATIVE CONTROL: a non-inverted window (`expires == issued`) within `SKEW_SECS` opens.
+    #[test]
+    fn an_inverted_validity_window_is_refused_in_both_seal_batch_and_open_in() {
+        let mut fake = Fake::root();
+        fake.now = 1_850;
+        private(&fake, "/s");
+        script_good(&fake, "/s");
+
+        let mut inverted = envelope("U", 5, 2_000);
+        inverted.expires = 1_900;
+        let seal_err = seal_batch(
+            &fake,
+            std::slice::from_ref(&inverted),
+            Path::new("/k/signing"),
+            Signing::Unattended,
+            Path::new("/s"),
+        )
+        .expect_err("seal_batch must refuse expires < issued");
+        assert!(seal_err.contains("before issued"), "{seal_err}");
+        assert!(
+            !fake.calls().iter().any(|c| c.contains("-Y sign")),
+            "ssh-keygen must not run on an inverted window: {:?}",
+            fake.calls()
+        );
+
+        let inverted_wire = format!("{SIG}{}", body_text(&inverted).unwrap());
+        let open_err = open_in(
+            &fake,
+            inverted_wire.as_bytes(),
+            Path::new("/as"),
+            "U",
+            &|_| 0,
+            Path::new("/s"),
+        )
+        .expect_err("open_in must refuse expires < issued even within SKEW_SECS");
+        assert_eq!(
+            open_err,
+            Refusal::Expired {
+                issued: 2_000,
+                expires: 1_900,
+                now: 1_850,
+            }
+        );
+
+        script_good(&fake, "/s");
+        let mut instant = envelope("U", 6, 2_000);
+        instant.expires = 2_000;
+        let instant_wire = format!("{SIG}{}", body_text(&instant).unwrap());
+        let opened = open_in(
+            &fake,
+            instant_wire.as_bytes(),
+            Path::new("/as"),
+            "U",
+            &|_| 0,
+            Path::new("/s"),
+        )
+        .expect("expires == issued within SKEW_SECS remains valid");
+        assert_eq!(opened.envelope.serial, 6);
     }
 }

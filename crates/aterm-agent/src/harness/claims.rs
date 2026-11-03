@@ -45,6 +45,17 @@
 //!   sleep or stop may run no later repair round to carry it.
 //! - **Claude Code's accounts.** Only Claude Code's rows are claimed, as only they were leased:
 //!   Claude Code alone has a usage tap to renew a claim, so another CLI's rows stay unclaimed.
+//! - **A wrong clock** (F22). Every row is placed by its writer's clock, so a Mac whose clock is
+//!   a day or more off writes and reads tables its peers never read or write. The table's read
+//!   says what this Mac's peers make of its clock ([`Tabled::clock`]), which peers it reads as
+//!   skewed ([`Tabled::skewed`]) and which it holds for ([`Tabled::held`]: on a narrower line,
+//!   every peer that counted an Off Mac against itself). A Mac they read **Off** writes no row
+//!   (the table refuses it) and uses its home accounts whatever it sees, and no other
+//!   ([`accounts::WhyNot::ClockOff`]); a Mac they are **split** over claims and releases its home
+//!   accounts and nothing else. A Mac that is neither holds each held peer's home accounts for it
+//!   ([`View::held`]) and keeps the peer's visible claims live past their `until` by as far as
+//!   its clock runs behind, so it never takes an account the skewed Mac may be using and cannot
+//!   show.
 
 use std::collections::BTreeMap;
 
@@ -301,6 +312,25 @@ pub struct View {
     pub me: String,
     /// What this Mac's Commons hears, where it observes its peers.
     pub presence: Option<Presence>,
+    /// The home accounts of the peers this Mac holds for ([`Tabled::held`]), each held on its home
+    /// Mac's behalf until the hold's `until` ([`holds`], F22): the earliest claim there is, so it
+    /// is senior to every other.
+    pub held: Vec<(LeaseKey, Holder)>,
+    /// The peers this Mac holds for (machine, lowercase hex), each until its hold ends (a day past
+    /// the reading): till then a row of theirs stays live past its `until` by as far as this Mac's
+    /// clock runs ahead of theirs.
+    pub skewed: BTreeMap<String, Skew>,
+}
+
+/// How a peer this Mac holds for reads on this Mac's clock (F22, [`View::skewed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Skew {
+    /// The hold lasts until this instant (Unix seconds).
+    pub until: i64,
+    /// This Mac's clock runs at most this far ahead of the peer's (seconds, rounded up; zero or
+    /// less where it does not run ahead): a row the peer dated to lapse at `until` lapses that
+    /// much later here.
+    pub ahead_s: i64,
 }
 
 impl View {
@@ -319,11 +349,21 @@ impl View {
             })
     }
 
-    /// True while `row`'s `claim` is live to this Mac at `now`: its row has not lapsed and, for a
-    /// lease, its Mac is not [`unheard`](Self::unheard).
+    /// True while `row`'s `claim` is live to this Mac at `now`: its row has not lapsed on this
+    /// Mac's clock (for a peer this Mac holds for, while that hold lasts, its `until` moved
+    /// later by as far as this clock runs ahead of the peer's, [`Self::skewed`]), and, for a
+    /// lease, its Mac is not [`unheard`](Self::unheard). A peer whose clock runs ahead, or a
+    /// skew of minutes, moves it no later than the reading shows: a lease the peer left at its
+    /// turn end but could not release (its clock read Off) lapses as it would have.
     #[must_use]
     pub fn live(&self, row: &Row, claim: &Claim, now: i64) -> bool {
-        row.until > now && (claim.kind == Kind::Home || !self.unheard(&row.machine, now))
+        let late = self
+            .skewed
+            .get(&row.machine)
+            .filter(|skew| skew.until > now)
+            .map_or(0, |skew| skew.ahead_s.max(0));
+        row.until.saturating_add(late) > now
+            && (claim.kind == Kind::Home || !self.unheard(&row.machine, now))
     }
 }
 
@@ -399,14 +439,15 @@ impl Book {
         self.rows.values()
     }
 
-    /// Every live claim on `key` as `view` sees it at `now`.
+    /// Every live claim on `key` as `view` sees it at `now`, and each hold `view` keeps on it for
+    /// a skewed peer while the hold lasts ([`View::held`]).
     pub fn live_claims<'a>(
         &'a self,
         key: &'a LeaseKey,
         view: &'a View,
         now: i64,
     ) -> impl Iterator<Item = Holder> + 'a {
-        self.rows.values().filter_map(move |row| {
+        let rows = self.rows.values().filter_map(move |row| {
             let claim = row.claim(key).filter(|claim| view.live(row, claim, now))?;
             Some(Holder {
                 machine: row.machine.clone(),
@@ -415,12 +456,27 @@ impl Book {
                 since: claim.since,
                 until: row.until,
             })
-        })
+        });
+        let held = view
+            .held
+            .iter()
+            .filter(move |(held, holder)| held == key && holder.until > now)
+            .map(|(_, holder)| holder.clone());
+        rows.chain(held)
     }
 
     /// The senior live claim on `key` as `view` sees it at `now`: the earliest `since`, then the
-    /// lower label, then the lower machine ([`senior_lease`]).
+    /// lower label, then the lower machine ([`senior_lease`]). A hold for a skewed peer
+    /// ([`View::held`]) is the earliest of all.
     #[must_use]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountClaimClock",
+            action = "BCold",
+            project = "aterm_agent::harness::claims::tests::claim_clock_transition"
+        )
+    )]
     pub fn senior(&self, key: &LeaseKey, view: &View, now: i64) -> Option<Holder> {
         self.live_claims(key, view, now)
             .reduce(|held, holder| senior_lease(&held, &holder).clone())
@@ -627,6 +683,170 @@ pub fn settle(
     }
 }
 
+/// What its peers make of this Mac's clock (`Judge`), a peer's stale claim on its home row in its
+/// view (`StalePeer`), and its clock being off as a peer reads it (`Skew`): none is code here.
+/// `account_claim_clock_conforms` sets each the way the model does and binds what the code makes
+/// of it.
+#[cfg(any(test, debug_assertions))]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountClaimClock",
+        action = "Judge",
+        reason = "What this Mac's peers read of its clock comes from the Commons runtime's clock.state through the table's read (aterm-db's DbClaimClock): account_claim_clock_conforms sets the standing the model judges in the accounts store, and, into Off, the hold the same round gives a peer that counted it (aterm-db's every_peer_that_counted_an_off_mac_holds_for_it)."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountClaimClock",
+        action = "StalePeer",
+        reason = "A peer's stale lease on this Mac's home row is what the replicas carried: account_claim_clock_conforms writes it into the leases the store holds."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountClaimClock",
+        action = "Skew",
+        reason = "Whether a peer holds for this Mac is that peer's clock reading (aterm-db's DbClaimClock): account_claim_clock_conforms names this Mac held in the peer's table read."
+    )
+)]
+#[doc(hidden)]
+pub fn account_claim_clock_environment() {}
+
+/// How long a clock record a read takes lasts in the accounts store ([`accounts::Clock::until`]):
+/// as long as the reading behind it stays fresh (`aterm_db::clock::FRESH_MS`).
+pub const CLOCK_HOLD_S: i64 = 30 * 60;
+
+/// Why `read`'s clock refuses a claim on a home account (`home`) or another one (F22): every claim
+/// while this Mac's peers read its clock as off (the table's own refusal), and a claim on an
+/// account that is not one of its homes while they are split over it.
+fn clock_refusal(read: &Tabled, home: bool) -> Option<String> {
+    let clock = read.clock.as_ref()?;
+    match clock.standing {
+        accounts::ClockStanding::Off { ahead } => {
+            Some(read.writable.clone().err().unwrap_or_else(|| {
+                format!(
+                    "this Mac's clock reads {} of {} of the {} Macs it hears; it writes no account \
+                 claim until the clock agrees",
+                    if ahead { "ahead" } else { "behind" },
+                    clock.against,
+                    clock.of
+                )
+            }))
+        }
+        accounts::ClockStanding::Split if !home => Some(format!(
+            "this Mac's clock disagrees with {} of the {} Macs it hears; it claims only its home \
+             accounts until they agree",
+            clock.against, clock.of
+        )),
+        accounts::ClockStanding::Split => None,
+    }
+}
+
+/// Whether `label` names the Mac called `names` (its primary label and aliases): the same word,
+/// or the same `m<N>` label however it is suffixed.
+fn names(names: &[String], label: &str) -> bool {
+    let label = label.trim_ascii();
+    let canon = super::ai_pool::leading_m_label(label).map(|(_, canon)| canon);
+    !label.is_empty()
+        && names.iter().any(|name| {
+            let name = name.trim_ascii();
+            name.eq_ignore_ascii_case(label)
+                || canon.is_some() && super::ai_pool::leading_m_label(name).map(|(_, c)| c) == canon
+        })
+}
+
+/// The holds this Mac keeps for the peers it holds for ([`Tabled::held`], F22): each account in
+/// `homes` (its key and its home Mac's label, `warm[0]`) whose home Mac is such a peer, held for
+/// it with the earliest claim there is until its hold ends (a day past the reading). So no Mac
+/// takes an account a skewed Mac may be using while its claims cannot be seen, and a Mac that
+/// leases one yields it at its next turn end.
+#[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountClaimClock",
+        action = "BRound",
+        project = "aterm_agent::harness::claims::tests::claim_clock_transition"
+    )
+)]
+pub fn holds(skewed: &[SkewedPeer], homes: &[(LeaseKey, String)]) -> Vec<(LeaseKey, Holder)> {
+    homes
+        .iter()
+        .filter_map(|(key, home)| {
+            let peer = skewed.iter().find(|peer| names(&peer.labels, home))?;
+            Some((
+                key.clone(),
+                Holder {
+                    machine: peer.machine.clone(),
+                    label: home.clone(),
+                    kind: Kind::Home,
+                    since: i64::MIN,
+                    until: peer.until,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// A Claude Code account `ai-pool.toml` names, with a home Mac: its label, its login address's
+/// key and its home Mac's label (`warm[0]`).
+pub(crate) type PoolHome = (String, LeaseKey, String);
+
+/// Each Claude Code account `ai-pool.toml` under `home` names with a home Mac ([`PoolHome`]);
+/// none where the file cannot be read.
+fn pool_homes(home: &std::path::Path) -> Vec<PoolHome> {
+    let path = home.join(".secrets").join(super::ai_pool::AI_POOL_FILE);
+    let Some(text) = super::ai_pool::read_bounded_text(&path, 4 * 1024 * 1024) else {
+        return Vec::new();
+    };
+    let Ok(pool) = super::ai_pool::Pool::from_toml(&text, &path.display().to_string()) else {
+        return Vec::new();
+    };
+    pool.accounts_for_cli(Cli::Claude)
+        .into_iter()
+        .filter_map(|(account, label)| {
+            let home = account.home_mac()?.to_owned();
+            let key = LeaseKey::for_cli(Cli::Claude, account.vendor.region, &account.email).ok()?;
+            Some((label, key, home))
+        })
+        .collect()
+}
+
+/// The claim keys of `pool`'s accounts, each with its home Mac's label, as [`holds`] takes them:
+/// the key [`keys`] gives the account's label (the roster's expected identity, which every claim
+/// and [`Book::senior`] use), and its login address's key where that differs (a peer whose roster
+/// still names the account by its login claims it so). A hold under either key holds the account
+/// however a peer's roster keys it.
+#[must_use]
+pub(crate) fn home_keys(pool: &[PoolHome], keys: &[(String, LeaseKey)]) -> Vec<(LeaseKey, String)> {
+    let mut homes = Vec::new();
+    for (label, login, home) in pool {
+        for (_, key) in keys.iter().filter(|(row, _)| row == label) {
+            homes.push((key.clone(), home.clone()));
+        }
+        if !homes.iter().any(|(key, _)| key == login) {
+            homes.push((login.clone(), home.clone()));
+        }
+    }
+    homes
+}
+
+/// The claim keys of the Claude Code accounts `ai-pool.toml` under `home` names, each with its
+/// home Mac's label ([`home_keys`]), keyed through the accounts' roster file under `home`; a
+/// roster that cannot be read keys them by login alone.
+fn homes_at(home: &std::path::Path) -> Vec<(LeaseKey, String)> {
+    let path = home
+        .join(".config/aterm")
+        .join(Cli::Claude.accounts().roster_file);
+    let keys = Roster::load_for(Cli::Claude, &path)
+        .map(|roster| keys(Cli::Claude, &roster))
+        .unwrap_or_default();
+    home_keys(&pool_homes(home), &keys)
+}
+
 /// The Commons table the rows ride, as the process that links `aterm-db` installs it
 /// ([`install`]).
 pub trait Table: Send + Sync {
@@ -665,6 +885,55 @@ pub struct Tabled {
     pub book: Book,
     /// Whether this Mac can write its row, and why not.
     pub writable: Result<(), String>,
+    /// What this Mac's peers say of its clock, where they read it Split or Off (F22); `None` while
+    /// they agree with it or it has no fresh reading.
+    pub clock: Option<ClockRead>,
+    /// The peers this Mac reads as skewed, unless its own clock is read Off (F22): the Macs a
+    /// clock warning names.
+    pub skewed: Vec<SkewedPeer>,
+    /// The peers whose home accounts this Mac holds for them, unless its own clock is read Off
+    /// (F22): every peer [`Self::skewed`] names, and every peer an Off Mac counted against itself
+    /// (`aterm_db::clock::Judgement::held`).
+    pub held: Vec<SkewedPeer>,
+}
+
+/// What this Mac's peers say of its clock, as a [`Table`] read gives it (F22).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClockRead {
+    /// Split or Off.
+    pub standing: accounts::ClockStanding,
+    /// Under Off, at least how far off (seconds).
+    pub by_s: i64,
+    /// The decisive readings against this Mac's clock.
+    pub against: u32,
+    /// The decisive readings counted.
+    pub of: u32,
+}
+
+/// A peer this Mac reads as skewed or holds for (F22): a fresh reading of its clock that does not
+/// agree ([`Tabled::skewed`], [`Tabled::held`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkewedPeer {
+    /// Its Commons machine (lowercase hex).
+    pub machine: String,
+    /// Its swarm labels, primary first, then its aliases; none where this Mac has no roster.
+    pub labels: Vec<String>,
+    /// Its holds last until this instant (Unix seconds).
+    pub until: i64,
+    /// This Mac's clock runs at most this far ahead of its (seconds, rounded up; zero or less
+    /// where it does not run ahead): how much later its rows lapse here ([`Skew::ahead_s`]).
+    pub ahead_s: i64,
+}
+
+impl SkewedPeer {
+    /// How it reads on this Mac's clock ([`View::skewed`]).
+    #[must_use]
+    pub const fn skew(&self) -> Skew {
+        Skew {
+            until: self.until,
+            ahead_s: self.ahead_s,
+        }
+    }
 }
 
 /// What to do with this Mac's claims.
@@ -727,7 +996,50 @@ pub fn touch_with(
     act: Act<'_>,
     now: i64,
 ) -> Touched {
-    touch_using(table, home, presence, state, cli, keys, act, now, Ok(None))
+    touch_using(
+        table,
+        home,
+        presence,
+        state,
+        cli,
+        keys,
+        &[],
+        act,
+        now,
+        Ok(None),
+    )
+}
+
+/// [`touch_with`] with `homes` (each account's key and its home Mac's label) for the holds this Mac
+/// keeps for the peers it reads as skewed ([`holds`]).
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "touch_with's arguments and the accounts' home Macs"
+)]
+pub(crate) fn touch_homes(
+    table: &dyn Table,
+    presence: Option<Presence>,
+    state: &mut accounts::State,
+    cli: Cli,
+    keys: &[(String, LeaseKey)],
+    homes: &[(LeaseKey, String)],
+    act: Act<'_>,
+    now: i64,
+) -> Touched {
+    let home = std::path::Path::new("/nonexistent/home");
+    touch_using(
+        table,
+        home,
+        presence,
+        state,
+        cli,
+        keys,
+        homes,
+        act,
+        now,
+        Ok(None),
+    )
 }
 
 #[expect(
@@ -789,6 +1101,7 @@ fn touch_using(
     state: &mut accounts::State,
     cli: Cli,
     keys: &[(String, LeaseKey)],
+    homes: &[(LeaseKey, String)],
     act: Act<'_>,
     now: i64,
     activity: Result<Option<&mut activity::Held>, String>,
@@ -805,9 +1118,35 @@ fn touch_using(
             };
         }
     };
+    // What this Mac's peers say of its clock lasts in the store as long as the reading behind it
+    // (F22), naming the peers it reads as skewed, and the peers it holds for have their home
+    // accounts held for them.
+    state.clock = read.clock.as_ref().map(|clock| accounts::Clock {
+        standing: clock.standing,
+        by_s: clock.by_s,
+        against: clock.against,
+        of: clock.of,
+        peers: read
+            .skewed
+            .iter()
+            .map(|peer| {
+                peer.labels
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| format!("claim:{}", peer.machine))
+            })
+            .collect(),
+        until: now.saturating_add(CLOCK_HOLD_S),
+    });
     let view = View {
         me: read.me.clone(),
         presence,
+        held: holds(&read.held, homes),
+        skewed: read
+            .held
+            .iter()
+            .map(|peer| (peer.machine.clone(), peer.skew()))
+            .collect(),
     };
     let mine = Mine {
         machine: read.me.clone(),
@@ -864,6 +1203,19 @@ fn touch_using(
         Act::Off => quiet(released(mine_now.as_ref(), |_| true, now)),
         Act::Claim(label) if state.execution_verdict(label).is_err() => {
             (Touched::PreparationOnly, None)
+        }
+        // While its peers read its clock as off, this Mac writes no row (its home claims are
+        // recorded as activity, and its peers hold its home rows for it); while they are split
+        // over it, it claims its home accounts only.
+        Act::Claim(label)
+            if clock_refusal(&read, state.home_accounts.contains(label)).is_some() =>
+        {
+            (
+                Touched::Unrecorded(
+                    clock_refusal(&read, state.home_accounts.contains(label)).unwrap_or_default(),
+                ),
+                None,
+            )
         }
         Act::Claim(label) => match key_of(label) {
             None => (Touched::NotApplicable, None),
@@ -1041,6 +1393,12 @@ pub fn read_book(home: &std::path::Path) -> Option<(View, Book)> {
     let view = View {
         me: read.me,
         presence: presence_now(),
+        skewed: read
+            .held
+            .iter()
+            .map(|peer| (peer.machine.clone(), peer.skew()))
+            .collect(),
+        held: holds(&read.held, &homes_at(home)),
     };
     Some((view, read.book))
 }
@@ -1179,7 +1537,14 @@ fn touch_reading(
             Err(_) if off => Ok(None),
             Err(why) => Err(why.clone()),
         };
-        outcome = touch_using(table, home, presence, state, cli, &keys, act, now, activity);
+        let homes = if off {
+            Vec::new()
+        } else {
+            home_keys(&pool_homes(home), &keys)
+        };
+        outcome = touch_using(
+            table, home, presence, state, cli, &keys, &homes, act, now, activity,
+        );
         Ok(Vec::new())
     }) {
         return if matches!(

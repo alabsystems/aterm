@@ -18,6 +18,8 @@ mod aos_step;
 mod bridge_fx;
 mod captures;
 mod closure_anchor;
+mod conflict_marker;
+mod debug_seam;
 mod doc_sentence;
 mod doors;
 mod eager_drop;
@@ -40,6 +42,7 @@ mod shown_term;
 mod slog_inert;
 mod stock_label;
 mod term_write;
+mod usage_read;
 mod win_resources;
 
 /// One violation: where, which rule, and what the rule saw there.
@@ -71,6 +74,7 @@ pub const GUARDS: &[Rule] = &[
     rules::ENGINE_PLATFORM,
     rules::RENDERER_TERMINAL,
     rules::DEV_READ,
+    debug_seam::DEBUG_SEAM,
     rules::INPUT_PROBE,
     graph::TEST_APPKIT_DOOR,
     graph::SHARED_APPLICATION,
@@ -104,6 +108,7 @@ pub const GUARDS: &[Rule] = &[
     installer::INSTALLER_NETWORK,
     agent_gate::AGENT_GATE,
     term_write::TERM_WRITE,
+    usage_read::USAGE_READ_ON_TIMER,
     shown_term::SHOWN_TERM,
     slog_inert::SLOG_INERT,
     eager_drop::EAGER_DROP,
@@ -115,6 +120,7 @@ pub const GUARDS: &[Rule] = &[
     closure_anchor::CLOSURE_ANCHOR,
     rules::LICENCE_HEADER,
     generated::GENERATED_SEAL,
+    conflict_marker::CONFLICT_MARKER,
     mirror_rows::MIRROR_ROWS,
     win_resources::WIN_RESOURCES,
 ];
@@ -306,7 +312,7 @@ impl Corpus {
         paths.sort();
         let mut files = Vec::with_capacity(paths.len());
         for path in paths {
-            let raw = std::fs::read_to_string(&path)
+            let raw = crate::tree::read_to_string(&path)
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
             let rel = crate::rel_path(root, &path);
             files.push(SourceFile::new(rel, raw));
@@ -321,7 +327,7 @@ impl Corpus {
                 scripts.push(script);
             }
             if is_manifest(rel) {
-                let text = std::fs::read_to_string(root.join(rel))
+                let text = crate::tree::read_to_string(&root.join(rel))
                     .map_err(|e| format!("cannot read {rel}: {e}"))?;
                 manifests.push((rel.clone(), text));
             }
@@ -490,7 +496,7 @@ pub(crate) struct Ignored {
 
 impl Ignored {
     pub(crate) fn read(root: &Path) -> Self {
-        Self::parse(&std::fs::read_to_string(root.join(".gitignore")).unwrap_or_default())
+        Self::parse(&crate::tree::read_to_string(&root.join(".gitignore")).unwrap_or_default())
     }
 
     fn parse(text: &str) -> Self {
@@ -587,12 +593,12 @@ impl Script {
         if by_name.is_none() {
             use std::io::Read as _;
             let mut head = [0u8; 2];
-            let mut file = std::fs::File::open(&path).map_err(unreadable)?;
+            let (mut file, _) = crate::tree::open_regular(&path).map_err(unreadable)?;
             if file.read_exact(&mut head).is_err() || head != *b"#!" {
                 return Ok(None);
             }
         }
-        let bytes = std::fs::read(&path).map_err(unreadable)?;
+        let bytes = crate::tree::read_bytes(&path).map_err(unreadable)?;
         if bytes.contains(&0) {
             return Ok(None);
         }

@@ -244,11 +244,40 @@ fn read(argv: &[String]) -> Result<Read, ArgvRefusal> {
 /// by a relaunch ([`FLAGS`]).
 const PROVIDER_FLAGS: &[&str] = &["--provider", "--preset", "--base-url", "-c", "--config"];
 
+/// The root options that say what a Muse Code run may do unasked: its worker's are its parent's
+/// (owner ruling 2026-11-02).
+const PERMISSION_FLAGS: &[&str] = &[
+    "--approval-judge",
+    "--approval-mode",
+    "--disable-approval",
+    "--disable-sandbox",
+    "--sandbox-network",
+    "--yolo",
+];
+
 /// Extract the root provider options (`--provider`, `--preset`, `--base-url`, `-c`, `--config`) from `argv`.
 ///
 /// # Errors
 /// Returns [`ArgvRefusal::UnknownFlag`] if `argv` contains an unrecognized flag before `--`.
 pub fn provider_flags(argv: &[String]) -> Result<Vec<String>, ArgvRefusal> {
+    flags_named(argv, PROVIDER_FLAGS)
+}
+
+/// The flags of `argv` a worker of this Muse Code starts with: [`provider_flags`] and its
+/// permissions ([`PERMISSION_FLAGS`]), in `argv`'s order.
+///
+/// # Errors
+/// Returns [`ArgvRefusal::UnknownFlag`] if `argv` contains an unrecognized flag before `--`.
+pub fn worker_flags(argv: &[String]) -> Result<Vec<String>, ArgvRefusal> {
+    let both: Vec<&str> = PROVIDER_FLAGS
+        .iter()
+        .chain(PERMISSION_FLAGS)
+        .copied()
+        .collect();
+    flags_named(argv, &both)
+}
+
+fn flags_named(argv: &[String], named: &[&str]) -> Result<Vec<String>, ArgvRefusal> {
     let mut out = Vec::new();
     let mut i = 1;
     while i < argv.len() {
@@ -273,7 +302,7 @@ pub fn provider_flags(argv: &[String]) -> Result<Vec<String>, ArgvRefusal> {
         } else {
             None
         };
-        if PROVIDER_FLAGS.contains(&name) {
+        if named.contains(&name) {
             out.push(tok.to_string());
             out.extend(value.cloned());
         }
@@ -568,8 +597,9 @@ pub fn log_workspace(log: &str) -> Option<String> {
 pub fn lock_pid(body: &str) -> Option<u32> {
     body.lines()
         .find_map(|l| l.trim().strip_prefix("pid="))
+        .filter(|s| !s.starts_with('0'))
         .and_then(crate::parse_uint::<u32>)
-        .filter(|&p| p > 0)
+        .filter(|&p| p > 1)
 }
 
 /// Session lock filename.
@@ -664,13 +694,32 @@ pub fn env_of_words(words: &[String]) -> Vec<(String, String)> {
 /// Whether `program` lies inside an `atpkg` store (`.../store/muse/<build>/bin/muse`).
 #[must_use]
 pub fn store_build(program: &Path) -> bool {
+    let plain = program.components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::Normal(_)
+        )
+    });
+    if !program.has_root() || !plain {
+        return false;
+    }
     let names: Vec<&str> = program
         .components()
         .rev()
         .take(5)
-        .filter_map(|c| c.as_os_str().to_str())
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
         .collect();
-    matches!(names.as_slice(), [PROGRAM, "bin", build, PROGRAM, "store"] if !build.is_empty())
+    matches!(
+        names.as_slice(),
+        [PROGRAM, "bin", build, PROGRAM, "store"]
+            if !(build.len() > 1 && build.starts_with('0'))
+                && crate::parse_uint::<u64>(build).is_some()
+    )
 }
 
 /// Format the manual `muse --contributor-mode off resume <session>` hint shown to the user:
@@ -723,6 +772,7 @@ pub enum LaunchEndpoint {
 
 struct ConfigEndpoint {
     provider: Option<String>,
+    preset: Result<bool, &'static str>,
     base_url: Option<Result<Option<String>, &'static str>>,
     proxy: Result<bool, &'static str>,
     ca_bundle: Result<bool, &'static str>,
@@ -733,6 +783,7 @@ impl Default for ConfigEndpoint {
     fn default() -> Self {
         Self {
             provider: None,
+            preset: Ok(false),
             base_url: None,
             proxy: Ok(false),
             ca_bundle: Ok(false),
@@ -743,10 +794,10 @@ impl Default for ConfigEndpoint {
 
 fn muse_env_var<'a>(env: &'a [String], key: &str) -> Option<&'a str> {
     env.iter()
-        .rev()
         .filter_map(|kv| kv.split_once('='))
-        .find(|(k, v)| *k == key && !v.trim().is_empty())
+        .find(|(k, _)| *k == key)
         .map(|(_, v)| v.trim())
+        .filter(|v| !v.is_empty())
 }
 
 fn resolve_muse_whole_var(raw: &str, env: &[String]) -> Result<String, &'static str> {
@@ -761,10 +812,17 @@ fn resolve_muse_whole_var(raw: &str, env: &[String]) -> Result<String, &'static 
     Ok(raw.to_string())
 }
 
-fn parse_muse_transport_flag(val: &Value, bad_msg: &'static str) -> Result<bool, &'static str> {
+fn parse_muse_transport_flag(
+    val: &Value,
+    env: &[String],
+    bad_msg: &'static str,
+) -> Result<bool, &'static str> {
     match val {
         Value::Null => Ok(false),
-        Value::String(s) => Ok(!s.trim().is_empty()),
+        Value::String(s) => {
+            let resolved = resolve_muse_whole_var(s.trim(), env)?;
+            Ok(!resolved.trim().is_empty())
+        }
         _ => Err(bad_msg),
     }
 }
@@ -828,12 +886,25 @@ fn apply_muse_config(spec: &str, env: &[String], state: &mut ConfigEndpoint) -> 
             };
             state.provider = Some(parsed);
         }
+        "preset" => {
+            let parsed = match aterm_json::from_str::<Value>(raw_val) {
+                Ok(v) => Ok(v),
+                Err(_) if !raw_val.starts_with(['{', '[', '"']) => {
+                    Ok(Value::String(raw_val.to_string()))
+                }
+                Err(_) => Err("Muse Code's -c preset is not valid JSON"),
+            };
+            state.preset = parsed.and_then(|v| {
+                parse_muse_transport_flag(&v, env, "Muse Code's -c preset is not a JSON string")
+            });
+        }
         "endpoint_transport.proxy" => {
             state.proxy = aterm_json::from_str::<Value>(raw_val)
                 .map_err(|_| "Muse Code's -c endpoint_transport.proxy is not valid JSON")
                 .and_then(|v| {
                     parse_muse_transport_flag(
                         &v,
+                        env,
                         "Muse Code's -c endpoint_transport.proxy is not a JSON string",
                     )
                 });
@@ -844,6 +915,7 @@ fn apply_muse_config(spec: &str, env: &[String], state: &mut ConfigEndpoint) -> 
                 .and_then(|v| {
                     parse_muse_transport_flag(
                         &v,
+                        env,
                         "Muse Code's -c endpoint_transport.ca_bundle is not a JSON string",
                     )
                 });
@@ -894,25 +966,26 @@ fn apply_muse_config(spec: &str, env: &[String], state: &mut ConfigEndpoint) -> 
                 state.auth = Ok(false);
             }
             Ok(Value::Object(map)) => {
-                state.proxy = map.get("proxy").map_or(Ok(false), |v| {
-                    parse_muse_transport_flag(
+                if let Some(v) = map.get("proxy") {
+                    state.proxy = parse_muse_transport_flag(
                         v,
+                        env,
                         "Muse Code's -c endpoint_transport.proxy is not a JSON string",
-                    )
-                });
-                state.ca_bundle = map.get("ca_bundle").map_or(Ok(false), |v| {
-                    parse_muse_transport_flag(
+                    );
+                }
+                if let Some(v) = map.get("ca_bundle") {
+                    state.ca_bundle = parse_muse_transport_flag(
                         v,
+                        env,
                         "Muse Code's -c endpoint_transport.ca_bundle is not a JSON string",
-                    )
-                });
-                state.auth = map
-                    .get("auth")
-                    .map_or(Ok(false), |v| parse_muse_auth_flag(v, env));
-                state.base_url = Some(
-                    map.get("base_url")
-                        .map_or(Ok(None), |v| parse_muse_base_url_value(v, env)),
-                );
+                    );
+                }
+                if let Some(v) = map.get("auth") {
+                    state.auth = parse_muse_auth_flag(v, env);
+                }
+                if let Some(v) = map.get("base_url") {
+                    state.base_url = Some(parse_muse_base_url_value(v, env));
+                }
             }
             _ => {
                 return Err("Muse Code's -c endpoint_transport is not a JSON object".to_string());
@@ -975,11 +1048,15 @@ fn muse_base_url_or_ca_gap(url: String, source: &'static str, env: &[String]) ->
 /// `-c endpoint_transport.base_url`), gated on `--provider` (`meta` or `local`, default `meta`),
 /// an unproxied `-c endpoint_transport` with no custom CA or mTLS auth, and no custom TLS CA
 /// environment variable on `https://` targets.
+/// Named `--preset` / `-c preset` profiles are treated as a gap because their transport settings
+/// live outside `argv`.
 #[must_use]
 pub fn launch_endpoint(argv: &[String], env: &[String]) -> LaunchEndpoint {
     let mut positional_seen = false;
     let mut exec = false;
     let mut base_url_flag: Option<Option<&str>> = None;
+    let mut provider_flag: Option<String> = None;
+    let mut preset_flag = false;
     let mut cfg = ConfigEndpoint::default();
     let mut i = 1;
     while i < argv.len() {
@@ -1022,8 +1099,11 @@ pub fn launch_endpoint(argv: &[String], env: &[String]) -> LaunchEndpoint {
                 base_url_flag = Some(val.map(str::trim).filter(|s| !s.is_empty()));
             }
             "--provider" => {
-                cfg.provider =
+                provider_flag =
                     Some(val.map_or_else(String::new, |s| s.trim().to_ascii_lowercase()));
+            }
+            "--preset" => {
+                preset_flag = true;
             }
             "-c" | "--config" => {
                 let Some(spec) = val else {
@@ -1038,7 +1118,17 @@ pub fn launch_endpoint(argv: &[String], env: &[String]) -> LaunchEndpoint {
             _ => {}
         }
     }
-    if let Some(p) = cfg.provider.as_deref()
+    match cfg.preset {
+        Ok(cfg_preset) if preset_flag || cfg_preset => {
+            return LaunchEndpoint::Gap(
+                "Muse Code's launch selects a preset profile, whose transport settings are not read"
+                    .to_string(),
+            );
+        }
+        Ok(_) => {}
+        Err(why) => return LaunchEndpoint::Gap(why.to_string()),
+    }
+    if let Some(p) = provider_flag.as_deref().or(cfg.provider.as_deref())
         && !matches!(p, "meta" | "local")
     {
         return LaunchEndpoint::Gap(

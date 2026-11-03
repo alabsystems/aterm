@@ -3183,6 +3183,7 @@ fn installed_environment_repair_conforms_and_preserves_unrelated_budgets() {
             passed: false,
             reason: Some(reason.to_string()),
             grant_chunks: false,
+            grant_empty: false,
             policy: None,
         });
         if case == 5 {
@@ -3290,6 +3291,7 @@ fn installed_environment_repair_conforms_and_preserves_unrelated_budgets() {
                 reason: None,
                 policy: None,
                 grant_chunks: false,
+                grant_empty: false,
             });
             assert_eq!(app.arm_native_auto_apply(11, &"ab".repeat(32)), case != 7);
             assert_eq!(
@@ -3332,6 +3334,7 @@ fn a_non_writable_install_location_is_booked_as_the_persons_at_the_arm() {
             "staged update failed pre-park verification: {reason}"
         )),
         grant_chunks: false,
+        grant_empty: false,
         policy: None,
     });
     let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
@@ -3416,6 +3419,7 @@ fn a_folder_that_took_the_write_since_it_refused_releases_its_block() {
                 passed,
                 reason: (!passed).then(|| location.to_string()),
                 grant_chunks: false,
+                grant_empty: false,
                 policy: None,
             })
         };
@@ -3582,6 +3586,7 @@ fn a_returned_attempt_the_folder_refused_is_the_persons_not_the_builds() {
             passed: false,
             reason: Some(reason.to_string()),
             grant_chunks: false,
+            grant_empty: false,
             policy: None,
         });
         let outcome = app.settle_rearmed_apply_failure(
@@ -3729,6 +3734,7 @@ fn a_press_the_folder_answered_is_not_sent_back_to_the_folder() {
             passed: answered,
             reason: (!answered).then(|| location.to_string()),
             grant_chunks: false,
+            grant_empty: false,
             policy: None,
         });
         let message = if answered {
@@ -3814,6 +3820,7 @@ fn a_later_refusal_of_another_cause_names_the_standing_block() {
             passed: false,
             reason: Some(refusal.to_string()),
             grant_chunks: false,
+            grant_empty: false,
             policy: None,
         });
         if settled {
@@ -5619,6 +5626,7 @@ fn stage_one_build_for_test(app: &mut App, build: u64) {
                 reason: None,
                 policy: None,
                 grant_chunks: false,
+                grant_empty: false,
             });
     }
     let current_build = app.native_updater_service.snapshot().current_build;
@@ -6148,8 +6156,34 @@ fn a_lane_that_waits_by_design_is_not_reported_as_landing_by_itself() {
                 .set_state(id, crate::session_store::SessionState::Exited);
         }
         assert!(
+            app.update_lands_by_itself_with(true, None),
+            "a kept image with no live terminal hands its windows over by itself: it never \
+             waits for a tab (0.145.0, 2026-11-02)"
+        );
+        for why in HandoffUnavailable::ALL {
+            assert!(!app.update_lands_by_itself_with(true, Some(why)), "{why:?}");
+        }
+        app.sessionless_handoff_refused = Some("no open tab is one the new build can restore");
+        assert!(
             !app.update_lands_by_itself_with(true, None),
-            "a kept image with no live terminal waits for one"
+            "a kept image the sessionless handoff cannot carry installs at the next launch"
+        );
+        assert_eq!(
+            app.apply_posture_with(
+                7,
+                crate::app_update_screen::ApplyPostureEnv {
+                    handoff_unavailable: None,
+                    auto_apply: crate::app_config::AutoApplySetting::On,
+                    nudge_seam: false,
+                },
+            ),
+            crate::update_words::ApplyPosture::AtNextLaunch,
+            "and its posture says so"
+        );
+        app.launch_image_kept = false;
+        assert!(
+            app.update_lands_by_itself_with(true, None),
+            "CONTROL: a replaceable image takes the cold lane"
         );
     }
 }
@@ -6455,6 +6489,7 @@ fn an_armed_lane_looks_at_once_and_starts_as_its_pre_park_read_ends() {
         reason: None,
         policy: None,
         grant_chunks: false,
+        grant_empty: false,
     });
     done.store(true, std::sync::atomic::Ordering::Release);
     force_auto_apply_attempt_now(&mut app);
@@ -6685,6 +6720,7 @@ fn a_check_report_is_never_lost_to_a_read_that_began_before_it() {
                 reason: None,
                 policy: None,
                 grant_chunks: false,
+                grant_empty: false,
             });
     };
     let read = |reason: Option<&str>, began: Instant, ended: Instant| {
@@ -7089,6 +7125,7 @@ fn a_pre_park_verdict_answers_only_for_its_own_artifact() {
         reason: None,
         policy: None,
         grant_chunks: false,
+        grant_empty: false,
     });
     assert_eq!(app.cached_handoff_preverification(&download), Some(false));
     assert_eq!(

@@ -103,11 +103,15 @@ fn serve_retires(
     unload: impl Fn(&str),
 ) -> Vec<String> {
     let bridge = bridge_file(paths);
-    let mut failed = match std::fs::remove_file(&bridge) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            vec![format!("{}: {e}", bridge.display())]
-        }
-        _ => Vec::new(),
+    let mut failed = match crate::paths::existing_real_dir(&paths.state_dir) {
+        Ok(true) => match std::fs::remove_file(&bridge) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                vec![format!("{}: {e}", bridge.display())]
+            }
+            _ => Vec::new(),
+        },
+        Ok(false) => Vec::new(),
+        Err(e) => vec![format!("{}: {e}", bridge.display())],
     };
     match exe {
         Ok(exe) => failed.extend(retire_jobs_with(paths, &exe, has_verb, unload)),

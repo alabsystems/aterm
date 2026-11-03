@@ -254,7 +254,7 @@ fn legacy_source_sync_preserves_only_owned_shared_rows_without_rewriting_conflic
     };
     let mut logins = accounts::Logins::default();
     let mut next = Roster::default();
-    retain_shared_rows(&mut next, &existing, &logins).unwrap();
+    retain_shared_rows(&mut next, &existing, &logins, false).unwrap();
     assert!(
         next.rows.is_empty(),
         "ordinary source removal remains effective"
@@ -280,20 +280,37 @@ fn legacy_source_sync_preserves_only_owned_shared_rows_without_rewriting_conflic
             None,
         )
         .unwrap();
-    retain_shared_rows(&mut next, &existing, &logins).unwrap();
+    retain_shared_rows(&mut next, &existing, &logins, false).unwrap();
     assert_eq!(next.rows, existing.rows);
     let mut changed = row.clone();
     changed.email = Some("other@example.test".into());
     let mut conflict = Roster {
         rows: vec![changed.clone()],
     };
-    assert!(retain_shared_rows(&mut conflict, &existing, &logins).is_err());
+    assert!(retain_shared_rows(&mut conflict, &existing, &logins, false).is_err());
     assert_eq!(conflict.rows, vec![changed]);
     let mut held = row.clone();
     held.held_by = Some("m2".into());
     let mut owned_elsewhere = Roster {
         rows: vec![held.clone()],
     };
-    retain_shared_rows(&mut owned_elsewhere, &existing, &logins).unwrap();
+    retain_shared_rows(&mut owned_elsewhere, &existing, &logins, false).unwrap();
     assert_eq!(owned_elsewhere.rows, vec![held]);
+    // A sheet's class is part of the retained configuration; the lab's derived class, which
+    // only orders the roster, is not (NEGATIVE CONTROL: without the `class_derived` arm the
+    // lab's reclassification is refused as a change to the retained account).
+    let mut reclassed = row.clone();
+    reclassed.class = match row.class {
+        accounts::Class::Dedicated => accounts::Class::Shared,
+        accounts::Class::Shared => accounts::Class::Dedicated,
+    };
+    let mut sheet = Roster {
+        rows: vec![reclassed.clone()],
+    };
+    assert!(retain_shared_rows(&mut sheet, &existing, &logins, false).is_err());
+    let mut lab = Roster {
+        rows: vec![reclassed.clone()],
+    };
+    retain_shared_rows(&mut lab, &existing, &logins, true).unwrap();
+    assert_eq!(lab.rows, vec![reclassed]);
 }

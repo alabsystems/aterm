@@ -63,8 +63,7 @@ pub struct Entry {
 /// person allowed on any member, with no password and no person at an admin Mac, except a key on
 /// a `code-only` line), to aterm 0.148 and later only. An earlier aterm reads past it as a comment and reads the vault
 /// as closed, so its approver no longer lets in a request its own server took for a LAN one by
-/// its address alone (a phone hotspot's, a café's): the pinned default ALab vault's home-LAN
-/// rule is a later aterm's, which needs member evidence (`crate::home_lan`).
+/// its address alone (a phone hotspot's, a café's).
 pub const OPEN_NOTE: &str =
     "open = yes (aterm 0.148 and later; an earlier aterm reads this vault as closed)";
 
@@ -333,9 +332,8 @@ impl Document {
     }
 
     /// Whether the vault is open: `[join]`'s `open = yes` line, or its open note ([`OPEN_NOTE`])
-    /// with no join password beside it. The pinned default ALab vault admits requests its server
-    /// observed on the home ALab LAN automatically ([`crate::home_lan`]); other vaults require a
-    /// member's Allow. A key [`Document::code_only`] names still needs explicit code approval.
+    /// with no join password beside it: a request needs a member's Allow or an admin's approval
+    /// by code. A key [`Document::code_only`] names still needs explicit code approval.
     pub fn open(&self) -> bool {
         self.model.open.is_some()
             || (!self.model.open_notes.is_empty() && self.model.join.is_none())
@@ -1521,9 +1519,18 @@ pub(crate) fn anchor_received<'a>(
     entry: &Entry,
     find: impl FnOnce(&str) -> Option<&'a Entry>,
 ) -> bool {
-    entry.anchor.as_deref().is_none_or(|anchor| {
-        anchor != entry.name && find(anchor).is_some_and(|anchor| anchor.if_absent)
+    anchor_received_fields(&entry.name, entry.anchor.as_deref(), |anchor| {
+        find(anchor).map(|entry| entry.if_absent)
     })
+}
+
+/// The same anchor rule over entry descriptors which need not retain their values.
+pub(crate) fn anchor_received_fields(
+    name: &str,
+    anchor: Option<&str>,
+    find: impl FnOnce(&str) -> Option<bool>,
+) -> bool {
+    anchor.is_none_or(|anchor| anchor != name && find(anchor) == Some(true))
 }
 
 /// Every host and admin a machine; at least one admin.

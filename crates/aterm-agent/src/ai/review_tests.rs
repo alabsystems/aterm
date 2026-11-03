@@ -232,6 +232,7 @@ fn row_of(c: &'static Connector, state: State) -> Row {
     Row {
         connector: c,
         wanted: true,
+        asked: true,
         state,
         mark: Mark::Ok,
         fact: "signed in".into(),

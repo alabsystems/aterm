@@ -7446,7 +7446,8 @@ impl App {
             Some(
                 crate::native_app::AppViewState::About(_)
                 | crate::native_app::AppViewState::Markdown(_)
-                | crate::native_app::AppViewState::Recovery(_),
+                | crate::native_app::AppViewState::Recovery(_)
+                | crate::native_app::AppViewState::Workers(_),
             )
             | None => false,
         }
@@ -7530,7 +7531,8 @@ impl App {
             }
             Some(
                 crate::native_app::AppViewState::About(_)
-                | crate::native_app::AppViewState::Recovery(_),
+                | crate::native_app::AppViewState::Recovery(_)
+                | crate::native_app::AppViewState::Workers(_),
             )
             | None => None,
         }
@@ -8210,7 +8212,7 @@ impl App {
                 }
                 "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
                     if let Some(d) = lc.chars().next().and_then(|c| c.to_digit(10)) {
-                        self.switch_tab_in(wid, d as usize - 1);
+                        self.switch_shown_tab_in(wid, d as usize - 1);
                     }
                     return true;
                 }
@@ -8811,7 +8813,9 @@ impl App {
             Action::NewWindow => self.open_new_window(),
             Action::NextTab => self.cycle_tab_in(wid, true),
             Action::PrevTab => self.cycle_tab_in(wid, false),
-            Action::SwitchTab(n) => self.switch_tab_in(wid, usize::from(n).saturating_sub(1)),
+            Action::SwitchTab(n) => {
+                self.switch_shown_tab_in(wid, usize::from(n).saturating_sub(1));
+            }
             Action::SplitVertical | Action::SplitHorizontal => {
                 let dir = if action == Action::SplitVertical {
                     pane::SplitDir::Vertical
@@ -9592,7 +9596,8 @@ impl App {
             | crate::native_app::AppKind::About
             | crate::native_app::AppKind::Settings
             | crate::native_app::AppKind::SystemState
-            | crate::native_app::AppKind::Recovery => return,
+            | crate::native_app::AppKind::Recovery
+            | crate::native_app::AppKind::Workers => return,
         };
         if self.headless {
             crate::logging::stderr_line!(
@@ -9690,9 +9695,14 @@ impl App {
             Some(wid)
                 if matches!(
                     action,
-                    menu::MenuAction::Paste | menu::MenuAction::Copy | menu::MenuAction::SelectAll
+                    menu::MenuAction::Paste
+                        | menu::MenuAction::Copy
+                        | menu::MenuAction::SelectAll
+                        | menu::MenuAction::Minimize
                 ) =>
             {
+                // Minimizing sends the program no input and changes no grid. Retire the
+                // pending hint, but keep the same hand through the native focus round trip.
                 self.clear_move_license_keeping_hand(wid);
             }
             _ => self.clear_front_move_license(),
@@ -9955,6 +9965,7 @@ impl App {
                 self.open_settings_tab(crate::native_settings::SettingsRoute::Messages);
             }
             MenuAction::SystemState => self.open_system_state_from_menu(),
+            MenuAction::Workers => self.open_workers_from_menu(),
             MenuAction::Mail => {
                 self.open_mail_tab();
             }
@@ -10151,6 +10162,11 @@ impl App {
                     aterm_log::info!("show {}: {e}", peer_sid.as_str());
                 }
             }
+            ConnVerb::MoveToTab => {
+                if !self.unpark_session(local) {
+                    aterm_log::info!("move to tab {}: not parked", peer_sid.as_str());
+                }
+            }
             ConnVerb::StopWorker => {
                 if let Some(why) = self.stop_worker_refusal(local) {
                     self.stop_worker_refused(local, why);
@@ -10166,14 +10182,24 @@ impl App {
                     return;
                 }
                 let label = self.tab_label_of_session(local);
-                let body =
-                    format!("Stop {label}? Its agent gets SIGTERM and its task reads exited.");
+                let (title, default_body, proceed) = crate::app_overview::stop_worker_sheet(&label);
+                let pending_recovery = self
+                    .pool
+                    .get(local)
+                    .is_some_and(|session| crate::native_act::renewal_pending(&session.ctx));
+                let body = if pending_recovery {
+                    format!(
+                        "Stop {label}? Its pending recovery will be cancelled and any running agent stopped."
+                    )
+                } else {
+                    default_body
+                };
                 let real_window = self
                     .windows
                     .get(&window)
                     .is_some_and(|ws| ws.os_window.is_some());
                 let answer = if real_window {
-                    self.apprt.confirm_owner("Stop Worker", &body, "Stop")
+                    self.apprt.confirm_owner(title, &body, proceed)
                 } else {
                     None
                 };

@@ -624,6 +624,7 @@ label_enum! {
         StatsLive => "stats_live",
         DeckClock => "deck_clock",
         NativeMotion => "native_motion",
+        ChipWord => "chip_word",
     }
 }
 
@@ -2820,20 +2821,42 @@ mod submit_split {
     /// The calling thread's CPU time in nanoseconds; 0 where it cannot be read.
     fn thread_cpu_ns() -> u64 {
         #[cfg(unix)]
-        {
-            let mut stamp = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            // SAFETY: `stamp` is a valid, writable `timespec` that outlives the call.
-            if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut stamp) } == 0 {
-                return u64::try_from(stamp.tv_sec)
-                    .unwrap_or(0)
-                    .saturating_mul(1_000_000_000)
-                    .saturating_add(u64::try_from(stamp.tv_nsec).unwrap_or(0));
-            }
+        if let Some(stamp) = super::calling_thread_cpu_stamp() {
+            return u64::try_from(stamp.tv_sec)
+                .unwrap_or(0)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(u64::try_from(stamp.tv_nsec).unwrap_or(0));
         }
         0
+    }
+}
+
+#[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+fn calling_thread_cpu_stamp() -> Option<libc::timespec> {
+    let mut stamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `stamp` is a valid, writable `timespec` that outlives the call.
+    (unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut stamp) } == 0)
+        .then_some(stamp)
+}
+
+/// The calling thread's CPU time in ns, unknown on an unread or unrepresentable clock.
+#[cfg(any(debug_assertions, feature = "dev-seams"))]
+pub(crate) fn calling_thread_cpu_ns() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let stamp = calling_thread_cpu_stamp()?;
+        let seconds = u64::try_from(stamp.tv_sec).ok()?;
+        let nanos = u64::try_from(stamp.tv_nsec)
+            .ok()
+            .filter(|n| *n < 1_000_000_000)?;
+        seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
+    }
+    #[cfg(not(unix))]
+    {
+        None
     }
 }
 

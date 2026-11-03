@@ -110,8 +110,9 @@ carries both projects' MIT notices.
 
 ## Licence sources
 
-Each file in `LICENSES/` is the project's licence file verbatim, fetched on 2026-10-16 with
-`gh api repos/<repo>/contents/<path>?ref=<commit> --jq .content | base64 -d`.
+Each file in `LICENSES/` is the project's licence file verbatim, fetched on 2026-10-16 from
+the GitHub contents API (`repos/<repo>/contents/<path>?ref=<commit>`, its `content` field
+base64-decoded; `agh api` reads that endpoint today).
 `MIT-iTerm2-Color-Schemes.txt` is the collection's `LICENSE` at
 `21f281d0834846eef984f75774638e7d16bac068`, its per-theme sentence included.
 

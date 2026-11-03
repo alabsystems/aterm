@@ -46,7 +46,7 @@ fn listing(sessions: Vec<HarnessSession>) -> HarnessState {
 }
 
 /// Seven sessions: a timed Cruise, a Cruise its loop told landed (the chip
-/// keeps `∞`), Land with its task unknown and open (`⤓ land`), Land landed
+/// keeps `∞`), Land with its task unknown and open (`⤓`), Land landed
 /// (`✓ landed`), Land through a person's own exchange (`⤓ quiet`), and one
 /// Off.
 fn seven() -> HarnessState {
@@ -69,7 +69,7 @@ pub(super) fn says(words: &str, part: &str) -> bool {
 }
 
 /// THE EVERY ROW TELLS LANDING FROM LANDED (§12.4.6): a session under Land
-/// is counted by the face its chip wears — `landing` for `⤓ land` (its task
+/// is counted by the face its chip wears — `landing` for Land's `⤓` (its task
 /// open or unknown), `landed` for `✓ landed`, `quiet` for `⤓ quiet` — and a
 /// zero part is not said.
 #[test]

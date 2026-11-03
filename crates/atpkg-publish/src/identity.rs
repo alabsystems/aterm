@@ -12,6 +12,9 @@ use crate::error::{Error, Result};
 /// headroom while rejecting oversized files or streams).
 const MAX_KEY_BYTES: u64 = 16 * 1024;
 
+/// Maximum size in bytes of a metadata, manifest, index, or state file read by `atpkg-publish`.
+pub(crate) const MAX_META_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Overwrite `buf` with zeroes through volatile writes so dead-store elimination keeps them.
 fn scrub_bytes(buf: &mut [u8]) {
     for b in buf {
@@ -21,8 +24,18 @@ fn scrub_bytes(buf: &mut [u8]) {
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
-fn read_key_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
-    use std::io::Read as _;
+pub(crate) fn open_regular_nonblock(
+    path: &Path,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
     let file = std::fs::File::open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() {
@@ -31,6 +44,38 @@ fn read_key_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
             "not a regular file",
         ));
     }
+    Ok((file, meta))
+}
+
+pub(crate) fn read_regular_bytes(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let (file, meta) = open_regular_nonblock(path)?;
+    if meta.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes} bytes"),
+        ));
+    }
+    let mut buf = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)?;
+    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes} bytes"),
+        ));
+    }
+    Ok(buf)
+}
+
+pub(crate) fn read_regular_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    let bytes = read_regular_bytes(path, max_bytes)?;
+    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn read_key_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let (file, meta) = open_regular_nonblock(path)?;
     if meta.len() > MAX_KEY_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -121,8 +166,8 @@ impl MachineKey {
     ///
     /// When `doc` cannot be read or the signature cannot be written.
     pub fn sign_file(&self, doc: &Path) -> Result<PathBuf> {
-        let bytes =
-            std::fs::read(doc).map_err(|e| Error::io(format!("read {}", doc.display()), &e))?;
+        let bytes = read_regular_bytes(doc, 64 * 1024 * 1024)
+            .map_err(|e| Error::io(format!("read {}", doc.display()), &e))?;
         let sig = self.sign(&bytes)?;
         let mut out = doc.as_os_str().to_owned();
         out.push(".sig");
@@ -234,13 +279,18 @@ fn read_record(ctx: &Ctx, key_pub: &str) -> Result<MachineRecord> {
              id>\"\n  pubkey = \"{key_pub}\""
         )
     };
-    let text = std::fs::read_to_string(&ctx.identity.record).map_err(|e| {
-        Error::refused(format!(
-            "no machine record at {} ({e}) — {}",
-            ctx.shown(&ctx.identity.record),
-            restore()
-        ))
-    })?;
+    let text = read_regular_bytes(&ctx.identity.record, 64 * 1024)
+        .and_then(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })
+        .map_err(|e| {
+            Error::refused(format!(
+                "no machine record at {} ({e}) — {}",
+                ctx.shown(&ctx.identity.record),
+                restore()
+            ))
+        })?;
     let table: aterm_toml::Table = text.parse().map_err(|e| {
         Error::refused(format!(
             "{} does not parse ({e}) — {}",

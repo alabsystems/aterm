@@ -52,7 +52,7 @@ pub(crate) fn confirm_key(
 /// control client posted is dropped there: one that names the confirmation's own window
 /// (`attached`), or, while the confirmation is up (`outstanding`), one that names no window
 /// (`hwkey … shape=press`: AppKit hands it to the key window) or any key at all during an
-/// app-modal alert (`app_modal`, a Quit or Close question), which takes every key. A posted key
+/// app-modal alert (`app_modal`, such as a message-bus menu confirmation), which takes every key. A posted key
 /// that names another window while a sheet is up passes on to that window.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const fn may_reach_confirmation(
@@ -85,8 +85,8 @@ fn with_confirmations<R>(f: impl FnOnce(&std::sync::atomic::AtomicUsize) -> R) -
     }
 }
 
-/// Held while one of the person's confirmations is on screen (a multi-line paste sheet, a Quit
-/// or Close alert, an owner's question): `hwkey` starts no burst and posts no further key while
+/// Held while one of the person's native confirmations is on screen (a multi-line paste sheet,
+/// a menu confirmation, an owner's question): `hwkey` starts no burst and posts no further key while
 /// any is held ([`confirmation_up`], read under the posting lock), and the question's opener
 /// fences the key queue once it holds one (`hwkey::fence_queued_keys`), so no posted key answers
 /// it, whatever window it names, queued before it opened or not, with or without the
@@ -521,8 +521,8 @@ mod tests {
 
     /// A POSTED KEY THAT COULD REACH A CONFIRMATION IS ASKED ABOUT, WHATEVER WINDOW IT NAMES:
     /// while the confirmation is up, a key naming no window (`hwkey … shape=press`, which AppKit
-    /// hands to the key window, the paste sheet) and any key during an app-modal Quit or Close
-    /// alert count as reaching it, so a posted one is dropped; a key naming another window while
+    /// hands to the key window, the paste sheet) and any key during an app-modal confirmation
+    /// count as reaching it, so a posted one is dropped; a key naming another window while
     /// a sheet is up passes to it, and nothing counts once the confirmation is gone.
     /// NEGATIVE CONTROL: with the rule `attached` alone (as `decide` read it at 3a3de060b1), the
     /// window-less key and the app-modal alert's key do not count, and the first assertion fails.

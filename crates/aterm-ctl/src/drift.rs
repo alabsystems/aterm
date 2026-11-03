@@ -199,6 +199,93 @@ fn no_analyzer_error(what: &str) -> io::Error {
     io::Error::other(msg)
 }
 
+/// Maximum bytes read from a saved asciicast recording (`64 MiB`).
+const MAX_CAST_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum bytes read from a saved screen text dump (`8 MiB`).
+const MAX_SCREEN_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "riscv64",
+        target_arch = "aarch64",
+        target_arch = "arm",
+    ),
+))]
+const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0800;
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0004;
+
+fn read_drift_file(path: &str, max_bytes: u64) -> io::Result<String> {
+    let map_err = |e: io::Error| {
+        let mut msg = String::from("cast drift: read ");
+        msg.push_str(path);
+        msg.push_str(": ");
+        msg.push_str(&e.to_string());
+        io::Error::new(e.kind(), msg)
+    };
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(any(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "riscv64",
+                target_arch = "aarch64",
+                target_arch = "arm",
+            ),
+        ),
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(NONBLOCK_OPEN_FLAG);
+    }
+    let file = opts.open(path).map_err(map_err)?;
+    let meta = file.metadata().map_err(map_err)?;
+    if !meta.is_file() {
+        return Err(map_err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        )));
+    }
+    if meta.len() > max_bytes {
+        return Err(map_err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        )));
+    }
+    let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let mut text = String::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_string(&mut text)
+        .map_err(map_err)?;
+    if text.len() > cap {
+        return Err(map_err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        )));
+    }
+    Ok(text)
+}
+
 /// The rows of a `text` dump: one per line, a final newline not making an
 /// extra row, `\r` endings tolerated.
 fn screen_rows(text: &str) -> Vec<String> {
@@ -230,23 +317,9 @@ pub(crate) fn offline_entry(parts: &[String], local: &LocalVerbs) -> io::Result<
             "offline `cast drift --file` replays the recording",
         ));
     };
-    let cast = std::fs::read_to_string(&off.file).map_err(|e| {
-        let mut msg = String::from("cast drift: read ");
-        msg.push_str(&off.file);
-        msg.push_str(": ");
-        msg.push_str(&e.to_string());
-        io::Error::new(e.kind(), msg)
-    })?;
+    let cast = read_drift_file(&off.file, MAX_CAST_FILE_BYTES)?;
     let screen = match &off.screen {
-        Some(path) => Some(screen_rows(&std::fs::read_to_string(path).map_err(
-            |e| {
-                let mut msg = String::from("cast drift: read ");
-                msg.push_str(path);
-                msg.push_str(": ");
-                msg.push_str(&e.to_string());
-                io::Error::new(e.kind(), msg)
-            },
-        )?)),
+        Some(path) => Some(screen_rows(&read_drift_file(path, MAX_SCREEN_FILE_BYTES)?)),
         None => None,
     };
     let args = off.args.join(" ");

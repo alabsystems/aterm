@@ -221,6 +221,7 @@ fn current_membership_and_local_custody_gate_shared_evidence_but_table_failure_d
     unproven.actor = None;
     observe_contacts(
         &bootstrap,
+        &std::cell::OnceCell::new(),
         &mut history,
         Vec::new(),
         &[unknown, own, unproven],
@@ -234,6 +235,7 @@ fn current_membership_and_local_custody_gate_shared_evidence_but_table_failure_d
     failed.application_error = Some("no table repair".into());
     observe_contacts(
         &bootstrap,
+        &std::cell::OnceCell::new(),
         &mut history,
         Vec::new(),
         &[failed],
@@ -259,6 +261,7 @@ fn current_membership_and_local_custody_gate_shared_evidence_but_table_failure_d
     };
     observe_contacts(
         &bootstrap,
+        &std::cell::OnceCell::new(),
         &mut history,
         Vec::new(),
         &[connected],

@@ -1580,13 +1580,14 @@ pub(crate) mod scripts {
         s
     }
 
-    /// A HELD COMMIT RIDING A PUBLISH (critic item B08): the bridge sends a round's held
-    /// inbox commit and its next publish as one burst in one write
-    /// (`Link::send_after_commit`), which astream takes into one batch. Each burst here is
-    /// a commit, then a publish: one commit that moves the group; one max-folded below it,
-    /// beside a resend the dedup answers; and one beside a publish its subject refuses, the
-    /// commit landing all the same. Then a group tail resumes past the last commit that
-    /// moved the group, before and after a restart.
+    /// A HELD COMMIT RIDING A BURST (critic items B08 and C13): the bridge sends a round's
+    /// held inbox commit ahead of its next publish, or of its bus mirror's slots, as one burst
+    /// in one write (`Link::send_burst`), which astream takes into one batch. Each burst here
+    /// is a commit, then what it rides: one commit that moves the group; one max-folded below
+    /// it, beside a resend the dedup answers; one beside a publish its subject refuses, the
+    /// commit landing all the same; and one ahead of three mirror slots on a session's `ev`
+    /// face, one of them a resend. Then a group tail resumes past the last commit that moved
+    /// the group, before and after a restart.
     pub(crate) fn corked() -> Vec<Step> {
         let group = || Request::SubscribeGroup {
             group: GROUP.to_string(),
@@ -1618,6 +1619,15 @@ pub(crate) mod scripts {
             Step::Send(2, group()),
             Step::Send(1, publish(P, seq(1, 3), LANE, "after")),
             Step::Deliver(2),
+            Step::Pipeline(
+                1,
+                vec![
+                    commit(GROUP, 6),
+                    publish(P, seq(1, 4), EV, "snap 1"),
+                    publish(P, seq(1, 5), EV, "snap 2"),
+                    publish(P, seq(1, 4), EV, "snap 1"),
+                ],
+            ),
             Step::Stop(super::Stop::Clean),
             Step::Start,
             Step::Dial(3),

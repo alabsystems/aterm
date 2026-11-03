@@ -35,6 +35,8 @@ fn the_measured_manifest_parses_and_a_changed_layout_refuses() {
         PACKAGE_0_157_1.replace("0.157.1", "0.157.1-alpha"),
         PACKAGE_0_157_1.replace("bin/codex", "/abs/codex"),
         PACKAGE_0_157_1.replace("bin/codex", "../codex"),
+        PACKAGE_0_157_1.replace("bin/codex", ""),
+        PACKAGE_0_157_1.replace("bin/codex", "."),
         "not json".to_string(),
     ] {
         assert_eq!(parse_package(&bad), None, "{bad}");

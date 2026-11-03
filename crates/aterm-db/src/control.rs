@@ -38,13 +38,17 @@ const HELLO_FIXED: usize = 4 + 16 + 32 + 32 + REQUEST_LEN;
 const MAX_HELLO: usize = HELLO_FIXED + MAX_NODE;
 const MAX_ACX2_HELLO: usize = HELLO_FIXED + 4 * 1024 * 1024;
 
+/// Evidence a peer can send (a hello, a witness, membership records or a version
+/// report) did not verify. Its error describes bytes a peer chooses, so the
+/// refusal stays generic; a local failure keeps its error ([`local_failure`]).
 fn failure(_: impl std::fmt::Display) -> Error {
     Error::new("Commons control journal refused the operation")
 }
 
 // Secrets errors name failures without exposing secret values. Preserve that
-// local evidence at the batch boundary; remote witness failures stay generic.
-fn journal_failure(operation: &str, error: aterm_secrets::Error) -> Error {
+// local evidence, and whether it was local contention, at every local boundary;
+// remote witness failures stay generic ([`failure`]).
+fn local_failure(operation: &str, error: aterm_secrets::Error) -> Error {
     Error::from(error).context(&format!("Commons control {operation}"))
 }
 
@@ -259,6 +263,7 @@ impl Repair {
         self.data.deferral = None;
         self.data.batch_deferral = None;
         self.data.interrupted = None;
+        self.data.clock = None;
     }
     /// The most recently channel-authenticated peer; the round may have failed.
     pub fn actor(&self) -> Option<Actor> {
@@ -300,6 +305,13 @@ impl Repair {
     /// What this round's peer said of its version ([`hearing::report`]).
     pub(crate) const fn said(&self) -> Said {
         self.said
+    }
+    /// What this round's application exchange read of this Mac's clock against the peer's
+    /// (`crate::clock`, F22), whether or not its table repair then succeeded. None also covers a
+    /// round that reached no table-ID list, a peer that sent two marks, and a pre-F22 peer that
+    /// offered no claims table.
+    pub const fn clock(&self) -> Option<crate::clock::Reading> {
+        self.data.clock
     }
     /// Only a fully completed application round has a report. None also covers
     /// legacy peers and deferred/failed upgrades, never a claim of no data.
@@ -492,8 +504,13 @@ impl Endpoint {
     /// exchanging data. Each application batch still rechecks fresh custody.
     pub fn from_session(session: &crate::table::Session<'_>) -> Result<Self> {
         let (bootstrap, journal) = session.control_context()?;
-        let request = bootstrap.request().map_err(failure)?;
-        if let Some(log_witness) = bootstrap.log_witness().map_err(failure)? {
+        let request = bootstrap
+            .request()
+            .map_err(|error| local_failure("device request", error))?;
+        if let Some(log_witness) = bootstrap
+            .log_witness()
+            .map_err(|error| local_failure("log witness", error))?
+        {
             return bootstrap.device().with_seed(|seed| {
                 let mut endpoint = Self::configured_log(
                     bootstrap.journal_dir(),
@@ -508,7 +525,7 @@ impl Endpoint {
         }
         let witness = bootstrap
             .witness_in(journal)
-            .map_err(failure)?
+            .map_err(|error| local_failure("witness", error))?
             .ok_or_else(|| Error::new("Commons membership has no historical approval"))?;
         bootstrap.device().with_seed(|seed| {
             let mut endpoint = Self::configured(
@@ -619,6 +636,16 @@ impl Endpoint {
         self
     }
 
+    /// Send no clock mark, as a build from before F22 does.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_marks(mut self, marks: bool) -> Self {
+        self.application = self
+            .application
+            .map(|application| application.with_marks(marks));
+        self
+    }
+
     /// Attach local secrets custody paths so control-only endpoints exchange verified membership
     /// records alongside Commons control history.
     #[must_use]
@@ -632,7 +659,7 @@ impl Endpoint {
         bootstrap: &aterm_secrets::commons::bootstrap::Bootstrap,
     ) -> Result<Option<Self>> {
         let journal = Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust())
-            .map_err(|error| journal_failure("admission", error))?;
+            .map_err(|error| local_failure("admission", error))?;
         Self::from_bootstrap_in(bootstrap, &journal)
     }
 
@@ -645,8 +672,10 @@ impl Endpoint {
     ) -> Result<Option<Self>> {
         let journal =
             Journal::open_existing_until(bootstrap.journal_dir(), bootstrap.trust(), deadline)
-                .map_err(|error| journal_failure("admission", error))?;
-        bootstrap.revalidate_custody().map_err(failure)?;
+                .map_err(|error| local_failure("admission", error))?;
+        bootstrap
+            .revalidate_custody()
+            .map_err(|error| local_failure("custody revalidation", error))?;
         Self::from_bootstrap_in(bootstrap, &journal)
     }
 
@@ -654,8 +683,13 @@ impl Endpoint {
         bootstrap: &aterm_secrets::commons::bootstrap::Bootstrap,
         journal: &Journal,
     ) -> Result<Option<Self>> {
-        if let Some(log_witness) = bootstrap.log_witness().map_err(failure)? {
-            let request = bootstrap.request().map_err(failure)?;
+        if let Some(log_witness) = bootstrap
+            .log_witness()
+            .map_err(|error| local_failure("log witness", error))?
+        {
+            let request = bootstrap
+                .request()
+                .map_err(|error| local_failure("device request", error))?;
             return bootstrap
                 .device()
                 .with_seed(|seed| {
@@ -671,10 +705,15 @@ impl Endpoint {
                 })
                 .map(Some);
         }
-        let Some(witness) = bootstrap.witness_in(journal).map_err(failure)? else {
+        let Some(witness) = bootstrap
+            .witness_in(journal)
+            .map_err(|error| local_failure("witness", error))?
+        else {
             return Ok(None);
         };
-        let request = bootstrap.request().map_err(failure)?;
+        let request = bootstrap
+            .request()
+            .map_err(|error| local_failure("device request", error))?;
         bootstrap
             .device()
             .with_seed(|seed| {
@@ -697,8 +736,14 @@ impl Endpoint {
         bootstrap: &aterm_secrets::commons::bootstrap::Bootstrap,
         paths: aterm_secrets::client::Paths,
     ) -> Result<Self> {
-        if bootstrap.log_witness().map_err(failure)?.is_some()
-            || bootstrap.witness().map_err(failure)?.is_some()
+        if bootstrap
+            .log_witness()
+            .map_err(|error| local_failure("log witness", error))?
+            .is_some()
+            || bootstrap
+                .witness()
+                .map_err(|error| local_failure("witness", error))?
+                .is_some()
         {
             return Err(Error::new(
                 "an enrolled device cannot use pending enrollment",
@@ -714,10 +759,13 @@ impl Endpoint {
         paths: aterm_secrets::client::Paths,
         deadline: Instant,
     ) -> Result<Self> {
-        if bootstrap.log_witness().map_err(failure)?.is_some()
+        if bootstrap
+            .log_witness()
+            .map_err(|error| local_failure("log witness", error))?
+            .is_some()
             || bootstrap
                 .witness_until(deadline)
-                .map_err(failure)?
+                .map_err(|error| local_failure("witness", error))?
                 .is_some()
         {
             return Err(Error::new(
@@ -731,7 +779,9 @@ impl Endpoint {
         bootstrap: &aterm_secrets::commons::bootstrap::Bootstrap,
         paths: aterm_secrets::client::Paths,
     ) -> Result<Self> {
-        let request = bootstrap.request().map_err(failure)?;
+        let request = bootstrap
+            .request()
+            .map_err(|error| local_failure("device request", error))?;
         bootstrap.device().with_seed(|seed| {
             let identity = NodeIdentity::from_seed(
                 &aterm_codec::hex::encode_lower(request.binding().incarnation()),
@@ -787,7 +837,7 @@ impl Endpoint {
         seed: &[u8; 32],
     ) -> Result<Self> {
         let endpoint = Self::configured(dir, trust, request, witness, seed)?;
-        drop(Journal::open(dir, trust).map_err(|error| journal_failure("admission", error))?);
+        drop(Journal::open(dir, trust).map_err(|error| local_failure("admission", error))?);
         Ok(endpoint)
     }
 
@@ -816,8 +866,8 @@ impl Endpoint {
         hello.extend_from_slice(request.bytes());
         hello.extend_from_slice(log_witness);
         let actor = request.binding().actor();
-        let report =
-            hearing::report(seed, trust.network, &actor, Version::own()).map_err(failure)?;
+        let report = hearing::report(seed, trust.network, &actor, Version::own())
+            .map_err(|error| local_failure("version report", error))?;
         Ok(Self {
             dir: dir.into(),
             trust,
@@ -864,8 +914,8 @@ impl Endpoint {
         hello.extend_from_slice(request.bytes());
         hello.extend_from_slice(witness);
         let actor = request.binding().actor();
-        let report =
-            hearing::report(seed, trust.network, &actor, Version::own()).map_err(failure)?;
+        let report = hearing::report(seed, trust.network, &actor, Version::own())
+            .map_err(|error| local_failure("version report", error))?;
         Ok(Self {
             dir: dir.into(),
             trust,
@@ -1725,8 +1775,10 @@ fn verify_peer_against_local_log(
     };
     let denied_by = |log: &aterm_secrets::membership_log::Log| {
         use aterm_secrets::membership_log::{EpochAudience, NodeStanding};
-        let log_roster = aterm_secrets::client::local_swarm_roster_for_log(paths, log)
-            .or_else(|| roster.clone());
+        let Ok(log_roster) = aterm_secrets::client::local_swarm_roster_for_log(paths, log) else {
+            return true;
+        };
+        let log_roster = log_roster.or_else(|| roster.clone());
         let membership = log.membership();
         membership.removal(&actor).is_some()
             || log.recipient_is_removed(&recipient)
@@ -1955,7 +2007,7 @@ impl Store for Disk<'_> {
     const MAX_WIRE: usize = MAX_NODE;
     fn inventory(&self) -> Result<BTreeSet<Digest>> {
         let journal = Journal::read_existing(self.dir, self.trust)
-            .map_err(|error| journal_failure("inventory", error))?;
+            .map_err(|error| local_failure("inventory", error))?;
         Ok(journal.inventory().copied().collect())
     }
     fn batch(&self, ids: &[Digest]) -> Result<Vec<Vec<u8>>> {
@@ -1963,7 +2015,7 @@ impl Store for Disk<'_> {
             return Ok(Vec::new());
         }
         let journal = Journal::read_existing(self.dir, self.trust)
-            .map_err(|error| journal_failure("batch", error))?;
+            .map_err(|error| local_failure("batch", error))?;
         ids.iter()
             .map(|id| {
                 journal
@@ -1991,7 +2043,7 @@ impl Store for Disk<'_> {
         // Peers mostly offer what is already held. Acknowledge those from the
         // lock-free view; take the writer only when a valid record is new.
         let known = Journal::read_existing(self.dir, self.trust)
-            .map_err(|error| journal_failure("retain inventory", error))?;
+            .map_err(|error| local_failure("retain inventory", error))?;
         let held: Vec<bool> = wires
             .iter()
             .zip(&valid)
@@ -2008,7 +2060,7 @@ impl Store for Disk<'_> {
                 // Another local writer kept the journal: acknowledge what is
                 // held, and leave the new records for the peer to offer again.
                 Err(error) if error.kind() == aterm_secrets::ErrorKind::JournalBusy => None,
-                Err(error) => return Err(journal_failure("retain", error)),
+                Err(error) => return Err(local_failure("retain", error)),
             }
         } else {
             None
@@ -2019,7 +2071,8 @@ impl Store for Disk<'_> {
             // barrier failed. Make the entry durable before calling these
             // records durable; a later checkpoint only extends this one.
             if held.iter().any(|held| *held) {
-                aterm_durable::durable_dir(self.dir).map_err(failure)?;
+                aterm_durable::durable_dir(self.dir)
+                    .map_err(|error| Error::from(error).context("Commons control retain"))?;
             }
             return Ok(held);
         };
@@ -2145,7 +2198,7 @@ impl<'a> MembershipDisk<'a> {
             self.loads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let store = aterm_secrets::client::load_records(self.paths)
-                .map_err(|error| journal_failure(op, error))?;
+                .map_err(|error| local_failure(op, error))?;
             *guard = Some(store);
         }
         f(guard.as_ref().expect("populated above"))
@@ -2237,7 +2290,7 @@ impl Store for MembershipDisk<'_> {
             self.trust.authority,
             wires,
         )
-        .map_err(|error| journal_failure("membership retain", error))?;
+        .map_err(|error| local_failure("membership retain", error))?;
         if verdicts.iter().any(|&v| v) {
             self.invalidate();
         }

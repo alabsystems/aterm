@@ -268,7 +268,8 @@ pub fn sign_all(ctx: &Ctx, pkgs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut sigs = Vec::new();
     for pkg in pkgs {
         let shown = ctx.shown(pkg);
-        let bytes = std::fs::read(pkg).map_err(|e| Error::io(format!("read {shown}"), &e))?;
+        let bytes = crate::identity::read_regular_bytes(pkg, crate::identity::MAX_META_BYTES)
+            .map_err(|e| Error::io(format!("read {shown}"), &e))?;
         let (sig, parsed) = sign_checked(&key, &bytes, &authority)
             .map_err(|e| Error::refused(format!("{shown}: {e}")))?;
         check_signable(&parsed).map_err(|e| Error::refused(format!("{shown}: {e}")))?;

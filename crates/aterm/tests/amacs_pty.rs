@@ -4,8 +4,7 @@
 //! Integration tests for `amacs` running under a real PTY controlling terminal,
 //! verifying terminal mode restoration on normal exit, SIGTERM, and panic.
 use std::io::{Read as _, Write as _};
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
-use std::os::unix::process::CommandExt as _;
+use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::path::Path;
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
@@ -112,39 +111,27 @@ impl Session {
         let alias = bin.join("amacs");
         std::os::unix::fs::symlink(aterm, &alias).expect("lay the amacs alias");
 
-        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-        // SAFETY: two fresh descriptors this test alone owns.
-        let (master, slave) =
-            unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        let mut before = None;
+        let (master, slave, child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
+            before = Some(termios(slave.as_raw_fd()));
+            #[expect(
+                clippy::disallowed_types,
+                reason = "spawn_session_leader_on_pty installs spawnfd::InheritNothing and pre_exec(TIOCSCTTY)"
+            )]
+            let mut cmd = std::process::Command::new(&alias);
+            launch_isolation::apply(&mut cmd, root.path());
+            cmd.arg(root.path().join("notes.txt"))
+                .env_remove("TMUX")
+                .env_remove("STY")
+                .env("TERM", "xterm-256color")
+                .envs(env.iter().copied())
+                .stdout(Stdio::from(slave.try_clone()?))
+                .stderr(Stdio::from(slave.try_clone()?));
+            Ok(cmd)
+        })
+        .expect("run amacs");
         aterm_pty::set_nonblocking(master.as_raw_fd(), true).expect("a non-blocking master");
-        let before = termios(master.as_raw_fd());
-
-        #[expect(
-            clippy::disallowed_types,
-            reason = "the controlling PTY needs pre_exec(TIOCSCTTY); launch_isolation::apply installs spawnfd::InheritNothing before that hook"
-        )]
-        let mut cmd = std::process::Command::new(&alias);
-        launch_isolation::apply(&mut cmd, root.path());
-        cmd.arg(root.path().join("notes.txt"))
-            .env_remove("TMUX")
-            .env_remove("STY")
-            .env("TERM", "xterm-256color")
-            .envs(env.iter().copied())
-            .stdin(Stdio::from(slave.try_clone().expect("dup the slave")))
-            .stdout(Stdio::from(slave.try_clone().expect("dup the slave")))
-            .stderr(Stdio::from(slave.try_clone().expect("dup the slave")));
-        // SAFETY: the hook runs in the forked child before `exec` and calls only
-        // async-signal-safe functions (`setsid`, `ioctl`) on its own stdin, the slave.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = cmd.spawn().expect("run amacs");
-        drop(cmd);
+        let before = before.expect("build captured termios before spawn");
         let mut session = Self {
             root,
             child,

@@ -5,8 +5,8 @@
 //! F10, §3.3.1). The fleet port's `ask` op hands each asking Mac's stream to the desk
 //! ([`ask_handler`]); the digest files one Info entry per request the desk heard that needs a
 //! person ("New Mac calling itself <name>", [`crate::join_entries`]), never an alert on screen,
-//! with [Allow] beside it; a request from this member's home ALab LAN on the default ALab vault
-//! feeds the vault's own automatic admission queue instead and files nothing. Allow shows a
+//! with [Allow] beside it, from every network; a Mac on this member's home ALab LAN gets in with
+//! no row by proving itself to the desk instead. Allow shows a
 //! phrase in a native sheet on this Mac's own display, for a person to type on the asking Mac. A
 //! row follows its Mac: it lapses once the Mac stops asking, closes on any admission, and goes
 //! when this Mac moves to another network ([`follow_network`]), and its entry ends with it.
@@ -304,17 +304,6 @@ pub(crate) fn spawn_lane(headless: bool) -> bool {
                     CHANGED.store(true, Ordering::Release);
                     before = now;
                 }
-                if let Some(desk) = &desk {
-                    match desk::forward_automatic_requests(desk, &paths) {
-                        Ok(0) => {}
-                        Ok(count) => aterm_log::info!(
-                            "members: queued {count} LAN requests for automatic ALab admission"
-                        ),
-                        Err(error) => aterm_log::info!(
-                            "members: automatic ALab admission will retry: {error}"
-                        ),
-                    }
-                }
                 if moved.wait(READ_EVERY) != crate::network_moved::Woke::Timer {
                     follow_network(&LIVE);
                     // The member's home ALab LAN is read with its Commons state
@@ -443,6 +432,7 @@ fn left(paths: &aterm_secrets::client::Paths) -> bool {
                 | Unavailable::NotAdmitted
                 | Unavailable::Revoked
                 | Unavailable::MissingIdentity
+                | Unavailable::ControlExcluded
                 | Unavailable::ControlNotVisible
         ))
     )
@@ -891,7 +881,6 @@ impl App {
                             crate::control::pct_encode(&note.by.join(",")),
                             if note.quorum { " quorum=1" } else { "" }
                         ),
-                        _ if row.automatic => "joining".to_owned(),
                         (None, RowState::Allowed(_)) => "allowed".to_owned(),
                         (None, _) => "asking".to_owned(),
                     };

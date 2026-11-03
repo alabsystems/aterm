@@ -422,7 +422,8 @@ pub(super) fn prompt_scope(kind: aterm_phase::PromptKind) -> Option<Scope> {
         | PromptKind::ComputerUse
         | PromptKind::ReadOutsideSetting
         | PromptKind::McpServer
-        | PromptKind::AutoModeSetup => Scope::Approvals,
+        | PromptKind::AutoModeSetup
+        | PromptKind::ChromeIntro => Scope::Approvals,
     })
 }
 

@@ -50,6 +50,10 @@ pub const ENV_TAB_SHELL: &str = "ATERM_TAB_SHELL";
 /// Development-seam environment variable enabling fast harness timers in debug builds.
 pub const ENV_DEV_FAST_TIMERS: &str = "ATERM_DEV_FAST_TIMERS";
 
+/// Development-seam environment variable naming the sleep a debug build's hosted harness loops
+/// read: `none`, a host that never sleeps, which every live test's instance sets.
+pub const ENV_DEBUG_HOST_SLEEP: &str = "ATERM_DEBUG_HOST_SLEEP";
+
 /// Environment variable advertising `amacs` as the default editor to shell integration.
 pub const ENV_DEFAULT_EDITOR: &str = "ATERM_DEFAULT_EDITOR";
 
@@ -95,6 +99,7 @@ pub const ENV_DENY_VARS: &[&str] = &[
     "ATERM_DEBUG_QUIT_BYE",
     "ATERM_DEBUG_HEADLESS_PKG_LANE",
     ENV_DEV_FAST_TIMERS,
+    ENV_DEBUG_HOST_SLEEP,
     "ATERM_UPDATE_TOKEN",
     "ATPKG_TOKEN",
     ENV_SESSION_ID,
@@ -239,6 +244,7 @@ mod tests {
             "ATERM_UPDATE_TOKEN",
             "ATPKG_TOKEN",
             ENV_DEV_FAST_TIMERS,
+            ENV_DEBUG_HOST_SLEEP,
         ] {
             assert!(is_ai_env_var(v), "{v} must be deny-listed for inheritance");
         }

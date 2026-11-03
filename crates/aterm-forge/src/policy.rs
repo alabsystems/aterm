@@ -72,7 +72,7 @@ pub struct Policy {
 /// Read `<root>/vendor/forge.toml`.
 pub fn load(root: &Path) -> Result<Policy, String> {
     let path = root.join(POLICY_PATH);
-    match std::fs::read_to_string(&path) {
+    match crate::read_regular_text(&path) {
         Ok(text) => parse(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Policy::default()),
         Err(e) => Err(format!(
@@ -296,7 +296,7 @@ pub struct LockEntry {
 /// Every `[[package]]` in `<root>/Cargo.lock`, in file order.
 pub fn lock_entries(root: &Path) -> Result<Vec<LockEntry>, String> {
     let path = root.join("Cargo.lock");
-    let text = std::fs::read_to_string(&path).map_err(|e| {
+    let text = crate::read_regular_text(&path).map_err(|e| {
         format!(
             "cannot read {} ({e}) — run `targo metadata --offline` from the workspace root to \
              regenerate it",
@@ -439,7 +439,7 @@ impl PatchEntry {
 /// Reads `[patch.crates-io]` entries from `<root>/Cargo.toml` and `Cargo.lock`.
 pub fn patch_entries(root: &Path) -> Result<Vec<PatchEntry>, String> {
     let manifest = root.join("Cargo.toml");
-    let text = std::fs::read_to_string(&manifest)
+    let text = crate::read_regular_text(&manifest)
         .map_err(|e| format!("cannot read {} ({e})", manifest.display()))?;
     let doc: DocumentMut = text
         .parse()
@@ -528,7 +528,7 @@ fn patched_manifest(
     kind: PatchTargetKind,
 ) -> Result<(String, String, String), String> {
     let path = root.join(rel).join("Cargo.toml");
-    let text = std::fs::read_to_string(&path).map_err(|e| {
+    let text = crate::read_regular_text(&path).map_err(|e| {
         format!(
             "cannot read {} ({e}) — `[patch.crates-io]` points at `{rel}`, so that directory \
              must contain the patched crate. Restore it, or delete the patch entry",
@@ -555,7 +555,7 @@ fn patched_manifest(
         if !claims_inheritance {
             return None;
         }
-        let root_text = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+        let root_text = crate::read_regular_text(root.join("Cargo.toml")).ok()?;
         let root_doc: DocumentMut = root_text.parse().ok()?;
         root_doc
             .get("workspace")

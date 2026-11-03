@@ -5,6 +5,12 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(all(test, unix))]
+aterm_db::admission_waits_in_tests!(aterm_spec::wait::MUST_HAPPEN);
+
+#[cfg(unix)]
+mod artifact_serve;
+
 #[cfg(target_os = "macos")]
 mod abrew_admission;
 #[cfg(target_os = "macos")]
@@ -44,6 +50,16 @@ mod build_admit {
     pub fn cmd(_: &[String]) -> crate::Res {
         Err(crate::Fail::die(
             "build-admit needs a debug lab image for its scratch-ledger seam",
+        ))
+    }
+}
+#[cfg(all(target_os = "macos", debug_assertions))]
+mod alab_roll;
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+mod alab_roll {
+    pub fn cmd(_: &[String]) -> crate::Res {
+        Err(crate::Fail::die(
+            "alab-roll needs a debug lab image for its scratch-registry seams",
         ))
     }
 }
@@ -97,6 +113,16 @@ mod fleet_menu;
 mod fleet_probe;
 #[cfg(target_os = "macos")]
 mod fleet_sim;
+#[cfg(all(target_os = "macos", debug_assertions))]
+mod service_acceptance;
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+mod service_acceptance {
+    pub fn cmd(_: &[String]) -> crate::Res {
+        Err(crate::Fail::die(
+            "service-acceptance requires a debug lab binary",
+        ))
+    }
+}
 #[cfg(target_os = "macos")]
 mod fleet_world;
 #[cfg(target_os = "macos")]
@@ -208,6 +234,8 @@ mod record;
 #[cfg(target_os = "macos")]
 mod recorder;
 #[cfg(target_os = "macos")]
+mod recording_cpu;
+#[cfg(target_os = "macos")]
 mod reduce;
 #[cfg(target_os = "macos")]
 mod relaunch_agy;
@@ -266,6 +294,8 @@ mod system_state_measure;
 #[cfg(target_os = "macos")]
 mod system_state_sheet;
 #[cfg(target_os = "macos")]
+mod tab_gallery;
+#[cfg(target_os = "macos")]
 mod tape;
 #[cfg(target_os = "macos")]
 mod trail_census;
@@ -304,6 +334,8 @@ mod windows_desk;
 #[cfg(target_os = "macos")]
 mod windows_guest;
 #[cfg(target_os = "macos")]
+mod windows_settings;
+#[cfg(target_os = "macos")]
 mod windows_smoke;
 #[cfg(target_os = "macos")]
 mod windows_uia;
@@ -335,16 +367,20 @@ pub fn wait_until(within: std::time::Duration, mut pred: impl FnMut() -> bool) -
 /// The verbs, as `help` prints them.
 pub const USAGE: &str = "\
 aterm-lab — the real Claude Code, Codex, agy, Muse Code or Grok Build TUI in a jailed private headless aterm
-against a local API stub (Anthropic, Responses, Gemini, Meta or xAI). A lab is fully local: no real account, token or egress.
+against a local API stub (Anthropic, Responses, Gemini, Meta or xAI). Most labs are fully local; artifact-serve is an explicit peer-bound LAN transfer.
 
 usage: targo --unverified lab <command> [tag] [args]
        (tag: the first word when it names a lab that is up, else $LAB_TAG or \"lab\" and the word is an argument;
        up takes one optional tag beside --window, --fabric and --tab-strip; down, ps, crash and sleep take any
        first word as the tag;
        a verb that brings up its own lab defaults to a tag of its own)
+  artifact-serve --bind LAN_IP:PORT --peer IP --status NEW_PATH --file NAME=ABSOLUTE_PATH...
+                                 serve immutable named snapshots to one peer using a capability stored only in the private status file
+                                 bounded by --lifetime-secs (default 900, maximum 3600) and --max-requests (default 32, maximum 128)
   up [tag] [--window] [--fabric] [--tab-strip]
                                  start the stub, a black-hole proxy, the egress witness and a jailed private aterm
-                                 (headless by default; --window opens one real window in the same jail)
+                                 (headless by default; --window opens one real window in the same jail), and name the
+                                 build that instance runs (<version>+g<commit>, as its `ctl version` and harness tapes do)
                                  --fabric: the lab's own bus: a private broker in the jail and the lab's socket dir, node and
                                  observer caps (<run>/fabric), the [fabric] table and the rendezvous file `aterm link` reads,
                                  the bridge connected before up returns; `down` ends it (refused beside a LAB_ATERM_TOML [fabric])
@@ -607,7 +643,7 @@ Outside any lab (no jail, no stub):
   instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N] [--scene band-icons|harness-layouts]
            [--env NAME=VALUE]... [--toml LINE]... [--toml-after LINE]... [--harness-key LINE]... [--home DIR] [--harness]
            [--reroute-prefix DIR] [--pre VERB]... [--image PNG] [--post VERB]... [--pages cold] [--keep] [-- PROGRAM ARGS]
-                                 run a private aterm in a scratch HOME/XDG world, print its socket and hold it until
+                                 run a private aterm in a scratch HOME/XDG world, print its socket and build and hold it until
                                  Ctrl-C (--window: a real window; --band: app (the default) runs it as its own launchd
                                  job, in a coalition of its own as aterm.app is, a window under its keeper there, and agent
                                  as this command's child, in its coalition; --image PNG: capture one settled frame, run
@@ -621,11 +657,15 @@ Outside any lab (no jail, no stub):
                                  evaluate abrew admission of Homebrew's formula.json and cask.json (fetched from
                                  formulae.brew.sh unless --indexes DIR holds them) on the newest Mac, that Mac with the
                                  named facts replaced, or this one (--this-machine)
-  commons-lan auto-join|prepare-recipient|prepare-source|join|run|follow|stop|declare|write|read …
+  alab-roll [--json]             the registry roll's three-Mac partition (design §3.8): three scratch Commons
+                                 custodies in this process, repaired over loopback, never a real Mac's state;
+                                 the seal waits for every Writer, m1 seals in the cut, m2 edits the sealed
+                                 generation, the late roll carries it (debug lab image)
+  commons-lan prepare-recipient|prepare-source|join|run|follow|stop|declare|write|read …
                                  prepare preserved private profiles on separate LAN hosts; synthetic prior vault approval,
                                  ordinary executable startup, exact generic table readback, no installed state changes
-                                 auto-join instead tests the live default ALab policy from a new identity, with no service install
-                                 retain that profile: a successful admission belongs to the live vault
+                                 a world on the live default ALab vault (one an earlier run left admitted there) opens for no
+                                 verb but behind --live-alab-vault-keeps-member: no run takes that member out again
   commons-startup <aterm> <new-output-directory> [--log-backed] [--suppressed | --observe SECONDS | --peer-cycle [--peer-details] | --local-follower]
                                  start an ordinary window and node host on private custody and loopback Commons;
                                  require enrollment, fresh signed table data in both directions and concurrent offline values after restart
@@ -685,6 +725,8 @@ Outside any lab (no jail, no stub):
                                  use this debug lab as helper to observe two real Trust builds holding separate memory claims in one scratch ledger,
                                  then release each and verify its claim leaves; does not measure CPU sharing or admission waits
                                  --sample-after samples each owned front still awaiting its barrier once, retaining scratch evidence
+  tab-gallery [--aterm PATH] [--themes NAME,...|all] [--quick] <out_dir>
+                                 real windowed frames of the tab strip per theme, one sheet each, and the contrast of every app tile measured from their pixels (`--help` for details)
   trail-gallery [--aterm PATH] [--theme dark|light|both] [--scenario NAME[,NAME]]... [--extra 'key = value']...
                 [--columns N] [--lines N] [--font-px N] [--no-clean] [--keep] <out_dir> [style ...]
                                  render cursor trail styles across themes/scenarios into <out_dir> with sidecars (`--help` for details)
@@ -731,6 +773,8 @@ Outside any lab (no jail, no stub):
                                  re-derive a windowed aos-repair run's measured phase from its kept trace (`--help` for details)
   resource-attribution [--aterm PATH]
                                  private two-tab delegated resource attribution check
+  recording-cpu --pid PID --aterm PATH --sock PATH --output PATH --duration-ms N --interval-ms N
+                                 read-only named-thread CPU and sampled temporal queue observations; no verdict
   git-starts [--minutes N] [--every-ms M]
                                  read-only, on this Mac as it is: list this uid's processes every M ms (100) for N
                                  minutes (10) and each local aterm's survey every 1 s; print process starts and git
@@ -972,7 +1016,10 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "agy-upgrade" => upgrade_agy::cmd_agy_upgrade(args),
         "agy-relaunch" => relaunch_agy::cmd_agy_relaunch(args),
         "fleet-sim" => fleet_sim::cmd(args),
+        "service-acceptance" => service_acceptance::cmd(args),
+        "artifact-serve" => artifact_serve::cmd(args),
         "fleet-menu" => fleet_menu::cmd(args),
+        "alab-roll" => alab_roll::cmd(args),
         "commons-lan" => commons_lan::cmd(args),
         "commons-startup" => commons_startup::cmd(args),
         "swarm" => swarm::cmd_swarm(args),
@@ -1033,11 +1080,13 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "paths" => verbs::cmd_paths(),
         "instance" => instance::cmd_instance(args),
         "resource-attribution" => resource_attribution::cmd(args),
+        "recording-cpu" => recording_cpu::cmd(args),
         "disk-lane" => disk_lane::cmd_disk_lane(args),
         "disk-ask" => disk_ask_lane::cmd_disk_ask(args),
         "slot-capture" => slot_lane::cmd_slot_capture(args),
         "slot-lane" => slot_lane::cmd_slot_lane(args),
         "build-admit" => build_admit::cmd(args),
+        "tab-gallery" => tab_gallery::cmd(args),
         "trail-gallery" => trail_gallery::cmd_trail_gallery(args),
         "deck-motion" => deck_motion::cmd_deck_motion(args),
         "__trail-redraw-fixture" => trail_gallery::cmd_redraw_fixture(args),
@@ -1178,6 +1227,7 @@ fn main() -> std::process::ExitCode {
                 slot_lane::HOLD_VERB => slot_lane::hold_main(rest),
                 aos_workers::WORKER_VERB => aos_workers::worker_main(rest),
                 swarm::partition::AGENT_VERB => swarm::partition::agent_main(rest),
+                swarm::partition::ACT_VERB => swarm::partition::act_main(rest),
                 "init" if std::env::var_os(swarm::partition::AGENT_SEAM).is_some() => {
                     swarm::partition::converge_standin(rest).unwrap_or(2)
                 }
@@ -1196,6 +1246,7 @@ fn main() -> std::process::ExitCode {
                                 | "paths"
                                 | "protected"
                                 | "fleet-sim"
+                                | "artifact-serve"
                                 | "swarm"
                                 | "reduce"
                                 | "trail-contrast"
@@ -1205,6 +1256,7 @@ fn main() -> std::process::ExitCode {
                                 | "trail-hue"
                                 | "abrew-admission"
                                 | "build-admit"
+                                | "recording-cpu"
                                 | "git-starts"
                         ) {
                             dispatch(&cmd, &rest)
@@ -1239,6 +1291,22 @@ fn main() -> std::process::ExitCode {
     // First, while this process has one thread: a tethered child starts as this image's verb.
     if let Some(code) = aterm_uds::tether::entry() {
         return code;
+    }
+    #[cfg(unix)]
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.first().is_some_and(|word| word == "artifact-serve") {
+            let code = match artifact_serve::cmd(&args[1..]) {
+                Ok(code) => code,
+                Err(fail) => {
+                    if let Some(message) = fail.msg {
+                        eprintln!("aterm-lab: {message}");
+                    }
+                    fail.code
+                }
+            };
+            return std::process::ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1));
+        }
     }
     eprintln!("aterm-lab: macOS only (sandbox-exec is the lab's jail)");
     std::process::ExitCode::from(3)

@@ -248,7 +248,7 @@ mod tests {
         let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seen = observed.clone();
         let name = format!("native-api-key-{}", "33".repeat(24));
-        aterm_uds::private_file::with_lock_wait_observer(
+        aterm_uds::file_lock::with_lock_wait_observer(
             move |_| {
                 seen.store(true, std::sync::atomic::Ordering::Relaxed);
                 release.lock().unwrap().take();

@@ -4,27 +4,25 @@
 
 //! The git-and-friends shim's dispatch: what the one `aterm` binary does when it is run as
 //! `git`, `cc`, `clang`, `make`, `python3` or another of [`aterm_types::clt_shim::SHIM_TOOLS`]
-//! through a shim symlink, while Apple's Command Line Tools are being installed (System State
-//! design §6.3).
+//! through a shim symlink, or as the `xcrun` Apple's stubs reach through `DEVELOPER_DIR`
+//! ([`aterm_types::clt_shim::developer_dir`]), on a Mac that has no Command Line Tools yet (System
+//! State design §6.3).
 //!
-//! The shim directory (the window's symlinks) is on new shells' PATH, ahead of `/usr/bin`, only
-//! while a setup pass is installing the tools and they are missing, so the common case is: the
-//! tools are still installing, and the shim prints one line and exits
-//! [`aterm_types::clt_shim::SHIM_EXIT`] at once — it never runs `/usr/bin/git`, whose
-//! `xcode-select` stub would raise macOS's install dialog. A shell opened before the tools
-//! arrived keeps the shim on its PATH (bash even hashes its path, which is why the directory
-//! stays until the next launch); once the tools are there that shim `exec`s Apple's own
-//! `/usr/bin/<tool>`, with the shim directory taken off the PATH it hands on, so a long-lived
-//! shell works the moment the install finishes: with the tools in place Apple's front end runs
-//! the developer directory's tool with the SDK set (`cc` finds `<stdio.h>`, `ld` finds
-//! `libSystem`), raises no dialog, and `xcrun`, which no developer directory carries, runs as it
-//! is ([`aterm_types::clt_shim::carried`]). For a name the tools do not carry (`pagestuff`,
-//! `llvm-gcc`) the stub would raise Apple's dialog for Xcode, so the shim says so in one line
-//! and exits instead. Once nothing installs the tools (a person's Stop, the Developer group
-//! turned off, an install that ended unfinished, or an account that may not install them, with
-//! the tools still missing: the window's [`aterm_types::clt_shim::wanted_mark`] is gone) the
-//! shim hands the call to Apple's own `/usr/bin/<tool>` too: Apple's route, which is the only
-//! one left.
+//! While the tools are missing the shim prints one line and exits
+//! [`aterm_types::clt_shim::SHIM_EXIT`] at once, and it never runs `/usr/bin/git`, whose
+//! `xcode-select` stub would raise macOS's install dialog: whether an install is on its way only
+//! changes the line. That holds after a person's Stop, an install that ended unfinished, and on an
+//! account that may not install them. A shell opened before the tools arrived keeps the shim on
+//! its PATH (bash even hashes its path, which is why the directory stays once laid);
+//! once the tools are there that shim `exec`s Apple's own `/usr/bin/<tool>`, with the shim
+//! directory taken off the PATH it hands on, so a long-lived shell works the moment the install
+//! finishes: with the tools in place Apple's front end runs the developer directory's tool with
+//! the SDK set (`cc` finds `<stdio.h>`, `ld` finds `libSystem`), raises no dialog, and `xcrun`,
+//! which no developer directory carries, runs as it is ([`aterm_types::clt_shim::carried`]). The
+//! process start already took an inherited `DEVELOPER_DIR` of the shim's off its environment
+//! ([`aterm_types::clt_shim::developer_dir_move`]). For a name the tools do not carry
+//! (`pagestuff`, `llvm-gcc`) the stub would raise Apple's dialog for Xcode, so the shim says so in
+//! one line and exits instead.
 //!
 //! The shim finds its directory, and so the mark beside it, from the path it was run by (the
 //! symlink's own, which macOS keeps as the program's path), never from `$HOME`: a shell that
@@ -34,22 +32,24 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use aterm_types::clt_shim::{SHIM_EXIT, absent_line, arrival_line};
+use aterm_types::clt_shim::{SHIM_EXIT, absent_line, arrival_line, called_tool, missing_line};
 
 /// The seams the dispatch reaches the Mac through, so a test drives it with no real tools and no
 /// real `exec`.
 trait ShimHost {
     /// Whether Apple's developer tools are installed now ([`aterm_types::clt_shim::developer_git`]).
     fn tools_present(&self) -> bool;
-    /// Whether a setup pass is installing the tools now: the mark beside this shim's directory
-    /// ([`aterm_types::clt_shim::wanted_mark`]).
+    /// Whether an install of the tools is on its way: the mark beside this shim's directory
+    /// ([`aterm_types::clt_shim::installing_mark`]).
     fn installing(&self) -> bool;
+    /// Whether this account may install the tools: one of the Mac's administrators
+    /// ([`aterm_uds::account::administrator`]), or groups that did not read.
+    fn may_install(&self) -> bool;
     /// Whether a developer directory carries `tool` ([`aterm_types::clt_shim::developer_tool`]),
     /// so Apple's `/usr/bin/<tool>` has a tool to run once the tools are present.
     fn carries(&self, tool: &str) -> bool;
     /// Apple's own `/usr/bin/<tool>`, which raises their install dialog while the tools are
-    /// missing: run only once they are present (for a tool they carry) or nothing installs
-    /// them.
+    /// missing: run only once they are present, for a tool they carry.
     fn apple_tool(&self, tool: &str) -> PathBuf;
     /// The shim directory, which the PATH handed to Apple's tool leaves out.
     fn shim_dir(&self) -> Option<PathBuf>;
@@ -76,23 +76,25 @@ pub fn run(tool: &str, rest: Vec<OsString>) -> ExitCode {
 
 /// The dispatch over its seams, returning the exit byte so a test can read it (`ExitCode` is
 /// opaque). On a real `Live` host the `exec` never returns; the byte is reached only when it
-/// fails, when the tools carry no such tool, or while they install.
+/// fails, when the tools carry no such tool, or while they are missing.
 fn run_with(host: &dyn ShimHost, tool: &str, rest: &[OsString]) -> u8 {
-    if host.tools_present() {
-        // This shell opened before the tools arrived. Apple's front end runs a tool they carry
-        // with the SDK set and raises no dialog now; for one they lack it would raise Apple's
-        // dialog for Xcode.
-        if !aterm_types::clt_shim::carried(tool, |tool| host.carries(tool)) {
-            host.warn(&absent_line(tool));
-            return SHIM_EXIT;
-        }
-    } else if host.installing() {
-        // The tools are still installing: say so and exit, never raising macOS's dialog.
-        host.warn(&arrival_line(tool));
+    if !host.tools_present() {
+        // Never Apple's stub, whatever becomes of the install: it would raise macOS's dialog.
+        let called = called_tool(tool, rest);
+        host.warn(&if host.installing() {
+            arrival_line(called)
+        } else {
+            missing_line(called, host.may_install())
+        });
         return SHIM_EXIT;
     }
-    // The tools are here, or nothing installs them (a Stop, the Developer group turned off, an
-    // install that ended unfinished): Apple's own tool.
+    // This shell opened before the tools arrived. Apple's front end runs a tool they carry with
+    // the SDK set and raises no dialog now; for one they lack it would raise Apple's dialog for
+    // Xcode.
+    if !aterm_types::clt_shim::carried(tool, |tool| host.carries(tool)) {
+        host.warn(&absent_line(tool));
+        return SHIM_EXIT;
+    }
     let target = host.apple_tool(tool);
     // Whatever runs gets the PATH without the shim, so nothing it starts comes back here.
     let path_var = host.path_var().map(|path| match host.shim_dir() {
@@ -104,9 +106,11 @@ fn run_with(host: &dyn ShimHost, tool: &str, rest: &[OsString]) -> u8 {
     SHIM_EXIT
 }
 
-/// The directory a shim run as `tool` lives in: the parent of `exe`, the path it was run by
+/// The shim directory a shim run as `tool` belongs to: the parent of `exe`, the path it was run by
 /// (macOS keeps a symlink's own path as the program's path, by `PATH` lookup and by a relative
-/// path alike), when that path's file name is `tool` and it is absolute; else this account's shim
+/// path alike), or the directory above that parent's developer directory for the `xcrun` Apple's
+/// stubs reach ([`aterm_types::clt_shim::shim_of_program_dir`]), when that path's file name is
+/// `tool` and it is absolute; else this account's shim
 /// directory ([`aterm_types::clt_shim::shim_dir`], `fallback`). Never `$HOME`'s alone: a shell
 /// that changed `HOME` still finds the directory it runs from.
 fn own_dir(
@@ -115,7 +119,7 @@ fn own_dir(
     fallback: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
     exe.filter(|exe| exe.is_absolute() && exe.file_name() == Some(OsStr::new(tool)))
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .and_then(|exe| exe.parent().map(aterm_types::clt_shim::shim_of_program_dir))
         .or_else(fallback)
 }
 
@@ -144,7 +148,16 @@ impl ShimHost for Live {
     fn installing(&self) -> bool {
         self.dir
             .as_deref()
-            .is_some_and(|dir| aterm_types::clt_shim::wanted_mark(dir).is_file())
+            .is_some_and(|dir| aterm_types::clt_shim::installing_mark(dir).is_file())
+    }
+
+    fn may_install(&self) -> bool {
+        #[cfg(unix)]
+        let admin = aterm_uds::account::administrator();
+        // No account groups read off Unix, where no Mac's tools are installed either.
+        #[cfg(not(unix))]
+        let admin = None;
+        admin != Some(false)
     }
 
     fn carries(&self, tool: &str) -> bool {
@@ -214,8 +227,10 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         present: bool,
-        /// Whether a setup pass is installing the tools (the window's mark).
+        /// Whether an install of the tools is on its way (the window's mark).
         installing: bool,
+        /// An account that is none of the Mac's administrators.
+        not_admin: bool,
         /// The tools the developer directory carries, by name.
         carries: Vec<&'static str>,
         path: Option<OsString>,
@@ -235,6 +250,10 @@ mod tests {
 
         fn installing(&self) -> bool {
             self.installing
+        }
+
+        fn may_install(&self) -> bool {
+            !self.not_admin
         }
 
         fn carries(&self, tool: &str) -> bool {
@@ -356,37 +375,72 @@ mod tests {
         assert_eq!(execs[0].3.as_deref(), Some(OsStr::new("/usr/bin:/bin")));
     }
 
-    /// A person's Stop (or the Developer group turned off) with the tools still missing leaves
-    /// nothing installing them: a shell that still has the shim on its PATH gets Apple's own
-    /// `/usr/bin/<tool>`, the route the person chose, with the shim off the PATH it hands on so
-    /// nothing comes back here, and no line of the shim's own.
+    /// A person's Stop, an install that ended unfinished, or an account that may not install them
+    /// leaves nothing installing the tools: the call still never reaches Apple's stub, and fails
+    /// plainly, with no word of an install nothing runs.
+    /// NEGATIVE CONTROL: the same call with the tools present does `exec` Apple's own tool
+    /// (`with_the_tools_present_it_execs_apples_own_tool_off_the_shim`).
     #[test]
-    fn with_nothing_installing_the_tools_it_hands_the_call_to_apples_own_tool() {
-        for tool in ["git", "cc", "python3", "pagestuff"] {
+    fn with_nothing_installing_the_tools_it_fails_plainly_and_never_runs_a_stub() {
+        for tool in ["git", "cc", "python3", "pagestuff", "xcrun"] {
             let fake = Fake {
                 path: Some(OsString::from(format!("{SHIM}:/usr/bin:/bin"))),
                 ..Fake::default()
             };
+            assert_eq!(run_with(&fake, tool, &[]), 69, "{tool}");
+            assert!(fake.execs.borrow().is_empty(), "{tool}: ran a stub");
             assert_eq!(
-                run_with(&fake, tool, &[OsString::from("--version")]),
-                69,
-                "{tool}: the exec fake fails, so the byte is reached"
-            );
-            let execs = fake.execs.borrow();
-            assert_eq!(execs.len(), 1, "{tool}");
-            assert_eq!(execs[0].0, Path::new(STUBS).join(tool), "{tool}");
-            assert_eq!(execs[0].1, *tool, "{tool}: argv0 is preserved");
-            assert_eq!(
-                execs[0].3.as_deref(),
-                Some(OsStr::new("/usr/bin:/bin")),
-                "{tool}: the shim is off the PATH Apple's tool gets"
-            );
-            let warnings = fake.warnings.borrow();
-            assert!(
-                warnings.iter().all(|line| !line.contains("arrives with")),
-                "{tool}: no word of an install nothing runs: {warnings:?}"
+                *fake.warnings.borrow(),
+                [aterm_types::clt_shim::missing_line(tool, true)],
+                "{tool}"
             );
         }
+        let standard = Fake {
+            not_admin: true,
+            ..Fake::default()
+        };
+        assert_eq!(run_with(&standard, "git", &[]), 69);
+        assert!(standard.execs.borrow().is_empty());
+        assert_eq!(
+            *standard.warnings.borrow(),
+            [aterm_types::clt_shim::missing_line("git", false)],
+            "an account that may not install them is not sent to an Install… it lacks"
+        );
+    }
+
+    /// Apple's stubs reach this shim as `$DEVELOPER_DIR/usr/bin/xcrun git --version`: with the
+    /// tools missing its line names `git`, and nothing runs. With them present the same call goes
+    /// to Apple's own `xcrun`, words as given: that is how a process that kept the variable from
+    /// before the tools arrived keeps working.
+    #[test]
+    fn a_stubs_call_through_the_developer_dir_names_its_tool_and_runs_nothing_while_missing() {
+        let rest = [OsString::from("git"), OsString::from("--version")];
+        let missing = Fake::default();
+        assert_eq!(run_with(&missing, "xcrun", &rest), 69);
+        assert!(missing.execs.borrow().is_empty());
+        assert_eq!(
+            *missing.warnings.borrow(),
+            [aterm_types::clt_shim::missing_line("git", true)]
+        );
+        let installing = Fake {
+            installing: true,
+            ..Fake::default()
+        };
+        assert_eq!(run_with(&installing, "xcrun", &rest), 69);
+        assert_eq!(
+            *installing.warnings.borrow(),
+            [aterm_types::clt_shim::arrival_line("git")]
+        );
+        let present = Fake {
+            present: true,
+            path: Some(OsString::from("/usr/bin:/bin")),
+            ..Fake::default()
+        };
+        let _ = run_with(&present, "xcrun", &rest);
+        let execs = present.execs.borrow();
+        assert_eq!(execs.len(), 1);
+        assert_eq!(execs[0].0, Path::new(STUBS).join("xcrun"));
+        assert_eq!(execs[0].2, rest);
     }
 
     /// With the tools present, a name they do not carry (Apple's stub for it would raise their
@@ -450,9 +504,19 @@ mod tests {
             dir: own_dir(Some(shim.join("git")), "git", home),
         };
         assert!(!live.installing(), "no mark yet");
-        std::fs::write(aterm_types::clt_shim::wanted_mark(&shim), b"").unwrap();
+        std::fs::write(aterm_types::clt_shim::installing_mark(&shim), b"").unwrap();
         assert!(live.installing(), "the mark beside its own directory");
-        assert_eq!(live.shim_dir(), Some(shim));
+        assert_eq!(live.shim_dir(), Some(shim.clone()));
+        assert!(!{
+            std::fs::remove_file(aterm_types::clt_shim::installing_mark(&shim)).unwrap();
+            live.installing()
+        });
+        // Apple's stub ran the developer directory's `xcrun`: the same directory's mark.
+        std::fs::write(aterm_types::clt_shim::installing_mark(&shim), b"").unwrap();
+        let through_stub = Live {
+            dir: own_dir(Some(shim.join("developer/usr/bin/xcrun")), "xcrun", home),
+        };
+        assert!(through_stub.installing());
     }
 
     /// A stand-in Mac on disk: a developer directory carrying `git` alone, a `/usr/bin` of
@@ -460,9 +524,8 @@ mod tests {
     /// real resolver ([`aterm_types::clt_shim::developer_tool_in`]) says what the tools carry;
     /// the stand-in's exec starts the call's program as a child. With the tools present, `git`
     /// runs Apple's own (the stand-in), with the shim off its PATH; `pagestuff`, which the tools
-    /// lack, runs nothing. While the tools install nothing runs at all. Once nothing installs
-    /// them (a Stop), Apple's own runs again, with the shim off its PATH: nothing can lead back
-    /// to the shim.
+    /// lack, runs nothing. While the tools are missing nothing runs at all, whether or not
+    /// anything installs them.
     #[cfg(unix)]
     #[test]
     fn on_a_stand_in_mac_the_shim_runs_only_apples_own_tool_and_never_reenters() {
@@ -481,6 +544,9 @@ mod tests {
             }
             fn installing(&self) -> bool {
                 self.installing
+            }
+            fn may_install(&self) -> bool {
+                true
             }
             fn carries(&self, tool: &str) -> bool {
                 aterm_types::clt_shim::developer_tool_in(
@@ -583,23 +649,22 @@ mod tests {
         assert_eq!(run_with(&installing, "git", &[]), 69);
         assert!(installing.ran.borrow().is_empty());
 
-        // A person's Stop with the tools still missing: Apple's own git runs, once, with the
-        // shim off its PATH.
+        // A person's Stop with the tools still missing: still nothing.
         let stopped = StandIn {
             installing: false,
             ..installing
         };
         assert_eq!(run_with(&stopped, "git", &[]), 69);
-        assert_eq!(*stopped.ran.borrow(), [stubs.join("git")]);
+        assert!(stopped.ran.borrow().is_empty());
         assert_eq!(
             read(),
-            format!("apple git {0}\napple git {0}\n", stubs.display()),
-            "after a Stop the call goes to Apple's own git, never back to the shim"
+            format!("apple git {}\n", stubs.display()),
+            "after a Stop Apple's stub is still never run"
         );
     }
 
     /// With the tools installed, a shell opened during the install (the shim stays on its PATH
-    /// until the next launch) builds a C program as one without the shim does: the shim's `cc`,
+    /// for as long as that shell lives) builds a C program as one without the shim does: the shim's `cc`,
     /// as the real dispatch resolves it on this Mac, compiles and links `#include <stdio.h>`.
     /// Measured on this Mac: the Command Line Tools' own `usr/bin/cc` run by absolute path with no
     /// `SDKROOT` fails `'stdio.h' file not found` (and a bare link fails `ld: library 'System' not
@@ -617,6 +682,9 @@ mod tests {
             }
             fn installing(&self) -> bool {
                 false
+            }
+            fn may_install(&self) -> bool {
+                true
             }
             fn carries(&self, tool: &str) -> bool {
                 aterm_types::clt_shim::developer_tool(tool).is_some()

@@ -74,8 +74,16 @@ mod claim_publication;
 pub use claim_publication::claim_publication_model;
 mod claim_ring;
 pub use claim_ring::claim_ring_model;
+mod claim_clock;
+pub use claim_clock::claim_clock_model;
 mod import_comparison;
 pub use import_comparison::import_comparison_model;
+mod alab_cells;
+pub use alab_cells::alab_cells_model;
+mod alab_journal;
+pub use alab_journal::alab_journal_model;
+mod storage_release;
+pub use storage_release::storage_release_model;
 
 /// Bounded executions of the durable fixed-share reservation API. Initial pins
 /// are assumed coherent across consumers; this model grants no provider access.

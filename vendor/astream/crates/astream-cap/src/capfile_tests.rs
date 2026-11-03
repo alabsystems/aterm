@@ -307,9 +307,10 @@ fn chmod(path: &std::path::Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-/// A cap file is outside the secret-file rule: [`read_file`] reads a ring at 0644, where
-/// [`read_private_file`] refuses the same file. What a reader may rely on for a cap file
-/// is whatever keeps the file private, never this module.
+/// A cap file read through [`read_file`] is outside the secret-file rule: it reads a ring at
+/// 0644, where [`read_private_file`] and [`read_private_ring`] refuse the same file. What a
+/// face that reads by [`read_file`] may rely on for a cap file is whatever keeps the file
+/// private, never this module.
 #[cfg(unix)]
 #[test]
 fn secret_file_rule_is_not_what_read_file_reads_a_cap_file_by() {
@@ -327,6 +328,252 @@ fn secret_file_rule_is_not_what_read_file_reads_a_cap_file_by() {
         read_private_file(&path).expect_err("the owner rule").kind(),
         std::io::ErrorKind::PermissionDenied
     );
+    assert_eq!(
+        read_private_ring(&path).expect_err("the owner rule").kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+}
+
+/// [`read_private_ring`] reads what [`read_file`] reads wherever the ring's file is its owner's
+/// alone, in any directory, by any number of names, and refuses each wider mode at once, naming
+/// the file and the `chmod` that closes it.
+#[cfg(unix)]
+#[test]
+fn secret_file_read_private_ring_holds_the_file_and_only_the_file() {
+    let scratch = secret_scratch("ring");
+    let dir = scratch.path();
+    chmod(dir, 0o755);
+    let path = dir.join("ring.cap");
+    let text = format_line("ro:/f/F/pub/>", &tag_from(1)) + "\n# a comment\n";
+    std::fs::write(&path, &text).unwrap();
+    for mode in [0o600, 0o400] {
+        chmod(&path, mode);
+        assert_eq!(
+            read_private_ring(&path).expect("its owner's alone, in a 0755 directory"),
+            read_file(&path).expect("the plain read")
+        );
+    }
+    chmod(&path, 0o600);
+    let second = dir.join("second.cap");
+    std::fs::hard_link(&path, &second).unwrap();
+    assert_eq!(read_private_ring(&path).expect("a second name").len(), 1);
+    std::fs::remove_file(&second).unwrap();
+
+    for mode in [0o640, 0o604, 0o644, 0o660] {
+        chmod(&path, mode);
+        let e = read_private_ring(&path).expect_err("a wider mode");
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{mode:o}");
+        let said = e.to_string();
+        assert!(
+            said.starts_with(&format!("{} is mode {mode:04o}: ", path.display())),
+            "{said}"
+        );
+        assert!(
+            said.contains(&format!("chmod 600 {}", path.display())),
+            "{said}"
+        );
+    }
+    chmod(&path, 0o600);
+
+    for (name, bytes) in [("empty", ""), ("comment", "# none yet\n")] {
+        let ring = dir.join(name);
+        std::fs::write(&ring, bytes).unwrap();
+        chmod(&ring, 0o600);
+        assert_eq!(read_private_ring(&ring).expect("no length floor"), vec![]);
+    }
+
+    let broken = dir.join("broken");
+    std::fs::write(&broken, "# one\nro:/f/F/> nothex\n").unwrap();
+    chmod(&broken, 0o600);
+    let e = read_private_ring(&broken).expect_err("a malformed line");
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        e.to_string()
+            .starts_with(&format!("{}:2: ", broken.display())),
+        "{e}"
+    );
+
+    let binary = dir.join("binary");
+    std::fs::write(&binary, [0xff, 0xfe]).unwrap();
+    chmod(&binary, 0o600);
+    let e = read_private_ring(&binary).expect_err("not UTF-8");
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        e.to_string()
+            .starts_with(&format!("{}:1: ", binary.display())),
+        "{e}"
+    );
+    std::fs::write(&binary, b"# one\n\n# three\n\xff\xfe\n").unwrap();
+    let e = read_private_ring(&binary).expect_err("not UTF-8 on a later line");
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        e.to_string()
+            .starts_with(&format!("{}:4: ", binary.display())),
+        "{e}"
+    );
+
+    let absent = dir.join("absent");
+    let e = read_private_ring(&absent).expect_err("no file");
+    assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+    assert!(
+        e.to_string()
+            .starts_with(&format!("{}: ", absent.display())),
+        "{e}"
+    );
+
+    let e = read_private_ring(dir).expect_err("a directory");
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "{} is a directory: a secret file is a regular file",
+            dir.display()
+        )
+    );
+}
+
+/// A link at the path is refused without opening what it names, naming the file and what to do,
+/// where the plain read follows it.
+#[cfg(unix)]
+#[test]
+fn secret_file_read_private_ring_follows_no_link() {
+    let scratch = secret_scratch("ring-link");
+    let real = scratch.path().join("real.cap");
+    std::fs::write(&real, format_line("ro:/f/F/pub/>", &tag_from(1)) + "\n").unwrap();
+    chmod(&real, 0o600);
+    let link = scratch.path().join("link.cap");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(
+        read_file(&link).expect("the plain read follows it").len(),
+        1
+    );
+    let e = read_private_ring(&link).expect_err("a link at the path");
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "{} is a symlink: a private ring is read through no link, so name the file it \
+             points at",
+            link.display()
+        )
+    );
+}
+
+/// A FIFO at the path is refused at once, behind the one-minute hang detector: [`read_file`]
+/// would wait for a writer that never comes.
+#[cfg(unix)]
+#[test]
+fn secret_file_read_private_ring_refuses_a_fifo_without_waiting_for_a_writer() {
+    let scratch = secret_scratch("ring-fifo");
+    let fifo = scratch.path().join("ring.cap");
+    let made = std::process::Command::new("mkfifo")
+        .arg("-m")
+        .arg("600")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success(), "mkfifo");
+    let shown = fifo.display().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_private_ring(&fifo));
+    });
+    let e = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("read_private_ring waited on a FIFO")
+        .expect_err("a FIFO is no ring");
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        e.to_string(),
+        format!("{shown} is a FIFO: a secret file is a regular file")
+    );
+}
+
+/// [`refusal_of`] names the clause a refusal holds, for a caller that acts on it, and only for what
+/// the rule refused: an open the OS refused has the same kind and is the OS's words, so a caller
+/// can tell a file the rule will not take from one it cannot open. The words are the same either
+/// way, the path first.
+#[cfg(unix)]
+#[test]
+fn secret_file_refusal_of_names_the_clause_and_nothing_the_rule_did_not_say() {
+    let scratch = secret_scratch("ring-clause");
+    let dir = scratch.path();
+    let path = dir.join("ring.cap");
+    std::fs::write(&path, format_line("ro:/f/F/pub/>", &tag_from(1)) + "\n").unwrap();
+
+    chmod(&path, 0o644);
+    let e = read_private_ring(&path).expect_err("a wider mode");
+    assert_eq!(
+        refusal_of(&e),
+        Some(Refusal::File(astream_sys::NotPrivate::Mode(0o644)))
+    );
+    assert!(
+        e.to_string()
+            .starts_with(&format!("{} is mode 0644: ", path.display())),
+        "{e}"
+    );
+
+    chmod(&path, 0o600);
+    assert!(read_private_ring(&path).is_ok(), "the control");
+
+    let link = dir.join("link.cap");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    let e = read_private_ring(&link).expect_err("a link");
+    assert_eq!(refusal_of(&e), Some(Refusal::Link));
+
+    let e = read_private_ring(dir).expect_err("a directory");
+    assert_eq!(
+        refusal_of(&e),
+        Some(Refusal::File(astream_sys::NotPrivate::Kind("a directory")))
+    );
+
+    let e = read_private_ring(dir.join("absent")).expect_err("no file");
+    assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(refusal_of(&e), None);
+
+    let broken = dir.join("broken");
+    std::fs::write(&broken, "ro:/f/F/> nothex\n").unwrap();
+    chmod(&broken, 0o600);
+    let e = read_private_ring(&broken).expect_err("a malformed line");
+    assert_eq!(refusal_of(&e), None);
+
+    // Root opens a file of mode 000 regardless, so only another user sees the OS refuse it.
+    if astream_sys::euid() != 0 {
+        chmod(&path, 0o000);
+        let e = read_private_ring(&path).expect_err("the OS refuses the open");
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(refusal_of(&e), None, "{e}");
+        assert!(
+            e.to_string().starts_with(&format!("{}: ", path.display())),
+            "{e}"
+        );
+        chmod(&path, 0o600);
+    }
+}
+
+/// On macOS a 0600 ring carrying an `everyone allow read` entry is open to every user, and is
+/// refused naming `chmod -N`; once cleared it reads.
+#[cfg(target_os = "macos")]
+#[test]
+fn secret_file_read_private_ring_refuses_an_access_list_that_lets_others_in() {
+    let scratch = secret_scratch("ring-acl");
+    let path = scratch.path().join("ring.cap");
+    std::fs::write(&path, format_line("ro:/f/F/pub/>", &tag_from(1)) + "\n").unwrap();
+    chmod(&path, 0o600);
+    chmod_acl(&["+a", "everyone allow read"], &path);
+    let e = read_private_ring(&path).expect_err("an allow entry");
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        refusal_of(&e),
+        Some(Refusal::File(astream_sys::NotPrivate::Acl))
+    );
+    assert!(
+        e.to_string()
+            .contains(&format!("chmod -N {}", path.display())),
+        "{e}"
+    );
+    chmod_acl(&["-N"], &path);
+    assert_eq!(read_private_ring(&path).expect("cleared").len(), 1);
 }
 
 /// 0600 or tighter passes; any group/other bit is refused, as `PermissionDenied`

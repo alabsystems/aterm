@@ -226,9 +226,9 @@ pub fn make_world(root: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(&dir)?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    std::fs::write(
-        root.join("cfg/aterm/aterm.toml"),
-        crate::instance::bell_off(CONFIG),
+    crate::instance::write_aterm_toml(
+        &root.join("cfg/aterm/aterm.toml"),
+        &crate::instance::bell_off(CONFIG),
     )
 }
 

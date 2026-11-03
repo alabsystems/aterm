@@ -66,7 +66,7 @@ src/lib.rs	test_fxhasher_bytes_match_rustc_hash	HASH-FX-3	HASH-FX-2, HASH-FX-1 (
 src/lib.rs	test_fxhasher_str_includes_terminator_byte	HASH-FX-3	HASH-FX-1 (write_u8(0xff), finish)
 ```
 
-## 3. Open findings
+## 3. Coverage
 
 - Each of the 7 tests maps to one of the 6 specs (§2).
 - Retiring `test_fxhasher_bytes_match_rustc_hash` and `test_fxhasher_str_includes_terminator_byte`
@@ -76,9 +76,9 @@ src/lib.rs	test_fxhasher_str_includes_terminator_byte	HASH-FX-3	HASH-FX-1 (write
   algorithm over all inputs, and the published vectors survive as `decide` corollaries that act as
   negative controls.
 
-## 4. Proof order
+## 4. Tests that are not spec samples
 
-No spec is blocked by gap 0 alone.
+None.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

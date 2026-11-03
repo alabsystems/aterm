@@ -209,10 +209,15 @@ enum VaultRead {
         approve: Option<String>,
         with_password: bool,
     },
-    /// Asked to join the default ALab vault at a URL: admission and retries run automatically,
-    /// so its note names no person step or admin.
+    /// Asked to join the default ALab vault at a URL. On the ALab LAN admission and retries run
+    /// automatically; off it nothing lets this Mac in by itself, so the note follows where this
+    /// Mac is (`at`, its network place: [`aterm_secrets::alab_join::JoinPlace`]) and names no admin
+    /// and no alert either way.
     /// `with_password` as for [`Self::Pending`].
-    Asking { with_password: bool },
+    Asking {
+        with_password: bool,
+        at: aterm_secrets::alab_join::JoinPlace,
+    },
     /// Asked to join the ALab vault, and a member let it in: it holds that member's `Allowed`
     /// ([`aterm_secrets::client::holds_allowed`]) and waits for the vault to record it.
     Allowed,
@@ -408,7 +413,7 @@ fn vault(plan: &Plan, here: scope::VaultHere, root: Option<&Path>) -> Result<Obs
         (_, Membership::Unconfigured) => VaultRead::Unconfigured,
         (None, _) => VaultRead::OtherVault,
         (Some(_), Membership::Pending) if client::password_refused(&paths) => VaultRead::Refused,
-        (Some(_), Membership::Pending) => pending_read(&paths, &status),
+        (Some(_), Membership::Pending) => pending_read(&paths, &status, join_place_now),
         (Some(_), Membership::Revoked { .. }) => VaultRead::Revoked,
         (Some(config), Membership::In { .. } | Membership::Plain) => member_read(
             client::materialization_ready_for(&paths, config).map_err(|error| error.to_string())?,
@@ -428,14 +433,28 @@ fn vault(plan: &Plan, here: scope::VaultHere, root: Option<&Path>) -> Result<Obs
     ))
 }
 
+/// Where this Mac is for its own ALab join's words, from its network place
+/// ([`aterm_secrets::alab_join::JoinPlace::of`]); not known in a unit test (the state root and
+/// route are the person's), off Unix, or with no state directory.
+fn join_place_now() -> aterm_secrets::alab_join::JoinPlace {
+    #[cfg(all(unix, not(test)))]
+    if let Some(state) = aterm_types::dirs::state_dir() {
+        return aterm_secrets::alab_join::JoinPlace::of(&aterm_netplace::read(&state));
+    }
+    aterm_secrets::alab_join::JoinPlace::Unknown
+}
+
 /// The Secrets row's read of this Mac's join while it waits (`status`, with the records under
-/// `paths`). The default ALab vault at a URL admits a Mac automatically, so its words name no
-/// person step and no admin ([`VaultRead::Asking`], and [`VaultRead::Allowed`] once the vault
-/// has let it in); another vault, or one at a path, which automatic admission does not reach,
-/// by the approve an admin Mac runs ([`aterm_secrets::client::Status::approve_command`]).
+/// `paths`). The default ALab vault at a URL admits a Mac automatically on the ALab LAN, so its
+/// words name no person step and no admin there, and off it say what lets this Mac in, as `at`
+/// reads where this Mac is, only for that join ([`VaultRead::Asking`], and
+/// [`VaultRead::Allowed`] once the vault has let it in); another vault, or one at a path, which
+/// automatic admission does not reach, by the approve an admin Mac runs
+/// ([`aterm_secrets::client::Status::approve_command`]).
 fn pending_read(
     paths: &aterm_secrets::client::Paths,
     status: &aterm_secrets::client::Status,
+    at: impl FnOnce() -> aterm_secrets::alab_join::JoinPlace,
 ) -> VaultRead {
     use aterm_secrets::client;
     use aterm_secrets::transport::Source;
@@ -449,7 +468,10 @@ fn pending_read(
     } else if allow && client::holds_allowed(paths) {
         VaultRead::Allowed
     } else if allow {
-        VaultRead::Asking { with_password }
+        VaultRead::Asking {
+            with_password,
+            at: at(),
+        }
     } else {
         VaultRead::Pending {
             approve,
@@ -613,9 +635,10 @@ fn vault_observation(
                 APPROVAL.to_owned()
             }),
         ),
-        // Default ALab admission stays automatic, including after the first wait.
-        VaultRead::Asking { with_password } => {
-            let joining = aterm_types::macos_setup::VAULT_ASKING_NOTE;
+        // Default ALab admission stays automatic on the ALab LAN, including after the first
+        // wait; off it the note says what lets this Mac in. The row waits, calm, either way.
+        VaultRead::Asking { with_password, at } => {
+            let joining = aterm_secrets::alab_join::asking_note(*at);
             (
                 Standing::Waiting,
                 aterm_types::macos_setup::VAULT_ASKING,
@@ -778,6 +801,7 @@ fn held_at_login_in(root: &Path, session: &str) -> Selection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_secrets::alab_join::JoinPlace;
     use aterm_types::macos_setup::BASE_PLAN;
 
     #[test]
@@ -1020,6 +1044,7 @@ mod tests {
             pending(None, true),
             VaultRead::Asking {
                 with_password: true,
+                at: JoinPlace::Away,
             },
             VaultRead::Allowed,
             VaultRead::Revoked,
@@ -1141,9 +1166,19 @@ mod tests {
             },
             VaultRead::Asking {
                 with_password: false,
+                at: JoinPlace::Home,
             },
             VaultRead::Asking {
                 with_password: true,
+                at: JoinPlace::Home,
+            },
+            VaultRead::Asking {
+                with_password: false,
+                at: JoinPlace::Away,
+            },
+            VaultRead::Asking {
+                with_password: true,
+                at: JoinPlace::Unknown,
             },
             VaultRead::Allowed,
             VaultRead::Member { synced: false },
@@ -1371,7 +1406,12 @@ mod tests {
             names: Vec::new(),
         };
         let row = |status: &Status| {
-            vault_observation(&pending_read(&paths, status), Selection::all(), None, false)
+            vault_observation(
+                &pending_read(&paths, status, || JoinPlace::Home),
+                Selection::all(),
+                None,
+                false,
+            )
         };
         let alab_at = || Source::Url(aterm_types::macos_setup::DEFAULT_VAULT_URL.into());
         let asking = row(&waiting(alab_at(), alab));
@@ -1447,12 +1487,70 @@ mod tests {
         );
     }
 
+    /// The ALab join's note follows where this Mac is, as its network place reads it
+    /// ([`aterm_secrets::alab_join::JoinPlace::of`], here a scripted place): the note is
+    /// `asking_note` of that place, the automatic one on the ALab LAN only (a phone hotspot with no
+    /// fleet book gets the away words, one holding the book the proof's, a plain LAN with no book
+    /// both). The row waits, calm, in every place: being away alerts nothing.
+    /// NEGATIVE CONTROL: the Asking arm wording `VAULT_ASKING_NOTE` whatever `at` says gives the
+    /// hotspot the automatic note, and this test fails at "a hotspot with no book".
+    #[test]
+    fn the_alab_joins_note_follows_the_place() {
+        use aterm_secrets::alab_join::asking_note;
+        const T: u64 = 1_800_000_000_000;
+        let home = aterm_netplace::sample::home(T, 3);
+        let bookless = |place: aterm_netplace::Place| aterm_netplace::Place {
+            known: None,
+            ..place
+        };
+        let lan = aterm_netplace::Place {
+            at: aterm_netplace::Where::Network(aterm_netplace::Kind::Lan),
+            recognised: None,
+            ..home.clone()
+        };
+        for (place, expected, why) in [
+            (home, JoinPlace::Home, "home"),
+            (
+                bookless(aterm_netplace::sample::hotspot(T, T)),
+                JoinPlace::Away,
+                "a hotspot with no book",
+            ),
+            (
+                aterm_netplace::sample::hotspot(T, T),
+                JoinPlace::Proves,
+                "a hotspot, holding the book",
+            ),
+            (bookless(lan), JoinPlace::Unknown, "a LAN with no book"),
+        ] {
+            let at = JoinPlace::of(&place);
+            assert_eq!(at, expected, "{why}");
+            let seen = vault_observation(
+                &VaultRead::Asking {
+                    with_password: false,
+                    at,
+                },
+                Selection::all(),
+                None,
+                false,
+            );
+            assert_eq!(
+                (seen.standing, seen.now.as_deref(), seen.note.as_deref()),
+                (
+                    Standing::Waiting,
+                    Some(aterm_types::macos_setup::VAULT_ASKING),
+                    Some(asking_note(expected))
+                ),
+                "{why}"
+            );
+        }
+    }
+
     /// Only a pending join sent with a password offers to retype it, beside the code or the wait.
     #[test]
     fn a_pending_join_sent_with_a_password_says_it_can_be_retyped() {
         for (read, seen) in every_vault_observation() {
-            let (VaultRead::Pending { with_password, .. } | VaultRead::Asking { with_password }) =
-                read
+            let (VaultRead::Pending { with_password, .. }
+            | VaultRead::Asking { with_password, .. }) = read
             else {
                 continue;
             };

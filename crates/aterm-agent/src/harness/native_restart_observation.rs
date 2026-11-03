@@ -18,16 +18,11 @@ fn path(opts: &Opts, tab: &str) -> std::path::PathBuf {
 }
 
 fn read(opts: &Opts, tab: &str) -> Option<Observed> {
-    use std::io::Read;
-    let mut bytes = String::new();
-    std::fs::File::open(path(opts, tab))
-        .ok()?
-        .take((native_observe::MAX_REQUEST * 2 + 1) as u64)
-        .read_to_string(&mut bytes)
-        .ok()?;
-    if bytes.len() > native_observe::MAX_REQUEST * 2 {
-        return None;
-    }
+    let bytes = aterm_uds::runs::read_bounded_regular_text(
+        &path(opts, tab),
+        (native_observe::MAX_REQUEST * 2) as u64,
+    )
+    .ok()?;
     let mut lines = bytes.lines();
     let native_observe::Request::Register(registration) =
         native_observe::Request::parse(lines.next()?)?

@@ -345,7 +345,7 @@ mod native {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let ms = libc::c_int::try_from(within.as_millis()).unwrap_or(libc::c_int::MAX);
+            let ms = crate::slots::poll_timeout_millis(within);
             // SAFETY: one valid pollfd, owned by this frame, for the call's length; the native
             // reference owns the descriptor throughout it.
             match unsafe { libc::poll(&raw mut poll, 1, ms) } {

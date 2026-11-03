@@ -4,9 +4,7 @@
 use super::{RootAnswer, leaf_program};
 use crate::quit_safety::SessionRoot;
 use crate::{App, WindowId, pane, restore};
-use aterm_uds::spawnfd::InheritNothing as _;
-use std::os::fd::{FromRawFd, OwnedFd};
-use std::os::unix::process::CommandExt;
+use std::os::fd::IntoRawFd as _;
 use std::time::{Duration, Instant};
 
 fn root(comm: &str, children: &[i32]) -> RootAnswer {
@@ -49,40 +47,26 @@ fn a_leaf_ran_a_program_when_its_job_its_root_or_a_child_says_so() {
     assert_eq!(leaf_program(100, 100, &RootAnswer::Unasked, None), None);
 }
 
-fn open_pty_pair() -> (i32, i32) {
-    aterm_pty::open_pty_pair().expect("open_pty_pair")
-}
-
 /// Spawn `argv` as the session leader of a fresh PTY with a hermetic `HOME` and `HISTFILE=/dev/null`.
 #[allow(clippy::zombie_processes)]
 pub(crate) fn spawn_leader(argv: &[&str], home: &std::path::Path) -> (i32, i32) {
-    let (master, slave) = open_pty_pair();
-    // SAFETY: `slave` is an open fd the pair handed over; owned here.
-    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-    let mut cmd = std::process::Command::new(argv[0]);
-    cmd.inherit_nothing()
-        .args(&argv[1..])
-        .env_clear()
-        .envs(aterm_spec::host::hermetic_env(home))
-        .env("HISTFILE", "/dev/null")
-        .env("PATH", "/usr/bin:/bin")
-        .env("PS1", "$ ")
-        .env("TERM", "dumb")
-        .stdin(slave.try_clone().expect("dup slave"))
-        .stdout(slave.try_clone().expect("dup slave"))
-        .stderr(slave);
-    // SAFETY: `setsid` and `ioctl` are async-signal-safe; the closure runs in the forked child after its stdio is the slave.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let child = cmd.spawn().expect("spawn the session leader");
+    let (master, slave, child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
+        let mut cmd = std::process::Command::new(argv[0]);
+        cmd.args(&argv[1..])
+            .env_clear()
+            .envs(aterm_spec::host::hermetic_env(home))
+            .env("HISTFILE", "/dev/null")
+            .env("PATH", "/usr/bin:/bin")
+            .env("PS1", "$ ")
+            .env("TERM", "dumb")
+            .stdout(slave.try_clone()?)
+            .stderr(slave.try_clone()?);
+        Ok(cmd)
+    })
+    .expect("spawn the session leader");
+    drop(slave);
     let pid = i32::try_from(child.id()).expect("pid");
-    (master, pid)
+    (master.into_raw_fd(), pid)
 }
 
 /// Read from `master` until `want` appears.

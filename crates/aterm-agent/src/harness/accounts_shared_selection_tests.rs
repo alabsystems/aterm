@@ -302,7 +302,6 @@ fn progress(bed: &Bed) -> (bool, usize) {
             work();
             Ok(())
         },
-        quota_refresh: &|_, _, _, _| {},
         sync_cooldown: &cooldown,
         rediscovery: &rediscovery,
         renew_guard: &guard,

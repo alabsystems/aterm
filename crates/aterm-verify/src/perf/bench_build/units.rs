@@ -35,6 +35,8 @@ pub(crate) struct Promise {
     pub every_at: Option<&'static str>,
     /// Whether debug assertions are on.
     pub debug_assertions: bool,
+    /// Whether overflow checks are on.
+    pub overflow_checks: bool,
     /// The plan's word for the LTO, when the arm promises one.
     pub lto: Option<&'static str>,
     /// The codegen units, when the arm promises them.
@@ -47,6 +49,7 @@ impl Promise {
         Promise {
             every_at: profile.every_crate_at(),
             debug_assertions: profile.debug_assertions(),
+            overflow_checks: matches!(profile, super::Profile::Dev),
             lto: profile.lto(),
             codegen_units: profile.codegen_units(),
         }
@@ -253,6 +256,20 @@ impl Audit {
                 )
             });
         }
+        let overflows = short(&|u| u.overflow_checks != promise.overflow_checks, &|u| {
+            format!(
+                "overflow checks {}",
+                if u.overflow_checks { "on" } else { "off" }
+            )
+        });
+        if !overflows.is_empty() {
+            return Some(format!(
+                "this arm promises overflow checks {} on every crate on the measured path, and cargo plans {} otherwise: {}",
+                if promise.overflow_checks { "on" } else { "off" },
+                overflows.len(),
+                overflows.join(", ")
+            ));
+        }
         if let Some(want) = promise.lto {
             let other = short(&|u| u.lto != want, &|u| format!("lto {}", u.lto));
             if !other.is_empty() {
@@ -380,12 +397,42 @@ mod tests {
         let why = audit.refusal(Promise::of(Profile::Opt)).expect("refused");
         assert!(why.contains("aterm-core (opt-level 2)"), "{why}");
         assert!(!why.contains("cc") && !why.contains("syn"), "{why}");
-        assert_eq!(audit.refusal(Promise::of(Profile::Dev)), None);
+        let dev =
+            Audit::of(&plan("2").replace("\"overflow_checks\":false", "\"overflow_checks\":true"))
+                .expect("the dev mix parses");
+        assert_eq!(dev.refusal(Promise::of(Profile::Dev)), None);
         assert_eq!(
-            audit.summary(),
+            dev.summary(),
             "3 units on the measured path: opt-level 2 ×1 (aterm-core) · opt-level 3 ×2; debug \
-             assertions on; overflow checks off; lto false ×3; codegen units 16 ×3"
+             assertions on; overflow checks on; lto false ×3; codegen units 16 ×3"
         );
+    }
+
+    #[test]
+    fn every_arm_refuses_a_unit_whose_overflow_checks_differ_from_its_promise() {
+        for (profile, text) in [
+            (
+                Profile::Dev,
+                plan("3").replace("\"overflow_checks\":false", "\"overflow_checks\":true"),
+            ),
+            (Profile::Opt, plan("3")),
+            (Profile::Shipped, shipped_plan(|all| all)),
+        ] {
+            let promise = Promise::of(profile);
+            assert_eq!(Audit::of(&text).unwrap().refusal(promise), None);
+            let expected = format!("\"overflow_checks\":{}", promise.overflow_checks);
+            let changed = format!("\"overflow_checks\":{}", !promise.overflow_checks);
+            let altered = text.replacen(&expected, &changed, 1);
+            assert_ne!(altered, text, "the measured unit was actually changed");
+            let why = Audit::of(&altered)
+                .unwrap()
+                .refusal(promise)
+                .expect("refused");
+            assert!(
+                why.contains("overflow checks") && why.contains("aterm"),
+                "{profile:?}: {why}"
+            );
+        }
     }
 
     #[test]

@@ -23,6 +23,9 @@ static ONE_TAKE: Mutex<()> = Mutex::new(());
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Usage {
+    /// Its pages in physical memory now, bytes (`ri_resident_size`), including clean file-backed
+    /// pages; this is the resident-size reading reported beside the footprint.
+    pub resident: u64,
     /// Its physical footprint now, bytes (`ri_phys_footprint`, Activity Monitor's "Memory"): its
     /// dirty private pages, compressed ones too, and none of the clean file-backed pages that
     /// `ps`'s resident size also counts.
@@ -65,6 +68,7 @@ pub fn usage(pid: u32) -> Result<Usage, instance::CouldNotRun> {
         .ok_or_else(|| CouldNotRun::Refused("the kernel's timebase is unreadable".into()))?;
     let ticks = info.ri_user_time.saturating_add(info.ri_system_time);
     Ok(Usage {
+        resident: info.ri_resident_size,
         footprint: info.ri_phys_footprint,
         cpu_ns: aterm_sysprobe::procs::ticks_to_ns(ticks, numer, denom),
     })
@@ -100,4 +104,60 @@ impl Rig {
             fake_tui: PathBuf::from(fake_tui),
         }
     }
+}
+
+/// Maximum size (128 MiB) accepted when reading PNG frames, recording indices, or logs.
+pub(crate) const MAX_MEASURE_FILE_BYTES: u64 = 128 << 20;
+
+pub(crate) fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let file = opts.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+pub(crate) fn read_regular_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let file = open_regular_file(path)?;
+    let meta = file.metadata()?;
+    if meta.len() > MAX_MEASURE_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds 128 MiB limit",
+        ));
+    }
+    let cap = usize::try_from(meta.len().min(MAX_MEASURE_FILE_BYTES)).unwrap_or(0);
+    let mut buf = Vec::with_capacity(cap);
+    file.take(MAX_MEASURE_FILE_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_MEASURE_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file grew past 128 MiB limit while reading",
+        ));
+    }
+    Ok(buf)
+}
+
+pub(crate) fn read_regular_text(path: &std::path::Path) -> std::io::Result<String> {
+    String::from_utf8(read_regular_file(path)?)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }

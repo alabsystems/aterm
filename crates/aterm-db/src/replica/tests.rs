@@ -18,6 +18,7 @@ use std::{
     time::Duration,
 };
 
+mod clock;
 mod compatibility;
 mod policy;
 mod recovery;
@@ -1715,21 +1716,38 @@ fn empty_batches_recheck_authority_without_reopening_unrequested_data() {
     let held = pair.lab._home.path().join("held-table-a");
     std::fs::rename(&pair.paths[0], &held).unwrap();
 
+    let mut output = Vec::new();
+    round
+        .send_batch(
+            &mut Cursor::new(&mut output),
+            peer,
+            |session| {
+                round.prepare_batch(session, table, &[] as &[Digest], |_, _, _| {
+                    panic!("an empty batch encodes no table records")
+                })
+            },
+            BatchKind::Operation,
+            &mut Report::default(),
+        )
+        .expect("an empty batch needs no unrequested table data");
+    assert_eq!(output, 0u32.to_le_bytes());
+    let mut output = Vec::new();
     assert!(
         round
-            .prepare_batch(peer, table, &[] as &[Digest], |_, _, _| {
-                panic!("an empty batch encodes no table records")
-            })
-            .expect("an empty batch needs no unrequested table data")
-            .is_empty()
-    );
-    assert!(
-        round
-            .prepare_batch(peer, table, &[record], |_, _, _| {
-                panic!("unavailable table data cannot supply a requested record")
-            })
+            .send_batch(
+                &mut Cursor::new(&mut output),
+                peer,
+                |session| {
+                    round.prepare_batch(session, table, &[record], |_, _, _| {
+                        panic!("unavailable table data cannot supply a requested record")
+                    })
+                },
+                BatchKind::Operation,
+                &mut Report::default(),
+            )
             .is_err()
     );
+    assert!(output.is_empty(), "unavailable data emits no frame");
 
     std::fs::rename(&held, &pair.paths[0]).unwrap();
     assert_eq!(
@@ -1746,13 +1764,19 @@ fn empty_batches_recheck_authority_without_reopening_unrequested_data() {
     );
     assert_eq!(pair.count(1), 1);
     pair.retire_b();
+    let mut output = Vec::new();
     assert!(
         round
-            .prepare_batch(peer, table, &[] as &[Digest], |_, _, _| {
-                panic!("an empty batch grants no stale peer authority")
-            })
+            .send_batch(
+                &mut Cursor::new(&mut output),
+                peer,
+                |_| panic!("a retired peer cannot prepare an outgoing batch"),
+                BatchKind::Operation,
+                &mut Report::default(),
+            )
             .is_err()
     );
+    assert!(output.is_empty(), "a retired peer receives no frame");
 }
 
 fn lost_acknowledgement_retries_the_same_durable_record_once(retry_ack: bool) -> (i64, i64, i64) {

@@ -854,6 +854,7 @@ impl AccountsHost for BackgroundHost<'_> {
     ) -> Result<i32, String> {
         self.renew_outcome_with_inputs(staging, email, browser, inputs)
             .map(|exit| exit.code)
+            .map_err(|failure| failure.to_string())
     }
     fn renew_outcome_with_inputs(
         &self,
@@ -861,11 +862,16 @@ impl AccountsHost for BackgroundHost<'_> {
         email: &str,
         browser: &RenewBrowser,
         inputs: &Path,
-    ) -> Result<super::super::cli::RenewalExit, String> {
-        super::super::cli::RenewalExit::from_capture(
-            sign_in_with_inputs(self.home, staging, email, browser, true, None, Some(inputs))
-                .map_err(|failure| failure.to_string())?,
-        )
+    ) -> Result<super::super::cli::RenewalExit, super::super::cli::RenewalFailure> {
+        super::super::cli::RenewalExit::from_capture(sign_in_with_inputs(
+            self.home,
+            staging,
+            email,
+            browser,
+            true,
+            None,
+            Some(inputs),
+        )?)
     }
     fn shared_claude_profile(
         &self,
@@ -922,24 +928,22 @@ impl AccountsHost for BackgroundHost<'_> {
     ) -> Result<i32, String> {
         self.renew_outcome(staging, email, browser)
             .map(|exit| exit.code)
+            .map_err(|failure| failure.to_string())
     }
     fn renew_outcome(
         &self,
         staging: &str,
         email: &str,
         browser: &RenewBrowser,
-    ) -> Result<super::super::cli::RenewalExit, String> {
-        super::super::cli::RenewalExit::from_capture(
-            sign_in(
-                self.home,
-                staging,
-                email,
-                browser,
-                self.headless,
-                self.mailbox,
-            )
-            .map_err(|failure| failure.to_string())?,
-        )
+    ) -> Result<super::super::cli::RenewalExit, super::super::cli::RenewalFailure> {
+        super::super::cli::RenewalExit::from_capture(sign_in(
+            self.home,
+            staging,
+            email,
+            browser,
+            self.headless,
+            self.mailbox,
+        )?)
     }
     fn status_in_home(&self, staging: &str) -> Result<super::super::align::Captured, String> {
         super::super::cli::status_in_home_within(

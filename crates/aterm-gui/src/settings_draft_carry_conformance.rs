@@ -412,6 +412,7 @@ fn tab_only_layout(manifest: &RestoreManifest, restore_tag: &str) -> crate::rest
         native_tabs: Vec::new(),
         tab_order: Vec::new(),
         active_item: Some(0),
+        workers_in_front: false,
         restored_tabs: vec![tab],
     }
 }

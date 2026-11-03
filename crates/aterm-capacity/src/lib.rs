@@ -20,14 +20,19 @@
 //! not fit, where no other claim holds memory or waits ahead for it, is admitted ALONE: what it
 //! is short of is work no claim holds, whose end no claim's end brings, so a wait for it would
 //! have no bound; it runs with no other memory claim beside it, each waiting while it is held
-//! ([`Short::Alone`]). It refuses at once only a need that can never fit here: all the memory
+//! ([`Short::Alone`]). Resource-only admission refuses at once a need that can never fit here: all the memory
 //! that can ever be available or more (physical memory less what is wired,
 //! [`Reading::reachable`]) unless it asks to be admitted alone ([`Need::alone`]), or more disk
-//! than the volume holds above its floor.
-//! Timing-sensitive work waits for the load within its [`Patience`]: past its reservation age
-//! it holds back claimed work that asks after it, and at its bound it starts whatever the load.
+//! than the volume holds above its floor. Requested Timing also refuses unknown CPU/load
+//! provenance and immediate overrides before starting work.
+//! Explicit load-only quiet work waits within its [`Patience`] and may start at its bound.
+//! [`Need::timing`] additionally requires measured CPU readiness, reserves claimed work from
+//! actual admission for the existing bounded hold, and requires [`Claim::measurement_entry`]
+//! after compilation before accepting measurements. Forced, unknown and expired admissions
+//! do not qualify. A sampled CPU interval promises neither continuous quiet nor GPU quiet;
+//! unclaimed work and old clients that do not implement this policy remain outside its protection.
 //!
-//! A claim's memory reservation is its declared peak less what its holder's process tree
+//! An ordinary holder-based claim's memory reservation is its declared peak less what its holder's process tree
 //! already uses, so memory in use is not counted twice: a process is counted toward its
 //! nearest claimant ancestor only, and a holder's use is credited once across all its claims.
 //! A claim whose work runs outside its holder's tree (a VM, parented to launchd) is credited
@@ -36,14 +41,41 @@
 //! the other held claims only, never to its ancestors' or to a waiter, so a run that holds a
 //! claim can start a tool that claims for itself. Other sessions' plain builds hold no claim,
 //! but they show in the reading.
+//!
+//! Cohort namespaces instead retain the complete declared budget while a launch is armed,
+//! its bound group remains present or unknown, or its original holder is no longer alive.
+//! A free inherited guard cannot release that reservation, and numeric pid credit cannot
+//! replace binding an actual controlled child. Holder observations do not reduce retained
+//! custody or grant ancestor coverage from a dead or reused holder.
 
 #![warn(missing_docs)]
+#![cfg_attr(
+    all(anchor_rules, unix, any(test, debug_assertions)),
+    feature(macro_attr)
+)]
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 pub mod admit;
 pub mod book;
+mod timing;
+pub use timing::{CpuPoint, CpuWindow, QuietPolicy, TimingCause, TimingEvidence, TimingIssue};
+mod cohort_reference;
+pub use cohort_reference::CohortClosureRef;
+#[cfg(unix)]
+pub mod cohort;
+#[cfg(unix)]
+mod cohort_environment;
+#[cfg(unix)]
+mod cohort_history_environment;
+#[cfg(unix)]
+#[doc(hidden)]
+pub use cohort_history_environment::capacity_history_environment;
+#[cfg(unix)]
+mod cohort_journal;
+#[cfg(unix)]
+pub mod cohort_namespace;
 pub mod floor;
 pub mod footprint;
 pub mod ledger;
@@ -56,8 +88,10 @@ pub use admit::{
     Shortfall, Waiter, admit, admit_relieved, admit_until, admit_with, covered_memory, covering,
     gib, never, reserved, span,
 };
+#[cfg(unix)]
+pub use cohort_environment::capacity_cohort_environment;
 pub use footprint::{Estimate, Footprint, Footprints, Meter, allocated, allocated_until, size};
-pub use ledger::{Held, Ledger, Record};
+pub use ledger::{Accounting, ClaimGuardIdentity, CohortClaimState, Held, Ledger, Record};
 #[cfg(any(test, debug_assertions))]
 pub use reading::Fixed;
 pub use reading::{
@@ -176,6 +210,8 @@ pub struct Need {
     pub disk: u64,
     /// Admit it only while the 1-minute load is at or below this, and no other quiet claim is held or waits ahead.
     pub quiet: Option<f64>,
+    /// Explicit load admission versus measured timing; never inferred from a label or bound.
+    pub quiet_policy: QuietPolicy,
     /// How long a quiet claim waits for the load ([`Patience`]); unset, it waits until the load falls.
     pub patience: Option<Patience>,
     /// Where its disk need lands (the working directory when unset). In a [`Record`], the mount of that volume.
@@ -242,6 +278,7 @@ impl Need {
     #[must_use]
     pub const fn quiet(mut self, max_load1: f64) -> Need {
         self.quiet = Some(max_load1);
+        self.quiet_policy = QuietPolicy::Load;
         self
     }
 
@@ -253,12 +290,15 @@ impl Need {
     }
 
     /// Timing-sensitive work, `what`: a [`Need::quiet`] claim whose bound is [`quiet_bound`] of
-    /// this machine's cores, waiting for it within [`QUIET_PATIENCE`].
+    /// this machine's cores and the existing quiet CPU criterion, within [`QUIET_PATIENCE`].
+    /// Call [`Claim::measurement_entry`] after compilation to qualify actual measurements.
     #[must_use]
     pub fn timing(what: impl Into<String>) -> Need {
-        Need::new(what)
+        let mut need = Need::new(what)
             .quiet(quiet_bound(cores()))
-            .patience(QUIET_PATIENCE)
+            .patience(QUIET_PATIENCE);
+        need.quiet_policy = QuietPolicy::Timing;
+        need
     }
 
     /// The checkout it runs for, `dir`, which its record and every wait line name in place of the working directory's ([`Self::checkout`]).
@@ -266,6 +306,18 @@ impl Need {
     pub fn checkout(mut self, dir: impl Into<String>) -> Need {
         self.checkout = Some(dir.into());
         self
+    }
+
+    /// Bind the captured complete checkout spelling, refusing representation loss before a
+    /// source operation publishes intent. Canonicalization and UTF-8 conversion are the caller's.
+    ///
+    /// # Errors
+    /// The spelling is empty or exceeds the shared capacity record's exact representation.
+    pub fn checkout_exact(mut self, dir: impl Into<String>) -> std::io::Result<Need> {
+        let dir = dir.into();
+        ledger::checkout_exact(&dir)?;
+        self.checkout = Some(dir);
+        Ok(self)
     }
 
     /// Admit its memory only ALONE: once no other claim on the machine holds memory or waits
@@ -387,8 +439,8 @@ pub struct Patience {
     /// cores or disk, outside its own process tree and ancestry) waits, naming it, so no new
     /// grant or admission adds load while it waits.
     pub reserve: Duration,
-    /// Next for this long, it starts whatever the load: its bound. Its tool's report says the load
-    /// it started under.
+    /// Next for this long, a load-only claim starts whatever the load. Timing instead refuses
+    /// unqualified work at this bound; an override supplies no CPU readiness.
     pub start: Duration,
     /// Its reservation lasts this long into the work once it starts, at most, so what it held back
     /// does not start in a burst beside the work's first minutes; it ends sooner when the claim
@@ -415,7 +467,8 @@ pub enum Admit {
     /// Wait for room ([`admit`]).
     #[default]
     Wait,
-    /// Take the claim at once, room or not, and say what it would have waited for: the owner's override, which keeps a starved run visible as starved.
+    /// Override resource-only admission at once and say what it would have waited for.
+    /// Requested Timing refuses this mode: an override cannot qualify measurements.
     Now,
 }
 
@@ -446,6 +499,8 @@ impl Admit {
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod cohort_model_tests;
 #[cfg(test)]
 mod coverage_tests;
 

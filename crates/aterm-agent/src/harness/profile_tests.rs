@@ -1583,6 +1583,57 @@ fn a_login_answers_to_its_rows_address_alone() {
 }
 
 #[test]
+fn an_attributed_login_key_requires_its_own_matching_profile() {
+    let tmp = tmp_dir("attributed-key");
+    let home = tmp.path().join("home");
+    let login = tmp.path().join("login");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&login).unwrap();
+    let env = vec![format!("HOME={}", home.display())];
+    let own = r#"{"oauthAccount":{"accountUuid":"owner-id","emailAddress":"owner@example.com"}}"#;
+    let dedicated =
+        r#"{"oauthAccount":{"accountUuid":"work-id","emailAddress":"work@example.com"}}"#;
+    std::fs::write(home.join(".claude.json"), own).unwrap();
+    std::fs::write(login.join(".claude.json"), dedicated).unwrap();
+    let named = Some(login.to_str().unwrap());
+    assert_eq!(
+        account_for_login(&env, &home, None, "owner@example.com"),
+        AccountKey::claude("owner-id")
+    );
+    assert_eq!(
+        account_for_login(&env, &home, named, "work@example.com"),
+        AccountKey::claude("work-id")
+    );
+    assert_eq!(
+        account_for_login(&env, &home, named, "owner@example.com"),
+        None
+    );
+    assert_eq!(
+        account_for_login(&env, &home, Some("relative-login"), "owner@example.com"),
+        None
+    );
+
+    let legacy = login.join(".config.json");
+    std::fs::write(&legacy, dedicated.replace("work-id", "renewed-id")).unwrap();
+    assert_eq!(
+        account_for_login(&env, &home, named, "work@example.com"),
+        AccountKey::claude("renewed-id")
+    );
+    for text in [
+        r#"{"oauthAccount":{"accountUuid":"work-id"}}"#,
+        r#"{"oauthAccount":{"emailAddress":"work@example.com"}}"#,
+        r#"{"oauthAccount":{"accountUuid":"other-id","emailAddress":"other@example.com"}}"#,
+        "not JSON",
+    ] {
+        std::fs::write(&legacy, text).unwrap();
+        assert_eq!(
+            account_for_login(&env, &home, named, "work@example.com"),
+            None
+        );
+    }
+}
+
+#[test]
 fn full_provider_identity_survives_email_changes_and_never_falls_back_to_another_home() {
     let tmp = tmp_dir("full-provider-identity");
     let first = tmp.path().join("first");
@@ -1837,6 +1888,22 @@ fn muse_usage_cache_freshness_separates_attempts_from_landings() {
     assert!(!muse_usage_attempt_recent(Some(&failed), 1_060));
     assert!(!muse_usage_fresh(None, 1_000));
     assert!(!muse_usage_attempt_recent(None, 1_000));
+}
+
+/// A running Muse reads its usage once: an aged figure or a failed fetch is no reason for another,
+/// however long the tab stays open. CONTROL: a session that has not read yet, on the same entries,
+/// is owed its read, so `read_here` is what holds the others back.
+#[test]
+fn a_running_muse_is_owed_one_usage_read() {
+    let failed = MuseUsageEntry {
+        attempted_at: 1_000,
+        reading: None,
+    };
+    let later = 1_000 + 7 * USAGE_CURRENT_S;
+    assert!(muse_usage_owed(None, false, 1_000), "the first read");
+    assert!(muse_usage_owed(Some(&failed), false, later), "CONTROL");
+    assert!(!muse_usage_owed(None, true, 1_000));
+    assert!(!muse_usage_owed(Some(&failed), true, later));
 }
 
 /// A FETCH THAT LANDS AFTER ITS ENTRY WAS FORGOTTEN still names its reading (the
@@ -3296,4 +3363,227 @@ fn no_weekly_gap_tells_the_person_to_act() {
         assert!(!gap.words().contains('?'), "never a bare `?`: {gap:?}");
         assert!(gap.spoken().starts_with("weekly figure unknown"), "{gap:?}");
     }
+}
+
+/// Step 9's agy rule: a running agy's footer asks agy once, when the session first draws it, and
+/// never on a resolver pass after that, however old the figure gets; the figure then ages out of
+/// the footer rather than being read again. CONTROL: the first pass does read (the stand-in's count
+/// is 1 and the event is reported), so the silence after is the rule and not a broken stand-in.
+#[cfg(unix)]
+#[test]
+fn a_running_agys_footer_reads_its_usage_once() {
+    let mut tmp = aterm_uds::deadline::KeptUntilRan::new(tmp_dir("agy-footer-once").keep());
+    let home = tmp.path().join("home");
+    let cfg = home.join(".gemini/antigravity-cli");
+    std::fs::create_dir_all(&cfg).expect("cfg");
+    std::fs::write(
+        cfg.join("cli.log"),
+        "I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: \
+         email=once@example.test, authMethod=consumer, quotaProject=\n",
+    )
+    .expect("cli.log");
+    let count = tmp.path().join("count");
+    let usage = tmp.path().join("usage.json");
+    let now = 1_792_796_000_i64;
+    std::fs::write(
+        &usage,
+        format!(
+            "{{\"status\":\"SUCCESS\",\"command\":{{\"name\":\"usage\",\"data\":{{\"groups\":[{{\"name\":\"Gemini Models\",\"buckets\":[{{\"id\":\"gemini-weekly\",\"name\":\"Weekly Limit Remaining\",\"window\":\"weekly\",\"remaining_fraction\":0.5,\"reset_time\":\"{}\"}}]}}]}}}}}}",
+            super::super::usage::rfc3339_utc(now + 30 * 24 * 3600)
+        ),
+    )
+    .expect("usage");
+    let agy = tmp.path().join("fake-agy.sh");
+    crate::harness::stand_in::proven(
+        &agy,
+        &format!(
+            "echo read >> '{}'\ncat '{}'\n",
+            count.display(),
+            usage.display()
+        ),
+    );
+    let argv = vec![agy.to_string_lossy().into_owned()];
+    let env = vec![format!("HOME={}", home.display())];
+    let store = super::super::agy_quota_store::Store::new(tmp.path(), "once");
+    let pass = |prev: &SubscriptionDisplay, at: i64| {
+        agy_subscription_with_store(
+            &argv,
+            &env,
+            &home,
+            prev,
+            Some("Gemini 3.1 Pro"),
+            at,
+            Some(&store),
+        )
+        .expect("a subscription")
+    };
+    let reads = || {
+        std::fs::read_to_string(&count)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let (first, events) =
+        super::super::provider_read::captured(|| pass(&SubscriptionDisplay::default(), now));
+    assert_eq!(reads(), 1);
+    assert_eq!(first.weekly.as_deref(), Some("weekly 50% left"));
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].why,
+        super::super::provider_read::InUse::LiveSession
+    );
+    tmp.ran();
+    let aged = pass(&first, now + 2 * USAGE_CURRENT_S);
+    assert_eq!(
+        reads(),
+        1,
+        "the figure past its current age is not read again"
+    );
+    assert!(
+        aged.weekly.as_deref().is_some_and(|w| w.contains("ago")),
+        "it stands with its age: {:?}",
+        aged.weekly
+    );
+    let gone = pass(&aged, now + 24 * 3600);
+    assert_eq!(reads(), 1);
+    assert_eq!(
+        gone.weekly, None,
+        "too old to show: unknown, not a stale figure"
+    );
+}
+
+/// A footer pass that made no read has not spent the session's one read, whereas a read that ran
+/// and failed has. CONTROL: the lock released, the same session's next pass reads, so the lock was
+/// all that held it back; the failed read's count stays at one past the retry time.
+#[cfg(unix)]
+#[test]
+fn a_skipped_agy_footer_read_is_made_later_and_a_failed_one_is_not_repeated() {
+    let mut tmp = aterm_uds::deadline::KeptUntilRan::new(tmp_dir("agy-footer-skip").keep());
+    let home = tmp.path().join("home");
+    let cfg = home.join(".gemini/antigravity-cli");
+    std::fs::create_dir_all(&cfg).expect("cfg");
+    std::fs::write(
+        cfg.join("cli.log"),
+        "I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: \
+         email=skip@example.test, authMethod=consumer, quotaProject=\n",
+    )
+    .expect("cli.log");
+    let count = tmp.path().join("count");
+    let agy = tmp.path().join("fake-agy.sh");
+    crate::harness::stand_in::proven(
+        &agy,
+        &format!("echo read >> '{}'\nexit 1\n", count.display()),
+    );
+    let argv = vec![agy.to_string_lossy().into_owned()];
+    let env = vec![format!("HOME={}", home.display())];
+    let store = super::super::agy_quota_store::Store::new(tmp.path(), "skip");
+    let now = 1_792_797_000_i64;
+    let pass = |prev: &SubscriptionDisplay, at: i64| {
+        agy_subscription_with_store(
+            &argv,
+            &env,
+            &home,
+            prev,
+            Some("Gemini 3.1 Pro"),
+            at,
+            Some(&store),
+        )
+        .expect("a subscription")
+    };
+    let reads = || {
+        std::fs::read_to_string(&count)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let held = store.try_lock().expect("the lock");
+    let skipped = pass(&SubscriptionDisplay::default(), now);
+    assert_eq!(reads(), 0);
+    assert!(!skipped.usage_read, "the lock held: nothing was read");
+    drop(held);
+    let failed = pass(&skipped, now + 1);
+    assert_eq!(reads(), 1, "CONTROL: the skipped read is made");
+    tmp.ran();
+    assert!(failed.usage_read);
+    assert!(
+        store.recent_failure(now + 2).is_some(),
+        "failed footer read records Store failure backoff for sibling readers"
+    );
+    let again = pass(&failed, now + 24 * 3600);
+    assert_eq!(reads(), 1, "a read that failed is not repeated");
+    assert!(again.usage_read);
+}
+
+/// NEGATIVE CONTROL: `muse_usage_forget` (the fact menu's explicit `Refresh usage` action) clears
+/// `MUSE_USAGE_CACHE` so a live Muse session whose `prev.usage_read` is already `true` kicks one
+/// fresh read, whereas ordinary aged resolver passes with the cache intact never re-read.
+#[cfg(unix)]
+#[test]
+fn muse_usage_forget_allows_one_explicit_refresh_on_a_live_session() {
+    let mut tmp = aterm_uds::deadline::KeptUntilRan::new(tmp_dir("muse-forget-refresh").keep());
+    let home = tmp.path().join("home");
+    let store = home.join(".config/muse");
+    std::fs::create_dir_all(&store).expect("store");
+    std::fs::write(
+        store.join("auth.json"),
+        r#"{"schema_version":2,"providers":{"meta":{"mechanism":"oauth","storage":"keychain","user_email":"forget@example.test","api_key":"[REDACTED]"}}}"#,
+    )
+    .expect("auth");
+    let count = tmp.path().join("count");
+    let fake_muse = tmp.path().join("fake-muse.sh");
+    crate::harness::stand_in::proven(
+        &fake_muse,
+        &format!("echo read >> '{}'\nexit 1\n", count.display()),
+    );
+    let argv = vec![fake_muse.to_string_lossy().into_owned()];
+    let env = vec![format!("HOME={}", home.display())];
+    let now = 1_792_800_000_i64;
+    let reads = || {
+        std::fs::read_to_string(&count)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let wait_idle = || {
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "muse fetch idle", || {
+            (!MUSE_USAGE_FETCHING.load(std::sync::atomic::Ordering::Acquire)).then_some(())
+        });
+    };
+    wait_idle();
+    muse_usage_forget("forget@example.test");
+
+    let first = muse_subscription_for(&argv, &env, &home, &SubscriptionDisplay::default(), now)
+        .expect("initial muse subscription");
+    assert!(first.usage_read);
+    wait_idle();
+    assert_eq!(reads(), 1, "CONTROL: initial pass runs one fetch");
+    tmp.ran();
+
+    let aged = muse_subscription_for(&argv, &env, &home, &first, now + 2 * USAGE_CURRENT_S)
+        .expect("aged muse subscription");
+    wait_idle();
+    assert_eq!(
+        reads(),
+        1,
+        "aged pass with cache entry intact never re-polls"
+    );
+    assert!(aged.usage_read);
+
+    muse_usage_forget("forget@example.test");
+    let refreshed = muse_subscription_for(
+        &argv,
+        &env,
+        &home,
+        &aged,
+        now + 2 * USAGE_CURRENT_S + MUSE_USAGE_RETRY_S + 5,
+    )
+    .expect("explicit fact-menu refresh");
+    assert!(refreshed.usage_read);
+    wait_idle();
+    assert_eq!(
+        reads(),
+        2,
+        "explicit muse_usage_forget must allow one fresh fetch on the live session"
+    );
+    muse_usage_forget("forget@example.test");
 }

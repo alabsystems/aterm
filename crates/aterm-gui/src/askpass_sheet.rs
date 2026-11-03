@@ -57,6 +57,7 @@ impl App {
             ticket,
             attribute_from,
             owned,
+            exact,
             command,
             invoker,
             reply,
@@ -118,7 +119,14 @@ impl App {
             ));
             return;
         }
-        self.build_askpass_sheet(wid, session, (&command, &invoker), owned, ticket, reply);
+        self.build_askpass_sheet(
+            wid,
+            session,
+            (&command, &invoker, exact),
+            owned,
+            ticket,
+            reply,
+        );
     }
 
     /// Build and attach the askpass sheet, or reply with a refusal on failure.
@@ -126,7 +134,7 @@ impl App {
         &mut self,
         wid: crate::WindowId,
         session: u64,
-        (command, invoker): (&str, &str),
+        (command, invoker, exact): (&str, &str, bool),
         owned: Option<std::sync::Arc<crate::cpu_policy_authorization::Operation>>,
         ticket: std::sync::Arc<crate::askpass::AskpassTicket>,
         reply: Sender<AskpassAnswer>,
@@ -160,6 +168,13 @@ impl App {
         let (message, informative) = if owned.is_some() {
             ("Authorize CPU diagnostics".to_owned(),
              "Read CPU scheduling information and save a diagnostic report. Authorization applies to this collection only.".to_owned())
+        } else if exact {
+            (
+                format!("Run this as root in tab for session {session}?"),
+                format!(
+                    "{command}\n\nAsked by:\n{invoker}\n\nYour password authorizes this one command, not later ones. A shell or script can go on to run anything."
+                ),
+            )
         } else {
             (
                 format!(

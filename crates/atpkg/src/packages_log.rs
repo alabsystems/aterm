@@ -564,6 +564,83 @@ fn redact_tokens(text: &str) -> String {
         /// any other word is the credential.
         Scheme,
     }
+    fn wrapping(c: char) -> bool {
+        matches!(
+            c,
+            '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | ',' | ';' | '.' | '<' | '>' | '`'
+        )
+    }
+    fn redact_word(word: &str, hide: &mut Hide) -> String {
+        let bare = word.trim_matches(wrapping);
+        match *hide {
+            Hide::Next => {
+                *hide = Hide::Nothing;
+                return REDACTED.to_string();
+            }
+            Hide::Scheme => {
+                if matches!(
+                    bare.to_ascii_lowercase().as_str(),
+                    "bearer" | "basic" | "token" | "digest"
+                ) {
+                    *hide = Hide::Next;
+                    return word.to_string();
+                }
+                *hide = Hide::Nothing;
+                return REDACTED.to_string();
+            }
+            Hide::Nothing => {}
+        }
+        if is_secret_shaped(bare) {
+            return REDACTED.to_string();
+        }
+        let segments: Vec<&str> = word.split_inclusive([',', ';', '&']).collect();
+        if segments.len() > 1 {
+            let mut joined = String::with_capacity(word.len());
+            let mut sub_hide = Hide::Nothing;
+            for seg in segments {
+                let (core, delim) = match seg.chars().next_back() {
+                    Some(c @ (',' | ';' | '&')) => {
+                        let cut = seg.len() - c.len_utf8();
+                        (&seg[..cut], &seg[cut..])
+                    }
+                    _ => (seg, ""),
+                };
+                if !core.is_empty() {
+                    joined.push_str(&redact_word(core, &mut sub_hide));
+                }
+                joined.push_str(delim);
+            }
+            if sub_hide != Hide::Nothing {
+                *hide = sub_hide;
+            }
+            return joined;
+        }
+        if let Some(at) = bare.find(['=', ':']) {
+            let key = bare[..at].trim_matches(['"', '\'']).to_ascii_lowercase();
+            let glued = bare[at + 1..].trim_matches(['"', '\'']);
+            let sep = &bare[at..=at];
+            if key == "authorization" && glued.is_empty() {
+                *hide = Hide::Scheme;
+                return word.to_string();
+            }
+            if is_credential_key(&key, sep == "=") || key == "authorization" {
+                if glued.is_empty() {
+                    *hide = Hide::Next;
+                    return word.to_string();
+                }
+                let lead = word.len() - word.trim_start_matches(wrapping).len();
+                let mut out = String::with_capacity(lead + at + 1 + REDACTED.len());
+                out.push_str(&word[..lead]);
+                out.push_str(&bare[..=at]);
+                out.push_str(REDACTED);
+                return out;
+            }
+        }
+        if matches!(bare.to_ascii_lowercase().as_str(), "bearer" | "token") {
+            *hide = Hide::Next;
+        }
+        word.to_string()
+    }
     let mut out = String::with_capacity(text.len());
     let mut hide = Hide::Nothing;
     for (i, word) in text.split(' ').enumerate() {
@@ -573,64 +650,7 @@ fn redact_tokens(text: &str) -> String {
         if word.is_empty() {
             continue;
         }
-        let wrapping = |c: char| {
-            matches!(
-                c,
-                '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | ',' | ';' | '.' | '<' | '>' | '`'
-            )
-        };
-        let bare = word.trim_matches(wrapping);
-        match hide {
-            Hide::Next => {
-                out.push_str(REDACTED);
-                hide = Hide::Nothing;
-                continue;
-            }
-            Hide::Scheme => {
-                if matches!(
-                    bare.to_ascii_lowercase().as_str(),
-                    "bearer" | "basic" | "token" | "digest"
-                ) {
-                    out.push_str(word);
-                    hide = Hide::Next;
-                } else {
-                    out.push_str(REDACTED);
-                    hide = Hide::Nothing;
-                }
-                continue;
-            }
-            Hide::Nothing => {}
-        }
-        if is_secret_shaped(bare) {
-            out.push_str(REDACTED);
-            continue;
-        }
-        if let Some(at) = bare.find(['=', ':']) {
-            let key = bare[..at].trim_matches(['"', '\'']).to_ascii_lowercase();
-            let glued = bare[at + 1..].trim_matches(['"', '\'']);
-            let sep = &bare[at..=at];
-            if key == "authorization" && glued.is_empty() {
-                out.push_str(word);
-                hide = Hide::Scheme;
-                continue;
-            }
-            if is_credential_key(&key, sep == "=") || key == "authorization" {
-                if glued.is_empty() {
-                    out.push_str(word);
-                    hide = Hide::Next;
-                } else {
-                    let lead = word.len() - word.trim_start_matches(wrapping).len();
-                    out.push_str(&word[..lead]);
-                    out.push_str(&bare[..=at]);
-                    out.push_str(REDACTED);
-                }
-                continue;
-            }
-        }
-        if matches!(bare.to_ascii_lowercase().as_str(), "bearer" | "token") {
-            hide = Hide::Next;
-        }
-        out.push_str(word);
+        out.push_str(&redact_word(word, &mut hide));
     }
     out
 }
@@ -714,20 +734,42 @@ pub fn append_line(dir: &Path, line: &str, may_rotate: bool) -> io::Result<()> {
 #[cfg(unix)]
 fn open_append(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "packages.log is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 #[cfg(not(unix))]
 fn open_append(path: &Path) -> io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && !meta.file_type().is_file()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "packages.log is not a regular file",
+        ));
+    }
+    let file = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .open(path)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "packages.log is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 /// Path to `packages.log.<n>` beside `path`.
@@ -815,11 +857,19 @@ pub fn parse_record(line: &str) -> Option<Entry> {
     if kind.is_empty() || !kind.bytes().all(|b| b.is_ascii_lowercase() || b == b'-') {
         return None;
     }
+    let clean_field = |s: &str| {
+        s.chars().all(|c| {
+            !c.is_control()
+                && !is_bidi_control(c)
+                && !is_zero_width(c)
+                && !matches!(c, '\u{2028}' | '\u{2029}')
+        })
+    };
     let mut pid = None;
     let mut fields = Vec::new();
     for part in parts {
         let (key, value) = part.split_once('=')?;
-        if key.is_empty() {
+        if key.is_empty() || !clean_field(key) || !clean_field(value) {
             return None;
         }
         if key == "pid" {
@@ -850,7 +900,9 @@ pub fn read_tail(dir: &Path, max: usize) -> Vec<Entry> {
 pub fn read_tail_of(dir: &Path, max: usize, keep: impl Fn(&Entry) -> bool) -> Vec<Entry> {
     let path = dir.join(LOG_NAME);
     let mut out = Vec::new();
-    for file in [path.clone(), rotated_path(&path, 1)] {
+    for file in
+        std::iter::once(path.clone()).chain((1..=KEEP_ROTATED).map(|n| rotated_path(&path, n)))
+    {
         if out.len() >= max {
             break;
         }
@@ -1454,5 +1506,63 @@ mod tests {
         for d in [&dir, &store, &other] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// NEGATIVE CONTROL: `read_tail_of` walks all 5 rotated files (`packages.log.1`..`packages.log.5`)
+    /// when `max` is not yet satisfied, `redact_tokens` redacts credential keys inside `,`/`;`/`&`
+    /// compound tokens without swallowing neighboring fields, and `parse_record` rejects unescaped
+    /// control/bidi/zero-width bytes in keys or values while accepting sanitized records.
+    #[test]
+    fn tail_scans_all_five_rotations_compound_tokens_redact_and_dirty_records_refuse() {
+        let dir = scratch("tail-five");
+        let path = dir.join(LOG_NAME);
+        let line = |n: i64| {
+            render(
+                1_790_000_000 + n,
+                1,
+                &Event::PassStart {
+                    lane: "window",
+                    verb: "update",
+                },
+            )
+        };
+        std::fs::write(&path, line(6)).unwrap();
+        for n in 1..=KEEP_ROTATED {
+            std::fs::write(rotated_path(&path, n), line(6 - i64::from(n))).unwrap();
+        }
+        let all = read_tail(&dir, 10);
+        let ats: Vec<i64> = all.iter().filter_map(|e| e.at).collect();
+        assert_eq!(
+            ats,
+            vec![
+                1_790_000_006,
+                1_790_000_005,
+                1_790_000_004,
+                1_790_000_003,
+                1_790_000_002,
+                1_790_000_001,
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            sanitize("user=alice,token=sec123,role=admin"),
+            "user=alice,token=[redacted],role=admin"
+        );
+        assert_eq!(sanitize("a=1&api_key=xyz"), "a=1&api_key=[redacted]");
+
+        assert_eq!(
+            parse_record("2026-09-21T14:13:20Z\tprogram\tpid=1\treason=bad\u{1b}[31m\n"),
+            None
+        );
+        assert_eq!(
+            parse_record("2026-09-21T14:13:20Z\tprogram\tpid=1\treason=bad\u{202E}\n"),
+            None
+        );
+        assert_eq!(
+            parse_record("2026-09-21T14:13:20Z\tprogram\tpid=1\treason=clean\n")
+                .and_then(|e| e.get("reason").map(str::to_string)),
+            Some("clean".to_string())
+        );
     }
 }

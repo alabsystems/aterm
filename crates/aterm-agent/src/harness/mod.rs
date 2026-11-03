@@ -27,6 +27,7 @@ pub mod agy_quota_store;
 pub mod ai_pool;
 #[cfg(unix)]
 pub mod ai_signin;
+pub mod alab_roster;
 pub mod align;
 mod auth_deadline;
 #[cfg(test)]
@@ -37,12 +38,14 @@ pub mod cli;
 pub mod codex_alab;
 pub mod codex_app_login;
 pub mod codex_facts;
+pub mod codex_renewal;
 pub mod codex_rollout;
 pub mod codex_steps;
 pub mod codex_tap;
 pub mod contract;
 pub mod credit_offers;
 pub mod disk;
+pub mod email_cli;
 pub mod excerpt;
 pub mod first_exec;
 pub mod flight;
@@ -52,6 +55,7 @@ pub mod grok_signin;
 pub mod headless_fetch;
 pub mod headless_oauth;
 pub mod hold_said;
+pub mod journal;
 pub mod land_receipt;
 pub mod lanes;
 pub mod laps;
@@ -60,12 +64,18 @@ pub mod login_drive;
 pub mod login_latch;
 pub mod mail_browser;
 pub mod mail_recovery;
+pub mod mailbox_needs;
 pub mod mailbox_routes;
+pub mod mailbox_seen;
 pub mod muse_usage;
 pub mod native_act;
 pub mod native_keys;
 #[cfg(unix)]
 mod native_launch;
+#[cfg(all(unix, debug_assertions))]
+pub use native_launch::{
+    FixtureStage as NativeLauncherFixtureStage, fixture_entry as native_launcher_fixture_entry,
+};
 #[cfg(all(test, target_os = "macos"))]
 mod native_launch_tests;
 pub mod native_observe;
@@ -74,6 +84,7 @@ pub mod netwatch;
 pub mod open_url;
 pub mod outlook;
 pub mod profile;
+pub mod provider_read;
 pub mod relaunch;
 pub mod remote_renew;
 pub mod repo_work;

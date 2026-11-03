@@ -112,7 +112,7 @@ pub fn read(
             }
             Membership::Pending => PeersRead::Deferred(not_let_in(
                 &format!("vault {name}"),
-                waits_for(&status),
+                (waits_for(&status), &|| ops.join_place()),
                 "no pass joins it again",
             )),
             Membership::Revoked { seq } => PeersRead::Deferred(format!(
@@ -202,7 +202,7 @@ pub fn join(
     } else {
         PeersDone::Waiting(not_let_in(
             &name,
-            waits_for(&status),
+            (waits_for(&status), &|| ops.join_place()),
             "its request stands, and no pass sends another",
         ))
     })
@@ -235,13 +235,18 @@ fn waits_for(status: &aterm_secrets::client::Status) -> Waits {
 }
 
 /// What `sync.peers` says of `vault` (`vault alab`) while it has not let this Mac in, waiting
-/// for `waits`, then `then`.
-fn not_let_in(vault: &str, waits: Waits, then: &str) -> String {
+/// for `waits`, then `then`: at the ALab vault, what lets this Mac in where it is (`at`, read
+/// only then: `aterm_secrets::alab_join::let_in`).
+fn not_let_in(
+    vault: &str,
+    (waits, at): (Waits, &dyn Fn() -> aterm_secrets::alab_join::JoinPlace),
+    then: &str,
+) -> String {
     match waits {
         Waits::Approver => format!(
             "{vault} has not let this Mac in yet: {}, or give the join password, which System \
              State's Secrets row or `aterm init` takes; {then}",
-            crate::init_secrets::LET_IN
+            aterm_secrets::alab_join::let_in(at())
         ),
         Waits::PasswordOrApproval => format!(
             "{vault} has not let this Mac in: it asks a join password or an admin's approval, \
@@ -255,6 +260,7 @@ mod tests {
     use super::*;
     use crate::init_secrets::tests::{Scripted, configured, unconfigured};
     use crate::items::defaults::tests::{ctx, user};
+    use aterm_secrets::alab_join::JoinPlace;
     use aterm_secrets::client::JoinOutcome;
     use std::cell::Cell;
 
@@ -347,18 +353,24 @@ mod tests {
         assert_eq!(ops.joins().len(), 1, "never joined again");
     }
 
-    /// A Mac the ALab vault has not let in yet is told to press Allow on any Mac in ALab (or give
-    /// a password or a code), in the join's answer and in every later read; another vault's Mac
-    /// is told its vault asks a password or an approval. No pass joins either again.
-    /// NEGATIVE CONTROL: a [`waits_for`] that ignores the vault tells the ALab Mac its vault asks
-    /// a password or an approval.
+    /// A Mac the ALab vault has not let in yet is told what lets it in where it is (or to give a
+    /// password), in the join's answer and in every later read: the automatic admission's words on
+    /// the ALab LAN, and off it the words that promise none; another vault's Mac is told its vault
+    /// asks a password or an approval. No pass joins either again.
+    /// NEGATIVE CONTROLS: a [`waits_for`] that ignores the vault tells the ALab Mac its vault asks
+    /// a password or an approval; `not_let_in` giving `LET_IN` wherever this Mac is fails at
+    /// "off the ALab LAN, no automatic admission".
     #[test]
     fn a_pending_alab_join_waits_for_the_vaults_approver() {
-        let mut alab = configured(Membership::Pending);
-        let signer: [u8; 32] = aterm_secrets::b64::decode_padded(aterm_secrets::ALAB_SIGNER)
-            .and_then(|key| key.try_into().ok())
-            .expect("the ALab signer");
-        alab.config.as_mut().expect("a config").signer = Some(signer);
+        let alab_pending = || {
+            let mut alab = configured(Membership::Pending);
+            let signer: [u8; 32] = aterm_secrets::b64::decode_padded(aterm_secrets::ALAB_SIGNER)
+                .and_then(|key| key.try_into().ok())
+                .expect("the ALab signer");
+            alab.config.as_mut().expect("a config").signer = Some(signer);
+            alab
+        };
+        let alab = alab_pending();
         let other = configured(Membership::Pending);
         for (status, waits) in [(alab, Waits::Approver), (other, Waits::PasswordOrApproval)] {
             let ops = Scripted::new(vec![Ok(unconfigured())]);
@@ -367,7 +379,7 @@ mod tests {
                 joined(&ops),
                 Ok(PeersDone::Waiting(not_let_in(
                     "vault alab",
-                    waits,
+                    (waits, &|| JoinPlace::Home),
                     "its request stands, and no pass sends another"
                 ))),
                 "{waits:?}"
@@ -376,11 +388,25 @@ mod tests {
             let looks = Cell::new(0);
             assert_eq!(
                 looked(&ops, &ALLOWED, &Heard::Found, &looks),
-                PeersRead::Deferred(not_let_in("vault alab", waits, "no pass joins it again")),
+                PeersRead::Deferred(not_let_in(
+                    "vault alab",
+                    (waits, &|| JoinPlace::Home),
+                    "no pass joins it again"
+                )),
                 "{waits:?}"
             );
             assert!(ops.joins().is_empty(), "no pass joins it again");
         }
+        let ops = Scripted::new(vec![Ok(alab_pending())]);
+        ops.placed(JoinPlace::Away);
+        let looks = Cell::new(0);
+        let read = looked(&ops, &ALLOWED, &Heard::Found, &looks);
+        assert!(
+            matches!(&read, PeersRead::Deferred(why)
+                if why.contains(aterm_secrets::alab_join::LET_IN_AWAY)
+                    && !why.contains(crate::init_secrets::LET_IN)),
+            "off the ALab LAN, no automatic admission: {read:?}"
+        );
     }
 
     /// A Mac removed from its vault reads deferred, naming the removal, not joined: no

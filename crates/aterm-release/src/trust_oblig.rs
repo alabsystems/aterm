@@ -638,8 +638,8 @@ impl<'a> Sources<'a> {
     /// An in-tree file's lines, read once.
     fn lines(&mut self, rel: &str) -> std::result::Result<&[String], String> {
         if !self.lines.contains_key(rel) {
-            let text =
-                fs::read_to_string(self.repo.join(rel)).map_err(|e| format!("{rel}: {e}"))?;
+            let text = crate::durable::read_text(&self.repo.join(rel))
+                .map_err(|e| format!("{rel}: {e}"))?;
             let lines = text
                 .split('\n')
                 .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
@@ -765,7 +765,8 @@ pub fn reduce(
     repo: &Path,
     manifest: Option<&str>,
 ) -> std::result::Result<Record, String> {
-    let file = fs::File::open(report).map_err(|e| format!("{}: {e}", report.display()))?;
+    let file = crate::durable::open_regular_file(report)
+        .map_err(|e| format!("{}: {e}", report.display()))?;
     let mut src = Sources::new(repo, manifest)?;
     let mut reader = BufReader::new(file);
     let mut buf = Vec::new();

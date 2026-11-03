@@ -13,7 +13,9 @@ use atpkg::vendor_direct::Version as BuildVersion;
 pub fn build_version(version: &str, build: Option<&str>) -> Option<BuildVersion> {
     let v = BuildVersion::parse(version.trim())?;
     match build {
-        Some(dir) => (crate::parse_uint::<u64>(dir) == Some(v.build_id())).then_some(v),
+        Some(dir) => (!(dir.len() > 1 && dir.starts_with('0'))
+            && crate::parse_uint::<u64>(dir) == Some(v.build_id()))
+        .then_some(v),
         None => Some(v),
     }
 }
@@ -297,6 +299,21 @@ pub fn gate(l: &Look) -> Result<(), &'static str> {
         Some(0) => Ok(()),
         Some(_) => Err("child-process"),
     }
+}
+
+/// Return the first inline `NAME=VALUE` assignment prefixing the `muse` command in `cmdline`
+/// that [`super::upgrade_muse::relaunch_env`] does not carry.
+#[must_use]
+pub fn inline_env(cmdline: &str) -> Option<String> {
+    super::upgrade_agy_live::inline_env_for(
+        cmdline,
+        super::upgrade_muse::PROGRAM,
+        &[
+            super::upgrade_muse::DATA_ENV,
+            super::upgrade_muse::CONFIG_ENV,
+            super::upgrade_muse::HOME_ENV,
+        ],
+    )
 }
 
 #[cfg(test)]

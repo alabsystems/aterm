@@ -22,12 +22,16 @@ impl Drop for WipedJson {
     }
 }
 
-fn line(bytes: &[u8]) -> bool {
+pub(super) fn is_line(bytes: &[u8]) -> bool {
     std::str::from_utf8(bytes).is_ok_and(|text| {
         let text = text.strip_suffix('\n').unwrap_or(text);
         let text = text.strip_suffix('\r').unwrap_or(text);
         !text.trim().is_empty() && !text.chars().any(char::is_control)
     })
+}
+
+fn line(bytes: &[u8]) -> bool {
+    is_line(bytes)
 }
 
 /// Validate all entries and return the deployer's public account identity when applicable.
@@ -46,7 +50,7 @@ pub(super) fn validate(want: &Want, values: &Values) -> Result<Option<String>> {
     let refused = || Error::new("the contribution failed the want's validator");
     let bytes = values.0[0].1.as_slice();
     match want {
-        Want::Mailbox(_) => {
+        Want::Mailbox(_) | Want::MailboxComponent(_) => {
             if values.0.iter().any(|(_, value)| !line(value.as_slice())) {
                 return Err(refused());
             }

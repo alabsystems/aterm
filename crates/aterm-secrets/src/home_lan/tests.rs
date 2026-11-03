@@ -2,52 +2,95 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use aterm_netplace::facts::Here;
+use aterm_netplace::{Answer, Facts, PathFacts, member_key};
 
 const NOW: u64 = 1_800_000_000_000;
-const HOME_GW: &str = "a0b1c2d3e4f5";
+const HOME_HW: [u8; 6] = [0xa0, 0xb1, 0xc2, 0xd3, 0xe4, 0xf5];
+/// When this Mac's current stay on the network began: half an hour before [`NOW`].
+const STAY: u64 = NOW - 30 * 60_000;
 
-fn on(name: &str, ip: [u8; 4], mask: [u8; 4]) -> InterfaceAddress {
-    InterfaceAddress {
-        name: name.into(),
-        address: Ipv4Addr::from(ip).into(),
-        netmask: Some(Ipv4Addr::from(mask).into()),
-        flags: 0,
+fn ip(text: &str) -> IpAddr {
+    text.parse().unwrap()
+}
+
+fn v4(text: &str) -> Ipv4Addr {
+    text.parse().unwrap()
+}
+
+fn path(expensive: bool, link: Link) -> PathFacts {
+    PathFacts {
+        usable: Some(true),
+        expensive,
+        constrained: false,
+        link,
     }
 }
 
-/// `interfaces` with the default route leaving from the first one that is not loopback.
-fn facts(interfaces: Vec<InterfaceAddress>, gateway: Option<&str>) -> Facts {
-    let primary = interfaces.iter().find_map(|address| match address.address {
-        IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
-        _ => None,
-    });
-    Facts {
-        interfaces,
-        primary,
-        gateway: gateway.map(str::to_owned),
-        expensive: false,
+/// This Mac with its default route on `iface` at `addr`/`prefix` behind the gateway `gw` whose
+/// hardware address is `hw` (none: unread), on a Wi-Fi path that is not expensive, holding
+/// `addr` and `others`, in a stay that began at [`STAY`] on that network, with `answers`, each
+/// booked on that network unless it names one.
+fn on(
+    (iface, addr, prefix): (&str, &str, u8),
+    (gw, hw): (&str, Option<&[u8]>),
+    others: &[&str],
+    answers: Vec<Answer>,
+) -> Now {
+    let route = RouteFacts {
+        interface: iface.to_owned(),
+        address: v4(addr),
+        prefix,
+        gateway: Some(v4(gw)),
+        gateway_hw: hw.map(<[u8]>::to_vec),
+    };
+    let mut own = vec![ip("127.0.0.1"), ip(addr)];
+    own.extend(others.iter().map(|other| ip(other)));
+    let answers = answers
+        .into_iter()
+        .map(|answer| Answer {
+            network: answer.network.clone().or_else(|| NetworkId::of(&route)),
+            ..answer
+        })
+        .collect();
+    Now {
+        stay_since_ms: Some(STAY),
+        stay_network: NetworkId::of(&route),
+        facts: Facts {
+            route: Some(route),
+            tunnel: None,
+            path: Some(path(false, Link::Wifi)),
+        },
+        point_to_point: false,
+        own,
+        answers,
+        at_ms: NOW,
     }
 }
 
-/// m22 on the home LAN: Wi-Fi at 192.168.1.20/24, loopback beside it.
-fn home() -> Facts {
-    facts(
-        vec![
-            on("lo0", [127, 0, 0, 1], [255, 0, 0, 0]),
-            on("en0", [192, 168, 1, 20], [255, 255, 255, 0]),
-        ],
-        Some(HOME_GW),
+/// m22 on the home LAN: Wi-Fi at 192.168.1.20/24 behind the home router.
+fn home(answers: Vec<Answer>) -> Now {
+    on(
+        ("en0", "192.168.1.20", 24),
+        ("192.168.1.1", Some(&HOME_HW)),
+        &[],
+        answers,
     )
 }
 
-fn answer(node: &str, addr: [u8; 4], via: [u8; 4], gateway: &str, ms: u64) -> Answer {
+/// `node`'s node-proven fleet answer from `addr`, through `via` on `en0`, its dial begun at
+/// `began`, answered half a second later, booked on the network [`on`] puts this Mac on.
+fn answer(node: &str, addr: &str, via: &str, began: u64) -> Answer {
     Answer {
-        node: node.to_owned(),
-        addr: Ipv4Addr::from(addr),
-        via: Ipv4Addr::from(via),
-        iface: "en0".to_owned(),
-        gateway: Some(gateway.to_owned()),
-        ms,
+        lane: Lane::Fleet,
+        member: member_key(Lane::Fleet, node),
+        addr: Some(ip(addr)),
+        via: Some(v4(via)),
+        iface: Some("en0".to_owned()),
+        network: None,
+        logged: true,
+        began_ms: began,
+        at_ms: began + 500,
     }
 }
 
@@ -57,99 +100,84 @@ fn members_at_home() -> Vec<Answer> {
         .map(|n| {
             answer(
                 &format!("node{n}"),
-                [192, 168, 1, 30 + n],
-                [192, 168, 1, 20],
-                HOME_GW,
+                &format!("192.168.1.{}", 30 + n),
+                "192.168.1.20",
                 NOW - 60_000,
             )
         })
         .collect()
 }
 
-fn ip(text: &str) -> IpAddr {
-    text.parse().unwrap()
-}
-
-/// A Mac on the home LAN, where three members proved their nodes, observes a peer on its subnet
-/// at home, and says it is home there (the tag a listing carries is the subnet's, never an
-/// address).
+/// A Mac on the home LAN, where three members proved their nodes, is home there, and holds
+/// another host on its subnet (IPv4-mapped too) as on the home ALab LAN.
 ///
 /// NEGATIVE CONTROL: `home_at` with its count compared to `MEMBERS + 1` returns
 /// `TooFew { heard: 3 }` and this test fails.
 #[test]
-fn a_home_lan_peer_with_member_evidence_is_observed_home() {
-    let tag = HomeTag::of(Ipv4Addr::new(192, 168, 1, 0), 24);
+fn a_network_where_enough_members_proved_themselves_is_home() {
+    let home_net = home_net_at(&home(members_at_home()));
     assert_eq!(
-        observed(
-            &home(),
-            &members_at_home(),
-            ip("192.168.1.20"),
-            ip("192.168.1.40"),
-            NOW
-        ),
-        Ok(tag.clone())
+        home_net,
+        Ok(HomeNet::at(v4("192.168.1.20"), v4("255.255.255.0")))
     );
-    // An IPv4-mapped arrival and peer read as IPv4.
-    assert_eq!(
-        observed(
-            &home(),
-            &members_at_home(),
-            ip("::ffff:192.168.1.20"),
-            ip("::ffff:192.168.1.41"),
-            NOW
-        ),
-        Ok(tag.clone())
-    );
-    assert_eq!(here(&home(), &members_at_home(), NOW), vec![tag.clone()]);
-    assert_eq!(HomeTag::parse(tag.as_str()), Some(tag.clone()));
-    assert!(!tag.as_str().contains("192"));
+    let home_net = home_net.unwrap();
+    assert!(home_net.holds(ip("192.168.1.40")));
+    // An IPv4-mapped peer reads as IPv4.
+    assert!(home_net.holds(ip("::ffff:192.168.1.41")));
 }
 
-/// An attacker on a phone hotspot shared with m22 is never observed at home, even where three
-/// members answered on that hotspot; nor is one on a network the facts call expensive.
+/// A phone hotspot m22 shares is never home, even where three members answered on that hotspot;
+/// nor is a network the path calls expensive or cellular, one whose path this process could not
+/// read, or one whose path carries no traffic.
 ///
-/// NEGATIVE CONTROL: with `home_at`'s hotspot check removed the hotspot peer reads
-/// `Ok(<tag of 172.20.10.0/28>)` and this test fails.
+/// NEGATIVE CONTROLS: with `home_at`'s hotspot check removed the hotspot reads
+/// `Ok(<172.20.10.3/28>)` and this test fails; with `path.link != Link::Cellular` removed
+/// from the path rule the cellular path reads home and it fails; with the path rule's
+/// `is_some_and` turned to `is_none_or` (an unread path let through) it fails at "not read".
 #[test]
-fn a_hotspot_peer_is_refused_whatever_answered() {
-    let hotspot = facts(
-        vec![on("en0", [172, 20, 10, 3], [255, 255, 255, 240])],
-        Some("0a0b0c0d0e0f"),
-    );
+fn a_hotspot_is_never_home_whatever_answered() {
     let answered: Vec<Answer> = (0..3u8)
         .map(|n| {
             answer(
                 &format!("node{n}"),
-                [172, 20, 10, 4 + n],
-                [172, 20, 10, 3],
-                "0a0b0c0d0e0f",
+                &format!("172.20.10.{}", 4 + n),
+                "172.20.10.3",
                 NOW - 1_000,
             )
         })
         .collect();
-    assert_eq!(
-        observed(
-            &hotspot,
-            &answered,
-            ip("172.20.10.3"),
-            ip("172.20.10.9"),
-            NOW
-        ),
-        Err(Away::Hotspot)
+    let hotspot = on(
+        ("en0", "172.20.10.3", 28),
+        ("172.20.10.1", Some(&[0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f])),
+        &[],
+        answered,
     );
-    assert!(here(&hotspot, &answered, NOW).is_empty());
-    let mut expensive = home();
-    expensive.expensive = true;
-    assert_eq!(
-        observed(
-            &expensive,
-            &members_at_home(),
-            ip("192.168.1.20"),
-            ip("192.168.1.40"),
-            NOW
+    assert_eq!(home_net_at(&hotspot), Err(Away::Hotspot));
+    for (path, why) in [
+        (Some(path(true, Link::Wifi)), "expensive"),
+        (Some(path(false, Link::Cellular)), "cellular"),
+        (None, "not read"),
+        (
+            Some(PathFacts {
+                usable: Some(false),
+                ..path(false, Link::Wifi)
+            }),
+            "no traffic",
         ),
-        Err(Away::Expensive)
-    );
+        (
+            Some(PathFacts {
+                usable: None,
+                ..path(false, Link::Wifi)
+            }),
+            "invalid",
+        ),
+    ] {
+        let mut now = home(members_at_home());
+        now.facts.path = path;
+        assert_eq!(home_net_at(&now), Err(Away::Expensive), "{why}");
+    }
+    // CONTROL: the same evidence on a usable Wi-Fi path that is not expensive reads home.
+    assert!(home_net_at(&home(members_at_home())).is_ok());
 }
 
 /// A café network where m22 sits with one other member (who answered three times) is no home:
@@ -158,134 +186,159 @@ fn a_hotspot_peer_is_refused_whatever_answered() {
 /// NEGATIVE CONTROL: with `nodes.dedup()` removed in `home_at` the repeated member counts three
 /// times, the café reads home, and this test fails.
 #[test]
-fn a_cafe_peer_beside_too_few_members_is_refused() {
-    let cafe = facts(
-        vec![on("en0", [10, 0, 0, 5], [255, 255, 255, 0])],
-        Some("c0ffeec0ffee"),
+fn a_cafe_beside_too_few_members_is_no_home() {
+    let cafe = on(
+        ("en0", "10.0.0.5", 24),
+        ("10.0.0.1", Some(&[0xc0, 0xff, 0xee, 0xc0, 0xff, 0xee])),
+        &[],
+        vec![
+            answer("m7node", "10.0.0.6", "10.0.0.5", NOW - 1_000),
+            answer("m7node", "10.0.0.6", "10.0.0.5", NOW - 2_000),
+            answer("m7node", "10.0.0.7", "10.0.0.5", NOW - 3_000),
+            answer("m9node", "10.0.0.8", "10.0.0.5", NOW - 4_000),
+        ],
     );
-    let answered = vec![
-        answer(
-            "m7node",
-            [10, 0, 0, 6],
-            [10, 0, 0, 5],
-            "c0ffeec0ffee",
-            NOW - 1_000,
-        ),
-        answer(
-            "m7node",
-            [10, 0, 0, 6],
-            [10, 0, 0, 5],
-            "c0ffeec0ffee",
-            NOW - 2_000,
-        ),
-        answer(
-            "m7node",
-            [10, 0, 0, 7],
-            [10, 0, 0, 5],
-            "c0ffeec0ffee",
-            NOW - 3_000,
-        ),
-        answer(
-            "m9node",
-            [10, 0, 0, 8],
-            [10, 0, 0, 5],
-            "c0ffeec0ffee",
-            NOW - 4_000,
-        ),
-    ];
-    assert_eq!(
-        observed(&cafe, &answered, ip("10.0.0.5"), ip("10.0.0.66"), NOW),
-        Err(Away::TooFew { heard: 2 })
-    );
+    assert_eq!(home_net_at(&cafe), Err(Away::TooFew { heard: 2 }));
 }
 
-/// No evidence is no home: none at all, evidence older than `FRESH`, evidence heard behind
-/// another router (the same subnet numbered by a café's), evidence heard through an address this
-/// Mac no longer holds, and a router not read yet all fail closed.
+/// No evidence is no home: none at all, evidence older than `FRESH`, evidence dated ahead of the
+/// clock, evidence heard behind another router (a café that numbers its hosts like home, where
+/// the stay the record names is still home's), evidence heard through an address this Mac no
+/// longer holds, a router not read yet, and no stay at all all fail closed.
 ///
-/// NEGATIVE CONTROLS: with the gateway comparison removed from `home_at`, the café that numbers
-/// its hosts like home reads home and this test fails; with the `FRESH` comparison removed, the
-/// stale evidence reads home and it fails.
+/// NEGATIVE CONTROLS: with the stay's network comparison removed from `home_at` (any stay
+/// counts), the café that numbers its hosts like home reads home and this test fails; with the
+/// `FRESH` comparison removed, the stale evidence reads home and it fails.
 #[test]
 fn no_member_evidence_fails_closed() {
-    let peer = (ip("192.168.1.20"), ip("192.168.1.40"));
-    let judge = |facts: &Facts, answers: &[Answer]| observed(facts, answers, peer.0, peer.1, NOW);
-    assert_eq!(judge(&home(), &[]), Err(Away::TooFew { heard: 0 }));
-    let stale: Vec<Answer> = members_at_home()
-        .into_iter()
-        .map(|a| Answer {
-            ms: NOW - FRESH.as_millis() as u64,
-            ..a
-        })
-        .collect();
-    assert_eq!(judge(&home(), &stale), Err(Away::TooFew { heard: 0 }));
-    let ahead: Vec<Answer> = members_at_home()
-        .into_iter()
-        .map(|a| Answer {
-            ms: NOW + 2 * AHEAD_MS,
-            ..a
-        })
-        .collect();
-    assert_eq!(judge(&home(), &ahead), Err(Away::TooFew { heard: 0 }));
-    // A café that numbers its hosts 192.168.1.0/24 too, behind another router.
-    let lookalike = facts(
-        vec![on("en0", [192, 168, 1, 20], [255, 255, 255, 0])],
-        Some("0badc0ffee00"),
-    );
     assert_eq!(
-        judge(&lookalike, &members_at_home()),
+        home_net_at(&home(Vec::new())),
         Err(Away::TooFew { heard: 0 })
     );
-    // The evidence came through 192.168.1.21, which this Mac no longer holds.
-    let moved = facts(
-        vec![on("en0", [192, 168, 1, 20], [255, 255, 255, 0])],
-        Some(HOME_GW),
+    let aged = |at_ms: u64| -> Vec<Answer> {
+        members_at_home()
+            .into_iter()
+            .map(|a| Answer {
+                began_ms: at_ms - 500,
+                at_ms,
+                ..a
+            })
+            .collect()
+    };
+    assert_eq!(
+        home_net_at(&home(aged(NOW - FRESH.as_millis() as u64))),
+        Err(Away::TooFew { heard: 0 })
     );
+    assert_eq!(
+        home_net_at(&home(aged(NOW + 2 * AHEAD_MS))),
+        Err(Away::TooFew { heard: 0 })
+    );
+    // A café that numbers its hosts 192.168.1.0/24 too, behind another router, read while the
+    // stay the record names is still the home network's.
+    let mut lookalike = on(
+        ("en0", "192.168.1.20", 24),
+        ("192.168.1.1", Some(&[0x0b, 0xad, 0xc0, 0xff, 0xee, 0x00])),
+        &[],
+        members_at_home(),
+    );
+    lookalike.stay_network = home(Vec::new()).stay_network;
+    assert_eq!(home_net_at(&lookalike), Err(Away::TooFew { heard: 0 }));
+    // The evidence came through 192.168.1.21, which this Mac no longer holds.
     let elsewhere: Vec<Answer> = members_at_home()
         .into_iter()
         .map(|a| Answer {
-            via: Ipv4Addr::new(192, 168, 1, 21),
+            via: Some(v4("192.168.1.21")),
             ..a
         })
         .collect();
-    assert_eq!(judge(&moved, &elsewhere), Err(Away::TooFew { heard: 0 }));
     assert_eq!(
-        judge(&facts(home().interfaces, None), &members_at_home()),
-        Err(Away::NoGateway)
+        home_net_at(&home(elsewhere)),
+        Err(Away::TooFew { heard: 0 })
     );
+    let unread = on(
+        ("en0", "192.168.1.20", 24),
+        ("192.168.1.1", None),
+        &[],
+        members_at_home(),
+    );
+    assert_eq!(home_net_at(&unread), Err(Away::NoGateway));
+    let mut no_stay = home(members_at_home());
+    no_stay.stay_since_ms = None;
+    assert_eq!(home_net_at(&no_stay), Err(Away::TooFew { heard: 0 }));
     // CONTROL: the same evidence, fresh, behind the home router, reads home.
-    assert!(judge(&home(), &members_at_home()).is_ok());
+    assert!(home_net_at(&home(members_at_home())).is_ok());
 }
 
-/// Only a peer on the subnet of the address it reached counts, and only on the network the
-/// default route takes: a routed or relayed peer, this Mac itself, an IPv6 or loopback request,
-/// and a request that reached this Mac's second network (here wired, `en7`, while the default
-/// route takes Wi-Fi) are no home.
+/// Only answers in the current stay count: three members that answered on the home LAN eight
+/// minutes ago, before this Mac went to a phone hotspot for a few minutes and came back, are
+/// fresh by the clock but from an earlier stay; and only node-proven fleet answers count, never
+/// three Commons contacts.
 ///
-/// NEGATIVE CONTROL: with `observed`'s on-link comparison removed, the routed peer
-/// `192.168.2.9` reads home and this test fails.
+/// NEGATIVE CONTROLS: with `answer.began_ms >= since` removed from `home_at`, the answers from
+/// before the hotspot read home and this test fails; with `answer.lane == Lane::Fleet` removed,
+/// the Commons contacts read home and it fails.
 #[test]
-fn only_an_on_link_peer_on_the_evidenced_subnet_is_observed_home() {
-    let wired_too = facts(
-        vec![
-            on("en0", [192, 168, 1, 20], [255, 255, 255, 0]),
-            on("en7", [10, 1, 0, 5], [255, 255, 255, 0]),
-        ],
-        Some(HOME_GW),
+fn only_this_stays_fleet_answers_count() {
+    let before: Vec<Answer> = members_at_home()
+        .into_iter()
+        .map(|a| Answer {
+            began_ms: NOW - 8 * 60_000,
+            at_ms: NOW - 8 * 60_000 + 500,
+            ..a
+        })
+        .collect();
+    let mut back = home(before);
+    back.stay_since_ms = Some(NOW - 60_000);
+    assert_eq!(home_net_at(&back), Err(Away::TooFew { heard: 0 }));
+    let contacts: Vec<Answer> = members_at_home()
+        .into_iter()
+        .enumerate()
+        .map(|(n, a)| Answer {
+            lane: Lane::Commons,
+            member: member_key(Lane::Commons, &format!("peer{n}")),
+            ..a
+        })
+        .collect();
+    assert_eq!(home_net_at(&home(contacts)), Err(Away::TooFew { heard: 0 }));
+    // CONTROL: the same members heard in this stay over the fleet read home.
+    assert!(home_net_at(&home(members_at_home())).is_ok());
+}
+
+/// Only another host on the home subnet is on the home ALab LAN: a routed or relayed peer, a
+/// public address, a host on this Mac's second network (here wired, `10.1.0.0/24`, while the
+/// default route takes Wi-Fi), this Mac itself, loopback and IPv6 are not; nor does an answer
+/// that came from this Mac's own address count as a member's.
+///
+/// NEGATIVE CONTROL: with `HomeNet::holds`'s subnet comparison removed, the routed peer
+/// `192.168.2.9` reads as held and this test fails.
+#[test]
+fn only_another_host_on_the_home_subnet_is_held() {
+    let wired_too = on(
+        ("en0", "192.168.1.20", 24),
+        ("192.168.1.1", Some(&HOME_HW)),
+        &["10.1.0.5"],
+        members_at_home(),
     );
-    let members = members_at_home();
-    let judge =
-        |arrival: &str, peer: &str| observed(&wired_too, &members, ip(arrival), ip(peer), NOW);
-    assert_eq!(judge("192.168.1.20", "192.168.2.9"), Err(Away::NotOnLink));
-    assert_eq!(judge("192.168.1.20", "93.184.216.34"), Err(Away::NotOnLink));
-    assert_eq!(judge("192.168.1.20", "10.1.0.9"), Err(Away::NotOnLink));
-    assert_eq!(judge("192.168.1.20", "10.1.0.5"), Err(Away::ThisMac));
-    assert_eq!(judge("127.0.0.1", "127.0.0.1"), Err(Away::NotIpv4));
-    assert_eq!(judge("fe80::1", "fe80::2"), Err(Away::NotIpv4));
-    assert_eq!(judge("10.1.0.5", "10.1.0.9"), Err(Away::NotOnLink));
-    assert_eq!(judge("192.168.9.9", "192.168.9.10"), Err(Away::NotOnLink));
-    // CONTROL: a peer on the evidenced subnet.
-    assert!(judge("192.168.1.20", "192.168.1.99").is_ok());
+    let home_net = home_net_at(&wired_too).unwrap();
+    for away in [
+        "192.168.2.9",
+        "93.184.216.34",
+        "10.1.0.9",
+        "10.1.0.5",
+        "192.168.1.20",
+        "::ffff:192.168.1.20",
+        "127.0.0.1",
+        "::1",
+        "fe80::2",
+    ] {
+        assert!(!home_net.holds(ip(away)), "{away}");
+    }
+    // Three answers, one of them from this Mac's own address: two members.
+    let mut own = members_at_home();
+    own[2].addr = Some(ip("192.168.1.20"));
+    assert_eq!(home_net_at(&home(own)), Err(Away::TooFew { heard: 2 }));
+    // CONTROL: a host on the evidenced subnet.
+    assert!(home_net.holds(ip("192.168.1.99")));
 }
 
 /// Only the default route's Ethernet or Wi-Fi network can be home: three member VMs answering on
@@ -293,165 +346,452 @@ fn only_an_on_link_peer_on_the_evidenced_subnet_is_observed_home() {
 /// default route, a full-tunnel VPN beside the home Wi-Fi, and evidence heard on another
 /// interface than the one that holds the address now are no home.
 ///
-/// NEGATIVE CONTROLS: with `home_kind`'s check removed from `Facts::home_subnet`, the VM bridge
-/// reads `Ok(<tag of 192.168.64.0/24>)` and this test fails; with `answer.iface == iface` removed
-/// from `home_at`, the evidence heard on `en1` reads home and it fails.
+/// NEGATIVE CONTROLS: with `home_kind`'s check removed from `home_route`, the VM bridge reads
+/// `Ok(<192.168.64.1/24>)` and this test fails; with the interface comparison
+/// (`answer.iface …`) removed from `home_at`, the evidence heard on `en0` reads home on `en1` and
+/// it fails.
 #[test]
 fn only_the_default_routes_ethernet_or_wifi_can_be_home() {
-    let three = |subnet: [u8; 3], via: u8, iface: &str| -> Vec<Answer> {
+    let three = |subnet: &str, via: &str, iface: &str| -> Vec<Answer> {
         (0..3u8)
             .map(|n| Answer {
-                iface: iface.to_owned(),
+                iface: Some(iface.to_owned()),
                 ..answer(
                     &format!("node{n}"),
-                    [subnet[0], subnet[1], subnet[2], 30 + n],
-                    [subnet[0], subnet[1], subnet[2], via],
-                    HOME_GW,
+                    &format!("{subnet}.{}", 30 + n),
+                    via,
                     NOW - 1_000,
                 )
             })
             .collect()
     };
     // A Mac whose default route takes its VM bridge, where three member VMs answered.
-    let bridge = facts(
-        vec![on("bridge100", [192, 168, 64, 1], [255, 255, 255, 0])],
-        Some(HOME_GW),
+    let bridge = on(
+        ("bridge100", "192.168.64.1", 24),
+        ("192.168.64.254", Some(&HOME_HW)),
+        &[],
+        three("192.168.64", "192.168.64.1", "bridge100"),
     );
-    let vms = three([192, 168, 64], 1, "bridge100");
-    assert_eq!(
-        observed(&bridge, &vms, ip("192.168.64.1"), ip("192.168.64.40"), NOW),
-        Err(Away::Interface)
-    );
-    assert!(here(&bridge, &vms, NOW).is_empty());
+    assert_eq!(home_net_at(&bridge), Err(Away::Interface));
     // A tunnel, and an `en` link that is point to point.
-    for (name, flags) in [("utun4", IFF_POINTOPOINT), ("en5", IFF_POINTOPOINT)] {
-        let tunnel = facts(
-            vec![InterfaceAddress {
-                flags,
-                ..on(name, [10, 8, 0, 2], [255, 255, 255, 0])
-            }],
-            Some(HOME_GW),
+    for name in ["utun4", "en5"] {
+        let mut tunnel = on(
+            (name, "10.8.0.2", 24),
+            ("10.8.0.1", Some(&HOME_HW)),
+            &[],
+            three("10.8.0", "10.8.0.2", name),
         );
-        let members = three([10, 8, 0], 2, name);
-        assert_eq!(
-            observed(&tunnel, &members, ip("10.8.0.2"), ip("10.8.0.9"), NOW),
-            Err(Away::Interface),
-            "{name}"
-        );
+        tunnel.point_to_point = true;
+        assert_eq!(home_net_at(&tunnel), Err(Away::Interface), "{name}");
     }
     // No default route at all.
-    let unrouted = Facts {
-        primary: None,
-        ..home()
-    };
-    let peer = (ip("192.168.1.20"), ip("192.168.1.40"));
-    assert_eq!(
-        observed(&unrouted, &members_at_home(), peer.0, peer.1, NOW),
-        Err(Away::Interface)
-    );
-    // A full-tunnel VPN beside the home Wi-Fi: the default route takes the tunnel.
-    let mut vpn = home();
-    vpn.interfaces
-        .push(on("utun3", [10, 8, 0, 2], [255, 255, 255, 255]));
-    vpn.primary = Some(Ipv4Addr::new(10, 8, 0, 2));
-    assert_eq!(
-        observed(&vpn, &members_at_home(), peer.0, peer.1, NOW),
-        Err(Away::Interface)
-    );
+    let mut unrouted = home(members_at_home());
+    unrouted.facts.route = None;
+    assert_eq!(home_net_at(&unrouted), Err(Away::Interface));
+    // A full-tunnel VPN beside the home Wi-Fi: a tunnel holds the default route.
+    let mut vpn = home(members_at_home());
+    vpn.facts.tunnel = Some("utun3".to_owned());
+    assert_eq!(home_net_at(&vpn), Err(Away::Interface));
     // The address the evidence came through is on another interface now.
-    let rewired = facts(
-        vec![on("en1", [192, 168, 1, 20], [255, 255, 255, 0])],
-        Some(HOME_GW),
+    let rewired = on(
+        ("en1", "192.168.1.20", 24),
+        ("192.168.1.1", Some(&HOME_HW)),
+        &[],
+        members_at_home(),
     );
-    assert_eq!(
-        observed(&rewired, &members_at_home(), peer.0, peer.1, NOW),
-        Err(Away::TooFew { heard: 0 })
-    );
+    assert_eq!(home_net_at(&rewired), Err(Away::TooFew { heard: 0 }));
     // CONTROL: the same evidence on the interface it came through reads home.
-    assert!(observed(&home(), &members_at_home(), peer.0, peer.1, NOW).is_ok());
-    assert!(home_kind("en0", 0) && home_kind("en12", 0));
-    assert!(!home_kind("en", 0) && !home_kind("enx0", 0) && !home_kind("awdl0", 0));
+    assert!(home_net_at(&home(members_at_home())).is_ok());
+    assert!(home_kind("en0", false) && home_kind("en12", false));
+    assert!(!home_kind("en", false) && !home_kind("enx0", false) && !home_kind("awdl0", false));
+    assert!(!home_kind("en0", true));
 }
 
-/// An approver honours a listing's `home=` only from a server it reaches at home: itself
-/// (loopback, or one of its own addresses, IPv4-mapped too) or a server on its home subnet. A
-/// server it reaches by a route (another subnet, the Internet, a VPN's far end) or over IPv6
-/// off this Mac observed nothing it can stand behind, nor does any server while it is away.
+/// The fleet heartbeat's notes reach admission through the one source: three members noted into
+/// the network place's evidence (`aterm_netplace::heard::note_answer`, with the route each answer
+/// took and the interface holding it) under a scratch state root read back, through the place's
+/// own stay, as home; a member reached by a route this Mac took no address on for (a routed or
+/// relayed member) is passed over.
 ///
-/// NEGATIVE CONTROL: with `serving` returning `here` whatever `server` is, the routed server
-/// `10.8.0.1` gives the home tag and this test fails.
+/// NEGATIVE CONTROL: with `note_answer` writing no interface (`iface: None`), no answer passes
+/// the interface rule, admission reads `TooFew { heard: 0 }`, and this test fails.
 #[test]
-fn an_approver_honours_home_only_from_a_server_it_reaches_at_home() {
-    let tag = HomeTag::of(Ipv4Addr::new(192, 168, 1, 0), 24);
-    let members = members_at_home();
-    let through = |server: &str| serving(&home(), &members, ip(server), NOW);
-    for server in [
-        "127.0.0.1",
-        "::1",
-        "192.168.1.20",
-        "192.168.1.50",
-        "::ffff:192.168.1.50",
-    ] {
-        assert_eq!(through(server), vec![tag.clone()], "{server}");
-    }
-    for server in ["10.8.0.1", "192.168.2.9", "93.184.216.34", "fe80::1"] {
-        assert!(through(server).is_empty(), "{server}");
-    }
-    assert!(serving(&home(), &[], ip("127.0.0.1"), NOW).is_empty());
-}
-
-/// The fleet heartbeat's notes keep the newest answer per member, tie each to the address this
-/// Mac reached it through and the router then, pass over a member reached from no subnet of
-/// this Mac and a node id the file cannot hold, and read back as evidence.
-///
-/// NEGATIVE CONTROL: with `note_with` keeping every answer (no `retain` of the noted nodes),
-/// `node0` reads back twice and this test fails.
-#[test]
-fn notes_keep_the_newest_answer_per_member_and_read_back_as_evidence() {
+fn the_heartbeats_notes_in_the_network_place_read_back_as_evidence() {
     let root = aterm_tempfile::tempdir().unwrap();
-    let paths = Paths::for_home(root.path());
-    let first: Vec<(String, IpAddr)> = (0..3u8)
+    let dir = aterm_netplace::record::dir(root.path());
+    let home_now = home(Vec::new());
+    let mut script = aterm_netplace::facts::Script {
+        facts: home_now.facts.clone(),
+        via: Vec::new(),
+    };
+    let members: Vec<(String, IpAddr)> = (0..3u8)
         .map(|n| (format!("node{n}"), ip(&format!("192.168.1.{}", 30 + n))))
-        .chain([
-            ("routed".to_owned(), ip("172.16.5.5")),
-            ("Bad Node".to_owned(), ip("192.168.1.50")),
-        ])
+        .chain([("routed".to_owned(), ip("172.16.5.5"))])
         .collect();
-    note_with(&paths, &first, &home(), NOW - 120_000).unwrap();
-    note_with(
-        &paths,
-        &[("node0".to_owned(), ip("192.168.1.30"))],
-        &home(),
-        NOW - 60_000,
+    for (_, addr) in &members[..3] {
+        script.via.push((*addr, Some(v4("192.168.1.20"))));
+    }
+    script.via.push((ip("172.16.5.5"), None));
+    let here = Here {
+        facts: home_now.facts.clone(),
+        point_to_point: false,
+        own: home_now.own.clone(),
+    };
+    // The keeper opened this stay a minute before the round.
+    let (record, _) = aterm_netplace::step(
+        &aterm_netplace::Record::default(),
+        &here.facts,
+        &aterm_netplace::Evidence::default(),
+        None,
+        NOW - 120_000,
+        Some(NOW - 120_000),
+    );
+    aterm_netplace::record::write(
+        &dir,
+        &aterm_netplace::record::Written {
+            revision: 1,
+            keeper_pid: Some(std::process::id()),
+            keeper_started_ms: Some(NOW - 120_000),
+            written_ms: NOW - 120_000,
+            record,
+        },
     )
     .unwrap();
-    let read = read(&paths);
-    let mut nodes: Vec<&str> = read.iter().map(|a| a.node.as_str()).collect();
-    nodes.sort_unstable();
-    assert_eq!(nodes, ["node0", "node1", "node2"]);
-    let node0 = read.iter().find(|a| a.node == "node0").unwrap();
-    assert_eq!(node0.ms, NOW - 60_000);
-    assert_eq!(node0.via, Ipv4Addr::new(192, 168, 1, 20));
-    assert_eq!(node0.iface, "en0");
-    assert_eq!(node0.gateway.as_deref(), Some(HOME_GW));
-    assert!(observed(&home(), &read, ip("192.168.1.20"), ip("192.168.1.40"), NOW).is_ok());
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(paths.dir.join(FILE))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o600);
+    aterm_netplace::facts::script_here(script, || {
+        for (node, addr) in &members {
+            aterm_netplace::heard::note_answer(
+                &dir,
+                (Lane::Fleet, node),
+                Some(*addr),
+                (home_now.stay_network.as_ref(), true),
+                (NOW - 61_000, NOW - 60_000),
+            );
+        }
+    });
+    let now = aterm_netplace::proof::read_with(root.path(), here, NOW);
+    assert_eq!(now.answers.len(), 4, "every answer noted");
+    assert_eq!(home_net_at(&now), Ok(HomeNet::test()));
+    // Without the third member's answer, the routed one does not make up the count.
+    let mut two = now.clone();
+    two.answers
+        .retain(|answer| answer.member != member_key(Lane::Fleet, "node2"));
+    assert_eq!(home_net_at(&two), Err(Away::TooFew { heard: 2 }));
 }
 
-/// The test place says every IPv4 request is home under the test tag; the empty place says no
-/// request is.
+/// Answers heard on the home LAN count only on the home LAN, whatever the stay says: this Mac on
+/// a lookalike network (a café that numbers its hosts like home, behind its own router) roams to
+/// the real home LAN for under a minute, where the keeper reads no gateway hardware address (or
+/// does not look) and so the lookalike's stay continues, and the heartbeat proves three members
+/// there; back on the lookalike, the stay since before the roam is this network's, and those
+/// answers, fresh, through this Mac's address and interface, from the subnet, are booked on the
+/// home LAN (or on none, where the gateway was unread), never here.
+///
+/// NEGATIVE CONTROL: with `answer.network.as_ref() == Some(&network)` removed from `home_at`, the
+/// answers heard on the home LAN read the lookalike home and "booked on another network" fails.
 #[test]
-fn the_test_places_say_what_they_name() {
-    let peer = ip("127.0.0.1");
-    assert_eq!(AtHome.observed(peer, peer), Ok(HomeTag::test()));
-    assert_eq!(AtHome.here(), vec![HomeTag::test()]);
-    assert_eq!(AtHome.serving(peer), vec![HomeTag::test()]);
-    assert!(Nowhere.observed(peer, peer).is_err());
-    assert!(Nowhere.here().is_empty());
-    assert!(Nowhere.serving(peer).is_empty());
+fn answers_heard_on_another_network_in_the_same_stay_are_no_evidence_here() {
+    const LOOKALIKE_HW: [u8; 6] = [0x0b, 0xad, 0xc0, 0xff, 0xee, 0x00];
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = aterm_netplace::record::dir(root.path());
+    let facts = |hw: Option<&[u8]>| {
+        on(
+            ("en0", "192.168.1.20", 24),
+            ("192.168.1.1", hw),
+            &[],
+            Vec::new(),
+        )
+    };
+    let (lookalike, home_read, home_unread) = (
+        facts(Some(&LOOKALIKE_HW)),
+        facts(Some(&HOME_HW)),
+        facts(None),
+    );
+    let mut record = aterm_netplace::Record::default();
+    for (now, at) in [(&lookalike, STAY), (&home_unread, NOW - 3 * 60_000)] {
+        record = aterm_netplace::step(
+            &record,
+            &now.facts,
+            &aterm_netplace::Evidence::default(),
+            None,
+            at,
+            Some(STAY),
+        )
+        .0;
+    }
+    aterm_netplace::record::write(
+        &dir,
+        &aterm_netplace::record::Written {
+            revision: 1,
+            keeper_pid: Some(std::process::id()),
+            keeper_started_ms: Some(STAY),
+            written_ms: NOW - 3 * 60_000,
+            record,
+        },
+    )
+    .unwrap();
+    // The round on the home LAN: one member noted while its gateway was read (the keeper did not
+    // look), two while it was not.
+    for (n, now) in [(0u8, &home_read), (1, &home_unread), (2, &home_unread)] {
+        let addr = ip(&format!("192.168.1.{}", 30 + n));
+        let script = aterm_netplace::facts::Script {
+            facts: now.facts.clone(),
+            via: vec![(addr, Some(v4("192.168.1.20")))],
+        };
+        aterm_netplace::facts::script_here(script, || {
+            aterm_netplace::heard::note_answer(
+                &dir,
+                (Lane::Fleet, &format!("node{n}")),
+                Some(addr),
+                (aterm_netplace::facts::network_now().as_ref(), true),
+                (NOW - 2 * 60_000, NOW - 2 * 60_000 + 500),
+            );
+        });
+    }
+    let here = Here {
+        facts: lookalike.facts.clone(),
+        point_to_point: false,
+        own: lookalike.own.clone(),
+    };
+    let back = aterm_netplace::proof::read_with(root.path(), here, NOW);
+    assert_eq!(
+        (back.stay_since_ms, back.stay_network.clone()),
+        (Some(STAY), lookalike.stay_network.clone()),
+        "PRECONDITION: the lookalike's stay continued across the roam"
+    );
+    assert_eq!(back.answers.len(), 3, "PRECONDITION: every answer noted");
+    assert_eq!(
+        home_net_at(&back),
+        Err(Away::TooFew { heard: 0 }),
+        "booked on another network"
+    );
+    // CONTROL: the same answers booked on this network read home.
+    let mut booked_here = back.clone();
+    for answer in &mut booked_here.answers {
+        answer.network.clone_from(&lookalike.stay_network);
+    }
+    assert!(home_net_at(&booked_here).is_ok());
+}
+
+/// Only answers a round under this Mac's vault's membership log heard are evidence: three members
+/// an isolated job's heartbeat (a test's, a lab's, CI's, with no vault and no deny list) heard on
+/// the home LAN, under the very state root the vault reads, are no home, so a member the log took
+/// out, which such a round dials, never counts.
+///
+/// NEGATIVE CONTROL: with `answer.logged` removed from `home_at`, the isolated round's answers
+/// read home and "an isolated round's answers" fails.
+#[test]
+fn only_answers_a_round_under_the_vaults_log_heard_are_evidence() {
+    let isolated: Vec<Answer> = members_at_home()
+        .into_iter()
+        .map(|a| Answer { logged: false, ..a })
+        .collect();
+    assert_eq!(
+        home_net_at(&home(isolated)),
+        Err(Away::TooFew { heard: 0 }),
+        "an isolated round's answers"
+    );
+    // Two under the log and one isolated: two members.
+    let mut mixed = members_at_home();
+    mixed[2].logged = false;
+    assert_eq!(home_net_at(&home(mixed)), Err(Away::TooFew { heard: 2 }));
+    // CONTROL: the same answers under the log read home.
+    assert!(home_net_at(&home(members_at_home())).is_ok());
+}
+
+/// A network the place merely remembers is no proof: back on the home LAN with nothing heard in
+/// this stay yet, the place reads `alab-lan` (remembered), and admission still says too few, from
+/// the very files the place read.
+///
+/// NEGATIVE CONTROL: with `answer.began_ms >= since` removed from `home_at`, the answers from the
+/// stay before the hotspot (within `FRESH`) read home and this test fails.
+#[test]
+fn a_network_the_place_remembers_is_not_enough() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (at_home, own) = returned_home_from_a_hotspot(root.path());
+    let place = aterm_netplace::read_with(root.path(), at_home.clone(), NOW);
+    assert_eq!(
+        (place.at, place.recognised),
+        (
+            aterm_netplace::Where::AlabLan,
+            Some(aterm_netplace::Recognised::Remembered)
+        ),
+        "PRECONDITION: the place reads the remembered home"
+    );
+    let here = Here {
+        facts: at_home,
+        point_to_point: false,
+        own,
+    };
+    let now = aterm_netplace::proof::read_with(root.path(), here, NOW);
+    assert_eq!(now.stay_since_ms, Some(NOW - 60_000));
+    assert_eq!(home_net_at(&now), Err(Away::TooFew { heard: 0 }));
+}
+
+/// BACK ON THE HOME LAN, THE FIRST HEARTBEAT ROUND THERE ADMITS, with no wait: the keeper steps
+/// home, onto a phone hotspot and home again (the record the keeper writes), the answers from
+/// before the hotspot do not count, and the round that runs on the return notes three members
+/// through the heartbeat's own writer (`heard::note_answer`, the network it began and ended on
+/// booked on each), so the very next read of the proof is home, holding a peer on the subnet. This
+/// drives the keeper, the heartbeat's notes and admission together across a return home (the lab
+/// lane that drives real instances is design §8's).
+///
+/// NEGATIVE CONTROL: `note_answer` booking every answer on no network (`network = None`) leaves
+/// the round's answers unbooked, and "the first round back home admits" fails with
+/// `TooFew { heard: 0 }`.
+#[test]
+fn back_on_the_home_lan_the_first_round_there_admits() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (at_home, own) = returned_home_from_a_hotspot(root.path());
+    let dir = aterm_netplace::record::dir(root.path());
+    let read = || {
+        aterm_netplace::proof::read_with(
+            root.path(),
+            Here {
+                facts: at_home.clone(),
+                point_to_point: false,
+                own: own.clone(),
+            },
+            NOW,
+        )
+    };
+    assert_eq!(
+        home_net_at(&read()),
+        Err(Away::TooFew { heard: 0 }),
+        "PRECONDITION: nothing from before the hotspot counts"
+    );
+    for n in 0..3u8 {
+        let addr = ip(&format!("192.168.1.{}", 30 + n));
+        let script = aterm_netplace::facts::Script {
+            facts: at_home.clone(),
+            via: vec![(addr, Some(v4("192.168.1.20")))],
+        };
+        aterm_netplace::facts::script_here(script, || {
+            let began_on = aterm_netplace::facts::network_now();
+            aterm_netplace::heard::note_answer(
+                &dir,
+                (Lane::Fleet, &format!("node{n}")),
+                Some(addr),
+                (began_on.as_ref(), true),
+                (NOW - 30_000, NOW - 30_000 + 500),
+            );
+        });
+    }
+    let now = read();
+    assert_eq!(
+        now.stay_since_ms,
+        Some(NOW - 60_000),
+        "the stay since the return"
+    );
+    assert_eq!(
+        home_net_at(&now).map(|_| ()),
+        Ok(()),
+        "the first round back home admits"
+    );
+    assert!(
+        home_net_at(&now).is_ok_and(|net| net.holds(ip("192.168.1.40"))),
+        "and a Mac on the subnet proves itself from home"
+    );
+}
+
+/// This Mac back on the home LAN a minute ago, under `root`: three members answered there nine
+/// minutes ago and the keeper learned it, then three minutes on a phone hotspot (the record the
+/// keeper wrote, the answers heard and the fleet's book of five), and the facts and addresses it
+/// holds there now.
+fn returned_home_from_a_hotspot(root: &std::path::Path) -> (Facts, Vec<IpAddr>) {
+    let dir = aterm_netplace::record::dir(root);
+    let home_now = home(Vec::new());
+    let at_home = home_now.facts.clone();
+    let hotspot = Facts {
+        route: Some(RouteFacts {
+            interface: "en0".to_owned(),
+            address: v4("172.20.10.2"),
+            prefix: 28,
+            gateway: Some(v4("172.20.10.1")),
+            gateway_hw: Some(vec![2, 0, 0, 0, 0, 1]),
+        }),
+        tunnel: None,
+        path: Some(path(true, Link::Wifi)),
+    };
+    // Home: three members answer and the keeper learns the network; then the hotspot for three
+    // minutes; then home again a minute ago.
+    let evidence = aterm_netplace::Evidence {
+        answers: members_at_home()
+            .into_iter()
+            .map(|a| Answer {
+                began_ms: NOW - 9 * 60_000,
+                at_ms: NOW - 9 * 60_000 + 500,
+                ..a
+            })
+            .collect(),
+        ..aterm_netplace::Evidence::default()
+    };
+    let book = aterm_netplace::Book {
+        members: (0..5)
+            .map(|n| aterm_netplace::BookMember {
+                member: member_key(Lane::Fleet, &format!("node{n}")),
+                addr: None,
+                answered_ms: None,
+                network: None,
+            })
+            .collect(),
+    };
+    let mut record = aterm_netplace::Record::default();
+    for (facts, at) in [
+        (&at_home, NOW - 20 * 60_000),
+        (&at_home, NOW - 8 * 60_000),
+        (&hotspot, NOW - 4 * 60_000),
+        (&at_home, NOW - 60_000),
+    ] {
+        record = aterm_netplace::step(&record, facts, &evidence, Some(&book), at, Some(STAY)).0;
+    }
+    assert_eq!(record.remembered.len(), 1, "PRECONDITION: home was learned");
+    aterm_netplace::record::write(
+        &dir,
+        &aterm_netplace::record::Written {
+            revision: 1,
+            keeper_pid: Some(std::process::id()),
+            keeper_started_ms: Some(STAY),
+            written_ms: NOW - 60_000,
+            record,
+        },
+    )
+    .unwrap();
+    aterm_netplace::heard::add(&dir, evidence).unwrap();
+    aterm_netplace::heard::write_book(&dir, (0..5).map(|n| (format!("node{n}"), None, None)), None)
+        .unwrap();
+    (at_home, home_now.own)
+}
+
+/// A member last heard off this network is not here: its newer answer from another network
+/// shadows its older one on the home LAN, so two members remain and this Mac is not home there;
+/// an answer elsewhere older than its home one shadows nothing.
+///
+/// NEGATIVE CONTROL: dropping the newer-answer check from `home_at`'s filter counts `node2`'s
+/// older home answer, and this test fails at "a member last heard elsewhere".
+#[test]
+fn a_newer_answer_from_another_network_shadows_an_older_home_answer() {
+    let elsewhere = RouteFacts {
+        interface: "en0".to_owned(),
+        address: v4("10.0.0.20"),
+        prefix: 24,
+        gateway: Some(v4("10.0.0.1")),
+        gateway_hw: Some(vec![0x02, 0x11, 0x22, 0x33, 0x44, 0x55]),
+    };
+    let away = |began: u64| Answer {
+        network: NetworkId::of(&elsewhere),
+        ..answer("node2", "10.0.0.32", "10.0.0.20", began)
+    };
+    let mut answers = members_at_home();
+    answers.push(away(NOW - 10_000));
+    assert_eq!(
+        home_net_at(&home(answers)),
+        Err(Away::TooFew { heard: 2 }),
+        "a member last heard elsewhere"
+    );
+    let mut answers = members_at_home();
+    answers.push(away(NOW - 120_000));
+    assert!(
+        home_net_at(&home(answers)).is_ok(),
+        "an older answer elsewhere shadows nothing"
+    );
 }

@@ -7,7 +7,8 @@
 //! reads `owner_needed` for its alert. The test plays each host's main thread and the worker's
 //! session: on `WorkerSaid::Claimed` the claimant's stub spawn starts a session, fails, or says
 //! nothing, and that host's next look reads what it did (`Ahead::spawned`); the session's task
-//! record says it works, ended or stalled (`Ahead::task`); a host can end, with a successor that
+//! record says it works or ended (`Ahead::task`; a stall reads working, as the window reads one,
+//! since a stall may move on); a host can end, with a successor that
 //! runs its sessions under a new `HostId` or with none. Every look is projected onto the model
 //! and its moves fired: a move the model does not enable, a law it breaks after one, or a lease
 //! whose episode, worker record, due reading or round the model's state does not match fails the
@@ -225,7 +226,7 @@ impl World {
         self.trail.push(format!("aterm done {done}"));
     }
 
-    /// The worker's task record says `task`: it ended or stalled, so its session stops working.
+    /// The worker's task record says `task`: it ended, so its session stops working.
     fn worker_ends(&mut self, task: TaskSeen) -> Result<(), String> {
         let Some(s) = self.session.as_mut() else {
             return Err(self.fail("no worker session to end".to_owned()));
@@ -387,6 +388,7 @@ impl World {
                 worker_ok: self.able[h],
                 task: Some(&task),
                 spawned: spawned.as_ref(),
+                target: None,
             },
         };
         let roster = ask::Roster {
@@ -803,8 +805,13 @@ fn an_out_episode_claims_one_worker_that_starts_and_finishes() {
 
 /// A round waiting only on a held session claims the worker; past its wall the session is
 /// nominated, but the round elects nobody while the worker works, and elects it once the worker
-/// stalled and is over.
+/// ended and is over.
 fn held_round(w: &mut World) -> Result<(), String> {
+    held_round_ending(w, TaskSeen::Ended)
+}
+
+/// [`held_round`], its worker ending as `ended`.
+fn held_round_ending(w: &mut World, ended: TaskSeen) -> Result<(), String> {
     w.seats[0] = vec![("s-a", 30)];
     w.held = vec!["s-a"];
     w.to(SHORT);
@@ -817,7 +824,7 @@ fn held_round(w: &mut World) -> Result<(), String> {
     w.look(0)?;
     w.wait(60_000);
     w.look(0)?;
-    w.worker_ends(TaskSeen::Stalled("sign-in".to_owned()))?;
+    w.worker_ends(ended)?;
     w.look(0)?;
     w.wait(60_000);
     w.look(0)?;
@@ -840,6 +847,18 @@ fn a_round_waiting_on_held_sessions_claims_the_worker_and_waits_on_it() {
         "the round waited on the worker: {:#?}",
         w.trail
     );
+}
+
+/// A WORKER THAT COULD NOT FINISH IS OVER AS A FINISHED ONE IS: the model's `Over`, and the round
+/// that waited on it elects again.
+#[test]
+fn a_worker_that_could_not_finish_is_over_and_the_round_goes_on() {
+    let mut w = World::new("could-not-finish");
+    held_round_ending(&mut w, TaskSeen::Failed("could-not-finish".to_owned()))
+        .unwrap_or_else(|e| panic!("{e}"));
+    for action in ["Claim", "Over", "Elect", "Type", "Settle"] {
+        assert!(w.fired(action) > 0, "{action}: {:#?}", w.trail);
+    }
 }
 
 /// The asked session frees nothing: the round after its hand-off claims the worker, which works

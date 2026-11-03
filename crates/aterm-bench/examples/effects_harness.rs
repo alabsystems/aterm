@@ -1714,7 +1714,7 @@ fn typing_scene(rig: &mut Rig, style: GlowStyle, page: Page, script: Script) -> 
             host.bodyless_before_publish(&input, now)
         };
         let splice_ns = host.splice(&mut input);
-        let glass = host.fx.light_arms().iter().any(|(arm, _)| arm == "glass");
+        let glass = host.fx.glass_drew();
         if glass {
             glass_frames += 1;
         }

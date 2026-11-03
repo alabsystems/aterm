@@ -18,6 +18,7 @@ fn cli(id: &'static str, state: State, mark: Mark, fact: &str) -> AiCli {
         product: row.product,
         claude: row.is_claude(),
         wanted: true,
+        asked: true,
         state,
         mark,
         fact: fact.to_string(),

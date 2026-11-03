@@ -398,7 +398,7 @@ fn computer_rows(
     }
     let mut rows = vec![header_line(
         "tabs/computers/header",
-        "COMPUTER \u{b7} STATUS \u{b7} IPV4 & HOSTNAME \u{2014} LIVE SYSTEM VITALS (CPU / GPU / RAM / DISK / UPTIME / RTT) \u{2014} HARDWARE \u{b7} OS & SSH \u{b7} SESSIONS",
+        "COMPUTER \u{b7} STATUS \u{b7} IPV4 & HOSTNAME \u{2014} REPORTED SYSTEM VITALS (CPU / GPU / RAM / DISK / UPTIME / RTT) \u{2014} HARDWARE \u{b7} OS & SSH \u{b7} SESSIONS",
         inner,
     )];
     if tabs.computers.is_empty() {

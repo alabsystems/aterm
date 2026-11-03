@@ -58,8 +58,18 @@ fn short_sid(sid: &str) -> String {
     aterm_messages::presence::short_sid(sid)
 }
 
+/// The Stop Worker sheet's words for the worker labelled `label`: its title, its body and its
+/// proceed button (`objc_confirm_drive` raises the same sheet on a real `NSAlert`).
+pub(crate) fn stop_worker_sheet(label: &str) -> (&'static str, String, &'static str) {
+    (
+        "Stop Worker",
+        format!("Stop {label}? Its agent gets SIGTERM and its task reads exited."),
+        "Stop",
+    )
+}
+
 impl App {
-    fn overview_chip(
+    pub(crate) fn overview_chip(
         &self,
         h: &crate::session_store::SessionHandle,
         hosting: &crate::harness_reach::HarnessHosting,
@@ -129,7 +139,7 @@ impl App {
             if let Some(why) = t.why.filter(|_| !landed) {
                 words.push_str(&format!(" ({why})"));
             }
-            if t.state == crate::task_record::TaskState::Done && t.result_bytes > 0 {
+            if t.state.marks_its_tab() && t.result_bytes > 0 {
                 words.push_str(&format!(" \u{00b7} {}", size_words(t.result_bytes)));
             }
             words
@@ -189,11 +199,9 @@ impl App {
                 crate::task_record::TaskState::Working | crate::task_record::TaskState::Stalled
             )
         });
-        let has_result = task.as_ref().is_some_and(|t| {
-            t.state == crate::task_record::TaskState::Done
-                && t.result_bytes > 0
-                && t.result_path.is_some()
-        });
+        let has_result = task
+            .as_ref()
+            .is_some_and(crate::native_workers::result_to_read);
         OverviewChip {
             sid: h.sid.clone(),
             local_id: h.local_id,
@@ -220,7 +228,7 @@ impl App {
             worker_of: is_worker,
             held_by_person: person,
             has_result,
-            stoppable: live_task,
+            stoppable: live_task || crate::native_act::renewal_pending(ctx),
         }
     }
 
@@ -573,28 +581,7 @@ impl App {
         let Some(ctx) = self.pool.get(session).map(|s| s.ctx.clone()) else {
             return Some(StopRefused::Gone);
         };
-        let (live, shell_in_front) = {
-            let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            let live = tl.task().is_some_and(|t| {
-                matches!(
-                    t.state,
-                    crate::task_record::TaskState::Working | crate::task_record::TaskState::Stalled
-                )
-            });
-            (live, shell_in_front(tl.agent()))
-        };
-        if !live {
-            return Some(StopRefused::NotRunning);
-        }
-        if self.person_gesture_refused()
-            && let Some(refusal) = crate::fabric::halt_refusal(&ctx, "signal")
-        {
-            return Some(StopRefused::Halted(refusal.trim_end().to_string()));
-        }
-        if shell_in_front {
-            return Some(StopRefused::NoAgent);
-        }
-        None
+        stop_worker_refusal_in(&ctx, self.person_gesture_refused())
     }
 
     /// Say why stop worker stopped nothing, to whom it concerns.
@@ -648,14 +635,7 @@ impl App {
         } else {
             aterm_slog::Actor::Human
         };
-        let reply = crate::control::signal_verb(master, "term", &ctx, by);
-        let reply = reply.trim_end().to_string();
-        match reply.strip_prefix("OK ") {
-            Some(ok) => Ok(ok.to_string()),
-            None => Err(StopRefused::Signal(
-                reply.strip_prefix("ERR ").unwrap_or(&reply).to_string(),
-            )),
-        }
+        stop_worker_in(master, &ctx, by)
     }
 
     /// Read result: open a done worker's result file as a Markdown document tab on `wid`.
@@ -669,7 +649,7 @@ impl App {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .task()
-                    .filter(|t| t.result_bytes > 0)
+                    .filter(|t| crate::native_workers::result_to_read(t))
                     .and_then(|t| t.result_path.clone())
             })
             .ok_or_else(|| "no result to read".to_string())?;
@@ -860,6 +840,87 @@ pub(crate) enum StopRefused {
     NoAgent,
     /// The `signal` verb's own refusal (no foreground program, a platform with no signals).
     Signal(String),
+}
+
+/// The production Stop Worker preconditions on an already resolved session.
+/// Human owner gestures may stop a held tab; control clients retain the fabric refusal.
+pub(crate) fn stop_worker_refusal_in(
+    ctx: &crate::SessionCtx,
+    controller: bool,
+) -> Option<StopRefused> {
+    let refusal = stop_worker_signal_refusal_in(ctx, controller);
+    if !controller
+        && matches!(
+            refusal,
+            Some(StopRefused::NotRunning | StopRefused::NoAgent)
+        )
+        && crate::native_act::renewal_pending(ctx)
+    {
+        None
+    } else {
+        refusal
+    }
+}
+
+fn stop_worker_signal_refusal_in(ctx: &crate::SessionCtx, controller: bool) -> Option<StopRefused> {
+    let (live, shell_in_front) = {
+        let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        let live = tl.task().is_some_and(|t| {
+            matches!(
+                t.state,
+                crate::task_record::TaskState::Working | crate::task_record::TaskState::Stalled
+            )
+        });
+        (live, shell_in_front(tl.agent()))
+    };
+    if !live {
+        return Some(StopRefused::NotRunning);
+    }
+    if controller && let Some(refusal) = crate::fabric::halt_refusal(ctx, "signal") {
+        return Some(StopRefused::Halted(refusal.trim_end().to_string()));
+    }
+    if shell_in_front {
+        return Some(StopRefused::NoAgent);
+    }
+    None
+}
+
+/// Run the confirmed production Stop Worker operation, rechecking its live session.
+/// The caller owns the UI confirmation and records the actual person gesture first.
+pub(crate) fn stop_worker_in(
+    master: i32,
+    ctx: &crate::SessionCtx,
+    by: aterm_slog::Actor,
+) -> Result<String, StopRefused> {
+    if let Some(refused) = stop_worker_refusal_in(ctx, !matches!(by, aterm_slog::Actor::Human)) {
+        return Err(refused);
+    }
+    let cancelled = if matches!(by, aterm_slog::Actor::Human) {
+        crate::native_act::cancel_renewal_owner(ctx)
+            .map_err(|why| StopRefused::Signal(why.into()))?
+    } else {
+        false
+    };
+    if cancelled && crate::native_act::cancelled_native_shell_front(ctx, master) {
+        return Ok("recovery cancelled".into());
+    }
+    if let Some(refused) =
+        stop_worker_signal_refusal_in(ctx, !matches!(by, aterm_slog::Actor::Human))
+    {
+        return if cancelled && matches!(refused, StopRefused::NotRunning | StopRefused::NoAgent) {
+            Ok("recovery cancelled".into())
+        } else {
+            Err(refused)
+        };
+    }
+    let reply = crate::control::signal_verb(master, "term", ctx, by);
+    let reply = reply.trim_end().to_string();
+    match reply.strip_prefix("OK ") {
+        Some(ok) => Ok(ok.to_string()),
+        None => Err(StopRefused::Signal(
+            reply.strip_prefix("ERR ").unwrap_or(&reply).to_string(),
+        )),
+    }
 }
 
 /// Whether `publication` says the tab's foreground program is its shell and no agent.
@@ -1240,6 +1301,30 @@ mod tests {
                 crate::app_input::PressPhase::Initial,
             );
         }
+    }
+
+    #[test]
+    fn codex_renewal_owner_stop_shares_the_apps_live_task_refusal() {
+        use crate::app_overview::{StopRefused, stop_worker_in, stop_worker_refusal_in};
+        use crate::task_record::{TaskMark, TaskState, mark_session_task};
+        let (app, _, sids) = app_with_three();
+        give_task(&app, &sids[1], crate::task_record::FROM_CTL);
+        let local = local_of(&app, &sids[1]);
+        let ctx = ctx_of(&app, &sids[1]);
+        assert_eq!(
+            app.stop_worker_refusal(local),
+            stop_worker_refusal_in(&ctx, false)
+        );
+        assert_eq!(stop_worker_refusal_in(&ctx, false), None);
+        mark_session_task(&ctx, local, &TaskMark::new(TaskState::Done)).unwrap();
+        assert_eq!(
+            app.stop_worker_refusal(local),
+            Some(StopRefused::NotRunning)
+        );
+        assert_eq!(
+            stop_worker_in(-1, &ctx, aterm_slog::Actor::Human),
+            Err(StopRefused::NotRunning)
+        );
     }
 
     #[test]

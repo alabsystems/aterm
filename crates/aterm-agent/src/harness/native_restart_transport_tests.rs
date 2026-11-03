@@ -246,6 +246,7 @@ fn private_token_constructor_retains_both_plans_and_original_budget_through_roll
     let (mut st, _) = state(&command);
     let original = std::sync::Arc::new(std::sync::Mutex::new(None::<Prepare>));
     let kept = original.clone();
+    let durable_opts = opts.clone();
     let mut issued = None;
     let (mut client, worker) = endpoint(move |line| {
         if let Some(reply) = common(line) {
@@ -284,6 +285,12 @@ fn private_token_constructor_retains_both_plans_and_original_budget_through_roll
                 "OK native-act state=precommitted\n".into()
             }
             Request::Commit(_, phase, version) => {
+                assert!(
+                    upgrade_drive::load(&durable_opts, "conversation")
+                        .unwrap()
+                        .native_rollback,
+                    "the actual durable phase precedes the host Commit, including its lost ACK"
+                );
                 assert_eq!(phase, ImagePhase::Rollback);
                 assert_eq!(version, "1.0.1");
                 "OK native-act state=committed claim=builtin revision=-\n".into()
@@ -318,8 +325,22 @@ fn private_token_constructor_retains_both_plans_and_original_budget_through_roll
         "rollback never creates another id or deadline"
     );
     assert!(resume(&mut client, SID, &cap, phase(&st), "1.2", 0).is_ok());
-    assert!(complete(&mut client, SID, &mut st));
+    // A lost Resume ACK / stale local checkpoint cannot erase the host's
+    // already accepted Rollback phase. Query must recover it before Precommit.
+    st.native_rollback = false;
+    assert!(complete(&opts, "conversation", &mut client, SID, &mut st));
     assert!(st.native.is_none() && st.native_prepare.is_empty());
+    assert!(
+        st.native_rollback,
+        "completed rollback remains phase-specific evidence"
+    );
+    upgrade_drive::save_checked(&opts, "conversation", &st).unwrap();
+    assert!(
+        upgrade_drive::load(&opts, "conversation")
+            .unwrap()
+            .native_rollback,
+        "durable completion must not become a forward success"
+    );
     let prepared_plan = original.lock().unwrap().clone().unwrap();
     let NativePlan::Restart {
         forward,
@@ -595,4 +616,93 @@ fn completed_forward_receipt_can_only_prepare_its_fixed_old_slot_as_a_distinct_c
         actual_request(line),
         Some(Request::Signal(_) | Request::Resume(..))
     )));
+}
+
+#[test]
+fn resume_only_driver_starts_with_observation_and_never_reissues_signal_on_lost_reply() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(dir.path());
+    let command = planned();
+    let (mut st, _) = state(&command);
+    let (mut client, worker) = endpoint(|line| {
+        if let Some(reply) = common(line) {
+            return Some(reply);
+        }
+        match request(line) {
+            Request::Prepare(plan) => Some(format!(
+                "OK native-act state=admitted id={} cap={}\n",
+                plan.id,
+                binding().capability
+            )),
+            _ => panic!("only preparation expected"),
+        }
+    });
+    assert_eq!(
+        begin(
+            &opts,
+            &mut client,
+            &mut st,
+            "conversation",
+            Scope::Relaunch,
+            &command.target,
+            Some(&command),
+            Some(&command)
+        ),
+        Ok(Recovery::Admitted)
+    );
+    drop(client);
+    worker.join().unwrap();
+    let Some(Request::Prepare(prepare)) = Request::parse(&st.native_prepare) else {
+        panic!("exact admitted operation");
+    };
+    for signal_original in [false, true, false] {
+        // A closed connection is unknown, so the exact retained admission is
+        // replayed. The Resume-only path must not send Signal even on retry.
+        let (client, worker) = endpoint(|_| None);
+        assert!(
+            super::super::codex_renewal::drive_connection(
+                &opts,
+                SID,
+                &prepare,
+                st.clone(),
+                client,
+                signal_original,
+            )
+            .is_none()
+        );
+        let seen = worker.join().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            matches!(request(&seen[0]), Request::Signal(_)),
+            signal_original
+        );
+        if !signal_original {
+            assert!(matches!(request(&seen[0]), Request::Query(_)));
+        }
+    }
+}
+
+#[test]
+fn rollback_phase_checkpoint_failure_never_sends_precommit_or_commit() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(dir.path());
+    std::fs::write(&opts.state, b"obstruct owned test state directory").unwrap();
+    let mut st = St {
+        native: Some(binding()),
+        native_prepare: "retained-original".into(),
+        native_rollback: true,
+        ..St::default()
+    };
+    let original = st.clone();
+    let (mut client, worker) = endpoint(|line| {
+        assert!(
+            matches!(request(line), Request::Query(_)),
+            "failed checkpoint must deny every mutation"
+        );
+        Some("OK native-act state=unknown\n".into())
+    });
+    assert!(!complete(&opts, "conversation", &mut client, SID, &mut st));
+    assert_eq!(st, original);
+    drop(client);
+    assert_eq!(worker.join().unwrap().len(), 1);
 }

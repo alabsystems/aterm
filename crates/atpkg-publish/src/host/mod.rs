@@ -329,3 +329,24 @@ pub fn gh_serves(ctx: &crate::ctx::Ctx, role: HostRole) -> bool {
         HostChoice::Agh => false,
     }
 }
+
+/// `host.write_preflight` of each slug in `slugs`, in order and each once: the first refusal,
+/// with the slug it names. A pre-claim site asks it of every repository its run writes or
+/// clones under the role's writer, because under agh both push and a release-tier grant are
+/// per repository, so the index repository's answer says nothing of a program repository's.
+///
+/// # Errors
+///
+/// The first slug whose check failed, and why.
+pub fn preflight_each(
+    host: &dyn ReleaseHost,
+    slugs: impl IntoIterator<Item = Slug>,
+) -> Result<(), (Slug, HostError)> {
+    let mut asked = std::collections::BTreeSet::new();
+    for slug in slugs {
+        if asked.insert(slug.clone()) {
+            host.write_preflight(&slug).map_err(|e| (slug, e))?;
+        }
+    }
+    Ok(())
+}

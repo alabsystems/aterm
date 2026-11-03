@@ -20,6 +20,118 @@ const RELEASES: [(u64, &str, &str); 8] = [
 
 const OLDEST_BOTTLE_MAJOR: u64 = 11;
 
+/// brew `MacOSVersion::SYMBOLS` keys (newest first).
+pub const MACOS_SYMBOLS: [&str; 7] = [
+    "golden_gate",
+    "tahoe",
+    "sequoia",
+    "sonoma",
+    "ventura",
+    "monterey",
+    "big_sur",
+];
+
+/// brew `Tag#standardized_arch`.
+fn standardized_arch(arch: &str) -> &str {
+    match arch {
+        "x86_64" | "intel" => "x86_64",
+        "arm64" | "arm" | "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// brew `Utils::Bottles::Tag#to_sym` for a system/arch pair.
+#[must_use]
+pub fn bottle_tag_symbol(system: &str, arch: &str) -> String {
+    let arch = standardized_arch(arch);
+    if system == "all" && arch == "all" {
+        return "all".to_string();
+    }
+    if MACOS_SYMBOLS.contains(&system) && arch == "x86_64" {
+        return system.to_string();
+    }
+    format!("{arch}_{system}")
+}
+
+/// brew `Tag.from_symbol(value).to_sym`; `None` is brew's
+/// `Invalid bottle tag symbol` ArgumentError.
+#[must_use]
+pub fn bottle_tag_from_symbol(value: &str) -> Option<String> {
+    if value == "all" {
+        return Some("all".to_string());
+    }
+    // Hardware::CPU::ALL_ARCHS, in order.
+    const ALL_ARCHS: [&str; 12] = [
+        "i386", "x86_64", "ppc", "ppc32", "ppc7400", "ppc7450", "ppc970", "ppc64", "ppc64le",
+        "ppc970", "arm64", "aarch64",
+    ];
+    let wordy = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    };
+    for arch in ALL_ARCHS {
+        if let Some(system) = value
+            .strip_prefix(arch)
+            .and_then(|rest| rest.strip_prefix('_'))
+            && wordy(system)
+        {
+            return Some(bottle_tag_symbol(system, arch));
+        }
+    }
+    wordy(value).then(|| bottle_tag_symbol(value, "x86_64"))
+}
+
+/// The tag symbol for a `--os`/`--arch` simulation pair
+/// (brew `Tag.from_arg(nil, os:, arch:)` after
+/// `os_arch_combinations` defaulting).
+#[must_use]
+pub fn simulated_bottle_tag(os: Option<&str>, arch: Option<&str>) -> String {
+    let host = Machine::this();
+    let system = match os {
+        Some(os) => os.to_string(),
+        None => match host.os {
+            Os::Linux => "linux".to_string(),
+            Os::Macos => host
+                .macos_version()
+                .and_then(release)
+                .map(|(_, name, _)| name.to_string())
+                .unwrap_or_else(|| "macos".to_string()),
+            Os::Other => "macos".to_string(),
+        },
+    };
+    let arch = arch.unwrap_or(&host.arch);
+    bottle_tag_symbol(&system, arch)
+}
+
+/// Every (os, arch) combination brew's `os_arch_combinations`
+/// yields, as tag symbols: `all` expands to ALL_OS_OPTIONS /
+/// ARCH_OPTIONS; unset defaults to the host's own.
+#[must_use]
+pub fn bottle_tag_combinations(os: Option<&str>, arch: Option<&str>) -> Vec<String> {
+    let mut oses: Vec<Option<String>> = Vec::new();
+    match os {
+        Some("all") => {
+            oses.extend(MACOS_SYMBOLS.iter().map(|s| Some((*s).to_string())));
+            oses.push(Some("linux".to_string()));
+        }
+        Some(os) => oses.push(Some(os.to_string())),
+        None => oses.push(None),
+    }
+    let arches: Vec<Option<String>> = match arch {
+        Some("all") => vec![Some("intel".to_string()), Some("arm".to_string())],
+        Some(arch) => vec![Some(arch.to_string())],
+        None => vec![None],
+    };
+    let mut out = Vec::new();
+    for os in &oses {
+        for arch in &arches {
+            out.push(simulated_bottle_tag(os.as_deref(), arch.as_deref()));
+        }
+    }
+    out
+}
+
 const ARCHES: [&str; 2] = ["arm64", "x86_64"];
 
 /// The release macOS `version` is: by its major from 11 on, and of the 10.x
@@ -124,6 +236,43 @@ impl Machine {
             }
         }
         Ok(Machine::mac(arch, macos, xcode, clt))
+    }
+
+    /// A machine simulated from brew `--os`/`--arch` values
+    /// (`SimulateSystem`): `os` is a macOS release symbol,
+    /// `macos` (generic, no release), or `linux`; `arch` is
+    /// `arm`/`intel`. Each defaults to this host's own.
+    #[must_use]
+    pub fn simulated(os: Option<&str>, arch: Option<&str>) -> Machine {
+        let host = Machine::this();
+        let arch = match arch {
+            Some("arm") => "arm64".to_string(),
+            Some("intel") => "x86_64".to_string(),
+            _ => host.arch.clone(),
+        };
+        let blank = |os: Os| Machine {
+            os,
+            arch: arch.clone(),
+            macos: OnceLock::from(None),
+            xcode: OnceLock::from(None),
+            clt: OnceLock::from(false),
+        };
+        match os {
+            Some("linux") => blank(Os::Linux),
+            Some("macos") => blank(Os::Macos),
+            Some(symbol) => match RELEASES.iter().find(|(_, name, _)| *name == symbol) {
+                Some((major, ..)) => Machine::mac(&arch, &major.to_string(), None, true),
+                None => blank(Os::Macos),
+            },
+            None => match host.os {
+                Os::Linux => blank(Os::Linux),
+                Os::Macos => match host.macos_version() {
+                    Some(version) => Machine::mac(&arch, version, None, true),
+                    None => blank(Os::Macos),
+                },
+                Os::Other => blank(Os::Other),
+            },
+        }
     }
 
     /// The newest Mac abrew can name (arm64 on the newest release with Xcode and CLT).
@@ -286,7 +435,14 @@ impl DeveloperDir {
 
     fn active(&self) -> Option<std::path::PathBuf> {
         let mut dir = match &self.developer_dir_env {
-            Some(env) if !env.is_empty() => std::path::PathBuf::from(env),
+            // A shell opened before the tools arrived can still name aterm's shim directory,
+            // which holds only `xcrun` and says nothing of this Mac's tools.
+            Some(env)
+                if !env.is_empty()
+                    && !aterm_types::clt_shim::is_shim_developer_dir(std::path::Path::new(env)) =>
+            {
+                std::path::PathBuf::from(env)
+            }
             _ => match std::fs::read_link(&self.select_link) {
                 Ok(target) => target,
                 Err(_) => self.defaults.iter().find(|d| d.is_dir())?.clone(),
@@ -362,6 +518,54 @@ mod tests {
     }
 
     #[test]
+    fn bottle_tag_symbols_follow_brew_tag() {
+        assert_eq!(bottle_tag_symbol("sequoia", "intel"), "sequoia");
+        assert_eq!(bottle_tag_symbol("sequoia", "arm"), "arm64_sequoia");
+        assert_eq!(bottle_tag_symbol("linux", "intel"), "x86_64_linux");
+        assert_eq!(bottle_tag_symbol("macos", "arm"), "arm64_macos");
+        assert_eq!(bottle_tag_symbol("all", "all"), "all");
+        assert_eq!(
+            bottle_tag_from_symbol("bogus").as_deref(),
+            Some("x86_64_bogus")
+        );
+        assert_eq!(
+            bottle_tag_from_symbol("arm64_tahoe").as_deref(),
+            Some("arm64_tahoe")
+        );
+        assert_eq!(bottle_tag_from_symbol("tahoe").as_deref(), Some("tahoe"));
+        assert_eq!(bottle_tag_from_symbol("all").as_deref(), Some("all"));
+        assert_eq!(bottle_tag_from_symbol("foo-bar"), None);
+        assert_eq!(
+            simulated_bottle_tag(Some("linux"), Some("intel")),
+            "x86_64_linux"
+        );
+        assert_eq!(bottle_tag_combinations(Some("all"), Some("intel")).len(), 8);
+        assert_eq!(bottle_tag_combinations(None, Some("all")).len(), 2);
+    }
+
+    #[test]
+    fn simulated_machines_carry_brew_variation_keys() {
+        assert_eq!(
+            Machine::simulated(Some("linux"), Some("arm")).variation_keys(),
+            Some(vec!["arm64_linux".to_string()])
+        );
+        assert_eq!(
+            Machine::simulated(Some("linux"), Some("intel")).variation_keys(),
+            Some(vec!["x86_64_linux".to_string()])
+        );
+        assert_eq!(
+            Machine::simulated(Some("sequoia"), Some("intel")).variation_keys(),
+            Some(vec!["x86_64_sequoia".to_string(), "sequoia".to_string()])
+        );
+        // Generic macos has no release, hence no variation keys
+        // and the base API record applies.
+        assert_eq!(
+            Machine::simulated(Some("macos"), Some("arm")).variation_keys(),
+            None
+        );
+    }
+
+    #[test]
     fn variation_keys_name_exactly_this_system() {
         assert_eq!(
             Machine::mac("arm64", "27.0.1", None, true).variation_keys(),
@@ -417,6 +621,25 @@ mod tests {
              \t<key>CFBundleShortVersionString</key>\n\t<string>{version}</string>\n\
              \t<key>CFBundleVersion</key>\n\t<string>24000</string>\n</dict>\n</plist>\n"
         )
+    }
+
+    /// aterm's shim directory in `DEVELOPER_DIR` reads as no choice at all.
+    /// NEGATIVE CONTROL: any other directory there wins over the selection.
+    #[test]
+    fn the_shims_developer_dir_is_no_choice_of_tools() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let selected = tmp.path().join("selected");
+        std::fs::create_dir_all(&selected).unwrap();
+        let active = |env: &str| {
+            DeveloperDir {
+                developer_dir_env: Some(env.into()),
+                select_link: tmp.path().join("no-link"),
+                defaults: vec![selected.clone()],
+            }
+            .active()
+        };
+        assert_eq!(active("/s/clt-shim/developer"), Some(selected.clone()));
+        assert_eq!(active("/s/own"), Some("/s/own".into()));
     }
 
     /// The Xcode version is read off the selected developer directory's

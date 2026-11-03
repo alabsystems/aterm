@@ -11,6 +11,38 @@ use zeroize::Zeroizing;
 
 const CHALLENGE: &[u8] = b"aterm/release-ring/authorize/1\0";
 
+/// Select the newest master-signed generation before checking a signer's authority. An
+/// invalid supplied pair, malformed signed roster or fork at the newest generation refuses
+/// selection. In particular, callers cannot ignore a newer revocation and use an old grant.
+pub(crate) fn newest_roster<'a, T>(
+    anchors: &[&str],
+    candidates: impl IntoIterator<Item = (T, &'a [u8], &'a [u8])>,
+) -> Option<(T, u64)> {
+    let mut chosen: Option<(T, u64, &[u8])> = None;
+    let mut fork = false;
+    for (item, raw, signature) in candidates {
+        let verified =
+            aterm_update_core::roster::verify_roster(anchors, raw.to_vec(), signature).ok()?;
+        let roster = Roster::parse(&verified).ok()?;
+        if let Some((_, seq, old_raw)) = &chosen {
+            if roster.roster_seq == *seq {
+                fork |= raw != *old_raw;
+                continue;
+            }
+            if roster.roster_seq < *seq {
+                continue;
+            }
+        }
+        chosen = Some((item, roster.roster_seq, raw));
+        fork = false;
+    }
+    if fork {
+        None
+    } else {
+        chosen.map(|(item, seq, _)| (item, seq))
+    }
+}
+
 /// Why the delivered profile and key do not establish release authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reject {

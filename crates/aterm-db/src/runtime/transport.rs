@@ -281,14 +281,38 @@ pub(super) struct Contact {
     pub(super) said: Said,
     /// When that round authenticated; [`Self::at`] while none did.
     pub(super) said_at: Instant,
+    /// The reading of this Mac's clock against the peer's (`crate::clock`, F22) that the
+    /// latest-authenticated round to take one took.
+    pub(super) clock: Option<crate::clock::Reading>,
+    /// When the round that took [`Self::clock`] authenticated. Rounds are ordered by this steady
+    /// clock, never by the wall time a reading was taken at, which a clock set back moves back.
+    pub(super) clock_at: Instant,
 }
 impl Contact {
-    fn new(actor: astream_wire::sync::Actor, at: Instant, said: Said) -> Self {
+    fn new(
+        actor: astream_wire::sync::Actor,
+        at: Instant,
+        said: Said,
+        clock: Option<crate::clock::Reading>,
+    ) -> Self {
         Self {
             actor,
             at,
             said,
             said_at: at,
+            clock,
+            clock_at: at,
+        }
+    }
+    /// Fold in `clock`, what a round authenticated at `at` read: it replaces the reading held
+    /// unless an earlier-authenticated round took it, whichever round finished first. A round
+    /// that read nothing keeps the reading held.
+    fn read(&mut self, at: Instant, clock: Option<crate::clock::Reading>) {
+        if let Some(clock) = clock
+            && (self.clock.is_none() || at >= self.clock_at)
+        {
+            self.clock = Some(clock);
+            self.clock_at = at;
         }
     }
     /// Fold in another round with this peer, authenticated at `at`. Rounds finish out of their
@@ -590,8 +614,10 @@ impl Transport {
                 if let Some((actor, at)) = repair.authenticated_contact() {
                     if let Some(contact) = self.contacts.iter_mut().find(|c| c.actor == actor) {
                         contact.heard(at, repair.said());
+                        contact.read(at, repair.clock());
                     } else if self.contacts.len() < 64 {
-                        self.contacts.push(Contact::new(actor, at, repair.said()));
+                        self.contacts
+                            .push(Contact::new(actor, at, repair.said(), repair.clock()));
                     }
                 }
                 #[cfg(test)]

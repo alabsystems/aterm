@@ -247,7 +247,7 @@ pub(super) fn lookup(
 
 #[cfg(target_os = "linux")]
 pub(super) fn physical(name: &str) -> io::Result<bool> {
-    use std::{fs::File, io::Read, path::Path};
+    use std::{io::Read, os::unix::fs::OpenOptionsExt as _, path::Path};
     if name.is_empty()
         || name.len() > 15
         || !name
@@ -266,9 +266,14 @@ pub(super) fn physical(name: &str) -> io::Result<bool> {
         return Ok(false);
     }
     let mut kind = Vec::new();
-    File::open(path.join("type"))?
-        .take(33)
-        .read_to_end(&mut kind)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path.join("type"))?;
+    if !file.metadata()?.is_file() {
+        return Ok(false);
+    }
+    file.take(33).read_to_end(&mut kind)?;
     Ok(kind.len() <= 32 && kind == b"1\n") // ARPHRD_ETHER
 }
 

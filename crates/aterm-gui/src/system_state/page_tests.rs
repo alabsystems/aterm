@@ -172,9 +172,15 @@ fn what_needs_you_is_pinned_in_the_card_once_and_the_headline_says_so() {
             .iter()
             .find(|line| line.line == Line::of(item))
             .unwrap();
+        // The list says so too, so it never reads as all done; the card holds the words.
+        let row = line
+            .rows
+            .iter()
+            .find(|row| row.subject == item)
+            .unwrap_or_else(|| panic!("{item:?} is in the card and gone from its line"));
         assert!(
-            line.rows.iter().all(|row| row.subject != item),
-            "{item:?} is in the card and on its line"
+            row.note.is_none() && !row.turn_on_sync && !row.install_tools && !row.copy_command,
+            "{item:?}'s words and buttons are the card's: {row:?}"
         );
         assert!(
             matches!(line.mark, Mark::NeedsYou | Mark::Failed),
@@ -428,7 +434,7 @@ fn no_row_appears_twice_on_any_page() {
         let status = status_of(name);
         let mut app = reading(&status);
         let (_, card, _) = drawn(&app);
-        // Every item is some row's, so the row it holds leaves its line.
+        // Every item is some row's, which stays on its line once.
         assert!(
             card.iter().all(|item| item.subject.is_some()),
             "{name}: a card item names no row: {card:?}"
@@ -452,10 +458,6 @@ fn no_row_appears_twice_on_any_page() {
                     continue;
                 }
                 assert!(seen.insert(rest.to_owned()), "{name}: {key} drawn twice");
-                assert!(
-                    !carded.iter().any(|subject| row_slug(*subject) == rest),
-                    "{name}: {key} is on its line and in the card"
-                );
             }
         }
     }

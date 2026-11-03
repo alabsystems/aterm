@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Conformance test for the writer half (`channel::index::publish_with`) of the `AtpkgIndexPublishWalk` model.
+//! Conformance test for the writer half (`channel::index::publish_with`) of the `AtpkgIndexPublishWalk` model,
+//! over two channels: M1's `FakeHost`, and `AghHost` on agh-fake's loopback server (plan §15).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -12,11 +13,16 @@ use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use atpkg_publish::api::{Baseline, IndexRequest};
 use atpkg_publish::channel::index::{parse_delta, publish_with};
+use atpkg_publish::ctx::Ctx;
+#[cfg(unix)]
+use atpkg_publish::ctx::HostChoice;
 use atpkg_publish::host::fake::{FakeHost, FakeRelease};
-use atpkg_publish::host::{Hosts, Slug};
+use atpkg_publish::host::{HostRef, Hosts, Slug};
 use atpkg_publish::quad::{QUAD_FILES, index_tag};
 
 use super::Rig;
+#[cfg(unix)]
+use super::agh_write_contract::{AghWorld, Setup, WriteWorld};
 
 const OWN_VALID_UNTIL: &str = "2098-01-01T00:00:00Z";
 const FOREIGN_VALID_UNTIL: &str = "2098-01-02T00:00:00Z";
@@ -120,50 +126,52 @@ impl Fixture {
         self.rig.ctx.index_slug()
     }
 
-    fn lay(&self, tags: [i64; 3]) -> Arc<FakeHost> {
-        let host = Arc::new(FakeHost::new());
-        for build in 1..=4u64 {
-            let code = if build == 1 {
-                2
-            } else {
-                tags[usize::try_from(build).expect("small") - 2]
-            };
-            let source = match code {
-                0 => continue,
-                1 | 2 => &self.own[&build],
-                _ => &self.foreign[&build],
-            };
-            let assets = QUAD_FILES
-                .iter()
-                .map(|f| {
-                    (
-                        (*f).to_string(),
-                        std::fs::read(source.join(f)).expect("quad"),
-                    )
-                })
-                .collect();
-            host.put(
-                &self.slug(),
-                &index_tag(build),
-                FakeRelease {
-                    draft: matches!(code, 1 | 3),
-                    prerelease: true,
-                    assets,
-                },
-            );
-        }
-        host
+    /// What release `build` holds under its channel `code`, or `None` for code 0.
+    fn laid(&self, build: u64, code: i64) -> Option<Lay> {
+        let source = match code {
+            0 => return None,
+            1 | 2 => &self.own[&build],
+            _ => &self.foreign[&build],
+        };
+        let assets = QUAD_FILES
+            .iter()
+            .map(|f| {
+                (
+                    (*f).to_string(),
+                    std::fs::read(source.join(f)).expect("quad"),
+                )
+            })
+            .collect();
+        Some(Lay {
+            tag: index_tag(build),
+            draft: matches!(code, 1 | 3),
+            assets,
+        })
     }
 
-    fn code_at(&self, host: &FakeHost, build: u64) -> i64 {
-        let Some(rel) = host.release_of(&self.slug(), &index_tag(build)) else {
+    /// The releases 1..=4 of a channel at `tags` (index 1 is always A's, published).
+    fn lays(&self, tags: [i64; 3]) -> Vec<Lay> {
+        (1..=4u64)
+            .filter_map(|build| {
+                let code = if build == 1 {
+                    2
+                } else {
+                    tags[usize::try_from(build).expect("small") - 2]
+                };
+                self.laid(build, code)
+            })
+            .collect()
+    }
+
+    fn code_at(&self, laid: &dyn Laid, build: u64) -> i64 {
+        let tag = index_tag(build);
+        let held = laid.held(&tag);
+        assert!(held.len() <= 1, "{tag}: {} releases hold it", held.len());
+        let Some((draft, Some(index))) = held.into_iter().next() else {
             return 0;
         };
-        let Some(index) = rel.assets.get(QUAD_FILES[0]) else {
-            return 0;
-        };
-        let mine = *index == std::fs::read(self.own[&build].join(QUAD_FILES[0])).expect("own");
-        match (mine, rel.draft) {
+        let mine = index == std::fs::read(self.own[&build].join(QUAD_FILES[0])).expect("own");
+        match (mine, draft) {
             (true, true) => 1,
             (true, false) => 2,
             (false, true) => 3,
@@ -171,10 +179,15 @@ impl Fixture {
         }
     }
 
-    fn publish(&self, ba: i64, na: i64, tags: [i64; 3]) -> (bool, [i64; 3], String) {
-        let host = self.lay(tags);
-        let mut ctx = self.rig.ctx.clone();
-        ctx.hosts = Hosts::single(host.clone());
+    fn publish(
+        &self,
+        channel: &dyn Channel,
+        ba: i64,
+        na: i64,
+        tags: [i64; 3],
+    ) -> (bool, [i64; 3], String) {
+        let laid = channel.lay(&self.slug(), &self.lays(tags));
+        let ctx = laid.ctx(&self.rig);
         let ba = u64::try_from(ba).expect("positive");
         let na = u64::try_from(na).expect("positive");
         let baseline = if na == ba + 1 {
@@ -188,25 +201,146 @@ impl Fixture {
         let req = IndexRequest {
             baseline,
             delta: valid_until(OWN_VALID_UNTIL),
-            out: self
-                .rig
-                .path(&format!("run-{ba}-{na}-{tags:?}").replace([' ', ',', '[', ']'], "")),
+            out: self.rig.path(
+                &format!("run-{}-{ba}-{na}-{tags:?}", channel.name())
+                    .replace([' ', ',', '[', ']'], ""),
+            ),
             upload: true,
             pack_dir: None,
         };
         let mut log = Rig::log();
         let ok = publish_with(&ctx, &req, &mut log).is_ok();
         let after = [
-            self.code_at(&host, 2),
-            self.code_at(&host, 3),
-            self.code_at(&host, 4),
+            self.code_at(&*laid, 2),
+            self.code_at(&*laid, 3),
+            self.code_at(&*laid, 4),
         ];
         (ok, after, log.text())
     }
 }
 
-#[test]
-fn the_real_indexer_takes_the_models_decision_on_every_channel_it_reaches() {
+/// One release a case lays down before the run.
+struct Lay {
+    tag: String,
+    draft: bool,
+    assets: BTreeMap<String, Vec<u8>>,
+}
+
+/// Where a case's channel lives.
+trait Channel {
+    fn name(&self) -> &'static str;
+    /// A fresh channel at `slug` holding `lays`, each a prerelease.
+    fn lay(&self, slug: &Slug, lays: &[Lay]) -> Box<dyn Laid>;
+}
+
+/// A channel a case laid down.
+trait Laid {
+    /// The rig's context, publishing to this channel.
+    fn ctx(&self, rig: &Rig) -> Ctx;
+    /// Every release holding `tag`: whether it is a draft, and its index file's bytes.
+    fn held(&self, tag: &str) -> Vec<(bool, Option<Vec<u8>>)>;
+}
+
+/// M1's channel: one `FakeHost` serving both owners.
+struct FakeChannel;
+
+struct FakeLaid {
+    host: Arc<FakeHost>,
+    slug: Slug,
+}
+
+impl Channel for FakeChannel {
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+
+    fn lay(&self, slug: &Slug, lays: &[Lay]) -> Box<dyn Laid> {
+        let host = Arc::new(FakeHost::new());
+        for lay in lays {
+            host.put(
+                slug,
+                &lay.tag,
+                FakeRelease {
+                    draft: lay.draft,
+                    prerelease: true,
+                    assets: lay.assets.clone(),
+                },
+            );
+        }
+        Box::new(FakeLaid {
+            host,
+            slug: slug.clone(),
+        })
+    }
+}
+
+impl Laid for FakeLaid {
+    fn ctx(&self, rig: &Rig) -> Ctx {
+        let mut ctx = rig.ctx.clone();
+        ctx.hosts = Hosts::single(self.host.clone());
+        ctx
+    }
+
+    fn held(&self, tag: &str) -> Vec<(bool, Option<Vec<u8>>)> {
+        self.host
+            .release_of(&self.slug, tag)
+            .map(|rel| (rel.draft, rel.assets.get(QUAD_FILES[0]).cloned()))
+            .into_iter()
+            .collect()
+    }
+}
+
+/// The channel on a fresh agh-fake: `alabsystems/aterm` public with push for
+/// `fixture-release-bot`, written by an `AghHost` routed by the release profile and agh.toml's
+/// `[[writers]]` grant to atpkg-publish, read through `load_for_host`, with a zero retry pause
+/// so `probe_served` takes no wall time. Staging stays the rig's `FakeHost`, and the context
+/// is `HostChoice::Agh`.
+#[cfg(unix)]
+struct AghChannel;
+
+#[cfg(unix)]
+impl Channel for AghChannel {
+    fn name(&self) -> &'static str {
+        "agh"
+    }
+
+    fn lay(&self, slug: &Slug, lays: &[Lay]) -> Box<dyn Laid> {
+        let world = AghWorld::build(Setup::RELEASE);
+        assert_eq!(world.slug(), *slug, "the channel is the index slug");
+        for lay in lays {
+            let assets: Vec<(&str, &[u8])> = lay
+                .assets
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+                .collect();
+            world.lay(&lay.tag, lay.draft, &assets);
+        }
+        Box::new(world)
+    }
+}
+
+#[cfg(unix)]
+impl Laid for AghWorld {
+    fn ctx(&self, rig: &Rig) -> Ctx {
+        let mut ctx = rig.ctx.clone().with_host_choice(HostChoice::Agh);
+        let channel: HostRef = self.host.clone();
+        ctx.hosts = Hosts {
+            staging: rig.host.clone(),
+            channel,
+        };
+        ctx
+    }
+
+    fn held(&self, tag: &str) -> Vec<(bool, Option<Vec<u8>>)> {
+        self.read(tag)
+            .into_iter()
+            .map(|held| (held.draft, held.assets.get(QUAD_FILES[0]).cloned()))
+            .collect()
+    }
+}
+
+/// Every case either model reaches, driven through the real indexer onto `channel`.
+fn takes_the_models_decision(on: &dyn Channel) {
     let model = atpkg_index_publish_walk_model();
     let buggy = interp::with_buggy(&model, 1);
     let mut cases: BTreeMap<(i64, i64, [i64; 3]), bool> = BTreeMap::new();
@@ -223,7 +357,7 @@ fn the_real_indexer_takes_the_models_decision_on_every_channel_it_reaches() {
     let mut controls: BTreeSet<&str> = BTreeSet::new();
     let mut taken: BTreeSet<&str> = BTreeSet::new();
     for &(ba, na, tags) in cases.keys() {
-        let (ok, after, log) = fx.publish(ba, na, tags);
+        let (ok, after, log) = fx.publish(on, ba, na, tags);
         let mut state = model.init_state();
         for (var, value) in [
             ("pa", 1),
@@ -241,7 +375,10 @@ fn the_real_indexer_takes_the_models_decision_on_every_channel_it_reaches() {
             .collect();
         assert_eq!(enabled.len(), 1, "one decision at {state:?}: {enabled:?}");
         taken.insert(enabled[0]);
-        let label = format!("baseline {ba}, number {na}, channel {tags:?}");
+        let label = format!(
+            "{}: baseline {ba}, number {na}, channel {tags:?}",
+            on.name()
+        );
         if enabled[0] == "RefuseA" {
             assert!(
                 !ok,
@@ -295,4 +432,15 @@ fn the_real_indexer_takes_the_models_decision_on_every_channel_it_reaches() {
         "{committed} of {}",
         cases.len()
     );
+}
+
+#[test]
+fn the_real_indexer_takes_the_models_decision_on_every_channel_it_reaches() {
+    takes_the_models_decision(&FakeChannel);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_real_indexer_takes_the_models_decision_over_agh_host() {
+    takes_the_models_decision(&AghChannel);
 }

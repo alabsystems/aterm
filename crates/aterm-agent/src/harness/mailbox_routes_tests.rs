@@ -588,6 +588,11 @@ fn every_mailbox_login_is_printed_masked() {
     assert!(words.contains("mailbox(ow…@…) "), "{words}");
     let words = read(Mailbox::WebmailOnly, Some("ow…@…")).words();
     assert!(words.contains("mailbox(ow…@…, webmail only) "), "{words}");
+    let words = read(Mailbox::WebmailNoPassword, Some("ow…@…")).words();
+    assert!(
+        words.contains("mailbox(ow…@…, webmail only, no password) "),
+        "{words}"
+    );
     let waiting = read(Mailbox::NoPassword, Some("wa…@…"));
     assert!(
         waiting
@@ -1039,6 +1044,56 @@ fn only_an_accounts_own_mailbox_is_private_and_asked_for() {
             .words()
             .contains("mailbox(ow…@… has no password yet) ")
     );
+}
+
+/// A WEBMAIL INBOX ENDS THE ASK FOR ITS PASSWORD ONLY WITH ONE: the legacy top-level file m2
+/// holds (`webmail_url`, `user`, `password`) is webmail with the password, so it holds the
+/// mailbox the lab was asked for; the same file with no password, or naming a password file not
+/// delivered yet, is still tried beside a browser but holds nothing to end the ask with.
+#[test]
+fn a_webmail_inbox_holds_the_mailbox_only_with_its_password() {
+    use super::super::sign_in_ladder::{Mailbox, Profile, Read};
+    let row = super::super::accounts::Row {
+        label: "m2-3".to_owned(),
+        email: Some("ai@pm.example.test".to_owned()),
+        ..super::super::accounts::Row::default()
+    };
+    let offer =
+        |text: &str| super::super::accounts_sync::mailbox_offer(false, Some(config(text)), &row).0;
+    let webmail = "webmail_url = \"https://mail.example.test/inbox\"\n\
+                   user = \"owner@proton.example.test\"\n";
+    for (text, want) in [
+        (
+            format!("{webmail}password = \"pw\"\n"),
+            Mailbox::WebmailOnly,
+        ),
+        (webmail.to_owned(), Mailbox::WebmailNoPassword),
+        (
+            format!("{webmail}password_file = \"/nonexistent.noindex/pw\"\n"),
+            Mailbox::WebmailNoPassword,
+        ),
+    ] {
+        assert_eq!(offer(&text), want, "{text}");
+    }
+    let read = |mailbox| Read {
+        profile: Profile::None,
+        mailbox,
+        mailbox_login: None,
+        vault: None,
+        browser: false,
+        row_browser: false,
+        hosts: 0,
+    };
+    assert!(read(Mailbox::Ready).holds_mailbox());
+    assert!(read(Mailbox::WebmailOnly).holds_mailbox());
+    for none in [
+        Mailbox::WebmailNoPassword,
+        Mailbox::NoPassword,
+        Mailbox::SharedNoPassword,
+        Mailbox::None,
+    ] {
+        assert!(!read(none).holds_mailbox(), "{none:?}");
+    }
 }
 
 /// TWO MAILBOX FILES WITH ONE LOGIN: the lower file's entry keeps none of its secrets, but its

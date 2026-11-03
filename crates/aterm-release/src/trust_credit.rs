@@ -474,7 +474,7 @@ pub fn judge(epoch: &Epoch, credit: &Credit) -> Vec<String> {
 /// # Errors
 /// The ledger is there and does not parse.
 pub fn current_epoch(repo: &Path) -> Result<Option<Epoch>, String> {
-    match std::fs::read_to_string(repo.join(EPOCHS)) {
+    match crate::durable::read_text(&repo.join(EPOCHS)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("{EPOCHS}: {e}")),
         Ok(text) => Ok(parse_epochs(&text)?.pop()),
@@ -485,7 +485,7 @@ pub fn current_epoch(repo: &Path) -> Result<Option<Epoch>, String> {
 #[must_use]
 pub fn read_record(target: &Path, package: &str) -> Option<Result<Tally, String>> {
     let path = record_path(target, package);
-    match std::fs::read_to_string(&path) {
+    match crate::durable::read_text(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => Some(Err(format!("{}: {e}", path.display()))),
         Ok(text) => Some(tally(&text).map_err(|why| format!("{}: {why}", path.display()))),
@@ -510,7 +510,7 @@ pub fn run_cmd(repo: &Path, records: &[PathBuf]) -> i32 {
     let mut credit = Credit::default();
     let mut by_name: BTreeMap<String, Option<Result<Tally, String>>> = BTreeMap::new();
     for r in records {
-        let read = match std::fs::read_to_string(r) {
+        let read = match crate::durable::read_text(r) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => Some(Err(e.to_string())),
             Ok(text) => Some(tally(&text)),

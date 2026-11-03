@@ -63,25 +63,67 @@ fn transport_result(
         };
     }
     if (5..=8).contains(&kind) {
-        let status = match kind {
-            5 => "200 OK",
-            6 => "404 Not Found",
-            7 => "302 Found",
-            _ => "500 Internal Server Error",
+        let (status, reason) = match kind {
+            5 => (200, "OK"),
+            6 => (404, "Not Found"),
+            7 => (302, "Found"),
+            _ => (500, "Internal Server Error"),
         };
         let (url, server) = super::tests::stub(
-            format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").into_bytes(),
+            format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n").into_bytes(),
         );
-        let result = transport::fetch_within_as_observed(
+        if kind == 5 || kind == 6 {
+            let result = transport::fetch_within_as_observed(
+                &url,
+                Some(3),
+                aterm_spec::wait::MUST_HAPPEN,
+                subscriber.as_deref(),
+            );
+            server.join().unwrap().unwrap();
+            let observed = result.unwrap();
+            let expected = if kind == 5 {
+                Fetched::Body(Vec::new())
+            } else {
+                Fetched::Missing
+            };
+            assert_eq!(observed.fetched, expected);
+            assert!(observed.http204.is_none());
+            return (observed.http204, Some(observed.fetched));
+        }
+        // Observe the completed status before classification: an unrelated lost request
+        // must not satisfy a refusal case merely because neither outcome is an HTTP 204.
+        // The public fetch flattens Foreign and Unheard into the same Error, so these two
+        // cases exercise its production classifier before that information is discarded.
+        let client = aterm_http::Client::new(
+            aterm_http::Trust::PlatformVerifier,
+            aterm_http::ProxyMode::Direct,
+            aterm_spec::wait::MUST_HAPPEN,
+        );
+        let target = format!("{url}?after=3");
+        let mut request = client.get(&target);
+        if let Some(subscriber) = subscriber.as_deref() {
+            request = request.header(transport::SUBSCRIBER_HEADER, subscriber);
+        }
+        let response = request.send_phased(&[]);
+        server.join().unwrap().unwrap();
+        let response = response.expect("the configured HTTP status");
+        assert_eq!(response.status(), status);
+        let result = transport::test_classify_get_response(
+            Ok(response),
             &url,
             Some(3),
-            Duration::from_secs(60),
             subscriber.as_deref(),
         );
-        server.join().unwrap();
-        return result.map_or((None, None), |observed| {
-            (observed.http204, Some(observed.fetched))
-        });
+        return match kind {
+            7 => {
+                assert!(result.unwrap().fetched().is_err(), "a redirect is foreign");
+                (None, None)
+            }
+            _ => {
+                assert!(!result.unwrap_err().held, "the server answered HTTP 500");
+                (None, None)
+            }
+        };
     }
     if kind == 9 || kind == 11 {
         let fetched = if kind == 9 {

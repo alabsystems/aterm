@@ -48,18 +48,6 @@ pub(super) struct WallMemory {
     written: bool,
 }
 
-const fn title_witness(p: Program) -> bool {
-    match p {
-        Program::Claude => true,
-        Program::Codex
-        | Program::Grok
-        | Program::Kimi
-        | Program::Agy
-        | Program::Muse
-        | Program::Generic => false,
-    }
-}
-
 /// What vouches, at each rung of the canary's ladder
 /// ([`Session::stuck_climb`]), that the agent does not work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,10 +56,10 @@ enum Witness {
     /// animates while the agent works, and a screen no reader names says
     /// nothing either way.
     Title,
-    /// agy's or Muse Code's own words stood still since the episode began
-    /// ([`still_words`]): their reader read the turn's end as evidence and
-    /// names the work (`what`, [`ScreenReader::background_wait`]); a turn of
-    /// the agent's own, a draft typed, or other work moves them.
+    /// The agent's own words stood still since the episode began
+    /// ([`still_words`]): its reader read the turn's end as evidence and names
+    /// the work (`what`, [`ScreenReader::work_left`]); a turn of the agent's
+    /// own, a draft typed, or other work moves them.
     Words(&'static str),
 }
 
@@ -625,21 +613,21 @@ impl<C: Ctl> Session<'_, C> {
             self.stuck_asked = None;
             return;
         };
-        let (at, witness) = if title_witness(reader.program()) {
-            (since, Witness::Title)
-        } else {
-            let what = reader.background_wait(&screen.rows).unwrap_or_default();
-            let words = still_words(reader, &screen.rows, what);
-            let from = match &self.stuck_still {
-                Some((was, from)) if *was == words => *from,
-                _ => {
-                    self.stuck_over(screen.seq, "the agent's words moved", review);
-                    let now = self.fx.mono();
-                    self.stuck_still = Some((words, now));
-                    now
-                }
-            };
-            (from.max(since), Witness::Words(what))
+        let (at, witness) = match reader.work_left(&screen.rows) {
+            None => (since, Witness::Title),
+            Some(what) => {
+                let words = still_words(reader, &screen.rows, what);
+                let from = match &self.stuck_still {
+                    Some((was, from)) if *was == words => *from,
+                    _ => {
+                        self.stuck_over(screen.seq, "the agent's words moved", review);
+                        let now = self.fx.mono();
+                        self.stuck_still = Some((words, now));
+                        now
+                    }
+                };
+                (from.max(since), Witness::Words(what))
+            }
         };
         self.stuck_climb(
             screen,
@@ -859,8 +847,7 @@ impl<C: Ctl> Session<'_, C> {
                 )),
                 Witness::Words(what) => review.note(&format!(
                     "STUCK seq={} the agent's turn ended and its own background work ({what}) \
-                     has run for {minutes} min under words that stood still: nothing is typed \
-                     while it runs, a question the turn ended on included. If that work never \
+                     has run for {minutes} min under words that stood still. If that work never \
                      ends (a server, a daemon, a repeating timer), only a person can end it.",
                     screen.seq,
                 )),

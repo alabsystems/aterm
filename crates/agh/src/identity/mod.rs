@@ -196,6 +196,7 @@ impl Profile {
 
     /// Set whether `legacy_loose` is honoured: `config::load_for_host` and
     /// `provision::add_with` (WP8) are its two callers.
+    #[cfg(unix)]
     pub(crate) fn set_legacy_loose(&mut self, on: bool) {
         self.legacy_loose = on;
     }
@@ -333,27 +334,78 @@ pub enum LoadError {
     Unavailable(&'static str),
 }
 
-impl LoadError {
-    /// Maps `Missing` and `Unavailable` to `Presence::Absent` and others to `Presence::Unusable`.
+/// A [`LoadError`]'s variant without its detail: what its slug and its presence turn on, so a
+/// taped presence decodes by the same rule that encoded it (`Presence::from_slug`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadKind {
+    /// [`LoadError::Missing`].
+    Missing,
+    /// [`LoadError::Loose`].
+    Loose,
+    /// [`LoadError::Symlink`].
+    Symlink,
+    /// [`LoadError::Malformed`].
+    Malformed,
+    /// [`LoadError::Unsupported`].
+    Unsupported,
+    /// [`LoadError::Io`].
+    Io,
+    /// [`LoadError::Unavailable`].
+    Unavailable,
+}
+
+impl LoadKind {
+    /// `missing`, `loose`, `symlink`, `malformed`, `unsupported`, `io`, `unavailable`.
     #[must_use]
-    pub const fn presence(&self) -> Presence {
+    pub const fn slug(self) -> &'static str {
         match self {
-            LoadError::Missing | LoadError::Unavailable(_) => Presence::Absent,
-            other => Presence::Unusable(other.slug()),
+            LoadKind::Missing => "missing",
+            LoadKind::Loose => "loose",
+            LoadKind::Symlink => "symlink",
+            LoadKind::Malformed => "malformed",
+            LoadKind::Unsupported => "unsupported",
+            LoadKind::Io => "io",
+            LoadKind::Unavailable => "unavailable",
         }
     }
 
-    /// `missing`, `loose`, `symlink`, `malformed`, `unsupported`, `io`, `unavailable`.
+    /// `Missing` and `Unavailable` are `Presence::Absent`; every other kind is
+    /// `Presence::Unusable` of its slug.
+    #[must_use]
+    pub const fn presence(self) -> Presence {
+        match self {
+            LoadKind::Missing | LoadKind::Unavailable => Presence::Absent,
+            other => Presence::Unusable(other.slug()),
+        }
+    }
+}
+
+impl LoadError {
+    /// Maps `Missing` and `Unavailable` to `Presence::Absent` and others to `Presence::Unusable`
+    /// ([`LoadKind::presence`]).
+    #[must_use]
+    pub const fn presence(&self) -> Presence {
+        self.kind().presence()
+    }
+
+    /// `missing`, `loose`, `symlink`, `malformed`, `unsupported`, `io`, `unavailable`
+    /// ([`LoadKind::slug`]).
     #[must_use]
     pub const fn slug(&self) -> &'static str {
+        self.kind().slug()
+    }
+
+    /// The variant, without its detail.
+    #[must_use]
+    pub const fn kind(&self) -> LoadKind {
         match self {
-            LoadError::Missing => "missing",
-            LoadError::Loose(_) => "loose",
-            LoadError::Symlink => "symlink",
-            LoadError::Malformed(_) => "malformed",
-            LoadError::Unsupported(_) => "unsupported",
-            LoadError::Io(_) => "io",
-            LoadError::Unavailable(_) => "unavailable",
+            LoadError::Missing => LoadKind::Missing,
+            LoadError::Loose(_) => LoadKind::Loose,
+            LoadError::Symlink => LoadKind::Symlink,
+            LoadError::Malformed(_) => LoadKind::Malformed,
+            LoadError::Unsupported(_) => LoadKind::Unsupported,
+            LoadError::Io(_) => LoadKind::Io,
+            LoadError::Unavailable(_) => LoadKind::Unavailable,
         }
     }
 

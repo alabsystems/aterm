@@ -48,9 +48,11 @@ impl Fixture {
 
     fn seeded(&self) -> (State, Body, Envelope) {
         let (body, envelope) = self.received(VaultNetworkSource::ConfiguredUrl, 500);
+        let lock = StateLock::take(&self.paths).unwrap();
         let mut state = load_state(&self.paths).unwrap();
         assert!(record(
             &self.paths,
+            &lock,
             &self.config,
             &self.config,
             &mut state,
@@ -155,6 +157,7 @@ fn admission_transition_with(
         1_000
     };
     let (mut received_body, envelope) = f.received(source, stamp);
+    let lock = StateLock::take(&f.paths).unwrap();
     if action == "EarlierStartLaterCommit" {
         received_body.attempt._sampled_at =
             previous_body.attempt._sampled_at - Duration::from_secs(1);
@@ -219,7 +222,9 @@ fn admission_transition_with(
         forged.attempt.sampled_at_ms = stamp;
         body = Some(forged);
     }
-    let recorded = record(&f.paths, &requested, &config, &mut state, &envelope, body);
+    let recorded = record(
+        &f.paths, &lock, &requested, &config, &mut state, &envelope, body,
+    );
     let receipt = state.network_materialization.as_ref().unwrap();
     let original = receipt.observation
         == VaultNetworkMaterialization {

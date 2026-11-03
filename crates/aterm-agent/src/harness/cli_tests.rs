@@ -2119,14 +2119,7 @@ fn a_kimi_limits_read_persists_the_month_and_session() {
     let stats = |json: bool| {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_accounts_stats_of(
-            Cli::Kimi,
-            &env,
-            &FakeHost::new(&never_asked),
-            json,
-            &mut out,
-            &mut err,
-        );
+        let code = run_accounts_stats_of(Cli::Kimi, &env, json, &mut out, &mut err);
         assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
         out
     };
@@ -2160,14 +2153,7 @@ fn a_kimi_row_with_no_monthly_reading_says_why() {
     std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let code = run_accounts_stats_of(
-        Cli::Kimi,
-        &env,
-        &FakeHost::new(&never_asked),
-        false,
-        &mut out,
-        &mut err,
-    );
+    let code = run_accounts_stats_of(Cli::Kimi, &env, false, &mut out, &mut err);
     assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
     let text = String::from_utf8(out).unwrap();
     let row = text
@@ -2181,6 +2167,8 @@ fn a_kimi_row_with_no_monthly_reading_says_why() {
     assert!(!row.contains('?'), "{row}");
 }
 
+/// The person's Kimi read reports the row it reads, as `asked`. CONTROL: with no roster it
+/// refuses before reading and reports nothing.
 #[test]
 fn kimi_refresh_uses_a_quota_only_tab_and_always_closes_it() {
     let tmp = tmp_dir("kimi-refresh");
@@ -2195,8 +2183,64 @@ fn kimi_refresh_uses_a_quota_only_tab_and_always_closes_it() {
     };
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let code = run_kimi_refresh_with(&mut ctl, &env, true, &mut out, &mut err);
+    let refused = tmp_dir("kimi-refresh-none");
+    let (code, none) = crate::harness::provider_read::captured(|| {
+        run_kimi_refresh_with(
+            &mut RefreshCtl::default(),
+            &env_at(&refused),
+            true,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+    });
+    assert_eq!(code, ExitCode::from(1));
+    assert!(none.is_empty(), "CONTROL: a refusal is no read");
+    let (spawn_fail_code, spawn_fail_events) = crate::harness::provider_read::captured(|| {
+        let mut spawn_fail = RefreshCtl {
+            fail_at: Some(1),
+            ..RefreshCtl::default()
+        };
+        run_kimi_refresh_with(
+            &mut spawn_fail,
+            &env,
+            true,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+    });
+    assert_eq!(spawn_fail_code, ExitCode::from(1));
+    assert!(
+        spawn_fail_events.is_empty(),
+        "NEGATIVE CONTROL: failed quota-tab spawn must not report a KimiPanel read"
+    );
+    let held_tmp = tmp_dir("kimi-refresh-held");
+    let held_env = env_at(&held_tmp);
+    std::fs::write(
+        held_env.accounts_roster_for(Cli::Kimi).unwrap(),
+        "[[account]]\nlabel = 'kimi-other'\nclass = 'dedicated'\nheld_by = 'm2'\n",
+    )
+    .unwrap();
+    let (held_code, held_events) = crate::harness::provider_read::captured(|| {
+        run_kimi_refresh_with(
+            &mut RefreshCtl::default(),
+            &held_env,
+            true,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+    });
+    assert_eq!(held_code, ExitCode::from(1));
+    assert!(
+        held_events.is_empty(),
+        "NEGATIVE CONTROL: non-warm held_by rows must not be refreshed here"
+    );
+    let (code, events) = crate::harness::provider_read::captured(|| {
+        run_kimi_refresh_with(&mut ctl, &env, true, &mut out, &mut err)
+    });
     assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].account.as_deref(), Some("kimi-m22"));
+    assert_eq!(events[0].why, crate::harness::provider_read::InUse::Asked);
     assert_eq!(ctl.calls.len(), 12, "{:?}", ctl.calls);
     assert_eq!(ctl.calls[2], "@s-quota send exec kimi");
     assert_eq!(ctl.calls[5], "@s-quota send /usage");
@@ -2332,7 +2376,7 @@ fn kimi_refresh_executes_the_enrolled_home_as_an_environment_assignment() {
     shell
         .env("PATH", &bin)
         .arg("-c")
-        .arg(kimi_refresh_command(&env).unwrap());
+        .arg(kimi_refresh_command(&env).unwrap().1);
     let output = aterm_uds::deadline::output_within(&mut shell, std::time::Duration::from_secs(60))
         .expect("scratch shell completes");
     assert!(
@@ -2526,6 +2570,28 @@ fn the_disk_report_names_nothing_removable_by_default_and_is_journalled() {
         &env,
     );
     assert_eq!(rows.lines().count(), 2, "{rows}");
+
+    let (ok, out, err) = go(
+        &Cmd::Disk {
+            targets: vec![tmp.path().join("no-such-target")],
+            apply: None,
+            json: true,
+        },
+        &env,
+    );
+    assert!(ok, "{err}");
+    let records: Vec<Value> = out
+        .lines()
+        .map(|line| aterm_json::from_str(line).expect("one JSON object per line"))
+        .collect();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.get("kind").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        [Some("disk"), Some("disk-watch")],
+        "{out}"
+    );
 }
 
 #[test]
@@ -2601,6 +2667,86 @@ fn disk_why_explains_the_ask_from_its_lease_and_its_ledger_rows() {
         "{out}"
     );
     assert_eq!(lines.count(), 2, "{out}");
+}
+
+/// `disk why` SAYS WHAT THE WORKER REMOVED ITSELF, from the ledger's `disk-free` rows, which are
+/// not the rule's own `free-ask` rows it prints: it once counted only the rows it printed, and
+/// said `it removed 0 B itself` of every worker while Messages said the true figure. CONTROLS:
+/// another session's removal and the worker's own refused removal are not counted.
+#[test]
+fn disk_why_says_what_the_worker_removed_from_the_ledgers_other_rows() {
+    use disk::ask;
+    let tmp = tmp_dir("disk-why-removed");
+    let env = env_at(&tmp);
+    std::fs::create_dir_all(&env.state).expect("state");
+    let host = ask::HostId {
+        pid: 7,
+        start: "x".to_owned(),
+    };
+    let t = env.now * 1000;
+    let lease = ask::Lease {
+        volumes: vec![ask::Entry {
+            key: "dev:1".to_owned(),
+            worker: Some(ask::Worker {
+                host: host.clone(),
+                at_ms: t - 600_000,
+                state: ask::WorkerState::Over {
+                    why: "finished".to_owned(),
+                    sid: Some("s-w".to_owned()),
+                    at_ms: t,
+                    rose: 5 << 30,
+                    target_met: None,
+                },
+                orphan_ms: None,
+                free_at_claim: None,
+                target: None,
+            }),
+            ..ask::Entry::default()
+        }],
+        ..ask::Lease::default()
+    };
+    std::fs::write(env.state.join(ask::LEASE_FILE), lease.encode()).expect("lease");
+    let over = ask::WorkerSaid::Over {
+        sid: Some("s-w".to_owned()),
+        why: "finished".to_owned(),
+        rose: 5 << 30,
+        target_met: None,
+        here: true,
+    };
+    let removed = |sid: &str, action: &str, gib: u64| {
+        disk::free::row(
+            env.now,
+            sid,
+            &tmp.path().join("home/.cache/x"),
+            action,
+            Some(gib << 30),
+            "",
+        )
+    };
+    disk_ask_journal(
+        &env.state,
+        &[
+            removed("s-w", "removed", 3),
+            removed("s-w", "removed", 1),
+            removed("s-w", "refused", 7),
+            removed("s-other", "removed", 11),
+            ask::worker_row(env.now, "dev:1", &over, 9 << 30, &host),
+        ],
+    );
+    let (ok, out, err) = go(&Cmd::DiskWhy { json: false }, &env);
+    assert!(ok, "{err}");
+    let line = out
+        .lines()
+        .find(|l| l.contains("worker: @s-w"))
+        .unwrap_or_else(|| panic!("a worker line: {out}"));
+    assert!(
+        line.contains(&format!("it removed {} itself", disk::human_bytes(4 << 30))),
+        "{line}"
+    );
+    assert!(
+        !out.contains("\"kind\":\"disk-free\""),
+        "only the rule's rows are printed: {out}"
+    );
 }
 
 #[test]
@@ -3318,11 +3464,19 @@ fn the_verb_json_carries_what_each_row_went_kept_and_why() {
     std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     drop(hold);
     assert!(ok, "{err}");
-    let applied = out
+    let records: Vec<Value> = out
         .lines()
-        .filter_map(|l| aterm_json::from_str::<Value>(l).ok())
-        .find(|v| v.get("kind").and_then(Value::as_str) == Some("disk-apply"))
-        .unwrap_or_else(|| panic!("no disk-apply object: {out}"));
+        .map(|line| aterm_json::from_str(line).expect("one JSON object per line"))
+        .collect();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.get("kind").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        [Some("disk"), Some("disk-watch"), Some("disk-apply")],
+        "{out}"
+    );
+    let applied = &records[2];
     let rows = applied
         .get("rows")
         .and_then(Value::as_array)
@@ -6288,6 +6442,7 @@ fn a_survey_reads_each_row_as_the_report_does() {
             }
         )
     );
+    assert_eq!(work.five_hour_pct, Some(100));
     assert_eq!(
         (pool_a.label.as_str(), pool_a.class, pool_a.enrolled),
         ("pool-a", Class::Shared, false)
@@ -7349,6 +7504,203 @@ fn a_figure_held_only_in_the_sample_is_shown_by_both_views() {
         row(&after)["windows"][0]["missing"]["reason"],
         Value::from("window-reset")
     );
+    assert_eq!(row(&after)["session_pct"], Value::Null);
+    assert_eq!(row(&after)["session_reset"], Value::Null);
+}
+
+fn assert_current_quota_aliases(row: &Value) {
+    let windows = row["windows"].as_array().expect("quota windows");
+    for (id, pct, reset) in [
+        (accounts::SESSION_LIMIT, "session_pct", "session_reset"),
+        (accounts::WEEK_LIMIT, "week_pct", "week_reset"),
+    ] {
+        let window = windows
+            .iter()
+            .find(|w| w["id"] == Value::from(id))
+            .expect(id);
+        assert_eq!(row[pct], window["used_pct"], "{id}: {row}");
+        let current_reset = if window["used_pct"] == Value::Null {
+            Value::Null
+        } else {
+            window["resets_at"].clone()
+        };
+        assert_eq!(row[reset], current_reset, "{id}: {row}");
+    }
+}
+
+#[test]
+fn quota_json_and_survey_use_the_current_window_without_rewriting_history() {
+    for cli in [Cli::Claude, Cli::Kimi] {
+        let tmp = tmp_dir("quota-json");
+        let env = env_at(&tmp);
+        std::fs::write(
+            env.accounts_roster_for(cli).expect("roster path"),
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
+        )
+        .expect("roster");
+        let store = env.accounts_store_for(cli).expect("store");
+        let sample_at = env.now - 2 * 3_600;
+        let session_reset = env.now + 3_600;
+        let week_reset = env.now + 86_400;
+        let mut note = None;
+        store
+            .transact(env.now, &mut note, |state| {
+                let mut events = accounts::note_sample(
+                    state,
+                    "main",
+                    accounts::Sample {
+                        session_pct: Some(40),
+                        session_reset: Some(session_reset),
+                        week_pct: Some(25),
+                        week_reset: Some(week_reset),
+                        at: sample_at,
+                        ..accounts::Sample::default()
+                    },
+                    env.now,
+                );
+                events.extend(accounts::note_auth(state, "main", Auth::SignedOut, env.now));
+                Ok(events)
+            })
+            .expect("sample");
+        let report = |env: &Env| {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run_accounts_of(
+                &AccountsOf {
+                    cli,
+                    form: AccountsCmd::Report { json: true },
+                    vendor: accounts::Vendor::default(),
+                },
+                env,
+                &FakeHost::new(&never_asked),
+                &mut out,
+                &mut err,
+            );
+            assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+            let doc: Value = aterm_json::from_slice(&out).expect("report JSON");
+            let row = doc["accounts"][0].clone();
+            assert_current_quota_aliases(&row);
+            let config = env.config.as_ref().expect("config");
+            let survey = survey_accounts(cli, (config, &env.state, env.home.as_deref()), env.now)
+                .expect("survey");
+            let [summary] = survey.rows.as_slice() else {
+                panic!("one account")
+            };
+            assert_eq!(row["session_pct"], Value::from(summary.five_hour_pct));
+            assert_eq!(row["week_pct"], Value::from(summary.seven_day_pct));
+            assert_eq!(row["week_reset"], Value::from(summary.week_reset));
+            row
+        };
+        let row = report(&env);
+        assert_eq!(row["session_pct"], Value::from(40));
+        assert_eq!(row["week_pct"], Value::from(25));
+        assert_eq!(row["windows"][1]["as_of"], Value::from(sample_at));
+
+        let wall_at = env.now - 30;
+        store
+            .transact(env.now, &mut note, |state| {
+                Ok(accounts::note_wall(
+                    state,
+                    "main",
+                    accounts::WEEK_LIMIT,
+                    Some(week_reset),
+                    wall_at,
+                    env.now,
+                ))
+            })
+            .expect("newer wall");
+        let mut files = every_file(tmp.path());
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        let row = report(&env);
+        assert_eq!(row["session_pct"], Value::from(40));
+        assert_eq!(row["week_pct"], Value::from(100));
+        assert_eq!(row["week_reset"], Value::from(week_reset));
+        assert_eq!(row["windows"][1]["source"], Value::from("wall"));
+        assert_eq!(row["windows"][1]["as_of"], Value::from(wall_at));
+        assert_eq!(row["sampled_at"], Value::from(sample_at));
+        assert_eq!(row["auth"], Value::from("signed-out"));
+
+        let mut after = env.clone();
+        after.now = session_reset;
+        let row = report(&after);
+        assert_eq!(row["session_pct"], Value::Null);
+        assert_eq!(row["week_pct"], Value::from(100));
+        after.now = week_reset;
+        let row = report(&after);
+        assert_eq!(row["week_pct"], Value::Null);
+        assert_eq!(row["windows"][1]["resets_at"], Value::from(week_reset));
+        assert_eq!(row["windows"][1]["state"], Value::from("void"));
+        let mut after_files = every_file(tmp.path());
+        after_files.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            after_files, files,
+            "reports and survey never write the records"
+        );
+        let (state, _) = store.load(env.now).expect("unchanged state");
+        assert_eq!(
+            state
+                .account("main")
+                .sample
+                .as_ref()
+                .expect("sample")
+                .week_pct,
+            Some(25)
+        );
+    }
+}
+
+#[test]
+fn quota_json_withholds_cut_or_undated_window_aliases() {
+    let tmp = tmp_dir("quota-json-cut");
+    let env = env_at(&tmp);
+    let mut state = accounts::State::default();
+    let reset = env.now + 3_600;
+    accounts::note_sample(
+        &mut state,
+        "main",
+        accounts::Sample {
+            session_pct: Some(40),
+            week_pct: Some(25),
+            week_reset: Some(reset),
+            at: env.now - 300,
+            ..accounts::Sample::default()
+        },
+        env.now,
+    );
+    state
+        .accounts
+        .get_mut("main")
+        .expect("account")
+        .windows
+        .insert(
+            accounts::WEEK_LIMIT.into(),
+            accounts::WindowFig {
+                pct_x10: 800,
+                reset,
+                at: env.now - 100,
+                by: "fixture".into(),
+                source: accounts::SOURCE_TAP.into(),
+                epoch_at: Some(env.now - 50),
+            },
+        );
+    env.accounts_store().save(&state).expect("save");
+    let before = std::fs::read(env.accounts_store().state_file()).expect("state bytes");
+    let (code, out, err) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+    assert_eq!(code, exit(0), "{err}");
+    let doc: Value = aterm_json::from_str(&out).expect("report JSON");
+    let row = &doc["accounts"][0];
+    assert_current_quota_aliases(row);
+    assert_eq!(row["session_pct"], Value::Null);
+    assert_eq!(row["week_pct"], Value::Null);
+    assert_eq!(
+        row["windows"][1]["missing"]["reason"],
+        Value::from("reset-used")
+    );
+    assert_eq!(row["windows"][1]["resets_at"], Value::from(reset));
+    assert_eq!(
+        std::fs::read(env.accounts_store().state_file()).expect("state bytes"),
+        before
+    );
 }
 
 const STATS_UUID: &str = "0f6c2b8e-1d3a-4c5e-9b7f-2a4d6e8c0b1a";
@@ -8044,6 +8396,7 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
     };
     let b = super::profile::AccountKey::claude(STATS_OTHER).expect("a key");
     let absent = |row: &Value| {
+        assert_current_quota_aliases(row);
         for field in [
             "session_pct",
             "session_reset",
@@ -8066,6 +8419,7 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
         assert!(row["walls"].as_object().expect("walls").is_empty(), "{row}");
     };
     let observed = |row: &Value| {
+        assert_current_quota_aliases(row);
         assert_eq!(row["session_pct"], Value::from(100u64), "{row}");
         assert_eq!(row["week_pct"], Value::from(80u64), "{row}");
         assert_eq!(row["sampled_at"], Value::from(env.now), "{row}");
@@ -9599,10 +9953,13 @@ supervisor_version=0.3.0+gabc supervisor_vendor=1.0.70 autopilot=-
 2 s-bbb - live t meta=0 supervisor=codex-alab%405150 supervisor_proven=1 \
 supervisor_version=- supervisor_vendor=- autopilot=-
 3 s-ccc - live t meta=0 supervisor=grok-alab@4343 supervisor_proven=0 \
-supervisor_version=- supervisor_vendor=- autopilot=-
+supervisor_version=0.3.1%0aevil supervisor_vendor=1.0.70%1b[31m autopilot=-
 4 s-ddd - live t meta=0 supervisor=aterm-harness@1234 supervisor_proven=0 autopilot=cruise
 5 s-eee - live t meta=0 supervisor=kimi-alab@77 supervisor_proven=0 autopilot=-
 6 s-fff - live t meta=0 supervisor=- supervisor_proven=0 autopilot=-
+7 s-ggg - live t meta=0 supervisor=codex-alab@ supervisor_proven=1 autopilot=-
+8 s-hhh - live t meta=0 supervisor=codex-alab@1 supervisor_proven=1 autopilot=-
+9 s-iii - live t meta=0 supervisor=codex-alab@05150 supervisor_proven=1 autopilot=-
 not a row supervisor=grok-alab@9 supervisor_proven=1
 ";
 

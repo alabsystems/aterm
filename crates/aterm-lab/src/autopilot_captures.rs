@@ -2400,7 +2400,7 @@ const PAD_SAID: &str = "; its pad: ";
 /// [`codex_alab_proof::pad_of`]) beside the chip's `chrome` line: the pad quoted, and a
 /// [`FINDING`] where aterm drew any Codex chip. Where the chip stood down beside that line, a build that
 /// names its mode there (`says_mode`, [`codex_alab_proof::SAYS_ITS_MODE`]) must name the face
-/// ([`forever::surfaces::face_cells`]), else a [`FINDING`]; an older build's line is said to name
+/// ([`forever::surfaces::face_words`]), else a [`FINDING`]; an older build's line is said to name
 /// no mode.
 fn pad_words(chip_line: &str, pad: Option<&str>, says_mode: bool) -> String {
     let mut w = format!(
@@ -2414,7 +2414,7 @@ fn pad_words(chip_line: &str, pad: Option<&str>, says_mode: bool) -> String {
         ));
     } else if let Some(p) = own {
         let face = forever::word(chip_line, "face").unwrap_or_else(|| "-".into());
-        match forever::surfaces::face_cells(&face) {
+        match forever::surfaces::face_words(&face) {
             Some(cells) if says_mode && !p.contains(cells) => w.push_str(&format!(
                 "; {FINDING}codex-alab's own line names no {face} ({cells:?} not on it)"
             )),
@@ -2543,7 +2543,7 @@ fn turn_to_row(lab: &dyn Lab, label: &str) -> Result<String, String> {
 
 fn raise(lab: &dyn Lab, label: &str) -> Result<String, String> {
     let strip = forever::surfaces::strip_tabs(&lab.said(&["chrome"]));
-    let Some(at) = strip.iter().find(|t| t.label == label).map(|t| t.index) else {
+    let Some(at) = strip.iter().find(|t| t.label == label).map(|t| t.index + 1) else {
         return Err(format!("no tab labelled {label} in the strip"));
     };
     let r = lab.said(&["tab", &at.to_string()]);

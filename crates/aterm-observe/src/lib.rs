@@ -99,7 +99,7 @@ pub const fn encode_watcher_budget_wire(
 #[inline]
 #[must_use]
 pub const fn decode_watcher_budget_wire(bytes: &[u8]) -> Option<(u32, u32, u64)> {
-    if bytes.len() < WATCHER_BUDGET_WIRE_BYTES {
+    if bytes.len() != WATCHER_BUDGET_WIRE_BYTES {
         return None;
     }
     if bytes[0] != b'O' || bytes[1] != b'B' || bytes[2] != b'S' || bytes[3] != b'B' {
@@ -162,7 +162,7 @@ pub const fn encode_row_verdict_wire(
 #[inline]
 #[must_use]
 pub const fn decode_row_verdict_wire(bytes: &[u8]) -> Option<(RowVerdict, u16, u8, u64)> {
-    if bytes.len() < ROW_VERDICT_WIRE_BYTES {
+    if bytes.len() != ROW_VERDICT_WIRE_BYTES {
         return None;
     }
     if bytes[0] != b'O' || bytes[1] != b'B' || bytes[2] != b'S' || bytes[3] != b'V' {
@@ -379,6 +379,12 @@ mod tests {
             decode_watcher_budget_wire(&bw),
             Some((1024, 128 * 1024, 1 << 22))
         );
+        let mut bw_trailing = bw.to_vec();
+        bw_trailing.push(0);
+        assert!(
+            decode_watcher_budget_wire(&bw_trailing).is_none(),
+            "fixed 20-byte budget frames reject trailing bytes"
+        );
         let over_bw = encode_watcher_budget_wire(2048, 128 * 1024, 1 << 22);
         assert!(decode_watcher_budget_wire(&over_bw).is_none());
 
@@ -389,6 +395,12 @@ mod tests {
         ] {
             let vw = encode_row_verdict_wire(verdict, 12, 16, 99);
             assert_eq!(decode_row_verdict_wire(&vw), Some((verdict, 12, 16, 99)));
+            let mut vw_trailing = vw.to_vec();
+            vw_trailing.push(0);
+            assert!(
+                decode_row_verdict_wire(&vw_trailing).is_none(),
+                "fixed 16-byte verdict frames reject trailing bytes"
+            );
         }
     }
 }

@@ -98,7 +98,10 @@ pub(crate) fn collect_input_paths(args: &[String]) -> Vec<PathBuf> {
             }
             "-filelist" => {
                 if let Some(list_path) = expanded.get(i + 1)
-                    && let Ok(text) = std::fs::read_to_string(list_path)
+                    && let Ok(text) = aterm_uds::atomic_file::read_regular_text(
+                        std::path::Path::new(list_path),
+                        aterm_uds::atomic_file::MAX_CONFIG_BYTES,
+                    )
                 {
                     for line in text.lines() {
                         let entry = line.split(',').next().unwrap_or("").trim();
@@ -125,7 +128,10 @@ fn expand_response_args(args: &[String], depth: usize, out: &mut Vec<String>) {
     for arg in args {
         if depth < 2
             && let Some(resp_path) = arg.strip_prefix('@')
-            && let Ok(content) = std::fs::read_to_string(resp_path)
+            && let Ok(content) = aterm_uds::atomic_file::read_regular_text(
+                std::path::Path::new(resp_path),
+                aterm_uds::atomic_file::MAX_CONFIG_BYTES,
+            )
         {
             let nested: Vec<String> = split_response_tokens(&content);
             expand_response_args(&nested, depth + 1, out);
@@ -175,13 +181,15 @@ fn has_object_or_archive_ext(path: &str) -> bool {
     path.ends_with(".o") || path.ends_with(".rlib") || path.ends_with(".a")
 }
 
+const MAX_CONTAINER_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Reads all Mach-O object and archive inputs and returns the deduplicated static symbol
 /// order list for Apple `ld -order_file`.
 #[must_use]
 pub(crate) fn build_order_list(paths: &[PathBuf]) -> Vec<String> {
     let mut raw = Vec::new();
     for (idx, path) in paths.iter().enumerate() {
-        let Ok(bytes) = std::fs::read(path) else {
+        let Ok((bytes, _)) = aterm_uds::atomic_file::read_regular(path, MAX_CONTAINER_BYTES) else {
             continue;
         };
         let file_order = u32::try_from(idx).unwrap_or(u32::MAX);

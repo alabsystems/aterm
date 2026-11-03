@@ -78,5 +78,9 @@ aterm-models-db.workspace = true
 aterm-models-swarm.workspace = true
 aterm-spec.workspace = true
 
+[[example]]
+name = "commons_epoch_probe"
+test = true
+
 [lints]
 workspace = true

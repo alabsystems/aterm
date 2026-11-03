@@ -96,7 +96,8 @@ pub fn build(
     let at = work.join(format!("{STEM}_bg.wasm"));
     std::fs::write(&at, &bound).map_err(|e| format!("cannot write {}: {e}", at.display()))?;
     world.optimise(&at, out)?;
-    let wasm = std::fs::read(&at).map_err(|e| format!("cannot read {}: {e}", at.display()))?;
+    let wasm =
+        crate::durable::read_file(&at).map_err(|e| format!("cannot read {}: {e}", at.display()))?;
     if wasm == bound {
         return Err(format!(
             "wasm-opt left {} byte for byte as it was — the engine never ships pre-opt",

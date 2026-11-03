@@ -38,8 +38,8 @@ fn is_compiled_output(path: &Path) -> bool {
         return true;
     }
     let mut head = Vec::with_capacity(8);
-    if std::fs::File::open(path)
-        .and_then(|f| f.take(8).read_to_end(&mut head))
+    if crate::identity::open_regular_nonblock(path)
+        .and_then(|(f, _)| f.take(8).read_to_end(&mut head))
         .is_err()
     {
         return false;

@@ -53,16 +53,86 @@ const fn order(noun: Noun) -> Option<&'static str> {
     }
 }
 
+/// The keys of the documents agh itself writes, each with its JSON type: a write's report
+/// (`write_out::WriteReport`), a journal intent (`agh intent show`) and the git helper's
+/// answer (`agh whoami --git`). `None` for a noun whose document is GitHub's.
+const fn keys(noun: Noun) -> Option<&'static [(&'static str, &'static str)]> {
+    match noun {
+        Noun::Write => Some(&[
+            ("answer", "any|null"),
+            ("dry_run", "boolean"),
+            ("id", "number|null"),
+            ("intent", "string|null"),
+            ("key", "string"),
+            ("op", "string"),
+            ("outcome", "string"),
+            ("repo", "string"),
+            ("url", "string|null"),
+        ]),
+        Noun::Intent => Some(&[
+            ("at_secs", "number"),
+            ("grant", "string|null"),
+            ("id", "string"),
+            ("identity", "string"),
+            ("key", "string"),
+            ("observed", "array"),
+            ("op", "string"),
+            ("open", "boolean"),
+            ("repo", "string"),
+            ("request", "string"),
+            ("retracted", "number|null"),
+            ("settled", "string|null"),
+            ("target_commitish", "string|null"),
+        ]),
+        Noun::Credential => Some(&[
+            ("answer", "string"),
+            ("grant", "string|null"),
+            ("profile", "string|null"),
+            ("repo", "string|null"),
+            ("tier", "string|null"),
+            ("why", "string|null"),
+        ]),
+        Noun::Release
+        | Noun::ReleaseList
+        | Noun::Asset
+        | Noun::ContentEntry
+        | Noun::TreeEntry
+        | Noun::Commit
+        | Noun::Branch
+        | Noun::Tag
+        | Noun::Repo
+        | Noun::User
+        | Noun::Identity
+        | Noun::Rate
+        | Noun::Policy
+        | Noun::Route
+        | Noun::Compare
+        | Noun::Raw
+        | Noun::Download
+        | Noun::Wait
+        | Noun::Permission
+        | Noun::Meta => None,
+    }
+}
+
 fn noun_row(noun: Noun) -> Value {
+    let keys = keys(noun).map_or(Value::Null, |keys| {
+        Value::Object(
+            keys.iter()
+                .map(|(name, kind)| ((*name).to_string(), Value::from(*kind)))
+                .collect(),
+        )
+    });
     json!({
         "default_fields": default_fields(noun),
         "derived": derived_fields(noun),
+        "keys": keys,
         "name": noun.slug(),
         "order": order(noun),
     })
 }
 
-/// `[{"default_fields","derived","name","order"}]`.
+/// `[{"default_fields","derived","keys","name","order"}]`.
 #[must_use]
 pub fn nouns() -> Value {
     Value::Array(Noun::ALL.into_iter().map(noun_row).collect())

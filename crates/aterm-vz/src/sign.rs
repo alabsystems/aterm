@@ -87,6 +87,9 @@ pub struct Placed {
     pub fresh: bool,
 }
 
+/// Maximum helper executable size accepted by [`place`] and [`helper_sha256`].
+const MAX_HELPER_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Copy `built` to `host/<sha256>/aterm-vz-host` and sign the copy there with `sign`
 /// ([`codesign`] in the lab; the tests' records the argv), then make it 0555 and rename its
 /// directory into place. A completed copy already there is kept; replacing an incomplete real
@@ -101,8 +104,8 @@ pub fn place(
     host: &Path,
     sign: &mut dyn FnMut(&Path, &Path) -> Result<(), String>,
 ) -> Result<Placed, String> {
-    let bytes =
-        std::fs::read(built).map_err(|e| format!("could not read {} ({e})", built.display()))?;
+    let bytes = crate::read_regular_bounded(built, MAX_HELPER_BYTES)
+        .map_err(|e| format!("could not read {} ({e})", built.display()))?;
     let mut h = aterm_digest::Sha256::new();
     h.update(&bytes);
     let sha256 = crate::hex(&h.finalize());
@@ -213,8 +216,8 @@ pub fn helper_sha256(exe: &Path) -> Result<String, String> {
     if let Some((_, sha)) = content_dir(exe) {
         return Ok(sha.to_string());
     }
-    let bytes =
-        std::fs::read(exe).map_err(|e| format!("could not read {} ({e})", exe.display()))?;
+    let bytes = crate::read_regular_bounded(exe, MAX_HELPER_BYTES)
+        .map_err(|e| format!("could not read {} ({e})", exe.display()))?;
     let mut h = aterm_digest::Sha256::new();
     h.update(&bytes);
     Ok(crate::hex(&h.finalize()))

@@ -1132,14 +1132,20 @@ impl PackagesStatusReport {
                     row.update.version = aterm_agent::harness::codex_alab::linked_package_versions(
                         layout, &row.name,
                     )
-                    .map(|(product, client)| format!("{product} (client {client}; dev-linked)"));
+                    .map(|(product, client)| format!("{product} (client {client}; dev-linked)"))
+                    .or_else(|| {
+                        atpkg::harness::linked_local_build_version(layout, &row.name)
+                            .map(|version| format!("{version} (dev-linked)"))
+                    });
                 }
                 continue;
             }
             let Some(build) = row.installed_build else {
                 continue;
             };
-            if atpkg::vendor_direct::is_vendor(&row.name) {
+            if atpkg::vendor_direct::is_vendor(&row.name)
+                && !atpkg::alab::build_is_alab(layout, &row.name, build)
+            {
                 if let Some(record) =
                     atpkg::vendor_direct::complete_record(&layout.build_dir(&row.name, build))
                 {
@@ -3337,6 +3343,45 @@ mod tests {
             .unwrap();
         assert_eq!(row.kind, ProgramStateKind::DevLinkUnavailable);
         assert_eq!(row.update.version, None);
+
+        let harness_checkout = temp.path().join("grok-alab");
+        let harness_rel = std::path::PathBuf::from("bin")
+            .join(format!("grok-alab{}", std::env::consts::EXE_SUFFIX));
+        let harness_exe = harness_checkout.join(&harness_rel);
+        std::fs::create_dir_all(harness_exe.parent().unwrap()).unwrap();
+        std::fs::write(&harness_exe, b"harness bytes, never executed").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&harness_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(
+            harness_checkout.join(atpkg::harness::LOCAL_BUILD_JSON),
+            r#"{"schema":2,"origin":"local-build","program":"grok-alab","command":"grok-alab","version":"0.3.0+g1aef4a3bf"}"#,
+        )
+        .unwrap();
+        atpkg::link(&layout, "grok-alab", &harness_checkout, &[harness_rel]).unwrap();
+        let mut harness_report = PackagesStatusReport::from_parts(
+            true,
+            true,
+            "fixture".into(),
+            Some(&prior),
+            &[(
+                "grok-alab".into(),
+                atpkg::linkmode::live_linked_checkout(&layout, "grok-alab").unwrap(),
+            )],
+        );
+        harness_report.attach_store_facts(&layout, None);
+        let harness_row = harness_report
+            .programs
+            .iter()
+            .find(|row| row.name == "grok-alab")
+            .unwrap();
+        assert_eq!(harness_row.kind, ProgramStateKind::DevLinked);
+        assert_eq!(
+            harness_row.update.version.as_deref(),
+            Some("0.3.0+g1aef4a3bf (dev-linked)")
+        );
     }
 
     /// Shadowed is read.
@@ -4507,6 +4552,28 @@ mod tests {
             std::fs::write(&record, bad).unwrap();
             assert_eq!(upstream("codex"), None, "{bad}");
         }
+
+        // A stale vendor head stamp on disk must not override the ALab index pin on an active
+        // ALab store build of codex.
+        atpkg::vendor_direct::ProgramStamp::record_check(
+            &layout,
+            "codex",
+            NOW - 120,
+            atpkg::vendor_direct::Version::parse("0.164.0"),
+            None,
+        )
+        .unwrap();
+        let mut report = report_of(&[("codex", Some(BUILD), atpkg::state::managed(BUILD, 75))]);
+        let pins: std::collections::BTreeMap<String, u64> =
+            [("codex".to_string(), BUILD + 1)].into_iter().collect();
+        report.attach_store_facts(&layout, Some(&pins));
+        let codex = &report.programs[0].update;
+        assert_eq!(
+            codex.latest_known.as_deref(),
+            Some(atpkg::vendor_direct::build_words(BUILD + 1).as_str()),
+            "ALab build uses the index pin, never a stale vendor ProgramStamp"
+        );
+        assert_eq!(codex.checked_at, None);
     }
 
     fn entry(at: i64, kind: &str, pid: u32, fields: &[(&str, &str)]) -> atpkg::packages_log::Entry {

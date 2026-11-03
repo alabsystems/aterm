@@ -367,10 +367,13 @@ mod imp {
     pub(super) fn sys_flock() -> i64 {
         static NR: OnceLock<i64> = OnceLock::new();
         *NR.get_or_init(|| {
-            std::fs::read_to_string("/proc/sys/kernel/arch")
-                .ok()
-                .and_then(|arch| sys_flock_for_kernel_arch(&arch))
-                .unwrap_or(TARGET_SYS_FLOCK)
+            crate::atomic_file::read_regular_text(
+                std::path::Path::new("/proc/sys/kernel/arch"),
+                1024,
+            )
+            .ok()
+            .and_then(|arch| sys_flock_for_kernel_arch(&arch))
+            .unwrap_or(TARGET_SYS_FLOCK)
         })
     }
 
@@ -404,7 +407,10 @@ mod imp {
     }
 
     pub(super) fn asleep(thread: Thread) -> io::Result<Option<Asleep>> {
-        let line = std::fs::read_to_string(format!("/proc/self/task/{}/syscall", thread.tid))?;
+        let line = crate::atomic_file::read_regular_text(
+            std::path::Path::new(&format!("/proc/self/task/{}/syscall", thread.tid)),
+            4096,
+        )?;
         Ok(parse(&line))
     }
 }

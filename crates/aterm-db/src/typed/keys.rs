@@ -121,6 +121,19 @@ pub fn machine_pk(birth: &str) -> String {
     h8("mc", b"aterm/alab/machine/1\0", &[birth.as_bytes()])
 }
 
+/// A Mac's hardware hint under one network, 16 hex (design §4.7): `HMAC(key, "aterm/alab/hw-hint/1"
+/// ‖ IOPlatformUUID)[..8]`, the key a digest of the network identity, not an epoch key, so it stays
+/// stable across rotations and says nothing of the hardware outside this network. The uuid is read
+/// in one spelling, so two readings of one Mac give one hint.
+pub fn hw_hint(network: &[u8; 16], platform_uuid: &str) -> String {
+    let mut seed = b"aterm/alab/hw-hint-key/1\0".to_vec();
+    seed.extend_from_slice(network);
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &Sha256::digest(&seed));
+    let mut message = b"aterm/alab/hw-hint/1".to_vec();
+    message.extend_from_slice(platform_uuid.trim().to_ascii_uppercase().as_bytes());
+    hex::encode_lower(&ring::hmac::sign(&key, &message).as_ref()[..8])
+}
+
 /// An address's key: its digest, so the address itself is never a key.
 ///
 /// # Errors
@@ -220,25 +233,82 @@ pub fn auth_route_pk(account: &str, method: &str) -> Result<String> {
     Ok(format!("ar-{hex}-{code}"))
 }
 
-/// A seat's key: slot `slot` (1 to 99) on a machine. Machine and slot are the natural key, so
-/// two addresses placed in one slot at once are a visible conflict, not two rows.
+/// A preference's key: one machine prefers one account. Only the pair is in the key, so the
+/// row's rank, its note and whether it has ended all merge per cell on one row, and no place on
+/// a Mac is an identity (design §0).
 ///
 /// # Errors
-/// `machine` is not a machine key or `slot` is outside 1 to 99.
-pub fn seat_pk(machine: &str, slot: u8) -> Result<String> {
-    let hex = machine
-        .strip_prefix("mc-")
-        .filter(|_| is_digest_pk(machine, "mc"))
-        .ok_or_else(|| Error::new("a seat names a machine"))?;
-    if !(1..=99).contains(&slot) {
-        return Err(Error::new("a seat's slot is 1 to 99"));
+/// `machine` is not a machine key or `account` is not an account key.
+pub fn preference_pk(machine: &str, account: &str) -> Result<String> {
+    if !is_digest_pk(machine, "mc") || !is_digest_pk(account, "ac") {
+        return Err(Error::new("a preference names a machine and an account"));
     }
-    Ok(format!("st-{hex}-{slot}"))
+    let mut input = b"aterm/alab/preference/1\0".to_vec();
+    input.extend_from_slice(machine.as_bytes());
+    input.push(0);
+    input.extend_from_slice(account.as_bytes());
+    Ok(format!(
+        "pf-{}",
+        hex::encode_lower(&Sha256::digest(&input)[..11])
+    ))
+}
+
+/// The CLI word a realm's default account label starts with: the CLI that signs in to it.
+fn realm_cli(realm: &str) -> Option<&'static str> {
+    Some(match canonical_realm(realm)? {
+        "claude" => "claude",
+        "codex" => "codex",
+        "grok" => "grok",
+        "kimi:global" | "kimi:mainland-cn" => "kimi",
+        "google" => "agy",
+        "meta" => "muse",
+        _ => return None,
+    })
+}
+
+/// An account's default label, `<cli>-<6 hex of its key>`: it names no machine and no address,
+/// so a row keeps it wherever the account runs.
+///
+/// # Errors
+/// An unknown realm, or `account` is not an account key.
+pub fn default_account_label(realm: &str, account: &str) -> Result<String> {
+    let cli = realm_cli(realm).ok_or_else(|| Error::new("unknown provider realm"))?;
+    let hex = account
+        .strip_prefix("ac-")
+        .filter(|_| is_digest_pk(account, "ac"))
+        .ok_or_else(|| Error::new("a label names an account"))?;
+    Ok(format!("{cli}-{}", &hex[..6]))
 }
 
 /// An import source's key: a digest of its bytes, so a re-run of the same file collapses.
 pub fn source_pk(bytes: &[u8]) -> String {
     format!("sr-{}", hex::encode_lower(&Sha256::digest(bytes)[..8]))
+}
+
+/// An archived owned record's key in a later table generation (design §3.8): a digest of the
+/// operation it carries, so every Mac that carries one record names one row.
+pub fn archived_pk(operation: &[u8; 32]) -> String {
+    let mut input = b"aterm/alab/archived/1\0".to_vec();
+    input.extend_from_slice(operation);
+    format!("ar-{}", hex::encode_lower(&Sha256::digest(&input)[..8]))
+}
+
+/// A table roll's cover row (design §3.8): one per generation rolled from and Mac that restated
+/// it, so a Mac's later restatement of what it still held replaces its own earlier cover.
+pub fn roll_pk(from: u32, uuid32: &str) -> String {
+    let mut input = b"aterm/alab/roll/1\0".to_vec();
+    input.extend_from_slice(&from.to_le_bytes());
+    input.push(0);
+    input.extend_from_slice(uuid32.as_bytes());
+    format!("rl-{}", hex::encode_lower(&Sha256::digest(&input)[..8]))
+}
+
+/// A writer of a rolled table as its cover row names it: 32 hex digits of a digest of its
+/// Commons actor, which is 48 bytes and would not fit a cover's record at 128 Macs.
+pub fn actor_key(actor: &[u8]) -> String {
+    let mut input = b"aterm/alab/actor/1\0".to_vec();
+    input.extend_from_slice(actor);
+    hex::encode_lower(&Sha256::digest(&input)[..16])
 }
 
 /// A Mac model's key: `hw.model` with `,` replaced by `-` (`Mac16,8` → `Mac16-8`).

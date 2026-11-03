@@ -56,29 +56,76 @@ pub fn stamp_info_plist(
     Ok(plist)
 }
 
+fn non_comment_spans(plist: &str, key: &str) -> Result<Vec<(usize, usize)>, String> {
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    while let Some(rel) = plist[cursor..].find("<!--") {
+        let cstart = cursor + rel;
+        if cstart > cursor {
+            spans.push((cursor, cstart));
+        }
+        let after_open = cstart + 4;
+        let end_rel = plist[after_open..].find("-->").ok_or_else(|| {
+            format!("Info.plist template: unterminated XML comment while stamping {key}")
+        })?;
+        cursor = after_open + end_rel + 3;
+    }
+    if cursor < plist.len() {
+        spans.push((cursor, plist.len()));
+    }
+    Ok(spans)
+}
+
 /// Replace or insert one `<key>K</key><string>V</string>` pair, textually: the committed template is trusted, tab-indented XML, and a plist parser would be a dependency for no gain.
 pub(crate) fn set_plist_string(plist: &str, key: &str, value: &str) -> Result<String, String> {
     let value = aterm_codec::xml::escape(value);
     let key_tag = format!("<key>{key}</key>");
-    if let Some(kpos) = plist.find(&key_tag) {
-        let after = kpos + key_tag.len();
-        let sstart = plist[after..]
-            .find("<string>")
-            .map(|i| after + i + "<string>".len())
-            .ok_or_else(|| format!("Info.plist template: no <string> after {key_tag}"))?;
-        let send = plist[sstart..]
-            .find("</string>")
-            .map(|i| sstart + i)
-            .ok_or_else(|| format!("Info.plist template: unterminated <string> for {key}"))?;
-        if !plist[after..sstart - "<string>".len()].trim().is_empty() {
+    let spans = non_comment_spans(plist, key)?;
+    if let Some(kpos) = spans
+        .iter()
+        .find_map(|&(s, e)| plist[s..e].find(&key_tag).map(|i| s + i))
+    {
+        let mut pos = kpos + key_tag.len();
+        loop {
+            let trimmed = plist[pos..].trim_start();
+            pos = plist.len() - trimmed.len();
+            if let Some(after_comment) = plist[pos..].strip_prefix("<!--") {
+                let end_rel = after_comment.find("-->").ok_or_else(|| {
+                    format!("Info.plist template: unterminated XML comment while stamping {key}")
+                })?;
+                pos += 4 + end_rel + 3;
+            } else {
+                break;
+            }
+        }
+        if plist[pos..].starts_with("<string/>") {
+            return Ok(format!(
+                "{}<string>{value}</string>{}",
+                &plist[..pos],
+                &plist[pos + "<string/>".len()..]
+            ));
+        }
+        if !plist[pos..].starts_with("<string>") {
             return Err(format!(
                 "Info.plist template: {key} is not a <string> value"
             ));
         }
-        Ok(format!("{}{}{}", &plist[..sstart], value, &plist[send..]))
+        let sstart = pos + "<string>".len();
+        let send = plist[sstart..]
+            .find("</string>")
+            .map(|i| sstart + i)
+            .ok_or_else(|| format!("Info.plist template: unterminated <string> for {key}"))?;
+        if plist[sstart..send].contains('<') {
+            return Err(format!(
+                "Info.plist template: unescaped '<' inside <string> for {key}"
+            ));
+        }
+        Ok(format!("{}{value}{}", &plist[..sstart], &plist[send..]))
     } else {
-        let dict_end = plist
-            .rfind("</dict>")
+        let dict_end = spans
+            .iter()
+            .rev()
+            .find_map(|&(s, e)| plist[s..e].rfind("</dict>").map(|i| s + i))
             .ok_or_else(|| "Info.plist template: no closing </dict>".to_string())?;
         Ok(format!(
             "{}\t{key_tag}\n\t<string>{value}</string>\n{}",
@@ -337,7 +384,7 @@ pub fn assemble_at(spec: &BundleSpec, app: &Path) -> Result<(), String> {
     let icns = mac_dir.join("aterm.icns");
     let icon = icns.is_file().then_some("aterm");
     let template_path = mac_dir.join("Info.plist");
-    let template = std::fs::read_to_string(&template_path)
+    let template = crate::durable::read_text(&template_path)
         .map_err(|e| format!("read {}: {e}", template_path.display()))?;
     let stamped = stamp_info_plist(
         &template,
@@ -382,7 +429,7 @@ pub fn handoff_policy_for_cut(
 ) -> Result<(String, aterm_update_core::handoff_policy::PolicyFile), String> {
     let path = repo_root.join(aterm_update_core::handoff_policy::SOURCE_PATH);
     let shown = path.display().to_string();
-    let text = std::fs::read_to_string(&path)
+    let text = crate::durable::read_text(&path)
         .map_err(|e| handoff_policy_unreadable(&format!("read {shown}: {e}")))?;
     let policy = handoff_policy_of_text(&text, &shown)?;
     Ok((text, policy))
@@ -526,20 +573,42 @@ mod staging_tests {
         dist.join(name)
     }
 
+    /// NEGATIVE CONTROL: `set_plist_string` must ignore commented-out `<key>`/`</dict>` tags,
+    /// replace empty `<string/>` tags cleanly, and refuse unescaped `<` inside `<string>` or
+    /// non-`<string>` values without clobbering later keys.
     #[test]
     fn set_plist_string_rejects_non_string_values_without_overwriting_later_strings() {
         let plist = "<plist><dict>\n\
+            \t<!-- <key>Name</key><string>commented</string> -->\n\
             \t<key>Flag</key>\n\t<false/>\n\
             \t<key>Items</key>\n\t<array><string>keep-me</string></array>\n\
+            \t<key>Empty</key>\n\t<!-- gap --><string/>\n\
             \t<key>Name</key>\n\t<string>old</string>\n\
-            </dict></plist>";
+            </dict><!-- </dict> --></plist>";
         let err = set_plist_string(plist, "Flag", "new").unwrap_err();
         assert!(err.contains("Flag is not a <string> value"), "{err}");
         let err = set_plist_string(plist, "Items", "new").unwrap_err();
         assert!(err.contains("Items is not a <string> value"), "{err}");
         let updated = set_plist_string(plist, "Name", "new").unwrap();
+        assert!(updated.contains("<!-- <key>Name</key><string>commented</string> -->"));
         assert!(updated.contains("<string>keep-me</string>"));
         assert!(updated.contains("<key>Name</key>\n\t<string>new</string>"));
+        let filled = set_plist_string(&updated, "Empty", "filled").unwrap();
+        assert!(filled.contains("<key>Empty</key>\n\t<!-- gap --><string>filled</string>"));
+        let inserted = set_plist_string(&filled, "Added", "val").unwrap();
+        assert!(
+            inserted
+                .contains("\t<key>Added</key>\n\t<string>val</string>\n</dict><!-- </dict> -->")
+        );
+
+        let unclosed = "<plist><dict>\n\
+            \t<key>Broken</key>\n\t<string>missing-close\n\
+            \t<key>Later</key>\n\t<string>ok</string>\n\
+            </dict></plist>";
+        let err = set_plist_string(unclosed, "Broken", "new").unwrap_err();
+        assert!(err.contains("Broken"), "{err}");
+        let err = set_plist_string("<!-- unclosed <dict></dict>", "Added", "x").unwrap_err();
+        assert!(err.contains("Added"), "{err}");
     }
 
     #[test]

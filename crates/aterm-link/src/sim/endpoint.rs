@@ -22,6 +22,10 @@ pub(crate) struct EpRules {
     pub(crate) chain: bool,
     /// A replaced log (`forgot=1`) forgets every session log's mirror cursor.
     pub(crate) mirror_forgets: bool,
+    /// A session's exit moves the count `sessions bridge` and `outbox` name (`roster=`).
+    pub(crate) exit_moves_roster: bool,
+    /// The endpoint names that count at all, as an aterm before it does not.
+    pub(crate) names_roster: bool,
 }
 
 impl Default for EpRules {
@@ -32,6 +36,8 @@ impl Default for EpRules {
             forgets: true,
             chain: true,
             mirror_forgets: true,
+            exit_moves_roster: true,
+            names_roster: true,
         }
     }
 }
@@ -219,6 +225,24 @@ pub(crate) struct EpState {
     stamp: aterm_slog::Stamp,
     /// The world, whose broker each fetch answer is read against as it arrives ([`Fetched`]).
     world: Option<Arc<super::Core>>,
+    /// The roster's count: one more for every session that comes or goes, as
+    /// `SessionStore::roster_seq` moves.
+    roster_seq: u64,
+    /// Every post an `outbox` reply has listed, by sender and id.
+    listed: BTreeSet<(String, u64)>,
+    /// What the last `sessions bridge` reply listed.
+    roster_read: BTreeSet<String>,
+    /// THE ROUTING LAW'S EVIDENCE: the post a listing was the first to name after its recipient
+    /// left, by body, with that recipient, while the last roster read still names the recipient.
+    /// Until the next roster read a bridge holding that read would commit on a roster it
+    /// remembers, so none of these may land on the recipient's lane until then
+    /// ([`super::world::World::check_always`]). Past that read a look was taken, and a landing
+    /// is another door's: a `live` row the bridge could not withdraw, or a ghost's.
+    pub(crate) listed_after_exit: BTreeMap<String, String>,
+    /// Senders whose `outbox sent` this aterm answers as one whose session it no longer finds
+    /// (item C14): the post stays unretired and the bridge's pin of it stands, as a power cut
+    /// between the pin and the retire leaves it, until the world cuts the power.
+    pub(crate) unretired: BTreeSet<String>,
 }
 
 /// One `link gap` a bridge told, scoped as aterm-gui-fabric's `cmd_link_gap` scopes it.
@@ -396,6 +420,7 @@ impl Endpoint {
             session.log = Some(log);
         }
         s.sessions.insert(local, session);
+        s.roster_seq += 1;
     }
 
     /// A session leaves (its tab closed): its log goes with it.
@@ -405,6 +430,9 @@ impl Endpoint {
         session.log = None;
         let sid = session.sid.clone();
         s.gone.push(session);
+        if s.rules.exit_moves_roster {
+            s.roster_seq += 1;
+        }
         Some(sid)
     }
 
@@ -417,6 +445,8 @@ impl Endpoint {
         };
         let session = s.gone.remove(at);
         s.sessions.insert(local, session);
+        s.roster_seq += 1;
+        s.listed_after_exit.retain(|_, to| to != sid);
         true
     }
 
@@ -429,6 +459,7 @@ impl Endpoint {
             x
         }));
         s.log = None;
+        s.roster_seq += 1;
     }
 
     /// Session `local` appends to its log.
@@ -629,16 +660,22 @@ impl Endpoint {
             "log-take" if s.mirror => s.log_take(words),
             "log-landed" if s.mirror => s.log_landed(words),
             "outbox" => match words.next() {
-                None | Some("earlier-receipts=1") => {
+                asked @ (None | Some("earlier-receipts=1")) => {
+                    // A bare `outbox` is an attach's probe, which routes nothing it lists.
+                    if asked.is_some() {
+                        s.note_listing();
+                    }
                     let frame = s.outbox_frame();
-                    format!("OK {}\n{frame}", frame.len())
+                    format!("OK {}{}\n{frame}", frame.len(), s.roster_token())
                 }
                 Some("sent") => s.retire_post(words),
                 Some(_) => "ERR usage: outbox\n".to_string(),
             },
             "sessions" => match words.next() {
                 Some("bridge") => {
-                    let mut r = format!("OK {}\n", s.sessions.len());
+                    s.roster_read = s.sessions.values().map(|x| x.sid.clone()).collect();
+                    s.listed_after_exit.clear();
+                    let mut r = format!("OK {}{}\n", s.sessions.len(), s.roster_token());
                     for (local, session) in &s.sessions {
                         r.push_str(&format!(
                             "{local} {} nonce={}\n",
@@ -740,6 +777,39 @@ impl EpState {
         self.sessions.values_mut().find(|s| s.sid == sid)
     }
 
+    /// The header's ` roster=<seq>`, as `cmd_outbox` and `cmd_sessions_bridge` write it.
+    fn roster_token(&self) -> String {
+        if self.rules.names_roster {
+            format!(" roster={}", self.roster_seq)
+        } else {
+            String::new()
+        }
+    }
+
+    /// An `outbox` reply is about to list every queued post ([`EpState::listed_after_exit`]).
+    fn note_listing(&mut self) {
+        let mut first_listed = Vec::new();
+        for session in self.sessions.values() {
+            for p in session.posts.iter().filter(|p| p.retired.is_none()) {
+                if !self.listed.contains(&(session.sid.clone(), p.id)) {
+                    first_listed.push((session.sid.clone(), p.id, p.to.clone(), p.body.clone()));
+                }
+            }
+        }
+        for (sid, id, to, body) in first_listed {
+            self.listed.insert((sid, id));
+            let Some(to) = to.strip_prefix('@') else {
+                continue;
+            };
+            let left = self.gone.iter().any(|g| g.sid == to)
+                && !self.sessions.values().any(|l| l.sid == to);
+            if left && self.roster_read.contains(to) {
+                self.listed_after_exit
+                    .insert(String::from_utf8_lossy(&body).into_owned(), to.to_string());
+            }
+        }
+    }
+
     /// Every queued post, then every owed receipt.
     fn outbox_frame(&self) -> String {
         let mut frame = String::new();
@@ -798,6 +868,9 @@ impl EpState {
             return "ERR usage: outbox sent\n".to_string();
         };
         let rest: Vec<&str> = words.collect();
+        if self.unretired.contains(sid) {
+            return "ERR no such session\n".to_string();
+        }
         let Some(session) = self.session_by_sid(sid) else {
             return "ERR no such session\n".to_string();
         };

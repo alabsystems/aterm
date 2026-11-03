@@ -11,25 +11,181 @@ pub(super) struct Fixture {
     pub(super) reply: transport::NoContentReply,
 }
 
-pub(super) fn stub(response: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
-    use std::io::{Read as _, Write as _};
+pub(super) fn stub(response: Vec<u8>) -> (String, std::thread::JoinHandle<std::io::Result<()>>) {
+    stub_noting_empty(response, || {})
+}
+
+fn stub_noting_empty(
+    response: Vec<u8>,
+    mut empty: impl FnMut() + Send + 'static,
+) -> (String, std::thread::JoinHandle<std::io::Result<()>>) {
+    use std::os::fd::AsFd as _;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}/v1/team", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(60)))
-            .unwrap();
-        let mut head = Vec::new();
-        while !head.ends_with(b"\r\n\r\n") {
-            let mut byte = [0];
-            stream.read_exact(&mut byte).unwrap();
-            head.push(byte[0]);
-            assert!(head.len() < 16 * 1024);
+        let until = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        loop {
+            aterm_uds::ready::until(listener.as_fd(), aterm_uds::ready::Interest::Read, until)?;
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if read_request_head(&mut stream, until)?.is_none() {
+                // A TCP connect followed by an orderly close supplied no HTTP request.
+                // It must not consume this fixture's one response.
+                empty();
+                continue;
+            }
+            write_response(&mut stream, &response, until)?;
+            return Ok(());
         }
-        stream.write_all(&response).unwrap();
     });
     (url, server)
+}
+
+fn write_response(
+    stream: &mut std::net::TcpStream,
+    mut response: &[u8],
+    until: std::time::Instant,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::fd::AsFd as _;
+    while !response.is_empty() {
+        aterm_uds::ready::until(stream.as_fd(), aterm_uds::ready::Interest::Write, until)?;
+        match stream.write(response) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(written) => response = &response[written..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// As the real server's request reader, distinguish no request from an incomplete request.
+/// The same absolute hang detector covers accept, empty connections, and the complete head.
+fn read_request_head(
+    stream: &mut std::net::TcpStream,
+    until: std::time::Instant,
+) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    use std::os::fd::AsFd as _;
+    stream.set_nonblocking(true)?;
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        aterm_uds::ready::until(stream.as_fd(), aterm_uds::ready::Interest::Read, until).map_err(
+            |error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "HTTP request failed after {} header bytes: {error}",
+                        head.len()
+                    ),
+                )
+            },
+        )?;
+        let mut byte = [0];
+        match stream.read(&mut byte) {
+            Ok(0) if head.is_empty() => return Ok(None),
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("HTTP request ended after {} header bytes", head.len()),
+                ));
+            }
+            Ok(_) => head.push(byte[0]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "HTTP request failed after {} header bytes: {error}",
+                        head.len()
+                    ),
+                ));
+            }
+        }
+        if head.len() >= 16 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HTTP request reached {} header bytes, exceeding the fixture's bound",
+                    head.len()
+                ),
+            ));
+        }
+    }
+    Ok(Some(head))
+}
+
+#[test]
+fn an_empty_closed_connection_does_not_consume_the_http204_response() {
+    let (seen, empty) = std::sync::mpsc::channel();
+    let (url, server) = stub_noting_empty(
+        b"HTTP/1.1 204 No Content\r\nETag: \"9\"\r\n\r\n".to_vec(),
+        move || seen.send(()).unwrap(),
+    );
+    let authority = url
+        .strip_prefix("http://")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap();
+    drop(std::net::TcpStream::connect(authority).unwrap());
+    empty.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+    let observed =
+        transport::fetch_within_as_observed(&url, Some(3), aterm_spec::wait::MUST_HAPPEN, None)
+            .unwrap();
+    server.join().unwrap().unwrap();
+    assert!(matches!(observed.fetched, Fetched::NoNewer(Some(9))));
+    assert!(
+        observed.http204.is_some(),
+        "an actual HTTP 204 was received"
+    );
+}
+
+#[test]
+fn the_http_stub_rejects_an_incomplete_header_before_another_request() {
+    use std::io::Write as _;
+    let (url, server) = stub(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec());
+    let authority = url
+        .strip_prefix("http://")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap();
+    let queued = (|| -> std::io::Result<std::net::TcpStream> {
+        let mut client = std::net::TcpStream::connect(authority)?;
+        client.write_all(b"GET /v1/team HTTP/1.1\r\nHost: test\r\n")?;
+        // Queue a complete second request before ending the first. A stub that swallows
+        // the partial-header error will answer this request and finish successfully.
+        let mut next = std::net::TcpStream::connect(authority)?;
+        next.write_all(b"GET /v1/team HTTP/1.1\r\nHost: test\r\n\r\n")?;
+        client.shutdown(std::net::Shutdown::Write)?;
+        Ok(next)
+    })();
+    // Keep the second connection open while joining, even under the swallowing control.
+    // The stub's one deadline also bounds this join if sending either request failed.
+    let ended = server.join().unwrap();
+    let _next = queued.unwrap();
+    assert_eq!(ended.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
 }
 
 pub(super) fn fixture(etag: Option<&str>, with_recipient: bool) -> Fixture {
@@ -63,7 +219,7 @@ pub(super) fn fixture(etag: Option<&str>, with_recipient: bool) -> Fixture {
         subscriber.as_deref(),
     )
     .unwrap();
-    server.join().unwrap();
+    server.join().unwrap().unwrap();
     assert!(matches!(observed.fetched, Fetched::NoNewer(_)));
     Fixture {
         _root: root,

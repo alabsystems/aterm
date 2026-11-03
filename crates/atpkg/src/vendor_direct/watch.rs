@@ -1149,7 +1149,9 @@ fn installed(layout: &Layout, spec: &VendorSpec) -> Option<Installed> {
     if owner != program || !dir.is_dir() {
         return None;
     }
-    if crate::alab::build_is_alab(layout, program, build) {
+    if crate::alab::build_is_alab(layout, program, build)
+        && !crate::alab::vendor_chosen(layout, program)
+    {
         return None;
     }
     Some(if is_vendor_build(build) {

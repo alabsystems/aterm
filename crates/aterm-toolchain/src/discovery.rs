@@ -230,21 +230,21 @@ fn is_upstream_channel(channel: &str) -> bool {
         || channel.starts_with("1.")
 }
 
-fn is_pinned_toolchain(dir: &Path, pinned: Option<&str>) -> bool {
+fn is_pinned_toolchain(dir: &Path, pinned: Option<&str>, probe: &mut Probe<'_>) -> bool {
     let channel = match pinned {
         None => return true,
         Some(channel) if is_upstream_channel(channel) => return true,
         Some(channel) => channel,
     };
-    pinned_sysroot(dir, channel).is_some()
+    pinned_sysroot(dir, channel, probe).is_some()
 }
 
-fn pinned_sysroot(dir: &Path, channel: &str) -> Option<PathBuf> {
+fn pinned_sysroot(dir: &Path, channel: &str, probe: &mut Probe<'_>) -> Option<PathBuf> {
     let driver = [format!("{channel}c"), channel.to_string()]
         .into_iter()
         .map(|n| dir.join(tool_file(&n)))
         .find(|p| is_executable_file(p) && !is_pending_stub(p))?;
-    let sysroot = bounded_stdout(&driver, &["--print", "sysroot"], DATE_PROBE_BOUND)?;
+    let sysroot = probe.stdout(&driver, &["--print", "sysroot"], DATE_PROBE_BOUND)?;
     let sysroot = sysroot.trim();
     (!sysroot.is_empty() && Path::new(sysroot).join("lib/rustlib").is_dir())
         .then(|| PathBuf::from(sysroot))
@@ -398,13 +398,13 @@ impl Demoted {
     }
 }
 
-fn commit_date(bin: &Path) -> Option<String> {
+fn commit_date(bin: &Path, probe: &mut Probe<'_>) -> Option<String> {
     ["trustc", "rustc"]
         .iter()
         .map(|n| bin.join(tool_file(n)))
         .filter(|p| is_executable_file(p) && !is_pending_stub(p))
         .find_map(|driver| {
-            let text = bounded_stdout(&driver, &["-vV"], DATE_PROBE_BOUND)?;
+            let text = probe.stdout(&driver, &["-vV"], DATE_PROBE_BOUND)?;
             let date = text
                 .lines()
                 .find_map(|l| l.strip_prefix("commit-date: "))?
@@ -420,6 +420,26 @@ fn commit_date(bin: &Path) -> Option<String> {
                 });
             shaped.then_some(date)
         })
+}
+
+struct Probe<'a> {
+    before: &'a mut dyn FnMut(&Path) -> Result<(), String>,
+    error: Option<String>,
+}
+
+impl Probe<'_> {
+    fn stdout(&mut self, program: &Path, args: &[&str], bound: Duration) -> Option<String> {
+        if self.error.is_some() {
+            return None;
+        }
+        let executable = std::fs::canonicalize(program).ok()?;
+        let directory = executable.parent()?;
+        if let Err(error) = (self.before)(directory) {
+            self.error = Some(error);
+            return None;
+        }
+        bounded_stdout(&executable, args, bound)
+    }
 }
 
 fn bounded_stdout(program: &Path, args: &[&str], bound: Duration) -> Option<String> {
@@ -472,14 +492,18 @@ fn bounded_stdout(program: &Path, args: &[&str], bound: Duration) -> Option<Stri
     status.success().then_some(out)
 }
 
-fn older_than_store(rustup: &Path, store_prefix: &Path) -> Option<(String, String)> {
+fn older_than_store(
+    rustup: &Path,
+    store_prefix: &Path,
+    probe: &mut Probe<'_>,
+) -> Option<(String, String)> {
     if std::fs::symlink_metadata(store_prefix.join("links").join(STORE_CHANNEL)).is_ok() {
         return None;
     }
     let store = store_stage2_bin(store_prefix);
     std::fs::metadata(&store).ok()?;
-    let its = commit_date(rustup)?;
-    let theirs = commit_date(&store)?;
+    let its = commit_date(rustup, probe)?;
+    let theirs = commit_date(&store, probe)?;
     (its < theirs).then_some((its, theirs))
 }
 
@@ -543,6 +567,21 @@ impl Toolchain {
         path_env: &OsStr,
         pinned: Option<&str>,
     ) -> Self {
+        Self::discover_guarded(stage2_bin, home, path_env, pinned, &mut |_| Ok(()))
+            .expect("unguarded discovery cannot refuse a probe")
+    }
+
+    /// Discover with a guard before every compiler probe, using the ordinary environment resolution.
+    /// The guard receives the canonical directory containing the executable to be probed.
+    /// # Errors
+    /// The first guard refusal; no compiler probe executes after a refusal.
+    pub fn discover_guarded(
+        stage2_bin: Option<&Path>,
+        home: &Path,
+        path_env: &OsStr,
+        pinned: Option<&str>,
+        before_probe: &mut dyn FnMut(&Path) -> Result<(), String>,
+    ) -> Result<Self, String> {
         let xdg = {
             let explicit = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty());
             #[cfg(windows)]
@@ -552,7 +591,14 @@ impl Toolchain {
         };
         let prefix = atpkg_prefix(home, xdg.as_deref());
         let rustup = rustup_home(std::env::var_os("RUSTUP_HOME").as_deref(), home);
-        Self::discover_with_store(stage2_bin, &rustup, Some(&prefix), path_env, pinned)
+        Self::discover_with_store_guarded(
+            stage2_bin,
+            &rustup,
+            Some(&prefix),
+            path_env,
+            pinned,
+            before_probe,
+        )
     }
 
     /// Discover the toolchain across `stage2_bin`, `rustup_home`, `store_prefix`, and `path_env`.
@@ -564,6 +610,33 @@ impl Toolchain {
         path_env: &OsStr,
         pinned: Option<&str>,
     ) -> Self {
+        Self::discover_with_store_guarded(
+            stage2_bin,
+            rustup_home,
+            store_prefix,
+            path_env,
+            pinned,
+            &mut |_| Ok(()),
+        )
+        .expect("unguarded discovery cannot refuse a probe")
+    }
+
+    /// Discover with a guard before compiler execution, including version comparisons and borrowed tools.
+    /// The guard retains any protection it acquires for the canonical executable directory.
+    /// # Errors
+    /// The first guard refusal; it is never converted into a successful fallback selection.
+    pub fn discover_with_store_guarded(
+        stage2_bin: Option<&Path>,
+        rustup_home: &Path,
+        store_prefix: Option<&Path>,
+        path_env: &OsStr,
+        pinned: Option<&str>,
+        before_probe: &mut dyn FnMut(&Path) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        let mut probe = Probe {
+            before: before_probe,
+            error: None,
+        };
         let physical = |dir: PathBuf| std::fs::canonicalize(&dir).unwrap_or(dir);
         let targo = tool_file("targo");
         let mut refused = None;
@@ -573,7 +646,7 @@ impl Toolchain {
             let driver = dir.join(&targo);
             if is_executable_file(&driver)
                 && !is_pending_stub(&driver)
-                && !is_pinned_toolchain(&dir, pinned)
+                && !is_pinned_toolchain(&dir, pinned, &mut probe)
             {
                 refused = Some(dir.clone());
             }
@@ -590,7 +663,7 @@ impl Toolchain {
             let stale = store_prefix
                 .filter(|_| pinned.unwrap_or(STORE_CHANNEL) == STORE_CHANNEL)
                 .filter(|_| is_executable_file(&rustup_targo) && !is_pending_stub(&rustup_targo))
-                .and_then(|prefix| older_than_store(&rustup, prefix));
+                .and_then(|prefix| older_than_store(&rustup, prefix, &mut probe));
             let head: Vec<PathBuf> = match (&stale, &store_bin) {
                 (Some(_), Some(store)) => vec![store.clone(), rustup.clone()],
                 _ => std::iter::once(rustup.clone())
@@ -605,7 +678,7 @@ impl Toolchain {
                     continue;
                 }
                 let dir = physical(dir);
-                if is_pinned_toolchain(&dir, pinned) {
+                if is_pinned_toolchain(&dir, pinned, &mut probe) {
                     chosen = Some(dir);
                     refused = None;
                     break;
@@ -636,13 +709,13 @@ impl Toolchain {
             if explicit {
                 return None;
             }
-            let found = managed_tool(name, store_prefix, path_env, pinned)?;
+            let found = managed_tool_guarded(name, store_prefix, path_env, pinned, &mut probe)?;
             borrowed.push((name, found.clone()));
             Some(found)
         };
         let trustfmt = tool(TRUSTFMT);
         let tippy = tool(TIPPY);
-        Self {
+        let found = Self {
             targo: tool_dir.join(targo),
             trustdoc: tool_dir.join(tool_file("trustdoc")),
             tippy,
@@ -652,6 +725,10 @@ impl Toolchain {
             refused,
             store_bin,
             demoted,
+        };
+        match probe.error {
+            Some(error) => Err(error),
+            None => Ok(found),
         }
     }
 
@@ -803,11 +880,31 @@ pub const TRUSTFMT: &str = "trustfmt";
 /// The Trust lint driver's file name.
 pub const TIPPY: &str = "targo-tippy";
 
+#[cfg(all(test, unix))]
 fn managed_tool(
     name: &str,
     store_prefix: Option<&Path>,
     path_env: &OsStr,
     pinned: Option<&str>,
+) -> Option<PathBuf> {
+    managed_tool_guarded(
+        name,
+        store_prefix,
+        path_env,
+        pinned,
+        &mut Probe {
+            before: &mut |_| Ok(()),
+            error: None,
+        },
+    )
+}
+
+fn managed_tool_guarded(
+    name: &str,
+    store_prefix: Option<&Path>,
+    path_env: &OsStr,
+    pinned: Option<&str>,
+    probe: &mut Probe<'_>,
 ) -> Option<PathBuf> {
     store_prefix
         .map(store_stage2_bin)
@@ -822,7 +919,7 @@ fn managed_tool(
             let Some(channel) = pinned.filter(|channel| !is_upstream_channel(channel)) else {
                 return Some(tool);
             };
-            let sysroot = pinned_sysroot(tool.parent()?, channel)?;
+            let sysroot = pinned_sysroot(tool.parent()?, channel, probe)?;
             let physical = std::fs::canonicalize(sysroot.join("bin").join(tool_file(name))).ok()?;
             (is_executable_file(&physical) && !is_pending_stub(&physical)).then_some(physical)
         })
@@ -1159,6 +1256,128 @@ mod tests {
         }
         fs::write(sysroot.join("commit-date"), date).expect("date");
         fs::canonicalize(&bin).expect("canonicalize")
+    }
+
+    #[cfg(unix)]
+    fn record_dated_probes(fixture: &Path, require_guard: bool) {
+        let script = fixture.join("dated-trustc");
+        let original = fs::read_to_string(&script).expect("read driver");
+        let guard = if require_guard {
+            "test -f \"$root/guarded\" || exit 1\n"
+        } else {
+            ""
+        };
+        fs::write(
+            script,
+            original.replace(
+                "case \"$1\" in",
+                &format!("{guard}echo probed >> \"$root/probes\"\ncase \"$1\" in"),
+            ),
+        )
+        .expect("record probes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_guard_refusal_runs_no_compiler_and_cannot_fall_back() {
+        let fixture = aterm_tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let first = dated_bin(root, &root.join("first"), "2026-09-17");
+        let second = dated_bin(root, &root.join("second"), "2026-09-18");
+        record_dated_probes(root, false);
+        let path = std::env::join_paths([&first, &second]).unwrap();
+        let absent_rustup = root.join("no-rustup");
+        // Negative control: the same executable really runs without a refusing guard.
+        let unguarded =
+            Toolchain::discover_with_store(None, &absent_rustup, None, &path, Some("trust"));
+        assert_eq!(unguarded.stage2_dir, first);
+        assert!(root.join("first/probes").is_file());
+        for name in ["first/probes", "second/probes"] {
+            let _ = fs::remove_file(root.join(name));
+        }
+        let mut called = Vec::new();
+        let refused = Toolchain::discover_with_store_guarded(
+            None,
+            &absent_rustup,
+            None,
+            &path,
+            Some("trust"),
+            &mut |dir| {
+                called.push(dir.to_path_buf());
+                Err("lease denied".into())
+            },
+        );
+        assert_eq!(refused.unwrap_err(), "lease denied");
+        assert_eq!(called, [first]);
+        assert!(!root.join("first/probes").exists());
+        assert!(!root.join("second/probes").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_executes_the_guarded_executable_when_its_alias_changes() {
+        let fixture = aterm_tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let first = dated_bin(root, &root.join("first"), "2026-09-17");
+        let second = dated_bin(root, &root.join("second"), "2026-09-18");
+        let alias = root.join("compiler-alias");
+        std::os::unix::fs::symlink(first.join("trustc"), &alias).unwrap();
+        let mut before = |dir: &Path| {
+            assert_eq!(dir, first);
+            fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink(second.join("trustc"), &alias).unwrap();
+            Ok(())
+        };
+        let mut probe = Probe {
+            before: &mut before,
+            error: None,
+        };
+        let sysroot = probe
+            .stdout(&alias, &["--print", "sysroot"], DATE_PROBE_BOUND)
+            .unwrap();
+        assert_eq!(sysroot.trim(), first.parent().unwrap().to_str().unwrap());
+        assert_eq!(fs::canonicalize(&alias).unwrap(), second.join("trustc"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_guard_covers_both_compilers_before_a_staleness_comparison() {
+        let fixture = aterm_tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let prefix = root.join("pkg");
+        let store = dated_bin(root, &prefix.join("store/trust/9192"), "2026-09-17");
+        std::os::unix::fs::symlink(
+            prefix.join("store/trust/9192"),
+            prefix.join("store/trust/current"),
+        )
+        .unwrap();
+        let older = dated_bin(root, &root.join("older"), "2026-08-20");
+        let rustup = root.join("rustup");
+        fs::create_dir_all(rustup.join("toolchains")).unwrap();
+        std::os::unix::fs::symlink(root.join("older"), rustup.join("toolchains/trust")).unwrap();
+        record_dated_probes(root, true);
+        let mut guarded = std::collections::BTreeSet::new();
+        let found = Toolchain::discover_with_store_guarded(
+            None,
+            &rustup,
+            Some(&prefix),
+            OsStr::new(""),
+            Some("trust"),
+            &mut |dir| {
+                guarded.insert(dir.to_path_buf());
+                fs::write(dir.parent().unwrap().join("guarded"), "held").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(found.stage2_dir, store);
+        assert!(found.demoted.is_some());
+        assert_eq!(
+            guarded,
+            [older.clone(), store.clone()].into_iter().collect()
+        );
+        assert!(older.parent().unwrap().join("probes").is_file());
+        assert!(store.parent().unwrap().join("probes").is_file());
     }
 
     /// A rustup `trust` older than the store ranks below it and populates `demoted`.

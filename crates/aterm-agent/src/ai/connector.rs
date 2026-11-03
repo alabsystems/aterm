@@ -1353,6 +1353,41 @@ pub fn ids() -> Vec<&'static str> {
     connections().map(|c| c.id).collect()
 }
 
+fn is_kimi_env_credential(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("kimi-code-env-"))
+        .and_then(|name| name.strip_suffix(".json"))
+        .is_some_and(|id| id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The stored login file under `home` (`stat`ed, never opened): a connector's literal path, or
+/// Kimi Code's environment-scoped `credentials/kimi-code-env-<id>.json`.
+#[must_use]
+pub fn stored_login_file(c: &Connector, home: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Some(file) = c
+        .stores
+        .iter()
+        .map(|relative| home.join(relative))
+        .find(|path| path.is_file())
+    {
+        return Some(file);
+    }
+    if c.id != "kimi" {
+        return None;
+    }
+    std::fs::read_dir(home.join("credentials"))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && is_kimi_env_credential(path))
+        .max_by(|a, b| {
+            let ma = std::fs::metadata(a).ok().and_then(|m| m.modified().ok());
+            let mb = std::fs::metadata(b).ok().and_then(|m| m.modified().ok());
+            ma.cmp(&mb).then_with(|| a.file_name().cmp(&b.file_name()))
+        })
+}
+
 /// Whose OAuth login the home path `name` (`~/…`) is, by the product's name, as the connector
 /// rows say where each CLI keeps it: a file of [`Connector::stores`] under the CLI's
 /// [`Home::default`], or the refresh aterm journals beside one
@@ -1382,6 +1417,12 @@ pub fn login_file(name: &str) -> Option<&'static str> {
             row.stores.iter().any(|store| {
                 let file = fold_path(&Path::new(row.home.default).join(store));
                 wanted == file || unjournaled == file
+            }) || (row.id == "kimi" && {
+                let creds_dir = fold_path(&Path::new(row.home.default).join("credentials"));
+                [wanted.as_str(), unjournaled].into_iter().any(|candidate| {
+                    let path = Path::new(candidate);
+                    path.parent() == Some(Path::new(&creds_dir)) && is_kimi_env_credential(path)
+                })
             })
         });
     if let Some(row) = stored {

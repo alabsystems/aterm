@@ -733,7 +733,13 @@ impl App {
                     return;
                 }
                 self.apply_task_face(session, face, None, None);
-                if face == Some(aterm_agent::harness::acts::TaskFace::Theirs) {
+                if matches!(
+                    face,
+                    Some(
+                        aterm_agent::harness::acts::TaskFace::Theirs
+                            | aterm_agent::harness::acts::TaskFace::Failed
+                    )
+                ) {
                     self.clear_land_held(session);
                 }
             }
@@ -1124,7 +1130,7 @@ impl App {
             return;
         };
         let front = ws.tab_set.active_index();
-        let tab_count = ws.tab_set.len();
+        let tab_count = ws.tab_set.shown_len();
         let denial_marks =
             self.effective_observer_mode() == crate::consent_observer::ObserverMode::Full;
         for (index, (tab, item)) in ws
@@ -1136,27 +1142,37 @@ impl App {
         {
             item.load = self.chip_load(tab_count, tab);
             let mut level = item.attention;
-            tab.root.any_leaf(&mut |view| {
-                if let Some(session) = self
-                    .view_store
-                    .get(*view)
-                    .copied()
-                    .and_then(crate::tab_model::View::terminal_session)
-                {
-                    if self.consent_observer.marks_session(session)
-                        || (denial_marks && self.consent_attention.marks_session(session))
+            let mut read = |canonical: usize, tab: &crate::tab_model::Tab| {
+                tab.root.any_leaf(&mut |view| {
+                    if let Some(session) = self
+                        .view_store
+                        .get(*view)
+                        .copied()
+                        .and_then(crate::tab_model::View::terminal_session)
                     {
-                        level = level.max(presence::ChipLevel::Note);
+                        if self.consent_observer.marks_session(session)
+                            || (denial_marks && self.consent_attention.marks_session(session))
+                        {
+                            level = level.max(presence::ChipLevel::Note);
+                        }
+                        if let Some(slot) = self.presence.slot(session) {
+                            level = level.max(slot.chip());
+                        }
+                        if Some(canonical) != front && self.done_unseen(session) {
+                            level = level.max(presence::ChipLevel::Done);
+                        }
                     }
-                    if let Some(slot) = self.presence.slot(session) {
-                        level = level.max(slot.chip());
-                    }
-                    if Some(index) != front && self.done_unseen(session) {
-                        level = level.max(presence::ChipLevel::Done);
-                    }
+                    false
+                });
+            };
+            read(index, tab);
+            // The Workers chip lights for the workers it stands for: they have no chip of their own.
+            if ws.tab_set.home() == Some(tab.id) {
+                let first = ws.tab_set.shown_len();
+                for (at, parked) in ws.tab_set.parked().iter().enumerate() {
+                    read(first + at, parked);
                 }
-                false
-            });
+            }
             item.attention = level;
             item.team = self
                 .view_store
@@ -1301,10 +1317,22 @@ impl App {
         if !self.window_looked_at(wid) {
             return seen;
         }
-        let Some(tab) = self.windows.get(&wid).and_then(|ws| ws.tab_set.active()) else {
+        let Some(ws) = self.windows.get(&wid) else {
             return seen;
         };
-        let shown = if tab.zoomed {
+        let Some(tab) = ws.tab_set.active() else {
+            return seen;
+        };
+        // THE WORKERS LIST ON SCREEN IS A LOOK AT THE ROWS IT SHOWS: each concluded row says how
+        // its task ended, a landing too, as its tab would. A program's own turn end is no row's.
+        let list = ws.tab_set.home() == Some(tab.id);
+        let shown = if list {
+            ws.tab_set
+                .parked()
+                .iter()
+                .flat_map(|parked| parked.root.leaves())
+                .collect()
+        } else if tab.zoomed {
             vec![tab.focus]
         } else {
             tab.root.leaves()
@@ -1318,8 +1346,20 @@ impl App {
             else {
                 continue;
             };
-            if let Some(rev) = self.task_done.get(&session).copied() {
+            let ended = self
+                .task_done
+                .get(&session)
+                .or(self.task_exited.get(&session));
+            if let Some(rev) = ended.copied() {
                 seen.task |= self.done_seen.insert(session, rev) != Some(rev);
+            }
+            if list {
+                if ended.is_some()
+                    && let Some(glass) = self.harness_glass.get_mut(&session)
+                {
+                    seen.end |= glass.see_end();
+                }
+                continue;
             }
             if let Some(news) = self.turn_ends_unseen(session) {
                 self.turn_end_seen.insert(session, news);
@@ -1418,6 +1458,7 @@ impl App {
             .collect();
         let mut rows = Vec::with_capacity(handles.len());
         let mut done = std::collections::HashMap::new();
+        let mut exited = std::collections::HashMap::new();
         for (local, sid, ctx) in handles {
             let name = self.tab_label_of_session(local);
             let task = ctx
@@ -1426,8 +1467,14 @@ impl App {
                 .unwrap_or_else(|p| p.into_inner())
                 .task()
                 .map(|t| (t.from.clone(), t.state, t.entered, t.since));
-            if let Some((_, crate::task_record::TaskState::Done, entered, _)) = &task {
+            if let Some((_, state, entered, _)) = &task
+                && state.marks_its_tab()
+            {
                 done.insert(local, *entered);
+            } else if let Some((_, state, entered, _)) = &task
+                && state.has_an_end_to_read()
+            {
+                exited.insert(local, *entered);
             }
             rows.push(crate::team::Row {
                 local,
@@ -1442,11 +1489,12 @@ impl App {
             });
         }
         let teams = crate::team::table(&rows);
-        if teams == self.teams && done == self.task_done {
+        if teams == self.teams && done == self.task_done && exited == self.task_exited {
             return;
         }
         self.teams = teams;
         self.task_done = done;
+        self.task_exited = exited;
         if let Some(front) = self.frontmost_window {
             self.note_done_seen(front);
         }
@@ -1822,6 +1870,8 @@ impl App {
             ws.presence.watermarks.remove(&session);
         }
         self.done_seen.remove(&session);
+        self.task_exited.remove(&session);
+        self.worker_end_told.remove(&session);
         self.turn_end_seen.remove(&session);
         self.forget_need(session, need_unix_now());
         self.rebuild_teams();
@@ -2060,7 +2110,7 @@ pub(crate) fn harness_need_hover(ask: &crate::needs::HarnessAsk) -> Vec<String> 
 /// stopped typing`), led by its holder's name where a self-claim stopped its own typing
 /// ([`crate::harness_glass::ShownStop::words`]), since these words name aterm as the driver
 /// (§14.3.2: `land: codex-alab stopped typing`). `hold`: Land's hold of whoever drives it
-/// ([`App::shown_hold`]), said under `⤓ land` once its yield was read, led by its holder's name
+/// ([`App::shown_hold`]), said under Land's `⤓` once its yield was read, led by its holder's name
 /// where a self-claim told it and no stop of that holder's named it first
 /// ([`crate::harness_glass::ShownHold::words`], §14.3.3: `land: codex-alab: not landed yet, 1
 /// untracked file`).
@@ -2104,7 +2154,9 @@ pub(crate) fn driven_words(
             }),
         ),
         ChipFace::Landed if landed_said => "land".to_owned(),
-        ChipFace::Landed | ChipFace::Theirs => format!("land, {}", face.word()?),
+        ChipFace::Landed | ChipFace::Theirs | ChipFace::Failed => {
+            format!("land, {}", face.word()?)
+        }
         ChipFace::Off | ChipFace::MasterOff | ChipFace::AgentOff(_) | ChipFace::Unhosted => {
             return None;
         }
@@ -2620,6 +2672,57 @@ mod tests {
         );
     }
 
+    /// AN EXITED WORKER'S END IS CLEARED BY A LOOK AS A DONE ONE'S IS, with no dot on its tab: its
+    /// Done for you row says it, and the look covers it. Going to it from that row clears it as well.
+    /// NEGATIVE CONTROL: where nobody looks it stays unread.
+    #[test]
+    fn an_exited_workers_end_is_seen_by_a_look_and_by_going_to_it() {
+        use crate::task_record::WHY_EXIT;
+        let seen_row = |app: &App, session: u64| app.done_seen.get(&session).copied();
+        let (mut app, wid, _first, _) = app_with_stub();
+        let (second, second_ctx) = second_tab(&mut app, wid);
+        let tabs = app.windows[&wid].tab_set.tabs().len();
+        {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.band_on_screen_for_test = true;
+            ws.occluded = true;
+        }
+        app.frontmost_window = Some(wid);
+        let exit = TaskMark {
+            why: Some(WHY_EXIT),
+            ..TaskMark::new(TaskState::Exited)
+        };
+        mark_session_task(&second_ctx, second, &exit).expect("unfenced");
+        app.on_task_changed(second);
+        app.refresh_presence_all_windows();
+        let entered = second_ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .task()
+            .expect("a task")
+            .entered;
+        assert_eq!(app.task_exited.get(&second), Some(&entered));
+        assert_eq!(seen_row(&app, second), None, "nobody looked");
+        app.on_occlusion_changed(wid, false);
+        app.switch_tab_in(wid, tabs - 1);
+        assert_eq!(seen_row(&app, second), Some(entered), "a look");
+
+        let (mut app, wid, _first, _) = app_with_stub();
+        let (second, second_ctx) = second_tab(&mut app, wid);
+        mark_session_task(&second_ctx, second, &exit).expect("unfenced");
+        app.on_task_changed(second);
+        app.note_session_done_seen(second);
+        let entered = second_ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .task()
+            .expect("a task")
+            .entered;
+        assert_eq!(seen_row(&app, second), Some(entered), "going to it");
+    }
+
     #[test]
     fn a_task_done_where_nobody_looks_keeps_its_dot() {
         let (mut app, wid, _first, _) = app_with_stub();
@@ -2796,9 +2899,7 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn the_pills_resume_continues_only_a_job_still_stopped() {
-        use aterm_uds::spawnfd::InheritNothing as _;
-        use std::os::fd::{FromRawFd as _, OwnedFd};
-        use std::os::unix::process::CommandExt as _;
+        use std::os::fd::IntoRawFd as _;
         struct Leader {
             child: std::process::Child,
             master: i32,
@@ -2812,30 +2913,19 @@ mod tests {
             }
         }
         let (_app, _wid, _sid, ctx) = app_with_stub();
-        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-        // SAFETY: `slave` is a fresh fd this test alone owns.
-        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-        let stdio = || std::process::Stdio::from(slave.try_clone().expect("dup slave"));
-        let mut cmd = std::process::Command::new("/bin/sleep");
-        cmd.inherit_nothing()
-            .arg("60")
-            .stdin(stdio())
-            .stdout(stdio())
-            .stderr(stdio());
-        // SAFETY: in the forked child before exec: `setsid` and `ioctl(TIOCSCTTY)` are async-signal-safe and touch nothing of the parent's.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let led = Leader {
-            child: cmd.spawn().expect("spawn sleep"),
-            master,
-        };
+        let (master, slave, child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
+            let mut cmd = std::process::Command::new("/bin/sleep");
+            cmd.arg("60")
+                .stdout(std::process::Stdio::from(slave.try_clone()?))
+                .stderr(std::process::Stdio::from(slave.try_clone()?));
+            Ok(cmd)
+        })
+        .expect("spawn sleep");
         drop(slave);
+        let led = Leader {
+            child,
+            master: master.into_raw_fd(),
+        };
         let pid = libc::pid_t::try_from(led.child.id()).expect("pid");
         let until = |what: &str, stopped: bool| {
             aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {

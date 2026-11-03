@@ -14,15 +14,19 @@ pub struct GateSummary {
     pub entries: usize,
 }
 
+fn is_section_header(line: &str, section: &str) -> bool {
+    line.strip_prefix(&format!("## [{section}]"))
+        .is_some_and(|rest| rest.trim().is_empty() || rest.starts_with([' ', '\t', '-']))
+}
+
 /// The real body of a section: the lines between `## [<name>]` and the next `## ` heading, with HTML comments (multi-line included), `###` scaffold headings and blank lines removed.
 pub fn real_body(text: &str, section: &str) -> Vec<String> {
-    let header = format!("## [{section}]");
     let mut in_section = false;
     let mut in_comment = false;
     let mut out = Vec::new();
     for raw in text.lines() {
         if !in_section {
-            in_section = raw.starts_with(&header);
+            in_section = is_section_header(raw, section);
             continue;
         }
         if raw.starts_with("## ") {
@@ -61,21 +65,32 @@ pub fn real_body(text: &str, section: &str) -> Vec<String> {
 
 /// Whether the changelog already carries a `## [<version>]` section: the roll's double-roll guard and the claim's "cut elsewhere" abort (ledger.rs) share it.
 pub fn has_section(text: &str, version: &str) -> bool {
-    let header = format!("## [{version}]");
-    text.lines().any(|l| l.starts_with(&header))
+    text.lines().any(|l| is_section_header(l, version))
 }
 
 /// Pre-claim gates, in transcript order: `[Unreleased]` exists, its real body is non-empty, and the raw section carries no `'''` or raw control character.
+/// Leftover git conflict-marker lines (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`) in the raw section are also refused.
 pub fn gate_unreleased(text: &str) -> Result<GateSummary> {
     gate_section(text, "Unreleased")
 }
 
+fn conflict_marker_head(raw: &str) -> Option<&'static str> {
+    if raw == "=======" {
+        Some("=======")
+    } else if raw == "<<<<<<<" || raw.starts_with("<<<<<<< ") {
+        Some("<<<<<<<")
+    } else if raw == "|||||||" || raw.starts_with("||||||| ") {
+        Some("|||||||")
+    } else if raw == ">>>>>>>" || raw.starts_with(">>>>>>> ") {
+        Some(">>>>>>>")
+    } else {
+        None
+    }
+}
+
 /// The same gate over any section: a recut re-cuts a version whose body an earlier wedged cut already rolled into `## [X.Y.Z]`, so it judges that section (the fresh `[Unreleased]` above it is legitimately empty).
 pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
-    if !text
-        .lines()
-        .any(|l| l.starts_with(&format!("## [{section}]")))
-    {
+    if !has_section(text, section) {
         return Err(Error::new(format!(
             "{CHANGELOG_FILE} has no \"## [{section}]\" section"
         )));
@@ -95,6 +110,13 @@ pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
                     "{CHANGELOG_FILE} line {}: [{section}] contains ''' — this would \
                      terminate the release manifest's TOML multiline literal; rewrite \
                      the entry (use backticks or double quotes)",
+                    idx + 1
+                )));
+            }
+            if let Some(marker) = conflict_marker_head(raw) {
+                return Err(Error::new(format!(
+                    "{CHANGELOG_FILE} line {}: [{section}] contains git conflict marker \
+                     `{marker}` — resolve the merge artifact before cutting",
                     idx + 1
                 )));
             }
@@ -125,7 +147,7 @@ pub fn roll(text: &str, version: &str, date: &str) -> Result<String> {
              rolled; a recut reuses it instead of rolling again"
         )));
     }
-    if !text.lines().any(|l| l.starts_with("## [Unreleased]")) {
+    if !has_section(text, "Unreleased") {
         return Err(Error::new(format!(
             "{CHANGELOG_FILE} has no \"## [Unreleased]\" section"
         )));
@@ -133,7 +155,7 @@ pub fn roll(text: &str, version: &str, date: &str) -> Result<String> {
     let mut out = Vec::new();
     let mut done = false;
     for line in text.lines() {
-        if !done && line.starts_with("## [Unreleased]") {
+        if !done && is_section_header(line, "Unreleased") {
             out.push(line.to_string());
             out.push(String::new());
             out.push(format!("## [{version}] - {date}"));
@@ -209,7 +231,7 @@ pub fn roll_shipped(main: &str, source: &str, version: &str, date: &str) -> Resu
     let lines: Vec<&str> = main.lines().collect();
     let start = lines
         .iter()
-        .position(|l| l.starts_with("## [Unreleased]"))
+        .position(|l| is_section_header(l, "Unreleased"))
         .ok_or_else(|| {
             Error::new(format!(
                 "{CHANGELOG_FILE} has no \"## [Unreleased]\" section"
@@ -241,7 +263,7 @@ fn unreleased_body(text: &str) -> Result<Vec<&str>> {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines
         .iter()
-        .position(|l| l.starts_with("## [Unreleased]"))
+        .position(|l| is_section_header(l, "Unreleased"))
         .ok_or_else(|| {
             Error::new(format!(
                 "{CHANGELOG_FILE} has no \"## [Unreleased]\" section"
@@ -333,15 +355,14 @@ fn unshipped_entries(main_body: &[&str], shipped: &[&str]) -> Vec<String> {
 
 /// Extract a rolled section's body verbatim, for the manifest, the release body and the in-app notes: the raw lines between `## <version>` and the next `## ` heading, trimmed of leading and trailing blank lines only.
 pub fn rolled_body(text: &str, version: &str) -> Result<String> {
-    let header = format!("## [{version}]");
     let mut grab = false;
     let mut lines: Vec<&str> = Vec::new();
     for line in text.lines() {
         if !grab {
-            grab = line.starts_with(&header);
+            grab = is_section_header(line, version);
             continue;
         }
-        if line.starts_with("## [") {
+        if line.starts_with("## ") {
             break;
         }
         lines.push(line);
@@ -542,14 +563,13 @@ fn la_date(unix: i64, offset: i64) -> String {
 }
 
 /// 0-based (start, end) line indices of a section: `start` is the `## [name]` header, `end`
-/// the next `## [` heading (or one past the last line).
+/// the next `## ` heading (or one past the last line).
 fn section_span(text: &str, section: &str) -> Option<(usize, usize)> {
-    let header = format!("## [{section}]");
     let lines: Vec<&str> = text.lines().collect();
-    let start = lines.iter().position(|l| l.starts_with(&header))?;
+    let start = lines.iter().position(|l| is_section_header(l, section))?;
     let end = lines[start + 1..]
         .iter()
-        .position(|l| l.starts_with("## ["))
+        .position(|l| l.starts_with("## "))
         .map_or(lines.len(), |p| start + 1 + p);
     Some((start, end))
 }
@@ -645,5 +665,26 @@ mod tests {
         let body = "### Fixed\n- a thing\n- another";
         let doc = release_notes_document("0.44.0", body);
         assert!(doc.ends_with(&format!("\n---\n\n{body}\n")), "{doc}");
+    }
+
+    /// NEGATIVE CONTROL: non-bracketed `## ` headings end a section consistently across
+    /// `real_body`, `rolled_body`, and `gate_section`, and suffix collisions on `## [0.1.0]extra`
+    /// do not match `0.1.0`.
+    #[test]
+    fn section_headers_are_exact_and_stop_at_any_h2() {
+        let doc = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n\
+                   <!-- a -->- **Kept** — real note.\n\n\
+                   ## [0.1.0]extra\n\n- wrong\n\n\
+                   ## [0.1.0] - 2026-10-01\n\n### Fixed\n\n- shipped\n\n\
+                   ## Appendix\n\n'''\n";
+        assert_eq!(
+            real_body(doc, "Unreleased"),
+            vec!["- **Kept** — real note."]
+        );
+        assert_eq!(gate_unreleased(doc).unwrap().entries, 1);
+        assert!(has_section(doc, "0.1.0"));
+        assert!(!has_section(doc, "0.2.0"));
+        assert_eq!(rolled_body(doc, "0.1.0").unwrap(), "### Fixed\n\n- shipped");
+        assert!(gate_section(doc, "0.1.0").is_ok());
     }
 }

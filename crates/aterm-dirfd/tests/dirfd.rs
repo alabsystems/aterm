@@ -558,6 +558,81 @@ fn flagged_renames_report_enosys_on_unsupported_unix() {
     assert_eq!(err, mine::Errno::NOSYS);
 }
 
+/// A namespace fence exchanges a file with a nonempty directory in one kernel operation.
+/// Both original identities and a previously held directory descriptor survive. Missing
+/// entries and incompatible flags preserve the complete tree rather than partially renaming.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[test]
+fn an_exchange_preserves_both_entries_and_refuses_partial_fences() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let root = open_root_mine(dir.path());
+    std::fs::create_dir(dir.path().join("legacy")).unwrap();
+    std::fs::write(dir.path().join("legacy/claim"), b"old reservation").unwrap();
+    std::fs::write(dir.path().join("fence"), b"new namespace").unwrap();
+    let legacy = mine::openat(&root, "legacy", mine_flags_dir(), mine::Mode::empty()).unwrap();
+    let old_directory = mine::fstat(&legacy).unwrap();
+    let old_file = std::fs::metadata(dir.path().join("fence")).unwrap();
+
+    let before = snapshot(dir.path());
+    assert!(
+        mine::renameat_with(
+            &root,
+            "legacy",
+            &root,
+            "absent",
+            mine::RenameFlags::EXCHANGE
+        )
+        .is_err()
+    );
+    assert_eq!(
+        snapshot(dir.path()),
+        before,
+        "a missing peer cannot move the directory"
+    );
+    assert!(
+        mine::renameat_with(
+            &root,
+            "legacy",
+            &root,
+            "fence",
+            mine::RenameFlags::EXCHANGE | mine::RenameFlags::NOREPLACE
+        )
+        .is_err()
+    );
+    assert_eq!(
+        snapshot(dir.path()),
+        before,
+        "incompatible flags cannot change either entry"
+    );
+
+    mine::renameat_with(&root, "legacy", &root, "fence", mine::RenameFlags::EXCHANGE).unwrap();
+    let directory = std::fs::metadata(dir.path().join("fence")).unwrap();
+    let file = std::fs::metadata(dir.path().join("legacy")).unwrap();
+    assert_eq!(
+        (directory.dev(), directory.ino()),
+        (old_directory.st_dev, old_directory.st_ino)
+    );
+    assert_eq!((file.dev(), file.ino()), (old_file.dev(), old_file.ino()));
+    assert_eq!(
+        std::fs::read(dir.path().join("legacy")).unwrap(),
+        b"new namespace"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("fence/claim")).unwrap(),
+        b"old reservation"
+    );
+    assert!(
+        std::fs::read(dir.path().join("legacy/claim")).is_err(),
+        "legacy path traversal is physically fenced"
+    );
+    let held_claim =
+        mine::openat(&legacy, "claim", mine_flags_file(), mine::Mode::empty()).unwrap();
+    assert!(
+        mine::FileType::from_raw_mode(mine::fstat(&held_claim).unwrap().st_mode).is_file(),
+        "the old held directory still names its own claim"
+    );
+}
+
 /// Directory listings, before and after mutation.
 #[test]
 fn directory_listings_agree() {

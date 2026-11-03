@@ -3142,7 +3142,7 @@ fn a_crashs_surviving_record_is_what_the_layout_names_through_the_back_off() {
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
         let notes: Arc<Mutex<Vec<HostNote>>> = Arc::default();
         let (s1, n1, n2) = (Arc::clone(&seen), Arc::clone(&notes), Arc::clone(&notes));
-        hooks.acts.relaunch = Arc::new(move |sid, _, snap, _, _, _| {
+        hooks.acts.relaunch = Arc::new(move |sid, _, snap, _, _, _, _| {
             let layout = published_snapshot(sid).and_then(|s| s.session);
             let told = n2
                 .lock()
@@ -6375,6 +6375,24 @@ struct Acting {
     /// The `[harness] upgrade` switch each relaunch was asked under.
     upgrading: Mutex<Vec<bool>>,
     human_ms: Mutex<Option<u64>>,
+    /// Another control client's last typing into the session and how long ago, ms (`status
+    /// typed_by=`, `typed_ms=`; none: `-`): a driver's `/exit`.
+    typed_by: Mutex<Option<(String, u64)>>,
+    /// Who asked aterm to stop the agent's group, if that stop stands ([`Acts::end_asked`]).
+    end_asked: Mutex<Option<EndAsked>>,
+    /// A task face the loop tells at its next look ([`IdleHost::task_face`]), once.
+    face: Mutex<Option<aterm_agent::harness::acts::TaskFace>>,
+    /// The faces the loop told.
+    faces_told: AtomicUsize,
+    /// How long ago a control client other than aterm's own typed into the session, ms
+    /// ([`Acts::driven`]), when it is not [`Self::typed_by`]'s (aterm's own lines or the message
+    /// bus typed after it).
+    driven_ms: Mutex<Option<u64>>,
+    /// The tab's `status` cannot be read: the control socket does not answer.
+    status_unread: AtomicBool,
+    /// Whether each relaunch attempt was of an exit an Autopilot carries
+    /// ([`relaunch::Carried::Yes`]).
+    carried_exits: Mutex<Vec<bool>>,
     /// The session reads `hold=1`.
     held: AtomicBool,
     /// The session's `status hand=` (none: `-`): a turn, a lease or a
@@ -6948,6 +6966,7 @@ impl Acting {
         let a14f = w(self);
         let (a26, a25b) = (w(self), w(self));
         let (a27, a28, a29) = (w(self), w(self), w(self));
+        let (a5e, a5d) = (w(self), w(self));
         Hooks {
             roster: Arc::new(move || {
                 w1.passes.fetch_add(1, Ordering::SeqCst);
@@ -7015,6 +7034,12 @@ impl Acting {
                     }
                     if w3.fail_once.swap(false, Ordering::SeqCst) {
                         return BodyEnd::Failed("a failed run".to_string());
+                    }
+                    if let Some(host) = job.opts.idle_host.as_ref()
+                        && let Some(face) = w3.face.lock().unwrap().take()
+                    {
+                        host.task_face(face);
+                        w3.faces_told.fetch_add(1, Ordering::SeqCst);
                     }
                     if let Some(host) = job.opts.idle_host.as_ref() {
                         let now = w3.stall_held.load(Ordering::SeqCst);
@@ -7240,6 +7265,9 @@ impl Acting {
                     fg
                 }),
                 status: Arc::new(move |sid| {
+                    if a4.status_unread.load(Ordering::SeqCst) {
+                        return None;
+                    }
                     let human = a4
                         .human_ms
                         .lock()
@@ -7258,9 +7286,14 @@ impl Acting {
                             |h| aterm_control::wire::pct_encode(h),
                         );
                     let proven = u8::from(a4.proven.lock().unwrap().contains(sid));
+                    let (typed_by, typed_ms) = a4.typed_by.lock().unwrap().clone().map_or_else(
+                        || ("-".to_string(), "-".to_string()),
+                        |(by, ms)| (aterm_control::wire::pct_encode(&by), ms.to_string()),
+                    );
                     Some(format!(
                         "OK program=claude hold={hold} hand={hand} human_ms={human} \
-                         supervisor={supervisor} supervisor_proven={proven}"
+                         typed_by={typed_by} typed_ms={typed_ms} supervisor={supervisor} \
+                         supervisor_proven={proven}"
                     ))
                 }),
                 asked: Arc::new(move |sid, snap| {
@@ -7356,8 +7389,18 @@ impl Acting {
                     ));
                     step
                 }),
-                relaunch: Arc::new(move |sid, _, snap, left, upgrade, asked| {
+                end_asked: Arc::new(move |_, _, _| a5e.end_asked.lock().unwrap().clone()),
+                driven: Arc::new(move |_| {
+                    let typed = a5d.typed_by.lock().unwrap().clone();
+                    a5d.driven_ms.lock().unwrap().or_else(|| {
+                        typed
+                            .filter(|(by, _)| by != "aterm" && by != "the message bus")
+                            .map(|(_, ms)| ms)
+                    })
+                }),
+                relaunch: Arc::new(move |sid, _, snap, left, upgrade, asked, carried| {
                     a5.relaunch_attempts.fetch_add(1, Ordering::SeqCst);
+                    a5.carried_exits.lock().unwrap().push(carried);
                     assert_eq!(snap.tab, sid, "the snapshot of the session that left");
                     if a5.busy_sweep.load(Ordering::SeqCst) {
                         return "busy:another-sweep".to_string();
@@ -7375,7 +7418,7 @@ impl Acting {
                         || (matches!(left, ExitRecord::Unread)
                             && snap.codex().is_none()
                             && a5.record_left(snap));
-                    if !survived && asked.is_none() {
+                    if !survived && asked.is_none() && !carried {
                         return "ended:graceful-exit".to_string();
                     }
                     if asked.is_some() {
@@ -11773,6 +11816,7 @@ fn the_probe_is_claimed_once_under_the_lock_for_the_process_that_asked() {
     assert_eq!(
         idle.kept.lock().unwrap().account.probing,
         Some(Probing {
+            at: a.clock(),
             label: "main".to_string(),
             pid: agent.pid,
             start: agent.start.clone(),
@@ -12132,6 +12176,7 @@ fn a_sample_is_recorded_only_for_the_process_the_probe_was_claimed_for() {
     assert!(idle.probe_claimed().is_err(), "its claim stands in the way");
     a.now
         .store(ACCT_NOW + accounts::PROBE_MIN_S, Ordering::SeqCst);
+    idle.turn_ran();
     assert!(idle.account_probe().is_ok());
     idle.account_probed(Ok(&accounts::Sample::default()));
     assert_eq!(held(&a), None);
@@ -13985,7 +14030,7 @@ fn an_exit_with_no_login_to_come_back_under_waits_under_its_own_for_the_sign_in(
             })
         });
         let (r1, world) = (Arc::clone(&relaunched), Arc::clone(&a));
-        hooks.acts.relaunch = Arc::new(move |sid, _, snap, _, _, _| {
+        hooks.acts.relaunch = Arc::new(move |sid, _, snap, _, _, _, _| {
             r1.lock().unwrap().push(snap.login.clone());
             world.exec(sid, ACCT_TALK_A, snap.login.as_deref(), world.clock());
             "adopted".to_string()
@@ -15482,6 +15527,7 @@ fn signed_out(labels: &[&str]) -> AccountsSaid {
         none_soon: false,
         wrong: Vec::new(),
         no_sign_in: Vec::new(),
+        clock: None,
     }
 }
 
@@ -15623,6 +15669,7 @@ fn own_on_credits(a: &Accts) -> AccountsSaid {
         none_soon: false,
         wrong: Vec::new(),
         no_sign_in: Vec::new(),
+        clock: None,
     }
 }
 
@@ -20919,6 +20966,8 @@ fn a_crash_is_read_at_its_exit_whatever_removes_its_record_during_the_back_off()
     a.record_gone.store(false, Ordering::SeqCst);
     a.exit_looks.store(0, Ordering::SeqCst);
     a.graceful.store(true, Ordering::SeqCst);
+    // A `/exit` a driver typed: the exit is the driver's, so its removed record leaves it.
+    *a.typed_by.lock().unwrap() = Some(("lab (pid 411)".to_string(), 4_000));
     a.set(&[]);
     until("handed, and left", || {
         a.exit_records.lock().unwrap().len() == 2 && !a.accounts_gone.lock().unwrap().is_empty()
@@ -20928,6 +20977,197 @@ fn a_crash_is_read_at_its_exit_whatever_removes_its_record_during_the_back_off()
     assert_eq!(a.relaunched.lock().unwrap().len(), 1, "left alone");
     assert!(a.badges.lock().unwrap().is_empty(), "nothing said");
     host.shutdown_and_join();
+}
+
+/// What the host told of relaunches, in order ([`HostNote::Relaunch`]).
+fn relaunch_said(a: &Acting) -> Vec<RelaunchSay> {
+    a.notes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|n| match n {
+            HostNote::Relaunch { said, .. } => Some(said.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What the host recorded of the ends it left ([`RelaunchSay::Left`]), in order.
+fn left_said(a: &Acting) -> Vec<LeftEnd> {
+    relaunch_said(a)
+        .into_iter()
+        .filter_map(|said| match said {
+            RelaunchSay::Left { end } => Some(end),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether the host asked the owner anything of a relaunch: a tab's mark raised, or a told
+/// [`RelaunchSay::Cannot`] (an exception, or the mark's own word).
+fn asked_the_owner(a: &Acting) -> bool {
+    a.badges.lock().unwrap().iter().any(Option::is_some)
+        || relaunch_said(a)
+            .iter()
+            .any(|said| matches!(said, RelaunchSay::Cannot { .. }))
+}
+
+/// THE AUTOPILOT CARRIES AN EXIT ONCE A HEALTHY RUN, through the host: under the default Cruise
+/// an agent that ends in order on nobody's word (its record removed, nobody typing) comes back;
+/// ended so again before it ran [`relaunch::HEALTHY`] (a person's `kill` from outside aterm, an
+/// agent that ends itself after each start) it is left where its launch's own end would be and
+/// recorded once, a journal record that asks the owner nothing, rather than brought back on the
+/// back-off for ever.
+#[test]
+fn an_agent_carried_back_that_ends_again_soon_is_left_and_recorded() {
+    let a = Arc::new(Acting::default());
+    a.open.lock().unwrap().insert("s-again".to_string());
+    a.set(&[("s-again", Program::Claude)]);
+    let host = HostHandle::start(on(), false, false, a.hooks());
+    a.attached(&host, "s-again");
+    a.graceful.store(true, Ordering::SeqCst);
+    a.set(&[]); // ended in order on a signal from outside aterm
+    until("carried back", || a.relaunched.lock().unwrap().len() == 1);
+    assert_eq!(*a.carried_exits.lock().unwrap(), [true]);
+    a.set(&[("s-again", Program::Claude)]); // the relaunched agent
+    until("attached again, and carried on", || {
+        host.live() == ["s-again"] && a.carried.load(Ordering::SeqCst) == 1
+    });
+    a.record_gone.store(false, Ordering::SeqCst);
+    a.exit_looks.store(0, Ordering::SeqCst);
+    a.set(&[]); // ended so again, seconds after it came back
+    until("left, and recorded", || !left_said(&a).is_empty());
+    until("decided", || a.accounts_gone.lock().unwrap().len() == 1);
+    host.shutdown_and_join();
+    assert_eq!(
+        a.relaunched.lock().unwrap().len(),
+        1,
+        "not brought back again"
+    );
+    assert_eq!(*a.carried_exits.lock().unwrap(), [true, false]);
+    assert_eq!(left_said(&a), [LeftEnd::EndedAgain], "recorded once");
+    assert!(!asked_the_owner(&a), "{:?}", relaunch_said(&a));
+}
+
+/// A CRASH SPENDS NOTHING OF THE CARRIED RUN ([`relaunch::Relaunches::carry`]): the crash rule
+/// relaunches a crash under any Autopilot, so its relaunch starts no clock the carry reads, and
+/// the agent it brought back that then ends in order on nobody's word (an outside `SIGTERM`,
+/// seconds later) is carried back too.
+#[test]
+fn a_crash_relaunched_starts_no_carried_clock() {
+    let a = Arc::new(Acting::default());
+    a.open.lock().unwrap().insert("s-crash".to_string());
+    a.set(&[("s-crash", Program::Claude)]);
+    let host = HostHandle::start(on(), false, false, a.hooks());
+    a.attached(&host, "s-crash");
+    a.set(&[]); // crashed: its record survives
+    until("relaunched as a crash", || {
+        a.relaunched.lock().unwrap().len() == 1
+    });
+    a.set(&[("s-crash", Program::Claude)]); // the relaunched agent
+    until("attached again, and carried on", || {
+        host.live() == ["s-crash"] && a.carried.load(Ordering::SeqCst) == 1
+    });
+    a.graceful.store(true, Ordering::SeqCst);
+    a.exit_looks.store(0, Ordering::SeqCst);
+    a.set(&[]); // ended in order, seconds after it came back
+    until("carried back", || a.relaunched.lock().unwrap().len() == 2);
+    host.shutdown_and_join();
+    assert_eq!(
+        *a.carried_exits.lock().unwrap(),
+        [false, true],
+        "the crash the crash rule's, the orderly end the Autopilot's"
+    );
+    assert!(left_said(&a).is_empty(), "{:?}", relaunch_said(&a));
+    assert!(!asked_the_owner(&a), "{:?}", relaunch_said(&a));
+}
+
+/// THE CAP HOLDS ON EVERY CARRIED ATTEMPT ([`relaunch::Relaunches::carry`]): a carried exit's
+/// relaunch that landed, its agent gone again before its landing could be read, is tried again
+/// on the back-off as any unread landing is; that try is no longer carried, so the orderly end
+/// is left and recorded, never brought back a second time inside [`relaunch::HEALTHY`].
+#[test]
+fn a_carried_relaunch_that_landed_and_is_gone_again_is_not_carried_twice() {
+    let a = Arc::new(Acting::default());
+    a.open.lock().unwrap().insert("s-twice".to_string());
+    a.set(&[("s-twice", Program::Claude)]);
+    a.relaunches.lock().unwrap().push_back("landed");
+    let host = HostHandle::start(on(), false, false, a.hooks());
+    a.attached(&host, "s-twice");
+    a.graceful.store(true, Ordering::SeqCst);
+    a.set(&[]); // ended in order on nobody's word; its relaunch lands and is gone at once
+    until("left, and recorded", || !left_said(&a).is_empty());
+    until("decided", || a.accounts_gone.lock().unwrap().len() == 1);
+    host.shutdown_and_join();
+    assert_eq!(a.relaunched.lock().unwrap().len(), 1, "brought back once");
+    assert_eq!(*a.carried_exits.lock().unwrap(), [true, false]);
+    assert_eq!(left_said(&a), [LeftEnd::EndedAgain]);
+    assert!(!asked_the_owner(&a), "{:?}", relaunch_said(&a));
+}
+
+/// LAND CARRIES NO EXIT PAST ITS LANDING: the loop told the task's face landed, and the agent
+/// then ends in order on nobody's word; the tab's `status` names no task once it publishes no
+/// agent, so the host reads the face it kept ([`relaunch::carried`]): left where its launch's own
+/// end would be, never brought back. Under Cruise the same end comes back.
+#[test]
+fn an_exit_under_land_after_its_work_landed_is_not_carried() {
+    use aterm_agent::harness::acts::TaskFace;
+    for (autopilot, carried) in [(Autopilot::Land, false), (Autopilot::Cruise, true)] {
+        let a = Arc::new(Acting::default());
+        a.open.lock().unwrap().insert("s-landed".to_string());
+        a.words
+            .lock()
+            .unwrap()
+            .insert("s-landed".to_string(), autopilot);
+        a.set(&[("s-landed", Program::Claude)]);
+        *a.face.lock().unwrap() = Some(TaskFace::Landed);
+        let host = HostHandle::start(on(), false, false, a.hooks());
+        a.attached(&host, "s-landed");
+        until("the loop told its face", || {
+            a.faces_told.load(Ordering::SeqCst) == 1
+        });
+        a.graceful.store(true, Ordering::SeqCst);
+        a.set(&[]); // ended in order on a signal from outside aterm
+        until("the exit decided", || {
+            !a.carried_exits.lock().unwrap().is_empty()
+        });
+        host.shutdown_and_join();
+        assert_eq!(*a.carried_exits.lock().unwrap(), [carried], "{autopilot:?}");
+        assert_eq!(
+            a.relaunched.lock().unwrap().len(),
+            usize::from(carried),
+            "{autopilot:?}"
+        );
+        assert!(left_said(&a).is_empty(), "{:?}", relaunch_said(&a));
+    }
+}
+
+/// An exit nothing was read of while its agent ran (no snapshot: a wrapper, a script, agy's or
+/// Muse Code's `-p`, which no snapshot reads) is left unsaid under the default Cruise too:
+/// nothing tells it from a one-shot that ended as asked.
+#[test]
+fn an_exit_nothing_was_read_of_is_left_unsaid_under_cruise() {
+    let a = Arc::new(Acting::default());
+    a.unreadable.store(true, Ordering::SeqCst);
+    a.open.lock().unwrap().insert("s-unread".to_string());
+    a.set(&[("s-unread", Program::Claude)]);
+    let host = HostHandle::start(on(), false, false, a.hooks());
+    until("attached", || host.live() == ["s-unread"]);
+    a.graceful.store(true, Ordering::SeqCst);
+    a.set(&[]);
+    until("the exit decided", || {
+        !a.accounts_gone.lock().unwrap().is_empty()
+    });
+    host.shutdown_and_join();
+    assert_eq!(a.relaunch_attempts.load(Ordering::SeqCst), 0);
+    assert!(
+        !relaunch_said(&a)
+            .iter()
+            .any(|said| matches!(said, RelaunchSay::Cannot { .. })),
+        "nothing said: {:?}",
+        relaunch_said(&a)
+    );
+    assert!(a.badges.lock().unwrap().iter().all(Option::is_none));
 }
 
 #[test]
@@ -23673,6 +23913,10 @@ fn a_relaunch_owed_after_the_park_is_carried() {
             a.restart("s-a", restart_stamp::Cause::Asked);
         }
         a.record_gone.store(case != "crash", Ordering::SeqCst);
+        if case == "own" {
+            // Its own `/exit`, typed by a driver: the exit is the driver's, not carried.
+            *a.typed_by.lock().unwrap() = Some(("lab (pid 411)".to_string(), 4_000));
+        }
         host.pause_restored();
         assert_eq!(
             host.pending_restored_snapshot_for("s-a"),
@@ -24701,7 +24945,7 @@ fn an_agent_back_and_gone_again_conforms_to_the_commit_owed_model() {
             let (a, tries, slot) = (Arc::clone(&a), Arc::clone(&tries), Arc::clone(&slot));
             let passes = Arc::clone(&passes);
             let live = Arc::clone(&h.acts.relaunch);
-            Arc::new(move |sid, grace, snap, left, upgrade, stalled| {
+            Arc::new(move |sid, grace, snap, left, upgrade, stalled, carried| {
                 let first = tries.fetch_add(1, Ordering::SeqCst) == 0;
                 if first && (case == "landed" || case == "landed-handover") {
                     let host = slot.lock().unwrap().clone().expect("started");
@@ -24732,7 +24976,7 @@ fn an_agent_back_and_gone_again_conforms_to_the_commit_owed_model() {
                     a.set(&[]);
                     a.line_started.store(true, Ordering::SeqCst);
                 }
-                live(sid, grace, snap, left, upgrade, stalled)
+                live(sid, grace, snap, left, upgrade, stalled, carried)
             })
         };
         let host = HostHandle::start(on(), false, false, h);
@@ -27305,15 +27549,18 @@ fn the_real_look_conforms_to_the_upgrade_look_model() {
 /// The body of the `claude` stand-in: it leads its pty, takes its TERM disposition first
 /// (`$1`: `deaf` ignores it, as a Claude Code whose JS thread spins does; `gated` removes its
 /// record and then waits at `$HOME/gate`, a fifo, before it exits 0, a graceful end the test
-/// lets finish when it chooses, [`RealAgent::open_gate`]; anything else removes its record
-/// and exits 0, as a Claude Code's graceful end does), then writes Claude Code's own record
-/// of itself (`procStart` the kernel start the harness's snapshot reads) and sleeps.
+/// lets finish when it chooses, [`RealAgent::open_gate`]; `term143` removes its record and
+/// exits 143, as Claude Code's own end on a `SIGTERM` reads at its shell; anything else
+/// removes its record and exits 0, as a Claude Code's graceful end does), then writes Claude
+/// Code's own record of itself (`procStart` the kernel start the harness's snapshot reads) and
+/// sleeps.
 #[cfg(target_os = "macos")]
 const CLAUDE_STAND_IN: &str = r#"#!/bin/sh
 rec="$HOME/.claude/sessions/$$.json"
 case "$1" in
 deaf) trap '' TERM ;;
 gated) trap 'rm -f "$rec"; read _ < "$HOME/gate"; exit 0' TERM ;;
+term143) trap 'rm -f "$rec"; exit 143' TERM ;;
 *) trap 'rm -f "$rec"; exit 0' TERM ;;
 esac
 mkdir -p "$HOME/.claude/sessions"
@@ -27348,9 +27595,7 @@ impl RealAgent {
     }
 
     fn spawn_as(mode: &str, local_id: u64) -> Self {
-        use aterm_uds::spawnfd::InheritNothing as _;
-        use std::os::fd::{FromRawFd, OwnedFd};
-        use std::os::unix::process::CommandExt;
+        use std::os::fd::IntoRawFd as _;
         let home = aterm_tempfile::TempDir::new().expect("home");
         let bin = home.path().join("bin");
         std::fs::create_dir_all(&bin).expect("bin");
@@ -27363,29 +27608,18 @@ impl RealAgent {
             // SAFETY: a NUL-terminated path this test owns.
             assert_eq!(unsafe { libc::mkfifo(gate.as_ptr(), 0o600) }, 0, "the gate");
         }
-        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-        // SAFETY: `slave` is a fresh fd this test alone owns.
-        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-        let stdio = || std::process::Stdio::from(slave.try_clone().expect("dup slave"));
-        let mut program = std::process::Command::new(&claude);
-        program
-            .inherit_nothing()
-            .arg(mode)
-            .env("HOME", home.path())
-            .stdin(stdio())
-            .stdout(stdio())
-            .stderr(stdio());
-        // SAFETY: runs in the forked child before exec using async-signal-safe `setsid`/`ioctl`.
-        unsafe {
-            program.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = program.spawn().expect("spawn the stand-in");
+        let (master, slave, mut child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
+            let mut program = std::process::Command::new(&claude);
+            program
+                .arg(mode)
+                .env("HOME", home.path())
+                .stdout(std::process::Stdio::from(slave.try_clone()?))
+                .stderr(std::process::Stdio::from(slave.try_clone()?));
+            Ok(program)
+        })
+        .expect("spawn the stand-in");
         drop(slave);
+        let master = master.into_raw_fd();
         // SAFETY: `master` is this test's open PTY master; the duplicate fd is owned by the drain.
         let drained = unsafe { libc::fcntl(master, libc::F_DUPFD_CLOEXEC, 0) };
         assert!(drained >= 0, "dup the master");
@@ -27563,6 +27797,401 @@ impl Drop for RealAgent {
         }
         aterm_pty::close_fd(self.master);
     }
+}
+
+/// Who an unasked `SIGTERM`'s exit is, in [`unasked_term`]'s world.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndBy {
+    /// Nobody: no person's key, no other typing, a `SIGTERM` sent by pid from outside aterm.
+    Nobody,
+    /// Nobody, the session's own Autopilot word Land.
+    NobodyUnderLand,
+    /// Nobody, and the snapshot read while the agent ran names no conversation.
+    NobodyNoConversation,
+    /// A driver typed into the session 4 s before: its `/exit`, aterm's own line typed after it
+    /// (`typed_by=aterm`).
+    Driver,
+    /// The `SIGTERM` was asked through aterm's `signal` verb by a control client, `lab (pid 411)`.
+    SignalVerb,
+    /// The `SIGTERM` was asked through aterm's `signal` verb by the person (the Overview's Stop).
+    SignalVerbByPerson,
+    /// A `SIGKILL` asked through aterm's `signal` verb by a control client, `lab (pid 411)`: the
+    /// end leaves its record, as a crash's does.
+    SignalVerbKill,
+    /// A `SIGKILL` asked through aterm's `signal` verb by aterm's own harness (a credit claim's
+    /// end of an agent it took over).
+    SignalVerbKillByHarness,
+    /// Nobody, as far as anything shows: the tab's `status` cannot be read at the exit.
+    StatusUnread,
+    /// A person's key 1.5 s before.
+    Person,
+}
+
+/// One relaunch attempt the host made: the lane's step, the exit read, and whether an Autopilot
+/// carried it.
+#[cfg(target_os = "macos")]
+type Attempt = (String, &'static str, bool);
+
+/// What one unasked `SIGTERM` came to through the host ([`unasked_term`]).
+#[cfg(target_os = "macos")]
+struct UnaskedTerm {
+    /// Each attempt the host made.
+    attempts: Vec<Attempt>,
+    /// The conversation the host owes a relaunch of once the first attempt was made: what a
+    /// handoff's or a quit's layout carries for the tab.
+    owed: Option<String>,
+    /// The pauses the host took.
+    pauses: Vec<Duration>,
+    /// What the host told of the relaunch.
+    told: Vec<RelaunchSay>,
+    /// Each mark the host set on the tab, or cleared (`None`).
+    badges: Vec<Option<String>>,
+}
+
+/// Tab 1's exit of 2026-10-27 (`s-b0b71f322edb7785c368`, aterm v0.145.0) through the host: a
+/// supervised Claude Code under Cruise, nobody typing, no hold, no other supervisor, dies of a
+/// `SIGTERM` (`end`): its end removes its record and its shell reads 143. The host hands the
+/// exit to its worker, which reads it and makes its attempts through the real lane (a dry run in
+/// the stand-in's home, a live `bash` standing as the tab's shell); whether an end aterm was
+/// asked for stands is read off the agent's own session log, as the live act reads it.
+#[cfg(target_os = "macos")]
+fn unasked_term(end: EndBy, local_id: u64) -> UnaskedTerm {
+    const SESSION: &str = "0badf00d-1111-2222-3333-444455556666";
+    let agent = RealAgent::spawn_as("term143", local_id);
+    let project = agent.home.path().join(".claude/projects/p");
+    std::fs::create_dir_all(&project).expect("its project");
+    std::fs::write(
+        project.join(format!("{SESSION}.jsonl")),
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"fix the bug\"}}\n",
+    )
+    .expect("its conversation's transcript");
+    let a = Arc::new(Acting::default());
+    a.home
+        .set(agent.home.path().to_path_buf())
+        .expect("one home");
+    a.starts
+        .lock()
+        .unwrap()
+        .insert(agent.upid(), agent.start.clone());
+    a.open.lock().unwrap().insert(agent.sid.clone());
+    a.set(&[(agent.sid.as_str(), Program::Claude)]);
+    a.pids
+        .lock()
+        .unwrap()
+        .insert(agent.sid.clone(), (agent.upid(), Program::Claude));
+    match end {
+        EndBy::NobodyUnderLand => {
+            a.words
+                .lock()
+                .unwrap()
+                .insert(agent.sid.clone(), Autopilot::Land);
+        }
+        EndBy::NobodyNoConversation => *a.session_now.lock().unwrap() = Some(None),
+        EndBy::Driver => {
+            *a.typed_by.lock().unwrap() = Some(("aterm".to_string(), 500));
+            *a.driven_ms.lock().unwrap() = Some(4_000);
+        }
+        EndBy::Person => *a.human_ms.lock().unwrap() = Some(1_500),
+        EndBy::Nobody
+        | EndBy::SignalVerb
+        | EndBy::SignalVerbByPerson
+        | EndBy::SignalVerbKill
+        | EndBy::SignalVerbKillByHarness
+        | EndBy::StatusUnread => {}
+    }
+    let opts = upgrade_drive::Opts {
+        home: agent.home.path().to_path_buf(),
+        state: agent.home.path().join("state"),
+        sock: None,
+        token: None,
+        only_sid: Some(agent.sid.clone()),
+        dry_run: true,
+        human_grace_s: 120,
+        hand_back: true,
+        background: false,
+        aterm_state: None,
+        ask: false,
+        several_logins: false,
+        usage_credits: false,
+        usage_tap: None,
+        instances: upgrade_drive::Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
+        land: false,
+        press: None,
+        timings: aterm_agent::harness::Timings::FAST,
+        tell: upgrade_drive::Tell::Off,
+    };
+    let shell = tab_shell();
+    let shell_pid = shell.child.id();
+    let attempts: Arc<Mutex<Vec<Attempt>>> = Arc::default();
+    let seen = Arc::clone(&attempts);
+    // How many pauses the host had taken when its last relaunch act returned.
+    let paused_at: Arc<Mutex<Option<usize>>> = Arc::default();
+    let paused_seen = Arc::clone(&paused_at);
+    let pauses_of = Arc::clone(&a);
+    let mut hooks = a.hooks();
+    let ctx = Arc::clone(&agent.ctx);
+    hooks.acts.end_asked =
+        Arc::new(move |_, group, began| crate::harness_host::end_asked_of(&ctx, group, began));
+    hooks.acts.relaunch = Arc::new(move |_, _, snap, left, upgrade, asked, carried| {
+        // The stand-in leads its own pty with no shell under it: the lane is handed a live
+        // `bash` as the tab's shell, as tab 1's zsh stood at its prompt.
+        let snap = &Snapshot {
+            shell: shell_pid,
+            ..snap.clone()
+        };
+        let r = if carried {
+            relaunch::after_carried_exit(&opts, snap, left, upgrade)
+        } else {
+            relaunch::after_exit(&opts, snap, left, upgrade, asked)
+        };
+        seen.lock()
+            .unwrap()
+            .push((r.step.clone(), left.word(), carried));
+        let paused = pauses_of.pauses.lock().unwrap().len();
+        *paused_seen.lock().unwrap() = Some(paused);
+        r.step
+    });
+    let host = HostHandle::start(on(), false, false, hooks);
+    a.attached(&host, &agent.sid);
+    until("the host's snapshot of it published", || {
+        crate::harness_host::published_snapshot(&agent.sid)
+            .is_some_and(|snap| snap.pid == agent.upid() && snap.start == agent.start)
+    });
+    if end == EndBy::StatusUnread {
+        a.status_unread.store(true, Ordering::SeqCst);
+    }
+    let lab = Some("lab (pid 411)");
+    if let Some((by, from, sig)) = match end {
+        EndBy::SignalVerb => Some((aterm_slog::Actor::Ctl, lab, "term")),
+        EndBy::SignalVerbByPerson => Some((aterm_slog::Actor::Human, None, "term")),
+        EndBy::SignalVerbKill => Some((aterm_slog::Actor::Ctl, lab, "kill")),
+        EndBy::SignalVerbKillByHarness => Some((aterm_slog::Actor::Harness, None, "kill")),
+        _ => None,
+    } {
+        let reply = crate::control::control_input::signal_verb_from(
+            agent.master,
+            sig,
+            &agent.ctx,
+            by,
+            from,
+        );
+        assert_eq!(reply, format!("OK signalled pgrp {}\n", agent.pid));
+    } else {
+        // SAFETY: `agent` is this test's own unreaped child, so its pid has not been reused.
+        assert_eq!(unsafe { libc::kill(agent.pid, libc::SIGTERM) }, 0);
+    }
+    until("the agent ended and was reaped", || agent.ended().is_some());
+    if matches!(end, EndBy::SignalVerbKill | EndBy::SignalVerbKillByHarness) {
+        assert_eq!(
+            agent
+                .ended()
+                .and_then(|s| std::os::unix::process::ExitStatusExt::signal(&s)),
+            Some(libc::SIGKILL)
+        );
+        assert!(agent.record_left(), "its SIGKILL end left its record");
+    } else {
+        assert_eq!(agent.ended().and_then(|s| s.code()), Some(143));
+        assert!(!agent.record_left(), "its SIGTERM end removed its record");
+    }
+    a.set(&[]);
+    // The host tells an attempt's word only after its relaunch act returns, then backs off (a
+    // relaunch still owed: one more pause) or settles the exit (its account gone, its task
+    // exited). Wait for that, not for the attempt alone, so the word it told is read.
+    until("the exit decided and its word told", || {
+        let paused = *paused_at.lock().unwrap();
+        paused.is_some_and(|at| a.pauses.lock().unwrap().len() > at)
+            || !a.accounts_gone.lock().unwrap().is_empty()
+            || !a.tasks_exited.lock().unwrap().is_empty()
+    });
+    let owed = host
+        .pending_restored_for(&agent.sid)
+        .and_then(|owed| owed.snap.session);
+    let told = a
+        .notes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|n| match n {
+            HostNote::Relaunch { said, .. } => Some(said.clone()),
+            _ => None,
+        })
+        .collect();
+    let seen = UnaskedTerm {
+        attempts: attempts.lock().unwrap().clone(),
+        owed,
+        pauses: a.pauses.lock().unwrap().clone(),
+        told,
+        badges: a.badges.lock().unwrap().clone(),
+    };
+    assert!(
+        a.relaunched.lock().unwrap().is_empty(),
+        "the stub lane never ran"
+    );
+    host.shutdown_and_join();
+    drop(shell);
+    seen
+}
+
+/// A live `bash` standing at a tab's prompt ([`tab_shell`]).
+#[cfg(target_os = "macos")]
+struct TabShell {
+    child: aterm_uds::spawnfd::Child,
+    _image: aterm_uds::deadline::KeptUntilRan,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for TabShell {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A `bash` waiting on its stdin: a copy named `bash` (the lane reads a shell's dialect off its
+/// name), removed once it printed that it ran.
+#[cfg(target_os = "macos")]
+fn tab_shell() -> TabShell {
+    let dir = aterm_tempfile::tempdir()
+        .expect("a shell image directory")
+        .keep();
+    let mut image = aterm_uds::deadline::KeptUntilRan::new(dir);
+    aterm_uds::deadline::ad_hoc_copy(
+        std::path::Path::new("/bin/bash"),
+        &image.path().join("bash"),
+    );
+    let mut command = aterm_uds::spawnfd::Command::new(image.path().join("bash"));
+    command
+        .args(["-c", "printf 'ran\\n'; read -r _"])
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::piped());
+    let mut child = command.spawn().expect("bash");
+    aterm_uds::deadline::prints(&mut child, "ran", aterm_uds::deadline::ECHO_HANG);
+    image.ran();
+    TabShell {
+        child,
+        _image: image,
+    }
+}
+
+/// [`unasked_term`]: under Cruise or Land an exit nobody owns comes back on its own conversation
+/// as a crash's relaunch though it removed its record (the back-off's first step, owed so that a
+/// handoff's or a quit's layout carries it), and one that cannot is said to the owner. A driver's
+/// typing (aterm's own line after it included) and a person's key keep the exit theirs, said to
+/// nobody. A stop asked through aterm's `signal` verb is its asker's whatever the end left of the
+/// agent's record (a `SIGKILL`'s stays, as a crash's does): never relaunched, the person's or
+/// aterm's own said to nobody, another program's recorded naming it. An exit whose `status`
+/// cannot be read is left and recorded. A record asks the owner nothing: no exception, no mark.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unasked_sigterm_under_cruise_comes_back_through_the_host() {
+    const SESSION: &str = "0badf00d-1111-2222-3333-444455556666";
+    let asked_nothing = |seen: &UnaskedTerm| {
+        seen.badges.iter().all(Option::is_none)
+            && !seen
+                .told
+                .iter()
+                .any(|said| matches!(said, RelaunchSay::Cannot { .. }))
+    };
+    for (n, end) in [EndBy::Nobody, EndBy::NobodyUnderLand]
+        .into_iter()
+        .enumerate()
+    {
+        let back = unasked_term(end, 7410 + n as u64);
+        assert_eq!(
+            back.attempts.first(),
+            Some(&("would-relaunch".to_string(), "removed", true)),
+            "{end:?}: {:?}",
+            back.attempts
+        );
+        assert_eq!(
+            back.owed.as_deref(),
+            Some(SESSION),
+            "{end:?}: owed on its conversation"
+        );
+        assert!(
+            back.pauses.contains(&relaunch::BACKOFF[0]),
+            "{end:?}: the crash back-off: {:?}",
+            back.pauses
+        );
+    }
+    let nameless = unasked_term(EndBy::NobodyNoConversation, 7412);
+    assert_eq!(
+        nameless.attempts,
+        [("refused:no-conversation".to_string(), "removed", true)]
+    );
+    assert_eq!(nameless.owed, None, "nothing left to bring back");
+    assert!(
+        nameless.told.iter().any(|said| matches!(
+            said,
+            RelaunchSay::Cannot { reason, marked: false, .. }
+                if *reason == cannot_reason("no-conversation")
+        )),
+        "the owner hears it, once, as an exception: {:?}",
+        nameless.told
+    );
+    let driver = unasked_term(EndBy::Driver, 7413);
+    assert_eq!(
+        driver.attempts,
+        [("ended:graceful-exit".to_string(), "removed", false)]
+    );
+    assert_eq!(driver.owed, None, "owed to nobody");
+    assert!(
+        driver.told.iter().all(|said| *said == RelaunchSay::Ended),
+        "nothing said: {:?}",
+        driver.told
+    );
+    let person = unasked_term(EndBy::Person, 7415);
+    assert!(person.attempts.is_empty(), "{:?}", person.attempts);
+    assert_eq!(person.owed, None);
+    for (local_id, end, recorded) in [
+        (
+            7418,
+            EndBy::SignalVerbKill,
+            Some(LeftEnd::AskedBy("lab (pid 411)".to_string())),
+        ),
+        (7419, EndBy::SignalVerbKillByHarness, None),
+        (7414, EndBy::SignalVerbByPerson, None),
+        (
+            7416,
+            EndBy::SignalVerb,
+            Some(LeftEnd::AskedBy("lab (pid 411)".to_string())),
+        ),
+    ] {
+        let theirs = unasked_term(end, local_id);
+        assert!(
+            theirs.attempts.is_empty(),
+            "{end:?}: never relaunched: {:?}",
+            theirs.attempts
+        );
+        assert_eq!(theirs.owed, None, "{end:?}: owed to nobody");
+        let left: Vec<LeftEnd> = theirs
+            .told
+            .iter()
+            .filter_map(|said| match said {
+                RelaunchSay::Left { end } => Some(end.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(left, Vec::from_iter(recorded), "{end:?}: {:?}", theirs.told);
+        assert!(asked_nothing(&theirs), "{end:?}: {:?}", theirs.told);
+    }
+    let unread = unasked_term(EndBy::StatusUnread, 7417);
+    assert_eq!(
+        unread.attempts,
+        [("ended:graceful-exit".to_string(), "removed", false)],
+        "left where its launch's own end would be"
+    );
+    assert_eq!(unread.owed, None, "owed to nobody");
+    assert!(
+        unread.told.contains(&RelaunchSay::Left {
+            end: LeftEnd::Unread
+        }),
+        "recorded: {:?}",
+        unread.told
+    );
+    assert!(asked_nothing(&unread), "{:?}", unread.told);
 }
 
 /// A watch the test runs itself on `agent`'s program, set up as the act's or the carrier's
@@ -28208,38 +28837,25 @@ impl Drop for EndShell {
 #[cfg(target_os = "macos")]
 impl ShellJob {
     fn spawn(local_id: u64) -> Self {
-        use aterm_uds::spawnfd::InheritNothing as _;
-        use std::os::fd::{FromRawFd, OwnedFd};
-        use std::os::unix::process::CommandExt;
+        use std::os::fd::IntoRawFd as _;
         let home = aterm_tempfile::TempDir::new().expect("home");
         let bin = home.path().join("bin");
         std::fs::create_dir_all(&bin).expect("bin");
         let claude = bin.join("claude");
         aterm_tempfile::stand_in(&claude, CLAUDE_STAND_IN).expect("the stand-in");
-        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-        // SAFETY: `slave` is a fresh fd this test alone owns.
-        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-        let stdio = || std::process::Stdio::from(slave.try_clone().expect("dup slave"));
-        let mut shell = std::process::Command::new("/bin/zsh");
-        shell
-            .inherit_nothing()
-            .args(["-f", "-i"])
-            .env("HOME", home.path())
-            .env("PS1", "READY%% ")
-            .stdin(stdio())
-            .stdout(stdio())
-            .stderr(stdio());
-        // SAFETY: runs in the forked child before exec using async-signal-safe `setsid`/`ioctl`.
-        unsafe {
-            shell.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = shell.spawn().expect("zsh");
+        let (master, slave, mut child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
+            let mut shell = std::process::Command::new("/bin/zsh");
+            shell
+                .args(["-f", "-i"])
+                .env("HOME", home.path())
+                .env("PS1", "READY%% ")
+                .stdout(std::process::Stdio::from(slave.try_clone()?))
+                .stderr(std::process::Stdio::from(slave.try_clone()?));
+            Ok(shell)
+        })
+        .expect("zsh");
         drop(slave);
+        let master = master.into_raw_fd();
         let zsh = i32::try_from(child.id()).expect("pid");
         let said = Arc::new(Mutex::new(Vec::<u8>::new()));
         // SAFETY: `master` is this test's open PTY master; the duplicate fd is owned by the drain.
@@ -29946,6 +30562,8 @@ fn another_agent_in_the_tab_leaves_the_mark_that_asks_for_its_conversation() {
         a.badges.lock().unwrap()
     );
     a.graceful.store(true, Ordering::SeqCst);
+    // The other conversation's own `/exit`, typed by a driver: the driver's exit, left.
+    *a.typed_by.lock().unwrap() = Some(("lab (pid 411)".to_string(), 4_000));
     let tries = a.relaunched.lock().unwrap().len();
     a.set(&[]);
     until("its exit decided", || {
@@ -30602,7 +31220,14 @@ fn a_row_no_route_signs_in_is_the_digests_fact_until_its_login_is_made() {
     );
     let no_sign_in = |state: &accounts::State, logins: &accounts::Logins| {
         let bound = accounts::bound(&roster, logins);
-        let said = AccountsSaid::listed(&bound, state, logins, ACCT_NOW + 60, &BTreeSet::new());
+        let said = AccountsSaid::listed(
+            &bound,
+            state,
+            logins,
+            ACCT_NOW + 60,
+            &BTreeSet::new(),
+            &|| false,
+        );
         let stands = said.stands();
         match said {
             AccountsSaid::Listed { no_sign_in, .. } => (no_sign_in, stands),
@@ -30649,6 +31274,7 @@ fn a_login_a_tab_signs_in_is_off_the_digests_due_line() {
             &logins,
             a.clock(),
             &idle.login_latches.carried_rows(),
+            &|| false,
         ) {
             AccountsSaid::Listed { due, .. } => due,
             other => panic!("{other:?}"),
@@ -30717,6 +31343,7 @@ fn a_tabs_sign_in_ends_when_a_move_relaunches_it_onto_another_login() {
             &logins,
             a.clock(),
             &idle.login_latches.carried_rows(),
+            &|| false,
         );
         let after = accounts_told(&notes);
         if took {
@@ -32556,60 +33183,106 @@ fn a_reading_held_back_for_a_new_login_is_taken_when_served_after_it() {
     assert_eq!(key(), profile::AccountKey::claude(b));
 }
 
-/// Under a roster of several accounts a tap reading carries no key.
+/// A matching profile identifies the attributed row even when other accounts are listed.
 #[cfg(unix)]
 #[test]
-fn under_several_accounts_a_tap_reading_carries_no_key() {
-    let one =
-        "[[account]]\nlabel = \"home-a\"\nclass = \"dedicated\"\nemail = \"owner@example.com\"\n";
-    let two = format!(
-        "{one}\n[[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\ndir = \"/logins/work-2\"\n"
-    );
-    let (a, b) = (
-        "11111111-1111-4111-8111-111111111111",
-        "22222222-2222-4222-8222-222222222222",
-    );
-    for (roster, keyed) in [(two, false), (one.to_string(), true)] {
+fn tap_identity_matches_the_default_row_in_a_multi_account_roster() {
+    for (email, expected) in [("owner@example.com", true), ("other@example.com", false)] {
         let w = TapWorld::new();
-        std::fs::write(w.roster_path(), &roster).expect("roster");
+        std::fs::write(w.roster_path(),
+            "[[account]]\nlabel = \"home-a\"\nclass = \"dedicated\"\nemail = \"owner@example.com\"\n\n[[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\ndir = \"/logins/work-2\"\nemail = \"work@example.com\"\n"
+        ).unwrap();
         let home = w.tmp.path().join("home");
-        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&home).unwrap();
         *w.env.lock().unwrap() = vec![format!("HOME={}", home.display())];
-        let sign_in = |uuid: &str| {
-            let text = format!(r#"{{"oauthAccount":{{"accountUuid":"{uuid}"}}}}"#);
-            std::fs::write(home.join(".claude.json"), text).expect("profile");
-        };
-        let key = || {
-            let (state, _) = accounts::Store::at(&w.state()).load(w.clock()).ok()?;
-            state.accounts.get("home-a")?.key
-        };
-        sign_in(a);
+        std::fs::write(
+            home.join(".claude.json"),
+            format!(r#"{{"oauthAccount":{{"accountUuid":"owner-id","emailAddress":"{email}"}}}}"#),
+        )
+        .unwrap();
         let idle = w.worker(&tap_on(), tapped_argv(), true);
         w.tap(10, 42, None);
         idle.usage_tap();
+        assert_eq!(w.sample_of("home-a").unwrap().session_pct, Some(42));
+        let state = accounts::Store::at(&w.state()).load(w.clock()).unwrap().0;
         assert_eq!(
-            w.sample_of("home-a").and_then(|s| s.session_pct),
-            Some(42),
-            "{roster}"
+            state.account("home-a").key,
+            profile::AccountKey::claude("owner-id").filter(|_| expected),
+            "{email}"
         );
-        assert_eq!(key(), profile::AccountKey::claude(a).filter(|_| keyed));
-        sign_in(b);
-        w.later(10);
-        w.tap(20, 47, None);
-        idle.usage_tap();
-        if keyed {
-            assert_eq!(w.rows(accounts::Kind::Epoch), 1, "{roster}");
-            assert_eq!(w.sample_of("home-a"), None, "held back");
-        } else {
-            assert_eq!(w.rows(accounts::Kind::Epoch), 0, "{roster}");
-            assert_eq!(key(), None);
-            assert_eq!(
-                w.sample_of("home-a").and_then(|s| s.session_pct),
-                Some(47),
-                "taken at once"
-            );
-        }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn tap_identity_uses_the_dedicated_process_profile() {
+    let w = TapWorld::new();
+    let home = w.tmp.path().join("home");
+    let login = w.tmp.path().join("work-login");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&login).unwrap();
+    std::fs::write(
+        home.join(".claude.json"),
+        r#"{"oauthAccount":{"accountUuid":"owner-id","emailAddress":"owner@example.com"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        login.join(".claude.json"),
+        r#"{"oauthAccount":{"accountUuid":"work-id","emailAddress":"work@example.com"}}"#,
+    )
+    .unwrap();
+    let login = login.to_string_lossy().into_owned();
+    let quoted = aterm_json::to_string(&login).unwrap();
+    std::fs::write(w.roster_path(), format!(
+        "[[account]]\nlabel = \"home-a\"\nclass = \"dedicated\"\nemail = \"owner@example.com\"\n\n[[account]]\nlabel = \"work-2\"\nclass = \"dedicated\"\ndir = {quoted}\nemail = \"work@example.com\"\n"
+    )).unwrap();
+    *w.env.lock().unwrap() = vec![
+        format!("HOME={}", home.display()),
+        format!("{}={login}", accounts::LOGIN_ENV),
+    ];
+    let idle = w.worker(&tap_on(), tapped_argv(), true);
+    idle.kept.lock().unwrap().snapshot.as_mut().unwrap().login = Some(login.clone());
+    w.tap(10, 42, Some(&login));
+    idle.usage_tap();
+    assert_eq!(w.sample_of("work-2").unwrap().session_pct, Some(42));
+    let state = accounts::Store::at(&w.state()).load(w.clock()).unwrap().0;
+    assert_eq!(
+        state.account("work-2").key,
+        profile::AccountKey::claude("work-id")
+    );
+    assert_eq!(state.account("home-a").key, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn tap_identity_change_is_not_hidden_by_unchanged_windows() {
+    let w = TapWorld::new();
+    let home = w.tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    *w.env.lock().unwrap() = vec![format!("HOME={}", home.display())];
+    let write = |id: &str| {
+        std::fs::write(
+            home.join(".claude.json"),
+            format!(r#"{{"oauthAccount":{{"accountUuid":"{id}"}}}}"#),
+        )
+        .unwrap()
+    };
+    write("first-id");
+    let idle = w.worker(&tap_on(), tapped_argv(), true);
+    w.tap(10, 42, None);
+    idle.usage_tap();
+    assert_eq!(w.sample().unwrap().session_pct, Some(42));
+    write("second-id");
+    w.later(10);
+    w.tap(20, 42, None);
+    idle.usage_tap();
+    let state = accounts::Store::at(&w.state()).load(w.clock()).unwrap().0;
+    assert_eq!(
+        state.account("main").key,
+        profile::AccountKey::claude("second-id")
+    );
+    assert_eq!(w.sample(), None, "the prior identity's figures are retired");
+    assert_eq!(w.rows(accounts::Kind::Epoch), 1);
 }
 
 /// A first reading under an epoch is not noted as taken.
@@ -36817,6 +37490,13 @@ fn a_restored_queue_that_panicked_drops_nothing_unsaid() {
                 c.lock().unwrap().push(sid.to_string());
             }
         });
+        let over: Arc<Mutex<Vec<String>>> = Arc::default();
+        let o = Arc::clone(&over);
+        h.note = Arc::new(move |note| {
+            if let HostNote::RestoredOver { sid } = note {
+                o.lock().unwrap().push(sid);
+            }
+        });
         let host = HostHandle::start(on(), false, false, h);
         let restored = |sid: &str, tab: u32| RestoredAgent {
             sid: sid.to_string(),
@@ -36847,7 +37527,7 @@ fn a_restored_queue_that_panicked_drops_nothing_unsaid() {
             queue.missed.push(gathered.clone());
             queue.closed = closed;
         }
-        let mut missed = restored_queue_panicked(&host.shared, host.hooks.badge.as_ref());
+        let mut missed = restored_queue_panicked(&host.shared, &host.hooks);
         missed.sort_by_key(|m| m.order);
         let (left, running) = {
             let queue = host.shared.restored.lock().unwrap();
@@ -36864,6 +37544,7 @@ fn a_restored_queue_that_panicked_drops_nothing_unsaid() {
                 cleared.lock().unwrap().is_empty(),
                 "CONTROL: no word cleared"
             );
+            assert!(over.lock().unwrap().is_empty(), "CONTROL: no record told");
         } else {
             assert_eq!(left, 0, "over");
             let places: Vec<&str> = missed.iter().map(|m| m.place.as_str()).collect();
@@ -36877,6 +37558,13 @@ fn a_restored_queue_that_panicked_drops_nothing_unsaid() {
             let mut words = cleared.lock().unwrap().clone();
             words.sort();
             assert_eq!(words, ["s-qa", "s-qb"], "every tab's word cleared");
+            let mut over = over.lock().unwrap().clone();
+            over.sort();
+            assert_eq!(
+                over,
+                ["s-qa", "s-qb"],
+                "each worker's record hears its agent is not coming back"
+            );
         }
         host.shutdown_and_join();
     }
@@ -40972,6 +41660,9 @@ fn account_move_claims_target_before_restarting_and_refuses_when_held_elsewhere(
                 me: self.me.to_owned(),
                 book,
                 writable: self.writable.map_err(str::to_owned),
+                clock: None,
+                skewed: Vec::new(),
+                held: Vec::new(),
             })
         }
 
@@ -41551,4 +42242,162 @@ fn agy_limit_until_reads_quota_without_a_session_and_parks_only_when_rotation_is
         idle.park.load(Ordering::SeqCst),
         "when rotation is due (Pick::Rotate), park is set so host_steps_here rotates immediately"
     );
+}
+
+/// A row whose sign-in found no route is no fact while Claude works on the default login (the new
+/// Mac's "Claude sign-in found no route"): `AccountsSaid::listed` asks, and only when a row fails.
+/// CONTROL: with no working login the fact stands, and no asking happens for no failing row.
+#[test]
+fn a_row_no_route_signs_in_is_no_fact_while_claude_works() {
+    let roster = accounts::Roster {
+        rows: vec![accounts::Row {
+            label: "w3".to_string(),
+            dir: Some("/nonexistent/w3".to_string()),
+            email: Some("w3@example.test".to_string()),
+            ..accounts::Row::default()
+        }],
+    };
+    let state = accounts::State::default();
+    let mut logins = accounts::Logins::default();
+    let looked = std::cell::Cell::new(0);
+    let no_sign_in = |logins: &accounts::Logins, works: bool| {
+        let said = AccountsSaid::listed(
+            &roster,
+            &state,
+            logins,
+            ACCT_NOW + 60,
+            &BTreeSet::new(),
+            &|| {
+                looked.set(looked.get() + 1);
+                works
+            },
+        );
+        match said {
+            AccountsSaid::Listed { no_sign_in, .. } => no_sign_in.len(),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(no_sign_in(&logins, false), 0);
+    assert_eq!(looked.get(), 0, "no row failed: no profile is read");
+    let _ = accounts::note_sign_in_attempt(
+        &mut logins,
+        "w3",
+        accounts::AttemptOutcome::NoRoute,
+        "profile(none)",
+        ACCT_NOW,
+    );
+    assert_eq!(
+        no_sign_in(&logins, false),
+        1,
+        "CONTROL: Claude does not work"
+    );
+    assert_eq!(no_sign_in(&logins, true), 0, "Claude works");
+}
+
+/// This Mac's clock record (`accounts::State::clock`, docs/DESIGN-fluid-swarm-2026-10-28.md
+/// F22) is the digest's clock line while it counts, and a line stands for it; a renewal of the
+/// record says the same, so the host tells nothing new; past its `until` it says nothing.
+///
+/// Negative control: with `stands` leaving the clock out, no line stood for an Off clock (`a
+/// line stands for the clock`).
+#[test]
+fn the_clock_record_is_the_digests_line_while_it_counts() {
+    let roster = accounts::Roster::default();
+    let logins = accounts::Logins::default();
+    let clock = accounts::Clock {
+        standing: accounts::ClockStanding::Off { ahead: false },
+        by_s: 86_400,
+        against: 3,
+        of: 4,
+        peers: Vec::new(),
+        until: ACCT_NOW + 100,
+    };
+    let state = accounts::State {
+        clock: Some(clock.clone()),
+        ..accounts::State::default()
+    };
+    let at = |now| AccountsSaid::listed(&roster, &state, &logins, now, &BTreeSet::new(), &|| false);
+    let live = at(ACCT_NOW + 60);
+    assert!(
+        matches!(
+            &live,
+            AccountsSaid::Listed { clock: Some(said), .. } if *said == ClockSaid::from(&clock)
+        ),
+        "{live:?}"
+    );
+    assert!(live.stands(), "a line stands for the clock");
+    let renewed = accounts::State {
+        clock: Some(accounts::Clock {
+            until: ACCT_NOW + 1900,
+            ..clock.clone()
+        }),
+        ..accounts::State::default()
+    };
+    assert_eq!(
+        AccountsSaid::listed(
+            &roster,
+            &renewed,
+            &logins,
+            ACCT_NOW + 60,
+            &BTreeSet::new(),
+            &|| false
+        ),
+        live,
+        "a renewal is no news"
+    );
+    let lapsed = at(ACCT_NOW + 100);
+    assert!(
+        matches!(&lapsed, AccountsSaid::Listed { clock: None, .. }),
+        "{lapsed:?}"
+    );
+    assert!(!lapsed.stands());
+}
+
+/// A claim that never typed `/usage` is no read: not reported, and it owes no turn. CONTROL: the
+/// typed read in the next test reports and owes one.
+#[test]
+fn a_claim_that_typed_nothing_is_no_read() {
+    let a = Accts::new();
+    let _agent = a.spawn("s-used-2", ACCT_TALK_A, "main");
+    let idle = a.worker("s-used-2", &on());
+    let (claimed, events) = provider_read::captured(|| idle.account_probe());
+    assert!(claimed.is_ok());
+    assert!(events.is_empty(), "a claim reads nothing");
+    idle.account_probed(Err(ProbeMiss::NotWritten));
+    a.now.store(ACCT_NOW + 7 * 24 * 3600, Ordering::SeqCst);
+    assert_ne!(
+        idle.probe_claimed().err(),
+        Some(NoProbe::NotUsed),
+        "nothing was typed, so no turn is owed before the next read"
+    );
+}
+
+/// The owner's rule on Claude Code's panel: after a read, time alone makes no other one due, however
+/// long the sample ages; only a turn run on the session does. Entering `/usage` reports the read
+/// with its row and why. CONTROL: the same aged sample after `turn_ran` is claimed, so `NotUsed` is
+/// the only thing that held it back.
+#[test]
+fn time_alone_never_makes_another_usage_read_due() {
+    let a = Accts::new();
+    let _agent = a.spawn("s-used-1", ACCT_TALK_A, "main");
+    let idle = a.worker("s-used-1", &on());
+    assert!(idle.account_probe().is_ok(), "a session's first read");
+    let ((), events) = provider_read::captured(|| idle.account_probe_typed());
+    assert_eq!(
+        events,
+        [provider_read::ProbeEvent {
+            at: a.clock(),
+            read: provider_read::Read::ClaudePanel,
+            account: Some("main".to_owned()),
+            login: None,
+            why: provider_read::InUse::LiveSession,
+        }]
+    );
+    a.now.store(ACCT_NOW + 7 * 24 * 3600, Ordering::SeqCst);
+    idle.account_probed(Err(ProbeMiss::Lost));
+    let (aged, events) = provider_read::captured(|| idle.probe_claimed());
+    assert_eq!(aged, Err(NoProbe::NotUsed), "a week later, with no turn");
+    assert!(events.is_empty(), "no read, no report");
+    idle.turn_ran();
+    assert!(idle.account_probe().is_ok(), "a turn ran: the read is due");
 }

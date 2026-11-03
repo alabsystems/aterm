@@ -235,7 +235,7 @@ fn conn_round_trips_against_a_live_headless_instance() {
     assert_eq!(got, format!("{{\"edges\":[],\"dst\":\"{sid2}\"}}\n"));
 
     let target = format!("@{sid2}");
-    client_ok(&inst, &["ctl", "--sock", &sock, "tab", "1"], &[]);
+    client_ok(&inst, &["ctl", "--sock", &sock, "raise", &sid2], &[]);
     let grant = client_ok(
         &inst,
         &["ctl", "--sock", &sock, "grant", &sid1, "read-screen"],

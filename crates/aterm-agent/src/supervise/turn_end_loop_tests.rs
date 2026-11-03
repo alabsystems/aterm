@@ -50,6 +50,9 @@ mod probe_own_line;
 #[path = "point_key_loop_tests.rs"]
 mod point_key_loop;
 
+#[path = "custody_loop_tests.rs"]
+mod custody_loop;
+
 fn hosted(max_s: u64) -> SuperviseOpts {
     SuperviseOpts {
         policy: SupervisorConfig {
@@ -2952,16 +2955,16 @@ fn a_screen_unmoved_since_the_write_is_waited_past_where_it_reads_as_another_tex
     assert_eq!(seq_waits(&t), 1, "escalated at once: {}", t.evidence());
 }
 
-/// An escalation (`typed, not submitted`) on a screen that never moves is never typed again on it
-/// ([`Session::type_fenced`], [`Session::input_unread`], [`turn_end_loop::Undrawn::Written`]),
-/// however often a wake rekeys that frame as a new point and however long it stands: a screen
-/// that moves 300 s after the write, past the escalation at the echo's minute and
-/// [`turn_end_loop::UNDRAWN_INPUT_HANG`] after it, as one that moves at 100 s. The hold has no
-/// clock, so the unmoved screen is decided again only as a wake brings it (each of the three
-/// rekeyed wakes once), never on a re-decision timer. Negative control: once the screen moves,
-/// the next decision acts, an Enter fenced on that read.
+/// A LINE HELD IN CUSTODY ON A SCREEN THAT NEVER MOVES IS NEVER TYPED AGAIN ON IT
+/// ([`Session::type_fenced`], [`Session::custody_gate`]), however often a wake rekeys that frame as
+/// a new point and however long it stands: a screen that moves 300 s after the write, past the
+/// give-up at the echo's minute and [`turn_end_loop::UNDRAWN_INPUT_HANG`] after it, as one that
+/// moves at 100 s. The hold raises nothing (no badge, no `ESCALATED`) and journals one record per
+/// change of what holds it, however often it is looked at; on a limit wall it is no session at
+/// rest, so no restart in place. Negative control: once the screen moves, the next decision acts,
+/// an Enter fenced on that read.
 #[test]
-fn an_escalation_on_an_unmoved_screen_is_never_typed_again_through_the_loop() {
+fn a_line_held_on_an_unmoved_screen_is_never_typed_again_through_the_loop() {
     for stands in [100, 300] {
         let (t, noted) = escalated_on_an_unmoved_screen(stands, None);
         let unmoved_seq = t
@@ -2976,35 +2979,27 @@ fn an_escalation_on_an_unmoved_screen_is_never_typed_again_through_the_loop() {
             t.evidence()
         );
         assert!(
-            t.left_typed()
-                .is_some_and(|a| a.contains("a minute after it was written")),
-            "{stands} s: escalated as a hang: {}",
+            held_formed(&noted).is_some_and(|l| l.contains("a minute after it was written")),
+            "{stands} s: held at the hang: {noted:#?}"
+        );
+        assert!(
+            t.m.attention.is_none() && !noted.iter().any(|l| l.starts_with("ESCALATED ")),
+            "{stands} s: no badge, no ask: {noted:#?}\n{}",
             t.evidence()
         );
-        let escalated = noted
-            .iter()
-            .find_map(|l| l.strip_prefix("ESCALATED seq="))
-            .and_then(|l| l.split_whitespace().next())
-            .map(str::to_string);
-        let held: Vec<&String> = noted
-            .iter()
-            .filter(|l| {
-                l.starts_with("SKIPPED ")
-                    && l.contains("the worker has not drawn the input it read")
-            })
-            .collect();
+        let on = held_on(&noted);
+        let held = held_lines(&noted);
         assert!(
-            !held.is_empty()
-                && held.iter().all(|l| escalated
-                    .as_deref()
-                    .is_some_and(|seq| l.starts_with(&format!("SKIPPED seq={seq} ")))),
-            "{stands} s: decided again on the unmoved screen (escalated at {escalated:?}, written \
-             at {unmoved_seq:?}), nothing written: {noted:#?}\n{}",
+            held.iter().all(|l| on
+                .as_deref()
+                .is_some_and(|seq| l.starts_with(&format!("SKIPPED seq={seq} ")))),
+            "{stands} s: held on the unmoved screen (at {on:?}, written at {unmoved_seq:?}), \
+             nothing written: {noted:#?}\n{}",
             t.evidence()
         );
         assert!(
             held.len() <= 3,
-            "{stands} s: decided again only as a wake brought the screen, {} times: {held:#?}",
+            "{stands} s: one record per change of what holds it, {} records: {held:#?}",
             held.len()
         );
         assert_eq!(
@@ -3127,7 +3122,7 @@ fn a_line_drawn_after_a_decision_on_its_frame_is_decided_again() {
 /// the line itself standing whole, or typed text going, decides again. A grey suggestion changing,
 /// coming or going moves the composer and is neither. Text that is not the line is a person's.
 #[test]
-fn a_composer_change_that_is_not_the_line_decides_nothing() {
+fn a_composer_change_that_is_not_the_line_never_writes_it_twice_nor_presses_enter() {
     for (what, row, typed) in [
         ("another suggestion", "❯ run the tests next", false),
         ("no suggestion", "❯", false),
@@ -4183,6 +4178,31 @@ fn note_field<'a>(note: &'a str, field: &str) -> Option<&'a str> {
         .find_map(|w| w.strip_prefix(field)?.strip_prefix('='))
 }
 
+/// The journal's records of a line held in custody ([`crate::supervise::journal::LINE_HELD`]): its
+/// forming at the give-up, then one at each change of what holds it.
+fn held_lines(noted: &[String]) -> Vec<&String> {
+    noted
+        .iter()
+        .filter(|l| l.starts_with("SKIPPED ") && l.contains(crate::supervise::journal::LINE_HELD))
+        .collect()
+}
+
+/// The record of a line taken into custody at the give-up: `SKIPPED … typed, not submitted (…):
+/// … held until the worker draws it (input=…)`.
+fn held_formed(noted: &[String]) -> Option<&String> {
+    held_lines(noted)
+        .into_iter()
+        .find(|l| l.contains(" typed, not submitted ("))
+}
+
+/// The content seq a line was taken into custody on ([`held_formed`]).
+fn held_on(noted: &[String]) -> Option<String> {
+    held_formed(noted)
+        .and_then(|l| l.strip_prefix("SKIPPED seq="))
+        .and_then(|l| l.split_whitespace().next())
+        .map(str::to_string)
+}
+
 /// THE PROGRAM, NOT ATERM, HOLDS THE TEXT, AND THE JOURNAL SAYS SO ONCE: a Claude Code that leaves
 /// Land's instruction unread in its input for 25 s (rv1's labs: 1 to 60 s, `status input=pending`)
 /// gets one `NOTE` past the reaction wait, under land@v1, with the unread input `status` timed
@@ -4250,9 +4270,10 @@ fn a_text_the_program_holds_unread_is_noted_once_and_typed_nowhere() {
 
 /// THE NOTE'S READ ONLY OBSERVES ([`Session::call_observed`]): a `status` that reads the write
 /// `input=stalled` at the reaction wait, and only `input=pending` by the echo's hang, leaves the
-/// hang to read it afresh, so the line given up on is badged as it would be with no note, never
-/// withheld as a stall on a reading fifty seconds old. Negative control by mutation: the note
-/// read through [`Session::call`], whose stall suspicion the hang's badge then takes as standing.
+/// hang to read it afresh, so the line given up on is taken into custody on the hang's own read
+/// (`input=pending`) as it would be with no note, never withheld as a stall on a reading fifty
+/// seconds old, and raises nothing. Negative control by mutation: the note read through
+/// [`Session::call`], whose stall suspicion the give-up then takes as standing.
 #[test]
 fn a_stalled_read_at_the_note_starts_no_stall_look() {
     let h = land_held_shaped(
@@ -4267,22 +4288,18 @@ fn a_stalled_read_at_the_note_starts_no_stall_look() {
                 (Duration::from_secs(30), INPUT_STALLED),
                 (Duration::MAX, INPUT_KEY_UNREAD),
             ];
-            m.exit_when = Some(|m| {
-                m.requests
-                    .iter()
-                    .any(|r| r.starts_with("meta set attention owner=supervisor "))
-            });
         },
     );
     let notes = held_notes(&h.noted);
     assert_eq!(notes.len(), 1, "{:#?}", h.noted);
     assert_eq!(note_field(notes[0], "input"), Some("stalled"), "{notes:#?}");
     assert!(
-        h.t.left_typed().is_some(),
-        "badged at the hang, on its own read: {:#?}\n{}",
+        held_formed(&h.noted).is_some_and(|l| l.ends_with("(input=pending)")),
+        "held at the hang, on its own read: {:#?}\n{}",
         h.noted,
         h.t.evidence()
     );
+    assert!(h.t.m.attention.is_none(), "{}", h.t.evidence());
     assert!(
         !h.noted
             .iter()
@@ -4296,9 +4313,10 @@ fn a_stalled_read_at_the_note_starts_no_stall_look() {
 /// ONCE WHEN IT DRAWS, AND LAND GOES ON FROM IT (rv1-ab3's land-n: 565 bytes unread 60.5 s, drawn
 /// at 66 s; the at1 review's run, 2026-11-01: drawn at +91.8 s, held 120 s as "a person is
 /// typing", submitted, then typed a second time at the agent's `Nothing left:`). Under the shipped
-/// person's grace, the write is given up on at [`turn_end_loop::ECHO_HANG`] and badged; when the
-/// program draws the line whole 75 s after the write, the look at the line it left decides again
-/// and presses its Enter past the paste guard alone, as no person typed it; that Enter is Land's
+/// person's grace, the write is given up on at [`turn_end_loop::ECHO_HANG`] and held in custody,
+/// unbadged; when the program draws the line whole 75 s after the write, the look at the line it
+/// left decides again and presses its Enter past the paste guard alone, as no person typed it;
+/// that Enter is Land's
 /// instruction given, so at the agent's defense Land types its check, never the instruction again.
 /// The run's own tape reads the same: one land@v1 written, drawn 75 s on, its Enter the later
 /// decision's, and aterm's own share of it seconds. Negative controls by mutation: the late Enter
@@ -4327,8 +4345,9 @@ fn land_held_unread_past_the_echo_hang_is_submitted_once_when_it_draws() {
         h.t.evidence()
     );
     assert!(
-        h.t.left_typed().is_some(),
-        "given up on at the echo's hang: {}",
+        held_formed(&h.noted).is_some() && h.t.left_typed().is_none(),
+        "given up on at the echo's hang, held unbadged: {:#?}\n{}",
+        h.noted,
         h.t.evidence()
     );
     assert!(
@@ -4424,40 +4443,36 @@ fn a_left_line_a_person_cleared_lets_the_session_go_on() {
     }
 }
 
-/// AN ESCALATION'S HOLD OUTLASTS A STATUS READ OF ITS TEXT UNREAD ([`Session::input_unread`],
-/// [`turn_end_loop::Undrawn::Written`]): a starved worker still holds the loop's continuation
-/// queued, so `status` reads it unread (`input=pending`) for 70 s after the write, on the screen
-/// the write was escalated on, and that read leaves the escalation's hold as it was: no clock.
-/// The screen stands 300 s, so a hold the status read had turned into its own
-/// ([`turn_end_loop::Undrawn::Read`]) would run out [`turn_end_loop::UNDRAWN_INPUT_HANG`] after
-/// the queue last read unread, with the screen still unmoved. The continuation is written once,
-/// escalated once, and the screen is decided again only as a wake brings it. NEGATIVE CONTROLS:
-/// the status read of the unread input on the escalated screen is in the journal (the read the
-/// hold must outlast happened), and once the screen moves the next decision acts, an Enter fenced
-/// on that read.
+/// A HELD LINE'S HOLD OUTLASTS A STATUS READ OF IT UNREAD ([`Session::custody_gate`],
+/// [`turn_end_loop::Held`]): a starved worker still holds the loop's continuation queued, so
+/// `status` reads it unread (`input=pending`) for 70 s after the write, on the screen the line was
+/// taken into custody on, and that read holds it with no clock of its own but a doubling due. The
+/// screen stands 300 s, so a hold that ran out [`turn_end_loop::UNDRAWN_INPUT_HANG`] after the
+/// queue last read unread would write the line again on the unmoved screen; a later clear read
+/// proves it read, and on a limit wall no session is at rest, so no restart. The continuation is
+/// written once and raises nothing, and every record of the hold is on that screen. NEGATIVE
+/// CONTROLS: the status read of the unread input is in the journal (the read the hold must outlast
+/// happened), and once the screen moves the next decision acts, an Enter fenced on that read.
 #[test]
-fn an_escalations_hold_outlasts_a_status_read_of_its_text_unread() {
+fn a_held_lines_hold_outlasts_a_status_read_of_it_unread() {
     let (t, noted) = escalated_on_an_unmoved_screen(300, Some(70));
     assert_eq!(t.sends().len(), 1, "written once: {}", t.evidence());
-    let escalated: Vec<&str> = noted
-        .iter()
-        .filter_map(|l| l.strip_prefix("ESCALATED seq="))
-        .filter_map(|l| l.split_whitespace().next())
-        .collect();
-    assert_eq!(escalated.len(), 1, "escalated once: {noted:#?}");
-    let skips: Vec<&String> = noted.iter().filter(|l| l.starts_with("SKIPPED ")).collect();
     assert!(
-        skips
-            .iter()
-            .any(|l| l.contains("the worker has not read the input written to it (input=pending)")),
+        t.m.attention.is_none() && !noted.iter().any(|l| l.starts_with("ESCALATED ")),
+        "no badge, no ask: {noted:#?}"
+    );
+    assert!(
+        held_formed(&noted).is_some_and(|l| l.ends_with("(input=pending)")),
         "the status read the text unread: {noted:#?}"
     );
+    let on = held_on(&noted).expect("held");
+    let skips: Vec<&String> = noted.iter().filter(|l| l.starts_with("SKIPPED ")).collect();
     assert!(
         (1..=3).contains(&skips.len())
             && skips
                 .iter()
-                .all(|l| l.starts_with(&format!("SKIPPED seq={} ", escalated[0]))),
-        "decided again only on the escalated screen, as a wake brought it, {} times: {skips:#?}",
+                .all(|l| l.starts_with(&format!("SKIPPED seq={on} "))),
+        "held only on the screen it formed on, one record per change, {} records: {skips:#?}",
         skips.len()
     );
     assert_eq!(
@@ -4473,9 +4488,9 @@ fn an_escalations_hold_outlasts_a_status_read_of_its_text_unread() {
     );
 }
 
-/// An echo that hung on a frame drawn after the write (escalated `typed, not submitted`) is never
-/// typed again on that frame ([`Session::type_fenced`], [`Session::input_unread`]), however long
-/// it stands: a screen that moves 300 s after the write, past the escalation and
+/// An echo that hung on a frame drawn after the write (its line held in custody, unbadged) is never
+/// typed again on that frame ([`Session::type_fenced`], [`Session::custody_gate`]), however long it
+/// stands: a screen that moves 300 s after the write, past the give-up and
 /// [`turn_end_loop::UNDRAWN_INPUT_HANG`] after it, as one that moves at 100 s. Negative control:
 /// once the screen moves, the next decision acts, an Enter fenced on that read.
 #[test]
@@ -4542,11 +4557,7 @@ fn echo_hung_on_a_later_frame(stands: u64) {
                 .find_map(|w| w.strip_prefix("if-gen=1."))
         })
         .map(str::to_string);
-    let escalated = noted
-        .iter()
-        .find_map(|l| l.strip_prefix("ESCALATED seq="))
-        .and_then(|l| l.split_whitespace().next())
-        .map(str::to_string);
+    let on = held_on(&noted);
     assert_eq!(
         t.sends().len(),
         1,
@@ -4554,27 +4565,21 @@ fn echo_hung_on_a_later_frame(stands: u64) {
         t.evidence()
     );
     assert!(
-        t.left_typed()
-            .is_some_and(|a| a.contains("a minute after it was written")),
-        "escalated as a hang: {}",
+        held_formed(&noted).is_some_and(|l| l.contains("a minute after it was written"))
+            && t.m.attention.is_none(),
+        "held at the hang, unbadged: {noted:#?}\n{}",
         t.evidence()
     );
     assert!(
-        escalated.is_some() && escalated != written,
-        "escalated on the frame drawn after the write (written at {written:?}, escalated at \
-         {escalated:?}): {noted:#?}"
+        on.is_some() && on != written,
+        "held on the frame drawn after the write (written at {written:?}, held at {on:?}): \
+         {noted:#?}"
     );
-    let held: Vec<&String> = noted
-        .iter()
-        .filter(|l| {
-            l.starts_with("SKIPPED ") && l.contains("the worker has not drawn the input it read")
-        })
-        .collect();
+    let held = held_lines(&noted);
     assert!(
-        !held.is_empty()
-            && held.iter().all(|l| escalated
-                .as_deref()
-                .is_some_and(|seq| l.starts_with(&format!("SKIPPED seq={seq} ")))),
+        held.iter().all(|l| on
+            .as_deref()
+            .is_some_and(|seq| l.starts_with(&format!("SKIPPED seq={seq} ")))),
         "decided again on that frame, nothing written: {noted:#?}\n{}",
         t.evidence()
     );
@@ -4957,69 +4962,12 @@ fn a_hand_held_through_a_slow_echo_is_renewed_before_it_lapses() {
     assert!(m.lease_times.is_empty(), "{evidence}");
 }
 
-#[test]
-fn a_text_left_typed_on_a_screen_that_never_moved_is_never_typed_again_on_it() {
-    let said = "Fixed the parser; the suite is green.";
-    let act = |unmoved: Duration| {
-        let mut m = Mock::new(vec![
-            busy_screen(),
-            ended(said),
-            typed_in(said, "keep going"),
-            busy_screen(),
-        ]);
-        m.gen_fence = true;
-        m.sends_gen = true;
-        m.human_seq = Some(0);
-        m.help = FENCED_HELP.to_string();
-        m.screen_cols.insert(2, 12);
-        m.unmoved_after_send = Some(unmoved);
-        let mut s = virtual_session(&mut m, None);
-        let point = s.await_turn(Duration::from_secs(60)).expect("the turn end");
-        let mut heard = Heard::default();
-        let typed = s
-            .type_text_written(&point, "keep going", RULE_CONTINUE, &mut heard)
-            .expect("the act")
-            == crate::supervise::run::turn_end_loop::Written::Submitted;
-        let held = s.input_unread(point.screen.seq, RULE_CONTINUE, &mut heard);
-        drop(s);
-        let evidence = format!("{:#?}\n{:#?}", heard.noted, m.requests);
-        let attention = m
-            .requests
-            .iter()
-            .find(|r| r.starts_with("meta set attention owner=supervisor "))
-            .cloned();
-        (typed, held, heard.noted, attention, evidence)
-    };
-
-    let (typed, held, noted, attention, evidence) = act(Duration::from_secs(120));
-    assert!(!typed, "left typed: {evidence}");
-    assert!(
-        attention.is_some_and(|a| a.contains(
-            "(typed, not submitted (the composer had not shown it whole a minute after it was \
-             written)"
-        )),
-        "escalated as a hang: {evidence}"
-    );
-    assert!(held, "the next act on that screen is held: {evidence}");
-    assert!(
-        noted.iter().any(|n| n.starts_with("SKIPPED seq=102 ")
-            && n.contains("the worker has not drawn the input it read")),
-        "{evidence}"
-    );
-
-    let (typed, held, _, attention, evidence) = act(Duration::from_secs(5));
-    assert!(typed, "entered: {evidence}");
-    assert!(attention.is_none(), "{evidence}");
-    assert!(!held, "nothing held back: {evidence}");
-}
-
 const HAND_HOLDER: &str = "aterm-harness@1";
 
 /// The probe's `/usage` echo is waited on as an act's is ([`Session::probe_type`],
 /// [`Session::await_echo`]): drawn late, its Enter goes, fenced on the read that shows it whole;
-/// never drawn, it is left typed, the next act on that unmoved screen is held, and the probe's
-/// gate shuts (`pending-input`). Negative control: on a screen that moved to another text it is
-/// left typed at once, nothing held.
+/// never drawn, it is taken into custody and the probe's gate shuts (`pending-input`). Negative
+/// control: on a screen that moved to another text it is left typed at once, nothing held.
 #[test]
 fn the_probes_usage_is_judged_by_what_the_screen_shows() {
     use crate::supervise::policy::turn_end::ProbeGate;
@@ -5051,11 +4999,7 @@ fn the_probes_usage_is_judged_by_what_the_screen_shows() {
         let gate = s
             .probe_gate_seen(&point, host.as_ref(), &opts)
             .expect("the gates");
-        let held = s.input_unread(
-            point.screen.seq,
-            crate::supervise::policy::turn_end::RULE_USAGE_PROBE,
-            &mut heard,
-        );
+        let held = s.custody.is_some();
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
         let sends = m.requests.iter().filter(|r| r.starts_with("send ")).count();
@@ -5096,7 +5040,7 @@ fn the_probes_usage_is_judged_by_what_the_screen_shows() {
         Some(ProbeGate::PendingInput),
         "the probe's gate shut on the unmoved screen: {evidence}"
     );
-    assert!(held, "the next act on that screen is held: {evidence}");
+    assert!(held, "taken into custody: {evidence}");
 
     // Negative control: the screen moved to another text.
     let (typed, gate, held, _, enters, evidence) = act("other", None, "something else");
@@ -13316,6 +13260,82 @@ fn the_canarys_words_moving_after_its_exception_clear_it() {
         heard.noted
     );
     assert_eq!(s.stuck_rung, StuckRung::Said);
+}
+
+/// THE SHELL A TURN LEFT IS TOLD AS THE AGENT'S OWN WORK (a Claude Code 2.1.312 tab, 2026-10-27):
+/// its turn ended over a lint run it left, Claude Code compacted the idle conversation under the
+/// done row, and the canary logged an error every time it climbed, `Claude's own title has said
+/// idle for 90 min over a screen this build does not recognise`, though the screen says what
+/// holds the tab. This is that screen, its composer's `ok, keep going` built both ways, by the
+/// `cell` reply as the loop reads it: Claude Code's dim suggestion and a person's draft.
+/// Negative control: a screen that names no work keeps the title as its witness, its record
+/// the unread one (`memory_scrolled`, an active `/goal`, in the ladder tests above).
+#[test]
+fn the_shell_a_turn_left_under_an_idle_compaction_is_told_as_the_agents_own_work() {
+    use aterm_phase::prompt::fixtures::{IDLE_COMPACTED_OVER_A_SHELL_2_1_312, screen};
+    for (name, attrs) in [("a suggestion", "dim"), ("a draft", "none")] {
+        let (dir, path) = journal_file("stuck-left-shell");
+        let host = Arc::new(LadderHost::default());
+        let mut m = Mock::new(vec![
+            busy_screen(),
+            screen(IDLE_COMPACTED_OVER_A_SHELL_2_1_312),
+        ]);
+        m.title = Some("✳ Compact system performance monitor window".to_string());
+        m.cursor_on_caret = true;
+        m.cursor_col = Some(2);
+        m.cell_attrs = attrs;
+        m.vanish_after = Some(14);
+        m.stall_sleep = Some(Duration::from_millis(25));
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            policy: SupervisorConfig {
+                autopilot: crate::supervise::config::Autopilot::Land,
+                ..hosted(60).policy
+            },
+            ..hosted(60)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.setup.stuck_after = Duration::from_millis(30);
+        });
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let kind = |k: &str| -> Vec<String> {
+            records
+                .iter()
+                .filter(|r| r.line.starts_with(k))
+                .map(|r| r.line.clone())
+                .collect()
+        };
+        let (stuck, stalled, exception) = (kind("STUCK"), kind("STALLED"), kind("EXCEPTION"));
+        let rule = aterm_phase::phase::work_left(&screen(IDLE_COMPACTED_OVER_A_SHELL_2_1_312))
+            .expect("the work the screen names");
+        assert!(
+            stuck.len() == 1
+                && stuck[0].contains(&format!("({rule})"))
+                && !stuck[0].contains("title"),
+            "{name}: {stuck:#?}\n{lines:#?}"
+        );
+        assert!(
+            stalled.len() == 1 && !stalled[0].contains("does not classify"),
+            "{name}: {stalled:#?}\n{lines:#?}"
+        );
+        assert!(
+            exception.len() == 1 && exception[0].contains("kind=stalled when=later"),
+            "{name}: {exception:#?}\n{lines:#?}"
+        );
+        assert_eq!(
+            *host.told.lock().unwrap(),
+            [
+                "own-work:some",
+                "exception:stalled",
+                "unread:none",
+                "exception:none"
+            ],
+            "{name}: the record is the work's"
+        );
+        assert_eq!(count(&m, "turn"), 0, "{name}: the ladder types nothing");
+    }
 }
 
 #[test]

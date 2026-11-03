@@ -597,7 +597,11 @@ fn a_clis_own_roster_beside_accounts_toml_is_its_pool_and_names_the_row_to_sign_
     );
     let made = b.home.join(".aterm/logins/kimi/kimi-one");
     std::fs::create_dir_all(made.join("credentials")).expect("login dir");
-    std::fs::write(made.join("credentials/kimi-code.json"), "{}").expect("placeholder login");
+    std::fs::write(
+        made.join("credentials/kimi-code-env-0e4f99c69cc27850.json"),
+        "{}",
+    )
+    .expect("placeholder login");
     std::fs::write(
         config.join("accounts-kimi.toml"),
         format!(

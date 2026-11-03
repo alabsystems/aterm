@@ -347,34 +347,14 @@ src/theme_api.rs	web_translucency_raises_the_effective_floor	web-contrast-floor
 
 ## 3. Coverage
 
-- 141 live tests mapped across the 78 specs in §2 (plus 1 deleted timing test in §4).
+- 141 live tests mapped across the 78 specs in §2 (plus 1 deleted timing test noted in §5.8).
 - The biggest collapses: `predict-binding-refines-predictor` (10), `scroll-accumulator` (6), `band-next-wake` (6), `band-is-translation` (5), `web-theme-install` (5).
 - `scroll-navigation` is clause (c) of `scroll-input-export`. `theme_api::cursor_color_follows_osc12_and_resets_on_112`
   is the export-level view of `theme-reset-baseline` and maps there.
 
 ## 4. Tests missing from §2
 
-Each line names a test file under `src/`, its tests, and the rows they sample.
-
-- `lib.rs`: `host_mode_getters_follow_the_program` (`mode-getters-delegate`);
-  `mouse_getters_follow_the_mode_and_encoders_take_host_cells` (`mode-getters-delegate`,
-  `mouse-report-encoding`); `encode_key_follows_the_live_mode_and_its_mirrored_bits`
-  (`encode-key-stateless-equals-instance`); `console_input_words_note_one_input_each_and_refuse_unknowns`
-  (`console-input-admission`); `a_minted_scheme_links_through_osc8_until_revoked`
-  (`hyperlink-scheme-gate`); `last_command_output_is_none_then_the_latest_block_then_evicted`
-  (`last-command-output`); `search_meta_and_summary_carry_what_the_legacy_export_drops`
-  (`search-exports-agree`); `scrollback_limit_zero_is_unlimited_and_a_shrink_reclamps_the_viewport`
-  (`scrollback-retention-limit`); `small_history_rewraps_inline_and_a_deep_one_defers_to_stepped_pumps`
-  and `a_resize_during_the_window_supersedes_without_losing_history` (`reflow-offload-contract`);
-  `registered_font_handles_dedupe_build_and_refuse_unknowns` (`font-registry-interning`);
-  `the_host_theme_is_the_frames_colour_baseline` (`theme-reset-baseline`,
-  `frame-scratch-live-colors`); `incremental_and_gated_renders_equal_a_single_full_render`
-  (`render-history-independence`); `selection_range_reports_display_coords_and_none_off_screen`
-  (`selection-range-projection`).
-- `predict_api.rs`: `a_run_s_first_press_hands_the_predictor_its_row` and
-  `a_press_while_scrolled_back_hands_no_row` (`predict-binding-refines-predictor`).
-- `theme_api.rs`: `set_theme_after_a_named_theme_reports_the_host_appearance` (`web-theme-install`,
-  `web-theme-appearance-follow`).
+None: all 141 live `#[test]` functions across `src/` are mapped in §2.
 
 ## 5. Implied specs that look wrong, or tests that disagree with their names
 

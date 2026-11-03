@@ -175,8 +175,8 @@ impl Mark {
         Self::ALL.into_iter().find(|mark| mark.value() == value)
     }
 
-    /// The state in words: what a screen reader hears in a line's label, and what High Contrast
-    /// adds to every line. A line still being read says [`CHECKING_WORD`] instead.
+    /// The state in words, read in a line's label and drawn in every theme.
+    /// A line still being read says [`CHECKING_WORD`] instead.
     pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Pending => "to do",
@@ -207,7 +207,7 @@ pub(crate) struct LineView {
     /// on a Mac outside ALab), nor while a Restore runs.
     pub(crate) offered: bool,
     pub(crate) mark: Mark,
-    /// The state in words, said once in the label and drawn under High Contrast: the mark's
+    /// The state in words, said once in the label and drawn in every theme: the mark's
     /// word, or [`CHECKING_WORD`] while the line is read.
     pub(crate) word: &'static str,
     /// Its live status phrase: what is true now, and where that differs from what aterm sets
@@ -646,10 +646,20 @@ pub(crate) fn line_view(
         .filter(|row| Line::of(row.subject) == line)
         .collect();
     let in_card = |row: &RowView| card.iter().any(|item| item.subject == Some(row.subject));
+    // A row the card asks about stays in its list with its mark and value, so a list never reads
+    // as all done while one of its rows needs the person. The card holds its words and buttons.
     let shown: Vec<RowView> = members
         .iter()
-        .filter(|row| !in_card(row))
-        .map(|row| (*row).clone())
+        .map(|row| {
+            let mut shown = (*row).clone();
+            if in_card(row) {
+                shown.note = None;
+                shown.turn_on_sync = false;
+                shown.install_tools = false;
+                shown.copy_command = false;
+            }
+            shown
+        })
         .collect();
     let plan = app.reviewed_plan();
     let steps = Steps::of(status, rows, Some(&plan));
@@ -1192,7 +1202,11 @@ fn hero_words(app: &SystemStateApp, rows: &[RowView], card: &[CardItem]) -> Hero
         return hero;
     }
     if status.joins_quietly() {
-        // A calm wait, as one aterm retries by itself (§4.3): the Secrets line says it.
+        // A calm wait, as one aterm retries by itself (§4.3): the Secrets line says it. "Joining
+        // ALab…" names the step this Mac is on (it asks the members, and its subscriber asks
+        // again), never what lets it in: that depends on where it is, and the Secrets row's own
+        // note says it (`aterm_secrets::alab_join::asking_note`: automatic on the ALab LAN only),
+        // so the hero promises nothing off the LAN.
         hero.headline = SETTING_UP.to_owned();
         hero.sub = with_counts(JOINING_ALAB);
         return hero;

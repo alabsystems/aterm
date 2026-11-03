@@ -25,7 +25,7 @@ pub(super) const EXPORT_INCLUDES: Rule = Rule {
 const MACROS: [&str; 3] = ["include", "include_str", "include_bytes"];
 
 fn export_includes(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    let manifest = match std::fs::read_to_string(tree.root.join(MANIFEST)) {
+    let manifest = match crate::tree::read_to_string(&tree.root.join(MANIFEST)) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {

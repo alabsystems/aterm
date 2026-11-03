@@ -4,7 +4,7 @@
 # aterm-winit-keymap: spec recovery from its unit tests
 
 Each row of §1 is a spec to prove through Trust/Clean about the compiled Rust functions of
-`crates/aterm-winit-keymap/src/lib.rs`; the tests it subsumes are then deleted. §4 lists the tests
+`crates/aterm-winit-keymap/src/lib.rs`; the tests it subsumes are then deleted. §3 lists the tests
 no row cites.
 
 > Status 2026-10-16: the 8 specs below are the crate's migration worklist. Each is proved through
@@ -17,7 +17,7 @@ callers: `crates/aterm-gui/src/keymap.rs` (`map_logical_key`, `map_numpad_key`, 
 `crates/aterm-gui/src/keybinding.rs` (`layout_letter_twin_for`),
 and the GUI key path (`sided_modifier`, `physical_modifier_twin`).
 
-Result: **8 specs**, covering **12 tests** (§4 has 0 non-spec tests left).
+Result: **8 specs**, covering **12 tests** (§3 has 0 non-spec tests left).
 
 ## 0. Notation used in the statements
 
@@ -115,22 +115,15 @@ src/lib.rs	base_layout_key_is_us_qwerty	base-layout-key-table
 src/lib.rs	layout_letter_twin_names_the_us_letter_under_a_non_latin_letter	layout-letter-twin-for	base-layout-key-table
 ```
 
-## 3. Open finding
+## 3. Tests with no row
 
-- 12 tests read. All 12 map to one of the 8 specs (§4 has 0 non-spec tests left).
+None. All 12 `#[test]` functions in `src/lib.rs` map to one of the 8 specs above:
 - The biggest collapse is `numpad-key-table` (5 primary); `named-key-table` retires the consolidated
-  `named_key_table_maps_every_category_and_rejects_unmapped` sample (§5.3).
+  `named_key_table_maps_every_category_and_rejects_unmapped` sample (§4.3).
 - `a_right_side_modifier_press_maps_to_its_right_variant` is retired only when both
   `sided-modifier-contract` and `logical-key-contract` are proved (it asserts one half of each).
 
-## 4. Tests with no row
-
-- `maps_function_keys_past_f12_and_media_keys` samples `named-key-table`.
-- `layout_letter_twin_names_the_us_letter_under_a_non_latin_letter` (`layout_letter_twin_for`) and
-  `us_qwerty_shifted_and_kitty_wire_round_trip` (`us_qwerty_shifted_ascii`,
-  `encode_kitty_key_wire_le`, `decode_kitty_key_wire_le`) test functions no row states.
-
-## 5. Proof order
+## 4. Resolved findings
 
 1. **Resolved — `map_numpad_key` doc aligned with `numpad-key-table` clause (1).** `map_numpad_key`
    documents explicitly that `Character` keys outside `T_kp_char` return `None` directly and that
@@ -142,7 +135,7 @@ src/lib.rs	layout_letter_twin_names_the_us_letter_under_a_non_latin_letter	layou
    `physical-twin-involution`.
 3. **Resolved — `maps_function_keys_past_f12_and_media_keys` renamed and widened to `named_key_table_maps_every_category_and_rejects_unmapped`.** The history-pinning test name is replaced with a direct `T_named` category sample covering navigation, editing, lock/system, function (`F1..=F35`), media/audio, sided modifiers (`Left(m)`), and unmapped (`None`) variants under `named-key-table`.
 
-## 6. Proof order (easiest high-value first)
+## 5. Proof order (easiest high-value first)
 
 No spec here is blocked by gap 0 alone; the cheapest are those needing only gaps 1 and 12 (plus 3).
 

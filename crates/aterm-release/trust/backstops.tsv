@@ -14,6 +14,7 @@ astream-broker	f7a030e645ab7ee2	rss-backstop	<astream_broker::client::Pipelined<
 astream-broker	f8534bbb108ca00b	rss-backstop	<astream_broker::broker::StreamFailure as core::cmp::PartialEq>::eq unreachable vendor/astream/crates/astream-broker/src/broker.rs:664 `PartialEq`
 astream-broker	fb06bcd80981a991	rss-backstop	astream_broker::sharded::sharded_count_nonzero postcondition vendor/astream/crates/astream-broker/src/sharded.rs:69 `0 < shards`
 astream-cap	-	cancelled	0
+astream-digest	-	cancelled	0
 astream-wire	-	cancelled	0
 aterm-a11y	-	cancelled	0
 aterm-a11y	86b8f44402d428c6	wall-backstop	aterm_a11y::macos::Element::meta::{closure#0} assertion @none:0 `-`

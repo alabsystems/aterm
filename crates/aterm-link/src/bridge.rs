@@ -23,7 +23,7 @@ use crate::body::{via_ok, Body};
 use crate::ctl::{Ctl, Reply, REQUEST_LINE_MAX};
 use crate::fx::{BusCloser, Fx};
 use crate::mailbox::{End, EventMark, Item, Mailbox, Pushed, ReplayPressure, Source};
-use crate::pipeline::{HeldCommit, Link};
+use crate::pipeline::{HeldCommit, Link, Publish};
 use crate::presence::{Fields, Marked, Mode, Slot};
 use crate::render::trust_of;
 use crate::state::{
@@ -338,6 +338,15 @@ const EXPIRED_KEEP: usize = 4096;
 
 const REASON_TOKEN_MAX: usize = 32;
 
+/// The `roster=<seq>` token of a `sessions bridge` or `outbox` reply's header: `None` from an
+/// aterm that sends none.
+fn roster_token(header: &str) -> Option<u64> {
+    header
+        .split(' ')
+        .find_map(|t| t.strip_prefix("roster="))
+        .and_then(crate::parse_uint)
+}
+
 fn parse_bridge_roster<'a>(
     rows: impl Iterator<Item = &'a str>,
 ) -> io::Result<(BTreeMap<u64, String>, BTreeMap<String, String>)> {
@@ -636,16 +645,44 @@ impl Fault {
 /// Minted capability line parsed from `--cap-file` via [`astream_cap::capfile`].
 pub use astream_cap::capfile::Line as Cap;
 
-/// Reads and parses a `--cap-file` into capability lines via [`astream_cap::capfile`].
+/// Reads and parses a `--cap-file` into capability lines through astream's owner-only ring reader
+/// ([`astream_cap::capfile::read_private_ring`]). A cap is authority, so a file others can read, a
+/// symlink and a FIFO are each refused at once, every refusal starting with `path` and saying what
+/// to do. The file is what is judged, never its folder: a person keeps a cap where they choose.
+///
+/// # Errors
+/// A refused or absent file, or a ring that does not parse (`InvalidData`, naming `path:line`).
 pub fn read_cap_file(path: &str) -> io::Result<Vec<Cap>> {
-    astream_cap::capfile::read_file(path).map_err(|e| match e {
-        astream_cap::capfile::ReadError::Io { error, .. } => {
-            io::Error::new(error.kind(), format!("{path}: {error}"))
-        }
-        malformed @ astream_cap::capfile::ReadError::Malformed(_) => {
-            io::Error::new(io::ErrorKind::InvalidData, malformed.to_string())
+    astream_cap::capfile::read_private_ring(path).map_err(|e| {
+        if e.kind() == io::ErrorKind::InvalidInput {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "{e}: move it aside, then `aterm fabric on` mints a node's ring and `aterm \
+                     fabric mint-for <h-name> --out <cap>` a person's"
+                ),
+            )
+        } else {
+            e
         }
     })
+}
+
+/// Whether a capability read failed without establishing an absent or malformed ring.
+/// A rule refusal or unavailable I/O never authorizes replacing the file.
+pub(crate) fn cap_refused(error: &io::Error) -> bool {
+    !matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+    )
+}
+
+/// Write a test's cap file as every aterm that mints one does: owner-only.
+#[cfg(test)]
+pub(crate) fn write_owner_only(path: &std::path::Path, ring: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::write(path, ring).expect("write a cap file");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod a cap");
 }
 
 /// Reads all `--cap-file` paths in order into a single capability ring.
@@ -1295,6 +1332,13 @@ pub struct Bridge {
     attaching: bool,
     attach_rtt: Option<Duration>,
     bye: Option<Bye>,
+    /// The `roster=<seq>` of the `sessions bridge` reply `locals` and `per_sid.epochs` were last
+    /// read from, while aterm sends one and no inherited bye is latched. A drain whose `outbox` reply names
+    /// the same count is looking at that roster, and reads it no more ([`Bridge::drain_whole`]).
+    roster_seen: Option<u64>,
+    /// The drain under way has looked at the roster since its `outbox` reply, so a post it
+    /// resolves to an unknown sid has nothing newer to find ([`Bridge::resolve_to`]).
+    roster_looked: bool,
     withdrawn: BTreeSet<String>,
     withdrawal_told: bool,
     set_aside: u64,
@@ -1305,8 +1349,8 @@ pub struct Bridge {
     /// The last bridge of the state dir ran in an earlier boot, as judged when this bridge
     /// started ([`StateDir::last_ran_in_an_earlier_boot`]): the run record named an earlier
     /// boot, or, with no record, the incarnation lease did, and no lease named an attach of this
-    /// boot. The start's first roster, where it reads, sweeps that boot's sessions' files
-    /// ([`Bridge::sweep_sessions_of_an_earlier_boot`]); no later roster does.
+    /// boot. The start's first roster, where it reads, sweeps that boot's sessions' files and
+    /// post reservations ([`Bridge::sweep_sessions_of_an_earlier_boot`]); no later roster does.
     earlier_boot: bool,
     mailbox: Arc<Mailbox>,
     fx: Fx,
@@ -1619,6 +1663,8 @@ impl Bridge {
             attaching: false,
             attach_rtt: None,
             bye: None,
+            roster_seen: None,
+            roster_looked: false,
             withdrawn: BTreeSet::new(),
             withdrawal_told: false,
             set_aside: 0,
@@ -1656,10 +1702,7 @@ impl Bridge {
     }
 
     fn reload_caps(&mut self) {
-        let fresh = read_ring(&self.cfg.cap_files).map_err(|e| e.to_string());
-        let verdict = fresh
-            .and_then(|ring| ring_refusal(&ring, &self.caps, &self.node).map_or(Ok(ring), Err));
-        match verdict {
+        match ring_on_disk(&self.cfg.cap_files, &self.caps, &self.node) {
             Ok(ring) => {
                 if ring != self.caps {
                     stderr_line!(
@@ -2121,40 +2164,44 @@ impl Bridge {
             return self.conclude(then, Err(broker_unreachable()));
         };
         let started = self.fx.now();
-        let sent = match held {
-            Some((upto, group)) => link
-                .send_after_commit(
-                    HeldCommit {
-                        group: &group,
-                        upto,
-                        tag: Then::Commit { upto, retry },
-                    },
-                    producer_id,
-                    seq,
-                    first,
-                    subject,
-                    body,
-                    then,
-                    started,
-                )
-                .map_err(|(e, commit, then)| (e, Some(commit), then)),
-            None => link
-                .send(producer_id, seq, first, subject, body, then, started)
-                .map_err(|(e, then)| (e, None, then)),
+        let commit = held.as_ref().map(|(upto, group)| HeldCommit {
+            group,
+            upto: *upto,
+            tag: Then::Commit { upto: *upto, retry },
+        });
+        let publish = Publish {
+            producer_id,
+            seq,
+            first,
+            subject,
+            body,
+            tag: then,
         };
+        let sent = link.send_burst(commit, vec![publish], started);
         if first && self.unsent == Some(seq) {
             self.unsent = None;
         }
-        if let Err((e, commit, then)) = sent {
-            self.judge(started, Err(&e), None);
-            if let Some(commit) = commit {
-                self.conclude(commit, Err(io::Error::new(e.kind(), e.to_string())));
+        if let Err(unsent) = sent {
+            let e = self.burst_unsent(started, unsent.error, unsent.commit);
+            if let Some(then) = unsent.tags.into_iter().next() {
+                self.conclude(then, Err(e));
             }
-            return self.conclude(then, Err(e));
+            return;
         }
         if !self.in_round && self.ack_batch == 0 {
             self.settle_acks();
         }
+    }
+
+    /// A burst the link did not take ([`Link::send_burst`]): the failure judged once, and the
+    /// commit that rode it, if one did, concluded failed with a copy of the error; the error
+    /// is handed back for the burst's publishes, which nothing is owed for either.
+    fn burst_unsent(&mut self, started: Instant, e: io::Error, commit: Option<Then>) -> io::Error {
+        self.judge(started, Err(&e), None);
+        if let Some(commit) = commit {
+            self.conclude(commit, Err(io::Error::new(e.kind(), e.to_string())));
+        }
+        e
     }
 
     fn batched<R>(&mut self, step: impl FnOnce(&mut Self) -> R) -> R {
@@ -2516,7 +2563,11 @@ impl Bridge {
         // cut does where no copy can be read (`Bridge::landed_since`). On an own lane the
         // record's entry stood until it settled, and such a record is never delivered, so the
         // copy given up went unread and the one the retry appends is the one a reader is
-        // handed. A record retention still holds is read, not taken for a cut, on a broker that
+        // handed. On another node's lane nothing held the copy back from that node's reader,
+        // which may have read it before retention gave it up: there the retry is a second copy
+        // that node is handed (the limit `Bridge::landed_since` states, a second node on one
+        // broker being only aterm-lab's, the tests' and the bench's today). A record retention
+        // still holds is read, not taken for a cut, on a broker that
         // tells fetches ([`Bridge::read_at`]), so there the retry never puts a second copy
         // beside one a reader can still be handed. On one that does not (`ReadAt::Untold`) the
         // refusal decides nothing: the retry is sent as past a cut, and where retention still
@@ -2817,6 +2868,7 @@ impl Bridge {
         };
         let (locals, epochs) = parse_bridge_roster(rows.iter().map(String::as_str))?;
         self.locals = locals;
+        self.roster_seen = roster_token(reply.header()).filter(|_| self.bye.is_none());
         let mut fresh = Vec::new();
         for (sid, nonce) in epochs {
             if self.per_sid.epochs.insert(sid.clone(), nonce).is_none() {
@@ -3631,6 +3683,29 @@ impl Bridge {
         let off = self.inbox_commit_due()?;
         self.inbox_pending_records = 0;
         Some(off)
+    }
+
+    /// The inbox commit the bus mirror's burst carries (critic item C13): the held one
+    /// ([`Bridge::take_held_commit`]), or, with no inbox record queued, the one the round's
+    /// settle would hold for the loop's next write ([`Bridge::hold_inbox_commit`]). The
+    /// mirror's pass runs before that settle ([`Bridge::mirror_then_round`]), so when the
+    /// endpoint's line for a delivery's mail count was read before the delivery's round
+    /// ended, the snapshot it owes is taken first, and its send IS that next write. With an
+    /// inbox record queued the commit waits for the record's delivery, as the settle leaves
+    /// it.
+    pub(super) fn take_commit_for_the_mirror(&mut self) -> Option<u64> {
+        #[cfg(test)]
+        let only_held = self
+            .fx
+            .mutant(crate::sim::world::Mutant::MirrorRidesOnlyAHeldCommit);
+        #[cfg(not(test))]
+        let only_held = false;
+        if self.commit_held.is_none()
+            && (only_held || self.mailbox.inbox_queued() || !self.hold_inbox_commit())
+        {
+            return None;
+        }
+        self.take_held_commit()
     }
 
     fn flush_inbox_commit(&mut self) {
@@ -4770,6 +4845,12 @@ impl Bridge {
         self.conn.is_none() && !e.get_ref().is_some_and(|inner| inner.is::<Answered>())
     }
 
+    /// An attach's republish of this node's in-flight journal, by sequence, before the attach
+    /// drains a post. Within one boot it keeps each sender's order on the bus, as 06d102f827
+    /// argued, because a sender has one post in flight (`settle_sender` before its next,
+    /// asserted in `send_post`), an entry outlives its answer only where its `acked` could not
+    /// be written, and the log keeps a prefix. A bridge that keeps several of a sender's posts
+    /// in flight must make that argument again.
     fn settle_in_flight(&mut self) -> bool {
         let settled = self.replay_in_flight();
         self.release_replays_by_a_peek();
@@ -4956,9 +5037,17 @@ impl Bridge {
     /// astream's dedup reaches only the records at or above the base its retention leaves: a
     /// cut drops the keys below it, a carried record's too. So a republish at the entry's
     /// pinned sequence would append a record a cut passed again; one read back here is
-    /// settled where it is. A record on this node's own lane whose entry stands is never
+    /// settled where it is. ON THIS NODE'S OWN LANES a record whose entry stands is never
     /// delivered, so never read: one retention gave up went unread, by its age or its
     /// class's bytes, and the republish after a `None` is the one copy a reader is handed.
+    /// Every record in flight is on an own lane (only an own-lane publish is journaled,
+    /// [`Bridge::publish_journaled`]), so the attach's replay is held to that. A retry at a
+    /// pin ([`Bridge::landed_at_its_pin`]) reads back a post to ANOTHER NODE'S LANE too, and
+    /// there nothing held its first copy back from that node's reader: past a cut that gave up
+    /// a copy that node had read (astream drops a pruned record's dedup key with it), the read
+    /// finds none and the retry appends a second, which that node is handed again. Today only
+    /// aterm-lab, the tests and the bench put a second node on one broker (the fabric is one
+    /// machine's bus: `docs/DESIGN-session-log-2026-10-15.md`).
     ///
     /// A read that went on at the floor is read again from where it was refused, TOLD what
     /// retention gave up ([`transport::fetch_told_kept`], on a connection of its own:
@@ -7198,8 +7287,8 @@ impl Bridge {
             Ok(reply) if reply.header() == LEGACY_OUTBOX_USAGE => self.ctl_request("outbox"),
             answer => answer,
         };
-        let drained = match reply {
-            Ok(reply) if reply.ok() => reply.body().to_vec(),
+        let (drained, roster) = match reply {
+            Ok(reply) if reply.ok() => (reply.body().to_vec(), roster_token(reply.header())),
             Ok(reply) => {
                 stderr_line!("aterm-link: outbox refused: {}", reply.header());
                 return None;
@@ -7225,9 +7314,15 @@ impl Bridge {
         if drain.receipts.is_empty() && drain.posts.is_empty() {
             return whole;
         }
-        if let Err(e) = self.refresh_sessions() {
-            stderr_line!("aterm-link: the roster could not be re-read before a drain: {e}");
-            return None;
+        // A DOOR THAT COMMITS MUST LOOK (69979209f1): a session that left before this listing
+        // must not be resolved as hosted. aterm read the count it names after the listing, and
+        // every departure moves it, so the count this roster was read at is that look; any other
+        // count, or none from an older aterm, reads the roster.
+        if roster.is_none() || roster != self.roster_seen {
+            if let Err(e) = self.refresh_sessions() {
+                stderr_line!("aterm-link: the roster could not be re-read before a drain: {e}");
+                return None;
+            }
         }
         let mut stalled: BTreeSet<String> = BTreeSet::new();
         for receipt in drain.receipts {
@@ -7247,7 +7342,9 @@ impl Bridge {
                 stalled.insert(receipt.sid.clone());
             }
         }
+        let looked = std::mem::replace(&mut self.roster_looked, true);
         let finished = self.batched(|bridge| bridge.drain_posts(drain.posts));
+        self.roster_looked = looked;
         (finished && stalled.is_empty() && self.held_senders.is_empty())
             .then_some(whole)
             .flatten()
@@ -7330,7 +7427,9 @@ impl Bridge {
                 #[cfg(test)]
                 let existing_pin = existing_pin
                     .filter(|_| !self.fx.mutant(crate::sim::world::Mutant::FreshSeqOnRetry));
-                if existing_pin.is_none() && keyed.is_none() && !self.budget_allows(&subject, opens)
+                if existing_pin.is_none()
+                    && keyed.is_none()
+                    && !self.budget_allows(&subject, opens, 0)
                 {
                     self.retire_at_the_door(&post, DeadReason::SubjectBudget);
                     return true;
@@ -7740,7 +7839,12 @@ impl Bridge {
         }
     }
 
-    fn budget_allows(&mut self, subject: &str, opens: Opens) -> bool {
+    /// Whether a publish to `subject` may go out under the node's subject budget: an indexed
+    /// subject always may, and so may any while the budget cannot be read; a new one only
+    /// while it leaves the reserve `opens` keeps whole, counting `opening` new subjects the
+    /// caller already allowed ahead of it, which the broker's count does not hold until they
+    /// land.
+    fn budget_allows(&mut self, subject: &str, opens: Opens, opening: u64) -> bool {
         if self.indexed_subjects.contains(subject) {
             return true;
         }
@@ -7760,7 +7864,7 @@ impl Bridge {
             Ok(None) | Err(_) => return true,
         };
         let reserve = opens.reserve(budget.max);
-        if budget.remaining() > reserve {
+        if budget.remaining() > reserve.saturating_add(opening) {
             return true;
         }
         let fx = self.fx.clone();
@@ -7777,9 +7881,14 @@ impl Bridge {
             self.indexed_subjects.insert(subject.to_string());
             return true;
         }
+        let ahead = if opening == 0 {
+            String::new()
+        } else {
+            format!(" ({opening} of them already allowed to new subjects ahead of it)")
+        };
         stderr_line!(
             "aterm-link: the post to {subject} would open a subject with {} of this \
-             node's {} left: the last {reserve} are kept for {}",
+             node's {} left{ahead}: the last {reserve} are kept for {}",
             budget.remaining(),
             budget.max,
             opens.kept_for()
@@ -7830,7 +7939,7 @@ impl Bridge {
                 return Ok(Route::Unroutable);
             }
             let mut hosted = self.per_sid.epochs.contains_key(&sid);
-            if !hosted {
+            if !hosted && !self.roster_looked {
                 let _ = self.refresh_sessions();
                 hosted = self.per_sid.epochs.contains_key(&sid);
             }
@@ -8178,6 +8287,7 @@ impl Bridge {
                     self.publish_session_presence(&sid, "exited");
                 }
                 self.per_sid.epochs.remove(&sid);
+                self.roster_seen = None;
                 let _ = self.refresh_sessions();
             }
             _ => {}
@@ -8185,6 +8295,9 @@ impl Bridge {
     }
 
     fn take_bye(&mut self, bye: Bye) {
+        // The count carries into a successor whose local ids can differ
+        // (`continue_roster_seq`), so past a bye no count stands for a roster.
+        self.roster_seen = None;
         if self.attachment != Attachment::Inherited || self.bye == Some(Bye::Quit) {
             return;
         }
@@ -9201,22 +9314,31 @@ impl Bridge {
         }
     }
 
-    /// Unlink the files an earlier boot's sessions left in the state dir, keeping those of every
-    /// session the roster just read ([`StateDir::sweep_sessions_of_an_earlier_boot`]); once, at
-    /// the start, after its recovery tried the sweep of torn files. A roster that did not read
-    /// sweeps nothing, and what is left goes at the next boot's start.
+    /// Unlink the files an earlier boot's sessions left in the state dir and retire their post
+    /// reservations, keeping those of every session the roster just read
+    /// ([`StateDir::sweep_sessions_of_an_earlier_boot`]), so the subjects they named go back
+    /// to the budget at the reclaim's next due pass ([`Bridge::reclaim_subjects`]); once, at
+    /// the start, after its recovery tried the sweep of torn files and before the attach
+    /// publishes again what is in flight. A roster that did not read sweeps nothing, and what
+    /// is left goes at the next boot's start.
     fn sweep_sessions_of_an_earlier_boot(&mut self) {
         let live: BTreeSet<String> = self.locals.values().cloned().collect();
+        #[cfg(test)]
+        self.state.keep_earlier_boot_reservations(
+            self.fx
+                .mutant(crate::sim::world::Mutant::KeepEarlierBootReservations),
+        );
         match self.state.sweep_sessions_of_an_earlier_boot(&live) {
             Ok(0) => {}
             Ok(n) => stderr_line!(
-                "aterm-link: the last bridge ran in an earlier boot: {n} files of the sessions \
-                 that boot ended (keys/, acks/, unhandled/, seen/, topics/) removed from the \
-                 state dir"
+                "aterm-link: the last bridge ran in an earlier boot: {n} files and post \
+                 reservations of the sessions that boot ended (keys/, acks/, unhandled/, seen/, \
+                 topics/ and the post journal's reservations) removed from the state dir"
             ),
             Err(e) => stderr_line!(
-                "aterm-link: the files of the sessions an earlier boot ended could not all be \
-                 removed from the state dir: {e}; what is left goes at the next boot's start"
+                "aterm-link: the files and post reservations of the sessions an earlier boot \
+                 ended could not all be removed from the state dir: {e}; what is left goes at \
+                 the next boot's start"
             ),
         }
     }
@@ -9297,6 +9419,7 @@ impl Bridge {
             if self.watches_quarantine() {
                 self.tell_quarantine();
             }
+            // A redial reads the ring anyway, so a ring widened under this bridge is said here.
             if let Some(wait) = backoff.lost_with(self.fx.now(), self.fx.jitter()) {
                 if self.park_detached(wait) {
                     self.on_aterm_closed();
@@ -9454,9 +9577,22 @@ impl Bridge {
             park = park.min(left);
         }
         let owed = acks_owed || held_left.is_some();
+        // A park the bus mirror's pass cut short of the grace leaves the held commit for that
+        // pass, whose burst carries it (critic item C13, [`Bridge::take_commit_for_the_mirror`]);
+        // the next round's settle still sends it alone once the grace is out
+        // ([`Bridge::hold_inbox_commit`]). Any other park that takes nothing sends it.
+        let for_the_mirror = held_left.is_some_and(|left| park < left)
+            && self
+                .mirror_due(now)
+                .is_some_and(|at| at.saturating_duration_since(now) <= park);
+        #[cfg(test)]
+        let for_the_mirror = for_the_mirror
+            && !self
+                .fx
+                .mutant(crate::sim::world::Mutant::ShortParkSendsTheHeldCommit);
         let (go_on, took) = self.take_one(park);
         if go_on && !took && owed {
-            if self.commit_held.is_some() {
+            if self.commit_held.is_some() && !for_the_mirror {
                 self.flush_inbox_commit();
             }
             self.settle_acks();
@@ -10113,6 +10249,12 @@ fn ring_binds(caps: &[Cap]) -> BTreeSet<String> {
         .filter_map(|g| g.principal)
         .filter(|p| crate::enable::is_node_id(p))
         .collect()
+}
+
+/// The ring in `cap_files` if a bridge holding `held` as `node` takes it, or why it keeps `held`.
+fn ring_on_disk(cap_files: &[String], held: &[Cap], node: &str) -> Result<Vec<Cap>, String> {
+    let fresh = read_ring(cap_files).map_err(|e| e.to_string())?;
+    ring_refusal(&fresh, held, node).map_or(Ok(fresh), Err)
 }
 
 fn ring_refusal(fresh: &[Cap], held: &[Cap], node: &str) -> Option<String> {
@@ -12264,6 +12406,11 @@ mod tests {
         hellos: Arc<std::sync::Mutex<Vec<String>>>,
         hello_answer: Arc<std::sync::Mutex<String>>,
         reads_refused: Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
+        /// The `roster=` this lane names in `outbox` and `sessions bridge`, `None` as an older
+        /// aterm names none.
+        roster_seq: Arc<std::sync::Mutex<Option<u64>>>,
+        /// How many `sessions bridge` requests it has answered.
+        roster_reads: Arc<std::sync::atomic::AtomicU64>,
         transcript: Arc<std::sync::Mutex<Vec<String>>>,
         on_deliver: Arc<std::sync::Mutex<Option<LaneHook>>>,
         deliver_answers: Arc<std::sync::Mutex<BTreeMap<String, String>>>,
@@ -12387,6 +12534,8 @@ mod tests {
                 sent: Arc::default(),
                 delivered: Arc::default(),
                 roster_refused: Arc::default(),
+                roster_seq: Arc::default(),
+                roster_reads: Arc::default(),
                 roster_answer: Arc::default(),
                 hellos: Arc::default(),
                 hello_answer: Arc::new(std::sync::Mutex::new(
@@ -12421,6 +12570,7 @@ mod tests {
             let topics_seen = lane.topics_seen.clone();
             let (roster_refused, reads_refused) =
                 (lane.roster_refused.clone(), lane.reads_refused.clone());
+            let (roster_seq, roster_reads) = (lane.roster_seq.clone(), lane.roster_reads.clone());
             let links = lane.links.clone();
             let log_answer = lane.log_answer.clone();
             let (outbox, sent) = (lane.outbox.clone(), lane.sent.clone());
@@ -12461,11 +12611,20 @@ mod tests {
                 let mut out = stream.as_ref();
                 for line in BufReader::new(stream.as_ref()).lines() {
                     let Ok(line) = line else { return };
+                    let roster_token = || {
+                        roster_seq
+                            .lock()
+                            .unwrap()
+                            .map_or_else(String::new, |seq| format!(" roster={seq}"))
+                    };
+                    if line == "sessions bridge" {
+                        roster_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                     let reply = if line.starts_with("AUTH ") {
                         continue;
                     } else if matches!(line.as_str(), "outbox" | "outbox earlier-receipts=1") {
                         match outbox.lock().unwrap().as_ref() {
-                            Some(frame) => format!("OK {}\n{frame}", frame.len()),
+                            Some(frame) => format!("OK {}{}\n{frame}", frame.len(), roster_token()),
                             None => "ERR denied\n".to_string(),
                         }
                     } else if line.starts_with("outbox sent ") {
@@ -12522,7 +12681,7 @@ mod tests {
                         r
                     } else if line == "sessions bridge" {
                         let rows = roster.lock().unwrap();
-                        let mut r = format!("OK {}\n", rows.len());
+                        let mut r = format!("OK {}{}\n", rows.len(), roster_token());
                         for (local, sid) in rows.iter() {
                             r.push_str(&format!("{local} {sid} nonce={local:032x}\n"));
                         }
@@ -20521,6 +20680,286 @@ mod tests {
         (rode, records)
     }
 
+    /// **A MIRROR SNAPSHOT INSIDE THE GRACE CARRIES THE HELD COMMIT IN ONE WRITE AND ONE
+    /// BATCH** (critic item C13). A delivery owes its commit; the delivery moves the
+    /// session's mail count, so the endpoint's line for it wakes the bus mirror, whose take
+    /// holds the session's snapshot. The mirror's send is the loop's next write: the commit
+    /// goes out ahead of the batch's slots in one burst, and the broker takes them into one
+    /// writer batch. Once the acks are read the group is through the delivery and every slot
+    /// is on the bus. So it goes in each order the loop meets the two in:
+    ///
+    /// - [`MirrorPass::AfterTheSettle`]: the line comes while the loop parks, after the idle
+    ///   round held the commit;
+    /// - [`MirrorPass::BeforeTheSettle`]: the line was read before the delivery's round
+    ///   ended, so the mirror's pass, which runs ahead of the round's settle
+    ///   ([`Bridge::mirror_then_round`]), finds the commit due and not yet held;
+    /// - [`MirrorPass::AfterAShortPark`]: the round held the commit with the mirror's pass due
+    ///   now, so the park is cut short of the grace and takes nothing.
+    ///
+    /// NEGATIVE CONTROLS, one per order: with the mirror sending its slots bare
+    /// ([`crate::sim::world::Mutant::MirrorSendsItsSlotsBare`], the bridge before C13), with
+    /// its burst carrying only a commit already held
+    /// ([`crate::sim::world::Mutant::MirrorRidesOnlyAHeldCommit`]), and with every park that
+    /// takes nothing sending the held commit
+    /// ([`crate::sim::world::Mutant::ShortParkSendsTheHeldCommit`]), the burst carries no
+    /// commit and the commit costs a writer batch of its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_mirror_snapshot_inside_the_grace_carries_the_held_commit_in_one_write_and_one_batch() {
+        use crate::sim::world::Mutant;
+        for (pass, mutant) in [
+            (MirrorPass::AfterTheSettle, Mutant::MirrorSendsItsSlotsBare),
+            (
+                MirrorPass::BeforeTheSettle,
+                Mutant::MirrorRidesOnlyAHeldCommit,
+            ),
+            (
+                MirrorPass::AfterAShortPark,
+                Mutant::ShortParkSendsTheHeldCommit,
+            ),
+        ] {
+            let rode = mirror_after_a_delivery(crate::fx::Fx::os(), pass);
+            assert_eq!(
+                rode.owed.first().copied(),
+                Some("commit"),
+                "{pass:?}: the commit went out first: {:?}",
+                rode.owed
+            );
+            assert!(
+                rode.owed[1..].iter().all(|kind| *kind == "mirror") && rode.owed.len() > 1,
+                "{pass:?}: every slot behind it, in the one burst: {:?}",
+                rode.owed
+            );
+            assert!(
+                rode.snapshot,
+                "{pass:?}: PRECONDITION: the take holds the snapshot"
+            );
+            assert_eq!(
+                (rode.held_after_send, rode.batches),
+                (false, 1),
+                "{pass:?}: taken by the mirror's burst, the commit and every slot one writer batch"
+            );
+            assert!(
+                rode.committed && rode.on_bus,
+                "{pass:?}: the group is through the delivery"
+            );
+
+            let bare = mirror_after_a_delivery(crate::fx::Fx::os_without(mutant), pass);
+            assert!(
+                bare.owed.iter().all(|kind| *kind == "mirror") && !bare.owed.is_empty(),
+                "{pass:?}: NEGATIVE CONTROL ({mutant:?}): the slots went bare: {:?}",
+                bare.owed
+            );
+            assert_eq!(
+                bare.batches, 2,
+                "{pass:?}: NEGATIVE CONTROL ({mutant:?}): the commit went alone, in a batch of \
+                 its own"
+            );
+            assert!(bare.committed && bare.on_bus, "{pass:?} ({mutant:?})");
+        }
+    }
+
+    /// **A MIRROR PASS AT THE WINDOW'S EDGE STILL CARRIES THE DUE COMMIT** (critic item C13
+    /// review): with one ack short of [`PIPELINE_WINDOW`] owed when the pass starts, the
+    /// burst waits for room for the commit and a slot rather than writing its slots one bare
+    /// write each, so the first burst carries the commit ahead of the snapshot.
+    #[cfg(unix)]
+    #[test]
+    fn a_mirror_pass_at_the_windows_edge_still_carries_the_due_commit() {
+        let rode = mirror_after_a_delivery(crate::fx::Fx::os(), MirrorPass::AtTheWindowsEdge);
+        let sent: Vec<&str> = rode
+            .owed
+            .iter()
+            .copied()
+            .filter(|kind| *kind != "other")
+            .collect();
+        assert_eq!(
+            sent.first().copied(),
+            Some("commit"),
+            "the commit went out ahead of every slot: {:?}",
+            rode.owed
+        );
+        assert!(
+            sent.len() > 1 && sent[1..].iter().all(|kind| *kind == "mirror"),
+            "every slot behind it: {:?}",
+            rode.owed
+        );
+        assert!(rode.snapshot, "PRECONDITION: the take holds the snapshot");
+        assert!(
+            !rode.held_after_send && rode.committed && rode.on_bus,
+            "taken by the mirror's burst, and the group is through the delivery"
+        );
+    }
+
+    /// The order the loop meets a delivery's commit and the mirror pass it owes in
+    /// ([`mirror_after_a_delivery`]).
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum MirrorPass {
+        /// The idle round holds the commit, then the endpoint's line wakes the mirror.
+        AfterTheSettle,
+        /// The mirror is owed already when the delivery's round ends: its pass comes first.
+        BeforeTheSettle,
+        /// The idle round holds the commit with the mirror's pass due now: the park is zero.
+        AfterAShortPark,
+        /// [`MirrorPass::BeforeTheSettle`] with the pipeline window one ack short of full
+        /// when the pass starts, the session's face already indexed (no budget read settles
+        /// the window first).
+        AtTheWindowsEdge,
+    }
+
+    /// What [`mirror_after_a_delivery`] saw.
+    #[cfg(unix)]
+    struct MirrorRide {
+        /// What the mirror's send left owed on the link, oldest first.
+        owed: Vec<&'static str>,
+        /// Whether a slot of the take was a snapshot.
+        snapshot: bool,
+        /// Whether a commit was still held once the mirror's send went out.
+        held_after_send: bool,
+        /// The writer batches from the round's park (or the mirror's send) through the
+        /// commit's landing.
+        batches: u64,
+        /// Whether the group ended through the delivery.
+        committed: bool,
+        /// Whether every slot ended on the bus.
+        on_bus: bool,
+    }
+
+    /// A delivery that owes its commit, then the mirror pass the endpoint's line owes, met in
+    /// the order `pass` names, on `fx`; once its acks are read, a commit still owed goes
+    /// alone, as the backstop sends it.
+    #[cfg(unix)]
+    fn mirror_after_a_delivery(fx: crate::fx::Fx, pass: MirrorPass) -> MirrorRide {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+        bridge.fx = fx;
+        let (records, _reader, _socket, broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 1);
+        bridge.mirror = Some(mirror_run::MirrorRun::acked_for_tests(
+            &bridge.state,
+            aterm_slog::TAKE_MAX,
+        ));
+        let mut log = aterm_slog::Log::with_limits(
+            1,
+            aterm_slog::Limits::new(8, 1 << 20).expect("a small ring"),
+        );
+        log.open_session(
+            aterm_slog::Kind::Spawn,
+            aterm_slog::Src::Aterm,
+            aterm_slog::Conf::Exact,
+            aterm_slog::Actor::Aterm,
+            aterm_slog::Fields::new(),
+            aterm_slog::Stamp::new(1, 1),
+        )
+        .expect("the session opens");
+        lane.mirror
+            .lock()
+            .unwrap()
+            .logs
+            .insert("s-b".to_string(), log);
+
+        bridge.in_round = true;
+        bridge.on_inbox_record(&records[0]);
+        bridge.in_round = false;
+        assert_eq!(
+            bridge.inbox_pending,
+            Some(records[0].0),
+            "PRECONDITION: the delivery owes its commit"
+        );
+        assert!(bridge.mailbox.is_idle());
+        assert_eq!(bridge.conn.as_ref().map(Link::unacked), Some(0));
+        let batches = broker.stats().writer_batches;
+        match pass {
+            MirrorPass::AfterTheSettle => {
+                bridge.settle_owed();
+                assert!(
+                    bridge.commit_held.is_some(),
+                    "PRECONDITION: the idle round holds it"
+                );
+                bridge.mirror_wake();
+            }
+            MirrorPass::BeforeTheSettle => {
+                bridge.mirror_wake();
+                assert!(
+                    bridge.commit_held.is_none(),
+                    "PRECONDITION: no round held it yet"
+                );
+            }
+            MirrorPass::AtTheWindowsEdge => {
+                let node = bridge.node.clone();
+                bridge
+                    .indexed_subjects
+                    .insert(subject::session_face("f", &node, "s-b", "ev"));
+                bridge.in_round = true;
+                for i in 0..PIPELINE_WINDOW - 1 {
+                    bridge.publish_ev(&format!("ahead {i}"));
+                }
+                bridge.in_round = false;
+                assert_eq!(
+                    bridge.conn.as_ref().map(Link::unacked),
+                    Some(PIPELINE_WINDOW - 1),
+                    "PRECONDITION: room for one write"
+                );
+                bridge.mirror_wake();
+                assert!(
+                    bridge.commit_held.is_none(),
+                    "PRECONDITION: no round held it yet"
+                );
+            }
+            MirrorPass::AfterAShortPark => {
+                bridge.mirror_wake();
+                bridge.settle_owed();
+                assert!(
+                    bridge.commit_held.is_some(),
+                    "PRECONDITION: the idle round holds it"
+                );
+                let wait = bridge.park_wait(bridge.fx.now());
+                assert_eq!(
+                    wait,
+                    Duration::ZERO,
+                    "PRECONDITION: the mirror's pass is due now"
+                );
+                assert!(bridge.park_and_take(wait));
+                assert_eq!(
+                    bridge.parked,
+                    Some(Duration::ZERO),
+                    "PRECONDITION: the park took nothing"
+                );
+            }
+        }
+        bridge.mirror_step();
+        let link = bridge.conn.as_ref().expect("the link stands");
+        let owed: Vec<&'static str> = link
+            .owed()
+            .map(|then| match then {
+                Then::Commit { .. } => "commit",
+                Then::Mirror { .. } => "mirror",
+                _ => "other",
+            })
+            .collect();
+        let snapshot = bridge
+            .mirror
+            .as_deref()
+            .is_some_and(|m| m.batch().0.iter().any(|s| s.body.contains(" op=snap ")));
+        let held_after_send = bridge.commit_held.is_some();
+        bridge.settle_acks();
+        bridge.flush_inbox_commit();
+        bridge.settle_acks();
+        let on_bus = bridge.mirror.as_deref().is_some_and(|m| {
+            m.batch()
+                .1
+                .iter()
+                .all(|o| matches!(o, mirror_run::Outcome::OnBus(_)))
+        });
+        MirrorRide {
+            owed,
+            snapshot,
+            held_after_send,
+            batches: broker.stats().writer_batches - batches,
+            committed: bridge.committed == Some(records[0].0) && bridge.inbox_pending.is_none(),
+            on_bus,
+        }
+    }
+
     /// **THE WIND-DOWN LANDS A HELD INBOX COMMIT** (critic item B08): a commit held for the
     /// next write when aterm closes the bridge is the owed commit the wind-down lands, so
     /// the group is through the delivery and the next bridge redelivers nothing. The delivery
@@ -25137,6 +25576,249 @@ mod tests {
         }
     }
 
+    /// `<dir>/<name>` holding one line of a ring, at `mode`.
+    #[cfg(unix)]
+    fn a_ring_at(dir: &std::path::Path, name: &str, mode: u32) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join(name);
+        let c = astream_cap::mint(&[7u8; 32], "ro:/f/f1/pub/>").expect("mint");
+        std::fs::write(
+            &path,
+            astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n",
+        )
+        .expect("the ring");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// What a cap can be refused for, and the words that say what to do: the mode's `chmod`, and
+    /// what makes a right one for what is no file of its own.
+    #[cfg(unix)]
+    fn refusal(path: &str) -> (io::ErrorKind, String) {
+        let e = read_cap_file(path).expect_err("a refused cap");
+        (e.kind(), e.to_string())
+    }
+
+    /// A cap is authority: one others can read is refused at once, naming the file and the `chmod`
+    /// that closes it, and so is one read back by a bridge that holds a ring.
+    #[cfg(unix)]
+    #[test]
+    fn a_cap_file_others_can_read_is_refused_naming_the_file_and_the_chmod() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-cap-wide")
+            .tempdir()
+            .expect("scratch");
+        for mode in [0o644, 0o640, 0o604, 0o660] {
+            let path = a_ring_at(dir.path(), "wide.cap", mode);
+            let (kind, said) = refusal(&path);
+            assert_eq!(kind, io::ErrorKind::PermissionDenied, "{mode:o}: {said}");
+            assert!(
+                said.starts_with(&format!("{path} is mode {mode:04o}: ")),
+                "{said}"
+            );
+            assert!(said.contains(&format!("chmod 600 {path}")), "{said}");
+        }
+    }
+
+    /// A FIFO for a cap has no writer and never will: the read says so at once, behind the
+    /// one-minute hang detector, where a plain read waits for ever.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_for_a_cap_file_is_refused_without_waiting_for_a_writer() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-cap-fifo")
+            .tempdir()
+            .expect("scratch");
+        let fifo = dir.path().join("fifo.cap");
+        let made = aterm_uds::spawnfd::command("mkfifo")
+            .arg("-m")
+            .arg("600")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo");
+        let path = fifo.to_string_lossy().into_owned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reading = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_cap_file(&reading).map_err(|e| (e.kind(), e.to_string())));
+        });
+        let (kind, said) = rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the read waited on a FIFO")
+            .expect_err("a FIFO is no cap file");
+        assert_eq!(kind, io::ErrorKind::InvalidInput, "{said}");
+        assert!(said.starts_with(&format!("{path} is a FIFO: ")), "{said}");
+        assert!(said.contains("aterm fabric mint-for"), "what to do: {said}");
+    }
+
+    /// A link is refused without being followed, naming the link and what to do.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_for_a_cap_file_is_refused_without_following_it() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-cap-link")
+            .tempdir()
+            .expect("scratch");
+        let real = a_ring_at(dir.path(), "real.cap", 0o600);
+        let link = dir.path().join("link.cap");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let path = link.to_string_lossy().into_owned();
+        let (kind, said) = refusal(&path);
+        assert_eq!(kind, io::ErrorKind::PermissionDenied, "{said}");
+        assert!(
+            said.starts_with(&format!("{path} is a symlink: ")),
+            "{said}"
+        );
+        assert!(said.contains("name the file it points at"), "{said}");
+        assert_eq!(read_cap_file(&real).expect("the file itself").len(), 1);
+    }
+
+    /// What every build wrote keeps reading: a ring at 0600 or tighter, in a directory of any mode
+    /// (`mint-for --out ~/h-andrew.cap`, a home directory being 0750 or 0755) and by any number of
+    /// names (`fabric on` holds a second one while it keeps an old ring aside). A wrong line is
+    /// still a wrong line, and an absent file still says so.
+    #[cfg(unix)]
+    #[test]
+    fn a_cap_file_every_build_wrote_keeps_reading_wherever_a_person_keeps_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-cap-kept")
+            .tempdir()
+            .expect("scratch");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("a directory others can list");
+        for mode in [0o600, 0o400] {
+            let path = a_ring_at(dir.path(), &format!("kept-{mode:o}.cap"), mode);
+            assert_eq!(
+                read_ring(std::slice::from_ref(&path)).expect("kept").len(),
+                1
+            );
+        }
+        let named = a_ring_at(dir.path(), "named.cap", 0o600);
+        std::fs::hard_link(&named, dir.path().join("named.cap.aside")).expect("a second name");
+        assert_eq!(read_cap_file(&named).expect("two names").len(), 1);
+
+        let empty = dir.path().join("empty.cap");
+        std::fs::write(&empty, "").expect("empty");
+        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        assert!(read_cap_file(&empty.to_string_lossy())
+            .expect("no length floor")
+            .is_empty());
+
+        let broken = dir.path().join("broken.cap");
+        std::fs::write(&broken, "ro:/f/f1/> nothex\n").expect("broken");
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let e = read_cap_file(&broken.to_string_lossy()).expect_err("malformed");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            e.to_string()
+                .starts_with(&format!("{}:1: ", broken.display())),
+            "{e}"
+        );
+
+        let absent = dir.path().join("absent.cap");
+        let e = read_cap_file(&absent.to_string_lossy()).expect_err("absent");
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert!(
+            e.to_string()
+                .starts_with(&format!("{}: ", absent.display())),
+            "{e}"
+        );
+    }
+
+    /// Supervised startup must refuse the same files as every other reader, before it can
+    /// admit control lanes, and leave both bytes and permissions untouched.
+    #[cfg(unix)]
+    #[test]
+    fn supervised_start_refuses_unsafe_rings_before_admitting_its_lanes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-cap-start")
+            .tempdir()
+            .expect("scratch");
+        let real = a_ring_at(dir.path(), "node.cap", 0o600);
+        let bytes = std::fs::read(&real).unwrap();
+        let link = dir.path().join("link.cap");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let link = link.to_string_lossy().into_owned();
+        for folder_mode in [0o700, 0o755] {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(folder_mode))
+                .unwrap();
+            for (path, mode) in [(&real, 0o644), (&real, 0o000), (&link, 0o600)] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+                let cfg = Config {
+                    fleet: "f1".into(),
+                    broker: dir
+                        .path()
+                        .join("unused.sock")
+                        .to_string_lossy()
+                        .into_owned(),
+                    cap_files: vec![path.clone()],
+                    state_dir: dir.path().join("state").to_string_lossy().into_owned(),
+                    accept_from: Vec::new(),
+                    sock: None,
+                    token: None,
+                    presence: Mode::Meta,
+                    receipts: true,
+                    log: crate::mirror::LogMode::Off,
+                };
+                // These sentinels are not sockets: a skipped capability check fails at a
+                // different boundary, without waiting for an endpoint that will never reply.
+                let lanes = InheritedLanes {
+                    verb: std::fs::File::open("/dev/null").unwrap().into(),
+                    push: std::fs::File::open("/dev/null").unwrap().into(),
+                };
+                let error = match Bridge::with_inherited_lanes(cfg, lanes) {
+                    Ok(_) => panic!("a refused ring started a bridge"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+                assert!(error.to_string().contains(path.as_str()), "{error}");
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    mode
+                );
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+            assert!(read_cap_file(&real).is_ok(), "the underlying ring is valid");
+            assert!(std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+    }
+
+    #[test]
+    fn os_permission_denials_are_refusals_not_repairable_missing_files() {
+        assert!(cap_refused(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+        assert!(cap_refused(&io::Error::from(io::ErrorKind::Other)));
+        assert!(!cap_refused(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(!cap_refused(&io::Error::from(io::ErrorKind::InvalidData)));
+    }
+
+    /// A RUNNING BRIDGE IS NEVER STRANDED: a ring widened or swapped under it is not taken, and the
+    /// verdict names what to do, so the bridge attaches with the ring it holds at its next dial.
+    #[cfg(unix)]
+    #[test]
+    fn a_ring_refused_on_disk_leaves_a_running_bridge_with_the_ring_it_holds() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-cap-held")
+            .tempdir()
+            .expect("scratch");
+        let path = a_ring_at(dir.path(), "node.cap", 0o600);
+        let files = vec![path.clone()];
+        let held = read_ring(&files).expect("the ring it holds");
+        assert_eq!(ring_on_disk(&files, &held, "n-a"), Ok(held.clone()));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("widen");
+        let why = ring_on_disk(&files, &held, "n-a").expect_err("a ring others can read");
+        assert!(why.contains(&format!("chmod 600 {path}")), "{why}");
+    }
+
     #[test]
     fn a_ring_read_again_is_taken_only_when_it_is_still_this_nodes() {
         let ring = |node: &str, tag: u8, exp: Option<&str>| -> Vec<Cap> {
@@ -25185,5 +25867,9 @@ mod tests {
 
     mod reclaim {
         include!("bridge_reclaim_tests.rs");
+    }
+
+    mod roster_count {
+        include!("bridge_roster_tests.rs");
     }
 }

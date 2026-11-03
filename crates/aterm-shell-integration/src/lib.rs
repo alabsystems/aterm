@@ -738,14 +738,49 @@ fn scratch_suffix() -> String {
     format!("{}-{nanos}-{n}", std::process::id())
 }
 
+fn ensure_real_root(root: &Path) -> Result<(), std::io::Error> {
+    if let Ok(meta) = std::fs::symlink_metadata(root)
+        && !meta.file_type().is_dir()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "shell-integration root is not a real directory: {}",
+                root.display()
+            ),
+        ));
+    }
+    std::fs::create_dir_all(root)?;
+    if !std::fs::symlink_metadata(root).is_ok_and(|m| m.file_type().is_dir()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "shell-integration root is not a real directory: {}",
+                root.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn install_script_set(root: &Path) -> Result<PathBuf, std::io::Error> {
+    if std::fs::symlink_metadata(root).is_ok_and(|m| !m.file_type().is_dir()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "shell-integration root is not a real directory: {}",
+                root.display()
+            ),
+        ));
+    }
     let address = script_set_address();
     let dir = root.join(address);
     if script_set_matches(&dir) {
         return Ok(dir);
     }
-    std::fs::create_dir_all(root)?;
+    ensure_real_root(root)?;
     let tmp = root.join(format!(".tmp-{address}-{}", scratch_suffix()));
+    std::fs::create_dir(&tmp)?;
     if let Err(e) = ensure_scripts(&tmp) {
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(e);
@@ -802,6 +837,9 @@ const fn is_address(name: &str) -> bool {
 }
 
 fn collect_old_script_sets(root: &Path, now: std::time::SystemTime) {
+    if !std::fs::symlink_metadata(root).is_ok_and(|m| m.file_type().is_dir()) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
@@ -810,8 +848,14 @@ fn collect_old_script_sets(root: &Path, now: std::time::SystemTime) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_dir() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() || ft.is_symlink() {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.file_type().is_dir() {
             continue;
         }
         let modified = meta.modified().unwrap_or(now);
@@ -1115,7 +1159,7 @@ builtin source \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"
 const CLT_BASH_ENV_FILE: &str = "bash/clt_env";
 
 /// The `BASH_ENV` hook that keeps the Command Line Tools shim ahead of `/usr/bin` in a bash
-/// started inside a tab (design §6.3). While aterm installs the tools (the shim's `.wanted` mark
+/// started inside a tab (design §6.3). While the tools are missing (the shim's `.wanted` mark
 /// is there), each integrated shell exports `BASH_ENV` naming this file and keeps the value it
 /// replaced in `ATERM_CLT_BASH_ENV_BEFORE`. A bash that runs a command (`bash -lc`, a script)
 /// reads it after

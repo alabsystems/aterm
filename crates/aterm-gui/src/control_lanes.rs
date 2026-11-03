@@ -175,6 +175,30 @@ impl Segment {
 }
 
 impl Outbox {
+    /// The explicit Rust-only host fixture records a decision, never reply data
+    /// (native replies may contain operation capabilities).
+    #[cfg(all(unix, debug_assertions))]
+    pub(super) fn fixture_reply_ok(&self) -> Option<bool> {
+        let Segment::Bytes(bytes) = self.segments.front()? else {
+            return None;
+        };
+        if bytes.starts_with(b"OK ") || bytes.starts_with(b"OK\n") {
+            Some(true)
+        } else if bytes.starts_with(b"ERR ") || bytes.starts_with(b"ERR\n") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// The explicit host fixture pauses only a completed Ready reply, never a
+    /// waiting/error response or any native capability-bearing payload.
+    #[cfg(all(unix, debug_assertions))]
+    pub(super) fn fixture_renewal_ready(&self) -> bool {
+        matches!(self.segments.front(), Some(Segment::Bytes(bytes))
+            if bytes.starts_with(b"OK codex-renewal state=ready id="))
+    }
+
     fn owed(&self) -> bool {
         !self.segments.is_empty()
     }

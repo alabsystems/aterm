@@ -38,16 +38,12 @@ struct Lab {
     url: String,
     hold: Duration,
     gap: Duration,
-    /// The server stands in for one on the home ALab LAN, where members answered
-    /// (`server::start_at_home`).
-    home: bool,
 }
 
 fn start(
     listener: std::net::TcpListener,
     store: PathBuf,
     (hold, gap): (Duration, Duration),
-    home: bool,
 ) -> Running {
     let options = Options {
         listen: "127.0.0.1:0".parse().expect("addr"),
@@ -57,12 +53,7 @@ fn start(
         hold,
         keep_awake: false,
     };
-    if home {
-        server::start_at_home(listener, &options, gap)
-    } else {
-        server::start_with_join_change_gap(listener, &options, gap)
-    }
-    .expect("server starts")
+    server::start_with_join_change_gap(listener, &options, gap).expect("server starts")
 }
 
 impl Lab {
@@ -78,20 +69,11 @@ impl Lab {
         Lab::tuned(vault, Duration::from_secs(50), Duration::ZERO)
     }
 
-    /// A lab whose server is on the home ALab LAN, its join queue changeable at once.
-    fn at_home(vault: &str) -> Lab {
-        Lab::placed(vault, (Duration::from_secs(50), Duration::ZERO), true)
-    }
-
     fn tuned(vault: &str, hold: Duration, gap: Duration) -> Lab {
-        Lab::placed(vault, (hold, gap), false)
-    }
-
-    fn placed(vault: &str, (hold, gap): (Duration, Duration), home: bool) -> Lab {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let copy = socket.try_clone().expect("a copy of the socket");
-        let server = start(copy, root.path().join("store"), (hold, gap), home);
+        let server = start(copy, root.path().join("store"), (hold, gap));
         let url = format!("http://{}/v1/{vault}", server.addr);
         Lab {
             root,
@@ -100,7 +82,6 @@ impl Lab {
             url,
             hold,
             gap,
-            home,
         }
     }
 
@@ -109,7 +90,7 @@ impl Lab {
         let store = self.root.path().join("store");
         std::fs::remove_dir_all(&store).expect("store removed");
         let copy = self.socket.try_clone().expect("a copy of the socket");
-        self.server = Some(start(copy, store, (self.hold, self.gap), self.home));
+        self.server = Some(start(copy, store, (self.hold, self.gap)));
     }
 
     /// Stop the server: no admin's approver, and no vault, can be reached.
@@ -124,7 +105,6 @@ impl Lab {
             copy,
             self.root.path().join("store"),
             (self.hold, self.gap),
-            self.home,
         ));
     }
 
@@ -1367,118 +1347,6 @@ fn a_personal_vault_request_with_no_allow_is_never_admitted() {
     ));
 }
 
-/// A first-time join on the home ALab LAN (its server observed it where members answered)
-/// needs no member's Allow, password or interaction under the default ALab policy. It gains the
-/// same authenticated secrets and Commons writer enrollment as an explicitly admitted member,
-/// and a later revoke still keeps it out. The same join at a server with no member evidence (a
-/// phone hotspot, a café) is never let in by the policy.
-///
-/// NEGATIVE CONTROL: with the lab's server started plainly (`Lab::changing`, no home), the
-/// request lists no `home=` and `test_auto_approve_alab_lan` approves nobody, so the
-/// `["m2"]` assertion fails (the second half of this test is that control, kept).
-#[test]
-fn the_default_alab_lan_policy_admits_a_new_machine_and_converges_commons() {
-    use aterm_secrets::commons::binding::Pending;
-    use aterm_secrets::commons::roster::Role;
-
-    {
-        let away = Lab::changing("alab");
-        let admin = away.home("m1");
-        let created = client::create(&admin, &away.url, None, Some("m1")).unwrap();
-        let machine = away.home("m2");
-        let pinned = format!("{}#{}", away.url, created.signer);
-        join_unattended(&machine, &pinned, "m2").unwrap();
-        let requests = client::requests(&admin, None).unwrap();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].home.is_none(), "no member evidence: no home");
-        assert!(
-            client::test_auto_approve_alab_lan(&admin)
-                .unwrap()
-                .approved
-                .is_empty()
-        );
-    }
-    let lab = Lab::at_home("alab");
-    let admin = lab.home("m1");
-    let token = synthetic("gh");
-    write_private(&admin.home.join(".secrets/gh_access_token"), &token);
-    let created = client::create(
-        &admin,
-        &lab.url,
-        Some(&admin.home.join(".secrets")),
-        Some("m1"),
-    )
-    .unwrap();
-    let machine = lab.home("m2");
-    let pinned = format!("{}#{}", lab.url, created.signer);
-    assert!(matches!(
-        join_unattended(&machine, &pinned, "m2").unwrap(),
-        JoinOutcome::Pending { .. }
-    ));
-    let requests = client::requests(&admin, None).unwrap();
-    assert_eq!(requests.len(), 1);
-    assert!(
-        requests[0].home.is_some() && requests[0].allowed.is_none() && requests[0].proof.is_none()
-    );
-    // The fixture's key is not the compiled ALab key, even though its vault is named alab.
-    assert!(client::auto_approve(&admin).unwrap().approved.is_empty());
-    let done = client::test_auto_approve_alab_lan(&admin).unwrap();
-    assert_eq!(done.approved, ["m2"]);
-    assert!(done.allowed.is_empty() && done.asking.is_empty());
-    assert_eq!(
-        client::admin_cached(&admin)
-            .unwrap()
-            .commons_admission("m2")
-            .unwrap()
-            .method,
-        client::AdmissionMethod::Open
-    );
-    applied(client::sync(&machine, None).unwrap());
-    assert_eq!(
-        read(&machine, "gh_access_token").as_deref(),
-        Some(token.as_str())
-    );
-    assert!(matches!(
-        client::status(&machine).unwrap().membership,
-        Membership::In { .. }
-    ));
-
-    let owner = Bootstrap::required(&admin).unwrap();
-    let peer = Bootstrap::required(&machine).unwrap();
-    assert_eq!(owner.trust(), peer.trust());
-    let request = peer.request().unwrap();
-    let (mut pending, challenge) =
-        Pending::issue(&request, owner.trust().network, owner.trust().authority).unwrap();
-    let answer = peer.device().answer(&request, &challenge).unwrap();
-    let possession = pending.verify(&answer).unwrap();
-    let mut owner_journal = Journal::open_existing(owner.journal_dir(), owner.trust()).unwrap();
-    let node = client::admin_cached(&admin)
-        .unwrap()
-        .enroll_commons_member(&owner, &mut owner_journal, possession)
-        .unwrap();
-    let mut peer_journal = Journal::open_existing(peer.journal_dir(), peer.trust()).unwrap();
-    peer_journal.ingest(node.bytes()).unwrap();
-    let access = peer
-        .access_in(&peer_journal)
-        .unwrap()
-        .expect("new member is a Commons writer");
-    assert_eq!(access.local().role(), Role::Writer);
-    assert_eq!(access.local().binding(), request.binding());
-    drop(access);
-    drop(peer_journal);
-    drop(owner_journal);
-
-    let open = client::admin_open(&admin).unwrap();
-    client::admin_revoke(&admin, &open, "m2", false).unwrap();
-    assert!(
-        client::test_auto_approve_alab_lan(&admin)
-            .unwrap()
-            .approved
-            .is_empty()
-    );
-    assert_eq!(client::sync(&machine, None).unwrap(), SyncOutcome::NotIn);
-}
-
 /// What `paths` holds of Commons control: its state (one head, or a conflict of several) and
 /// every control node it holds; `None` while it holds no Commons control at all.
 fn control(paths: &Paths) -> Option<(String, Vec<String>)> {
@@ -1611,8 +1479,6 @@ fn an_allowed_signed_by_a_key_no_roster_member_binds_is_refused() {
             host: "mb".into(),
             code: client::join_code(&recipient),
             time: None,
-            lan: false,
-            home: None,
             allowed: Some(allowed.to_text()),
             proof: None,
         }

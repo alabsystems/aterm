@@ -11,7 +11,7 @@
 mod kitty;
 pub(crate) mod lines;
 mod lockup;
-mod marks;
+pub(crate) mod marks;
 mod page;
 
 use std::cell::{Cell, RefCell};
@@ -1515,6 +1515,9 @@ pub(crate) enum SystemStateAction {
     /// The Secrets vault row's Turn On Sync: this Mac's sync, which the
     /// person turned off, goes on again (`InitialSetupHandlers::sync_on`).
     TurnSyncOn { by_person: bool },
+    /// The offer's one press: a person asks for every grant macOS needs them to answer
+    /// (`InitialSetupHandlers::ask_access`), and the window's access steps take them in turn.
+    AskForAccess { by_person: bool },
     /// The GitHub repositories row's Install…: the terminal tab that installs Apple's Command
     /// Line Tools opens now (`App::press_developer_tools_install`).
     InstallDeveloperTools { by_person: bool },
@@ -1572,6 +1575,22 @@ fn edit_text(input: &mut TextInputState, event: TextInputEvent) {
         }
         TextInputEvent::Submit | TextInputEvent::Cancel => {}
     }
+}
+
+/// The key of the footer's one button for the grants on offer ([`offered_access`]).
+pub(crate) const ASK_FOR_ACCESS: &str = "system-state/access/ask";
+
+/// The grants on offer now: those only a person can give while nobody asked for them
+/// ([`aterm_types::macos_setup::ACCESS_OFFERED`]). They hold nothing back.
+pub(crate) fn offered_access(status: &SetupStatus) -> Vec<Access> {
+    status
+        .observations_for(status.plan.as_ref().map(|plan| plan.vault_url.as_str()))
+        .filter(|seen| seen.note.as_deref() == Some(aterm_types::macos_setup::ACCESS_OFFERED))
+        .filter_map(|seen| match seen.subject {
+            Subject::Access(access) => Some(access),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The key of the Secrets vault row's Turn On Sync button.
@@ -1825,7 +1844,16 @@ fn row_view_as(
         return RowView {
             subject,
             managed,
-            value: RowValue::Muted("Not needed".to_owned()),
+            value: RowValue::Muted(
+                if reading.and_then(|row| row.note.as_deref())
+                    == Some(aterm_types::macos_setup::ACCESS_OFFERED)
+                {
+                    "Offered"
+                } else {
+                    "Not needed"
+                }
+                .to_owned(),
+            ),
             chip: None,
             note: note.filter(|note| !note.trim().is_empty()),
             open: None,
@@ -2787,7 +2815,10 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
             .iter()
             .filter(|row| row.managed)
             .all(|row| BASE_PLAN.contains(row.subject.setting()));
-    let set_up = if base_plan {
+    // Grants still on offer are no permissions set up, and hold nothing back: setup itself ended.
+    let set_up = if !offered_access(status).is_empty() {
+        ATERM_SET_UP
+    } else if base_plan {
         "Permissions are set up"
     } else {
         "This Mac is set up"
@@ -2801,6 +2832,9 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
         })
     }
 }
+
+/// The set-up headline while macOS's grants are on offer ([`offered_access`]).
+pub(crate) const ATERM_SET_UP: &str = "aterm is set up";
 
 /// What a set-up headline adds after a Check that failed as a whole: the rows show what aterm
 /// read before ([`CHECK_FAILED_NOTE`]).
@@ -4437,6 +4471,11 @@ impl SystemStateApp {
             "system-state/row/secrets/disclose" => {
                 self.vault_open = Some(!self.vault_shown());
             }
+            ASK_FOR_ACCESS if !offered_access(&self.status).is_empty() => {
+                self.actions.push_back(SystemStateAction::AskForAccess {
+                    by_person: self.by_person,
+                });
+            }
             TURN_ON_SYNC => {
                 if self.reviewed_rows().iter().any(|row| row.turn_on_sync) {
                     self.actions.push_back(SystemStateAction::TurnSyncOn {
@@ -4565,7 +4604,7 @@ impl NativeAppModel for SystemStateApp {
         AppDescriptor {
             kind: AppKind::SystemState,
             name: "System State",
-            icon: AppIcon::Settings,
+            icon: AppIcon::SystemState,
             singleton: true,
         }
     }
@@ -4660,7 +4699,7 @@ impl NativeAppModel for SystemStateApp {
     fn presentation(&self, _view: &Self::ViewState) -> AppPresentation {
         AppPresentation {
             title: "System State".to_owned(),
-            icon: AppIcon::Settings,
+            icon: AppIcon::SystemState,
             indicators: AppIndicators {
                 // A choice takes effect at once: nothing here is ever unsaved.
                 dirty: false,

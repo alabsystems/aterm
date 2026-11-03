@@ -12,7 +12,6 @@
 mod iokit;
 
 use std::panic::AssertUnwindSafe;
-use std::sync::Weak;
 
 /// What the system announced, as a [`listen`] handler hears it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,32 +59,52 @@ pub fn answer(message: Message, handler: &mut dyn FnMut(Power), allow: impl FnOn
     }
 }
 
+/// A listener [`listen`] started: it hears until this is dropped, which ends its thread at once
+/// (its run loop is stopped, so nothing looks on a timer for its owner meanwhile).
+#[derive(Debug)]
+pub struct Listening {
+    /// What ends the thread; none for an [`Listening::inert`] one.
+    _stop: Option<imp::Stop>,
+}
+
+impl Listening {
+    /// A listener that hears nothing, for a test's arm of a seam that returns one.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn inert() -> Self {
+        Self { _stop: None }
+    }
+}
+
 /// Hear this Mac's sleep and wake on a thread of its own, handing each announcement to
-/// `handler` there and answering the system as [`answer`] does, until `alive` has no strong
-/// reference left (the thread looks every few seconds). Whether the system took the
-/// registration. Elsewhere than macOS: `false`, and nothing is heard.
-pub fn listen<T: Send + Sync + 'static>(
-    alive: Weak<T>,
-    handler: Box<dyn FnMut(Power) + Send>,
-) -> bool {
-    imp::listen(alive, handler)
+/// `handler` there and answering the system as [`answer`] does, until the returned
+/// [`Listening`] is dropped; `None` when the system did not take the registration. Elsewhere
+/// than macOS: `None`, and nothing is heard.
+#[must_use]
+pub fn listen(handler: Box<dyn FnMut(Power) + Send>) -> Option<Listening> {
+    imp::listen(handler).map(|stop| Listening { _stop: Some(stop) })
 }
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
     use super::Power;
-    use std::sync::Weak;
 
-    pub(super) fn listen<T>(_alive: Weak<T>, _handler: Box<dyn FnMut(Power) + Send>) -> bool {
-        false
+    /// Never made: nothing listens here.
+    #[derive(Debug)]
+    pub(super) enum Stop {}
+
+    pub(super) fn listen(_handler: Box<dyn FnMut(Power) + Send>) -> Option<Stop> {
+        None
     }
 }
 
 #[cfg(target_os = "macos")]
 mod imp {
     use super::iokit::{
-        CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRemoveSource, CFRunLoopRunInMode,
-        IOAllowPowerChange, IODeregisterForSystemPower, IONotificationPortDestroy,
+        CFRelease, CFRetain, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRef,
+        CFRunLoopRemoveSource, CFRunLoopRunInMode, CFRunLoopSourceContext, CFRunLoopSourceCreate,
+        CFRunLoopSourceInvalidate, CFRunLoopSourceRef, CFRunLoopSourceSignal, CFRunLoopStop,
+        CFRunLoopWakeUp, IOAllowPowerChange, IODeregisterForSystemPower, IONotificationPortDestroy,
         IONotificationPortGetRunLoopSource, IONotificationPortRef, IORegisterForSystemPower,
         IOServiceClose, io_connect_t, io_object_t, io_service_t, kCFRunLoopDefaultMode,
         kIOMessageCanSystemSleep, kIOMessageSystemHasPoweredOn, kIOMessageSystemWillNotSleep,
@@ -93,17 +112,57 @@ mod imp {
     };
     use super::{Message, Power, answer};
     use std::ffi::c_void;
-    use std::sync::{Weak, mpsc};
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
 
-    /// How long the listener's run loop runs between two looks at whether its owner is gone.
-    const LOOK: Duration = Duration::from_secs(5);
+    /// How long one run of the listener's run loop may last: CoreFoundation's own "forever"
+    /// (`CFRunLoopRun`'s), so it returns only when [`Stop`] stops it.
+    const FOREVER: f64 = 1.0e10;
 
     /// What the callback reaches through its refcon: the root domain session it answers on,
     /// and the handler.
     struct Listener {
         root: io_connect_t,
         handler: Box<dyn FnMut(Power) + Send>,
+    }
+
+    /// Ends a listener's thread when dropped: it marks the thread stopped, then signals the
+    /// thread's stop source and wakes its run loop. A signalled source stays pending until the
+    /// run loop runs, so a drop before the thread first runs it is not lost (a bare
+    /// `CFRunLoopStop` then would be).
+    #[derive(Debug)]
+    pub(super) struct Stop {
+        run_loop: CFRunLoopRef,
+        source: CFRunLoopSourceRef,
+        stopped: Arc<AtomicBool>,
+    }
+
+    // SAFETY: `Stop` holds its own retained reference to the run loop and the source, and uses
+    // them only through CoreFoundation calls documented safe from any thread
+    // (`CFRunLoopSourceSignal`, `CFRunLoopWakeUp`, `CFRelease`).
+    unsafe impl Send for Stop {}
+    // SAFETY: as for `Send`; a shared `Stop` exposes no call at all.
+    unsafe impl Sync for Stop {}
+
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.stopped.store(true, Ordering::Release);
+            // SAFETY: both references are the ones the listener's thread retained for this
+            // `Stop`, released once here; signalling an invalidated source does nothing.
+            unsafe {
+                CFRunLoopSourceSignal(self.source);
+                CFRunLoopWakeUp(self.run_loop);
+                CFRelease(self.source.cast_const().cast());
+                CFRelease(self.run_loop.cast_const().cast());
+            }
+        }
+    }
+
+    /// The stop source's perform: ends the current run of the run loop it fires on (the
+    /// listener's, while it runs).
+    extern "C" fn stop_here(_info: *mut c_void) {
+        // SAFETY: the calling thread's own run loop, which is running (this is its callout).
+        unsafe { CFRunLoopStop(CFRunLoopGetCurrent()) };
     }
 
     /// The message an IOKit message type names, if it is one [`answer`] takes.
@@ -144,11 +203,8 @@ mod imp {
     }
 
     #[cfg_attr(trust_verify, trust::skip)]
-    pub(super) fn listen<T: Send + Sync + 'static>(
-        alive: Weak<T>,
-        handler: Box<dyn FnMut(Power) + Send>,
-    ) -> bool {
-        let (told, registered) = mpsc::sync_channel(1);
+    pub(super) fn listen(handler: Box<dyn FnMut(Power) + Send>) -> Option<Stop> {
+        let (told, handed) = mpsc::sync_channel::<Option<Stop>>(1);
         let spawned = std::thread::Builder::new()
             .name("power-listen".to_owned())
             .spawn(move || {
@@ -168,28 +224,68 @@ mod imp {
                 if root == 0 {
                     // SAFETY: nothing was registered, so nothing else holds `listener`.
                     drop(unsafe { Box::from_raw(listener) });
-                    let _ = told.send(false);
+                    let _ = told.send(None);
                     return;
                 }
                 // SAFETY: no callback runs before this thread runs its run loop below.
                 unsafe { (*listener).root = root };
+                let mut context = CFRunLoopSourceContext {
+                    version: 0,
+                    info: std::ptr::null_mut(),
+                    retain: None,
+                    release: None,
+                    copyDescription: None,
+                    equal: None,
+                    hash: None,
+                    schedule: None,
+                    cancel: None,
+                    perform: stop_here,
+                };
                 // SAFETY: `port` is the live port the registration made; its source is
-                // borrowed while the port lives, and this thread's run loop is its own.
-                let (run_loop, source) = unsafe {
+                // borrowed while the port lives, and this thread's run loop is its own. The stop
+                // source is this thread's (the Create rule), its context copied at creation;
+                // the run loop and it are each retained once more for the `Stop`, which
+                // releases them.
+                let (run_loop, source, stop) = unsafe {
                     let source = IONotificationPortGetRunLoopSource(port);
                     let run_loop = CFRunLoopGetCurrent();
                     CFRunLoopAddSource(run_loop, source, kCFRunLoopDefaultMode);
-                    (run_loop, source)
+                    let stop = CFRunLoopSourceCreate(std::ptr::null(), 0, &raw mut context);
+                    if !stop.is_null() {
+                        CFRunLoopAddSource(run_loop, stop, kCFRunLoopDefaultMode);
+                        CFRetain(run_loop.cast_const().cast());
+                        CFRetain(stop.cast_const().cast());
+                    }
+                    (run_loop, source, stop)
                 };
-                let _ = told.send(true);
-                while alive.strong_count() > 0 {
-                    // SAFETY: this thread's own run loop, in the mode its source was added to.
-                    unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, LOOK.as_secs_f64(), 0) };
+                if stop.is_null() {
+                    let _ = told.send(None);
+                } else {
+                    let stopped = Arc::new(AtomicBool::new(false));
+                    // A `Stop` nobody received is dropped here, which marks this thread
+                    // stopped: it then never runs its run loop.
+                    let _ = told.send(Some(Stop {
+                        run_loop,
+                        source: stop,
+                        stopped: Arc::clone(&stopped),
+                    }));
+                    while !stopped.load(Ordering::Acquire) {
+                        // SAFETY: this thread's own run loop, in the mode its sources were
+                        // added to.
+                        unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, FOREVER, 0) };
+                    }
                 }
                 // SAFETY: the teardown IOPMLib.h orders: remove the source, deregister the
                 // notifier, close the session, destroy the port; no callback runs after the
                 // run loop stopped running, so `listener` is freed last, by this thread alone.
+                // The stop source leaves the run loop and is released by its creator (the
+                // `Stop` released its own reference, or never got one).
                 unsafe {
+                    if !stop.is_null() {
+                        CFRunLoopRemoveSource(run_loop, stop, kCFRunLoopDefaultMode);
+                        CFRunLoopSourceInvalidate(stop);
+                        CFRelease(stop.cast_const().cast());
+                    }
                     CFRunLoopRemoveSource(run_loop, source, kCFRunLoopDefaultMode);
                     IODeregisterForSystemPower(&raw mut notifier);
                     IOServiceClose(root);
@@ -197,7 +293,8 @@ mod imp {
                     drop(Box::from_raw(listener));
                 }
             });
-        spawned.is_ok() && registered.recv().unwrap_or(false)
+        spawned.ok()?;
+        handed.recv().ok().flatten()
     }
 }
 
@@ -255,24 +352,24 @@ mod tests {
     }
 
     /// The system takes the registration, and the listener's thread ends (dropping its
-    /// handler) once its owner is gone. No sleep is driven: a handler hears nothing here.
-    /// NEGATIVE CONTROL: a listener loop that runs on with its owner gone (`while
-    /// alive.strong_count() < usize::MAX`) keeps the handler, and the hang detector fails the
-    /// test: "the listener outlived its owner".
+    /// handler) once its [`Listening`] is dropped, with no look on a timer: the drop stops its
+    /// run loop, also when it comes before the thread first ran it. No sleep is driven: a
+    /// handler hears nothing here.
+    /// NEGATIVE CONTROL: a `Stop` whose drop marks the thread stopped but signals no source
+    /// (`CFRunLoopSourceSignal` and `CFRunLoopWakeUp` left out) leaves the run loop waiting
+    /// forever with the handler held, and the hang detector fails the test: "the listener
+    /// outlived its owner".
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_listener_registers_with_the_root_domain_and_ends_with_its_owner() {
-        use std::sync::{Arc, mpsc};
+    fn a_listener_registers_with_the_root_domain_and_ends_when_dropped() {
+        use std::sync::mpsc;
         const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
-        let owner = Arc::new(());
         let (kept, gone) = mpsc::channel::<()>();
-        assert!(listen(
-            Arc::downgrade(&owner),
-            Box::new(move |_| {
-                let _ = kept.send(());
-            })
-        ));
-        drop(owner);
+        let listening = listen(Box::new(move |_| {
+            let _ = kept.send(());
+        }))
+        .expect("the root domain takes the registration");
+        drop(listening);
         loop {
             match gone.recv_timeout(HANG_DETECTOR) {
                 Ok(()) => {}

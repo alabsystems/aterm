@@ -162,7 +162,9 @@ impl LaneState {
         head: u64,
         tx: &Transcript,
     ) -> Result<()> {
-        let Ok(text) = std::fs::read_to_string(&self.pins_seen) else {
+        let Ok(text) =
+            crate::identity::read_regular_text(&self.pins_seen, crate::identity::MAX_META_BYTES)
+        else {
             return Ok(());
         };
         let stamp = stamp_of(targets);
@@ -337,7 +339,7 @@ fn file_name(path: &Path) -> String {
 }
 
 fn read_number(path: &Path) -> Result<Option<u64>> {
-    match std::fs::read_to_string(path) {
+    match crate::identity::read_regular_text(path, 4096) {
         Ok(text) => {
             let trimmed = text.trim();
             (!trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()))

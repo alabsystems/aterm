@@ -604,6 +604,8 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         Err(ProbeNo::NoAccounts)
     }
 
+    fn account_probe_typed(&self) {}
+
     fn account_probed(&self, read: Result<&crate::harness::accounts::Sample, ProbeMiss>) {
         let _ = read;
     }

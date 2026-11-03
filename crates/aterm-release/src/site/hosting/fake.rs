@@ -54,6 +54,10 @@ pub struct State {
     /// The status the token endpoint answers a good grant with, when not 200 (the token in
     /// the body either way).
     pub token_status: Option<u16>,
+    /// Override the canonical site name for permission-probe tests.
+    pub site_name: Option<String>,
+    /// Override the permission response, including denied and malformed responses.
+    pub permissions: Option<Value>,
     versions: u32,
 }
 
@@ -209,6 +213,10 @@ fn serve(stream: TcpStream, state: &Mutex<State>, origins: &Origins, public: &[u
 fn name(method: &str, path: &str) -> &'static str {
     if path == "/token" {
         "token"
+    } else if method == "GET" && path.starts_with("/v1beta1/projects/-/sites/") {
+        "site"
+    } else if path.ends_with(":testIamPermissions") {
+        "permissions"
     } else if path.starts_with("/upload/") {
         "upload"
     } else if path.ends_with(":populateFiles") {
@@ -290,6 +298,19 @@ fn route(
     }
     let json: Option<Value> = aterm_json::from_slice(body).ok();
     match (method, route) {
+        ("GET", "site") => {
+            let site = path.rsplit('/').next().unwrap();
+            (
+                200,
+                aterm_json::json!({"name": st.site_name.clone().unwrap_or_else(|| format!("projects/fake-project/sites/{site}"))}),
+            )
+        }
+        ("POST", "permissions") => (
+            200,
+            st.permissions
+                .clone()
+                .unwrap_or_else(|| aterm_json::json!({"permissions":[super::access::UPDATE]})),
+        ),
         ("POST", "create") => {
             let Some(site) = path
                 .strip_prefix("/v1beta1/sites/")

@@ -45,11 +45,23 @@ pub struct UnitSpec {
 }
 
 impl UnitSpec {
-    /// The command the unit runs.
+    /// The command the unit runs: the snapshot, then `--host {h}` when the choice is not `gh`
+    /// (a global flag, so it comes before the verb), then `lane run`.
     #[must_use]
     pub fn argv(&self) -> Vec<String> {
+        let host = (self.host != HostChoice::Gh)
+            .then(|| ["--host".to_string(), self.host.as_str().to_string()])
+            .into_iter()
+            .flatten();
+        std::iter::once(self.binary.display().to_string())
+            .chain(host)
+            .chain(self.run_words())
+            .collect()
+    }
+
+    /// `lane run <kind> --sha256 … --log …`.
+    fn run_words(&self) -> Vec<String> {
         vec![
-            self.binary.display().to_string(),
             "lane".into(),
             "run".into(),
             self.kind.as_str().into(),

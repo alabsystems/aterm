@@ -61,7 +61,7 @@ pub fn same(a: &Key, b: &Key) -> bool {
 /// # Errors
 /// It could not be opened or read.
 pub fn read_disk(path: &Path) -> io::Result<Option<Key>> {
-    let mut f = std::fs::File::open(path)?;
+    let mut f = crate::open_nonblock(path)?;
     let mut buf = [0u8; SECTOR];
     let mut got = 0;
     while got < buf.len() {

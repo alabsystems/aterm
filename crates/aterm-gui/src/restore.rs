@@ -135,6 +135,11 @@ pub(crate) struct TerminalLeafRestore {
     /// restore times no program found or relaunched there as the worker.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub claim_ended: bool,
+    /// The task record of a parked worker in this leaf, as a seamless update carries one without
+    /// its ages ([`crate::task_record::restore_row`]), so a restore other than a seamless update
+    /// keeps the row a worker's tab is listed by ([`crate::task_record::seed_restored`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
     /// The agent this leaf carries runs in a claim folder but is no claim worker (the leaf names
     /// none, [`Self::mark_claim_bystander`]): someone's own, which a restore must not time as the
     /// worker. A writer before [`Self::claim_worker`] left both out, so a reader takes an agent in
@@ -918,6 +923,7 @@ impl TerminalLeafRestore {
 
     fn sanitize(&mut self) {
         self.cwd = storable_leaf_cwd(self.cwd.take());
+        self.task = storable_leaf_cwd(self.task.take());
         sanitize_leaf_title(&mut self.title);
         self.profile = self
             .profile
@@ -1488,6 +1494,10 @@ pub(crate) struct RestoredTab {
     pub focused_path: Vec<RestoreBranch>,
     #[serde(default)]
     pub zoomed: bool,
+    /// A worker's tab ([`crate::tab_model::Tab::parked`]). An older manifest has no such field and
+    /// an older build ignores it, losing only the grouping.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parked: bool,
 }
 
 impl RestoredTab {
@@ -1742,6 +1752,10 @@ pub(crate) struct WindowLayout {
     pub tab_order: Vec<TabOrderEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_item: Option<usize>,
+    /// The window showed its Workers list (`docs/DESIGN-workers-tab-2026-11-02.md`), which has no
+    /// item of its own: restore opens the list again and brings it to the front.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub workers_in_front: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restored_tabs: Vec<RestoredTab>,
 }
@@ -1879,6 +1893,7 @@ impl WindowLayout {
             native_tabs: Vec::new(),
             tab_order: Vec::new(),
             active_item: Some(0),
+            workers_in_front: false,
             restored_tabs: Vec::new(),
         }
     }
@@ -1964,6 +1979,7 @@ impl RestoredTab {
                         claim_ended: false,
                         not_claim_worker: false,
                         claim_worker: None,
+                        task: None,
                     }))
                 }
                 PaneLayout::Split {
@@ -1997,6 +2013,7 @@ impl RestoredTab {
             root,
             focused_path: focused.unwrap_or_default(),
             zoomed: false,
+            parked: false,
         })
     }
 
@@ -2015,6 +2032,7 @@ impl RestoredTab {
             root: RestoredSplitTree::leaf(RestoredView::Native(native)),
             focused_path: Vec::new(),
             zoomed: false,
+            parked: false,
         })
     }
 }
@@ -2440,6 +2458,7 @@ impl RestoreManifest {
             native_tabs: Vec::new(),
             tab_order: Vec::new(),
             active_item: None,
+            workers_in_front: false,
             restored_tabs: vec![RestoredTab {
                 root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
                     sid: Some("s-0123abcd".into()),
@@ -2467,9 +2486,11 @@ impl RestoreManifest {
                     claim_ended: false,
                     not_claim_worker: false,
                     claim_worker: None,
+                    task: None,
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,
+                parked: false,
             }],
         }])
     }
@@ -3925,6 +3946,32 @@ mod cold_resume_environment_tests;
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_parked_bit_round_trips_and_an_old_record_reads_as_a_shown_tab() {
+        let tab = |parked| RestoredTab {
+            root: RestoredSplitTree::leaf(RestoredView::Placeholder(PlaceholderLeafRestore {
+                restore_tag: "gone".to_string(),
+                reason: "gone".to_string(),
+                metadata: String::new(),
+                unhanded: None,
+            })),
+            focused_path: Vec::new(),
+            zoomed: false,
+            parked,
+        };
+        let shown = aterm_toml::to_string(&tab(false)).expect("serializes");
+        assert!(!shown.contains("parked"), "{shown}");
+        assert_eq!(
+            aterm_toml::from_str::<RestoredTab>(&shown).expect("an old record reads"),
+            tab(false)
+        );
+        let parked = aterm_toml::to_string(&tab(true)).expect("serializes");
+        assert_eq!(
+            aterm_toml::from_str::<RestoredTab>(&parked).expect("reads"),
+            tab(true)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_restore_lock_is_free_while_a_child_forked_under_it_has_yet_to_exec() {
@@ -4349,6 +4396,7 @@ mod tests {
             claim_ended: false,
             not_claim_worker: false,
             claim_worker: None,
+            task: None,
         }))
     }
 
@@ -4387,6 +4435,7 @@ mod tests {
             native_tabs: Vec::new(),
             tab_order: Vec::new(),
             active_item: Some(1),
+            workers_in_front: false,
             restored_tabs: vec![
                 RestoredTab {
                     root: RestoredSplitTree::Split {
@@ -4397,11 +4446,13 @@ mod tests {
                     },
                     focused_path: vec![RestoreBranch::Second],
                     zoomed: false,
+                    parked: false,
                 },
                 RestoredTab {
                     root: RestoredSplitTree::leaf(RestoredView::Native(settings)),
                     focused_path: Vec::new(),
                     zoomed: false,
+                    parked: false,
                 },
             ],
         }])
@@ -4569,6 +4620,7 @@ mod tests {
                 native_tabs: Vec::new(),
                 tab_order: Vec::new(),
                 active_item: None,
+                workers_in_front: false,
                 restored_tabs: Vec::new(),
             },
             WindowLayout {
@@ -4585,6 +4637,7 @@ mod tests {
                 native_tabs: Vec::new(),
                 tab_order: Vec::new(),
                 active_item: None,
+                workers_in_front: false,
                 restored_tabs: Vec::new(),
             },
         ])
@@ -4616,6 +4669,7 @@ mod tests {
                 TabOrderEntry::Native { index: 1 },
             ],
             active_item: Some(2),
+            workers_in_front: false,
             restored_tabs: Vec::new(),
         }])
     }
@@ -4635,6 +4689,7 @@ mod tests {
             root: RestoredSplitTree::leaf(RestoredView::Native(leaf)),
             focused_path: Vec::new(),
             zoomed: false,
+            parked: false,
         });
         RestoreManifest::new(vec![window])
     }
@@ -5047,11 +5102,13 @@ focused = true
             native_tabs: Vec::new(),
             tab_order: Vec::new(),
             active_item: Some(0),
+            workers_in_front: false,
             restored_tabs: shells
                 .map(|shell| RestoredTab {
                     root: terminal(Some(shell), "zsh"),
                     focused_path: Vec::new(),
                     zoomed: false,
+                    parked: false,
                 })
                 .collect(),
         }
@@ -5415,6 +5472,7 @@ focused = true
                     )),
                     focused_path: Vec::new(),
                     zoomed: false,
+                    parked: false,
                 })
                 .take(2),
             );
@@ -5610,6 +5668,7 @@ metadata = "opaque=copy-me"
             root,
             focused_path: Vec::new(),
             zoomed: false,
+            parked: false,
         }];
         assert!(
             RestoreManifest::from_toml(&aterm_toml::to_string(&manifest).unwrap()).is_none(),
@@ -5735,6 +5794,7 @@ metadata = "opaque=copy-me"
             native_tabs: Vec::new(),
             tab_order: Vec::new(),
             active_item: None,
+            workers_in_front: false,
             restored_tabs: vec![RestoredTab {
                 root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
                     sid,
@@ -5762,9 +5822,11 @@ metadata = "opaque=copy-me"
                     claim_ended: false,
                     not_claim_worker: false,
                     claim_worker: None,
+                    task: None,
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,
+                parked: false,
             }],
         };
         let leaf_of = |m: &RestoreManifest| match &m.windows[0].restored_tabs[0].root {

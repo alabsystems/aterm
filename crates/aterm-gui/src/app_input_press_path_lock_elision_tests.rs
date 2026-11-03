@@ -1507,7 +1507,8 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
 }
 
 /// A drag across a path in a mouse-tracking app (Claude Code's transcript) keeps
-/// the composer's keys lit, and so does copying the selection after it. The app
+/// the composer's keys lit, and so does copying the selection after it or
+/// minimizing and restoring the window. The app
 /// repaints its selection highlight above the caret and draws the caret back; had
 /// the drag or the copy drawn the generic boundary (the negative control,
 /// `clear_move_license`), that repaint would park the caret's row and every later
@@ -1528,6 +1529,8 @@ fn a_drag_into_a_tracking_app_keeps_the_composer_s_keys_lit() {
         DragThenMenuCopy,
         /// A drag, then ⌘C as `on_key` reads it.
         DragThenPhysicalCopy,
+        MinimizeThenRestore,
+        GenericBoundaryThenMinimize,
         GenericBoundary,
     }
     let geom = glow_geom();
@@ -1537,6 +1540,8 @@ fn a_drag_into_a_tracking_app_keeps_the_composer_s_keys_lit() {
         Between::Pointer(Gesture::Click),
         Between::Pointer(Gesture::Wheel),
         Between::DragThenMenuCopy,
+        Between::MinimizeThenRestore,
+        Between::GenericBoundaryThenMinimize,
         Between::GenericBoundary,
     ];
     if super::HARDCODED_SUPER_CHORDS {
@@ -1590,7 +1595,18 @@ fn a_drag_into_a_tracking_app_keeps_the_composer_s_keys_lit() {
             Between::DragThenMenuCopy | Between::DragThenPhysicalCopy => {
                 pointer_gesture(&mut app, wid, Gesture::Drag);
             }
-            Between::GenericBoundary => app.clear_move_license(wid),
+            Between::GenericBoundary | Between::GenericBoundaryThenMinimize => {
+                app.clear_move_license(wid);
+            }
+            Between::MinimizeThenRestore => {}
+        }
+        if matches!(
+            between,
+            Between::MinimizeThenRestore | Between::GenericBoundaryThenMinimize
+        ) {
+            app.fence_menu_action(crate::menu::MenuAction::Minimize);
+            app.on_focus(wid, false);
+            app.on_focus(wid, true);
         }
         // The app's selection highlight over the path two rows down, the caret drawn back.
         frame(&mut app, Some((2, 10, 's')), (0, 1), tape.step());
@@ -1619,7 +1635,10 @@ fn a_drag_into_a_tracking_app_keeps_the_composer_s_keys_lit() {
                 );
                 app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
             }
-            Between::Pointer(_) | Between::GenericBoundary => {}
+            Between::Pointer(_)
+            | Between::MinimizeThenRestore
+            | Between::GenericBoundaryThenMinimize
+            | Between::GenericBoundary => {}
         }
         // A quiet frame: the app's last print is still the highlight off the caret's row.
         frame(&mut app, None, (0, 1), tape.step());
@@ -1640,7 +1659,7 @@ fn a_drag_into_a_tracking_app_keeps_the_composer_s_keys_lit() {
         }
         let _ = drain(pipe);
         match between {
-            Between::GenericBoundary => {
+            Between::GenericBoundary | Between::GenericBoundaryThenMinimize => {
                 assert!(
                     verdicts
                         .iter()

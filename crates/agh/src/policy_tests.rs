@@ -11,16 +11,7 @@ use std::path::Path;
 use super::*;
 use crate::config::{self, OwnerRule};
 use crate::error::Kind;
-
-/// The canonical config (`tests/fixtures/canonical.toml`) with `{root}` filled.
-pub(super) fn canonical_text(root: &Path) -> String {
-    let root = root
-        .display()
-        .to_string()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    include_str!("../tests/fixtures/canonical.toml").replace("{root}", &root)
-}
+use crate::test_fixtures::canonical_text;
 
 fn canonical(root: &Path) -> Validated {
     let parsed = config::parse(&canonical_text(root)).expect("the canonical config parses");
@@ -254,14 +245,11 @@ fn permit_decided_takes_the_decision_it_is_given() {
 fn a_granted_literal_decides_as_an_argv_literal() {
     let root = scratch();
     let dirs = config::Dirs::under(root.path());
-    std::fs::create_dir_all(dirs.config.parent().expect("a parent")).expect("the parent");
-    aterm_uds::private_file::create_private_dir(&dirs.config).expect("the config directory");
     let text = format!(
         "{}\n[[writers]]\ncaller = \"fixture-caller\"\nrepos = [\"alabsystems/aterm\"]\n",
         canonical_text(root.path())
     );
-    aterm_uds::private_file::write_private(&dirs.config, "agh.toml", text.as_bytes())
-        .expect("agh.toml");
+    crate::test_fixtures::write_config(&dirs, &text);
     let router = Router::from_validated(
         config::load(&dirs)
             .expect("agh.toml loads")
@@ -295,5 +283,21 @@ fn a_granted_literal_decides_as_an_argv_literal() {
             );
             assert_eq!(by_grant, by_argv, "{target:?} with release {release:?}");
         }
+    }
+}
+
+#[test]
+fn every_unusable_presence_round_trips_its_slug() {
+    for kind in super::LOAD_KINDS {
+        let presence = kind.presence();
+        assert_eq!(
+            Presence::from_slug(presence.slug()),
+            Some(presence),
+            "{kind:?}"
+        );
+    }
+    assert_eq!(Presence::from_slug("present"), Some(Presence::Present));
+    for junk in ["", "taped", "missing", "Present", "loose_mode"] {
+        assert_eq!(Presence::from_slug(junk), None, "{junk:?}");
     }
 }

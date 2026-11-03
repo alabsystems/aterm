@@ -18,6 +18,12 @@ impl Default for Policy {
     }
 }
 impl Policy {
+    /// Whether local sharing includes `table`: disabling sharing or excluding its catalog
+    /// excludes every table, and an individual exclusion excludes only that table.
+    pub(crate) fn includes(&self, catalog: Digest, table: Digest) -> bool {
+        self.enabled && !self.excluded.contains(&catalog) && !self.excluded.contains(&table)
+    }
+
     /// The policy `aterm.toml` at `path` gives, read as the window reads its settings: a symlink
     /// (a dotfiles checkout, home-manager) is followed to a file this user or root owns and
     /// others cannot write ([`aterm_secrets::fsx::read_aterm_config`]), as `[swarm] enabled` is

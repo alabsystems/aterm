@@ -342,6 +342,7 @@ fn editor_only_layout(manifest: &crate::restore::RestoreManifest) -> crate::rest
         native_tabs: Vec::new(),
         tab_order: Vec::new(),
         active_item: Some(0),
+        workers_in_front: false,
         restored_tabs: vec![editor],
     }
 }
@@ -659,6 +660,7 @@ fn prelaunch_record() -> crate::HandoffPrelaunch {
         #[cfg(target_os = "macos")]
         booked_launch_unregistered: false,
         history_export: None,
+        sessionless: false,
     }
 }
 

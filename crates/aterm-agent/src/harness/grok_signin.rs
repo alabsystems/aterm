@@ -1609,6 +1609,10 @@ impl Approver for LadderApprover<'_, '_> {
                     self.headless = Some("approved".to_owned());
                     return Approval::Approved { page };
                 }
+                Approval::NotRun(said) => {
+                    self.headless = Some(headless_words("not run", &said));
+                    return Approval::NotRun(said);
+                }
                 Approval::Refused(said) => {
                     self.refused = true;
                     self.headless = Some(headless_words("refused", &said));

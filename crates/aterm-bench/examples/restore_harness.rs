@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Session-restore latency harness: replays a serialized ANSI snapshot into a fresh engine.
+// Steady-state restore replay rate: serialized ANSI snapshots replayed into fresh engines.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -13,7 +13,9 @@ const COLS: u16 = 80;
 const HISTORY_LINES: usize = 10_000;
 const RING_LINES: usize = 20_000;
 const N_ITERS: usize = 7;
-const WARMUP: usize = 2;
+// Two sub-MiB snapshots do not establish the operating point a throughput floor measures.
+// Warm by work rather than by a fixed iteration count; timed restores still use fresh engines.
+const WARMUP_BYTES: usize = 256 * 1024 * 1024;
 
 fn fill_corpus() -> Vec<u8> {
     let mut out = Vec::with_capacity(HISTORY_LINES * 64);
@@ -113,7 +115,8 @@ fn main() {
         secs
     };
 
-    for _ in 0..WARMUP {
+    let warmup = WARMUP_BYTES.div_ceil(payload.len()).max(2);
+    for _ in 0..warmup {
         let _ = one_restore();
     }
     let mut secs = Vec::with_capacity(N_ITERS);
@@ -132,7 +135,7 @@ fn main() {
     );
     println!(
         "{{\"restore_median_hz\":{hz:.3},\"restore_median_mbps\":{mbps:.3},\
-         \"payload_bytes\":{},\"history_lines\":{history},\"n\":{N_ITERS},\"warmup\":{WARMUP}}}",
+         \"payload_bytes\":{},\"history_lines\":{history},\"n\":{N_ITERS},\"warmup\":{warmup}}}",
         payload.len(),
     );
 }

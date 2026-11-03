@@ -304,7 +304,8 @@ impl App {
                     | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
-                    | crate::native_app::AppViewState::Recovery(_) => false,
+                    | crate::native_app::AppViewState::Recovery(_)
+                    | crate::native_app::AppViewState::Workers(_) => false,
                 });
             if changed && let Some(window) = self.windows.get_mut(&wid) {
                 window.last_present = None;
@@ -348,7 +349,8 @@ impl App {
                     | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
-                    | crate::native_app::AppViewState::Recovery(_) => false,
+                    | crate::native_app::AppViewState::Recovery(_)
+                    | crate::native_app::AppViewState::Workers(_) => false,
                 });
             if changed && let Some(window) = self.windows.get_mut(&wid) {
                 window.last_present = None;
@@ -391,7 +393,8 @@ impl App {
                     | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
-                    | crate::native_app::AppViewState::Recovery(_) => false,
+                    | crate::native_app::AppViewState::Recovery(_)
+                    | crate::native_app::AppViewState::Workers(_) => false,
                 });
             if changed && let Some(window) = self.windows.get_mut(&wid) {
                 window.last_present = None;
@@ -578,7 +581,8 @@ impl App {
                     | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
-                    | crate::native_app::AppViewState::Recovery(_) => false,
+                    | crate::native_app::AppViewState::Recovery(_)
+                    | crate::native_app::AppViewState::Workers(_) => false,
                 });
             if changed && let Some(window) = self.windows.get_mut(&wid) {
                 window.last_present = None;
@@ -1391,10 +1395,10 @@ impl App {
         let Some(ws) = self.windows.get(&wid) else {
             return Vec::new();
         };
-        if ws.tab_set.len() < 2 {
+        if ws.tab_set.shown_len() < 2 {
             return Vec::new();
         }
-        let active = ws.tab_set.active_index();
+        let active = ws.tab_set.strip_active();
         ws.tab_segments
             .iter()
             .filter_map(|segment| {
@@ -1939,10 +1943,10 @@ impl App {
             // mean "show me this tab".
             if let Some(index) = crate::a11y_tree::tab_action_index(&req, |index| {
                 let ws = self.windows.get(&wid)?;
-                if self.tab_strip_rows == 0 || ws.tab_set.len() < 2 {
+                if self.tab_strip_rows == 0 || ws.tab_set.shown_len() < 2 {
                     return None;
                 }
-                ws.tab_set.tab_at(index).map(|tab| tab.id.get())
+                ws.tab_set.shown().get(index).map(|tab| tab.id.get())
             }) {
                 self.switch_tab_in(wid, index);
                 if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {

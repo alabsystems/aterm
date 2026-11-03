@@ -7,6 +7,11 @@
 //! (`aterm_link::wait_tally`) and aterm's own handlers ([`HandlerTally`]). This holds what they
 //! share: the log2 [`Hist`] a row counts in, a row's text ([`put_row`]), the checksum
 //! ([`sum_text`]) and the reader of a line's words ([`Words`]).
+//!
+//! THE WRITER IS `#[inline]`, every function its write reaches: this crate has no dev speed row, so
+//! a function compiled here runs at opt-level 0 in the `dev` arm, while an inlined one is generated
+//! in its caller at the caller's level (`aterm-link` has a row), which keeps the bridge's own idle
+//! writes from being read in the ledger as the fabric's cost.
 
 /// The log2 bands each row counts in ([`Hist::buckets`]).
 pub const BUCKETS: usize = 18;
@@ -22,6 +27,7 @@ pub enum Unit {
 
 impl Unit {
     /// How far a value is shifted before its band is its bit length.
+    #[inline]
     const fn shift(self) -> u32 {
         match self {
             Unit::Ns => 10,
@@ -45,6 +51,7 @@ pub struct Hist {
 
 impl Hist {
     /// The band `v` falls into.
+    #[inline]
     #[must_use]
     pub fn band(v: u64, unit: Unit) -> usize {
         let shifted = v >> unit.shift();
@@ -63,6 +70,7 @@ impl Hist {
     }
 
     /// Count `v`.
+    #[inline]
     pub fn add(&mut self, v: u64, unit: Unit) {
         self.count = self.count.saturating_add(1);
         self.total = self.total.saturating_add(v);
@@ -125,6 +133,7 @@ impl Hist {
 }
 
 /// Writes `v` as exactly `out.len()` lowercase hex digits.
+#[inline]
 fn put_hex(out: &mut [u8], mut v: u64) {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     for slot in out.iter_mut().rev() {
@@ -143,6 +152,7 @@ pub fn row_text(name: &str, h: &Hist) -> Vec<u8> {
 }
 
 /// A row's text's length: its name's, and 214.
+#[inline]
 #[must_use]
 pub const fn row_len(name: &str) -> usize {
     1 + name.len() + 1 + 3 * 17 + BUCKETS * 9 - 1
@@ -150,6 +160,7 @@ pub const fn row_len(name: &str) -> usize {
 
 /// [`row_text`] written into `out`, which is exactly [`row_len`] long: the in-place rewrite of one
 /// row's place in the line.
+#[inline]
 pub fn put_row(out: &mut [u8], name: &str, h: &Hist) {
     let name = name.as_bytes();
     out[0] = b' ';
@@ -179,6 +190,7 @@ pub fn put_row(out: &mut [u8], name: &str, h: &Hist) {
 }
 
 /// The ` sum=<16 hex>\n` tail of a line whose body is `body`.
+#[inline]
 #[must_use]
 pub fn sum_text(body: &[u8]) -> String {
     format!(" sum={:016x}\n", checksum(body))
@@ -187,6 +199,7 @@ pub fn sum_text(body: &[u8]) -> String {
 /// THE LINE'S CHECKSUM: aterm-hash's word-at-a-time Fx hash, not FNV-1a. It only has to tell a torn
 /// read from a whole line, and the writer pays for it at every write: over a line of about 6 KiB
 /// FNV-1a's byte-serial multiply chain was most of the write's cost.
+#[inline]
 #[must_use]
 pub fn checksum(body: &[u8]) -> u64 {
     aterm_hash::fx_hash_bytes(body)
@@ -341,7 +354,7 @@ pub const HANDLER_SEAM: &str = "ATERM_FABRIC_HANDLER_TALLY";
 pub const HANDLER_FILE: &str = "handler-tally";
 
 /// What the line starts with: the format's name and version.
-const HANDLER_HEAD: &str = "handler-tally v=1";
+const HANDLER_HEAD: &str = "handler-tally v=2";
 
 /// One thing aterm does for the fabric, counted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -366,10 +379,15 @@ pub enum HandlerRow {
     AwaitArm,
     /// A parked `await inbox`, from its row's arrival in the ring to its answer.
     AwaitWake,
+    /// One transaction on a session's fleet mailbox, inside the verb that asked for it (`inbox`,
+    /// `await inbox`, a direct post or reply): its directory, its lock, its read and parse, and its
+    /// write when it edits. The session's fleet-mail watcher's refresh serves no verb, and is not
+    /// counted.
+    FleetMail,
 }
 
 /// How many rows a handler line holds.
-pub const HANDLER_ROWS: usize = 10;
+pub const HANDLER_ROWS: usize = 11;
 
 impl HandlerRow {
     /// Every row, in the line's order.
@@ -384,6 +402,7 @@ impl HandlerRow {
         HandlerRow::Inbox,
         HandlerRow::AwaitArm,
         HandlerRow::AwaitWake,
+        HandlerRow::FleetMail,
     ];
 
     /// Its place in the line.
@@ -406,6 +425,7 @@ impl HandlerRow {
             HandlerRow::Inbox => "inbox",
             HandlerRow::AwaitArm => "await_arm",
             HandlerRow::AwaitWake => "await_wake",
+            HandlerRow::FleetMail => "fleet_mail",
         }
     }
 }
@@ -511,7 +531,7 @@ mod tests {
         let t = sample();
         let line = t.render();
         assert!(
-            line.starts_with("handler-tally v=1 pid=0000004242 at="),
+            line.starts_with("handler-tally v=2 pid=0000004242 at="),
             "{line}"
         );
         assert_eq!(HandlerTally::parse(&line), Ok(t));
@@ -548,10 +568,10 @@ mod tests {
         }
         for bad in [
             "",
-            "handler-tally v=1\n",
+            "handler-tally v=2\n",
             &old[..old.len() - 1],
-            &old.replace("handler-tally v=1", "handler-tally v=2"),
-            &old.replace("handler-tally v=1", "wait-tally v=2"),
+            &old.replace("handler-tally v=2", "handler-tally v=1"),
+            &old.replace("handler-tally v=2", "wait-tally v=2"),
         ] {
             assert!(HandlerTally::parse(bad).is_err(), "{bad:?}");
         }

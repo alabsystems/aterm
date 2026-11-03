@@ -2883,6 +2883,20 @@ pub(crate) fn spawn_usage() -> String {
     )
 }
 
+/// `spawn`'s usage reply to a line it refuses, naming the word of it `refused` where one word
+/// breaks it ([`parse_spawn_args`]), as one line of its first 32 characters.
+pub(crate) fn spawn_refusal(refused: Option<&str>) -> String {
+    let usage = spawn_usage();
+    match refused {
+        Some(word) => format!(
+            "{}; not `{}`\n",
+            usage.trim_end(),
+            aterm_codec::tty::one_line(word, 32)
+        ),
+        None => usage,
+    }
+}
+
 /// Parsed `agent=<word>` worker specification for `spawn`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentSpec {
@@ -2915,8 +2929,9 @@ fn valid_model(model: &str) -> bool {
 
 const TAB_USAGE: &str = "ERR usage: tab <new|N|next|prev|close [N]|move <from> <to>>\n";
 
+/// A `spawn` line's form ([`parse_spawn_args`]).
 #[derive(Debug, PartialEq, Eq)]
-enum SpawnForm {
+pub(crate) enum SpawnForm {
     Plain {
         window: Option<u64>,
         raise: Option<bool>,
@@ -2934,16 +2949,21 @@ enum SpawnForm {
     },
 }
 
-fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
+/// `spawn`'s arguments as one form, or the word of them refused: `Err(Some(word))` names the
+/// token a refusal breaks on (a repeated `theme=` or `autopilot=` names the repeat), and
+/// `Err(None)` a line no one word breaks (a quote left open, a worker's option with no `agent=`,
+/// a connected form left incomplete or mixed with a plain one).
+pub(crate) fn parse_spawn_args(rest: &str) -> Result<SpawnForm, Option<String>> {
     use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
     let (mut cwd, mut split, mut kind, mut place, mut origin) = (None, None, None, None, None);
     let (mut window, mut raise, mut theme) = (None, None, None);
     let (mut agent, mut model, mut from, mut framed) = (None, None, None, false);
     let mut autopilot = None;
     let Some(tokens) = split_quoted_tokens(rest) else {
-        return Err(());
+        return Err(None);
     };
     for tok in tokens {
+        let refused = || Some(tok.clone());
         if let Some(v) = tok.strip_prefix("cwd=") {
             cwd = Some(v.to_string());
         } else if let Some(v) = tok.strip_prefix("theme=") {
@@ -2951,69 +2971,69 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
             // validated on the main thread against the catalog. Empty, or given
             // twice, is the usage line.
             if v.is_empty() || theme.replace(v.to_string()).is_some() {
-                return Err(());
+                return Err(refused());
             }
         } else if let Some(v) = tok.strip_prefix("window=") {
             if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(());
+                return Err(refused());
             }
-            window = Some(v.parse::<u64>().map_err(|_| ())?);
+            window = Some(v.parse::<u64>().map_err(|_| refused())?);
         } else if let Some(v) = tok.strip_prefix("raise=") {
             raise = Some(match v {
                 "t" | "true" => true,
                 "f" | "false" => false,
-                _ => return Err(()),
+                _ => return Err(refused()),
             });
         } else if let Some(v) = tok.strip_prefix("split=") {
             split = Some(match v {
                 "v" | "vertical" => crate::pane::SplitDir::Vertical,
                 "h" | "horizontal" => crate::pane::SplitDir::Horizontal,
-                _ => return Err(()),
+                _ => return Err(refused()),
             });
         } else if let Some(v) = tok.strip_prefix("connected=") {
             kind = Some(match v {
                 "controlled" => ConnectedSpawnKind::Controlled,
                 "controller" => ConnectedSpawnKind::Controller,
-                _ => return Err(()),
+                _ => return Err(refused()),
             });
         } else if let Some(v) = tok.strip_prefix("place=") {
             place = Some(match v {
                 "window" => ConnectedSpawnPlace::Window,
                 "tab" => ConnectedSpawnPlace::Tab,
-                _ => return Err(()),
+                _ => return Err(refused()),
             });
         } else if let Some(v) = tok.strip_prefix("of=") {
             // A bare sid, as `from=` and a hold's argument name one.
             if v.is_empty() || v.starts_with('@') {
-                return Err(());
+                return Err(refused());
             }
             origin = Some(aterm_session::SessionId::new(v));
         } else if let Some(v) = tok.strip_prefix("agent=") {
-            agent = Some(agent_spec(v).ok_or(())?);
+            agent = Some(agent_spec(v).ok_or_else(refused)?);
         } else if let Some(v) = tok.strip_prefix("model=") {
             if !valid_model(v) {
-                return Err(());
+                return Err(refused());
             }
             model = Some(v.to_string());
         } else if let Some(v) = tok.strip_prefix("autopilot=") {
             let word = match v {
                 "land" => aterm_agent::supervise::Autopilot::Land,
                 "cruise" => aterm_agent::supervise::Autopilot::Cruise,
-                _ => return Err(()),
+                _ => return Err(refused()),
             };
             if autopilot.replace(word).is_some() {
-                return Err(());
+                return Err(refused());
             }
         } else if let Some(v) = tok.strip_prefix("from=") {
             // A session id, as a task record's `from=` reads one.
             if v == crate::task_record::FROM_CTL || !crate::task_record::valid_from(v) {
-                return Err(());
+                return Err(refused());
             }
             from = Some(aterm_session::SessionId::new(v));
         } else if tok.starts_with("len=") {
             framed = true;
         } else {
-            return Err(());
+            return Err(refused());
         }
     }
     let agent = match agent {
@@ -3024,7 +3044,7 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
             from,
         }),
         None if model.is_some() || autopilot.is_some() || from.is_some() || framed => {
-            return Err(());
+            return Err(None);
         }
         None => None,
     };
@@ -3048,7 +3068,7 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
                 theme,
             })
         }
-        _ => Err(()),
+        _ => Err(None),
     }
 }
 
@@ -3113,17 +3133,22 @@ fn worker_order(
         .map(|order| order.under(autopilot))
 }
 
+/// The form of a `spawn ...` line, or its refusal: a retired agent by name, else the usage line
+/// naming the word it refuses ([`spawn_refusal`]), else a folder that is not there.
+fn spawn_form(rest: &str) -> Result<SpawnForm, String> {
+    if let Some(refusal) = spawn_retired_refusal(rest) {
+        return Err(refusal);
+    }
+    let form = parse_spawn_args(rest).map_err(|refused| spawn_refusal(refused.as_deref()))?;
+    spawn_cwd_refusal(&form).map_or(Ok(form), Err)
+}
+
 /// Handles `spawn ...`, creating a new terminal session or worker on the main thread.
 pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Option<u64>) -> String {
-    if let Some(refusal) = spawn_retired_refusal(rest) {
-        return refusal;
-    }
-    let Ok(form) = parse_spawn_args(rest) else {
-        return spawn_usage();
+    let form = match spawn_form(rest) {
+        Ok(form) => form,
+        Err(refusal) => return refusal,
     };
-    if let Some(refusal) = spawn_cwd_refusal(&form) {
-        return refusal;
-    }
     let sent = match form {
         SpawnForm::Plain {
             window,
@@ -3208,7 +3233,7 @@ pub(crate) fn cmd_tab_aimed(
         by,
         reply,
     }) {
-        Ok(Ok((active, count))) => format!("OK {active} {count}\n"),
+        Ok(Ok((active, count))) => super::control_input::tab_state_reply(active, count),
         Ok(Err(e)) => format!("ERR {e}\n"),
         Err(error) => format!("ERR tab command failed: {error}\n"),
     }
@@ -3319,6 +3344,32 @@ pub(crate) type SpawnTaken = Box<dyn FnOnce(&mut crate::App, Result<Spawned, Str
 
 /// Reply channel for a main-thread `tab` command's `(active_index, tab_count)` result.
 pub(crate) type TabCmdReply = std::sync::mpsc::Sender<Result<(usize, usize), String>>;
+
+/// `ask` as `booking` places it. A worker that parks lands behind what the window shows, whatever
+/// `raise=` says about the window, so nothing the person types is held for it either.
+pub(crate) fn placed_ask(
+    ask: crate::tab_spawn::SpawnAsk,
+    booking: SpawnBooking,
+) -> crate::tab_spawn::SpawnAsk {
+    let SpawnBooking {
+        cwd,
+        split,
+        raise,
+        admission,
+    } = booking;
+    let ask = crate::tab_spawn::SpawnAsk {
+        admission,
+        cwd,
+        ..ask
+    };
+    let parked = ask.parks() && split.is_none();
+    crate::tab_spawn::SpawnAsk {
+        background: (!raise || parked) && split.is_none(),
+        unasked: ask.unasked || parked,
+        refuses_worker_split: split.is_some(),
+        ..ask
+    }
+}
 
 impl crate::App {
     /// Resolves a [`SpawnAim`] to a live [`crate::WindowId`], or `Ok(None)` for the front window.
@@ -3487,20 +3538,14 @@ impl crate::App {
         booking: SpawnBooking,
         then: crate::tab_spawn::TabSpawnThen,
     ) {
-        let SpawnBooking {
-            cwd,
-            split,
-            raise,
-            admission,
-        } = booking;
-        let ask = crate::tab_spawn::SpawnAsk {
-            admission,
-            cwd,
-            background: !raise && split.is_none(),
-            ..ask
-        };
+        let split = booking.split;
+        let ask = placed_ask(ask, booking);
         match split {
             None => self.open_off_loop(owner, crate::tab_spawn::SpawnPlace::Tab, ask, then),
+            Some(_) if self.worker_on_show(owner) => {
+                let why = crate::tab_spawn::WORKER_SPLIT_REFUSED.to_string();
+                then.answer(self, owner, Err(why));
+            }
             Some(dir) => {
                 let _ = self.split_focused_pane_in_window(owner, dir, ask, then);
             }
@@ -4205,7 +4250,7 @@ mod spawn_parse_tests {
             "agent=kimi len=1",
             "connected=controlled place=tab of=s-a len=3",
         ] {
-            assert_eq!(parse_spawn_args(bad), Err(()), "{bad}");
+            assert!(parse_spawn_args(bad).is_err(), "{bad}");
         }
         let usage = super::spawn_usage();
         assert!(
@@ -4271,9 +4316,8 @@ mod spawn_parse_tests {
                 ),
                 "{rest}"
             );
-            assert_eq!(
-                parse_spawn_args(rest),
-                Err(()),
+            assert!(
+                parse_spawn_args(rest).is_err(),
                 "{rest}: no worker of any agent"
             );
         }
@@ -4285,6 +4329,42 @@ mod spawn_parse_tests {
         ] {
             assert_eq!(spawn_retired_refusal(rest), None, "the control: {rest}");
         }
+    }
+
+    /// A SPAWN'S REFUSAL NAMES THE WORD IT REFUSES: the bare usage line left its caller, a fleet
+    /// drive's lead above all, to guess which option was refused. The reply stays the usage line
+    /// (clients read `ERR usage: spawn` as such) and names the word, one line of its first 32
+    /// characters; a line no one word breaks gets the usage line alone.
+    #[test]
+    fn a_spawn_refusal_names_the_word_it_refuses() {
+        let usage = super::spawn_usage();
+        let long = format!("identity={}", "y".repeat(400));
+        for (rest, word) in [
+            (
+                "agent=claude autopilot=land autopilot=cruise len=1",
+                "autopilot=cruise",
+            ),
+            ("theme=a theme=b", "theme=b"),
+            ("agent=claude model=a/b len=1", "model=a/b"),
+            ("agent=claude from=ctl len=1", "from=ctl"),
+            ("agent=bogus len=1", "agent=bogus"),
+            ("window=abc", "window=abc"),
+            ("cwd=/w raise=maybe", "raise=maybe"),
+            ("split=v identity=worker", "identity=worker"),
+            (long.as_str(), "identity=yyyyyyyyyyyyyyyyyyyyyyy…"),
+        ] {
+            let reply = super::spawn_form(rest).expect_err(rest);
+            assert!(
+                reply.starts_with("ERR usage: spawn")
+                    && reply.contains(&format!("`{word}`"))
+                    && reply.lines().count() == 1,
+                "{rest}: {reply:?}"
+            );
+        }
+        for rest in ["model=opus", "connected=controlled", r#"cwd="/w"#] {
+            assert_eq!(super::spawn_form(rest), Err(usage.clone()), "{rest}");
+        }
+        assert!(super::spawn_form("split=v raise=f").is_ok(), "the control");
     }
 
     #[test]
@@ -4333,11 +4413,10 @@ mod spawn_parse_tests {
                 agent: None,
             })
         );
-        assert_eq!(parse_spawn_args("bogus"), Err(()));
-        assert_eq!(parse_spawn_args("split=diagonal"), Err(()));
-        assert_eq!(parse_spawn_args("identity=worker"), Err(()));
-        assert_eq!(parse_spawn_args("identity=-"), Err(()));
-        assert_eq!(parse_spawn_args(r#"cwd="C:\Program Files"#), Err(()));
+        for bad in ["bogus", "split=diagonal", "identity=worker", "identity=-"] {
+            assert_eq!(parse_spawn_args(bad), Err(Some(bad.to_owned())), "{bad}");
+        }
+        assert_eq!(parse_spawn_args(r#"cwd="C:\Program Files"#), Err(None));
     }
 
     #[test]
@@ -4361,27 +4440,23 @@ mod spawn_parse_tests {
                 ..
             })
         ));
-        assert_eq!(parse_spawn_args("connected=controlled place=tab"), Err(()));
-        assert_eq!(parse_spawn_args("connected=controlled of=s-abc"), Err(()));
-        assert_eq!(parse_spawn_args("connected=controlled"), Err(()));
-        assert_eq!(parse_spawn_args("place=tab"), Err(()));
-        assert_eq!(parse_spawn_args("of=s-abc"), Err(()));
-        assert_eq!(
-            parse_spawn_args("connected=owner place=tab of=s-abc"),
-            Err(())
-        );
-        assert_eq!(
-            parse_spawn_args("connected=controlled place=pane of=s-abc"),
-            Err(())
-        );
-        assert_eq!(
-            parse_spawn_args("connected=controlled place=tab of="),
-            Err(())
-        );
-        assert_eq!(
-            parse_spawn_args("connected=controlled place=tab of=@s-abc"),
-            Err(())
-        );
+        for incomplete in [
+            "connected=controlled place=tab",
+            "connected=controlled of=s-abc",
+            "connected=controlled",
+            "place=tab",
+            "of=s-abc",
+        ] {
+            assert_eq!(parse_spawn_args(incomplete), Err(None), "{incomplete}");
+        }
+        for (rest, word) in [
+            ("connected=owner place=tab of=s-abc", "connected=owner"),
+            ("connected=controlled place=pane of=s-abc", "place=pane"),
+            ("connected=controlled place=tab of=", "of="),
+            ("connected=controlled place=tab of=@s-abc", "of=@s-abc"),
+        ] {
+            assert_eq!(parse_spawn_args(rest), Err(Some(word.to_owned())), "{rest}");
+        }
         for knob in [
             "window=1",
             "raise=false",
@@ -4389,9 +4464,9 @@ mod spawn_parse_tests {
             "identity=worker",
             "identity=-",
         ] {
-            assert_eq!(
-                parse_spawn_args(&format!("connected=controlled place=tab of=s-abc {knob}")),
-                Err(()),
+            assert!(
+                parse_spawn_args(&format!("connected=controlled place=tab of=s-abc {knob}"))
+                    .is_err(),
                 "{knob}"
             );
         }
@@ -5147,7 +5222,10 @@ mod worker_start_app_tests {
 
             let (said, heard) = std::sync::mpsc::channel();
             let waiting = std::thread::spawn(move || {
-                let _ = said.send(crate::task_launch::await_first_prompt(&launch).map(|_| ()));
+                let _ = said.send(
+                    crate::task_launch::await_prompt(&launch, std::time::Duration::ZERO)
+                        .map(|_| ()),
+                );
                 launch
             });
             let mut stalled = crate::task_record::TaskMark::new(TaskState::Stalled);
@@ -5167,7 +5245,7 @@ mod worker_start_app_tests {
             crate::task_record::mark_session_task(&ctx, 1, &working).expect("unfenced");
             crate::feed_session_for_test(&app, 1, b"\x1b]133;A\x07$ \x1b]133;B\x07");
             assert!(
-                crate::task_launch::await_first_prompt(&launch).is_ok(),
+                crate::task_launch::await_prompt(&launch, std::time::Duration::ZERO).is_ok(),
                 "CONTROL: a working task's prompt takes its line"
             );
             crate::task_launch::stall_task_why(&ctx, 1, "shell", "CONTROL");
@@ -5176,6 +5254,127 @@ mod worker_start_app_tests {
                 (TaskState::Stalled, Some("shell")),
                 "CONTROL: a working task takes the launcher's stall"
             );
+        });
+    }
+
+    /// A PROMPT REDRAWN BEFORE ITS LINE IS NO STALL: a worker's shell repaints its first prompt
+    /// (the new tab's grid settling, an async prompt) between its launcher's look and the main
+    /// thread's fenced write, which then writes nothing. The launcher looks again and types once
+    /// that prompt settles, once; a person's use of the session stays final, before the first
+    /// admission and during the look again alike.
+    #[cfg(unix)]
+    #[test]
+    fn a_prompt_redrawn_before_its_launch_line_takes_the_line_once_it_settles() {
+        use crate::task_launch::Untyped;
+        #[derive(Clone, Copy, Debug)]
+        enum Before {
+            Redrawn,
+            Person,
+            RedrawnThenPerson,
+        }
+        let state = aterm_tempfile::Builder::new()
+            .prefix("aterm-worker-redrawn")
+            .tempdir()
+            .expect("scratch state home");
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            let mut app = App::headless_for_test();
+            let cases = [
+                (1, Before::Redrawn, pipe()),
+                (2, Before::Person, pipe()),
+                (3, Before::RedrawnThenPerson, pipe()),
+            ];
+            let mut launches = Vec::new();
+            for &(local, before, pipe) in &cases {
+                // A write end that takes the immediate sink write, as a PTY master does.
+                aterm_pty::set_nonblocking(pipe[1], true).expect("nonblocking write end");
+                let sink = Arc::new(SinkWriter::new(pipe[1]));
+                sink.note_master_nonblocking(true);
+                app.push_stub_tab(WindowId(0), crate::stub_session_with_sink(local, sink));
+                crate::feed_session_for_test(&app, local, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+                let sid = sid_of(&app, local);
+                let (seed, _path) = seeded(&sid);
+                let launch = app.ready_worker(&sid, worker(), seed).expect("a worker");
+                launches.push((local, before, pipe, launch.launch));
+            }
+            for (local, before, pipe, launch) in launches {
+                let ctx = ctx_of(&app, local);
+                let store = app.store.clone();
+                let (said, heard) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let seen = crate::task_launch::await_prompt(&launch, std::time::Duration::ZERO)
+                        .expect("its first prompt");
+                    let person = || {
+                        launch
+                            .ctx
+                            .human_input
+                            .note(crate::metrics::now_us(), crate::human_input::Gesture::Other);
+                    };
+                    let mut admitted = Vec::new();
+                    let typed = crate::task_launch::type_at_prompt(&launch, seen, |prompt| {
+                        let first = admitted.is_empty();
+                        if first {
+                            match before {
+                                Before::Redrawn | Before::RedrawnThenPerson => {
+                                    crate::term_lock(&launch.term).process(b"\r\x1b[K$ ");
+                                }
+                                Before::Person => person(),
+                            }
+                        }
+                        let result = crate::task_launch::type_launch_line(
+                            &store,
+                            &launch.ctx.self_id,
+                            launch.ctx.nonce,
+                            prompt,
+                            "worker",
+                        );
+                        if first && matches!(before, Before::RedrawnThenPerson) {
+                            person();
+                        }
+                        admitted.push(result.clone());
+                        Ok::<_, std::convert::Infallible>(result)
+                    });
+                    let _ = said.send((typed, admitted));
+                });
+                let (typed, admitted) = heard
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .expect("the launcher ended within a minute");
+                let record = ctx.timeline.lock().unwrap().task().cloned().unwrap();
+                let written = drained(pipe[0]);
+                match before {
+                    Before::Redrawn => {
+                        assert_eq!(
+                            admitted,
+                            [Err(Untyped::Unsettled), Ok("written whole")],
+                            "the redraw refused the first admission, the settled prompt took the line"
+                        );
+                        assert_eq!(typed, Some("written whole"));
+                        assert_eq!(written, b"worker\r", "typed once");
+                        assert_eq!((record.state, record.why), (TaskState::Working, None));
+                    }
+                    Before::Person | Before::RedrawnThenPerson => {
+                        assert!(
+                            match before {
+                                Before::Person => {
+                                    matches!(admitted.as_slice(), [Err(Untyped::Refused(_))])
+                                }
+                                _ => admitted == [Err::<&str, _>(Untyped::Unsettled)],
+                            },
+                            "{before:?}: admitted once: {admitted:?}"
+                        );
+                        assert_eq!(typed, None, "{before:?}");
+                        assert_eq!(written, b"", "{before:?}: nothing typed");
+                        assert_eq!(
+                            (record.state, record.why),
+                            (TaskState::Stalled, Some("shell")),
+                            "{before:?}"
+                        );
+                    }
+                }
+            }
+            drop(app);
+            for fd in cases.into_iter().flat_map(|(_, _, pipe)| pipe) {
+                unsafe { libc::close(fd) };
+            }
         });
     }
 

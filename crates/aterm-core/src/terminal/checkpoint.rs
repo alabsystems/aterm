@@ -26,6 +26,12 @@ pub struct GridCursorRepr {
     pub cursor_col: u16,
     /// Deferred-wrap (pending-wrap / wrap-next) flag.
     pub pending_wrap: bool,
+    /// The glyph before the cursor is still the one a mark continues (`Grid::cursor_follows_glyph`).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::ops::Not::not")
+    )]
+    pub follows_glyph: bool,
     /// DECSTBM scroll-region top (inclusive).
     pub scroll_top: u16,
     /// DECSTBM scroll-region bottom (inclusive).
@@ -61,6 +67,7 @@ impl GridCursorRepr {
             cursor_row: grid.cursor_row(),
             cursor_col: grid.cursor_col(),
             pending_wrap: grid.pending_wrap(),
+            follows_glyph: grid.cursor_follows_glyph(),
             scroll_top: region.top,
             scroll_bottom: region.bottom,
             margin_left: margins.left,
@@ -77,6 +84,7 @@ impl GridCursorRepr {
         grid.set_horizontal_margins(self.margin_left, self.margin_right);
         grid.set_cursor(self.cursor_row, self.cursor_col);
         grid.set_pending_wrap(self.pending_wrap);
+        grid.set_cursor_follows_glyph(self.follows_glyph);
         grid.restore_tab_stops(&self.tab_stops, self.tab_defaults_suppressed);
         grid.seed_handback(self.handback_rows, self.handback_above);
     }

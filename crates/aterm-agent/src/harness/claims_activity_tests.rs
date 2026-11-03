@@ -506,6 +506,7 @@ fn free_on(peer: &Replica, now: i64) -> bool {
     let view = super::super::View {
         me: "bb02".into(),
         presence: None,
+        ..super::super::View::default()
     };
     let book = super::super::Book::of(peer.row("aa01"));
     book.senior(&key(), &view, now).is_none()
@@ -648,6 +649,7 @@ fn an_off_gives_up_every_claim_whatever_record_cannot_be_read() {
                 &mut state,
                 Cli::Claude,
                 &[("alpha".into(), key())],
+                &[],
                 Act::Off,
                 NOW + 1,
                 Ok(Some(active)),
@@ -797,6 +799,7 @@ fn failed_save_still_observes_a_live_peer() {
         &mut state,
         Cli::Claude,
         &super::super::keys(Cli::Claude, &roster),
+        &[],
         Act::Claim("alpha"),
         NOW,
         Ok(Some(&mut active)),
@@ -906,6 +909,7 @@ fn failed_activity_save_cannot_publish_a_claim() {
         &mut state,
         Cli::Claude,
         &[("alpha".into(), key())],
+        &[],
         Act::Claim("alpha"),
         NOW,
         Ok(Some(&mut active)),
@@ -1234,6 +1238,7 @@ pub(crate) fn observation_transition(
                 &mut local,
                 Cli::Claude,
                 &[("alpha".into(), key())],
+                &[],
                 Act::Claim("alpha"),
                 NOW,
                 activity,

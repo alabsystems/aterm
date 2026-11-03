@@ -139,6 +139,9 @@ pub(crate) struct AskpassRequest {
     pub ticket: std::sync::Arc<AskpassTicket>,
     pub attribute_from: i32,
     pub owned: Option<std::sync::Arc<crate::cpu_policy_authorization::Operation>>,
+    /// aterm started this sudo itself (`control_sudo`): the words are exact and the password
+    /// authorizes them alone, since that sudo runs with `-k`.
+    pub exact: bool,
     pub command: String,
     pub invoker: String,
     pub reply: Sender<AskpassAnswer>,
@@ -173,13 +176,15 @@ pub(crate) fn reply_line(answer: &AskpassAnswer) -> aterm_uds::sudo::WireBuffer 
     }
 }
 
-/// Escape a command line for a trusted display: any control char, newline, or Unicode bidi/isolate/override is shown as `\u{XXXX}`, so a crafted argument can neither inject rows into the sheet nor reorder what the owner reads (design §3.4 step 4, §4).
+/// Escape a command line for a trusted display: any control char, newline, line or paragraph separator (U+2028, U+2029), or Unicode bidi mark/isolate/override (U+061C included) is shown as `\u{XXXX}`, so a crafted argument can neither inject rows into the sheet nor reorder what the owner reads (design §3.4 step 4, §4).
 pub(crate) fn escape_display(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             c if c.is_control()
+                || c == '\u{061c}'
                 || ('\u{200e}'..='\u{200f}').contains(&c)
+                || ('\u{2028}'..='\u{2029}').contains(&c)
                 || ('\u{202a}'..='\u{202e}').contains(&c)
                 || ('\u{2066}'..='\u{2069}').contains(&c) =>
             {

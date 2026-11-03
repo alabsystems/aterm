@@ -402,7 +402,7 @@ fn copy_mounted_tree(src_root: &Path, dir: &Path) -> Result<(), String> {
                 if meta.len() > remaining {
                     return Err("abrew: dmg size limit exceeded".to_string());
                 }
-                let source = std::fs::File::open(entry.path())
+                let source = crate::metadata_io::open_regular(&entry.path())
                     .map_err(|e| format!("abrew: cannot read payload: {e}"))?;
                 let mut dest = std::fs::OpenOptions::new()
                     .write(true)

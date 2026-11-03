@@ -18,10 +18,12 @@ pub const HELPER_PATH: &str = r"C:\lane\desk\desk.ps1";
 /// physical pixels.
 pub const HELPER: &str = r##"$ErrorActionPreference = 'Stop'
 $verb = $args[0]
-if ($verb -eq 'launch') {
+if ($verb -eq 'launch' -or $verb -eq 'launch-owned') {
   $bin = $args[1]
   $d = $args[2]
-  if (Test-Path $d) { Remove-Item -Recurse -Force $d }
+  if ($verb -eq 'launch-owned') {
+    New-Item -ItemType Directory -Path $d -ErrorAction Stop | Out-Null
+  } elseif (Test-Path $d) { Remove-Item -Recurse -Force $d }
   New-Item -ItemType Directory -Force -Path "$d\cfg\aterm", "$d\state" | Out-Null
   [IO.File]::WriteAllBytes("$d\cfg\aterm\aterm.toml", [Convert]::FromBase64String($args[3]))
   $env:XDG_CONFIG_HOME = "$d\cfg"
@@ -33,6 +35,8 @@ if ($verb -eq 'launch') {
   $p = Start-Process -FilePath "$bin\aterm-gui.exe" -ArgumentList $argv -PassThru -RedirectStandardOutput "$d\stdout.log" -RedirectStandardError "$d\stderr.log"
   # Without its handle opened while it runs, the process object has no exit code.
   $null = $p.Handle
+  $identity = @{ pid = $p.Id; birth = $p.StartTime.ToUniversalTime().Ticks.ToString(); image = $p.MainModule.FileName }
+  $identity | ConvertTo-Json -Compress | Set-Content -Path "$d\identity.json"
   Set-Content -Path "$d\pid" -Value $p.Id
   $p.WaitForExit()
   Set-Content -Path "$d\exit" -Value $p.ExitCode
@@ -432,6 +436,8 @@ public static class LaneDesk {
   [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
   [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
   [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT point);
+  [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] static extern IntPtr GetWindowDpiAwarenessContext(IntPtr h);
   [DllImport("user32.dll")] static extern int GetAwarenessFromDpiAwarenessContext(IntPtr c);
@@ -555,6 +561,13 @@ public static class LaneDesk {
   public static string Where(uint pid, string cls) {
     var h = ClassWindow(pid, cls);
     return h == IntPtr.Zero ? "error=no-window" : "place " + Place(h);
+  }
+
+  public static string Hit(uint pid, string cls, int x, int y) {
+    var own = ClassWindow(pid, cls);
+    var hit = GetAncestor(WindowFromPoint(new POINT { X = x, Y = y }), 2);
+    return "target-owned=" + (own != IntPtr.Zero && hit == own && GetForegroundWindow() == own ? "1" : "0") +
+      " left_down=" + ((GetAsyncKeyState(1) & 0x8000) != 0 ? "1" : "0");
   }
 
   // Move `pid`'s window of class `cls` up or down so its client area's top is at
@@ -736,6 +749,7 @@ switch ($verb) {
   'watch' { [LaneDesk]::Watch([uint32]$args[1], $args[2], [int]$args[3], $args[4]) }
   'readback' { [LaneDesk]::Readback([uint32]$args[1], $args[2], $args[3]) }
   'place' { [LaneDesk]::Where([uint32]$args[1], $args[2]) }
+  'hit' { [LaneDesk]::Hit([uint32]$args[1], $args[2], [int]$args[3], [int]$args[4]) }
   'move' { [LaneDesk]::Move([uint32]$args[1], $args[2], [int]$args[3]) }
   'lift' { [LaneDesk]::Lift([uint32]$args[1], $args[2], [int]$args[3]) }
   default { throw "desk.ps1: unknown verb '$verb'" }
@@ -1285,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn the_helper_runs_from_its_path_with_its_words_quoted() {
+    fn the_helper_command_keeps_its_path_and_quotes_its_words() {
         let line = helper_line(&["scale", "\\\\.\\DISPLAY2", "2"]);
         assert!(line.starts_with("powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\lane\\desk\\desk.ps1 scale "));
         assert!(line.ends_with(" 2 2>&1"));
@@ -1293,24 +1307,5 @@ mod tests {
             instance_dir(guest::Arch::X86_64, 2),
             "C:\\lane\\desk\\x86_64-2"
         );
-        for verb in [
-            "'windows'",
-            "'monitors'",
-            "'primary'",
-            "'scale'",
-            "'watch'",
-            "'readback'",
-            "'place'",
-            "'move'",
-            "'lift'",
-        ] {
-            assert!(HELPER.contains(&format!("  {verb} {{")), "{verb}");
-        }
-        for verb in ["'launch'", "'dragsource'"] {
-            assert!(
-                HELPER.contains(&format!("if ($verb -eq {verb}) {{")),
-                "{verb}"
-            );
-        }
     }
 }

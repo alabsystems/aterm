@@ -875,29 +875,48 @@ fn the_room_kept_for_a_status_bar_never_cuts_every_row() {
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
             let state = messages_view_state(&runtime, view);
             let plan = state.scroll_plan().expect("a list");
-            (
-                state.page_chrome.get(),
-                plan.room(),
-                plan.cut_stops(),
-                compiled,
-            )
+            let room = plan.room();
+            let cuts = plan.cut_stops();
+            let top = state
+                .scroll_record
+                .borrow()
+                .as_ref()
+                .map(scroll::ScrollRecord::top);
+            let target = state.page_reveal.as_ref();
+            let target_nodes = compiled
+                .paint
+                .iter()
+                .filter(|node| {
+                    target.is_some_and(|key| {
+                        node.key == *key
+                            || node.key.as_str().starts_with(&format!("{}/", key.as_str()))
+                    })
+                })
+                .take(12)
+                .collect::<Vec<_>>();
+            let target_semantics = target.and_then(|key| compiled.semantic(key));
+            let context = format!(
+                "room={room} cuts={cuts} top={top:?} chrome={:?} target={target:?} target_semantics={target_semantics:#?} target_nodes={target_nodes:#?}",
+                state.page_chrome.get()
+            );
+            (state.page_chrome.get(), room, cuts, compiled, context)
         };
         let preview = UiKey::new("settings/preview/cursor-styles");
         if scale > 1.5 {
             let short = (1_564.0, 180.0);
             // The chooser's frame gives way before its rows outgrow its list, so Themes keeps
             // the bar's room and every row whole.
-            let (chrome, room, cuts, _) = seated(SettingsRoute::Themes, short, false);
+            let (chrome, room, cuts, _, context) = seated(SettingsRoute::Themes, short, false);
             assert_eq!(
                 chrome,
                 PageChrome::FULL,
-                "Themes keeps its chrome and the bar's room"
+                "Themes keeps its chrome and the bar's room: {context}"
             );
             assert_eq!(cuts, 0, "every row of the chooser is whole in {room}pt");
-            let (still, barred, _, compiled) = seated(SettingsRoute::Themes, short, true);
+            let (still, barred, _, compiled, context) = seated(SettingsRoute::Themes, short, true);
             assert_eq!(
                 still, chrome,
-                "a bar that comes changes nothing of the chrome"
+                "a bar that comes changes nothing of the chrome: {context}"
             );
             assert!(
                 compiled
@@ -916,10 +935,10 @@ fn the_room_kept_for_a_status_bar_never_cuts_every_row() {
                 SettingsRoute::Packages,
                 SettingsRoute::CursorStyles,
             ] {
-                let (chrome, room, cuts, _) = seated(route, short, false);
+                let (chrome, room, cuts, _, context) = seated(route, short, false);
                 assert_eq!(
                     cuts, 0,
-                    "{route:?} at 1564×180: every stop whole in {room}pt"
+                    "{route:?} at 1564×180: every stop whole in {room}pt: {context}"
                 );
                 assert!(
                     chrome.bar_room_given,
@@ -3599,8 +3618,22 @@ fn a_choice_taller_than_its_list_takes_its_short_words() {
                 .unwrap();
             let mut seen = None;
             let mut before = None;
+            let mut last_frame = String::new();
+            let mut last_target = None;
             for _ in 0..200 {
                 let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                let state = messages_view_state(&runtime, view);
+                let plan = state.scroll_plan();
+                let top = state
+                    .scroll_record
+                    .borrow()
+                    .as_ref()
+                    .map(scroll::ScrollRecord::top);
+                last_frame = format!(
+                    "room={:?} top={top:?} chrome={:?}",
+                    plan.as_ref().map(scroll::ScrollPlan::room),
+                    state.page_chrome.get()
+                );
                 if let Some(node) = compiled.paint.iter().find(|node| node.key == key) {
                     let UiContent::Button(button) = &node.content else {
                         panic!("{key:?} is a button");
@@ -3609,6 +3642,13 @@ fn a_choice_taller_than_its_list_takes_its_short_words() {
                         .semantic(&key)
                         .map(|semantic| semantic.label.clone())
                         .unwrap_or_default();
+                    last_target = Some((
+                        top,
+                        node.rect,
+                        node.clip,
+                        button.spec.visual_label.clone(),
+                        heard.clone(),
+                    ));
                     if node.clip == node.rect {
                         seen = Some((button.spec.visual_label.clone(), heard));
                         break;
@@ -3624,12 +3664,12 @@ fn a_choice_taller_than_its_list_takes_its_short_words() {
                     .unwrap();
             }
             match seen {
-                None => faults.push(format!("{route:?}: {} is never whole", key.as_str())),
+                None => faults.push(format!("{route:?}: {} is never whole; last_frame[{last_frame}] last_target={last_target:?}", key.as_str())),
                 Some((words, heard)) => {
                     let words = words.unwrap_or_default().replace('\n', " ");
                     if words.contains("(default)") || !heard.contains("(default)") {
                         faults.push(format!(
-                            "{route:?}: {} shows {words:?}, heard {heard:?}",
+                            "{route:?}: {} shows {words:?}, heard {heard:?}; last_frame[{last_frame}] last_target={last_target:?}",
                             key.as_str()
                         ));
                     }

@@ -282,6 +282,9 @@ impl Table for Replica {
             me: self.me.to_owned(),
             book: self.book(),
             writable: Ok(()),
+            clock: None,
+            skewed: Vec::new(),
+            held: Vec::new(),
         })
     }
 
@@ -438,6 +441,7 @@ impl Client {
                 at: now,
                 heard: self.heard.clone(),
             }),
+            ..View::default()
         };
         self.table
             .book()

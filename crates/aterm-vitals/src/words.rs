@@ -1160,7 +1160,7 @@ fn job_marks(snap: &Snapshot) -> Vec<JobSaid> {
     let Some(jobs) = snap.jobs.as_deref() else {
         return Vec::new();
     };
-    let count = |v: Verdict| jobs.rows.iter().filter(|r| r.verdict == v).count() as u64;
+    let condition = |v| crate::jobs::wire::verdict_summary(jobs.rows.iter(), v);
     let zombies: u64 = jobs
         .findings
         .zombies
@@ -1169,29 +1169,24 @@ fn job_marks(snap: &Snapshot) -> Vec<JobSaid> {
         .map(|z| u64::from(z.count))
         .sum();
     [
-        (State::Stuck, count(Verdict::Stuck), "stuck"),
+        (State::Stuck, condition(Verdict::Stuck)),
         (
             State::Zombies,
-            zombies,
-            plural(zombies, "zombie", "zombies"),
+            (zombies > 0).then(|| format!("{zombies} {}", plural(zombies, "zombie", "zombies"))),
         ),
-        (State::Quiet, count(Verdict::Quiet), "quiet"),
-        (
-            State::Waiting,
-            count(Verdict::WaitingYou),
-            "waiting for you",
-        ),
-        (State::Stopped, count(Verdict::Parked), "stopped"),
+        (State::Quiet, condition(Verdict::Quiet)),
+        (State::Waiting, condition(Verdict::WaitingYou)),
+        (State::Stopped, condition(Verdict::Parked)),
     ]
     .into_iter()
-    .filter(|&(_, n, _)| n > 0)
-    .map(|(state, n, what)| {
+    .filter_map(|(state, words)| words.map(|words| (state, words)))
+    .map(|(state, words)| {
         let (mark, ink) = state_mark(Resource::Processes, state);
         JobSaid {
             state,
             mark,
             ink,
-            words: format!("{n} {what}"),
+            words,
         }
     })
     .collect()
@@ -3101,6 +3096,56 @@ mod tests {
             ..JobsView::default()
         })));
         s
+    }
+
+    #[test]
+    fn job_summaries_qualify_local_stalls_without_hiding_independent_ones() {
+        for verdict in [Verdict::Quiet, Verdict::Stuck] {
+            let mut wrapper = job("wrapper", verdict);
+            wrapper.class = crate::jobs::Class::Polling;
+            let mut s = snap();
+            for descendant in [None, Some((84682, 1_793_674_154_348_639)), None] {
+                wrapper.working_descendant = descendant;
+                let view = JobsView {
+                    rows: vec![wrapper.clone(), job("independent", Verdict::Stuck)],
+                    ..JobsView::default()
+                };
+                s.set_jobs(Some(Arc::new(view.clone())));
+                let words = job_marks(&s)
+                    .iter()
+                    .map(|m| m.words.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                assert_eq!(
+                    words.contains("child activity"),
+                    descendant.is_some(),
+                    "{words}"
+                );
+                assert_eq!(words.contains("local"), descendant.is_some(), "{words}");
+                assert!(
+                    words.contains("1 stuck") || words.contains("2 stuck"),
+                    "{words}"
+                );
+                assert_eq!(s.jobs.as_deref(), Some(&view));
+                assert_eq!(
+                    s.resources[Resource::Processes.index()].state,
+                    Some(State::Stuck)
+                );
+                let compact = state(Resource::Processes, &s, &MAC).expect("stuck state");
+                assert_eq!(
+                    compact.clauses.join("; ").contains("child activity"),
+                    descendant.is_some()
+                );
+                let details = processes_details(&s);
+                assert_eq!(
+                    details
+                        .iter()
+                        .flat_map(|d| &d.forms)
+                        .any(|w| w.contains("local")),
+                    descendant.is_some()
+                );
+            }
+        }
     }
 
     fn ladder_rows(loc: &Locale) -> Vec<(Resource, ResourceView)> {

@@ -103,11 +103,16 @@ aterm-converge = { workspace = true }
 # (docs/DESIGN-credential-requests-2026-10-27.md §12.1). No cycle: aterm-secrets links no
 # release crate.
 aterm-secrets = { workspace = true }
+# Early release observations reuse the authenticated control client, never a shell.
+aterm-agent = { workspace = true }
 
 # `ship site` uploads each file of the site as one gzip member around the PNG encoder's
 # deterministic DEFLATE (no clock, name or host in a member), so its SHA-256 names the
 # content for Firebase Hosting's populateFiles.
 aterm-png = { workspace = true }
+
+# Official offline staging reuses the in-app updater verification and publication.
+aterm-update = { workspace = true }
 
 # Same-filesystem clock stamps own an exclusive scratch directory in the slot;
 # they never remove a fixed pre-existing marker merely to read its mtime.
@@ -122,9 +127,6 @@ aterm-spec = { workspace = true }
 aterm-models-release = { workspace = true }
 # Tests hold every ask the release can raise (`notice ask`) to the wire's own parse.
 aterm-messages = { workspace = true }
-# The updater's own reading of a bundle's dev mark: `ship dev-app`'s tests hold the
-# plist it stamps to it, so the mark it seals is the one the updater leaves alone.
-aterm-update = { workspace = true }
 # A loopback GitHub (api, uploads, web and CDN origins): the release's REST lane
 # (src/github.rs) is tested against it through the real /usr/bin/curl, never the network.
 agh-fake = { workspace = true }

@@ -394,7 +394,7 @@ pub fn trust_cut_commands(main_sha: &str) -> Vec<String> {
         "python3 scripts/seal_line_audit.py   # exit 0 says the record covers the seal line; the condition holds only once each PORT and MEASURE row it lists is closed by a main commit".into(),
         "# the consumer check: aterm, ay, ty and clean, each at its origin/main, run the Rust steps of publish/config.sh's CHECK_CMD_DEFAULT with \"$STAGE\" as trust, from a scratch RUSTUP_HOME; each exits 0, or every red it shows is red under the published seal on the same tree".into(),
         format!("scripts/publish_seed_cut.sh --pack \"$STAGE\" --mint {mint}   # prints the archives' release and the re-pin push"),
-        format!("scripts/publish_seed_cut.sh --pack \"$STAGE\" --mint {mint} --publish   # gh release create + git push origin seed/repin-{c12}"),
+        format!("scripts/publish_seed_cut.sh --pack \"$STAGE\" --mint {mint} --publish   # creates the archives' release, then pushes seed/repin-{c12}"),
         "# once main contains the re-pin:".into(),
         "atpkg-publish publish-group rustc --seal \"$STAGE\" --dry-run".into(),
         "atpkg-publish publish-group rustc --seal \"$STAGE\" --upload".into(),

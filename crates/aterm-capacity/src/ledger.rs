@@ -3,10 +3,10 @@
 
 //! THE LEDGER: one directory of claims per user. A claim is a file its holder keeps locked
 //! ([`RecordLock`]) for as long as it lives, and its record says who holds it and for what:
-//! `<start>-<pid>-<seq>.wait` while it waits, `.claim` once admitted. The kernel lets the lock
-//! go when the holder dies, however it dies, so a file whose lock can be taken is a dead
-//! holder's and counts for nothing. `ledger.lock` orders the admissions: a waiter holds it only
-//! while it reads the ledger and decides.
+//! `<start>-<pid>-<seq>.wait` while it waits, `.claim` once admitted. Ordinary v1 claims end
+//! with their holder's lock. Cohort namespaces instead retain an armed or bound reservation
+//! after every guard closes, until the captured kernel scope proves drain. Unknown or torn
+//! custody blocks admission. `ledger.lock` orders each waiter's read and decision.
 
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
@@ -19,11 +19,72 @@ use aterm_toolchain::record_lock::RecordLock;
 
 use crate::{Need, Patience};
 
+#[cfg(unix)]
+#[path = "cohort_ledger.rs"]
+mod cohort_ledger;
+#[cfg(all(test, unix))]
+#[path = "cohort_failure_tests.rs"]
+mod failure_tests;
+
+/// Saved identity of the original claim guard. These numbers are observations, not a
+/// descriptor, writer, spawn receipt or permission to release a reservation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaimGuardIdentity {
+    /// Device of the original held guard, captured when the claim was admitted.
+    pub device: u64,
+    /// Inode of that same original guard; a replacement path is not interchangeable.
+    pub inode: u64,
+}
+
+/// Current factual state of one exact cohort claim generation. A missing working file
+/// without its matching durable tombstone remains unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CohortClaimState {
+    /// The exact marker and original guard match a durably covered retired tombstone.
+    Closed,
+    /// A validated claim remains without that published closure fact.
+    Retained,
+    /// Missing or incomplete evidence proves no closure.
+    Unknown,
+}
+
+/// Whether holder observations may reduce a record's reservation or establish ancestry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Accounting {
+    /// An ordinary live holder's process tree and measured writes may be credited.
+    #[default]
+    Holder,
+    /// Retain the entire budget; a dead or reused holder and closed guards prove no drain.
+    Whole,
+}
+
 /// The most of a claim file any reader takes, and where its lock's range starts on Windows: the record lies before it.
 pub const RECORD_MAX: u64 = 16 * 1024;
 
 /// The most bytes of `what`, `checkout` or the volume a record keeps.
 const TEXT_MAX: usize = 512;
+
+/// Validate an exact checkout spelling for admission and cross-prefix custody lookup.
+/// This performs no path walk; the caller supplies its captured canonical UTF-8 spelling.
+///
+/// # Errors
+/// The spelling is empty, relative, contains a parent traversal, or would be truncated by
+/// the bounded record representation.
+pub fn checkout_exact(checkout: &str) -> io::Result<&str> {
+    if checkout.is_empty()
+        || checkout.len() > TEXT_MAX
+        || !Path::new(checkout).is_absolute()
+        || Path::new(checkout)
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the checkout cannot be represented exactly in the capacity record",
+        ));
+    }
+    Ok(checkout)
+}
 
 // A record's three texts at their longest, each character escaped to JSON's six bytes, and its
 // figures, admission line and measured writes, still lie before RECORD_MAX: no live claim reads
@@ -72,6 +133,8 @@ pub struct Held {
 /// One claim's record: who holds it, for what, and whether it is admitted.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Record {
+    /// The accounting law established by the ledger probe, not by a numeric holder pid.
+    pub accounting: Accounting,
     /// The holder's pid.
     pub pid: u32,
     /// When the claim was made, unix ms: waiters are served in this order.
@@ -82,6 +145,8 @@ pub struct Record {
     pub checkout: String,
     /// What it needs; its `path` is the mount of the volume its disk need is on.
     pub need: Need,
+    /// Typed timing evidence; absent or malformed legacy metadata is unknown, not readiness.
+    pub timing: crate::TimingEvidence,
     /// Its grant, once admitted.
     pub held: Option<Held>,
     /// Processes outside its holder's tree whose use is its own ([`crate::Claim::credit`]): a
@@ -160,6 +225,12 @@ impl Record {
             }
         });
         o.insert("quiet".to_owned(), Value::from(quiet));
+        if self.need.quiet_policy != crate::QuietPolicy::Load {
+            o.insert(
+                "quiet_policy".to_owned(),
+                Value::from(self.need.quiet_policy.word()),
+            );
+        }
         if self.need.alone {
             o.insert("alone".to_owned(), Value::from(true));
         }
@@ -198,6 +269,12 @@ impl Record {
         line_of(o)
     }
 
+    pub(crate) fn timing_line(evidence: crate::TimingEvidence) -> String {
+        let mut value = Map::new();
+        value.insert("timing".into(), evidence.value());
+        line_of(value)
+    }
+
     /// How much longer, at most, this quiet claim holds back claimed work that asked after it, at
     /// `now` (unix ms): once next for its [`Patience::reserve`], while it waits, and for its
     /// [`Patience::hold`] after it starts, which it does by its [`Patience::start`]. `None` when
@@ -207,6 +284,15 @@ impl Record {
     pub fn reserves(&self, now: u64) -> Option<Duration> {
         let p = self.need.patience?;
         self.need.quiet?;
+        if self.need.quiet_policy != crate::QuietPolicy::Load
+            && self.held.is_some()
+            && let Some(admitted) = self.timing.admitted_ms
+            && self.held?.admitted_ms == admitted
+        {
+            // Only explicit actual admission provenance supplies this stronger bounded hold.
+            let end = admitted.saturating_add(millis(p.hold));
+            return (now < end).then(|| Duration::from_millis(end - now));
+        }
         let next = self.next_ms?;
         let from = next.saturating_add(millis(p.reserve));
         let bound = next.saturating_add(millis(p.start));
@@ -267,6 +353,14 @@ impl Record {
             cores: u32::try_from(num(&head, "cores")?).ok()?,
             disk: num(&head, "disk")?,
             quiet,
+            quiet_policy: match head.get("quiet_policy") {
+                None => crate::QuietPolicy::Load,
+                Some(v) => match v.as_str() {
+                    Some("load") => crate::QuietPolicy::Load,
+                    Some("timing") => crate::QuietPolicy::Timing,
+                    _ => crate::QuietPolicy::Unknown,
+                },
+            },
             patience,
             path: head
                 .get("volume")
@@ -280,24 +374,29 @@ impl Record {
         // The lines after the head, in the order they were added: a quiet waiter's `next_ms`,
         // the admission, then the measured writes' (written over in place) and each credit,
         // whichever came first.
+        let mut malformed_after = false;
         let after: Vec<Value> = lines
-            .filter_map(|l| aterm_json::from_str::<Value>(l).ok())
+            .filter_map(|l| match aterm_json::from_str::<Value>(l) {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    malformed_after = true;
+                    None
+                }
+            })
             .collect();
+        let explicit_held = after.iter().find_map(|v| {
+            Some(Held {
+                admitted_ms: num(v, "admitted_ms")?,
+                cores: u32::try_from(num(v, "cores")?).ok()?,
+                alone: v.get("alone").and_then(Value::as_bool) == Some(true),
+            })
+        });
         let held = held.then(|| {
-            after
-                .iter()
-                .find_map(|v| {
-                    Some(Held {
-                        admitted_ms: num(v, "admitted_ms")?,
-                        cores: u32::try_from(num(v, "cores")?).ok()?,
-                        alone: v.get("alone").and_then(Value::as_bool) == Some(true),
-                    })
-                })
-                .unwrap_or(Held {
-                    admitted_ms: start_ms,
-                    cores: need.cores,
-                    alone: false,
-                })
+            explicit_held.unwrap_or(Held {
+                admitted_ms: start_ms,
+                cores: need.cores,
+                alone: false,
+            })
         });
         let next_ms = after.iter().find_map(|v| num(v, "next_ms"));
         let credit = after
@@ -312,7 +411,29 @@ impl Record {
             .next_back()
             .unwrap_or_default();
         let wrote = held.and_then(|_| after.iter().find_map(|v| num(v, "wrote")));
+        // Keep the live reservation even when the newest proof is malformed; never retain an
+        // earlier ready proof through a later corrupt line.
+        let mut timing = if malformed_after {
+            crate::TimingEvidence::default()
+        } else {
+            after
+                .iter()
+                .filter_map(|v| v.get("timing"))
+                .next_back()
+                .map_or_else(crate::TimingEvidence::default, crate::TimingEvidence::read)
+        };
+        if need.quiet_policy != crate::QuietPolicy::Load {
+            // The complete admission line is an independently known resource fact. A later
+            // torn CPU observation cannot erase its bounded hold. Never use start_ms's legacy
+            // fallback, and never repair a mismatched CPU proof into qualifying evidence.
+            let actual = held.and(explicit_held).map(|h| h.admitted_ms);
+            if timing.admitted_ms != actual {
+                timing = crate::TimingEvidence::default();
+            }
+            timing.admitted_ms = actual;
+        }
         Some(Record {
+            accounting: Accounting::Holder,
             pid: u32::try_from(num(&head, "pid")?).ok()?,
             start_ms,
             seq: num(&head, "seq")?,
@@ -322,6 +443,7 @@ impl Record {
                 .unwrap_or_default()
                 .to_owned(),
             need,
+            timing,
             held,
             credit,
             wrote,
@@ -357,7 +479,7 @@ fn next_seq() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// A claim file this process laid and keeps locked; it goes, and its lock with it, when this is dropped.
+/// A locked claim file. Dropping a cohort claim preserves its file while work is live or unknown.
 #[derive(Debug)]
 pub(crate) struct Laid {
     lock: RecordLock,
@@ -365,6 +487,8 @@ pub(crate) struct Laid {
     /// The grant its file has written ([`Ledger::admit`]): a rename that failed after it is tried
     /// again under that grant, without writing another.
     granted: Option<Held>,
+    #[cfg(unix)]
+    custody: Option<cohort_ledger::Custody>,
 }
 
 impl Laid {
@@ -376,6 +500,10 @@ impl Laid {
     /// Add `line` to the record, refused where it would reach into the room kept for the
     /// measured writes' line ([`Self::wrote`]) before [`RECORD_MAX`], which no reader passes.
     pub(crate) fn append(&mut self, line: &str) -> io::Result<()> {
+        #[cfg(unix)]
+        if self.custody.is_some() {
+            return self.append_cohort(line);
+        }
         let end = self.lock.seek(SeekFrom::End(0))?;
         let room = RECORD_MAX - WROTE_LINE as u64;
         if end.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX)) > room {
@@ -390,6 +518,10 @@ impl Laid {
     /// Write `bytes` as the admitted claim's measured writes ([`Record::wrote`]): the line appended
     /// the first time, at the offset kept in `at`, and written over in place after, at one length.
     pub(crate) fn wrote(&mut self, at: &mut Option<u64>, bytes: u64) -> io::Result<()> {
+        #[cfg(unix)]
+        if self.custody.is_some() {
+            return self.wrote_cohort(at, bytes);
+        }
         let offset = match *at {
             Some(offset) => offset,
             None => self.lock.seek(SeekFrom::End(0))?,
@@ -439,10 +571,29 @@ impl Laid {
     /// # Errors
     /// A proof that fails (`InvalidData` naming it), the fresh open's error, or the file could not
     /// be read or its record decoded.
-    pub(crate) fn adopt(fd: std::os::fd::OwnedFd, path: &Path) -> io::Result<(Record, Laid)> {
+    pub(crate) fn adopt(
+        fd: std::os::fd::OwnedFd,
+        path: &Path,
+        writer: Option<std::os::fd::OwnedFd>,
+    ) -> io::Result<(Record, Laid)> {
         use std::os::unix::fs::MetadataExt as _;
         let refused = |why: &str| io::Error::new(io::ErrorKind::InvalidData, why.to_owned());
         let file = File::from(fd);
+        let ledger = Ledger::at(
+            path.parent()
+                .ok_or_else(|| refused("claim has no ledger"))?,
+        );
+        let cohort = ledger.cohort_aware()?;
+        if cohort && writer.is_none() {
+            return Err(refused(
+                "a read-only cohort guard cannot be promoted to a writer; transfer controller authority separately",
+            ));
+        }
+        if !cohort && writer.is_some() {
+            return Err(refused(
+                "legacy claims cannot receive a cohort controller transfer",
+            ));
+        }
         let held = file.metadata()?;
         let named = std::fs::symlink_metadata(path)?;
         if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
@@ -469,20 +620,81 @@ impl Laid {
             lock,
             path: path.to_path_buf(),
             granted: None,
+            custody: None,
         };
         let mut text = String::new();
-        let read = crate::open_regular_reader(path)
-            .and_then(|f| f.take(RECORD_MAX).read_to_string(&mut text));
+        let stamp = |m: &std::fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.ctime(),
+                m.ctime_nsec(),
+                m.mtime(),
+                m.mtime_nsec(),
+            )
+        };
+        let read = (|| {
+            use std::os::unix::fs::FileExt as _;
+            let before = laid.lock.metadata()?;
+            let mut bytes = vec![0u8; RECORD_MAX as usize + 1];
+            let mut length = 0;
+            while length < bytes.len() {
+                let read = laid.lock.read_at(&mut bytes[length..], length as u64)?;
+                if read == 0 {
+                    break;
+                }
+                length += read;
+            }
+            if length as u64 > RECORD_MAX {
+                return Err(refused("claim record is too large"));
+            }
+            if stamp(&before) != stamp(&laid.lock.metadata()?)
+                || stamp(&before) != stamp(&std::fs::symlink_metadata(path)?)
+            {
+                return Err(refused(
+                    "claim origin changed while reading its held descriptor",
+                ));
+            }
+            bytes.truncate(length);
+            text = String::from_utf8(bytes).map_err(|_| refused("claim record is not UTF-8"))?;
+            Ok(())
+        })();
         let held = path.to_str().is_some_and(|p| p.ends_with(CLAIM));
-        match read.map(|_| Record::decode(&text, held)) {
-            Ok(Some(record)) => {
+        let decoded = read.and_then(|_| {
+            let ledger = Ledger::at(
+                path.parent()
+                    .ok_or_else(|| refused("claim has no ledger"))?,
+            );
+            ledger.check_mode()?;
+            match ledger.mode {
+                Mode::Cohort(namespace) => {
+                    let (record, journal) =
+                        crate::cohort_journal::Journal::decode(&text, held, namespace.nonce())?;
+                    let writer = File::from(
+                        writer.ok_or_else(|| refused("missing private cohort writer transfer"))?,
+                    );
+                    let custody = cohort_ledger::Custody::adopt(
+                        namespace, journal, &text, &laid.lock, writer, path,
+                    )?;
+                    Ok((record, Some(custody)))
+                }
+                Mode::Legacy => Record::decode(&text, held)
+                    .map(|r| (r, None))
+                    .ok_or_else(|| refused("the claim's record does not decode")),
+                Mode::Refused(why) => Err(refused(&why)),
+            }
+        });
+        match decoded {
+            Ok((record, custody)) => {
                 let mut laid = laid;
                 laid.granted = record.held;
+                laid.custody = custody;
+                if let Err(error) = laid.check_custody() {
+                    laid.hand_off();
+                    return Err(error);
+                }
                 Ok((record, laid))
-            }
-            Ok(None) => {
-                laid.hand_off();
-                Err(refused("the claim's record does not decode"))
             }
             Err(e) => {
                 laid.hand_off();
@@ -494,6 +706,12 @@ impl Laid {
 
 impl Drop for Laid {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.custody.is_some() {
+            self.drop_cohort();
+            self.lock.unlock();
+            return;
+        }
         let _ = std::fs::remove_file(&self.path);
         self.lock.unlock();
     }
@@ -509,13 +727,132 @@ pub(crate) struct Turn {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ledger {
     dir: PathBuf,
+    mode: Mode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Mode {
+    Legacy,
+    #[cfg(unix)]
+    Cohort(crate::cohort_namespace::Namespace),
+    #[cfg(unix)]
+    Refused(String),
 }
 
 impl Ledger {
     /// The ledger in `dir`.
     #[must_use]
     pub fn at(dir: impl Into<PathBuf>) -> Ledger {
-        Ledger { dir: dir.into() }
+        let dir = dir.into();
+        #[cfg(unix)]
+        match crate::cohort_namespace::Namespace::resolve(&dir) {
+            Ok(Some(namespace)) => {
+                return Ledger {
+                    dir: namespace.backend(),
+                    mode: Mode::Cohort(namespace),
+                };
+            }
+            Err(error) => {
+                return Ledger {
+                    dir,
+                    mode: Mode::Refused(error.to_string()),
+                };
+            }
+            Ok(None) => {}
+        }
+        Ledger {
+            dir,
+            mode: Mode::Legacy,
+        }
+    }
+
+    fn check_mode(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        match &self.mode {
+            Mode::Cohort(namespace) => return namespace.validate(),
+            Mode::Refused(why) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, why.clone()));
+            }
+            Mode::Legacy => {
+                if crate::cohort_namespace::Namespace::resolve(&self.dir)?.is_some() {
+                    return Err(io::Error::other(
+                        "ledger namespace changed; reopen the cohort ledger",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this actual ledger currently validates its physical cohort namespace.
+    /// Pass the ledger itself to admission; a saved `true` is no transferable authority.
+    ///
+    /// # Errors
+    /// The declared namespace is partial, replaced, foreign or has unaccounted predecessors.
+    pub fn cohort_aware(&self) -> io::Result<bool> {
+        self.check_mode()?;
+        #[cfg(unix)]
+        if matches!(self.mode, Mode::Cohort(_)) {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Claims for an exactly represented captured checkout in this actual cohort ledger.
+    /// Unknown records and incomplete namespaces remain errors, never a different checkout.
+    ///
+    /// # Errors
+    /// The ledger is not cohort-aware, the spelling cannot be represented exactly, or any
+    /// namespace, authority or journal read fails. This method performs no checkout path IO.
+    pub fn for_checkout(&self, checkout: &str) -> io::Result<Vec<Record>> {
+        let checkout = checkout_exact(checkout)?;
+        if !self.cohort_aware()? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "exact checkout custody requires a validated cohort ledger",
+            ));
+        }
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|record| record.checkout == checkout)
+            .collect())
+    }
+
+    /// Observe closure only through the current namespace's durable tombstone matched to
+    /// this exact marker and original guard inode. This never repairs, reaps or grants a
+    /// writer or birth capability; absence alone is unknown.
+    /// # Errors
+    /// The namespace, metadata durability, physical origin or bounded read cannot validate.
+    pub fn cohort_claim_state(
+        &self,
+        reference: &crate::CohortClosureRef,
+    ) -> io::Result<CohortClaimState> {
+        self.check_mode()?;
+        #[cfg(unix)]
+        if let Mode::Cohort(namespace) = &self.mode {
+            return cohort_ledger::claim_state(namespace, reference, false);
+        }
+        let _ = reference;
+        Ok(CohortClaimState::Unknown)
+    }
+
+    /// Recover only an exact sealed pending generation, then reap only under actual kernel
+    /// scope drain and a free guard. This cannot truncate an unknown tail, refresh an origin,
+    /// adopt a writer or manufacture a BirthAttempt, Spawned or NoChild receipt.
+    /// # Errors
+    /// The exact namespace, marker, original guard, pending bytes/origin, flush or read fails.
+    pub fn reap_cohort_claim(
+        &self,
+        reference: &crate::CohortClosureRef,
+    ) -> io::Result<CohortClaimState> {
+        self.check_mode()?;
+        #[cfg(unix)]
+        if let Mode::Cohort(namespace) = &self.mode {
+            return cohort_ledger::claim_state(namespace, reference, true);
+        }
+        let _ = reference;
+        Ok(CohortClaimState::Unknown)
     }
 
     /// This user's ledger ([`user_dir`]).
@@ -530,7 +867,10 @@ impl Ledger {
         &self.dir
     }
 
-    /// Every live claim, oldest first, read without the admissions' lock and without removing a dead holder's file: what `aterm pkg capacity` prints.
+    /// Every held or retained claim, oldest first, without removing drained files: what
+    /// `aterm pkg capacity` prints. Cohort reservations can outlive every guard descriptor, and a
+    /// drained cohort claim stays listed, reserving its whole budget, until a reaping scan's
+    /// durable tombstone retires it.
     ///
     /// # Errors
     /// The directory could not be listed (never `NotFound`, which is no claims), or a claim file could not be tested.
@@ -550,13 +890,18 @@ impl Ledger {
         Ok(live)
     }
 
-    /// Every live claim, oldest first, a dead holder's file removed when `reap`.
+    /// Every held or retained claim, oldest first; reap only when its protocol proves drain.
     pub(crate) fn scan(&self, reap: bool) -> io::Result<Vec<Record>> {
         self.scan_where(reap, &|_| true)
     }
 
     /// [`Self::scan`] over the claim files whose name `named` takes.
     fn scan_where(&self, reap: bool, named: &dyn Fn(&str) -> bool) -> io::Result<Vec<Record>> {
+        self.check_mode()?;
+        #[cfg(unix)]
+        if let Mode::Cohort(namespace) = &self.mode {
+            return cohort_ledger::scan(namespace, reap, named);
+        }
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -589,6 +934,11 @@ impl Ledger {
 
     /// Take the admissions' lock if nobody holds it, writing this process's pid into it; `Err(holder)` while another waiter holds it (its pid, where it wrote one).
     pub(crate) fn try_turn(&self) -> io::Result<Result<Turn, Option<u32>>> {
+        self.check_mode()?;
+        #[cfg(unix)]
+        if let Mode::Cohort(namespace) = &self.mode {
+            return cohort_ledger::turn(namespace);
+        }
         ensure_dir(&self.dir)?;
         let path = self.dir.join(LOCK);
         let file = open_rendezvous(&path)?;
@@ -607,19 +957,26 @@ impl Ledger {
 
     /// A claim for `need` in the queue: the record laid under a name no reader looks at, locked, then named a waiter.
     pub(crate) fn lay(&self, need: &Need, start_ms: u64) -> io::Result<(Record, Laid)> {
-        ensure_dir(&self.dir)?;
+        self.check_mode()?;
         let mut need = need.clone();
         let record = Record {
+            accounting: Accounting::Holder,
             pid: std::process::id(),
             start_ms,
             seq: next_seq(),
             checkout: need.checkout.take().unwrap_or_else(checkout_of_cwd),
             need,
+            timing: crate::TimingEvidence::default(),
             held: None,
             credit: Vec::new(),
             wrote: None,
             next_ms: None,
         };
+        #[cfg(unix)]
+        if let Mode::Cohort(namespace) = &self.mode {
+            return cohort_ledger::lay(namespace, record);
+        }
+        ensure_dir(&self.dir)?;
         let stem = record.stem();
         let taking = self.dir.join(format!("{stem}{TAKING}"));
         let path = self.dir.join(format!("{stem}{WAIT}"));
@@ -652,6 +1009,8 @@ impl Ledger {
             lock,
             path: taking,
             granted: None,
+            #[cfg(unix)]
+            custody: None,
         };
         laid.lock.write_all(record.head_line().as_bytes())?;
         std::fs::rename(&laid.path, &path)?;
@@ -663,6 +1022,11 @@ impl Ledger {
     /// is written once: where the rename failed (the file removed meanwhile), the next call tries
     /// it again under the grant the file has, whatever `held` it is given.
     pub(crate) fn admit(&self, laid: &mut Laid, record: &mut Record, held: Held) -> io::Result<()> {
+        self.check_mode()?;
+        #[cfg(unix)]
+        if laid.custody.is_some() {
+            return laid.admit_cohort(record, held);
+        }
         let held = match laid.granted {
             Some(first) => first,
             None => {

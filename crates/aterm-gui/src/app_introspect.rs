@@ -5833,7 +5833,7 @@ impl App {
         let ws = self.windows.get(&wid)?;
         let titles: Vec<String> = ws
             .tab_set
-            .tabs()
+            .shown()
             .iter()
             .map(|tab| {
                 ws.tab_chrome_titles_by_tab.get(&tab.id).map_or_else(
@@ -5852,7 +5852,7 @@ impl App {
             &titles,
             &self.tab_strip_metadata(wid),
             &self.tab_tooltips(wid),
-            ws.tab_set.active_index().unwrap_or(0),
+            ws.tab_set.strip_active().unwrap_or(0),
         )?;
         #[cfg(any(test, debug_assertions))]
         let line = {
@@ -5896,6 +5896,13 @@ impl App {
                     (!window.is_null()).then_some(window)
                 });
 
+            if let (Some(window), Some(handle)) = (
+                ns_window,
+                self.frontmost_window
+                    .and_then(|wid| self._toolbars.get(&wid)),
+            ) {
+                out.extend(macos_tab_frame_lines(window, handle));
+            }
             // SAFETY: side-effect-free AppKit toolbar accessors on live main-thread receivers; each answer is +0, borrowed for the pool above.
             unsafe {
                 let toolbar = ns_window
@@ -5954,6 +5961,7 @@ impl App {
             } else if let Some(line) = self.stripless_tab_chrome() {
                 out.push(line);
             }
+            out.extend(self.workers_chrome_line());
 
             out.extend((self.app_menu_bar)(mtm));
         });
@@ -6971,6 +6979,53 @@ mod native_settings_compatibility_controls_tests {
             );
         }
     }
+}
+
+/// Each chip's `tab-frame` line: rects in the pixels of a `window` capture, whose origin is the window's top left.
+#[cfg(target_os = "macos")]
+fn macos_tab_frame_lines(
+    window: aterm_objc::Id,
+    handle: &crate::toolbar::ToolbarHandle,
+) -> Vec<String> {
+    use aterm_objc::sel;
+    use aterm_objc::{CGPoint, CGRect, CGSize};
+
+    use crate::appkit;
+    // SAFETY: `-frame` and `-convertRectToBacking:` are side-effect-free on the live main-thread window.
+    let height = unsafe {
+        let frame = appkit::send_rect(window, sel!(frame));
+        let local = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: frame.size,
+        };
+        appkit::send_rect_rect(window, sel!(convertRectToBacking:), local)
+            .size
+            .height
+    };
+    crate::toolbar::tab_frame_lines(handle, |view, [x, y, w, h]| {
+        // SAFETY: `-convertRect:toView:` and `-convertRectToBacking:` are side-effect-free on the live chip and its window; nil is the documented "window base coordinates" argument.
+        let b = unsafe {
+            let in_window = appkit::send_rect_rect_id(
+                view,
+                sel!(convertRect:toView:),
+                CGRect {
+                    origin: CGPoint { x, y },
+                    size: CGSize {
+                        width: w,
+                        height: h,
+                    },
+                },
+                aterm_objc::Id::NIL,
+            );
+            appkit::send_rect_rect(window, sel!(convertRectToBacking:), in_window)
+        };
+        [
+            b.origin.x,
+            height - b.origin.y - b.size.height,
+            b.size.width,
+            b.size.height,
+        ]
+    })
 }
 
 #[cfg(target_os = "macos")]

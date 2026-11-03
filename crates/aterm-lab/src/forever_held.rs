@@ -228,7 +228,7 @@ pub(in crate::forever) fn look_step(door: &Door<'_>, tab: &mut Tab, back: Option
             .into_iter()
             .find(|s| s.label == label)
     {
-        let _ = door.out(&["tab", &i.index.to_string()]);
+        let _ = door.out(&["tab", &(i.index + 1).to_string()]);
     }
 }
 

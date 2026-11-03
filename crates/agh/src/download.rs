@@ -124,14 +124,14 @@ pub fn plain_file_name(name: &str) -> bool {
     )
 }
 
-/// Rejects a destination that exists and is not a regular file.
+/// Rejects a destination that exists and is not a regular file (never following a symlink).
 ///
 /// # Errors
 ///
-/// Returns a usage error for a non-regular file or a local error if metadata cannot be read.
+/// Returns a usage error for a non-regular file or symlink, or a local error if metadata cannot be read.
 pub(crate) fn refuse_non_file(dest: &Path) -> Result<()> {
-    match std::fs::metadata(dest) {
-        Ok(meta) if meta.is_file() => Ok(()),
+    match std::fs::symlink_metadata(dest) {
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
         Ok(_) => Err(not_a_file(dest)),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(local("cannot read", dest, &e)),
@@ -147,7 +147,7 @@ fn not_a_file(dest: &Path) -> Error {
 }
 
 /// Reject a destination whose name ends in [`PART_SUFFIX`].
-fn refuse_part_name(dest: &Path) -> Result<()> {
+pub(crate) fn refuse_part_name(dest: &Path) -> Result<()> {
     if is_part_name(dest) {
         return Err(Error::usage(format!(
             "{} ends in {PART_SUFFIX}, the suffix of agh's own part files",
@@ -159,7 +159,7 @@ fn refuse_part_name(dest: &Path) -> Result<()> {
 
 /// A local failure: CouldNotRun `Sub::Local`.
 fn local(what: &str, path: &Path, e: &std::io::Error) -> Error {
-    Error::could_not_run(format!("{what} {}: {e}", path.display())).with_sub(Sub::Local)
+    Error::local(format!("{what} {}: {e}", path.display()))
 }
 
 /// A read of the body that failed: CouldNotRun `Wire(kind)`, why `{kind}: {detail}`.
@@ -234,8 +234,7 @@ impl Part {
     }
 
     fn closed(&self) -> Error {
-        Error::could_not_run(format!("{}: the part file is closed", self.path.display()))
-            .with_sub(Sub::Local)
+        Error::local(format!("{}: the part file is closed", self.path.display()))
     }
 
     fn file(&mut self) -> Result<&mut File> {
@@ -258,11 +257,10 @@ impl Part {
             .is_some_and(|file| still_named(&self.path, file));
         if !ours {
             self.kept = true;
-            return Err(Error::could_not_run(format!(
+            return Err(Error::local(format!(
                 "another download of {} replaced this one's part file",
                 dest.display()
-            ))
-            .with_sub(Sub::Local));
+            )));
         }
         self.file = None;
         std::fs::rename(&self.path, dest).map_err(|e| local("cannot rename into", dest, &e))?;
@@ -315,12 +313,15 @@ pub(crate) fn stream_to_file(
     dest: &Path,
     seen: &mut dyn FnMut(&[u8]),
 ) -> Result<u64> {
+    refuse_part_name(dest)?;
+    refuse_non_file(dest)?;
     let mut part = Part::create(dest)?;
     let path = part.path.clone();
     let written = copy(body, part.file()?, seen, &|e| {
         local("cannot write", &path, e)
     })?;
     part.durable()?;
+    refuse_non_file(dest)?;
     part.finish(dest)?;
     Ok(written)
 }
@@ -333,8 +334,10 @@ const O_NONBLOCK: i32 = 0o4000;
 const O_NONBLOCK: i32 = 0x0004;
 
 /// Open `path` to read it without waiting: on unix `O_NONBLOCK`, so a FIFO that appeared after
-/// `refuse_non_file` looked never blocks the open (the handle's type is judged next).
-fn open_to_hash(path: &Path) -> std::io::Result<File> {
+/// a look at the path never blocks the open (the handle's type is judged next). A regular
+/// file's reads are the same with it. An upload's file, `--notes-file` and a tape's files (its
+/// head, a replayed body) open here too.
+pub(crate) fn open_nonblocking(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -342,21 +345,90 @@ fn open_to_hash(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-/// The sha256 of the file at `path`; `None` when there is no file. Anything there but a
-/// regular file is usage (`refuse_non_file`), judged on the open handle.
+/// `(O_NONBLOCK | O_NOFOLLOW)` on Unix targets, matching `astream_sys`'s per-architecture flags
+/// (`asm-generic/fcntl.h` vs ARM/PowerPC overrides on Linux, and `<sys/fcntl.h>` on Darwin/BSDs).
+#[cfg(unix)]
+const fn dest_open_flags() -> i32 {
+    if cfg!(all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "arm",
+            target_arch = "aarch64",
+            target_arch = "powerpc",
+            target_arch = "powerpc64"
+        )
+    )) {
+        O_NONBLOCK | 0o100000
+    } else if cfg!(any(target_os = "linux", target_os = "android")) {
+        O_NONBLOCK | 0o400000
+    } else if cfg!(target_os = "openbsd") {
+        O_NONBLOCK | 0x0200
+    } else {
+        O_NONBLOCK | 0x0100
+    }
+}
+
+/// Whether `open(2)` refused `path` because its final component is a symlink (`ELOOP`, or
+/// FreeBSD/NetBSD's `EFTYPE`).
+#[cfg(unix)]
+fn is_symlink_open_refusal(error: &std::io::Error) -> bool {
+    let code = error.raw_os_error();
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        code == Some(40)
+    } else if cfg!(any(
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd"
+    )) {
+        matches!(code, Some(62 | 79))
+    } else {
+        code == Some(62)
+    }
+}
+
+/// Open destination `path` for digest inspection without waiting on a FIFO or following a symlink.
+fn open_regular_dest_nonblocking(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, dest_open_flags());
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::custom_flags(&mut options, 0x0020_0000);
+    options.open(path)
+}
+
+/// The sha256 of the regular file at `path` (never following a symlink); `None` when absent.
+/// Anything there other than a regular file is usage (`refuse_non_file`), judged unfollowed and on
+/// the open handle.
 fn file_digest(path: &Path) -> Result<Option<Sha256Digest>> {
-    let mut file = match open_to_hash(path) {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Err(not_a_file(path)),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(local("cannot read", path, &e)),
+    }
+    let mut file = match open_regular_dest_nonblocking(path) {
         Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(_) if path.is_dir() => return Err(not_a_file(path)),
+        #[cfg(unix)]
+        Err(ref e) if is_symlink_open_refusal(e) => return Err(not_a_file(path)),
+        Err(_) if std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.file_type().is_file()) => {
+            return Err(not_a_file(path));
+        }
         Err(e) => return Err(local("cannot read", path, &e)),
     };
-    let is_file = file
+    let metadata = file
         .metadata()
-        .map_err(|e| local("cannot read", path, &e))?
-        .is_file();
-    if !is_file {
+        .map_err(|e| local("cannot read", path, &e))?;
+    if !metadata.is_file() {
         return Err(not_a_file(path));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if metadata.file_attributes() & 0x0000_0400 != 0 {
+            return Err(not_a_file(path));
+        }
     }
     let mut hasher = aterm_digest::Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -479,10 +551,10 @@ fn fetch_inner(
             })?
         }
         Dest::Memory(data) => copy(&mut body, data, &mut seen, &|e| {
-            Error::could_not_run(format!("cannot hold the bytes: {e}")).with_sub(Sub::Local)
+            Error::local(format!("cannot hold the bytes: {e}"))
         })?,
         Dest::Writer(writer) => copy(&mut body, *writer, &mut seen, &|e| {
-            Error::could_not_run(format!("cannot write the bytes: {e}")).with_sub(Sub::Local)
+            Error::local(format!("cannot write the bytes: {e}"))
         })?,
     };
     if bytes > expect.size {
@@ -650,5 +722,47 @@ mod tests {
         let dest = root.path().join("asset.bin");
         drop(Part::create(&dest).expect("a part file"));
         assert!(!part_path(&dest).exists());
+    }
+
+    /// NEGATIVE CONTROL: `file_digest` and `refuse_non_file` reject live and dangling symlinks
+    /// without following them, rather than treating a symlink to a regular file as a regular file
+    /// or treating a dangling symlink as absent.
+    #[test]
+    fn file_digest_and_refuse_non_file_reject_live_and_dangling_symlinks() {
+        let root = aterm_tempfile::Builder::new()
+            .prefix("agh-dest-symlink-")
+            .tempdir()
+            .expect("a scratch directory");
+        let target = root.path().join("target.bin");
+        std::fs::write(&target, b"payload").expect("write target");
+        let live_link = root.path().join("live.bin");
+        std::os::unix::fs::symlink(&target, &live_link).expect("live symlink");
+        let dangling_link = root.path().join("dangling.bin");
+        std::os::unix::fs::symlink(root.path().join("missing.bin"), &dangling_link)
+            .expect("dangling symlink");
+
+        for link in [&live_link, &dangling_link] {
+            let err = refuse_non_file(link).expect_err("symlink destination must be refused");
+            assert_eq!(err.kind, Kind::Usage, "{}", err.why);
+            let err = file_digest(link).expect_err("file_digest must not follow symlinks");
+            assert_eq!(err.kind, Kind::Usage, "{}", err.why);
+            let mut body = std::io::Cursor::new(&b"replacement"[..]);
+            let err = stream_to_file(&mut body, link, &mut |_| {})
+                .expect_err("stream_to_file must refuse symlink destination");
+            assert_eq!(err.kind, Kind::Usage, "{}", err.why);
+            assert!(
+                std::fs::symlink_metadata(link)
+                    .expect("symlink intact")
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+        assert_eq!(std::fs::read(&target).expect("target intact"), b"payload");
+        assert!(
+            file_digest(&root.path().join("absent.bin"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(file_digest(&target).unwrap().is_some());
     }
 }

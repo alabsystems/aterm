@@ -163,24 +163,45 @@ pub fn excerpt(output: &str, max: usize) -> Vec<String> {
         .filter(|l| !l.trim().is_empty() && !is_progress(l) && !is_banner(l))
         .collect();
     let around = |hit: &dyn Fn(&str) -> bool| -> Vec<usize> {
-        let mut picked: Vec<usize> = Vec::new();
+        let mut anchors: Vec<usize> = Vec::new();
         let mut seen: Vec<(&str, Option<&str>)> = Vec::new();
         for (i, l) in lines.iter().enumerate() {
-            if picked.len() >= max {
+            if anchors.len() >= max {
                 break;
             }
-            let key = (l.trim(), lines.get(i + 1).map(|n| n.trim()));
+            let context = if l.trim_start().starts_with("ERROR") {
+                None
+            } else {
+                lines.get(i + 1).map(|n| n.trim())
+            };
+            let key = (l.trim(), context);
             if hit(l) && !seen.contains(&key) {
                 seen.push(key);
-                picked.extend(i.saturating_sub(2)..lines.len().min(i + 3));
+                anchors.push(i);
+            }
+        }
+        // Reserve the causes before their context: even a one-line excerpt must
+        // show a diagnostic, and nearby notes must not crowd out a later cause.
+        let mut picked = anchors.clone();
+        for i in anchors {
+            for (nearby, line) in lines
+                .iter()
+                .enumerate()
+                .take(lines.len().min(i + 3))
+                .skip(i.saturating_sub(2))
+            {
+                if picked.len() < max && !is_error(line) && !picked.contains(&nearby) {
+                    picked.push(nearby);
+                }
             }
         }
         picked.sort_unstable();
-        picked.dedup();
-        picked.truncate(max);
         picked
     };
-    let mut picked = around(&is_error);
+    let mut picked = around(&is_actionable_error);
+    if picked.is_empty() {
+        picked = around(&is_error);
+    }
     if picked.is_empty() {
         picked = around(&|l: &str| l.trim_start().starts_with("warning:"));
     }
@@ -290,12 +311,39 @@ fn is_error(line: &str) -> bool {
         .any(|p| t.contains(p))
 }
 
+/// Compiler diagnostics and explicit failed checks take precedence over logger
+/// severity records, which can be noisy without causing the command to fail.
+fn is_actionable_error(line: &str) -> bool {
+    let t = line
+        .trim_start()
+        .trim_start_matches('\u{2717}')
+        .trim_start();
+    [
+        "error:",
+        "error[",
+        "fatal:",
+        "fatal error:",
+        "FAIL",
+        "COULD NOT RUN",
+    ]
+    .iter()
+    .any(|p| t.starts_with(p))
+        || [
+            "panicked at",
+            "didn't exit successfully",
+            ": FAIL",
+            CEILING_KILL,
+        ]
+        .iter()
+        .any(|p| t.contains(p))
+}
+
 fn one_line(s: &str) -> String {
     s.replace(['\n', '\r'], " ")
 }
 
 /// `name` quoted for a shell when it holds anything but the characters a test path is made of.
-fn shell_word(name: &str) -> String {
+pub(crate) fn shell_word(name: &str) -> String {
     if !name.is_empty()
         && name
             .chars()
@@ -450,6 +498,66 @@ mod tests {
             "an error cargo printed twice is shown once"
         );
         assert_eq!(excerpt("", 4), Vec::<String>::new());
+    }
+
+    #[test]
+    fn actionable_diagnostics_survive_noisy_logger_records() {
+        let noise: String = (0..32)
+            .map(|i| {
+                format!(
+                    "ERROR rustc_interface::passes checksum unavailable\n\
+                     note: dependency {i}\nERROR logger detail {i}\n"
+                )
+            })
+            .collect();
+        for diagnostic in [
+            "error: method `unused` is never used",
+            "error[E0425]: cannot find value `missing`",
+            "fatal error: cannot open input",
+            "thread 'main' panicked at src/lib.rs:7:9:",
+            "✗ FAIL [OB-7] missing obligation",
+        ] {
+            let output = format!(
+                "{noise}\x1b[31m{diagnostic}\x1b[0m\n\
+                   --> src/lib.rs:7:9\n   |\n\
+                 error: could not compile `example`\n"
+            );
+            let found = excerpt(&output, MESSAGE_LINES);
+            assert!(found.iter().any(|line| line == diagnostic), "{found:?}");
+            assert!(found.iter().any(|line| line.contains("src/lib.rs:7:9")));
+            assert!(found.len() <= MESSAGE_LINES);
+            assert!(found.iter().all(|line| !line.starts_with("ERROR")));
+        }
+    }
+
+    #[test]
+    fn an_excerpt_reserves_causes_before_context_and_keeps_distinct_locations() {
+        let first = "error[E0425]: cannot find value `missing`";
+        let output = format!(
+            "note: preceding context\n{first}\n  --> src/a.rs:1:1\n   |\n\
+             {first}\n  --> src/b.rs:2:2\n   |\n"
+        );
+        assert_eq!(excerpt(&output, 1), [first]);
+        let found = excerpt(&output, MESSAGE_LINES);
+        assert_eq!(found.iter().filter(|line| *line == first).count(), 2);
+        for source in ["src/a.rs:1:1", "src/b.rs:2:2"] {
+            assert!(found.iter().any(|line| line.contains(source)));
+        }
+        assert!(excerpt(&output, 0).is_empty());
+    }
+
+    #[test]
+    fn logger_only_failures_still_show_each_distinct_error() {
+        let repeated = "ERROR transport could not write";
+        let mut output: String = (0..32)
+            .map(|i| format!("{repeated}\nnote: attempt {i}\n"))
+            .collect();
+        let distinct = "ERROR transport could not close";
+        output.push_str(distinct);
+        let found = excerpt(&output, MESSAGE_LINES);
+        assert_eq!(found.iter().filter(|line| *line == repeated).count(), 1);
+        assert!(found.iter().any(|line| line == distinct));
+        assert!(found.len() <= MESSAGE_LINES);
     }
 
     #[test]

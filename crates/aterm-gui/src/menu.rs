@@ -284,6 +284,8 @@ pub(crate) enum MenuAction {
     CopyCwd,
     /// Overview… ⌃⌘O: every session of this aterm on one card.
     Overview,
+    /// Workers…: the window's list of the workers it hosts.
+    Workers,
     /// Next That Needs You ⇧⌘J.
     NextNeed,
     /// Harness Log for This Tab ⇧⌘L.
@@ -374,6 +376,7 @@ impl MenuAction {
             MenuAction::Packages => 47,
             MenuAction::RenameSession => 48,
             MenuAction::Overview => 54,
+            MenuAction::Workers => 99,
             MenuAction::NextKitty => 57,
             MenuAction::HarnessLog => 60,
             MenuAction::TakeOver => 61,
@@ -460,6 +463,7 @@ impl MenuAction {
             47 => MenuAction::Packages,
             48 => MenuAction::RenameSession,
             54 => MenuAction::Overview,
+            99 => MenuAction::Workers,
             57 => MenuAction::NextKitty,
             60 => MenuAction::HarnessLog,
             61 => MenuAction::TakeOver,
@@ -1034,6 +1038,7 @@ impl MenuAction {
                 OwnerOnly
             }
             MenuAction::Overview
+            | MenuAction::Workers
             | MenuAction::HarnessLog
             | MenuAction::ReadThisMac
             | MenuAction::NetworkState
@@ -1156,6 +1161,7 @@ impl MenuAction {
             | MenuAction::CopySessionId
             | MenuAction::CopyCwd
             | MenuAction::Overview
+            | MenuAction::Workers
             | MenuAction::NextNeed
             | MenuAction::HarnessLog
             | MenuAction::TakeOver
@@ -1255,6 +1261,10 @@ impl MenuAction {
             MenuAction::Overview => {
                 "Show every session in this aterm: what it needs, what it is doing, its task, \
                  who drives it, and who manages whom."
+            }
+            MenuAction::Workers => {
+                "Show the workers this window hosts: what each is doing, how each ended, and its \
+                 result."
             }
             MenuAction::NextNeed => {
                 "Go to the tab that needs you most; again, to the next one that needs you."
@@ -1410,6 +1420,7 @@ impl MenuAction {
             "CopySessionId" => Some(MenuAction::CopySessionId),
             "CopyCwd" => Some(MenuAction::CopyCwd),
             "Overview" => Some(MenuAction::Overview),
+            "Workers" => Some(MenuAction::Workers),
             "NextNeed" => Some(MenuAction::NextNeed),
             "HarnessLog" => Some(MenuAction::HarnessLog),
             "ReadThisMac" => Some(MenuAction::ReadThisMac),
@@ -1639,6 +1650,12 @@ const AGENTS_MENU: &[MenuEntry] = &[
         action: MenuAction::Overview,
         key: "o",
         mods: MenuMods::CommandControl,
+    },
+    Item {
+        label: "Workers…",
+        action: MenuAction::Workers,
+        key: "",
+        mods: MenuMods::None,
     },
     Separator,
     Item {
@@ -3047,11 +3064,9 @@ mod macos {
         Some(item)
     }
 
-    /// Show a native modal confirmation (a ⌘Q quit, or a close that would lose work) and block.
-    pub(crate) fn confirm(title: &str, body: &str, proceed_label: &str) -> bool {
-        // Proceed whenever no alert could be shown (headless included, as
-        // `confirm_destructive_close` does): a quit that cannot ask must not wedge.
-        ask(title, body, proceed_label, AlertDefault::Proceed).unwrap_or(true)
+    /// Ask before a menu action changes state; unavailable UI supplies no approval.
+    pub(crate) fn confirm(title: &str, body: &str, proceed_label: &str) -> Option<bool> {
+        ask(title, body, proceed_label, AlertDefault::Proceed)
     }
 
     /// [`confirm`] for an owner gesture that changes this Mac.
@@ -3063,7 +3078,7 @@ mod macos {
     enum AlertDefault {
         /// Return (with any modifiers, via `alert_keys`) proceeds.
         Proceed,
-        /// Return and Escape cancel, and no key watch is installed.
+        /// Return and Escape cancel (via `alert_keys`, which sends both to Cancel).
         Cancel,
     }
 
@@ -3103,7 +3118,11 @@ mod macos {
             appkit::send_v_id(alert.id(), sel!(setMessageText:), title.id());
             appkit::send_v_id(alert.id(), sel!(setInformativeText:), body.id());
             if default == AlertDefault::Cancel {
-                let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), cancel.id());
+                let refuse = Obj::retain(appkit::send_id_id(
+                    alert.id(),
+                    sel!(addButtonWithTitle:),
+                    cancel.id(),
+                ));
                 let proceed_button =
                     appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), proceed.id());
                 if !proceed_button.is_null() {
@@ -3111,6 +3130,15 @@ mod macos {
                     // which the NSButton `-addButtonWithTitle:` returns is.
                     appkit::send_v_bool(proceed_button, sel!(setRefusesFirstResponder:), true);
                 }
+                // AppKit gives a first button titled Cancel Escape and no Return, so Return would
+                // press nothing: the key watch sends Return and Escape both to Cancel.
+                let panel = Obj::retain(appkit::send_id(alert.id(), sel!(window)));
+                let _keys = match (panel, refuse) {
+                    (Some(panel), Some(refuse)) => Obj::retain(refuse.id()).and_then(|on_return| {
+                        crate::alert_keys::watch_alert_keys(panel, None, on_return, refuse)
+                    }),
+                    _ => None,
+                };
                 let response = appkit::send_isize(alert.id(), sel!(runModal));
                 return Some(response == NS_ALERT_SECOND_BUTTON_RETURN);
             }
@@ -3431,6 +3459,21 @@ mod macos {
 
         use super::MenuTarget;
         use crate::appkit;
+
+        #[test]
+        fn an_unavailable_menu_confirmation_never_supplies_approval() {
+            std::thread::spawn(|| {
+                use crate::platform::AppRt as _;
+
+                assert!(appkit::MainThread::new().is_none());
+                let runtime = crate::platform::AppRtMacOS {
+                    probe_preferences: false,
+                };
+                assert_eq!(runtime.confirm("Change state?", "Test", "Proceed"), None);
+            })
+            .join()
+            .expect("off-main confirmation check");
+        }
 
         #[test]
         fn the_registered_class_is_what_the_runtime_reports() {
@@ -3755,6 +3798,7 @@ mod tests {
             [
                 (MenuAction::NextNeed, "j", MenuMods::CommandShift),
                 (MenuAction::Overview, "o", MenuMods::CommandControl),
+                (MenuAction::Workers, "", MenuMods::None),
                 (MenuAction::TakeOver, "", MenuMods::None),
                 (MenuAction::HandBack, "", MenuMods::None),
                 (MenuAction::HarnessLog, "l", MenuMods::CommandShift),

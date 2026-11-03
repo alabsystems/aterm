@@ -306,4 +306,15 @@ mod tests {
             Err(PodCastError::TargetAlignmentGreaterAndInputNotAligned)
         );
     }
+
+    #[test]
+    fn zeroed_returns_all_zero_bits() {
+        assert_eq!(u64::zeroed(), 0);
+        assert_eq!(i128::zeroed(), 0);
+        assert_eq!(f32::zeroed().to_bits(), 0);
+        assert_eq!(f64::zeroed().to_bits(), 0);
+        let arr = <[u32; 3]>::zeroed();
+        assert_eq!(bytes_of(&arr), &[0u8; 12]);
+        assert!(bytes_of(&<()>::zeroed()).is_empty());
+    }
 }

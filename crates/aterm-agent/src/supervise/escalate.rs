@@ -854,10 +854,10 @@ fn entry_key(shown: u64, tail: NeedTail) -> u64 {
 
 impl<C: Ctl> Session<'_, C> {
     /// WHAT THE NEEDS ENTRY SAYS THE HARNESS DOES BESIDE THE NEEDS under `mode` ([`NeedTail`]):
-    /// under Land, where it rests on them or the work landed beside them, the work waits only on
+    /// under Land, where it rests on them or the work concluded beside them, the work waits only on
     /// the person; it carries on otherwise.
     fn need_tail(&self, mode: Autopilot) -> NeedTail {
-        if mode == Autopilot::Land && (self.turn_end.land_resting() || self.turn_end.landed()) {
+        if mode == Autopilot::Land && (self.turn_end.land_resting() || self.turn_end.concluded()) {
             NeedTail::WaitsOnYou
         } else {
             NeedTail::CarryingOn

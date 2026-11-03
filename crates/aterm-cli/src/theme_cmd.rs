@@ -359,6 +359,17 @@ fn parse_import_args(args: &[OsString]) -> Result<Option<ImportArgs>, String> {
             Some(flag) if flag.starts_with('-') && flag.len() > 1 => {
                 return Err(format!("unknown option {flag:?}"));
             }
+            None if arg.as_encoded_bytes().starts_with(b"--name=") => {
+                if name.is_some() {
+                    return Err("--name is given twice".to_string());
+                }
+                return Err("--name must be UTF-8".to_string());
+            }
+            None if arg.as_encoded_bytes().starts_with(b"-")
+                && arg.as_encoded_bytes().len() > 1 =>
+            {
+                return Err(format!("unknown option {:?}", arg.to_string_lossy()));
+            }
             _ if file.is_some() => return Err("takes one file".to_string()),
             _ => file = Some(arg.clone()),
         }
@@ -785,5 +796,38 @@ pub(crate) mod tests {
             assert!(out.stdout.contains("aterm theme import"), "{argv:?}");
             assert!(out.stdout.contains("aterm theme list"), "{argv:?}");
         }
+    }
+
+    /// Non-UTF-8 `--name=<bytes>` and unknown `-...` flags are refused as usage errors (exit 2)
+    /// instead of falling through to the positional file slot.
+    /// NEGATIVE CONTROL: matching only `arg.to_str()` treats `--name=\xff` as a file path and
+    /// exits 1 on `open` instead of 2 with `USAGE`.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_flags_are_refused_as_usage_errors() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let root = scratch("non-utf8-flags");
+        let themes = root.join("themes");
+        let bad_inline_name = vec![
+            OsString::from("import"),
+            OsString::from("/nonexistent/x.conf"),
+            OsString::from_vec(b"--name=\xff".to_vec()),
+        ];
+        let out = run(&bad_inline_name, Some(&themes), &NEVER_LISTS);
+        assert_eq!(out.code, 2, "{out:?}");
+        assert!(out.stderr.contains("--name must be UTF-8"), "{out:?}");
+        assert!(out.stderr.contains(USAGE), "{out:?}");
+
+        let bad_flag = vec![
+            OsString::from("import"),
+            OsString::from_vec(b"--bogus\xff".to_vec()),
+        ];
+        let out = run(&bad_flag, Some(&themes), &NEVER_LISTS);
+        assert_eq!(out.code, 2, "{out:?}");
+        assert!(out.stderr.contains("unknown option"), "{out:?}");
+        assert!(out.stderr.contains(USAGE), "{out:?}");
+        assert!(!themes.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -16,7 +16,7 @@ pub(super) struct Progress {
 impl Progress {
     pub(super) fn open(path: &Path) -> std::io::Result<Self> {
         Ok(Self {
-            file: std::fs::File::open(path)?,
+            file: crate::open_regular(path)?,
             line: Vec::new(),
             oversized: false,
             reported: false,

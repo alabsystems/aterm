@@ -15968,6 +15968,10 @@ fn page(
     };
     let drawn_at = state.page_chrome_at.get();
     let drawn_chrome = state.page_chrome.get();
+    // A held caption and peek belong to the geometry they were measured in. The same
+    // list room at a different width or text size can need a different seat.
+    let geometry_changed = drawn_at.is_some_and(|at| !at.same_page(&chrome_at));
+    state.start_let_go.set(geometry_changed);
     let bar_most = state.status_bar_most.get();
     // What a seat in `chrome` lays the page out by: the rows' and fields' room, and what a
     // status's bar takes of the list.
@@ -16089,7 +16093,8 @@ fn page(
         } else {
             state.scroll_plan().map_or((true, (0, 0)), |plan| {
                 (
-                    plan.first_screen_need() <= plan.room() + 0.01,
+                    plan.first_screen_need() <= plan.room() + 0.01
+                        && state.keyboard_name_fits_in(&plan),
                     (plan.cut_stops(), plan.bare_captions()),
                 )
             })
@@ -16232,7 +16237,7 @@ fn page(
         let planned = told_plan(chrome, calm)?;
         let plan = &planned.0;
         Some((
-            plan.first_screen_need() <= plan.room() + 0.01,
+            plan.first_screen_need() <= plan.room() + 0.01 && state.keyboard_name_fits_in(plan),
             (plan.cut_stops(), plan.bare_captions()),
         ))
     };
@@ -16567,17 +16572,28 @@ fn page(
             let reveals = state.page_reveal.is_some()
                 && !state.reveals_pinned(record.as_ref())
                 && !state.reveal_left_by_press();
+            // A retained record can belong to another viewport, text size or bar room.
+            // Only this candidate's measured plan can establish its keyboard-name room.
+            let name_fits_here = || {
+                state.keyboard_name_reveal().is_none()
+                    || told_plan(chrome, bars)
+                        .is_some_and(|planned| state.keyboard_name_fits_in(&planned.0))
+            };
             // A PRESS'S STATUS NEVER CHANGES THE PAGE'S CHROME: its bar takes a side of the list,
             // or the toolbar's place, as the press's place lets it ([`scroll::BarSide`]). Chosen
             // again under it, a 178x152 window at 2x listed its toolbar, the switch pressed at
             // the list's top went up under it by the toolbar's 52pt, and the bar stood over the
             // rest of the page.
-            if tells && (scrolled || !reveals || (bars && state.press_holds_place())) {
+            if tells
+                && (scrolled || !reveals || (bars && state.press_holds_place()))
+                && name_fits_here()
+            {
                 return (chrome, None);
             }
             // A revealed row, captioned as calm, fits the calm room; a row filtered out is no stop.
             let row_fits = tells
                 && lists_themes(state, width)
+                && name_fits_here()
                 && state.page_reveal.as_ref().is_some_and(|reveal| {
                     let (room, held, rows) = calm_room_at(chrome);
                     showcase_page::row_filtered_out(state, rows, reveal)
@@ -16597,14 +16613,16 @@ fn page(
             match tells
                 .then(|| told_plan(chrome, true))
                 .flatten()
-                .map(|planned| state.revealed_stop_fits_in(&planned.0))
-            {
+                .map(|planned| {
+                    state.revealed_stop_fits_in(&planned.0)
+                        && state.keyboard_name_fits_in(&planned.0)
+                }) {
                 Some(fits) => {
                     #[cfg(test)]
                     if BAR_STEPS_SEATED.with(Cell::get) && crate::work_counts::page_work_counted() {
                         let seated = unseen(|| {
                             let _ = seat(chrome, true);
-                            state.revealed_stop_fits()
+                            state.revealed_stop_fits() && state.keyboard_name_fits()
                         });
                         assert_eq!(
                             seated, fits,
@@ -16617,7 +16635,9 @@ fn page(
                 }
                 None => {
                     let seated = seat(chrome, bars);
-                    if scrolled || !reveals || state.revealed_stop_fits() {
+                    if (scrolled || !reveals || state.revealed_stop_fits())
+                        && state.keyboard_name_fits()
+                    {
                         return (chrome, Some(seated.0));
                     }
                     spare = Some((chrome, seated));
@@ -17848,7 +17868,7 @@ fn page(
         };
         // Seats letting such a start go tell their own overruns and screens: drop what was told.
         let let_go = |go: bool| {
-            state.start_let_go.set(go);
+            state.start_let_go.set(go || geometry_changed);
             overruns.borrow_mut().clear();
             screens.borrow_mut().clear();
             tolds.borrow_mut().clear();
@@ -18073,11 +18093,7 @@ fn page(
         // New results first take no rung newly drawn that cuts the control it shows whole (R2).
         let anew = drawn_at.is_none() && !state.landing_owed();
         // Leaving the chrome drawn last anyway, staying keeps no R2: a rung cutting it comes next.
-        #[cfg(test)]
-        let strict_only = GIVE_WAY_STRICT_ONLY.with(Cell::get);
-        #[cfg(not(test))]
-        let strict_only = false;
-        let lax = anew && chrome != drawn_chrome && !strict_only;
+        let lax = anew && chrome != drawn_chrome;
         // Whether `trial`'s screen passes `strict`: a new rung cuts no control it can show whole.
         let uncut = |state: &SettingsViewState, trial: PageChrome, strict: bool| {
             !strict || trial == drawn_chrome || !state.keyboard_cut_here()
@@ -19046,8 +19062,6 @@ thread_local! {
     pub(crate) static TOOLBAR_LEAN_REFUSED: Cell<bool> = const { Cell::new(false) };
     /// Whether R2's give-way gives bars room only under bars, as c5ef831d7f did (a control).
     pub(crate) static GIVING_UNDER_BARS_ONLY: Cell<bool> = const { Cell::new(false) };
-    /// Whether new results' give-way skips its second pass off the chrome drawn last (a control).
-    pub(crate) static GIVE_WAY_STRICT_ONLY: Cell<bool> = const { Cell::new(false) };
     /// Whether a focused Reset color is laid at its hug width past the column (a control).
     pub(crate) static RESET_COLOR_UNCAPPED: Cell<bool> = const { Cell::new(false) };
     /// Whether this thread's renders stack a compact window's statuses under
@@ -43393,6 +43407,7 @@ use color_picker::{
 
 #[path = "native_settings_harness.rs"]
 mod harness_page;
+pub(crate) use harness_page::OWNER_RULES_PREFIX;
 
 #[path = "native_settings_lab.rs"]
 mod lab_page;

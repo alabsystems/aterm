@@ -472,6 +472,35 @@ pub fn config_flags(argv: &[String]) -> Vec<String> {
     out
 }
 
+/// The flags of `argv` a worker of this agy starts with: what moves its config
+/// ([`config_flags`]) and what it may do unasked, its parent's permissions (owner ruling
+/// 2026-11-02).
+#[must_use]
+pub fn worker_flags(argv: &[String]) -> Vec<String> {
+    let mut out = config_flags(argv);
+    let mut i = 1;
+    while i < argv.len() {
+        let tok = argv[i].as_str();
+        i += 1;
+        if matches!(tok, "-" | "--") || !tok.starts_with('-') {
+            break;
+        }
+        let Some((name, attached)) = flag_token(tok) else {
+            break;
+        };
+        let carries = matches!(flag(name), Some((Arity::One, _))) && attached.is_none();
+        let value = carries.then(|| argv.get(i).cloned()).flatten();
+        if carries {
+            i += 1;
+        }
+        if matches!(name, "dangerously-skip-permissions" | "sandbox" | "mode") {
+            out.push(tok.to_string());
+            out.extend(value);
+        }
+    }
+    out
+}
+
 /// Whether this launch retains the default credential/profile route. Reuse
 /// the pinned native flag grammar, including Go's single-dash and value rules.
 pub fn shared_key_defaults(args: &[String]) -> bool {
@@ -809,13 +838,32 @@ pub fn env_of_words(words: &[String]) -> Vec<(String, String)> {
 /// Whether `program` is a build in an atpkg store (`…/store/agy/<build>/ bin/agy`).
 #[must_use]
 pub fn store_build(program: &Path) -> bool {
+    let plain = program.components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::Normal(_)
+        )
+    });
+    if !program.has_root() || !plain {
+        return false;
+    }
     let names: Vec<&str> = program
         .components()
         .rev()
         .take(5)
-        .filter_map(|c| c.as_os_str().to_str())
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
         .collect();
-    matches!(names.as_slice(), [PROGRAM, "bin", build, PROGRAM, "store"] if !build.is_empty())
+    matches!(
+        names.as_slice(),
+        [PROGRAM, "bin", build, PROGRAM, "store"]
+            if !(build.len() > 1 && build.starts_with('0'))
+                && crate::parse_uint::<u64>(build).is_some()
+    )
 }
 
 /// THE LINE A PERSON IS TOLD to resume an agy conversation by hand.

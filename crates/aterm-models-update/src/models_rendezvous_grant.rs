@@ -25,6 +25,10 @@ pub fn native_update_rendezvous_grant_model() -> Model {
             var held = 0;
             var adopted = 0;
             var closed = 0;
+            var empty_capable = 0;
+            var empty_declared = 0;
+            var empty_offered = 0;
+            var sessionless = 0;
 
             action Upgrade when (phase == 0 && capable == 0) {
                 capable = 1;
@@ -32,8 +36,26 @@ pub fn native_update_rendezvous_grant_model() -> Model {
             action Declare when (phase == 0 && capable == 1 && declared == 0) {
                 declared = 1;
             }
-            action Grow when (phase == 0 && large == 0) {
+            action Grow when (phase == 0 && large == 0 && sessionless == 0) {
                 large = 1;
+            }
+            // The sessionless grant is its own declared capability (`empty1`): a target
+            // that reads chunks need not read an overlap that carries no session.
+            action UpgradeEmpty when (phase == 0 && empty_capable == 0) {
+                empty_capable = 1;
+            }
+            action DeclareEmpty when (
+                phase == 0 && empty_capable == 1 && empty_declared == 0
+            ) {
+                empty_declared = 1;
+            }
+            action Empty when (phase == 0 && large == 0 && sessionless == 0) {
+                sessionless = 1;
+            }
+            action OfferEmpty when (
+                phase == 0 && empty_offered == 0 && (empty_declared == 1 || Buggy == 1)
+            ) {
+                empty_offered = 1;
             }
             action Offer when (phase == 0 && offered == 0 && (declared == 1 || Buggy == 1)) {
                 offered = 1;
@@ -49,7 +71,10 @@ pub fn native_update_rendezvous_grant_model() -> Model {
                 claimed = 2;
                 phase = 2;
             }
-            action GrantOne when (phase == 2 && large == 0) {
+            action GrantOne when (
+                phase == 2 && large == 0 &&
+                (sessionless == 0 || empty_offered == 1 || Buggy == 1)
+            ) {
                 grant = 1;
                 need = 1;
                 phase = 3;
@@ -62,6 +87,10 @@ pub fn native_update_rendezvous_grant_model() -> Model {
                 phase = 3;
             }
             action RefuseTooMany when (phase == 2 && large == 1 && claimed == 1) {
+                grant = 3;
+                phase = 4;
+            }
+            action RefuseEmpty when (phase == 2 && sessionless == 1 && empty_offered == 0) {
                 grant = 3;
                 phase = 4;
             }
@@ -78,13 +107,16 @@ pub fn native_update_rendezvous_grant_model() -> Model {
             }
             action Adopt when (
                 adopted == 0 && closed == 0 && (grant == 1 || claimed == 2) &&
-                held > 0 && (held == need || Buggy == 1)
+                held > 0 && (held == need || Buggy == 1) &&
+                (sessionless == 0 || (empty_offered == 1 && empty_capable == 1))
             ) {
                 adopted = 1;
             }
             action Refuse when (
                 adopted == 0 && closed == 0 && held == sent && held > 0 &&
-                ((phase == 4 && held <= need - 1) || (grant == 2 && claimed == 1))
+                ((phase == 4 && held <= need - 1) || (grant == 2 && claimed == 1) ||
+                    (grant == 1 && sessionless == 1 &&
+                        (empty_offered == 0 || empty_capable == 0)))
             ) {
                 closed = 1;
                 held = if Buggy == 1 { held } else { 0 };
@@ -96,6 +128,13 @@ pub fn native_update_rendezvous_grant_model() -> Model {
             invariant OneMessageWhenItFits: grant <= 1 || grant == 3 || large == 1;
             invariant AdoptionIsWhole: adopted == 0 || held == need;
             invariant RefusalClosesEverything: closed == 0 || held == 0;
+            invariant EmptyOfferedOnlyWhenDeclared: empty_offered <= empty_declared;
+            invariant EmptyGrantOnlyWhenOffered:
+                if grant == 1 && sessionless == 1 {
+                    empty_offered == 1
+                } else {
+                    empty_offered <= 1
+                };
         }
     }
 }

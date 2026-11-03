@@ -426,9 +426,9 @@ pub(crate) struct State {
     pub(crate) held_total: u64,
     pub(crate) tries_not_yet: u64,
     pub(crate) seen_before_ack: u64,
-    /// Writes that carried a group commit and a publish together, the commit first: a
-    /// bridge's held inbox commit riding its next publish (critic item B08); and group
-    /// commits written alone.
+    /// Writes that carried a group commit and publishes together, the commit first: a
+    /// bridge's held inbox commit riding its next publish (critic item B08) or its bus
+    /// mirror's burst of slots (critic item C13); and group commits written alone.
     pub(crate) commits_corked: u64,
     pub(crate) commits_alone: u64,
     /// The rules every open SETS ([`crate::broker_rules::retain`]), as its `Hello` advertises
@@ -2847,7 +2847,9 @@ impl std::io::Write for SimStream {
             let mut s = lock(&self.process.core.broker.state);
             match frames.len() {
                 1 => s.commits_alone += 1,
-                2 if publish(frames.get(1)) => s.commits_corked += 1,
+                n if n > 1 && frames[1..].iter().all(|f| publish(Some(f))) => {
+                    s.commits_corked += 1;
+                }
                 _ => {}
             }
         }

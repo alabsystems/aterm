@@ -175,7 +175,7 @@ fn judge_line(
         let own = pad
             .filter(|p| !p.is_empty())
             .ok_or("codex-alab drew no native controls")?;
-        if let Some(cells) = surfaces::face_cells(face)
+        if let Some(cells) = surfaces::face_words(face)
             && !own.contains(cells)
         {
             return Err(format!("codex-alab's own line names no {face} ({own:?})"));

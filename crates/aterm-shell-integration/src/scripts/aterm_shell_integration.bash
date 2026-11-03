@@ -295,13 +295,13 @@ __aterm_path_front() {
             ;;
     esac
 }
-# While aterm installs Apple's Command Line Tools, `$ATERM_CLT_SHIM` names the
-# directory whose `git`, `cc` and kin say the tools are on their way instead of
+# While Apple's Command Line Tools are missing, `$ATERM_CLT_SHIM` names the
+# directory whose `git`, `cc` and kin fail plainly instead of
 # raising Apple's install dialog, and its `.wanted` mark is there. A profile's
 # `path_helper` puts `/usr/bin` back in front of it, so it moves to just ahead
 # of the first `/usr/bin` (else `/bin`): never ahead of a person's own earlier
 # entry. A PATH that already has it there is not assigned, which would flush
-# the command hash. Without the mark nothing installs them: the shim is put
+# the command hash. Without the mark the tools exist: the shim is put
 # back nowhere.
 __aterm_clt_shim_place() {
     local LC_ALL=C

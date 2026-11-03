@@ -963,6 +963,11 @@ pub fn run(
 
 /// The upkeep already holds sign-in admission and has selected an unattended
 /// route. It uses the same grant consumption and publication as explicit renewal.
+pub(in crate::harness) struct BackgroundRenewal {
+    pub renewal: Renewal,
+    pub observation: Option<super::RenewalObservation>,
+}
+
 pub(in crate::harness) fn background(
     env: &Env,
     host: &dyn AccountsHost,
@@ -971,10 +976,13 @@ pub(in crate::harness) fn background(
     policy: accounts::RenewalPolicy<'_>,
     browser: &RenewBrowser,
     authority: &dyn Authority,
-) -> Renewal {
+) -> BackgroundRenewal {
     let mut request = [0; 16];
     if aterm_uds::rand::fill(&mut request).is_err() || request == [0; 16] {
-        return Renewal::Failed;
+        return BackgroundRenewal {
+            renewal: Renewal::Failed,
+            observation: None,
+        };
     }
     let mut guard = Guard::Shared {
         authority,
@@ -986,7 +994,8 @@ pub(in crate::harness) fn background(
         .roster
         .row(&policy.row.label)
         .and_then(|row| row.dir.as_deref());
-    let result = renew_one_guarded(
+    let mut observation = None;
+    let result = super::renew_one_observed(
         env,
         host,
         store,
@@ -997,6 +1006,7 @@ pub(in crate::harness) fn background(
         &mut io::sink(),
         &mut io::sink(),
         &mut guard,
+        &mut observation,
     );
     if result != Renewal::Renewed {
         guard.failed(
@@ -1007,5 +1017,8 @@ pub(in crate::harness) fn background(
             &mut io::sink(),
         );
     }
-    result
+    BackgroundRenewal {
+        renewal: result,
+        observation,
+    }
 }

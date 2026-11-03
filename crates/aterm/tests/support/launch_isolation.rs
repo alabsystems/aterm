@@ -52,6 +52,12 @@ pub fn sock_fits(sock: &Path) -> bool {
 /// at that level.
 pub const SYSTEM_PRESSURE: &str = "ATERM_DEBUG_SYSTEM_PRESSURE";
 
+/// The development seam naming the sleep an instance's hosted harness loops read
+/// (`aterm-gui`'s `harness_host::NO_HOST_SLEEP`): [`apply`] sets it to `none`, so each loop reads
+/// a host that never sleeps, and a Mac with its lid closed, in and out of dark wake every few
+/// seconds, puts no wake to settle into what a test's hang detector waits on.
+pub const HOST_SLEEP: &str = aterm_types::domain::ENV_DEBUG_HOST_SLEEP;
+
 /// Config disabling automatic update, package, and agent supervisor lanes ([`HARNESS_OFF`]).
 /// Its `[packages] enabled = false` is also atpkg's no to unattended installs
 /// (`atpkg::adoption::unattended_install_off`), so a worker spawned in a world built on it runs the
@@ -202,7 +208,8 @@ pub fn apply(cmd: &mut Command, root: &Path) {
         .env("XDG_STATE_HOME", root.join("state"))
         .env("TMPDIR", root.join("tmp"))
         .env("ATERM_LOG", "off")
-        .env(SYSTEM_PRESSURE, "none");
+        .env(SYSTEM_PRESSURE, "none")
+        .env(HOST_SLEEP, "none");
     #[cfg(unix)]
     cmd.env("SHELL", "/bin/sh");
     #[cfg(windows)]

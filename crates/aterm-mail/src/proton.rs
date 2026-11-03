@@ -6,7 +6,7 @@
 use crate::{Folder, Mailbox, Message, Secret};
 use aterm_http::{Client, Method, ProxyMode, Trust};
 use aterm_json::{Value, json};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const API: &str = "https://mail.proton.me/api";
 
@@ -20,6 +20,8 @@ pub trait ApiTransport: Send {
         body: Option<Value>,
     ) -> Result<ApiResponse, ApiError>;
     fn renew(&mut self) -> Result<(), ApiError>;
+    /// Apply an outer deadline to all transport operations, including session renewal.
+    fn set_deadline(&mut self, _end: Option<Instant>) {}
 }
 
 /// A transport failure classified independently from its diagnostic text.
@@ -111,6 +113,100 @@ impl MessageCache {
     }
 }
 
+/// What Proton says one of an account's addresses is (`Type` of `/core/v4/addresses`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressKind {
+    /// 1: the account's own address, made with the account.
+    Original,
+    /// 2: an address added to the account.
+    Alias,
+    /// 3: an address at the owner's own domain.
+    Custom,
+    /// 4: the short-domain twin of the original (`pm.me`).
+    Premium,
+    /// 5: an outside address the account signs in with, which Proton does not receive at.
+    External,
+    /// A type this build does not know.
+    Other,
+}
+
+impl AddressKind {
+    fn of(code: Option<u64>) -> Self {
+        match code {
+            Some(1) => Self::Original,
+            Some(2) => Self::Alias,
+            Some(3) => Self::Custom,
+            Some(4) => Self::Premium,
+            Some(5) => Self::External,
+            _ => Self::Other,
+        }
+    }
+
+    /// Whether the address is the account's own login rather than an address it receives for
+    /// others: the original, its short-domain twin, an outside sign-in address, or an unknown type
+    /// (which fails closed so an unrecognised or missing `Type` never enters Commons).
+    pub const fn own(self) -> bool {
+        !matches!(self, Self::Alias | Self::Custom)
+    }
+}
+
+/// One address of the account.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub email: String,
+    pub kind: AddressKind,
+    /// Enabled and receiving: mail sent to it lands in this mailbox.
+    pub receives: bool,
+}
+
+/// An account's address list. No `Debug` shows an address.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct AddressList {
+    pub addresses: Vec<Listed>,
+    /// Every entry Proton returned was read; an entry with no address makes the list partial.
+    pub complete: bool,
+}
+
+impl std::fmt::Debug for AddressList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AddressList")
+            .field("addresses", &self.addresses.len())
+            .field("complete", &self.complete)
+            .finish()
+    }
+}
+
+impl AddressList {
+    /// Read `/core/v4/addresses`. An address receives when its `Status` is 1 and its `Receive` is
+    /// not 0 (an absent `Receive` reads as receiving, as Proton's own clients do).
+    fn read(response: &Value) -> Self {
+        let Some(entries) = response["Addresses"].as_array() else {
+            return Self::default();
+        };
+        let mut list = Self {
+            addresses: Vec::new(),
+            complete: true,
+        };
+        for entry in entries {
+            let Some(email) = entry["Email"].as_str().filter(|e| !e.trim().is_empty()) else {
+                list.complete = false;
+                continue;
+            };
+            let kind = AddressKind::of(entry["Type"].as_u64());
+            if kind == AddressKind::Other {
+                list.complete = false;
+            }
+            list.addresses.push(Listed {
+                email: email.to_owned(),
+                kind,
+                receives: entry["Status"].as_u64() == Some(1)
+                    && entry["Receive"].as_u64().unwrap_or(1) != 0,
+            });
+        }
+        list
+    }
+}
+
 #[path = "proton_send.rs"]
 mod send;
 pub use send::PreparedMessage;
@@ -119,6 +215,7 @@ pub struct Proton {
     client: Client,
     transport: Option<std::cell::RefCell<Box<dyn ApiTransport>>>,
     cache: MessageCache,
+    request_deadline: Option<Instant>,
     uid: Secret,
     access: Secret,
     refresh_token: Secret,
@@ -132,11 +229,62 @@ pub struct Proton {
     pub needs_two_factor: bool,
     keys: Vec<crate::crypto::pgp::Key>,
     send_keys: Vec<(String, usize)>,
+    /// The address list the last unlock read, kept for discovery ([`Proton::address_list`]).
+    listed: Option<AddressList>,
     verification: Option<crate::human::Verified>,
     challenge: std::cell::RefCell<Option<crate::human::Challenge>>,
 }
 
 impl Proton {
+    /// Observe header changes without evicting verified bodies on an unchanged poll.
+    pub fn observe_messages(
+        &mut self,
+        folder: &str,
+        limit: usize,
+        previous: &[Message],
+    ) -> Result<Vec<Message>, String> {
+        let messages = self.message_headers(folder, limit)?;
+        if messages != previous {
+            self.cache.clear();
+        }
+        Ok(messages)
+    }
+
+    fn message_headers(&self, folder: &str, limit: usize) -> Result<Vec<Message>, String> {
+        let path = format!(
+            "/mail/v4/messages?LabelID={}&PageSize={}&Sort=Time&Desc=1",
+            crate::oauth::encode(folder),
+            limit.min(100)
+        );
+        let value = self.call(Method::Get, &path, None)?;
+        value["Messages"]
+            .as_array()
+            .ok_or_else(|| "Proton returned no message list".to_string())?
+            .iter()
+            .map(message)
+            .collect()
+    }
+
+    /// Run an operation under one deadline, restoring the shared client afterwards.
+    pub fn run_until<T>(
+        &mut self,
+        end: Instant,
+        operation: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let previous = self.request_deadline;
+        let end = previous.map_or(end, |old| old.min(end));
+        self.request_deadline = Some(end);
+        if let Some(transport) = &self.transport {
+            transport.borrow_mut().set_deadline(Some(end));
+        }
+        let result = operation(self);
+        self.request_deadline = previous;
+        if let Some(transport) = &self.transport {
+            transport.borrow_mut().set_deadline(previous);
+        }
+        result
+    }
+
     /// Use an authenticated channel; callers must still check mailbox identity
     /// and unlock its encryption keys before reading or sending.
     pub fn with_transport(transport: Box<dyn ApiTransport>) -> Self {
@@ -170,6 +318,7 @@ impl Proton {
             ),
             transport: None,
             cache: MessageCache::default(),
+            request_deadline: None,
             uid: Secret::new(String::new()),
             access: Secret::new(String::new()),
             refresh_token: Secret::new(String::new()),
@@ -183,6 +332,7 @@ impl Proton {
             needs_two_factor: false,
             keys: Vec::new(),
             send_keys: Vec::new(),
+            listed: None,
             verification: None,
             challenge: std::cell::RefCell::new(None),
         }
@@ -266,15 +416,23 @@ impl Proton {
     }
 
     pub fn refresh_if_needed(&mut self) -> Result<bool, String> {
+        self.refresh_if_needed_with(Self::refresh)
+    }
+
+    fn refresh_if_needed_with(
+        &mut self,
+        refresh: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<bool, String> {
         if self.transport.is_some() {
             return Ok(false);
         }
+        // Publish a previous rotation before another exchange, even when it has expired.
+        self.persist_dirty()?;
         let now = aterm_time::unix_secs().ok_or("Invalid system clock")?;
         let refreshed = now.saturating_add(60) >= self.expires;
         if refreshed {
-            self.refresh()?;
+            refresh(self)?;
         }
-        self.persist_dirty()?;
         Ok(refreshed)
     }
 
@@ -298,6 +456,8 @@ impl Proton {
         Ok(())
     }
 
+    /// Native success publishes a stored session's rotation before returning. An external
+    /// transport owns its credentials and publication instead.
     fn refresh(&mut self) -> Result<(), String> {
         if let Some(transport) = &self.transport {
             return transport.borrow_mut().renew().map_err(|error| {
@@ -308,6 +468,7 @@ impl Proton {
                 format!("{failure}; {}", error.message)
             });
         }
+        self.persist_dirty()?;
         let mut nonce = [0; 32];
         aterm_uds::rand::fill(&mut nonce).map_err(|_| "Could not generate session nonce")?;
         let state: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -320,10 +481,15 @@ impl Proton {
                 "GrantType": "refresh_token", "RedirectURI": "https://protonmail.ch", "State": state
             })),
         )?;
-        self.install_tokens(&response)
+        self.install_tokens(&response)?;
+        self.persist_dirty()
     }
 
     fn install_tokens(&mut self, response: &Value) -> Result<(), String> {
+        self.install_tokens_at(response, aterm_time::unix_secs())
+    }
+
+    fn install_tokens_at(&mut self, response: &Value, now: Option<u64>) -> Result<(), String> {
         let uid = field(response, "UID")?;
         let access = field(response, "AccessToken")?;
         let refresh = field(response, "RefreshToken")?;
@@ -332,13 +498,15 @@ impl Proton {
         }) {
             return Err("Proton returned invalid session credentials".into());
         }
+        // Unknown expiry forbids cache reuse, but must not discard a valid rotation.
+        let expires = now.map_or(0, |now| {
+            now.saturating_add(response["ExpiresIn"].as_u64().unwrap_or(3600))
+        });
         self.uid = Secret::new(uid.into());
         self.access = Secret::new(access.into());
         self.refresh_token = Secret::new(refresh.into());
+        self.expires = expires;
         self.credentials_dirty = true;
-        self.expires = aterm_time::unix_secs()
-            .ok_or("Invalid system clock")?
-            .saturating_add(response["ExpiresIn"].as_u64().unwrap_or(3600));
         Ok(())
     }
 
@@ -350,14 +518,7 @@ impl Proton {
         operation: impl FnMut(&mut Self) -> Result<T, String>,
         verifier: impl FnOnce(&crate::human::Challenge) -> Result<crate::human::Verified, String>,
     ) -> Result<T, String> {
-        self.with_recovery(
-            operation,
-            |session| {
-                session.refresh()?;
-                session.persist_dirty()
-            },
-            verifier,
-        )
+        self.with_recovery(operation, Self::refresh, verifier)
     }
 
     fn with_recovery<T>(
@@ -367,11 +528,18 @@ impl Proton {
         verifier: impl FnOnce(&crate::human::Challenge) -> Result<crate::human::Verified, String>,
     ) -> Result<T, String> {
         self.challenge.take();
+        self.verification = None;
         let first = operation(self);
         let mut renewal_pending = first.is_err()
             && (!self.access.expose().is_empty() || self.transport.is_some())
             && self.last_failure.borrow().as_ref().is_some_and(|failure| {
-                failure.kind == crate::proton_error::Kind::SessionExpired
+                (failure.kind == crate::proton_error::Kind::SessionExpired
+                    || self.transport.is_some()
+                        && matches!(
+                            failure.kind,
+                            crate::proton_error::Kind::Verification
+                                | crate::proton_error::Kind::DeviceVerification
+                        ))
                     && !matches!(
                         failure.operation,
                         crate::proton_error::Operation::SignIn
@@ -384,12 +552,14 @@ impl Proton {
         let mut attempt = |session: &mut Self| {
             if renewal_pending {
                 renew(session)?;
+                session.verification = None;
                 renewal_pending = false;
             }
             operation(session)
         };
         let result = if needs_renewal {
             self.paused.take();
+            self.challenge.take();
             attempt(self)
         } else {
             first
@@ -409,7 +579,9 @@ impl Proton {
                 self.verification = Some(verified);
                 self.paused.take();
                 self.retry_at.set(None);
-                attempt(self)
+                let retried = attempt(self);
+                self.verification = None;
+                retried
             }
         }
     }
@@ -572,10 +744,58 @@ impl Proton {
         address_keys.append(&mut user_keys);
         self.keys = address_keys;
         self.send_keys = send_keys;
+        self.listed = Some(AddressList::read(&addresses));
         Ok(())
     }
 
+    /// The account's address list as the unlock that opened this mailbox read it, with no request
+    /// of its own: what the lab's address discovery records while a mailbox is open anyway
+    /// (docs/DESIGN-alab-lab-model-2026-11-01.md §4.10). `None` before an unlock.
+    pub fn address_list(&self) -> Option<&AddressList> {
+        self.listed.as_ref()
+    }
+
+    /// Test seam: the list an unlock would have read, for callers' tests that cannot unlock.
+    #[cfg(any(test, debug_assertions))]
+    pub fn read_address_list(&mut self, response: &Value) {
+        self.listed = Some(AddressList::read(response));
+    }
+
+    /// Whether authentication is owned by an external session transport.
+    pub fn externally_authenticated(&self) -> bool {
+        self.transport.is_some()
+    }
+
+    /// Decrypt a message while retaining its original body and MIME type.
+    /// Authentication readers need HTML link targets that a text projection omits.
+    pub fn read_source(&mut self, id: &str) -> Result<(Message, String), String> {
+        let value = self.call(
+            Method::Get,
+            &format!("/mail/v4/messages/{}", crate::oauth::encode(id)),
+            None,
+        )?;
+        let mut message = message(&value["Message"])?;
+        let body = value["Message"]["Body"]
+            .as_str()
+            .ok_or("Proton returned no message body")?;
+        let decrypted = crate::crypto::pgp::decrypt(body, &self.keys)?;
+        message.text = std::str::from_utf8(&decrypted)
+            .map_err(|_| "Message body is not UTF-8")?
+            .into();
+        let mime = value["Message"]["MIMEType"]
+            .as_str()
+            .unwrap_or("text/plain")
+            .to_owned();
+        Ok((message, mime))
+    }
+
     fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value, String> {
+        if self
+            .request_deadline
+            .is_some_and(|end| Instant::now() >= end)
+        {
+            return Err("Mail operation deadline expired".into());
+        }
         // Revocation must remain available even when mailbox operations are paused.
         if !(path == "/auth/v4" && matches!(method, Method::Delete)) {
             self.ready()?;
@@ -618,6 +838,12 @@ impl Proton {
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
             .limit(32 * 1024 * 1024);
+        if let Some(end) = self.request_deadline {
+            request = request.backstop(
+                end.saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(30)),
+            );
+        }
         if let Some(token) = &self.verification {
             request = request
                 .secret_header(
@@ -711,9 +937,12 @@ impl Proton {
                             .iter()
                             .any(|method| method.as_str().is_some_and(crate::human::supported))
                     })
-                && let Some(token) = parsed["Details"]["HumanVerificationToken"]
-                    .as_str()
-                    .filter(|s| !s.is_empty() && s.len() <= 8192)
+                && let Some(token) =
+                    parsed["Details"]["HumanVerificationToken"]
+                        .as_str()
+                        .filter(|s| {
+                            !s.is_empty() && s.len() <= 8192 && !s.chars().any(char::is_control)
+                        })
             {
                 let methods = parsed["Details"]["HumanVerificationMethods"]
                     .as_array()
@@ -813,19 +1042,9 @@ impl Mailbox for Proton {
     }
 
     fn messages(&mut self, folder: &str, limit: usize) -> Result<Vec<Message>, String> {
-        let path = format!(
-            "/mail/v4/messages?LabelID={}&PageSize={}&Sort=Time&Desc=1",
-            crate::oauth::encode(folder),
-            limit.min(100)
-        );
-        let value = self.call(Method::Get, &path, None)?;
+        let messages = self.message_headers(folder, limit)?;
         self.cache.clear();
-        value["Messages"]
-            .as_array()
-            .ok_or_else(|| "Proton returned no message list".to_string())?
-            .iter()
-            .map(message)
-            .collect()
+        Ok(messages)
     }
 
     fn read(&mut self, folder: &str, id: &str) -> Result<Message, String> {
@@ -834,22 +1053,8 @@ impl Mailbox for Proton {
         {
             return Ok(message);
         }
-        let value = self.call(
-            Method::Get,
-            &format!("/mail/v4/messages/{}", crate::oauth::encode(id)),
-            None,
-        )?;
-        let mut message = message(&value["Message"])?;
-        let body = value["Message"]["Body"]
-            .as_str()
-            .ok_or("Proton returned no message body")?;
-        let decrypted = crate::crypto::pgp::decrypt(body, &self.keys)?;
-        let body = std::str::from_utf8(&decrypted).map_err(|_| "Message body is not UTF-8")?;
-        message.text = if value["Message"]["MIMEType"].as_str() == Some("text/html") {
-            crate::mime::html_text(body)
-        } else {
-            body.into()
-        };
+        let (mut message, mime) = self.read_source(id)?;
+        message.text = project_body(&mime, &message.text);
         if folder != "1" {
             self.cache.insert(message.clone());
         }
@@ -871,23 +1076,41 @@ impl Mailbox for Proton {
     }
 }
 
+fn project_body(mime: &str, body: &str) -> String {
+    let media = mime.split(';').next().unwrap_or("").trim();
+    if media.eq_ignore_ascii_case("text/html") {
+        crate::mime::html_text(body)
+    } else if media.to_ascii_lowercase().starts_with("multipart/")
+        && let Ok(parsed) = crate::mime::parse(body.as_bytes())
+    {
+        parsed.text
+    } else {
+        body.to_owned()
+    }
+}
+
 fn message(value: &Value) -> Result<Message, String> {
-    let addresses = |key: &str| {
-        value[key]
+    let mut recipients = Vec::new();
+    for key in ["ToList", "CCList", "BCCList"] {
+        for addr in value[key]
             .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item["Address"].as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default()
-    };
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item["Address"].as_str().map(str::trim))
+            .filter(|addr| !addr.is_empty())
+        {
+            if !recipients
+                .iter()
+                .any(|seen: &&str| seen.eq_ignore_ascii_case(addr))
+            {
+                recipients.push(addr);
+            }
+        }
+    }
     Ok(Message {
         id: field(value, "ID")?.into(),
         from: value["Sender"]["Address"].as_str().unwrap_or("").into(),
-        to: addresses("ToList"),
+        to: recipients.join(", "),
         subject: value["Subject"].as_str().unwrap_or("").into(),
         date: value["Time"]
             .as_i64()
@@ -901,6 +1124,28 @@ fn message(value: &Value) -> Result<Message, String> {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+
+    #[test]
+    fn message_recipients_and_body_projection_handle_cc_bcc_and_parameterized_mime() {
+        let parsed = message(&json!({
+            "ID": "m1",
+            "Sender": {"Address": "login@anthropic.com"},
+            "ToList": [{"Address": "primary@proton.me"}],
+            "CCList": [{"Address": "PRIMARY@proton.me"}, {"Address": "cc@proton.me"}],
+            "BCCList": [{"Address": "bcc@proton.me"}],
+            "Subject": "Code",
+            "Time": 1_800_000_001,
+            "Unread": 1,
+        }))
+        .unwrap();
+        assert_eq!(parsed.to, "primary@proton.me, cc@proton.me, bcc@proton.me");
+        assert_eq!(
+            project_body("TEXT/HTML; charset=utf-8", "<p>Code <b>123456</b></p>"),
+            "Code 123456\n"
+        );
+        let multipart = "Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nHello MIME\r\n--b--\r\n";
+        assert_eq!(project_body("multipart/mixed", multipart), "Hello MIME");
+    }
 
     #[test]
     fn bulk_success_requires_every_item_and_is_not_a_read_success() {
@@ -980,12 +1225,52 @@ mod session_tests {
     struct ChannelState {
         requests: usize,
         renewals: usize,
+        deadlines: Vec<Option<Instant>>,
         responses: std::collections::VecDeque<Result<ApiResponse, ApiError>>,
     }
 
     struct Channel(std::sync::Arc<std::sync::Mutex<ChannelState>>);
 
+    #[test]
+    fn a_failed_folder_refresh_keeps_the_last_verified_body() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ChannelState {
+            responses: [Err("offline".into())].into(),
+            ..Default::default()
+        }));
+        let mut proton = Proton::with_transport(Box::new(Channel(state)));
+        proton.cache.insert(cached_message("one", "verified body"));
+        assert!(proton.messages("0", 50).is_err());
+        assert_eq!(proton.read("0", "one").unwrap().text, "verified body");
+    }
+
+    #[test]
+    fn unchanged_observations_keep_verified_bodies_and_changes_invalidate_them() {
+        let header = json!({"ID":"one","Subject":"mail","Unread":1});
+        let changed = json!({"ID":"one","Subject":"mail","Unread":0});
+        let body = |header: Value| {
+            aterm_json::to_string(&json!({"Code":1000,"Messages":[header]})).unwrap()
+        };
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ChannelState {
+            responses: [
+                reply(200, &body(header.clone())),
+                reply(200, &body(changed)),
+            ]
+            .into(),
+            ..Default::default()
+        }));
+        let mut proton = Proton::with_transport(Box::new(Channel(state)));
+        proton.cache.insert(cached_message("one", "verified body"));
+        let first = message(&header).unwrap();
+        let observed = proton.observe_messages("0", 50, &[first]).unwrap();
+        assert_eq!(proton.cache.get("one").unwrap().text, "verified body");
+        assert!(!proton.observe_messages("0", 50, &observed).unwrap()[0].unread);
+        assert!(proton.cache.get("one").is_none());
+    }
+
     impl ApiTransport for Channel {
+        fn set_deadline(&mut self, end: Option<Instant>) {
+            self.0.lock().unwrap().deadlines.push(end);
+        }
         fn request(
             &mut self,
             _: Method,
@@ -1015,6 +1300,30 @@ mod session_tests {
     }
 
     #[test]
+    fn expired_and_nested_operation_budgets_restore_the_shared_transport() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ChannelState {
+            responses: [reply(200, r#"{"Code":1000,"Messages":[]}"#)].into(),
+            ..Default::default()
+        }));
+        let mut proton = Proton::with_transport(Box::new(Channel(state.clone())));
+        let expired = Instant::now();
+        assert!(proton.run_until(expired, |p| p.messages("0", 10)).is_err());
+        assert_eq!(state.lock().unwrap().requests, 0);
+        let end = Instant::now() + Duration::from_secs(60);
+        proton
+            .run_until(end, |p| {
+                p.run_until(end + Duration::from_secs(60), |p| p.messages("0", 10))
+            })
+            .unwrap();
+        assert!(proton.request_deadline.is_none());
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.deadlines,
+            vec![Some(expired), None, Some(end), Some(end), Some(end), None]
+        );
+    }
+
+    #[test]
     fn external_session_renews_once_without_rotating_browser_credentials() {
         let state = std::sync::Arc::new(std::sync::Mutex::new(ChannelState {
             responses: [
@@ -1039,6 +1348,24 @@ mod session_tests {
                 .persist(std::path::Path::new("/unavailable"), "test@example.test")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn external_verification_renews_the_browser_session_before_requesting_a_code() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ChannelState {
+            responses: [reply(422, r#"{"Code":9001,"Details":{"HumanVerificationMethods":["ownership-email"],"HumanVerificationToken":"private-token"}}"#),
+                reply(200, r#"{"Code":1000,"Messages":[]}"#)].into(),
+            ..Default::default()
+        }));
+        let mut proton = Proton::with_transport(Box::new(Channel(state.clone())));
+        proton
+            .with_verification(
+                |p| p.messages("0", 10),
+                |_| panic!("browser renewal should resolve the challenge"),
+            )
+            .unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!((state.requests, state.renewals), (2, 1));
     }
 
     #[test]
@@ -1107,6 +1434,10 @@ mod session_tests {
                 if reads == 1 {
                     session.process_response("/core/v4/addresses", 401, None, br#"{"Code":401}"#)
                 } else {
+                    assert!(
+                        session.verification.is_none(),
+                        "consumed refresh proof must not leak onto the retried read"
+                    );
                     session.process_response("/core/v4/addresses", 200, None, br#"{"Code":1000}"#)
                 }
             },
@@ -1114,11 +1445,18 @@ mod session_tests {
                 renewals += 1;
                 if renewals == 1 {
                     session.process_response("/auth/v4/refresh", 422, None, br#"{"Code":9001,"Details":{"HumanVerificationMethods":["ownership-email"],"HumanVerificationToken":"private-token"}}"#).map(|_| ())
-                } else { Ok(()) }
+                } else {
+                    assert_eq!(
+                        session.verification.as_ref().map(|v| v.token.expose()),
+                        Some("proof")
+                    );
+                    Ok(())
+                }
             },
             |_| Ok(crate::human::Verified { token: Secret::new("proof".into()), method: "ownership-email".into() }),
         );
         assert!(result.is_ok());
+        assert!(proton.verification.is_none());
         assert_eq!((reads, renewals), (2, 2));
     }
 
@@ -1183,17 +1521,43 @@ mod session_tests {
         let result = proton.with_verification(
             |proton| {
                 calls += 1;
+                if calls == 2 {
+                    assert_eq!(
+                        proton.verification.as_ref().map(|v| v.token.expose()),
+                        Some("proof")
+                    );
+                }
                 proton.process_response("/auth/v4", 422, None, br#"{"Code":9001,"Details":{"HumanVerificationMethods":["ownership-email"],"HumanVerificationToken":"private-token"}}"#)
             },
             |_| Ok(crate::human::Verified { token: Secret::new("proof".into()), method: "ownership-email".into() }),
         );
         assert!(result.is_err());
         assert_eq!(calls, 2);
+        assert!(
+            proton.verification.is_none(),
+            "single-use verification proof must be cleared once recovery finishes"
+        );
         let result = proton.with_verification(
             |proton| proton.process_response("/auth/v4", 422, None, br#"{"Code":8002}"#),
             |_| panic!("Incorrect passwords must not trigger ownership verification"),
         );
         assert!(result.unwrap_err().contains("credentials"));
+        let result = proton.with_verification(
+            |proton| {
+                proton.process_response(
+                    "/auth/v4",
+                    422,
+                    None,
+                    br#"{"Code":9001,"Details":{"HumanVerificationMethods":["ownership-email"],"HumanVerificationToken":"bad\r\ntoken"}}"#,
+                )
+            },
+            |_| panic!("Control-character challenge tokens must not trigger verification"),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("no supported verification challenge")
+        );
     }
 
     #[test]
@@ -1210,6 +1574,61 @@ mod session_tests {
         assert!(proton.ready().is_err());
         proton.retry_at.set(Some(std::time::Instant::now()));
         assert!(proton.ready().is_ok());
+    }
+
+    /// The address list keeps each address with Proton's type and whether it receives, and an
+    /// entry with no address or an unknown `Type` makes it partial, and an unknown `Type` fails
+    /// closed as the account's own; a mailbox that was never unlocked has none.
+    /// NEGATIVE CONTROL: with `receives` reading `Status` alone, the disabled-receive address
+    /// reads as receiving: `` left: [true, true, true, false] right: [true, false, true, false] ``;
+    /// with `AddressKind::own` matching only 1/4/5, `AddressKind::Other.own()` is `false` and an
+    /// untyped or future-typed login can enter Commons.
+    #[test]
+    fn the_address_list_reads_types_and_receiving() {
+        assert!(Proton::empty().address_list().is_none());
+        let list = AddressList::read(&json!({"Code": 1000, "Addresses": [
+            {"Email": "own@proton.example", "Type": 1, "Status": 1, "Receive": 1},
+            {"Email": "quiet@proton.example", "Type": 2, "Status": 1, "Receive": 0},
+            {"Email": "ai@custom.example", "Type": 3, "Status": 1},
+            {"Email": "off@proton.example", "Type": 2, "Status": 0, "Receive": 1},
+        ]}));
+        assert!(list.complete);
+        assert_eq!(
+            list.addresses
+                .iter()
+                .map(|a| a.receives)
+                .collect::<Vec<_>>(),
+            [true, false, true, false]
+        );
+        assert_eq!(
+            list.addresses.iter().map(|a| a.kind).collect::<Vec<_>>(),
+            [
+                AddressKind::Original,
+                AddressKind::Alias,
+                AddressKind::Custom,
+                AddressKind::Alias
+            ]
+        );
+        assert!(
+            AddressKind::Original.own()
+                && AddressKind::Premium.own()
+                && AddressKind::External.own()
+                && AddressKind::Other.own()
+        );
+        assert!(!AddressKind::Custom.own() && !AddressKind::Alias.own());
+        assert!(!format!("{list:?}").contains('@'));
+        let unknown_type = AddressList::read(&json!({"Addresses": [
+            {"Email": "future@proton.example", "Type": 99, "Status": 1, "Receive": 1}
+        ]}));
+        assert!(!unknown_type.complete);
+        assert_eq!(unknown_type.addresses[0].kind, AddressKind::Other);
+        assert!(unknown_type.addresses[0].kind.own());
+        let partial =
+            AddressList::read(&json!({"Addresses": [{"Type": 2}, {"Email": "a@x.example"}]}));
+        assert!(!partial.complete);
+        assert_eq!(partial.addresses.len(), 1);
+        assert!(partial.addresses[0].kind.own());
+        assert!(!AddressList::read(&json!({"Code": 1000})).complete);
     }
 
     #[test]
@@ -1243,6 +1662,19 @@ mod session_tests {
         assert!(proton.credentials_dirty);
     }
 
+    #[test]
+    fn token_rotation_survives_an_unavailable_response_clock() {
+        let mut proton = Proton::empty();
+        proton.install_tokens_at(&json!({"UID":"uid", "AccessToken":"new-access", "RefreshToken":"new-refresh", "ExpiresIn":3600}), None).unwrap();
+        assert_eq!(proton.refresh_token.expose(), "new-refresh");
+        assert_eq!(proton.access.expose(), "new-access");
+        assert_eq!(
+            proton.expires, 0,
+            "unknown expiry cannot reuse a cached session"
+        );
+        assert!(proton.credentials_dirty);
+    }
+
     #[cfg(unix)]
     #[test]
     fn failed_session_write_retries_without_losing_rotated_tokens() {
@@ -1255,13 +1687,38 @@ mod session_tests {
         ));
         std::fs::write(&home, b"not a directory").unwrap();
         let mut proton = Proton::empty();
-        proton.install_tokens(&json!({"UID":"uid", "AccessToken":"new-access", "RefreshToken":"new-refresh", "ExpiresIn":3600})).unwrap();
+        proton.install_tokens_at(&json!({"UID":"uid", "AccessToken":"new-access", "RefreshToken":"new-refresh", "ExpiresIn":3600}), None).unwrap();
         proton.stored = Some((home.clone(), "a@example.test".into()));
-        assert!(proton.refresh_if_needed().is_err());
+        assert!(
+            proton
+                .refresh_if_needed_with(|_| panic!("save the pending rotation first"))
+                .is_err()
+        );
         assert!(proton.credentials_dirty);
         assert_eq!(proton.refresh_token.expose(), "new-refresh");
         std::fs::remove_file(&home).unwrap();
-        assert!(!proton.refresh_if_needed().unwrap());
+        assert!(
+            proton
+                .refresh_if_needed_with(|session| {
+                    assert!(!session.credentials_dirty);
+                    assert_eq!(
+                        crate::session::load(&home, "a@example.test")
+                            .unwrap()
+                            .unwrap()
+                            .refresh
+                            .expose(),
+                        "new-refresh"
+                    );
+                    session.expires = u64::MAX;
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert!(
+            !proton
+                .refresh_if_needed_with(|_| panic!("cached session is still valid"))
+                .unwrap()
+        );
         assert!(!proton.credentials_dirty);
         assert_eq!(
             crate::session::load(&home, "a@example.test")

@@ -18,7 +18,7 @@ use crate::artifact::lineage_switch::{self, Switch};
 use crate::artifact::upload;
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
-use crate::host::HostError;
+use crate::host::{HostError, HostRole, gh_serves, preflight_each};
 use crate::programs::{self, PIN_TRIPLE, RUSTC_GROUP, TRUST_EXPOSES};
 use crate::quad::{self, Freshness};
 use crate::triple::Triple;
@@ -232,6 +232,12 @@ pub fn siblings() -> Vec<&'static str> {
         .map(|p| p.name)
         .filter(|n| *n != BUNDLE)
         .collect()
+}
+
+/// The repositories of every member of the group, the bundle's among them: each is packed,
+/// uploaded to staging and published, so an upload's pre-claim checks ask each one's writer.
+fn group_repos() -> impl Iterator<Item = &'static str> {
+    programs::group_members(RUSTC_GROUP).map(|p| p.repo)
 }
 
 fn checkout_of(ctx: &Ctx, req: &GroupRequest, program: &str) -> PathBuf {
@@ -477,7 +483,8 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
     }
 
     let receipt_path = seal.join(atpkg::lineage::SEED_MINT_FILE);
-    let receipt = std::fs::read_to_string(&receipt_path).ok();
+    let receipt =
+        crate::identity::read_regular_text(&receipt_path, crate::identity::MAX_META_BYTES).ok();
     if !pf.seal_commit.is_empty() {
         let dormant = receipt.is_none()
             && parts.probe.lineage_switch(ctx, &req.trust_repo) == Switch::Dormant;
@@ -625,30 +632,53 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
                 ctx.shown(&ctx.identity.key)
             ));
         }
-        match ctx.usable_token(&ctx.tokens.channel) {
-            Ok(true) => {}
-            Ok(false) => pf.problems.push(format!(
-                "--upload needs the public owner's token at {} (the packs and the index are \
-                 published there)",
-                ctx.shown(&ctx.tokens.channel)
-            )),
-            Err(why) => pf.problems.push(format!(
-                "--upload needs the public owner's token at {}: {why}",
-                ctx.shown(&ctx.tokens.channel)
-            )),
+        if gh_serves(ctx, HostRole::Channel) {
+            match ctx.usable_token(&ctx.tokens.channel) {
+                Ok(true) => {}
+                Ok(false) => pf.problems.push(format!(
+                    "--upload needs the public owner's token at {} (the packs and the index are \
+                     published there)",
+                    ctx.shown(&ctx.tokens.channel)
+                )),
+                Err(why) => pf.problems.push(format!(
+                    "--upload needs the public owner's token at {}: {why}",
+                    ctx.shown(&ctx.tokens.channel)
+                )),
+            }
+        } else {
+            let slugs = std::iter::once(ctx.index_slug())
+                .chain(group_repos().map(|repo| ctx.public_slug(repo)));
+            if let Err((slug, e)) = preflight_each(&*ctx.hosts.channel, slugs) {
+                pf.problems.push(format!(
+                    "--upload needs the public owner's writer on {slug}: {e} (the packs and the \
+                     index are published there)"
+                ));
+            }
         }
-        match ctx.usable_token(&ctx.tokens.staging) {
-            Ok(true) => {}
-            Ok(false) => pf.problems.push(format!(
-                "--upload needs the staging owner's token at {} (every pack is uploaded to {} \
+        if !gh_serves(ctx, HostRole::Staging) {
+            let slugs = std::iter::once(ctx.staging_slug(atpkg::manifest::INDEX_REPO))
+                .chain(group_repos().map(|repo| ctx.staging_slug(repo)));
+            if let Err((slug, e)) = preflight_each(&*ctx.hosts.staging, slugs) {
+                pf.problems.push(format!(
+                    "--upload needs the staging owner's writer on {slug}: {e} (every pack is \
+                     uploaded to {} first)",
+                    ctx.accounts.staging
+                ));
+            }
+        } else {
+            match ctx.usable_token(&ctx.tokens.staging) {
+                Ok(true) => {}
+                Ok(false) => pf.problems.push(format!(
+                    "--upload needs the staging owner's token at {} (every pack is uploaded to {} \
                  first, and a write never goes anonymously)",
-                ctx.shown(&ctx.tokens.staging),
-                ctx.accounts.staging
-            )),
-            Err(why) => pf.problems.push(format!(
-                "--upload needs the staging owner's token at {}: {why}",
-                ctx.shown(&ctx.tokens.staging)
-            )),
+                    ctx.shown(&ctx.tokens.staging),
+                    ctx.accounts.staging
+                )),
+                Err(why) => pf.problems.push(format!(
+                    "--upload needs the staging owner's token at {}: {why}",
+                    ctx.shown(&ctx.tokens.staging)
+                )),
+            }
         }
     } else if !pf.have_key {
         pf.notes.push(format!(

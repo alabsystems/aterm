@@ -219,6 +219,7 @@ pub(crate) fn prelaunched(
         #[cfg(target_os = "macos")]
         booked_launch_unregistered: false,
         history_export: None,
+        sessionless: false,
     };
     (record, transferred)
 }
@@ -395,6 +396,7 @@ fn publish_chunked_pass(
             &aterm_update::HandoffCandidateFacts {
                 policy: aterm_update_core::handoff_policy::PolicyRead::Absent,
                 grant_chunks: true,
+                grant_empty: false,
             },
             crate::running_build_number(),
             "the test candidate",
@@ -528,6 +530,88 @@ fn a_fork_after_park_is_not_held_to_the_rendezvous_session_limit() {
     app.update_handoff_prelaunch = None;
     app.pool.sessions.retain(|id, _| *id == 0);
     release_pty(&mut app, pty);
+}
+
+/// One late park with no live session (the desk's one pane exited): whether it stood the
+/// successor down, and whether it handed the worker its capture. `declared` replaces the
+/// same-image seam with an artifact whose pre-park read passed, declaring empty1 or not.
+fn park_with_no_live_session(
+    sessionless: bool,
+    dialer_pid: Option<u32>,
+    declared: Option<bool>,
+) -> (bool, bool) {
+    let mut app = crate::App::headless_for_test();
+    let ids: Vec<u64> = app.pool.iter().map(|session| session.id).collect();
+    for id in ids {
+        app.store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_state(id, crate::session_store::SessionState::Exited);
+    }
+    assert!(app.handoff_live_sessions().is_empty(), "PRECONDITION");
+    let (mut record, transferred) = prelaunched(31, ApplyMode::Immediate, FreezeSeed::Default);
+    record.sessionless = sessionless;
+    if let Some(grant_empty) = declared {
+        let ticket =
+            crate::native_updater_service::ApplyAttemptTicket::for_test(7, "", &"ab".repeat(32));
+        super::PreverifyPublisher::for_attempt(&app.handoff_preverified, Some(&ticket))
+            .expect("an attempt names its artifact")
+            .publish_pass(
+                &aterm_update::HandoffCandidateFacts {
+                    policy: aterm_update_core::handoff_policy::PolicyRead::Absent,
+                    grant_chunks: false,
+                    grant_empty,
+                },
+                crate::running_build_number(),
+                "the test candidate",
+            );
+        record.apply_attempt = Some(ticket);
+        record.same_image = None;
+    }
+    app.update_handoff_prelaunch = Some(record);
+    app.on_update_handoff_awaiting_park(31, dialer_pid, None);
+    let stood_down = app
+        .update_handoff_prelaunch
+        .as_ref()
+        .is_some_and(|prelaunch| prelaunch.stood_down);
+    let handed = transferred.try_recv().is_ok();
+    app.pending_update_handoff = None;
+    app.update_handoff_prelaunch = None;
+    (stood_down, handed)
+}
+
+/// A sessionless attempt parks with no session, on the launched lane, for a successor that
+/// reads that grant. The fork lane's cue, a successor that does not declare empty1, and an
+/// attempt admitted with sessions that have all closed stand it down instead.
+#[test]
+fn a_sessionless_attempt_parks_only_for_a_launched_reader_of_its_grant() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let dialled = Some(4242);
+    for (label, sessionless, dialer, declared, expected) in [
+        ("same image", true, dialled, None, (false, true)),
+        ("empty1 declared", true, dialled, Some(true), (false, true)),
+        (
+            "empty1 undeclared",
+            true,
+            dialled,
+            Some(false),
+            (true, false),
+        ),
+        ("the fork lane's cue", true, None, None, (true, false)),
+        (
+            "admitted with sessions",
+            false,
+            dialled,
+            None,
+            (true, false),
+        ),
+    ] {
+        assert_eq!(
+            park_with_no_live_session(sessionless, dialer, declared),
+            expected,
+            "{label}: (stood down, handed over)"
+        );
+    }
 }
 
 /// A launchd-limited producer makes room for its own park. A window started from the Dock,

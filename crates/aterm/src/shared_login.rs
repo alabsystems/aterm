@@ -599,7 +599,7 @@ mod tests {
         let (_home, approved, _) = fixture();
         let (lock, _) =
             aterm_uds::private_file::open_private(&approved.paths.dir, "commons.lock").unwrap();
-        aterm_uds::private_file::lock_exclusive_until(
+        aterm_uds::file_lock::lock_exclusive_until(
             &lock,
             Instant::now() + aterm_spec::wait::MUST_HAPPEN,
             "the test holds Commons custody",

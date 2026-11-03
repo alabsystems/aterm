@@ -25,7 +25,9 @@ fn a_task_frame_is_at_most_64_kib() {
     );
     for bad in ["", "-1", "1k", "0x10"] {
         assert!(
-            frame_len(bad, "claude").is_err_and(|e| e.starts_with("ERR usage: spawn")),
+            frame_len(bad, "claude").is_err_and(
+                |e| e.starts_with("ERR usage: spawn") && e.contains(&format!("`len={bad}`"))
+            ),
             "{bad:?}"
         );
     }
@@ -1179,6 +1181,77 @@ fn a_spawn_installs_nothing_when_removal_evidence_is_unreadable() {
     );
     assert_eq!(store.installs.get(), 0);
     assert!(!store.present(program));
+}
+
+/// A LAUNCHER'S LOOK AGAIN AFTER A REDRAW REFUSED ITS LINE ([`await_prompt`] with
+/// [`PROMPT_SETTLE`]) takes a prompt only once one screen generation has held for the settle, so a
+/// prompt that keeps repainting gets no attempt between its repaints; its first look, with no
+/// settle, takes the prompt it finds.
+#[test]
+fn a_prompt_is_taken_once_one_screen_generation_has_held_for_the_settle() {
+    use crate::control::ScreenGen;
+    let ms = Duration::from_millis;
+    let (shown, redrawn) = (
+        ScreenGen { epoch: 0, seq: 7 },
+        ScreenGen { epoch: 0, seq: 8 },
+    );
+    let t0 = Instant::now();
+    let mut held = Held::default();
+    assert_eq!(held.look(shown, t0, PROMPT_SETTLE), PROMPT_SETTLE);
+    let t1 = t0 + PROMPT_SETTLE - ms(1);
+    assert_eq!(
+        held.look(shown, t1, PROMPT_SETTLE),
+        ms(1),
+        "not yet held for the settle"
+    );
+    assert_eq!(
+        held.look(redrawn, t1, PROMPT_SETTLE),
+        PROMPT_SETTLE,
+        "a redraw counts again from its look"
+    );
+    assert_eq!(
+        held.look(redrawn, t1 + PROMPT_SETTLE, PROMPT_SETTLE),
+        Duration::ZERO,
+        "held for the settle"
+    );
+    assert_eq!(
+        Held::default().look(shown, t0, Duration::ZERO),
+        Duration::ZERO,
+        "CONTROL: a first look takes the prompt it finds"
+    );
+}
+
+/// A WORKER'S LINE IS TRIED AGAIN ONLY WHERE NOTHING WAS WRITTEN ([`launch_line_typed`]): the
+/// fence's refusals, which it makes before a byte is written, are [`Untyped::Unsettled`]; a line
+/// written whole or in part is typed and never tried again, and a person's use or a write the
+/// sink did not take (a short write among them) stalls the task.
+#[test]
+fn only_a_press_that_wrote_nothing_is_tried_again() {
+    use crate::control::GuardedInput;
+    use crate::input::Delivery;
+    for unsettled in [GuardedInput::Changed, GuardedInput::Skipped] {
+        assert_eq!(
+            launch_line_typed(unsettled),
+            Err(Untyped::Unsettled),
+            "{unsettled:?}"
+        );
+    }
+    for written in [Delivery::Full, Delivery::PartialInDoubt { accepted: 3 }] {
+        assert!(
+            launch_line_typed(GuardedInput::Pressed(written)).is_ok(),
+            "{written:?} is typed, never typed again"
+        );
+    }
+    for refused in [
+        GuardedInput::Person,
+        GuardedInput::Pressed(Delivery::BusyZero),
+        GuardedInput::Pressed(Delivery::Failed),
+    ] {
+        assert!(
+            matches!(launch_line_typed(refused), Err(Untyped::Refused(_))),
+            "CONTROL: {refused:?} stalls the task"
+        );
+    }
 }
 
 /// A LAUNCHER'S INSTALLING MARK LIVES ON ITS SESSION'S TIMELINE WHILE IT STANDS, AND GOES WHEN

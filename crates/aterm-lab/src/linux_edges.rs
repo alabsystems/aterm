@@ -479,7 +479,8 @@ impl Run<'_> {
             let out = self.sh(&[
                 "sh",
                 "-c",
-                "printf '%s' \"$1\" | cat - \"$2\" > \"$2.new\" && mv \"$2.new\" \"$2\"",
+                // chmod 600: the guest umask would rebuild the config group-writable, and the GUI refuses those.
+                "printf '%s' \"$1\" | cat - \"$2\" > \"$2.new\" && chmod 600 \"$2.new\" && mv \"$2.new\" \"$2\"",
                 "config",
                 top,
                 &path,

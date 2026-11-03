@@ -21,14 +21,17 @@ mod alab_join;
 pub use account_input::{admin_set_entry_until, open_account_input};
 pub use alab_join::prepare_alab_join_retry;
 mod admin_keys;
+pub mod admin_service;
 mod admission;
 mod admit;
 mod bounded;
 mod chain_cache;
+mod continuity;
 mod creation;
 pub mod custodian;
 mod enrollment;
 mod entry;
+mod fan_out;
 mod fleet;
 mod foundation;
 mod genesis;
@@ -36,7 +39,7 @@ mod handover;
 mod http204_observation;
 mod inspection;
 mod join_queues;
-pub(crate) mod join_routing;
+mod join_routing;
 mod ledger_publish;
 mod locker_skew;
 mod log_entries;
@@ -49,6 +52,7 @@ mod readmit;
 mod records_cache;
 pub mod release;
 mod release_migration;
+mod removal_plan;
 mod remove;
 mod retirement;
 mod roster;
@@ -63,17 +67,20 @@ pub use admit::{
     log_admitted_actors, post_records_to_servers, write_from_log_bundle,
 };
 pub use bounded::{join_if_unchanged_until, sync_reader_until};
+pub use continuity::{Split, SplitBy, seat_splits, splits};
 pub use enrollment::{admin_cached, admin_cached_until};
 pub use entry::{
     EntryObservation, EntrySnapshot, EntryVersion, VerifiedEntry, observe_verified_entry,
     read_account_bound_entry, read_verified_entry,
 };
-#[cfg(any(test, debug_assertions))]
-pub use fleet::test_alab_fleet;
+#[path = "client/mailbox_index.rs"]
+mod mailbox_index;
 pub use fleet::{
     AlabFleet, FLEET_CODE_ENTRY, SWARM_ROSTER_ENTRY, admin_publish_alab_fleet, alab_fleet,
-    alab_fleet_code, parse_denied_nodes_toml, swarm_denied_nodes,
+    alab_fleet_code, parse_denied_nodes_toml, swarm_denied_nodes, swarm_denied_nodes_until,
 };
+#[cfg(any(test, debug_assertions))]
+pub use fleet::{test_alab_fleet, test_hold_state_lock, test_with_denied_nodes_busy};
 pub use foundation::{
     CommonsInit, Foundable, admin_commons_found_by_default, admin_commons_init, commons_foundable,
 };
@@ -90,11 +97,15 @@ pub use ledger_publish::{
     MergedHeads, ObservedHead, extend_parent_spine, ledger_publish_environment,
     merge_diverged_heads, publish_to_servers, read_server_heads, verify_approved_in_served_head,
 };
+pub(crate) use log_entries::local_swarm_roster_for_log_held;
 pub use log_entries::{
     admin_mirror_log, admit_member_in_log, check_log_commons_enrollment, configure_log_member,
     enroll_commons_member_in_log, keyed_epochs_environment, local_swarm_roster_for_log,
     member_denied_by_roster, publish_local_node_key, reconcile_commons_log, remove_member_in_log,
     trusted_commons_log,
+};
+pub use mailbox_index::{
+    mailbox_component_held, read_mailbox_component, refresh_mailbox_component_index,
 };
 pub use network_observation::{VaultNetworkMaterialization, VaultNetworkSource};
 pub use network_refresh::{
@@ -102,8 +113,8 @@ pub use network_refresh::{
 };
 use peer_candidates::{PeerDiscovery, PeerUse};
 pub use readmit::{
-    AUTOMATIC_PER_HOUR, Book, How as ReadmitHow, MAX_READMISSIONS, Proven, READMIT_EVERY_MS,
-    Readmit, admit_by_proof, prove_at, prove_at_ms, refuses_before_possession,
+    AUTOMATIC_PER_HOUR, Book, How as ReadmitHow, MAX_READMISSIONS, ProofAdmissionCapacity, Proven,
+    READMIT_EVERY_MS, Readmit, admit_by_proof, prove_at, prove_at_ms, refuses_before_possession,
     refuses_before_possession_at_ms,
 };
 pub use remove::{
@@ -117,9 +128,11 @@ pub use retirement::{
     Retirement, Revocation, StolenRevocation, admin_retire, admin_revoke, admin_revoke_stolen,
     machine_named_in_vault, repair_half_done_revokes, rotate_fleet_code_text,
 };
+pub(crate) use roster::with_roster_observation;
 pub use roster::{
     admin_seed_swarm_roster, resolve_local_swarm_label, swarm_lease_holder, swarm_roster,
 };
+pub(crate) use steward::local_recipient_denial_held;
 pub(crate) use steward::{AlabRoleContext, AlabRoleObservation, observe_alab_role};
 pub use steward::{
     StewardLease, StewardRevoke, StewardStandbyServer, Stewardship,
@@ -132,6 +145,10 @@ pub use vault_memo::{swarm_denied_nodes_now, swarm_roster_now};
 #[cfg(test)]
 mod approver_queue_tests;
 #[cfg(test)]
+pub(crate) use approver_queue_tests::{
+    mirror_vault as mirrored_vault_for_test, request as queued_identity_for_test,
+};
+#[cfg(test)]
 mod birth_tests;
 #[cfg(test)]
 mod join_tests;
@@ -141,6 +158,10 @@ mod log_entries_tests;
 mod own_head_tests;
 #[cfg(test)]
 mod peer_candidates_tests;
+#[cfg(test)]
+mod probe_reads_tests;
+#[cfg(test)]
+mod records_push_tests;
 #[cfg(test)]
 mod records_sync_tests;
 
@@ -181,7 +202,7 @@ impl Paths {
         self.dir.join("state.toml")
     }
 
-    fn cache_file(&self) -> PathBuf {
+    pub(crate) fn cache_file(&self) -> PathBuf {
         self.dir.join("vault")
     }
 
@@ -610,7 +631,7 @@ fn read_toml(
     toml_cache::read(path, what, max)
 }
 
-struct StateLock(std::fs::File);
+pub(crate) struct StateLock(std::fs::File);
 
 /// A missing observation place and a writer holding it are different read outcomes.
 enum StateObservation {
@@ -644,7 +665,7 @@ impl StateLock {
     fn take_at_until(paths: &Paths, path: &Path, deadline: Instant) -> crate::Result<StateLock> {
         publication_current(Some(deadline))?;
         let file: std::fs::File = Self::open_lock_file(paths, path)?;
-        aterm_uds::private_file::lock_exclusive_until(
+        aterm_uds::file_lock::lock_exclusive_until(
             &file,
             deadline,
             "vault publication lock is busy",
@@ -1215,6 +1236,26 @@ struct State {
     own: Option<BTreeSet<String>>,
 }
 
+/// Fingerprint the successful-round inputs relevant to a service health receipt. Ordinary
+/// heartbeat timestamps are excluded, while source, envelope, membership, pending writes and
+/// signed record progress invalidate a previously answered challenge.
+pub(crate) fn service_health_version(paths: &Paths) -> crate::Result<[u8; 32]> {
+    let state = load_state(paths)?;
+    let source = config(paths)?.as_ref().map(source_identity);
+    let value = aterm_json::json!({
+        "sequence":state.seq,
+        "envelope":state.digest.map(|d|hex(&d)),
+        "records":state.records_digest.map(|d|hex(&d)),
+        "state_source":state.source_identity.map(|d|hex(&d)),
+        "configured_source":source.map(|d|hex(&d)),
+        "membership":state.membership.word(),
+        "failed":state.failed,
+        "pending":state.pending,
+    });
+    let bytes = aterm_json::to_vec(&value).map_err(|e| Error::new(e.to_string()))?;
+    Ok(sha256(&bytes))
+}
+
 fn load_state(paths: &Paths) -> crate::Result<State> {
     let Some(table) = read_toml(&paths.state_file(), "state.toml", MAX_STATE)? else {
         return Ok(State::default());
@@ -1459,7 +1500,7 @@ pub fn status(paths: &Paths) -> crate::Result<Status> {
         config,
         machine,
         membership,
-        names: state.manifest.files.keys().cloned().collect(),
+        names: registry_names(&state),
     })
 }
 
@@ -1469,7 +1510,19 @@ pub fn status(paths: &Paths) -> crate::Result<Status> {
 /// # Errors
 /// The saved client state cannot be read or parsed.
 pub fn registered_names(paths: &Paths) -> crate::Result<Vec<String>> {
-    Ok(load_state(paths)?.manifest.files.into_keys().collect())
+    Ok(registry_names(&load_state(paths)?))
+}
+
+fn registry_names(state: &State) -> Vec<String> {
+    state
+        .manifest
+        .files
+        .keys()
+        .chain(state.own.iter().flatten())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// The entries this Mac reads from the membership log whose register holds concurrent values
@@ -2195,6 +2248,12 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
             {
                 return unavailable(Unavailable::Revoked);
             }
+            if configured.log.audience_left_out_recipient(
+                &crate::membership_log::EpochAudience::Commons,
+                &identity.recipient(),
+            ) {
+                return unavailable(Unavailable::ControlExcluded);
+            }
             return Ok(
                 match open_commons_control_from_log(&configured.log, &identity)? {
                     Some(control) => {
@@ -2282,7 +2341,7 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
             &identity.recipient(),
         )
     {
-        return unavailable(Unavailable::ControlNotVisible);
+        return unavailable(Unavailable::ControlExcluded);
     }
     if let Some((log, _)) = &seeded
         && log.has_commons_epochs()
@@ -2773,35 +2832,56 @@ fn place(source: &Source) -> String {
 }
 
 fn held_copy(paths: &Paths, config: &Config, state: &State) -> Option<Vec<u8>> {
+    read_held_copy(paths, config, state).ok().flatten()
+}
+
+/// Read the held envelope for an authorization decision, preserving an I/O failure as an error
+/// rather than mistaking a temporarily unreadable copy for an authoritative absence.
+fn read_held_copy(paths: &Paths, config: &Config, state: &State) -> crate::Result<Option<Vec<u8>>> {
     if state.membership != Stored::In {
-        return None;
+        return Ok(None);
     }
-    verified_cached_envelope(paths, config, state)
+    read_verified_cached_envelope(paths, config, state)
 }
 
 /// The exact authenticated cached envelope for local reading, even while admission is pending.
 /// Only [`held_copy`] admits one for publication back to a server.
 fn verified_cached_envelope(paths: &Paths, config: &Config, state: &State) -> Option<Vec<u8>> {
-    let pin = config.signer?;
+    read_verified_cached_envelope(paths, config, state)
+        .ok()
+        .flatten()
+}
+
+fn read_verified_cached_envelope(
+    paths: &Paths,
+    config: &Config,
+    state: &State,
+) -> crate::Result<Option<Vec<u8>>> {
+    let Some(pin) = config.signer else {
+        return Ok(None);
+    };
     let elsewhere = state
         .source_identity
         .is_some_and(|bound| bound != source_identity(config));
     if elsewhere || pin_gives_way(config) {
-        return None;
+        return Ok(None);
     }
-    let cached = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
-        .ok()
-        .flatten()?;
-    let (envelope, _, _) = envelope::verify_for_reader(
+    let Some(cached) = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)? else {
+        return Ok(None);
+    };
+    let Ok((envelope, _, _)) = envelope::verify_for_reader(
         cached.as_slice(),
         &config.name,
         &pin,
         &config.followed,
         None,
+    ) else {
+        return Ok(None);
+    };
+    Ok(
+        (envelope.seq == state.seq && Some(envelope.digest()) == state.digest)
+            .then(|| cached.as_slice().to_vec()),
     )
-    .ok()?;
-    (envelope.seq == state.seq && Some(envelope.digest()) == state.digest)
-        .then(|| cached.as_slice().to_vec())
 }
 
 fn missing(config: &Config) -> Error {
@@ -2851,7 +2931,7 @@ fn sync_found(
     found: Found<'_>,
     said: &std::cell::Cell<SourceSaid>,
 ) -> crate::Result<SyncOutcome> {
-    sync_repairing_inner(paths, wait, None, &[], true, Some((found, said)))
+    sync_repairing_inner(paths, wait, None, &[], true, Some((found, said)), None)
 }
 
 /// [`sync`], also probing `candidates` (`DEFAULT_VAULT_URLS` and `_alab-vault._tcp` peers) when the
@@ -2868,11 +2948,18 @@ pub fn sync_with_candidates(
     wait: Option<Duration>,
     candidates: &[String],
 ) -> crate::Result<SyncOutcome> {
-    sync_repairing_inner(paths, wait, None, candidates, true, None)
+    sync_repairing_inner(paths, wait, None, candidates, true, None, None)
 }
 
-fn sync_without_reconcile(paths: &Paths, candidates: &[String]) -> crate::Result<SyncOutcome> {
-    sync_repairing_inner(paths, None, None, candidates, false, None)
+/// [`sync_with_candidates`] with no wait and no mirror, every records post of the pass ending by
+/// `posts_by` where one is given ([`sync_repairing_inner`]): the pass a publish runs once its
+/// version landed, whose posts share the deadline of the publish's own.
+fn sync_without_reconcile(
+    paths: &Paths,
+    candidates: &[String],
+    posts_by: Option<Instant>,
+) -> crate::Result<SyncOutcome> {
+    sync_repairing_inner(paths, None, None, candidates, false, None, posts_by)
 }
 
 /// The vault `source.toml` names and this Mac's empty record store for it
@@ -3050,7 +3137,7 @@ pub fn retain_records_for_commons(
 /// # Errors
 /// Vault configuration is missing, no candidate server answers cleanly, or persisting fails.
 pub fn sync_records(paths: &Paths, wait: Option<Duration>) -> crate::Result<usize> {
-    sync_records_inner(paths, wait, &[], None)
+    sync_records_inner(paths, wait, &[], None, None)
 }
 
 /// [`sync_records`] with explicit `candidates` probed alongside policy and discovered peers when
@@ -3064,7 +3151,7 @@ pub fn sync_records_with_candidates(
     wait: Option<Duration>,
     candidates: &[String],
 ) -> crate::Result<usize> {
-    sync_records_inner(paths, wait, candidates, None)
+    sync_records_inner(paths, wait, candidates, None, None)
 }
 
 fn sync_records_inner(
@@ -3072,8 +3159,9 @@ fn sync_records_inner(
     wait: Option<Duration>,
     extra_peers: &[String],
     browsed: Option<Found<'_>>,
+    posts_by: Option<Instant>,
 ) -> crate::Result<usize> {
-    sync_records_until(paths, wait, extra_peers, browsed, None).map(|pass| pass.added)
+    sync_records_until(paths, wait, extra_peers, browsed, None, posts_by).map(|pass| pass.added)
 }
 
 /// What one records pass did ([`sync_records_until`]).
@@ -3089,12 +3177,72 @@ pub(crate) struct RecordsPass {
     pub(crate) untaken: bool,
 }
 
+/// What a bounded records pass ([`sync_records_until`]) keeps of its deadline, once its pulls end,
+/// to take the store's lock and ingest what came.
+const TAKE_RESERVE: Duration = Duration::from_millis(300);
+
+/// What a records pass ([`sync_records_until`]) makes of the records one server sent: what it
+/// sent, frame by frame, whether the pass offers the store all of it, and the batch it offers.
+struct RecordsJudged {
+    stream: crate::membership_log::untaken::Sent,
+    whole: bool,
+    batch: Option<Vec<u8>>,
+}
+
+/// What a records pass holds of a peer's answer once every pull has ended.
+struct PeerRecords {
+    /// The records it sent.
+    records: Brought,
+    /// Whether it lacks a record the pull named ([`transport::RecordsAnswer::needs`]).
+    needs: bool,
+    /// Its boot id ([`transport::RecordsAnswer::boot`]).
+    boot: Option<String>,
+}
+
+/// The records a peer sent, as a records pass holds them once every pull has ended.
+enum Brought {
+    /// No longer than [`fan_out::RECORDS`]' peek (none, for a `204` or a `404`): judged then.
+    Read(Vec<u8>),
+    /// Longer: judged once its whole read ended, while that read still held its slot, so no
+    /// more such bodies that nothing has verified are held at once than
+    /// [`fan_out::reads_within`] reads whole at once.
+    Judged(RecordsJudged),
+}
+
+impl PeerRecords {
+    /// What a pass holds of `answer`, `judge` judging its records when they are longer than the
+    /// peek.
+    fn of(answer: transport::RecordsAnswer, judge: impl Fn(Vec<u8>) -> RecordsJudged) -> Self {
+        let transport::RecordsAnswer { bytes, needs, boot } = answer;
+        let records = if bytes.len() > fan_out::RECORDS.peek {
+            Brought::Judged(judge(bytes))
+        } else {
+            Brought::Read(bytes)
+        };
+        Self {
+            records,
+            needs,
+            boot,
+        }
+    }
+}
+
+/// One records pass: pull from the source and its peers (beside the source where nothing waits,
+/// after a long poll of it that failed), keep what verifies, and post each server that said it
+/// lacks this Mac's frontier what [`Reposted::due`] makes it due: the complete records past what
+/// it last judged; the store's complete records (`encode_held`) where it judged none, none for
+/// [`REPOST_AGAIN`], or answers another boot id than its last judging pass heard (at most once per
+/// [`REPOST_AGAIN`]); or nothing where it judged this frontier within [`REPOST_AGAIN`] and has not
+/// restarted since.
+/// A bounded caller (`deadline`) ends every exchange by it and posts nothing; otherwise the posts
+/// end by `posts_by`, or one exchange from when they start where none is given.
 fn sync_records_until(
     paths: &Paths,
     wait: Option<Duration>,
     extra_peers: &[String],
     browsed: Option<Found<'_>>,
     deadline: Option<Instant>,
+    posts_by: Option<Instant>,
 ) -> crate::Result<RecordsPass> {
     use crate::membership_log::untaken::{Named, Noted, Sent};
 
@@ -3117,21 +3265,26 @@ fn sync_records_until(
     let total = wait.map_or(servers_within(Duration::from_secs(10)), |w| {
         w.saturating_add(Duration::from_secs(10))
     });
+    // A bounded pass ends its pulls [`TAKE_RESERVE`] before its deadline: a server that answers
+    // nothing until then must not leave what the others sent untaken for want of the time to
+    // take the store and ingest it.
+    let pulls_by = deadline.map(|by| {
+        by.checked_sub(TAKE_RESERVE)
+            .filter(|cut| *cut > now)
+            .unwrap_or(by)
+    });
     let total = bounded::budget(
-        deadline,
-        deadline.map_or(total, |_| total.min(PROBE_DEADLINE)),
+        pulls_by,
+        pulls_by.map_or(total, |_| total.min(PROBE_DEADLINE)),
     )?;
     let primary_named = named(primary_url);
-    let primary = transport::fetch_records_sync(
-        primary_url,
-        &primary_named.ids,
-        wait,
-        total,
-        subscriber.as_deref(),
-    );
-    // A successful long poll uses only the primary. Leave the next peer batch for a pass
-    // that asks those peers instead of consuming it without a request.
-    let peers = if primary.is_err() || wait.is_none() {
+    let sub_ref = subscriber.as_deref();
+    let fetch_primary =
+        || transport::fetch_records_sync(primary_url, &primary_named.ids, wait, total, sub_ref);
+    // A bounded pass browses for peers by its own deadline, not a fixed probe of its own.
+    let bounded_browse = PeerDiscovery::direct(pulls_by);
+    let browsed = browsed.or_else(|| pulls_by.map(|_| &bounded_browse));
+    let collect_peers = || {
         collect_sync_peer_urls(
             paths,
             &config,
@@ -3140,49 +3293,7 @@ fn sync_records_until(
             browsed,
             PeerUse::Records,
         )
-    } else {
-        Vec::new()
     };
-    let probe_peers = !peers.is_empty();
-    // Each answer with whether the pull that asked for it named a memo's heads ([`UNTAKEN`]).
-    type PeerRecordsFetch = (String, bool, crate::Result<transport::RecordsAnswer>);
-    let peer_batches: Vec<PeerRecordsFetch> = if probe_peers {
-        // Read on this thread: each peer's fetch runs on a scoped thread of its own.
-        let probe = servers_within(PROBE_DEADLINE);
-        let peer_named: Vec<(&String, Named)> = peers.iter().map(|url| (url, named(url))).collect();
-        let sub_ref = subscriber.as_deref();
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = peer_named
-                .iter()
-                .map(|(url, named)| {
-                    scope.spawn(move || {
-                        (
-                            (*url).clone(),
-                            named.heads > 0,
-                            bounded::budget(deadline, probe).and_then(|left| {
-                                transport::fetch_records_sync(url, &named.ids, None, left, sub_ref)
-                            }),
-                        )
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join().unwrap_or_else(|_| {
-                        (
-                            String::new(),
-                            false,
-                            Err(Error::new("peer record fetch panicked")),
-                        )
-                    })
-                })
-                .collect()
-        })
-    } else {
-        Vec::new()
-    };
-
     let vault_name = if alab_vault(&config) {
         crate::ALAB_VAULT
     } else if config.name != crate::ALAB_VAULT {
@@ -3194,6 +3305,100 @@ fn sync_records_until(
         local_store.clone().ingest(bytes).is_ok()
             || crate::membership_log::Store::decode(vault_name, bytes).is_ok()
     };
+    // What a non-empty answer brings: the whole stream as its batch when it verifies, else the
+    // records of it this build reads that descend from none it cannot read, when those verify.
+    // A server of a newer build sends a record of a kind this build does not know beside records
+    // it reads, and refusing the whole stream kept those records from every server that holds
+    // it.
+    let judge = |bytes: Vec<u8>| -> RecordsJudged {
+        let stream = Sent::read(&bytes);
+        let (batch, whole) = if batch_valid(&bytes) {
+            (Some(bytes), true)
+        } else {
+            let part = stream.readable(&bytes);
+            let part = (!part.is_empty() && part.len() < bytes.len() && batch_valid(&part))
+                .then_some(part);
+            (part, false)
+        };
+        RecordsJudged {
+            stream,
+            whole,
+            batch,
+        }
+    };
+    // Each answer with whether the pull that asked for it named a memo's heads ([`UNTAKEN`]).
+    type PeerRecordsFetch = (String, bool, crate::Result<PeerRecords>);
+    let fetch_peers = |peers: &[String]| -> Vec<PeerRecordsFetch> {
+        if peers.is_empty() {
+            return Vec::new();
+        }
+        let peer_named: Vec<(&String, Named)> = peers.iter().map(|url| (url, named(url))).collect();
+        // Every peer is asked at once, sharing one deadline, as [`fan_out::RECORDS`] reads them:
+        // any LAN host can advertise up to [`crate::discover::MAX_CANDIDATES`] of them, and read
+        // whole at once, each up to [`crate::membership_log::MAX_RECORDS_STREAM`], they could
+        // have a pass hold up to a gigabyte of records nothing had verified. The deadline is read
+        // here, on this thread, where a test sets it ([`servers_within`]).
+        let fetched = match bounded::budget(pulls_by, servers_within(PROBE_DEADLINE)) {
+            Ok(within) => {
+                let ids = |url: &str| {
+                    peer_named
+                        .iter()
+                        .find(|(peer, _)| peer.as_str() == url)
+                        .map_or(&[][..], |(_, named)| named.ids.as_slice())
+                };
+                fan_out::reads_within(
+                    fan_out::RECORDS,
+                    peers,
+                    within,
+                    |url, left, limit| {
+                        transport::fetch_records_within(url, ids(url), left, sub_ref, limit)
+                    },
+                    |url, read| match read? {
+                        transport::Pulled::Fetched(answer) => Ok(PeerRecords::of(answer, judge)),
+                        transport::Pulled::Larger => Err(transport::past_any_records_stream(url)),
+                    },
+                )
+            }
+            Err(elapsed) => peers.iter().map(|_| Some(Err(elapsed.clone()))).collect(),
+        };
+        peer_named
+            .iter()
+            .zip(fetched)
+            .map(|((url, named), fetched)| {
+                (
+                    (*url).clone(),
+                    named.heads > 0,
+                    fetched.unwrap_or_else(|| Err(Error::new("peer record fetch panicked"))),
+                )
+            })
+            .collect()
+    };
+    let (primary, peers, peer_batches) = if wait.is_none() {
+        // Where nothing waits, every peer is asked too, and beside the primary rather than after
+        // it: a primary that does not answer must not spend a bounded pass's whole deadline
+        // (readmit's freshness read) before any peer is asked.
+        std::thread::scope(|scope| {
+            let primary = scope.spawn(fetch_primary);
+            let peers = collect_peers();
+            let peer_batches = fetch_peers(&peers);
+            let primary = primary
+                .join()
+                .unwrap_or_else(|_| Err(Error::new("primary record fetch panicked")));
+            (primary, peers, peer_batches)
+        })
+    } else {
+        let primary = fetch_primary();
+        // A successful long poll uses only the primary. Leave the next peer batch for a pass
+        // that asks those peers instead of consuming it without a request.
+        let peers = if primary.is_err() {
+            collect_peers()
+        } else {
+            Vec::new()
+        };
+        let peer_batches = fetch_peers(&peers);
+        (primary, peers, peer_batches)
+    };
+
     // A server that answered a pull naming a memo's heads left their closure out of its answer.
     let mut untaken = (primary.is_ok() && primary_named.heads > 0)
         || peer_batches
@@ -3204,23 +3409,10 @@ fn sync_records_until(
     // read or write that fails returns before any note, and the same records come again. Each
     // with whether the pass offered the store all of it.
     let mut sent: Vec<(String, Sent, bool)> = Vec::new();
-    // The batch a non-empty answer from `url` brings: the whole stream when it verifies, else
-    // the records of it this build reads that descend from none it cannot read, when those
-    // verify. A server of a newer build sends a record of a kind this build does not know
-    // beside records it reads, and refusing the whole stream kept those records from every
-    // server that holds it.
-    let mut verified = |url: &str, bytes: Vec<u8>| -> Option<Vec<u8>> {
-        let stream = Sent::read(&bytes);
-        let (batch, whole) = if batch_valid(&bytes) {
-            (Some(bytes), true)
-        } else {
-            let part = stream.readable(&bytes);
-            let part = (!part.is_empty() && part.len() < bytes.len() && batch_valid(&part))
-                .then_some(part);
-            (part, false)
-        };
-        sent.push((url.to_owned(), stream, whole));
-        batch
+    // The batch what `url` sent brings, once `sent` notes it.
+    let mut offered = |url: &str, judged: RecordsJudged| -> Option<Vec<u8>> {
+        sent.push((url.to_owned(), judged.stream, judged.whole));
+        judged.batch
     };
     let mut verified_batches: Vec<Vec<u8>> = Vec::new();
     // Each server that lacks this Mac's frontier, with the boot id its answer carried.
@@ -3241,7 +3433,7 @@ fn sync_records_until(
                 if needs {
                     push_urls.push((primary_url.clone(), boot));
                 }
-            } else if let Some(batch) = verified(primary_url, bytes) {
+            } else if let Some(batch) = offered(primary_url, judge(bytes)) {
                 verified_batches.push(batch);
                 if needs {
                     push_urls.push((primary_url.clone(), boot));
@@ -3253,7 +3445,12 @@ fn sync_records_until(
         Err(err) => primary_err = Some(err),
     }
     for (url, named_heads, res) in peer_batches {
-        let Ok(transport::RecordsAnswer { bytes, needs, boot }) = res else {
+        let Ok(PeerRecords {
+            records,
+            needs,
+            boot,
+        }) = res
+        else {
             continue;
         };
         if named_heads {
@@ -3262,16 +3459,26 @@ fn sync_records_until(
         if !needs {
             Reposted::satisfied(paths, &url);
         }
-        if bytes.is_empty() {
-            any_answered = true;
-            if needs {
-                push_urls.push((url, boot));
+        let judged = match records {
+            Brought::Read(bytes) if bytes.is_empty() => None,
+            Brought::Read(bytes) => Some(judge(bytes)),
+            Brought::Judged(judged) => Some(judged),
+        };
+        match judged {
+            None => {
+                any_answered = true;
+                if needs {
+                    push_urls.push((url, boot));
+                }
             }
-        } else if let Some(batch) = verified(&url, bytes) {
-            any_answered = true;
-            verified_batches.push(batch);
-            if needs {
-                push_urls.push((url, boot));
+            Some(judged) => {
+                if let Some(batch) = offered(&url, judged) {
+                    any_answered = true;
+                    verified_batches.push(batch);
+                    if needs {
+                        push_urls.push((url, boot));
+                    }
+                }
             }
         }
     }
@@ -3366,21 +3573,51 @@ fn sync_records_until(
         let wire = store.encode_held();
         let frontier = sha256(&store.frontier().concat());
         let have = store.have();
-        for (url, boot) in &push_urls {
-            let boot = boot.as_deref();
-            let (past, posting) = match Reposted::due(paths, url, &frontier, boot) {
-                None => continue,
-                Some(Repost::Whole { boot_reset }) => (None, Posting::Whole { boot_reset }),
-                Some(Repost::Past(judged)) => (
-                    Some(crate::membership_log::encode_records(
-                        &store.missing(&judged),
-                    )),
-                    Posting::Past,
-                ),
-            };
-            let body = past.as_deref().unwrap_or(&wire);
-            if body.is_empty() || transport::post_records_answered(url, body).is_ok() {
-                Reposted::posted(paths, url, &frontier, have.clone(), posting, boot);
+        let due: Vec<Due<'_>> = push_urls
+            .iter()
+            .filter_map(|(url, boot)| {
+                let boot = boot.as_deref();
+                let (past, posting) = match Reposted::due(paths, url, &frontier, boot)? {
+                    Repost::Whole { boot_reset } => (None, Posting::Whole { boot_reset }),
+                    Repost::Past(judged) => (
+                        Some(crate::membership_log::encode_records(
+                            &store.missing(&judged),
+                        )),
+                        Posting::Past,
+                    ),
+                };
+                Some(Due {
+                    url,
+                    boot,
+                    past,
+                    posting,
+                })
+            })
+            .collect();
+        // Every server due records is posted them at once ([`fan_out::post_records`]), all by one
+        // deadline: one that takes the post and never reads it holds this pass, and the publish
+        // that ran it, for one exchange, not one each. A server due nothing past what it judged
+        // is judged at once.
+        let posts: Vec<(&str, &[u8])> = due
+            .iter()
+            .map(|due| (due.url, due.past.as_deref().unwrap_or(&wire)))
+            .filter(|(_, body)| !body.is_empty())
+            .collect();
+        let by = posts_by.unwrap_or_else(fan_out::one_exchange);
+        let mut answers = fan_out::post_records(&posts, by).into_iter();
+        for due in &due {
+            // `answers` holds one answer for each non-empty body, in order.
+            if due.past.as_deref().unwrap_or(&wire).is_empty()
+                || answers.next().is_some_and(|answer| answer.is_ok())
+            {
+                Reposted::posted(
+                    paths,
+                    due.url,
+                    &frontier,
+                    have.clone(),
+                    due.posting,
+                    due.boot,
+                );
             }
         }
     }
@@ -3414,6 +3651,16 @@ enum Repost {
     /// The records past these ids, the store's [`crate::membership_log::Store::have`] when the
     /// server last judged a post of it ([`crate::membership_log::Store::missing`]).
     Past(Vec<crate::membership_log::RecordId>),
+}
+
+/// A server a records pass posts to ([`sync_records_until`]), and what it is due.
+struct Due<'a> {
+    url: &'a str,
+    /// The boot id the pass heard from it.
+    boot: Option<&'a str>,
+    /// The records past what it last judged; `None` for the whole store.
+    past: Option<Vec<u8>>,
+    posting: Posting,
 }
 
 /// What a pass posted a server that judged it ([`Reposted::posted`]).
@@ -3650,26 +3897,17 @@ struct SyncPeerHead {
     network_body: Option<network_observation::Body>,
 }
 
-fn probe_sync_peer(
-    paths: &Paths,
-    url: &str,
+/// The head of the vault a peer served in `fetched`, where it verifies under `pin`, with the
+/// network evidence `attempt` binds to its bytes.
+fn sync_peer_head(
+    fetched: Fetched,
+    attempt: Option<network_observation::Attempt>,
     config: &Config,
     pin: &[u8; 32],
-    total: Duration,
-    subscriber: Option<&str>,
 ) -> Option<SyncPeerHead> {
-    let attempt = network_observation::Attempt::start(paths, config, VaultNetworkSource::PeerUrl);
-    let fetched = transport::get_within_as(url, total, subscriber).ok()?;
-    let network_body = match &fetched {
-        transport::Answer::Fetched(fetched) => {
-            attempt.and_then(|attempt| attempt.received(fetched))
-        }
-        transport::Answer::Foreign(_) => None,
-    };
-    let body = match fetched {
-        transport::Answer::Fetched(Fetched::Body(body)) => body,
-        transport::Answer::Fetched(Fetched::Missing | Fetched::NoNewer(_))
-        | transport::Answer::Foreign(_) => return None,
+    let network_body = attempt.and_then(|attempt| attempt.received(&fetched));
+    let Fetched::Body(body) = fetched else {
+        return None;
     };
     let (envelope, _, _) =
         envelope::verify_for_reader(&body, &config.name, pin, &config.followed, None).ok()?;
@@ -3683,6 +3921,10 @@ fn probe_sync_peer(
     })
 }
 
+/// The verified heads every one of `urls` serves `subscriber`, read at once within `total`
+/// ([`fan_out::envelopes_within`]), each read's lookup and connect within
+/// [`transport::PROBE_CONNECT`]: in `urls`' order, without the peers that served none in time or
+/// served one that does not verify.
 fn probe_peers_for_sync(
     paths: &Paths,
     urls: &[String],
@@ -3694,19 +3936,19 @@ fn probe_peers_for_sync(
     if urls.is_empty() {
         return Vec::new();
     }
-    let found: Vec<Option<SyncPeerHead>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = urls
-            .iter()
-            .map(|url| {
-                scope.spawn(move || probe_sync_peer(paths, url, config, pin, total, subscriber))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().ok().flatten())
-            .collect()
-    });
-    found.into_iter().flatten().collect()
+    let attempt = network_observation::Attempt::start(paths, config, VaultNetworkSource::PeerUrl);
+    fan_out::envelopes_within(
+        urls,
+        total,
+        |url, left, limit| {
+            let connect = Some(transport::PROBE_CONNECT.min(left));
+            transport::get_within_as(url, left, connect, subscriber, limit)
+        },
+        |fetched| sync_peer_head(fetched, attempt, config, pin),
+    )
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 type HeadLineage = (u64, [u8; 32], Vec<[u8; 32]>);
@@ -3782,12 +4024,15 @@ fn sync_repairing(
     wait: Option<Duration>,
     repaired: Option<&mut Repaired>,
 ) -> crate::Result<SyncOutcome> {
-    sync_repairing_inner(paths, wait, repaired, &[], true, None)
+    sync_repairing_inner(paths, wait, repaired, &[], true, None, None)
 }
 
 /// [`sync`] with `extra_peers` as its candidates, mirroring diverged servers where
 /// `allow_mirror`; a subscriber's pass hands it the servers its browse found and where to
-/// keep what the source itself said (`subscribing`, [`sync_found`]).
+/// keep what the source itself said (`subscribing`, [`sync_found`]). The records posts of the
+/// pass (its records pushes, a closed wrap gap's, a tended epoch's) all end by `posts_by` where
+/// one is given; with none, each ends one exchange from when it starts. A mirror's posts keep
+/// their own ([`log_entries::mirror_log_to_servers`]).
 fn sync_repairing_inner(
     paths: &Paths,
     wait: Option<Duration>,
@@ -3795,20 +4040,21 @@ fn sync_repairing_inner(
     extra_peers: &[String],
     allow_mirror: bool,
     subscribing: Option<(Found<'_>, &std::cell::Cell<SourceSaid>)>,
+    posts_by: Option<Instant>,
 ) -> crate::Result<SyncOutcome> {
     let config = configured(paths)?;
     let before = load_state(paths)?;
     let browsed = subscribing.map(|(found, _)| found);
     if matches!(config.source, Source::Url(_)) {
-        let _ = sync_records_inner(paths, None, extra_peers, browsed);
-        log_entries::tend_wrap_gaps(paths);
-        let _ = remove::tend_epochs(paths);
+        let _ = sync_records_inner(paths, None, extra_peers, browsed, posts_by);
+        log_entries::tend_wrap_gaps(paths, posts_by);
+        let _ = remove::tend_epochs_by(paths, posts_by);
     }
     let pending_records =
         log_entries::current_records_digest(paths, &config, &before) != before.records_digest;
     let waited_on_primary =
         matches!(&config.source, Source::Url(_)) && wait.is_some() && !pending_records;
-    network_refresh::run(paths, &config, |refresh| {
+    let outcome = network_refresh::run(paths, &config, |refresh| {
         let subscriber = subscriber_recipient(paths);
         let attempt =
             network_observation::Attempt::start(paths, &config, VaultNetworkSource::ConfiguredUrl);
@@ -3848,7 +4094,7 @@ fn sync_repairing_inner(
             http204_observation::retain(paths, &config, request, http204.as_ref());
         }
         if waited_on_primary && matches!(primary_result, Ok(Fetched::Body(_))) {
-            let _ = sync_records_inner(paths, None, extra_peers, browsed);
+            let _ = sync_records_inner(paths, None, extra_peers, browsed, posts_by);
         }
         // The source's body is news only as far as it verifies under the pin (the servers found are
         // read only under one): a body that claims a newer seq and does not verify (anyone on the
@@ -3932,6 +4178,7 @@ fn sync_repairing_inner(
                                 extra_peers,
                                 false,
                                 subscribing,
+                                posts_by,
                             );
                         }
                     }
@@ -3989,6 +4236,7 @@ fn sync_repairing_inner(
                     extra_peers,
                     false,
                     subscribing,
+                    posts_by,
                 );
             }
         }
@@ -4026,6 +4274,7 @@ fn sync_repairing_inner(
                     extra_peers,
                     false,
                     subscribing,
+                    posts_by,
                 );
             }
             // A carry that could not complete (a head whose records no server has, every server
@@ -4076,6 +4325,7 @@ fn sync_repairing_inner(
                             extra_peers,
                             false,
                             subscribing,
+                            posts_by,
                         );
                     }
                 }
@@ -4099,7 +4349,16 @@ fn sync_repairing_inner(
             }
             Err(err) => Err(err),
         }
-    })
+    });
+    if matches!(
+        outcome,
+        Ok(SyncOutcome::Applied { .. } | SyncOutcome::Unchanged { .. })
+    ) {
+        // This normal sync is authorized to verify its registered entry. Holder
+        // probes never take this path or open mailbox plaintext before custody.
+        let _ = mailbox_index::backfill_after_sync(paths);
+    }
+    outcome
 }
 
 /// [`sync`] as one try of a bounded wait (an approval's): a long-poll whose whole request ends
@@ -4429,6 +4688,7 @@ fn apply_fetched_until(
     {
         network_observation::record(
             paths,
+            &lock,
             &requested_config,
             &config,
             &mut state,
@@ -4517,6 +4777,7 @@ fn apply_fetched_until(
     state.source_identity = (!state.failed).then(|| source_identity(&config));
     network_observation::record(
         paths,
+        &lock,
         &requested_config,
         &config,
         &mut state,
@@ -4524,6 +4785,7 @@ fn apply_fetched_until(
         body,
     );
     save_state(paths, &state)?;
+    let _ = mailbox_index::record_applied(paths, &config, &state, &entries);
     Ok(SyncOutcome::Applied {
         seq: envelope.seq,
         report,
@@ -4579,6 +4841,7 @@ fn apply_configured_log(
     state.failed = apply_failed(&report);
     state.source_identity = (!state.failed).then(|| source_identity(config));
     save_state(paths, state)?;
+    let _ = mailbox_index::record_applied(paths, config, state, &entries);
     Ok(SyncOutcome::Applied {
         seq: state.seq,
         report,
@@ -5022,15 +5285,19 @@ pub fn on_ask_members(ask: fn(&Paths) -> crate::Result<usize>) {
     let _ = ASK_MEMBERS.set(ask);
 }
 
-/// How long a Mac waiting to be let into ALab waits before asking its members again, after
-/// `asks` asks in a row: 1, 2, 4 and 8 minutes, then every 15. A member keeps one row per asking
-/// Mac (`members::desk`), so an ask again shows nothing new there; it brings the row back only on
-/// a member that slept, was off the LAN or restarted its window since.
+/// How long a Mac waiting to be let into ALab waits at least before asking its members again,
+/// after `asks` asks in a row: 20 seconds, then 1, 2, 4 and 8 minutes, then every 15. An ask goes
+/// at the top of a subscriber round, which a waiting Mac's long poll holds about 25 seconds, so
+/// the second ask comes on the round after the first: a member on the home ALab LAN lets the Mac
+/// in on its first ask (`client::readmit`), and the second follows one that missed (a member busy
+/// with a vault pass, or a connection its listener's watchdog cut) about half a minute later,
+/// while a round that fails and naps 5 seconds asks no more often. A member keeps one row per
+/// asking Mac (`members::desk`), so an ask again shows nothing new there.
 fn ask_members_pause(asks: u32) -> Duration {
-    const MINUTES: [u64; 5] = [1, 2, 4, 8, 15];
+    const SECONDS: [u64; 6] = [20, 60, 120, 240, 480, 900];
     let at = usize::try_from(asks.saturating_sub(1))
-        .map_or(MINUTES.len() - 1, |at| at.min(MINUTES.len() - 1));
-    Duration::from_secs(MINUTES[at] * 60)
+        .map_or(SECONDS.len() - 1, |at| at.min(SECONDS.len() - 1));
+    Duration::from_secs(SECONDS[at])
 }
 
 /// When the subscriber last asked ALab's members, how many times in a row, on what, and what it
@@ -5137,7 +5404,7 @@ fn ask_members_if_due(
     let said = match ask(paths) {
         Ok(0) => "asked ALab's members to let this Mac in: none answers on this network".to_owned(),
         Ok(heard) => format!(
-            "asked ALab's members to let this Mac in: {heard} show its request; press Allow on any one"
+            "asked ALab's members to let this Mac in: {heard} answered; a member on this Mac's home ALab LAN lets it in by itself"
         ),
         Err(error) => format!("asking ALab's members to let this Mac in failed: {error}"),
     };
@@ -5285,10 +5552,13 @@ fn subscriber_loop_until(
     let mut repaired = None;
     let mut last_error = String::new();
     let mut repeated = String::new();
-    // The path is read once, as it starts (`server::stamp_of`).
-    let exe = std::env::current_exe().ok();
-    let stamp = || exe.as_deref().and_then(crate::server::stamp_of);
-    let program = stamp();
+    // The loaded image, not the first disk sample, anchors the watch: an update may
+    // already have replaced its path before this subscriber's first round.
+    let program = crate::program_watch::ProgramWatch::current();
+    if program.replaced() {
+        log("this program was replaced on disk; exiting so the service starts the new one");
+        return Ok(());
+    }
     // The converge pass's runner: started as this subscriber starts (after an update replaced
     // its program, launchd starts it again), after each version it applies, and when a healthy
     // round finds it due; one at a time, never waited for.
@@ -5296,7 +5566,7 @@ fn subscriber_loop_until(
     let mut runner: Option<aterm_uds::spawnfd::Child> = None;
     let mut notary = release::NotaryRounds::default();
     let converge_if = |due: bool, runner: &mut Option<aterm_uds::spawnfd::Child>| {
-        if let (true, Some(exe)) = (due, exe.as_deref()) {
+        if let (true, Some(exe)) = (due, program.path()) {
             *runner = (converging.start)(exe);
         }
     };
@@ -5325,7 +5595,7 @@ fn subscriber_loop_until(
         // next healthy round's due check): one started while the vault cannot be reached is no
         // zombie for as long as that lasts.
         let _ = crate::converge::Last::of(runner.as_mut());
-        if crate::server::replaced(program, stamp()) {
+        if program.replaced() {
             log("this program was replaced on disk; exiting so the service starts the new one");
             return Ok(());
         }
@@ -5356,6 +5626,7 @@ fn subscriber_loop_until(
         let said = std::cell::Cell::new(SourceSaid::AtOnce);
         match subscriber_pass_saying(paths, &mut repaired, hearing.found, &said) {
             Ok((config, outcome)) => {
+                let _ = crate::service_health::after_round(paths);
                 let after = progress();
                 let pass = Pass {
                     source: said.get(),
@@ -5576,9 +5847,10 @@ fn ask_again_if_due(paths: &Paths, config: &Config, log: &dyn Fn(&str)) {
 pub enum Approval {
     /// `password = …`: requests whose proof matches it.
     Password,
-    /// `open = yes`, or its open note ([`text::OPEN_NOTE`]): requests to the pinned default ALab
-    /// vault its server observed on the home ALab LAN, where members answered, except
-    /// `code-only` keys ([`crate::home_lan`]). Other vaults still require a member's Allow.
+    /// `open = yes`, or its open note ([`text::OPEN_NOTE`]): no join password. A request is let
+    /// in by a member's Allow, and otherwise waits for an admin's approval by code, on every
+    /// vault, the pinned ALab vault included: its asking alone admits nothing. A Mac on the home
+    /// ALab LAN is let in by a member when it proves itself, whatever `[join]` says.
     Open,
 }
 
@@ -5656,13 +5928,14 @@ pub(super) fn admin_removed_in_log(
     identity: &Identity,
     doc: &Document,
 ) -> bool {
-    let Some((log, _)) = log_entries::trusted_seeded_log(paths, config, envelope)
-        .ok()
-        .flatten()
-    else {
-        return false;
+    let log = match log_entries::trusted_seeded_log(paths, config, envelope) {
+        Ok(Some((log, _))) => log,
+        Ok(None) => return false,
+        Err(_) => return true,
     };
-    let mut roster = log_entries::local_swarm_roster_for_log(paths, &log);
+    let Ok(mut roster) = log_entries::local_swarm_roster_for_log(paths, &log) else {
+        return true;
+    };
     if let Ok(Some(doc_roster)) = crate::swarm_roster::SwarmRoster::from_document(doc) {
         match &mut roster {
             Some(r) => {
@@ -5883,7 +6156,8 @@ pub enum HeldMoved {
     FluidServer,
     /// An unpinned ALab server or subscriber held on an older release or another copy of this
     /// one: from [`ALAB_MANAGED_JOB_RELEASE`] ALab's jobs follow the installed release, so an old
-    /// but healthy job cannot hold back automatic LAN admission.
+    /// but healthy job cannot keep behavior the installed release dropped (0.148's and 0.149's
+    /// approver admitting a plain ask from the home ALab LAN among it).
     ManagedRelease,
     /// On the ALab vault's admin Mac, an approver older than [`ALLOWED_APPROVER_MIN_RELEASE`],
     /// which admits by `open` and drops a request a member Allowed.
@@ -5997,7 +6271,7 @@ pub fn mend_held(paths: &Paths, job: crate::service::Job) -> crate::Result<HeldM
 const ALLOWED_APPROVER_MIN_RELEASE: locker_skew::Version = (0, 146, 0);
 
 /// The release that keeps managed ALab jobs on the installed release, so an old but
-/// healthy server or approver cannot hold back automatic LAN admission.
+/// healthy server or approver cannot keep behavior the installed release dropped.
 const ALAB_MANAGED_JOB_RELEASE: locker_skew::Version = (0, 147, 0);
 
 fn held_alab_release_due(own: &locker_skew::Own, held: locker_skew::Version) -> bool {
@@ -6162,8 +6436,7 @@ const JOINS_WAIT: Duration = crate::server::DEFAULT_HOLD;
 
 /// The join queue as an approver last heard it: where, the version the server named (`None`:
 /// a server that names none, polled), its lines, and the address of the server that answered
-/// (`None`: not known), whose `home=` words count only where this Mac reaches it at home
-/// ([`crate::home_lan::Place::serving`]).
+/// (`None`: not known), which a long-poll continues from only.
 #[derive(Clone, Default)]
 struct Heard {
     url: String,
@@ -6183,14 +6456,12 @@ fn hear_joins(
     join_queues::hear(paths, config, heard, JOINS_WAIT)
 }
 
-/// What a judged approver pass read: the vault version, the requests, those of them the vault
-/// answered as they stand ([`still_answered`]), and the home ALab LAN networks this Mac was on
-/// ([`crate::home_lan`]).
+/// What a judged approver pass read: the vault version, the requests, and those of them the
+/// vault answered as they stand ([`still_answered`]).
 type Listed = (
     u64,
     std::collections::BTreeSet<Judged>,
     std::collections::BTreeSet<Answered>,
-    Vec<crate::home_lan::HomeTag>,
 );
 
 /// The requests in `pending` the vault answered as they stand ([`Answered`]). One whose time the
@@ -6298,8 +6569,11 @@ struct Approver {
     account_upkeep_at: Option<Instant>,
     /// What the last judged pass read ([`Listed`]).
     listed: Option<Listed>,
-    /// What [`write_asking`] last wrote.
+    /// The last successful asking judgment, retained while its display is withdrawn.
     told: Option<Vec<Asking>>,
+    /// The UI record was withdrawn after a failed observation; `told` still
+    /// retains the previous judgment used by the admission policy.
+    asking_withdrawn: bool,
     /// Whether the last pass met a failure, other than a failure to read on a Mac last read as a
     /// member, or a first refused publish ([`Approver::refused`]), which leave it as it was.
     failing: bool,
@@ -6457,16 +6731,27 @@ impl Approver {
         };
     }
 
-    /// Keep `asking` in the record an admin Mac's aterm reads ([`asking`]) when it changed.
+    /// Keep `asking` in the record an admin Mac's aterm reads ([`asking`]) when it changed
+    /// or a failed observation withdrew its previous display.
     fn tell(&mut self, paths: &Paths, log: &dyn Fn(&str), asking: Vec<Asking>) {
-        if self.told.as_ref() == Some(&asking) {
+        if !self.asking_withdrawn && self.told.as_ref() == Some(&asking) {
             return;
         }
         match write_asking(paths, &asking) {
-            Ok(()) => self.told = Some(asking),
+            Ok(()) => {
+                self.told = Some(asking);
+                self.asking_withdrawn = false;
+            }
             Err(error) => log(&format!(
                 "could not record the Macs asking to join: {error}"
             )),
+        }
+    }
+
+    fn withdraw_asking(&mut self, paths: &Paths, log: &dyn Fn(&str)) {
+        self.asking_withdrawn = true;
+        if let Err(error) = write_asking(paths, &[]) {
+            log(&format!("could not withdraw stale join actions: {error}"));
         }
     }
 
@@ -6476,6 +6761,7 @@ impl Approver {
     /// differs in more than its numbers comes: a pass that meets a sync mid-write goes
     /// unreported, and an approver that stays stuck says why.
     fn trouble(&mut self, paths: &Paths, log: &dyn Fn(&str), text: String) {
+        self.withdraw_asking(paths, log);
         let shape =
             |text: &str| -> String { text.chars().filter(|c| !c.is_ascii_digit()).collect() };
         let fresh = self.failing && self.reported.as_deref().map(shape) != Some(shape(&text));
@@ -6649,22 +6935,13 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
     };
     let by = match approval {
         Some(Approval::Password) => "by the join password",
-        Some(Approval::Open) if alab_vault(&config) => "by the default ALab home-LAN policy",
         Some(Approval::Open) | None => ALLOWED_BY,
     };
-    // The home ALab LAN networks this Mac is on now and reaches the server through: a request
-    // that server observed on one of them is the one the default ALab policy lets in, so a move
-    // onto or off it is judged anew. A server reached by a route, or not known, observed nothing
-    // this Mac stands behind.
-    let here = approver.heard.from.map_or_else(Vec::new, |from| {
-        crate::home_lan::Place::serving(&crate::home_lan::Live::new(paths.clone()), from)
-    });
     let judged: std::collections::BTreeSet<Judged> = pending.iter().map(Judged::of).collect();
     let listed = (
         seq,
         judged.clone(),
         still_answered(&pending, &approver.answered),
-        here.clone(),
     );
     let mut queue_config = config.clone();
     if !approver.heard.url.is_empty() {
@@ -6676,7 +6953,8 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
     // A request that came or went, a version that let a Mac in, or a request the vault answered
     // whose time moved (a Mac let go asking again) is read again too, so the record of the Macs
     // an admin approves by hand follows the queue and the vault.
-    let judging = due
+    let judging = approver.asking_withdrawn
+        || due
         || approver.listed.as_ref() != Some(&listed)
         || approver.begun.as_deref() != Some(queue.as_str());
     if judging {
@@ -6721,21 +6999,19 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
                 &pending,
                 &mut publishing,
                 &mut answered,
-                (keys, &here, Some(&queue_url)),
+                (keys, Some(&queue_url)),
             )
         });
         match done {
             Ok(mut done) => {
                 approver.keep_answered(paths, log, answered, queue, seen, seq);
                 // Read against the record this pass left, so the next pass rests.
-                approver.listed = Some((
-                    seq,
-                    judged,
-                    still_answered(&pending, &approver.answered),
-                    here,
-                ));
+                approver.listed = Some((seq, judged, still_answered(&pending, &approver.answered)));
                 approver.tell(paths, log, std::mem::take(&mut done.asking));
                 for line in approved_lines(&done, by) {
+                    log(&line);
+                }
+                for line in seat_lines(&done) {
                     log(&line);
                 }
                 let refused: Vec<&str> = done
@@ -6759,6 +7035,7 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
                 // and reads that version again soon; refused again, it is reported.
                 let refused = error.kind() == crate::ErrorKind::NotStored;
                 if refused && !approver.refused && !approver.failing {
+                    approver.withdraw_asking(paths, log);
                     approver.refused = true;
                     return Duration::from_secs(2);
                 }
@@ -6792,8 +7069,6 @@ pub struct Judged {
     pub proof: Option<String>,
     /// The member's Allow it carried, if any.
     pub allowed: Option<String>,
-    /// The home ALab LAN the serving vault observed it on, if any.
-    pub home: Option<crate::home_lan::HomeTag>,
 }
 
 impl Judged {
@@ -6803,7 +7078,6 @@ impl Judged {
             host: request.host.clone(),
             proof: request.proof.clone(),
             allowed: request.allowed.clone(),
-            home: request.home.clone(),
         }
     }
 }
@@ -6847,7 +7121,7 @@ impl Settled {
 const ALLOWED_BY: &str = "by a member's Allow";
 
 /// The approver's log lines for the machines `done` added: those a member's Allow let in apart
-/// from the rest, which `by` names (the join password or default ALab home-LAN policy).
+/// from the rest, which `by` names (the join password).
 fn approved_lines(done: &AutoApproved, by: &str) -> Vec<String> {
     let (allowed, rest): (Vec<&str>, Vec<&str>) = done
         .approved
@@ -6858,6 +7132,20 @@ fn approved_lines(done: &AutoApproved, by: &str) -> Vec<String> {
         .into_iter()
         .filter(|(hosts, _)| !hosts.is_empty())
         .map(|(hosts, by)| format!("approved {} {by}", hosts.join(", ")))
+        .collect()
+}
+
+/// The approver's log lines for each new machine `done` let in under the `m<N>` label of a
+/// standing seat (`client::continuity`): a new seat beside that one, on the record.
+fn seat_lines(done: &AutoApproved) -> Vec<String> {
+    done.beside
+        .iter()
+        .map(|(host, label)| {
+            format!(
+                "approved {host} as a new seat beside {label}'s: nothing proved it is that \
+                 seat's Mac"
+            )
+        })
         .collect()
 }
 
@@ -6875,9 +7163,13 @@ pub struct AutoApproved {
     /// Every request read and judged in this pass.
     pub judged: Vec<Judged>,
     /// The requests from machines not in the vault that this pass left for an admin to approve
-    /// by hand: no valid password or member's Allow, no default ALab LAN eligibility, or a
-    /// `code-only` key.
+    /// by hand: no valid password or member's Allow, or a `code-only` key.
     pub asking: Vec<Asking>,
+    /// The machine names in `approved` that asked under the `m<N>` label of a standing seat, each
+    /// with that seat's label: a new seat beside it (nothing the approver reads proves the Mac is
+    /// that seat's; only re-admission by proof moves a seat), which `aterm members list` names as
+    /// a [`Split`] once the log seats it.
+    pub beside: Vec<(String, String)>,
     /// The version published, when any machine was added.
     pub seq: Option<u64>,
 }
@@ -6893,27 +7185,6 @@ pub fn auto_approve(paths: &Paths) -> crate::Result<AutoApproved> {
     )
 }
 
-/// Exercise default ALab admission with a fixture signing key. Production derives this
-/// eligibility only from [`alab_vault`]; this seam is absent from release builds.
-#[cfg(any(test, debug_assertions))]
-pub fn test_auto_approve_alab_lan(paths: &Paths) -> crate::Result<AutoApproved> {
-    let admin = admin_open(paths)?;
-    let (pending, _, queue_url) = requests_from(paths, &admin.config)?;
-    auto_approve_listed_in(
-        paths,
-        &admin,
-        &pending,
-        &mut false,
-        &mut read_answered(paths).answered,
-        (
-            &mut JoinKeys::default(),
-            &[crate::home_lan::HomeTag::test()],
-            Some(&queue_url),
-        ),
-        true,
-    )
-}
-
 /// [`auto_approve_listed`] of the requests queued at `admin`'s source now.
 fn auto_approve_opened(
     paths: &Paths,
@@ -6921,17 +7192,14 @@ fn auto_approve_opened(
     publishing: &mut bool,
     answered: &mut std::collections::BTreeSet<Answered>,
 ) -> crate::Result<AutoApproved> {
-    let (pending, from, queue_url) = requests_from(paths, &admin.config)?;
-    let here = from.map_or_else(Vec::new, |from| {
-        crate::home_lan::Place::serving(&crate::home_lan::Live::new(paths.clone()), from)
-    });
+    let (pending, queue_url) = requests_from(paths, &admin.config)?;
     auto_approve_listed(
         paths,
         admin,
         &pending,
         publishing,
         answered,
-        (&mut JoinKeys::default(), &here, Some(&queue_url)),
+        (&mut JoinKeys::default(), Some(&queue_url)),
     )
 }
 
@@ -6978,41 +7246,17 @@ fn allowed_by_roster(
 /// `answered` from a key no longer in the vault is judged and left alone: no approval, no
 /// refusal, no ask. On success `answered` holds the requests the vault has answered now: those
 /// of keys in the vault (this pass's approvals included), and those it held before that are
-/// still queued. The join password's key comes from `keys`; `here` names the home ALab LAN
-/// networks this Mac is on now ([`crate::home_lan::Place::here`]), as reached through the
-/// selected queue's responding server. Its URL is where refusal verdicts are posted.
+/// still queued. The join password's key comes from `keys`, and `queue_url` is the selected
+/// queue's, where refusal verdicts are posted. No request is let in by its asking alone, on any
+/// vault, the pinned ALab vault included: a Mac on the home ALab LAN is let in by a member when
+/// it proves itself (`crate::client::readmit`), and its plain ask waits for a person here.
 fn auto_approve_listed(
     paths: &Paths,
     admin: &Admin,
     pending: &[Request],
     publishing: &mut bool,
     answered: &mut std::collections::BTreeSet<Answered>,
-    keys_here: (&mut JoinKeys, &[crate::home_lan::HomeTag], Option<&str>),
-) -> crate::Result<AutoApproved> {
-    auto_approve_listed_in(
-        paths,
-        admin,
-        pending,
-        publishing,
-        answered,
-        keys_here,
-        alab_vault(&admin.config),
-    )
-}
-
-/// [`auto_approve_listed`] with the pinned ALab vault's own policy on (`default_alab`) or off.
-/// The default ALab policy lets a request in with no person only where its server observed it
-/// on a home ALab LAN network this Mac is on now too (`here`): an older server's `lan=1`, a
-/// request heard on a hotspot or a café, and one heard on a network this approver is not on
-/// all wait for a member's Allow.
-fn auto_approve_listed_in(
-    paths: &Paths,
-    admin: &Admin,
-    pending: &[Request],
-    publishing: &mut bool,
-    answered: &mut std::collections::BTreeSet<Answered>,
-    (keys, here, queue_url): (&mut JoinKeys, &[crate::home_lan::HomeTag], Option<&str>),
-    default_alab: bool,
+    (keys, queue_url): (&mut JoinKeys, Option<&str>),
 ) -> crate::Result<AutoApproved> {
     let mut done = AutoApproved::default();
     let policy = Approval::of(&admin.published_doc);
@@ -7035,6 +7279,7 @@ fn auto_approve_listed_in(
     let mut kept = std::collections::BTreeSet::new();
     let mut newly_named = Vec::new();
     let mut roster = None;
+    let mut seat_log = None;
     // A Mac a member let in through the membership log is in `[machines]` already (the log's
     // overlay names it), so the approver never approves it. While it still asks with its
     // `Allowed`, the version served does not address it yet: the publish below names it there,
@@ -7114,15 +7359,6 @@ fn auto_approve_listed_in(
         if !members.contains(&request.recipient) {
             let method = if allowed {
                 Some(AdmissionMethod::Manual)
-            } else if default_alab
-                && approval == Some(Approval::Open)
-                && request
-                    .home
-                    .as_ref()
-                    .is_some_and(|home| here.contains(home))
-                && !code_only.contains(&request.recipient)
-            {
-                Some(AdmissionMethod::Open)
             } else if approval == Some(Approval::Password)
                 && key.zip(request.proof.as_ref()).is_some_and(|(key, proof)| {
                     key.verify(name, &request.recipient, &request.host, proof)
@@ -7133,9 +7369,19 @@ fn auto_approve_listed_in(
                 None
             };
             if let Some(method) = method {
+                // The seat the request asks under, by its host's `m<N>`: a name never takes a
+                // seat (only a proof moves one, `readmit`), so a Mac let in here under a standing
+                // seat's label is a new seat beside it, on the record.
+                let named = seat_log
+                    .get_or_insert_with(|| continuity::trusted_log(paths))
+                    .as_ref()
+                    .and_then(|log| continuity::seat_named(log, &request.host));
                 let host = free_name(&doc, &request.host);
                 doc.add_machine(&host, &request.recipient)
                     .map_err(|e| Error::new(e.to_string()))?;
+                if let Some(label) = named {
+                    done.beside.push((host.clone(), label));
+                }
                 newly_named.push((
                     request.recipient.clone(),
                     request.host.clone(),
@@ -7284,8 +7530,9 @@ impl Answered {
     }
 }
 
-/// The most join requests the record of answered ones holds.
-const ANSWERED_MOST: usize = 256;
+/// Answered records span independent queues and are bounded by bytes, rather
+/// than by the number of requests one server can hold.
+const ANSWERED_BYTES: usize = crate::text::MAX_TEXT + (64 << 10);
 
 /// Optional proof digests by request-line index. Older readers skip these comments.
 const ANSWERED_PROOF: &str = "#\tproof\t";
@@ -7352,7 +7599,7 @@ fn read_answered(paths: &Paths) -> AnsweredRecord {
     };
     // Its `code-only` lines are as long as the vault's own, so the vault's limit bounds them,
     // in a record of 2026-10-26 too.
-    let limit = crate::text::MAX_TEXT + (64 << 10);
+    let limit = ANSWERED_BYTES;
     let requests = read(&paths.answered_file(), limit).unwrap_or_default();
     // This build writes no head lines in `answered`, so any there are newer than the queue file.
     let queue = if requests
@@ -7386,7 +7633,7 @@ fn read_answered(paths: &Paths) -> AnsweredRecord {
     }
 }
 
-/// The requests in a record's `key<TAB>time<TAB>name` lines, at most [`ANSWERED_MOST`], with
+/// The requests in a record's `key<TAB>time<TAB>name` lines, with
 /// optional [`ANSWERED_PROOF`] comments. Missing or conflicting digests remain legacy records;
 /// their indices apply only when [`ANSWERED_CHECKSUM`] covers the exact record contents.
 fn answered_lines(text: &str) -> std::collections::BTreeSet<Answered> {
@@ -7407,7 +7654,6 @@ fn answered_lines(text: &str) -> std::collections::BTreeSet<Answered> {
                 proof: None,
             })
         })
-        .take(ANSWERED_MOST)
         .collect();
     let mut recorded = None;
     let mut covered = String::new();
@@ -7439,7 +7685,7 @@ fn answered_lines(text: &str) -> std::collections::BTreeSet<Answered> {
             .next()
             .filter(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|index| index.parse::<usize>().ok())
-            .filter(|index| *index < ANSWERED_MOST)
+            .filter(|index| *index < answered.len())
         else {
             continue;
         };
@@ -7465,14 +7711,13 @@ fn answered_lines(text: &str) -> std::collections::BTreeSet<Answered> {
     answered.into_iter().collect()
 }
 
-/// The lines [`answered_lines`] reads: one `key<TAB>time<TAB>name` line each, at most
-/// [`ANSWERED_MOST`], each followed by its optional proof-digest comment. The old request
-/// lines stay unchanged, so older builds still suppress their standing answered requests.
+/// The lines [`answered_lines`] reads: one `key<TAB>time<TAB>name` line each,
+/// each followed by its optional proof-digest comment. Each request keeps its
+/// legacy key/time/name layout; the record's size is bounded by [`ANSWERED_BYTES`].
 /// A final checksum binds the proof comments to those exact lines and their ordering.
 fn answered_text(answered: &std::collections::BTreeSet<Answered>) -> String {
     let mut text = answered
         .iter()
-        .take(ANSWERED_MOST)
         .enumerate()
         .map(|(index, answered)| {
             let host: String = answered.host.chars().filter(|c| !c.is_control()).collect();
@@ -7514,14 +7759,14 @@ fn write_answered(
     seen: &std::collections::BTreeSet<String>,
 ) -> crate::Result<()> {
     fsx::ensure_private_dir(&paths.dir)?;
+    let text = answered_text(answered);
+    if text.len() > ANSWERED_BYTES {
+        return Err(Error::new("answered request record exceeds its byte limit"));
+    }
     if answered.is_empty() {
         remove_record(&paths.answered_file())?;
     } else {
-        fsx::write_atomic(
-            &paths.answered_file(),
-            answered_text(answered).as_bytes(),
-            0o600,
-        )?;
+        fsx::write_atomic(&paths.answered_file(), text.as_bytes(), 0o600)?;
     }
     let Some(queue) = begun else {
         return remove_record(&paths.answered_queue_file());
@@ -7537,10 +7782,10 @@ fn write_answered(
     fsx::write_atomic(&paths.answered_queue_file(), text.as_bytes(), 0o600)
 }
 
-/// The requests this Mac let in by code that the server listed at its last approval
-/// ([`record_approved`]).
+/// The requests this Mac let in by code and has not observed withdrawn from all
+/// authorized queues ([`record_approved`]).
 fn read_approved(paths: &Paths) -> std::collections::BTreeSet<Answered> {
-    match fsx::read_private(&paths.answered_approved_file(), 64 << 10) {
+    match fsx::read_private(&paths.answered_approved_file(), ANSWERED_BYTES) {
         Ok(Some(bytes)) => answered_lines(&String::from_utf8_lossy(bytes.as_slice())),
         _ => std::collections::BTreeSet::new(),
     }
@@ -7550,21 +7795,28 @@ fn read_approved(paths: &Paths) -> std::collections::BTreeSet<Answered> {
 /// answered for its approver ([`read_approved`]), as the approver records a member's request: an
 /// approver that reads no version between this one and one that lets such a key go again (off,
 /// stuck, or outrun) still takes the request for no ask. The approvals keep their own file, which
-/// the approver only reads, so neither's write undoes the other's; each approval keeps only the
-/// requests `pending`, the server's listing, still names.
+/// the approver only reads, so neither's write undoes the other's. A complete observation
+/// retires prior requests no queue still lists; a partial or absent observation retains them.
 pub(crate) fn record_approved(
     paths: &Paths,
     pending: &[Request],
     recipients: &[String],
+    complete: bool,
 ) -> crate::Result<()> {
     let listed: std::collections::BTreeSet<Answered> =
         pending.iter().filter_map(Answered::of).collect();
     let before = read_approved(paths);
-    let mut approved: std::collections::BTreeSet<Answered> = listed
-        .iter()
-        .filter(|answer| before.iter().any(|held| held.matches(answer)))
-        .cloned()
-        .collect();
+    let mut approved: std::collections::BTreeSet<Answered> = if complete {
+        listed
+            .iter()
+            .filter(|answer| before.iter().any(|held| held.matches(answer)))
+            .cloned()
+            .collect()
+    } else {
+        // An unobserved queue may still hold any earlier answered request.
+        // Neither an unavailable mirror nor a direct-key approval withdraws it.
+        before.clone()
+    };
     approved.extend(
         pending
             .iter()
@@ -7578,11 +7830,11 @@ pub(crate) fn record_approved(
         return remove_record(&paths.answered_approved_file());
     }
     fsx::ensure_private_dir(&paths.dir)?;
-    fsx::write_atomic(
-        &paths.answered_approved_file(),
-        answered_text(&approved).as_bytes(),
-        0o600,
-    )
+    let text = answered_text(&approved);
+    if text.len() > ANSWERED_BYTES {
+        return Err(Error::new("approved request record exceeds its byte limit"));
+    }
+    fsx::write_atomic(&paths.answered_approved_file(), text.as_bytes(), 0o600)
 }
 
 /// The recipients of the requests this Mac's approvals by code recorded ([`record_approved`]).
@@ -7707,33 +7959,47 @@ fn asking_with(paths: &Paths, runs: &dyn Fn(&str) -> bool) -> Vec<Asking> {
 /// more than one name ([`one_name_asked`]), or the publish failed.
 pub fn approve_request(paths: &Paths, recipient: &str) -> crate::Result<String> {
     let admin = admin_open(paths)?;
+    approve_request_opened(paths, &admin, recipient)
+}
+
+fn approve_request_opened(paths: &Paths, admin: &Admin, recipient: &str) -> crate::Result<String> {
+    let observed = requests_for_approval(admin, &[ApprovalTarget::Recipient(recipient)])?;
+    approve_observed_request_opened(paths, admin, &observed, recipient)
+}
+
+fn approve_observed_request_opened(
+    paths: &Paths,
+    admin: &Admin,
+    observed: &ApprovalRequests,
+    recipient: &str,
+) -> crate::Result<String> {
     let mut doc = admin.doc.clone();
-    let pending = requests(paths, Some(&doc))?;
+    let pending = &observed.requests;
     let request = pending
         .iter()
         .find(|request| request.recipient == recipient)
         .ok_or_else(|| Error::new("that Mac no longer asks to join"))?;
-    one_name_asked(&pending, request)?;
+    one_name_asked(pending, request)?;
     let host = free_name(&doc, &request.host);
     doc.add_machine(&host, recipient)
         .map_err(|e| Error::new(e.to_string()))?;
     roster::maintain_swarm_roster_on_approve(
-        &admin,
+        admin,
         &mut doc,
         &[(recipient.to_owned(), request.host.clone(), host.clone())],
         &roster::log_labels(paths),
         aterm_time::unix_millis().unwrap_or(0),
     )?;
-    let published = admin_publish_approved(paths, &admin, &doc, &[recipient.to_owned()])?;
+    let published = admin_publish_approved(paths, admin, &doc, &[recipient.to_owned()])?;
     let approved_recipients = [recipient.to_owned()];
     ledger_publish::verify_approved_in_served_head(
         paths,
-        &admin,
+        admin,
         published.seq,
         &approved_recipients,
     )?;
     // Bookkeeping only: the approver records the request too once it reads this version.
-    let _ = record_approved(paths, &pending, &approved_recipients);
+    let _ = record_approved(paths, pending, &approved_recipients, observed.complete);
     Ok(host)
 }
 
@@ -7763,11 +8029,11 @@ thread_local! {
 /// listener's kernel completes without the server running. Its drop, a panic's unwind included,
 /// puts back the bound it replaced.
 #[cfg(test)]
-struct ServersAnswering(Option<Duration>);
+pub(crate) struct ServersAnswering(Option<Duration>);
 
 #[cfg(test)]
 impl ServersAnswering {
-    fn set() -> Self {
+    pub(crate) fn set() -> Self {
         Self(SERVERS_WITHIN.replace(Some(aterm_spec::wait::MUST_HAPPEN)))
     }
 }
@@ -7813,17 +8079,33 @@ pub enum ProbeOutcome {
 /// ([`transport::get_within`]); on macOS, no route to a LAN address is
 /// [`crate::ErrorKind::LocalNetworkPending`] (elsewhere it is [`crate::ErrorKind::Other`]).
 pub fn probe(url: &str, pin: &[u8; 32], total: Duration) -> crate::Result<ProbeOutcome> {
-    let base_url = url.split_once('#').map_or(url, |(base, _)| base);
+    let base_url = unpinned(url);
     let name = transport::vault_name(&Source::Url(base_url.to_string()))?;
-    let body = match transport::get_within(base_url, total)? {
+    let answer = transport::get_within(base_url, total)?;
+    Ok(probe_answer(base_url, &name, pin, answer))
+}
+
+/// `url` without the `#<signer>` pin it may carry: the address a [`probe`] reads.
+fn unpinned(url: &str) -> &str {
+    url.split_once('#').map_or(url, |(base, _)| base)
+}
+
+/// What `answer`, `base_url`'s to a [`probe`] for the vault `name`, says under `pin`.
+fn probe_answer(
+    base_url: &str,
+    name: &str,
+    pin: &[u8; 32],
+    answer: transport::Answer,
+) -> ProbeOutcome {
+    let body = match answer {
         transport::Answer::Fetched(Fetched::Body(body)) => body,
         transport::Answer::Fetched(Fetched::Missing | Fetched::NoNewer(_)) => {
-            return Ok(ProbeOutcome::Absent);
+            return ProbeOutcome::Absent;
         }
-        transport::Answer::Foreign(why) => return Ok(ProbeOutcome::NotThisVault(why)),
+        transport::Answer::Foreign(why) => return ProbeOutcome::NotThisVault(why),
     };
-    let verified = envelope::verify_for_reader(&body, &name, pin, &[], None);
-    Ok(match verified {
+    let verified = envelope::verify_for_reader(&body, name, pin, &[], None);
+    match verified {
         Ok((envelope, _, _)) => ProbeOutcome::Found(Probed {
             url: base_url.to_owned(),
             seq: envelope.seq,
@@ -7836,7 +8118,7 @@ pub fn probe(url: &str, pin: &[u8; 32], total: Duration) -> crate::Result<ProbeO
             }
             _ => ProbeOutcome::NotThisVault(error.to_string()),
         },
-    })
+    }
 }
 
 /// Whether `error`, a failed [`probe`] or fetch, is macOS's Local Network privacy refusing this
@@ -7878,7 +8160,13 @@ pub fn probe_candidates(
     pin: &[u8; 32],
     total: Duration,
 ) -> crate::Result<ProbeOutcome> {
-    probe_candidates_with(urls, pin, total, |_| ProbeOrigin::Default)
+    probe_candidates_with(
+        urls,
+        pin,
+        total,
+        |_| ProbeOrigin::Default,
+        transport::look_within,
+    )
 }
 
 /// The compiled addresses can certify a network's negative discovery record; an independently
@@ -7889,34 +8177,95 @@ enum ProbeOrigin {
     Discovered,
 }
 
+/// Where a candidate of [`probe_default`] came from: [`crate::ALAB_DEFAULT_URLS`] or a browse.
+fn default_or_discovered(url: &str) -> ProbeOrigin {
+    if crate::is_alab_default_url(url) {
+        ProbeOrigin::Default
+    } else {
+        ProbeOrigin::Discovered
+    }
+}
+
+/// [`probe_candidates`] of `urls`, each one's origin as `origin` says, each answer read by `look`
+/// ([`probes_within`]).
 fn probe_candidates_with(
     urls: &[String],
     pin: &[u8; 32],
     total: Duration,
     origin: impl Fn(&str) -> ProbeOrigin,
+    look: impl Fn(&str, Duration, usize) -> Looked + Sync,
 ) -> crate::Result<ProbeOutcome> {
     if urls.is_empty() {
         return Ok(ProbeOutcome::Absent);
     }
-    let outcomes: Vec<crate::Result<ProbeOutcome>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = urls
-            .iter()
-            .map(|url| scope.spawn(move || probe(url, pin, total)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|_| Err(Error::new("vault probe thread panicked")))
-            })
-            .collect()
-    });
+    let outcomes = probes_within(urls, pin, total, look);
     select_probed_outcome(
         urls.iter()
             .zip(outcomes)
             .map(|(url, outcome)| (origin(url), outcome)),
     )
+}
+
+/// [`probe_candidates_with`] of the ALab vault at [`crate::ALAB_DEFAULT_URLS`] and the servers a
+/// browse `discovered`, under `pin`, all within `total`, each answer read by `look`: the look
+/// [`probe_default`] and a bounded join's probe both take.
+fn probe_alab(
+    pin: &[u8; 32],
+    discovered: &[crate::discover::DiscoveredVault],
+    total: Duration,
+    look: impl Fn(&str, Duration, usize) -> Looked + Sync,
+) -> crate::Result<ProbeOutcome> {
+    let urls =
+        crate::discover::candidate_urls(crate::ALAB_DEFAULT_URLS, discovered, crate::ALAB_VAULT);
+    probe_candidates_with(&urls, pin, total, default_or_discovered, look)
+}
+
+/// What a probe's read of at most some bytes of one server's answer heard
+/// ([`transport::look_within`]).
+type Looked = crate::Result<transport::Pulled<transport::Answer>>;
+
+/// [`probe`] of each of `urls` under `pin` at once, all within `total`, each answer read by
+/// `look` ([`transport::look_within`]) under [`fan_out::reads_within`]'s bound
+/// ([`fan_out::ENVELOPES`]): every answer under the peek at once, and one longer than that whole
+/// under one of a few slots, or, for a compiled-in default address, without one. A Mac that is
+/// joining trusts none of the servers a browse names, so nothing it probes holds more unverified
+/// bodies than that at once. Each outcome is what [`probe`] says of that server's answer, in
+/// `urls`' order, and a read that failed is the error it failed with, as `look` said it (one
+/// `total` left no time for, [`fan_out::reads_within`]'s [`crate::ErrorKind::TimedOut`] one): the
+/// fold ([`select_probed_outcome`]) tells a Local Network refusal, a read macOS holds for a
+/// Local Network answer ([`crate::ErrorKind::LocalNetworkPending`]) and any other failure apart
+/// by them.
+fn probes_within(
+    urls: &[String],
+    pin: &[u8; 32],
+    total: Duration,
+    look: impl Fn(&str, Duration, usize) -> Looked + Sync,
+) -> Vec<crate::Result<ProbeOutcome>> {
+    fan_out::reads_within(
+        fan_out::ENVELOPES,
+        urls,
+        total,
+        |url, left, limit| {
+            let base_url = unpinned(url);
+            // A URL that names no vault is refused before anything is asked of it.
+            transport::vault_name(&Source::Url(base_url.to_owned()))?;
+            look(base_url, left, limit)
+        },
+        |url, read| {
+            let read = read?;
+            let base_url = unpinned(url);
+            let name = transport::vault_name(&Source::Url(base_url.to_owned()))?;
+            Ok(match read {
+                transport::Pulled::Fetched(answer) => probe_answer(base_url, &name, pin, answer),
+                transport::Pulled::Larger => {
+                    ProbeOutcome::NotThisVault(transport::past_any_envelope(base_url))
+                }
+            })
+        },
+    )
+    .into_iter()
+    .map(|outcome| outcome.unwrap_or_else(|| Err(Error::new("a vault probe panicked"))))
+    .collect()
 }
 
 fn select_probed_outcome(
@@ -8011,18 +8360,10 @@ pub fn probe_default(total: Duration) -> crate::Result<ProbeOutcome> {
         Err(err) if refused_by_local_network(&err) => return Err(err),
         Err(_) => Vec::new(),
     };
-    let urls =
-        crate::discover::candidate_urls(crate::ALAB_DEFAULT_URLS, &discovered, crate::ALAB_VAULT);
     let left = total
         .saturating_sub(started.elapsed())
         .max(Duration::from_millis(100).min(total));
-    probe_candidates_with(&urls, &pin, left, |url| {
-        if crate::is_alab_default_url(url) {
-            ProbeOrigin::Default
-        } else {
-            ProbeOrigin::Discovered
-        }
-    })
+    probe_alab(&pin, &discovered, left, transport::look_within)
 }
 
 /// Whether this build carries the ALab vault's signer, without which [`probe_default`] asks
@@ -8385,7 +8726,7 @@ fn join_with_until(
             None => sync(paths, None)?,
         };
         return Ok(JoinOutcome::Plain {
-            names: load_state(paths)?.manifest.files.keys().cloned().collect(),
+            names: registered_names(paths)?,
         });
     }
     let parsed = envelope::parse(&bytes)?;
@@ -8630,7 +8971,7 @@ fn already_in(paths: &Paths) -> crate::Result<Option<JoinOutcome>> {
     Ok(
         (state.membership == Stored::In).then(|| JoinOutcome::Joined {
             seq: state.seq,
-            names: state.manifest.files.keys().cloned().collect(),
+            names: registry_names(&state),
         }),
     )
 }
@@ -9010,6 +9351,22 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
     // the ALab release check, the steward's lease).
     let reader = subscriber_recipient(paths);
     let reader = reader.as_deref();
+    // What every candidate server past the source serves that verifies, read at once within one
+    // probe deadline and verified as it is read ([`fan_out::bodies_within`]): one after another,
+    // each server that takes the read and never answers held every admin command for a probe
+    // deadline of its own. In the candidates' order, so each choice below falls as it did read by
+    // read.
+    let candidate_bodies = || {
+        let mut urls = ledger_publish::candidate_server_urls(paths, &config, extra_urls);
+        if !urls.is_empty() {
+            urls.remove(0);
+        }
+        fan_out::bodies_within(&urls, servers_within(PROBE_DEADLINE), reader, |bytes| {
+            verifies(&bytes).then_some(bytes)
+        })
+        .into_iter()
+        .flatten()
+    };
     let served = match transport::fetch_as(&config.source, None, Duration::from_secs(30), reader) {
         Ok(Fetched::Body(bytes)) => {
             let mut chosen = bytes;
@@ -9021,17 +9378,8 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
                 let mut best_seq = primary_env
                     .seq
                     .max(cached.as_deref().and_then(seq_of).unwrap_or(0));
-                for url in ledger_publish::candidate_server_urls(paths, &config, extra_urls)
-                    .into_iter()
-                    .skip(1)
-                {
-                    if let Ok(Fetched::Body(cand_bytes)) = transport::fetch_within_as(
-                        &url,
-                        None,
-                        servers_within(PROBE_DEADLINE),
-                        reader,
-                    ) && verifies(&cand_bytes)
-                        && let Ok(cand_env) = envelope::parse(&cand_bytes)
+                for cand_bytes in candidate_bodies() {
+                    if let Ok(cand_env) = envelope::parse(&cand_bytes)
                         && cand_env.seq > best_seq
                         && (cand_env.parents.is_empty()
                             || cand_env.parents.contains(&primary_digest))
@@ -9046,17 +9394,8 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
         Ok(Fetched::Missing | Fetched::NoNewer(_)) => {
             let mut best: Option<(u64, Vec<u8>)> = None;
             if matches!(config.source, Source::Url(_)) {
-                for url in ledger_publish::candidate_server_urls(paths, &config, extra_urls)
-                    .into_iter()
-                    .skip(1)
-                {
-                    if let Ok(Fetched::Body(cand_bytes)) = transport::fetch_within_as(
-                        &url,
-                        None,
-                        servers_within(PROBE_DEADLINE),
-                        reader,
-                    ) && verifies(&cand_bytes)
-                        && let Some(cand_seq) = seq_of(&cand_bytes)
+                for cand_bytes in candidate_bodies() {
+                    if let Some(cand_seq) = seq_of(&cand_bytes)
                         && best.as_ref().is_none_or(|(s, _)| cand_seq > *s)
                     {
                         best = Some((cand_seq, cand_bytes));
@@ -9071,14 +9410,8 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
             }
             primary_reachable = false;
             let mut best: Option<(u64, Vec<u8>)> = None;
-            for url in ledger_publish::candidate_server_urls(paths, &config, extra_urls)
-                .into_iter()
-                .skip(1)
-            {
-                if let Ok(Fetched::Body(cand_bytes)) =
-                    transport::fetch_within_as(&url, None, servers_within(PROBE_DEADLINE), reader)
-                    && verifies(&cand_bytes)
-                    && let Some(cand_seq) = seq_of(&cand_bytes)
+            for cand_bytes in candidate_bodies() {
+                if let Some(cand_seq) = seq_of(&cand_bytes)
                     && best.as_ref().is_none_or(|(s, _)| cand_seq > *s)
                 {
                     best = Some((cand_seq, cand_bytes));
@@ -9527,8 +9860,8 @@ pub struct Published {
     pub password_renewed: bool,
     /// Whether a machine removed from an open vault was added to `code-only`.
     pub kept_out: bool,
-    /// Whether the vault is served at a URL, where an open vault's approver lets in any new
-    /// key that asks (a vault at a path lets in none without an admin).
+    /// Whether the vault is served at a URL, where a new key asks to join through its queue (a
+    /// vault at a path lets in none without an admin).
     pub queued: bool,
     /// Waiting join requests added to `code-only` when opening the vault.
     pub held: Vec<Request>,
@@ -9601,8 +9934,40 @@ fn admin_publish_found(
 
 /// [`admin_publish`] for a revoke that ran [`custody_readable`] before its permanent Commons
 /// retirement: no later read of this Mac's subscriber may refuse the publish that completes it.
+#[cfg(test)]
 fn admin_publish_checked(paths: &Paths, admin: &Admin, doc: &Document) -> crate::Result<Published> {
     publish_as(paths, admin, doc, false, &[], true)
+}
+
+/// Revoke is a durable security operation: prepare its complete log batch and
+/// final envelope before retiring anything, then publish those exact heads.
+fn admin_publish_revocation(
+    paths: &Paths,
+    admin: &Admin,
+    doc: &Document,
+    recipients: &[Recipient],
+) -> crate::Result<(Published, Option<retirement::Retirement>)> {
+    let mut retired = None;
+    let outcome = publish_as_with_removal(
+        paths,
+        admin,
+        doc,
+        false,
+        &[],
+        true,
+        &[],
+        None,
+        None,
+        Some((recipients, &mut retired)),
+    );
+    let published = outcome.map_err(|error| {
+        if retired.is_some() {
+            Error::new(format!("Commons membership is permanently retired; vault removal was not confirmed: {error}. Retry the same revoke command"))
+        } else {
+            error
+        }
+    })?;
+    Ok((published, retired))
 }
 
 /// Publish explicit manual recipient approvals with their machine-list changes.
@@ -9619,11 +9984,11 @@ pub fn admin_publish_approved(
 }
 
 /// Publish `doc`, an open vault, with each of `recipients` an admin let in at the terminal as
-/// it opened the vault (`aterm secrets password open`): each is recorded as the open vault's
-/// approver records the same admission ([`AdmissionMethod::Open`], never `Manual`: no code or
-/// password was checked), so in a vault with Commons control the publication shares the control
-/// entry with it (`enrollment::include_approved`) and it enrolls, as one the approver lets in
-/// does. An open approval never replaces a decision a recipient already holds.
+/// it opened the vault (`aterm secrets password open`): each is recorded as an open admission
+/// ([`AdmissionMethod::Open`], never `Manual`: no code or password was checked), so in a vault
+/// with Commons control the publication shares the control entry with it
+/// (`enrollment::include_approved`) and it enrolls. An open approval never replaces a decision a
+/// recipient already holds.
 /// # Errors
 /// `doc` is not open (an open admission needs an open vault), or the publish failed.
 pub fn admin_publish_opened(
@@ -9780,6 +10145,36 @@ fn publish_as_with(
     found: Option<Found<'_>>,
     deadline: Option<Instant>,
 ) -> crate::Result<Published> {
+    publish_as_with_removal(
+        paths,
+        admin,
+        doc,
+        rotate,
+        approved,
+        custody_checked,
+        extra_urls,
+        found,
+        deadline,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the common publication path plus explicit revocation preparation"
+)]
+fn publish_as_with_removal(
+    paths: &Paths,
+    admin: &Admin,
+    doc: &Document,
+    rotate: bool,
+    approved: &[(String, AdmissionMethod)],
+    custody_checked: bool,
+    extra_urls: &[String],
+    found: Option<Found<'_>>,
+    deadline: Option<Instant>,
+    mut removing: Option<(&[Recipient], &mut Option<retirement::Retirement>)>,
+) -> crate::Result<Published> {
     publication_current(deadline)?;
     admin_keys::validate_commons_transition(&admin.published_doc, doc)?;
     if !custody_checked {
@@ -9788,13 +10183,14 @@ fn publish_as_with(
     let seq = envelope::next_seq(admin.seq)?;
     let identity = machine_identity(paths)?;
     let (bound, demoted) = publication_rights(admin, doc, &identity)?;
-    retirement::validate_removals(paths, admin, doc)?;
+    if removing.is_none() {
+        retirement::validate_removals(paths, admin, doc)?;
+    }
     let rotate = rotate || demoted;
     let renewed = renew_join_password(&admin.published_doc, doc)?;
     let password_renewed = renewed.is_some();
     let doc = renewed.as_ref().unwrap_or(doc);
-    let (recorded, kept_out, held) =
-        code_only_for(paths, &admin.config, &admin.published_doc, doc)?;
+    let (recorded, kept_out, held) = code_only_for(&admin.config, &admin.published_doc, doc)?;
     let doc = recorded.as_ref().unwrap_or(doc);
     let shared = enrollment::include_approved(doc, approved)?;
     let doc = shared.as_ref().unwrap_or(doc);
@@ -9818,79 +10214,113 @@ fn publish_as_with(
     // stamp names the log's heads with it in: a Mac whose log lacks them reads the envelope's
     // lockers or waits (`log_entries::readable_log`), so a version that reaches a Mac before its
     // records, or whose records never left this Mac, is never read from an older log. The records
-    // are kept once a server took the envelope, so a refused publish leaves nothing behind.
-    let drafted = match admin.log_base {
-        log_entries::LogBase::Covers | log_entries::LogBase::Unstamped => {
-            log_entries::draft_document_diff_until(
-                paths,
-                &admin.config,
-                &envelope::signer_public(&admin.seed)?,
-                &admin.handoff,
-                &identity,
-                doc,
-                log_entries::Base {
-                    // The version opened, as the log holds it: what an audience this Mac holds no
-                    // key of is diffed against. An unstamped version is imported from its text.
-                    doc: (admin.log_base == log_entries::LogBase::Covers)
-                        .then_some(&admin.published_doc),
-                    resolve: Some(&admin.resolve),
-                    readmit: None,
-                },
-                deadline,
-            )
-            .ok()
-            .flatten()
-        }
-        // A log behind the version edited would draft the older values it holds: the edit goes
-        // out unstamped, read from its lockers until a writer whose log holds it imports it.
-        log_entries::LogBase::Behind | log_entries::LogBase::NoLog => None,
-    };
-    let stamp = drafted.as_ref().and_then(log_entries::Drafted::stamp);
-    let (bytes, release, pairs) = if rotate {
-        let mut seed = [0u8; 32];
-        aterm_uds::rand::fill(&mut seed)?;
-        let sealed = envelope::signer_public(&seed).and_then(|new| {
-            let old = envelope::signer_public(&admin.seed)?;
-            let endorsement = envelope::endorse(&admin.seed, &admin.config.name, &new)?;
-            let mut handoff = admin.handoff.clone();
-            handoff.push((old, endorsement));
-            let mut commons_seed = zeroize::Zeroizing::new(admin.commons_seed);
-            if !bound {
-                aterm_uds::rand::fill(commons_seed.as_mut())?;
-                let public = envelope::signer_public(&commons_seed)?;
-                if public == new || public == admin.commons_authority()? {
-                    return Err(Error::new("new vault authorities must have distinct keys"));
+    // are kept once a server took the envelope, so a refused ordinary edit leaves nothing
+    // behind. An explicit revoke prepares the entire security operation and keeps it atomically
+    // after sealing but before publication: failed publication cannot undo its retirement.
+    let mut attempt = 0;
+    let (drafted, bytes, release, pairs) = loop {
+        let prepared = match removing.as_ref() {
+            Some((recipients, _)) => Some(removal_plan::prepare(
+                paths, admin, doc, &identity, recipients, deadline,
+            )?),
+            None => None,
+        };
+        let drafted = if let Some(prepared) = &prepared {
+            prepared.drafted.clone()
+        } else {
+            match admin.log_base {
+                log_entries::LogBase::Covers | log_entries::LogBase::Unstamped => {
+                    log_entries::draft_document_diff_until(
+                        paths,
+                        &admin.config,
+                        &envelope::signer_public(&admin.seed)?,
+                        &admin.handoff,
+                        &identity,
+                        doc,
+                        log_entries::Base {
+                            // The version opened, as the log holds it: what an audience this Mac holds no
+                            // key of is diffed against. An unstamped version is imported from its text.
+                            doc: (admin.log_base == log_entries::LogBase::Covers)
+                                .then_some(&admin.published_doc),
+                            resolve: Some(&admin.resolve),
+                            readmit: None,
+                        },
+                        deadline,
+                    )?
                 }
+                // A log behind the version edited would draft the older values it holds: the edit goes
+                // out unstamped, read from its lockers until a writer whose log holds it imports it.
+                log_entries::LogBase::Behind | log_entries::LogBase::NoLog => None,
             }
+        };
+        let stamp = drafted.as_ref().and_then(log_entries::Drafted::stamp);
+        let (bytes, release, pairs) = if rotate {
+            let mut seed = [0u8; 32];
+            aterm_uds::rand::fill(&mut seed)?;
+            let sealed = envelope::signer_public(&seed).and_then(|new| {
+                let old = envelope::signer_public(&admin.seed)?;
+                let endorsement = envelope::endorse(&admin.seed, &admin.config.name, &new)?;
+                let mut handoff = admin.handoff.clone();
+                handoff.push((old, endorsement));
+                let mut commons_seed = zeroize::Zeroizing::new(admin.commons_seed);
+                if !bound {
+                    aterm_uds::rand::fill(commons_seed.as_mut())?;
+                    let public = envelope::signer_public(&commons_seed)?;
+                    if public == new || public == admin.commons_authority()? {
+                        return Err(Error::new("new vault authorities must have distinct keys"));
+                    }
+                }
+                let bytes = seal_stamped(
+                    &admin.config.name,
+                    seq,
+                    &seed,
+                    &commons_seed,
+                    bound,
+                    doc,
+                    &handoff,
+                    &admissions,
+                    stamp.as_deref(),
+                )?;
+                let release = alab_release(&Retired::compiled(), &handoff, &new);
+                Ok((bytes, release, handoff.len()))
+            });
+            zeroize::Zeroize::zeroize(&mut seed);
+            sealed?
+        } else {
             let bytes = seal_stamped(
                 &admin.config.name,
                 seq,
-                &seed,
-                &commons_seed,
+                &admin.seed,
+                &admin.commons_seed,
                 bound,
                 doc,
-                &handoff,
+                &admin.handoff,
                 &admissions,
                 stamp.as_deref(),
             )?;
-            let release = alab_release(&Retired::compiled(), &handoff, &new);
-            Ok((bytes, release, handoff.len()))
-        });
-        zeroize::Zeroize::zeroize(&mut seed);
-        sealed?
-    } else {
-        let bytes = seal_stamped(
-            &admin.config.name,
-            seq,
-            &admin.seed,
-            &admin.commons_seed,
-            bound,
-            doc,
-            &admin.handoff,
-            &admissions,
-            stamp.as_deref(),
-        )?;
-        (bytes, None, admin.handoff.len())
+            (bytes, None, admin.handoff.len())
+        };
+        if let Some(prepared) = prepared {
+            match prepared.commit(paths, admin, doc, deadline)? {
+                removal_plan::Committed::Changed if attempt < 3 => {
+                    attempt += 1;
+                    continue;
+                }
+                removal_plan::Committed::Changed => {
+                    return Err(Error::of_kind(
+                        crate::ErrorKind::VaultChanged,
+                        "the vault kept changing during removal planning; no retirement was committed",
+                    ));
+                }
+                removal_plan::Committed::Done(retired) => {
+                    if let Some((_, out)) = removing.as_mut() {
+                        **out = retired;
+                    }
+                }
+            }
+            retirement::validate_removals(paths, admin, doc)?;
+        }
+        break (drafted, bytes, release, pairs);
     };
     // The drafted records are held from here until a server's answer says what became of the
     // envelope that stamps them: one stored by a publish that never got to keep them (the process
@@ -9958,8 +10388,31 @@ fn publish_as_with(
                     .or(first_err)
                     .unwrap_or_else(|| Error::new("no candidate server accepted the publish")));
             }
+            // The version has landed. Every best-effort records post that follows (the store to
+            // each server below, and the posts of the pass that ends this publish) ends by one
+            // deadline, one exchange from now: however many servers hang, and in however many
+            // rounds the records go out, those posts hold the command for one exchange in all. A
+            // server whose PUT ran out its deadline unanswered is not posted the store: it
+            // answered nothing in an exchange, and a post to it would most likely hold the command
+            // to the deadline the same way. It may have stored the envelope all the same (a
+            // server that reads the PUT after this Mac gave up stores it, and its reply goes
+            // nowhere), stamped with records it was not posted: it takes them from a later
+            // records pass that hears it lack this Mac's frontier, and until then a Mac whose log
+            // lacks them reads this version from its lockers (`log_entries::readable_log`).
+            let posts_by = fan_out::one_exchange();
+            #[cfg(test)]
+            let posts_by = LANDED_POSTS_BY
+                .with(std::cell::Cell::take)
+                .unwrap_or(posts_by);
             if let Some(drafted) = &drafted {
-                log_entries::keep_drafted_until(paths, drafted, &urls, deadline)?;
+                let answered = answered_puts(&outcomes);
+                log_entries::keep_drafted_until(
+                    paths,
+                    drafted,
+                    &answered,
+                    deadline,
+                    Some(posts_by),
+                )?;
                 log_entries::forget_held_draft(paths);
             }
             // A server took this version: it is this Mac's own last version now, the one its
@@ -9982,7 +10435,7 @@ fn publish_as_with(
                 Some(deadline) => sync_reader_until(paths, deadline)
                     .err()
                     .map(|error| error.to_string()),
-                None => sync_without_reconcile(paths, &urls)
+                None => sync_without_reconcile(paths, &urls, Some(posts_by))
                     .err()
                     .map(|error| error.to_string()),
             }
@@ -10002,7 +10455,7 @@ fn publish_as_with(
                 published?;
             }
             if let Some(drafted) = &drafted {
-                log_entries::keep_drafted_until(paths, drafted, &[], deadline)?;
+                log_entries::keep_drafted_until(paths, drafted, &[], deadline, None)?;
                 log_entries::forget_held_draft(paths);
             }
             match deadline {
@@ -10024,6 +10477,31 @@ fn publish_as_with(
         held,
         local,
     })
+}
+
+/// The servers of a publish's `outcomes` that answered their PUT, or failed it some way other
+/// than running out its deadline ([`crate::ErrorKind::TimedOut`]): the ones a records post may
+/// still reach within an exchange. A server that ran the PUT out answered nothing in an exchange
+/// (a Mac whose aterm hung took the connection and read nothing), and would most likely run a
+/// records post out the same way. That proves nothing about the envelope: a server that reads
+/// the PUT after its deadline still stores it, so one left out here may hold this version and
+/// lack its records until a later records pass hears it lack this Mac's frontier.
+fn answered_puts(outcomes: &[(String, crate::Result<()>)]) -> Vec<String> {
+    outcomes
+        .iter()
+        .filter(|(_, put)| {
+            !put.as_ref()
+                .is_err_and(|err| err.kind() == crate::ErrorKind::TimedOut)
+        })
+        .map(|(url, _)| url.clone())
+        .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's deadline for the records posts that follow the next publish on this thread once
+    /// its version lands, in place of one exchange from then.
+    static LANDED_POSTS_BY: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -10114,7 +10592,6 @@ fn let_go(old: &Document, doc: &Document) -> Vec<String> {
 /// when the vault opens and from being shown as asking by an approver that never read it
 /// ([`code_only_standing`]); a password or a code still lets that key in.
 fn code_only_for(
-    paths: &Paths,
     config: &Config,
     old: &Document,
     doc: &Document,
@@ -10127,7 +10604,7 @@ fn code_only_for(
     let waiting: Vec<Request> = if !doc.open() || old.open() {
         Vec::new()
     } else {
-        requests_for(paths, config, Some(doc))?
+        pending_before_opening(config, old, doc)?
             .into_iter()
             .filter(|request| {
                 !named.contains(&request.recipient) && !gone.contains(&request.recipient)
@@ -10233,8 +10710,9 @@ pub struct Created {
 
 /// Create a new vault at `source` with this machine as its initial admin.
 ///
-/// The vault starts open (`[join]`'s open note, [`text::OPEN_NOTE`]). A new personal vault requires a member's
-/// Allow; only the pinned default ALab vault also admits LAN requests automatically.
+/// The vault starts open (`[join]`'s open note, [`text::OPEN_NOTE`]): each Mac that asks needs a
+/// member's Allow or an admin's approval by code. On the pinned default ALab vault a member on
+/// the home ALab LAN also lets in a Mac there that proves itself, whatever `[join]` says.
 /// `aterm secrets password new|set` enables admission by join password instead, and
 /// `password off` leaves each machine to a member's Allow or an admin's approval by code.
 pub fn create(
@@ -10456,7 +10934,7 @@ fn prepare_initial(
 }
 
 /// A pending join request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Request {
     /// The machine's key.
     pub recipient: String,
@@ -10466,13 +10944,23 @@ pub struct Request {
     pub code: String,
     /// When it asked (unix), when the server says.
     pub at: Option<u64>,
-    /// The home ALab LAN the serving vault observed it on, while that server is still on it
-    /// ([`crate::home_lan`]); absent on older server listings, whose `lan=1` admits nothing.
-    pub home: Option<crate::home_lan::HomeTag>,
     /// A member's signed Allow of it (`crate::members::Allowed`), if it carried one.
     pub allowed: Option<String>,
     /// Its proof of the join password, if it sent one.
     pub proof: Option<String>,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("recipient", &self.recipient)
+            .field("host", &self.host)
+            .field("code", &self.code)
+            .field("at", &self.at)
+            .field("member_allow_present", &self.allowed.is_some())
+            .field("password_proof_present", &self.proof.is_some())
+            .finish()
+    }
 }
 
 /// The names the queue lists `key` under, sorted, each once.
@@ -10515,18 +11003,234 @@ pub fn requests(paths: &Paths, doc: Option<&Document>) -> crate::Result<Vec<Requ
     requests_for(paths, &config, doc)
 }
 
-/// Pending requests and whether authenticated membership was available for filtering.
-pub fn inspect_requests(
+/// A fresh manual approval identifies a code or a recipient, independently of which
+/// queue a previous listing selected. Automatic admission keeps each queue's origin.
+pub(crate) enum ApprovalTarget<'a> {
+    Code(&'a str),
+    Recipient(&'a str),
+}
+
+/// Request observations and whether they cover every authorized queue. Only a
+/// complete observation may retire previously answered requests it no longer lists.
+pub(crate) struct ApprovalRequests {
+    pub(crate) requests: Vec<Request>,
+    pub(crate) complete: bool,
+}
+
+/// Queue policy from the authenticated baseline, never a partial materialized read.
+fn approval_queue_policy(config: &Config, baseline: &Document) -> crate::Result<Vec<String>> {
+    let mut policy = Vec::new();
+    let entries = baseline.entries();
+    let mut policies = entries
+        .iter()
+        .filter(|entry| entry.name == crate::SWARM_POLICY_ENTRY);
+    if config.signer.is_some()
+        && let Some(entry) = policies.next()
+    {
+        if policies.next().is_some() || entry.if_absent || entry.anchor.is_some() {
+            return Err(Error::new(
+                "join queue policy must be unique and unconditional",
+            ));
+        }
+        let text = std::str::from_utf8(entry.value.as_slice())
+            .map_err(|_| Error::new("join queue policy is not UTF-8"))?;
+        let parsed = crate::swarm_roster::SwarmPolicy::from_toml(text)?;
+        ledger_publish::push_policy_server_urls(&parsed, &config.name, |url| {
+            policy.push(url.to_owned())
+        });
+    }
+    Ok(policy)
+}
+
+fn approval_requests(config: &Config, baseline: &Document) -> crate::Result<(Vec<Request>, bool)> {
+    if !matches!(config.source, Source::Url(_)) {
+        return Ok((Vec::new(), false));
+    }
+    // The same authenticated baseline authorizes both the queue set and the
+    // eventual publication. A missing or busy materialized policy cannot erase
+    // a mirror from a supposedly complete observation.
+    let policy = approval_queue_policy(config, baseline)?;
+    let observed = join_queues::lookup(
+        config,
+        &policy,
+        Instant::now() + servers_within(PROBE_DEADLINE.saturating_mul(2)),
+    )?;
+    let mut pending = Vec::new();
+    for queue in observed.queues {
+        for mut request in requests_in(queue.lines, &[]) {
+            // Keep each replica's timestamp and proofs for answered bookkeeping.
+            // Selection below counts identities, never these transport copies.
+            request.recipient = Recipient::parse(&request.recipient)
+                .map_err(|error| Error::new(error.to_string()))?
+                .to_bech32();
+            pending.push(request);
+        }
+    }
+    Ok((pending, observed.incomplete))
+}
+
+/// Find every explicit target in one fresh observation of the authorized queues.
+/// A missing target is not a definite absence when some queues did not answer.
+pub(crate) fn requests_for_approval(
+    admin: &Admin,
+    targets: &[ApprovalTarget<'_>],
+) -> crate::Result<ApprovalRequests> {
+    if targets.is_empty() {
+        return Ok(ApprovalRequests {
+            requests: Vec::new(),
+            complete: false,
+        });
+    }
+    let (pending, incomplete) = approval_requests(&admin.config, &admin.published_doc)?;
+    for target in targets {
+        let matches: Vec<_> = pending
+            .iter()
+            .filter(|request| match target {
+                ApprovalTarget::Code(code) => request.code.eq_ignore_ascii_case(code),
+                ApprovalTarget::Recipient(recipient) => request.recipient == *recipient,
+            })
+            .collect();
+        let Some(request) = matches.first() else {
+            return Err(if incomplete {
+                Error::of_kind(
+                    crate::ErrorKind::JoinQueueIncomplete,
+                    "join queue lookup is incomplete; the requested identity may be on an unavailable queue",
+                )
+            } else {
+                Error::new("no machine waiting to join matches the requested identity")
+            });
+        };
+        if matches
+            .iter()
+            .any(|other| other.recipient != request.recipient)
+        {
+            return Err(Error::new("admission code is ambiguous"));
+        }
+        one_name_asked(&pending, request)?;
+    }
+    Ok(ApprovalRequests {
+        requests: pending,
+        complete: !incomplete,
+    })
+}
+
+/// Every request in one complete observation of the authenticated administrator's
+/// authorized queues. Bulk approval cannot promise every pending machine when a
+/// queue was unavailable. Keep admitted identities here for answered bookkeeping;
+/// the caller separately selects which pending identities to offer.
+pub(crate) fn all_requests_for_approval(admin: &Admin) -> crate::Result<ApprovalRequests> {
+    let (requests, incomplete) = approval_requests(&admin.config, &admin.published_doc)?;
+    if incomplete {
+        return Err(Error::of_kind(
+            crate::ErrorKind::JoinQueueIncomplete,
+            "cannot approve all while a join queue is unavailable; approve individual codes instead",
+        ));
+    }
+    Ok(ApprovalRequests {
+        requests,
+        complete: true,
+    })
+}
+
+/// Opening holds every already-waiting identity. A partial observation cannot
+/// establish that hold, so unlike a found manual approval it refuses to publish.
+pub(crate) fn requests_before_opening(
+    admin: &Admin,
+    doc: &Document,
+) -> crate::Result<Vec<Request>> {
+    pending_before_opening(&admin.config, &admin.published_doc, doc)
+}
+
+fn pending_before_opening(
+    config: &Config,
+    baseline: &Document,
+    doc: &Document,
+) -> crate::Result<Vec<Request>> {
+    let (mut pending, incomplete) = approval_requests(config, baseline)?;
+    if incomplete {
+        return Err(Error::of_kind(
+            crate::ErrorKind::JoinQueueIncomplete,
+            "cannot open the vault while a join queue is unavailable",
+        ));
+    }
+    let known: BTreeSet<_> = doc.machines().into_iter().map(|m| m.recipient).collect();
+    pending.retain(|request| !known.contains(&request.recipient));
+    Ok(pending)
+}
+
+/// One observed join queue, after authenticated membership filtering.
+/// Its server is the queue's reader endpoint, not the address of a joining machine.
+#[derive(Debug, Clone, Default)]
+pub struct RequestInspection {
+    /// Requests not excluded by the available authenticated membership.
+    pub requests: Vec<Request>,
+    /// Whether authenticated membership was available for filtering.
+    pub known_members_filtered: bool,
+    /// Selected queue's scheme, host and path, with query and fragment omitted.
+    pub queue_source: Option<String>,
+    /// Address recorded by the same connection that returned this queue.
+    pub queue_server: Option<std::net::IpAddr>,
+    /// Server's join-queue version, not a vault or membership sequence.
+    pub queue_version: Option<u64>,
+}
+
+impl RequestInspection {
+    fn from_queue(requests: Vec<Request>, known_members_filtered: bool, heard: Heard) -> Self {
+        Self {
+            requests,
+            known_members_filtered,
+            queue_source: (!heard.url.is_empty()).then(|| transport::describe(&heard.url)),
+            queue_server: heard.from,
+            queue_version: heard.version,
+        }
+    }
+}
+
+/// Pending requests and the origin of the queue that actually answered.
+/// # Errors
+/// Configuration, authenticated membership, or the selected queue cannot be read.
+pub fn inspect_requests(paths: &Paths, doc: Option<&Document>) -> crate::Result<RequestInspection> {
+    inspect_requests_with_deadline(paths, doc, None)
+}
+
+/// Pending join identities observed within one caller-owned deadline. Available
+/// local admin custody excludes approved recipients without fetching a vault.
+/// Unknown membership remains explicitly unfiltered, just as in [`inspect_requests`].
+/// # Errors
+/// Configuration, local membership or the queue is unreadable, or the deadline expires.
+pub fn inspect_requests_until(
+    paths: &Paths,
+    deadline: Instant,
+) -> crate::Result<RequestInspection> {
+    let admin = admin_cached_until(paths, deadline).ok();
+    inspect_requests_with_deadline(
+        paths,
+        admin.as_ref().map(|admin| &admin.doc),
+        Some(deadline),
+    )
+}
+
+fn inspect_requests_with_deadline(
     paths: &Paths,
     doc: Option<&Document>,
-) -> crate::Result<(Vec<Request>, bool)> {
+    deadline: Option<Instant>,
+) -> crate::Result<RequestInspection> {
     let config = config(paths)?.ok_or_else(|| Error::new("no vault configured"))?;
     let known = request_members(paths, &config, doc)?;
-    let (mut pending, _, _) = requests_from(paths, &config)?;
+    let mut heard = Heard::default();
+    let (lines, _) = match deadline {
+        Some(deadline) => join_queues::hear_until(paths, &config, &mut heard, deadline)?,
+        None => join_queues::hear(paths, &config, &mut heard, Duration::ZERO)?,
+    };
+    let mut pending = requests_in(lines, &[]);
     if let Some(known) = &known {
         pending.retain(|request| !known.contains(&request.recipient));
     }
-    Ok((pending, known.is_some()))
+    Ok(RequestInspection::from_queue(
+        pending,
+        known.is_some(),
+        heard,
+    ))
 }
 
 fn request_members(
@@ -10534,27 +11238,30 @@ fn request_members(
     config: &Config,
     doc: Option<&Document>,
 ) -> crate::Result<Option<Vec<String>>> {
+    // An administrator's grants can precede enrollment into the membership log.
+    // Either fact means the request no longer needs an approval from this reader.
+    let mut known: Option<Vec<String>> =
+        doc.map(|doc| doc.machines().into_iter().map(|m| m.recipient).collect());
     if let Some(log) = log_entries::trusted_local_log(paths, config)? {
-        return Ok(Some(
+        let known = known.get_or_insert_with(Vec::new);
+        known.extend(
             log.membership()
                 .members()
                 .values()
-                .map(|member| member.binding.recipient().to_bech32())
-                .collect(),
-        ));
+                .map(|member| member.binding.recipient().to_bech32()),
+        );
+        known.sort_unstable();
+        known.dedup();
     }
-    Ok(doc.map(|doc| doc.machines().into_iter().map(|m| m.recipient).collect()))
+    Ok(known)
 }
 
-/// The join requests at the configured queue or a verified policy mirror, the responding
-/// server's address (`None`: a path or unknown), and the actual queue URL (empty for a path).
-fn requests_from(
-    paths: &Paths,
-    config: &Config,
-) -> crate::Result<(Vec<Request>, Option<std::net::IpAddr>, String)> {
+/// The join requests at the configured queue or a verified policy mirror, and the actual queue
+/// URL (empty for a path).
+fn requests_from(paths: &Paths, config: &Config) -> crate::Result<(Vec<Request>, String)> {
     let mut heard = Heard::default();
     let (lines, _) = join_queues::hear(paths, config, &mut heard, Duration::ZERO)?;
-    Ok((requests_in(lines, &[]), heard.from, heard.url))
+    Ok((requests_in(lines, &[]), heard.url))
 }
 
 fn requests_for(
@@ -10565,7 +11272,7 @@ fn requests_for(
     let known: Vec<String> = doc
         .map(|doc| doc.machines().into_iter().map(|m| m.recipient).collect())
         .unwrap_or_default();
-    let (mut pending, _, _) = requests_from(paths, config)?;
+    let (mut pending, _) = requests_from(paths, config)?;
     pending.retain(|request| !known.contains(&request.recipient));
     Ok(pending)
 }
@@ -10588,7 +11295,6 @@ fn requests_in(lines: Vec<String>, known: &[String]) -> Vec<Request> {
             host: request.host,
             code: request.code,
             at: request.time,
-            home: request.home,
             allowed: request.allowed,
             proof: request.proof,
         });
@@ -13450,7 +14156,7 @@ mod tests {
         assert_eq!(queued(&current), ["from-b"]);
         let mut closed = opened.doc.clone();
         closed.set_open(false).expect("close clone");
-        let (_, _, held) = code_only_for(&admin, &opened.config, &closed, &opened.doc)
+        let (_, _, held) = code_only_for(&opened.config, &closed, &opened.doc)
             .expect("hold only the opened vault's waiting keys");
         assert_eq!(
             held.iter()
@@ -14209,7 +14915,6 @@ mod tests {
             host: "m9".to_string(),
             code: "abcd-efgh-ijkm-npqr".to_string(),
             at: None,
-            home: None,
             allowed: None,
             proof: Some(format!("proof-{n}")),
         };
@@ -14242,141 +14947,19 @@ mod tests {
             Approval::Password
         ));
         assert_eq!(settled.judged.len(), 1);
-        let mut newly_home = waiting.clone();
-        newly_home.home = Some(crate::home_lan::HomeTag::test());
-        assert!(settled.due(
-            &config,
-            1,
-            std::slice::from_ref(&newly_home),
-            Approval::Open
-        ));
-        settled.settle(vec![Judged::of(&newly_home)]);
-        assert!(!settled.due(&config, 1, &[newly_home], Approval::Open));
     }
 
-    /// The default ALab policy lets a request in with no person only where the vault is the
-    /// pinned ALab vault, open, the serving vault observed the request on the home ALab LAN
-    /// (`home=`), this approver is on that same home network now (`here`), and the key is not
-    /// `code-only`. An older server's `lan=1`, a request heard on a network this approver is
-    /// not on, and one with no observation all wait for a member's Allow.
+    /// On the pinned ALab vault, open, an approver lets in no Mac by its asking alone: a plain
+    /// ask, the same ask as an aterm 0.148 or 0.149 server listed it with its ` home=` tag (read
+    /// past, not refused), and a `code-only` key all wait for a person. A Mac on the home ALab
+    /// LAN is let in by a member when it proves itself (`readmit`), never by the approver.
     ///
-    /// NEGATIVE CONTROLS: with `auto_approve_listed_in`'s home check replaced by `true` (the old
-    /// rule took any private peer, which every request here is), the request with no home
-    /// observation is let in and "no observation" fails; with it narrowed to
-    /// `request.home.is_some()`, the approver off that network lets it in and "the approver is
-    /// elsewhere" fails.
+    /// NEGATIVE CONTROLS: with `auto_approve_listed` letting an open ALab vault's plain request
+    /// in as `AdmissionMethod::Open` (the approver's former home-LAN branch with its `home=`
+    /// check dropped), "a plain ask" fails; with `parse_join_line` refusing a ` home=` token,
+    /// the older server's line is skipped and "an older server's tagged line" fails.
     #[test]
-    fn automatic_lan_admission_requires_a_home_lan_observation_on_the_approvers_network() {
-        let root = aterm_tempfile::tempdir().unwrap();
-        let socket = bound();
-        let server = crate::server::start_at_home(
-            socket.try_clone().expect("a copy of the socket"),
-            &crate::server::Options {
-                listen: "127.0.0.1:0".parse().expect("addr"),
-                store: root.path().join("store"),
-                advertise: None,
-                pins: Vec::new(),
-                hold: Duration::from_millis(200),
-                keep_awake: false,
-            },
-            Duration::ZERO,
-        )
-        .expect("server starts");
-        let url = format!("http://{}/v1/alab", server.addr);
-        let paths = Paths::for_home(&root.path().join("m1"));
-        let created = create(&paths, &url, None, Some("m1")).unwrap();
-        let newcomer = Paths::for_home(&root.path().join("m2"));
-        join_pinned(&newcomer, &format!("{url}#{}", created.signer), "m2");
-        let mut admin = admin_open(&paths).unwrap();
-        let mut requests = requests_for(&paths, &admin.config, None).unwrap();
-        assert_eq!(requests.len(), 1);
-        let home = crate::home_lan::HomeTag::test();
-        assert_eq!(requests[0].home.as_ref(), Some(&home));
-        let judge = |admin: &Admin, requests: &[Request], here: &[_], default_alab| {
-            auto_approve_listed_in(
-                &paths,
-                admin,
-                requests,
-                &mut false,
-                &mut BTreeSet::new(),
-                (&mut JoinKeys::default(), here, None),
-                default_alab,
-            )
-            .unwrap()
-        };
-        let at_home = std::slice::from_ref(&home);
-        assert!(
-            !alab_vault(&admin.config),
-            "a personal vault named alab is not ALab"
-        );
-        assert!(auto_approve(&paths).unwrap().approved.is_empty());
-        requests[0].home = None;
-        assert!(
-            judge(&admin, &requests, at_home, true).approved.is_empty(),
-            "no observation"
-        );
-        requests[0].home = Some(home.clone());
-        assert!(
-            judge(&admin, &requests, &[], true).approved.is_empty(),
-            "the approver is elsewhere"
-        );
-        let other = crate::home_lan::HomeTag::of(std::net::Ipv4Addr::new(10, 9, 8, 0), 24);
-        assert!(
-            judge(&admin, &requests, std::slice::from_ref(&other), true)
-                .approved
-                .is_empty(),
-            "the approver is on another home network"
-        );
-        assert!(
-            judge(&admin, &requests, at_home, false).approved.is_empty(),
-            "no personal-vault admission"
-        );
-        admin.published_doc.set_open(false).unwrap();
-        assert!(
-            judge(&admin, &requests, at_home, true).approved.is_empty(),
-            "closed policy"
-        );
-        admin
-            .published_doc
-            .set_join_password(Some(b"fixture-password-for-automatic-lan-tests"))
-            .unwrap();
-        assert!(
-            judge(&admin, &requests, at_home, true).approved.is_empty(),
-            "password policy"
-        );
-        admin.published_doc.set_open(true).unwrap();
-        let open = admin.published_doc.clone();
-        admin
-            .published_doc
-            .add_code_only(&requests[0].recipient)
-            .unwrap();
-        let done = judge(&admin, &requests, at_home, true);
-        assert!(done.approved.is_empty(), "a revoked key stays out");
-        assert_eq!(done.code_only, [requests[0].recipient.clone()]);
-        admin.published_doc = open;
-        // The real entry point under the compiled-pin lookup reads this approver's own place:
-        // a scratch home holds no member evidence, so it fails closed.
-        let signer = admin.config.signer.unwrap();
-        let done = retiring(Vec::new(), signer, || auto_approve(&paths)).unwrap();
-        assert!(done.approved.is_empty(), "no evidence: no admission");
-        // CONTROL: the same request, observed at home by a server on this approver's network.
-        assert_eq!(
-            judge(&admin, &requests, at_home, true).approved,
-            ["m2"],
-            "a home-LAN request on the approver's network"
-        );
-        server.stop();
-    }
-
-    /// A server that holds no member evidence (every server a test starts plainly, and one
-    /// started with no secrets directory) observes no request on the home ALab LAN, however
-    /// private its peer, so the default ALab policy lets nobody in through it.
-    ///
-    /// NEGATIVE CONTROL: with `home_lan::Nowhere` observing every request at home (as the old
-    /// `lan_join_peer` took every loopback or private peer), the request lists `home=` and this
-    /// test fails (`left: Some(HomeTag(..))`, `right: None`).
-    #[test]
-    fn a_server_with_no_member_evidence_observes_no_home() {
+    fn the_alab_vaults_approver_lets_in_no_plain_ask() {
         let root = aterm_tempfile::tempdir().unwrap();
         let socket = bound();
         let server = serve(&root.path().join("store"), &socket);
@@ -14385,25 +14968,50 @@ mod tests {
         let created = create(&paths, &url, None, Some("m1")).unwrap();
         let newcomer = Paths::for_home(&root.path().join("m2"));
         join_pinned(&newcomer, &format!("{url}#{}", created.signer), "m2");
-        let admin = admin_open(&paths).unwrap();
-        let requests = requests_for(&paths, &admin.config, None).unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].home, None);
-        let done = auto_approve_listed_in(
-            &paths,
-            &admin,
-            &requests,
-            &mut false,
-            &mut BTreeSet::new(),
-            (
-                &mut JoinKeys::default(),
-                &[crate::home_lan::HomeTag::test()],
-                None,
-            ),
-            true,
-        )
-        .unwrap();
-        assert!(done.approved.is_empty());
+        let mut admin = admin_open(&paths).unwrap();
+        assert_eq!(
+            Approval::of(&admin.published_doc),
+            Some(Approval::Open),
+            "a vault is created open"
+        );
+        let listed = transport::list_joins(&url).unwrap();
+        assert_eq!(listed.len(), 1);
+        let tagged = requests_in(vec![format!("{} home=0123456789abcdef", listed[0])], &[]);
+        assert_eq!(
+            tagged,
+            requests_in(listed, &[]),
+            "an older server's tagged line"
+        );
+        let signer = admin.config.signer.unwrap();
+        let judge = |admin: &Admin, requests: &[Request]| {
+            auto_approve_listed(
+                &paths,
+                admin,
+                requests,
+                &mut false,
+                &mut BTreeSet::new(),
+                (&mut JoinKeys::default(), None),
+            )
+            .unwrap()
+        };
+        retiring(Vec::new(), signer, || {
+            assert!(alab_vault(&admin.config), "the pinned ALab vault");
+            let done = auto_approve(&paths).unwrap();
+            assert!(done.approved.is_empty(), "a plain ask");
+            assert_eq!(done.asking.len(), 1, "it waits for a person");
+            let done = judge(&admin, &tagged);
+            assert!(done.approved.is_empty(), "an older server's home= tag");
+            assert_eq!(done.asking.len(), 1);
+            admin
+                .published_doc
+                .add_code_only(&tagged[0].recipient)
+                .unwrap();
+            let done = judge(&admin, &tagged);
+            assert!(done.approved.is_empty(), "a code-only key");
+            assert_eq!(done.code_only, [tagged[0].recipient.clone()]);
+        });
+        // CONTROL: the request is there for a person, who approves it by its code.
+        assert_eq!(approve_request(&paths, &tagged[0].recipient).unwrap(), "m2");
         server.stop();
     }
 

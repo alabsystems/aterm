@@ -94,6 +94,9 @@ fn a_drive_hears_a_reads_session_in_front_of_its_verb() {
         "read @s-a1",
         "@s-a1 read trim",
         "hold s-a1 on",
+        "close s-a1",
+        "close @s-a1",
+        "@s-a1 close",
     ] {
         let argv = ["--host", "lab-mini"]
             .into_iter()
@@ -120,7 +123,10 @@ fn a_drive_hears_a_reads_session_in_front_of_its_verb() {
             "@s-a1 text tail=3",
             "@s-a1 text",
             "@s-a1 text trim",
-            "hold s-a1 on"
+            "hold s-a1 on",
+            "@s-a1 close",
+            "@s-a1 close",
+            "@s-a1 close"
         ]
     );
 }
@@ -294,6 +300,18 @@ fn a_plain_fleet_shell_has_one_explicit_folder_and_no_task_channel() {
         "cwd=/tmp window=0",
     ] {
         assert!(shell_spawn_head(&words(bad)).is_err(), "{bad}");
+    }
+    // Each refusal names the word it refuses, so the driver need not guess which.
+    for (bad, word) in [
+        ("cwd=relative", "cwd=relative"),
+        ("cwd=/tmp command=sh", "command=sh"),
+        ("cwd=/tmp -e sh", "-e"),
+        ("cwd=/tmp cwd=/", "cwd=/"),
+        ("cwd=/tmp raise=false raise=false", "raise=false"),
+        ("cwd=/tmp window=0", "window=0"),
+    ] {
+        let refusal = shell_spawn_head(&words(bad)).expect_err(bad).to_string();
+        assert!(refusal.contains(&format!("`{word}`")), "{bad}: {refusal}");
     }
 }
 
@@ -1171,14 +1189,28 @@ fn host_any_spawns_a_claude_or_codex_worker_alone() {
 
 const ANY_TEST: &str = any_host::ANY;
 
+struct AnyHostsGuard;
+
+impl AnyHostsGuard {
+    fn set(path: std::path::PathBuf) -> Self {
+        ANY_HOSTS_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(path));
+        Self
+    }
+}
+
+impl Drop for AnyHostsGuard {
+    fn drop(&mut self) {
+        ANY_HOSTS_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
 /// A worker `--host any` spawned is followed to its Mac by its sid: from the table the spawn
 /// recorded, else from the one live, proven member whose survey lists it.
 #[test]
 fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
     static DIALLED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
     let tmp = aterm_tempfile::tempdir().unwrap();
-    let any_table = tmp.path().join("driven-any-hosts.tsv");
-    ANY_HOSTS_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(any_table.clone()));
+    let _guard = AnyHostsGuard::set(tmp.path().join("driven-any-hosts.tsv"));
 
     fn fleet_survey(_: &survey::FleetAsk<'_>) -> Result<survey::FleetRead, survey::FleetRefused> {
         Ok(survey::FleetRead {
@@ -1319,6 +1351,100 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
     let unserved_err =
         resolve_any_sid_hosts(&["s-dead"], None, Some(unserved_survey)).expect_err("unserved");
     assert_eq!(crate::exit_for(&unserved_err), ExitCode::from(2));
+}
 
-    ANY_HOSTS_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+/// NEGATIVE CONTROL: `driven-any-hosts.tsv` refuses control/newline/tab injection, oversize sids or
+/// hosts, `"any"`, and loose/symlinked files on Unix, and `resolve_any_sid_hosts` neither lets a
+/// survey overwrite an existing recorded binding nor silently picks one peer when multiple proven
+/// peers list the same unrecorded sid.
+#[test]
+fn host_any_table_hardens_injection_permissions_recorded_bindings_and_ambiguous_sids() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let table_path = tmp.path().join("driven-any-hosts.tsv");
+    let _guard = AnyHostsGuard::set(table_path.clone());
+
+    record_any_sid_host("s-c25a", "m3");
+    record_any_sid_host("s-bad1", "m4\ns-c25a\tm-evil");
+    record_any_sid_host("s-bad2", "m4\tm-evil");
+    record_any_sid_host("s-bad3", "any");
+    record_any_sid_host(&format!("s-{}", "a".repeat(63)), "m4");
+    record_any_sid_host("s-bad4", &"m".repeat(256));
+    assert_eq!(
+        read_any_sid_hosts(),
+        vec![("s-c25a".to_owned(), "m3".to_owned())]
+    );
+
+    fn conflicting_survey(
+        _: &survey::FleetAsk<'_>,
+    ) -> Result<survey::FleetRead, survey::FleetRefused> {
+        let huge_sid = format!("s-{}", "f".repeat(128));
+        Ok(survey::FleetRead {
+            peers: vec![
+                survey::PeerSurvey {
+                    label: "m-a".into(),
+                    answer: Ok(vec![
+                        "instance host=m-a drive=1 sessions=3".into(),
+                        "session sid=s-c25a agent=idle".into(),
+                        "session sid=s-a1b2 agent=idle".into(),
+                        format!("session sid={huge_sid} agent=idle"),
+                    ]),
+                    fault: survey::PeerFault::Other,
+                    unproven: false,
+                    node: Some("node-a".into()),
+                    addr: None,
+                },
+                survey::PeerSurvey {
+                    label: "m-b".into(),
+                    answer: Ok(vec![
+                        "instance host=m-b drive=1 sessions=2".into(),
+                        "session sid=s-a1b2 agent=idle".into(),
+                        "session sid=s-b001 agent=idle".into(),
+                    ]),
+                    fault: survey::PeerFault::Other,
+                    unproven: false,
+                    node: Some("node-b".into()),
+                    addr: None,
+                },
+            ],
+            note: None,
+            alone: None,
+        })
+    }
+
+    assert_eq!(
+        resolve_any_sid_hosts(&["s-c25a", "s-b001"], None, Some(conflicting_survey)).unwrap(),
+        vec!["m3".to_owned(), "node-b".to_owned()]
+    );
+    assert_eq!(
+        read_any_sid_hosts(),
+        vec![
+            ("s-c25a".to_owned(), "m3".to_owned()),
+            ("s-b001".to_owned(), "node-b".to_owned()),
+        ]
+    );
+    let ambig =
+        resolve_any_sid_hosts(&["s-a1b2"], None, Some(conflicting_survey)).expect_err("ambiguous");
+    assert!(
+        ambig.to_string().contains("multiple fleet peers")
+            && ambig.to_string().contains("node-a")
+            && ambig.to_string().contains("node-b"),
+        "{ambig}"
+    );
+    assert!(
+        !read_any_sid_hosts().iter().any(|(sid, _)| sid == "s-a1b2"),
+        "ambiguous sid must not be cached"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&table_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_any_sid_hosts().is_empty());
+        std::fs::remove_file(&table_path).unwrap();
+        let target = tmp.path().join("other.tsv");
+        std::fs::write(&target, "s-c25a\tm3\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &table_path).unwrap();
+        assert!(read_any_sid_hosts().is_empty());
+    }
 }

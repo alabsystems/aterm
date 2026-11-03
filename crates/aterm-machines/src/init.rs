@@ -650,8 +650,35 @@ pub enum BaseLock {
     Try,
 }
 
+/// Who decided that a run of `aterm init` happens ([`Host::decided`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decider {
+    /// Whoever ran `aterm init` by name: a person, or a program that runs it for them.
+    Person,
+    /// aterm by itself: nobody ran `aterm init`, and aterm finishes setup after a package
+    /// install or update a person typed ([`PACKAGE_FOLLOW_UP`]). Such a run puts no question of
+    /// macOS's on the screen: at this Mac's console its look for the ALab vault waits until
+    /// macOS has answered aterm's Local Network question
+    /// ([`crate::init_secrets::Here::Unbidden`]); in a remote shell of the console's login,
+    /// where macOS raises none, it looks as a typed `aterm init` there does
+    /// ([`crate::init_secrets::Here::Remote`]). Rust in Spotlight searches no folder of the
+    /// person's for build folders ([`crate::init_spotlight::Projects::Unread`]).
+    Aterm,
+}
+
+/// The words of `aterm init` that finishes setup after a person's package install or update
+/// ([`Decider::Aterm`]). `--no-wait` waits behind no System State pass and stands each base item
+/// aside for a pass that holds the store. `--no-sign-out` builds no Messages or FaceTime
+/// sign-out, so nothing asks macOS for Accessibility or for Automation of System Events, and
+/// the Permissions rows leave Accessibility out. `--no-profile` leaves the workstation
+/// preferences to System State: they read and write other apps' defaults domains, which macOS
+/// may answer with its dialog about access to other apps' data.
+pub const PACKAGE_FOLLOW_UP: [&str; 3] = ["--no-wait", "--no-sign-out", "--no-profile"];
+
 /// What `aterm init` takes from the `aterm` that runs it ([`main_entry`]).
 pub struct Host<'a> {
+    /// Who decided this run happens ([`Decider`]).
+    pub decided: Decider,
     /// The base layer ([`Base`]), its store lock as [`BaseLock`] says.
     pub base: &'a dyn Fn(BaseLock) -> Base,
     /// Whether this process holds Full Disk Access, as the runner measures it.
@@ -1032,10 +1059,16 @@ fn entry(
     }
     // The look for the ALab vault overlaps reading the Mac (its context and the develop
     // layer); the secrets step takes its answer as the workstation groups are prepared, which
-    // is before the base layer runs, so every question comes before any change.
-    let ahead = (options.action == Action::Apply && options.joins() && options.vault.is_none())
-        .then(crate::init_secrets::look_ahead)
-        .flatten();
+    // is before the base layer runs, so every question comes before any change. A run aterm
+    // decided looks only from the secrets step, which at a Mac's console waits until macOS has
+    // answered its Local Network question ([`crate::init_secrets::Here::Unbidden`]) and in a
+    // remote shell, where macOS asks none, looks at once ([`crate::init_secrets::Here::Remote`]).
+    let ahead = (host.decided == Decider::Person
+        && options.action == Action::Apply
+        && options.joins()
+        && options.vault.is_none())
+    .then(crate::init_secrets::look_ahead)
+    .flatten();
     // What the person turned off in System State, or their Stop, holds this run's groups as it
     // holds the window's; the line saying so follows the tally.
     let held: Mutex<Vec<ItemReport>> = Mutex::new(Vec::new());
@@ -1044,6 +1077,7 @@ fn entry(
     let start: Mutex<Holds> = Mutex::new(Holds::NONE);
     let groups = |sys: &dyn System, ctx: &Ctx, mode: Mode, reading: &Reading<'_>| {
         let standing = Standing {
+            decided: host.decided,
             alab: host.alab,
             present: &host.present,
             holds: host.records.holds(),
@@ -1258,8 +1292,8 @@ fn tab_entry(options: &Options, host: &Host<'_>) -> u8 {
 /// `converge` (in this person's own login, `live`), and ends on one line:
 /// [`crate::init_clt::TAB_INSTALLED`] and 0, or why the install did not finish
 /// ([`crate::init_clt::Unfinished::line`]) and that class's exit
-/// ([`crate::init_clt::Unfinished::tab_exit`]: 1, or Low Data Mode's and a non-administrator's
-/// own). None of init's own report is printed.
+/// ([`crate::init_clt::Unfinished::tab_exit`]: 1, or Low Data Mode's, a non-administrator's and
+/// a stop's own). None of init's own report is printed.
 fn tab(
     sys: &dyn System,
     out: &crate::init_clt::Tab,
@@ -3415,7 +3449,7 @@ pub fn run_initial_spotlight(
 ) -> Result<Vec<ItemReport>, String> {
     Workstation {
         ctx: ctx.clone(),
-        items: crate::init_spotlight::items(ctx)?,
+        items: crate::init_spotlight::items(ctx, crate::init_spotlight::Projects::Noted)?,
         settings: Vec::new(),
         snapshots: None,
         held: Vec::new(),
@@ -3609,10 +3643,13 @@ struct Reading<'a> {
     picks: Picks,
 }
 
-/// What decides which groups a run takes besides its flags ([`picked`]), and whether the
-/// Messages and FaceTime sign-outs may run with no terminal: read from the `aterm` that runs it
-/// ([`Host`]) and from System State's records.
+/// What decides which groups a run takes besides its flags ([`picked`]), whether the Messages
+/// and FaceTime sign-outs may run with no terminal, and whether the run may put a question of
+/// macOS's on the screen ([`Decider`]): read from the `aterm` that runs it ([`Host`]) and from
+/// System State's records.
 struct Standing<'a> {
+    /// Who decided this run happens ([`Host::decided`]).
+    decided: Decider,
     /// Whether this is an ALab Mac ([`Host::alab`]).
     alab: &'a dyn Fn() -> bool,
     /// Whether a person is at this Mac's screen now ([`Host::present`]).
@@ -3636,8 +3673,11 @@ type Prepare<'a> =
 /// person's join password, which nothing asks for) and [`groups`] leaves the preferences to
 /// them, building the Messages and FaceTime sign-outs with no terminal only for a person at the
 /// screen ([`Standing::present`]). The vault is read only when this run names its item. For a
-/// person at the console the Permissions phase lists aterm's grants. A group that cannot be
-/// built is one row saying why ([`Unbuilt`]); the others run.
+/// person at the console the Permissions phase lists aterm's grants. A run aterm decided
+/// ([`Decider::Aterm`]) puts no question of macOS's on the screen: at the console its vault look
+/// waits for macOS's Local Network answer (a remote shell, where macOS asks none, looks at once),
+/// and Rust in Spotlight searches no folder of the person's. A group that cannot be built is one
+/// row saying why ([`Unbuilt`]); the others run.
 #[expect(
     clippy::too_many_arguments,
     reason = "one run's workstation inputs, each its own"
@@ -3685,9 +3725,10 @@ fn prepare_groups_with(
         flags_run,
     );
     let runs = picked.runs;
+    let decided = standing.decided;
     if !sys.macos() {
         return Ok((
-            elsewhere(sys, ctx, mode, vault, reading, runs, secrets)?,
+            elsewhere(sys, ctx, mode, vault, reading, runs, decided, secrets)?,
             picked,
         ));
     }
@@ -3715,7 +3756,7 @@ fn prepare_groups_with(
         // console, or nobody's, sets up nothing of this one.
         if presence == Presence::Remote {
             if runs.contains(Setting::Spotlight) {
-                groups.push((spotlight(ctx), anywhere(Class::Asked)));
+                groups.push((spotlight(ctx, decided), anywhere(Class::Asked)));
             }
             let secrets = if runs.contains(Setting::Secrets) {
                 vault_items(sys, ctx, mode, vault, reading, Here::Remote, secrets)?
@@ -3731,7 +3772,11 @@ fn prepare_groups_with(
         return Ok((groups, picked));
     }
     let person = presence == Presence::AtConsole;
-    let here = if person { Here::Person } else { Here::Session };
+    let here = match (person, decided) {
+        (true, Decider::Person) => Here::Person,
+        (true, Decider::Aterm) => Here::Unbidden,
+        (false, _) => Here::Session,
+    };
     let secrets = if runs.contains(Setting::Secrets) {
         vault_items(sys, ctx, mode, vault, reading, here, secrets)?
     } else {
@@ -3746,6 +3791,7 @@ fn prepare_groups_with(
     let (mut groups, rows) = groups(
         ctx,
         presence,
+        decided,
         secrets,
         github,
         reading.keyboards,
@@ -3764,13 +3810,18 @@ fn prepare_groups_with(
 }
 
 /// Rust in Spotlight's items ([`crate::init_spotlight::items`]), or the one row saying why
-/// they could not be built: a background row, run wherever this login's shell is.
-fn spotlight(ctx: &Ctx) -> Vec<Box<dyn Item>> {
+/// they could not be built: a background row, run wherever this login's shell is. A run aterm
+/// decided ([`Decider::Aterm`]) searches no folder of the person's for their build folders.
+fn spotlight(ctx: &Ctx, decided: Decider) -> Vec<Box<dyn Item>> {
+    let projects = match decided {
+        Decider::Person => crate::init_spotlight::Projects::Noted,
+        Decider::Aterm => crate::init_spotlight::Projects::Unread,
+    };
     built(
         crate::init_spotlight::ID,
         "spotlight",
         Setting::Spotlight.label(),
-        crate::init_spotlight::items(ctx),
+        crate::init_spotlight::items(ctx, projects),
     )
 }
 
@@ -3820,6 +3871,10 @@ fn anywhere(class: Class) -> Place {
 /// reading "macOS only"; the vault, which asks nothing of anyone (`--vault`'s questions only of
 /// a person at a terminal, an SSH session's included: nobody sits at a Linux box's console);
 /// and the repositories where `runs` takes them. Each runs in any shell of the account.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one run's workstation inputs, each its own"
+)]
 fn elsewhere(
     sys: &dyn System,
     ctx: &Ctx,
@@ -3827,10 +3882,15 @@ fn elsewhere(
     vault: Option<&str>,
     reading: &Reading<'_>,
     runs: Selection,
+    decided: Decider,
     secrets: impl FnOnce(&Ctx) -> Result<Arc<dyn crate::init_secrets::SecretsOps>, String>,
 ) -> Result<Vec<Group>, String> {
     let person = sys.terminal() && sys.agent_ancestor().is_none();
-    let here = if person { Here::Person } else { Here::Remote };
+    let here = match (person, decided) {
+        (true, Decider::Person) => Here::Person,
+        (true, Decider::Aterm) => Here::Unbidden,
+        (false, _) => Here::Remote,
+    };
     let secrets = if runs.contains(Setting::Secrets) {
         vault_items(sys, ctx, mode, vault, reading, here, secrets)?
     } else {
@@ -4018,6 +4078,7 @@ fn built(
 fn groups(
     ctx: &Ctx,
     presence: Presence,
+    decided: Decider,
     secrets: crate::init_secrets::Secrets,
     github: Vec<Box<dyn Item>>,
     keyboards: Option<&str>,
@@ -4129,7 +4190,7 @@ fn groups(
     // Rust in Spotlight changes nothing on the screen and asks nothing: a background row, as
     // the vault's join is (design §7).
     if runs.contains(Setting::Spotlight) {
-        groups.push((spotlight(ctx), place(Class::Asked)));
+        groups.push((spotlight(ctx, decided), place(Class::Asked)));
     }
     if person {
         let named = only.iter().any(|word| word == crate::init_fseventsd::ID);
@@ -5158,6 +5219,7 @@ mod tests {
     /// An ALab Mac with a person at its screen, nothing held in System State.
     fn alab_standing() -> Standing<'static> {
         Standing {
+            decided: Decider::Person,
             alab: &|| true,
             present: &|| true,
             holds: Holds::default(),
@@ -5167,6 +5229,7 @@ mod tests {
     /// A Mac that is not ALab's, with a person at its screen, nothing held in System State.
     fn personal_standing() -> Standing<'static> {
         Standing {
+            decided: Decider::Person,
             alab: &|| false,
             present: &|| true,
             holds: Holds::default(),
@@ -6186,6 +6249,7 @@ mod tests {
         let groups = groups(
             &alice,
             Presence::AtConsole,
+            Decider::Person,
             crate::init_secrets::Secrets {
                 items: Vec::new(),
                 waited_on: None,
@@ -6380,6 +6444,7 @@ mod tests {
     /// status as `ExitCode`'s `Debug` spells it.
     fn converge_run(args: &[&str], ports: &dyn crate::sync::Ports) -> String {
         let host = Host {
+            decided: Decider::Person,
             base: &|_| panic!("--converge composed init's base layer"),
             full_disk_access: &|| panic!("--converge measured Full Disk Access"),
             records: &NoSetup,
@@ -6603,8 +6668,11 @@ mod tests {
             targo: None,
         };
         let alice = crate::items::defaults::tests::user("alice", 501);
-        let station =
-            crate::init_spotlight::items(&crate::items::defaults::tests::ctx(&[alice])).unwrap();
+        let station = crate::init_spotlight::items(
+            &crate::items::defaults::tests::ctx(&[alice]),
+            crate::init_spotlight::Projects::Noted,
+        )
+        .unwrap();
         let line = |only: &str| Remedy::Init { only: only.into() }.command().unwrap();
         let mut lines = vec![
             crate::init_clt::place().remedy.command().unwrap(),
@@ -7142,6 +7210,7 @@ mod tests {
             sys.agent = agent;
             assert_eq!(crate::console::presence(&sys), presence);
             let standing = Standing {
+                decided: Decider::Person,
                 alab: &|| true,
                 present: if present { &|| true } else { &|| false },
                 holds: Holds::default(),
@@ -7262,6 +7331,118 @@ mod tests {
         .unwrap();
         assert_eq!(vault.joins().len(), 1, "probes {}", vault.probes());
         assert_eq!(vault.passwords(), [false], "no join password");
+    }
+
+    /// A run aterm decided at this Mac's console (the follow-up of a person's package install,
+    /// [`Decider::Aterm`]) puts no question of macOS's on the screen: before macOS has answered
+    /// its Local Network question the vault's look never runs and the row waits for a person
+    /// (deferred, the run exits 0), and Rust in Spotlight asks Spotlight for none of the
+    /// person's build folders. NEGATIVE CONTROL: the person's own run at the console looks for
+    /// the vault and searches for them.
+    #[test]
+    fn a_run_aterm_decided_raises_no_question_of_macos() {
+        const MDFIND: &str =
+            "alice$ /usr/bin/mdfind -onlyin /Users//alice -0 'kMDItemFSName == \"CACHEDIR.TAG\"'";
+        for (decided, asks) in [(Decider::Aterm, false), (Decider::Person, true)] {
+            let mut sys = alice_at(501);
+            sys.terminal = true;
+            sys.agent = None;
+            assert_eq!(init_presence(&sys), Presence::AtConsole);
+            sys.create_dir_all(Path::new("/Users//alice/Library/Caches"), 0o755)
+                .unwrap();
+            sys.file("/usr/bin/mdfind", b"").on(MDFIND, Ran::ok(""));
+            let (ctx, _) = local_context(&sys).unwrap();
+            let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
+                crate::init_secrets::tests::unconfigured(),
+            )]);
+            vault.lan_unanswered();
+            let port = Arc::clone(&vault);
+            let standing = Standing {
+                decided,
+                ..personal_standing()
+            };
+            let groups = prepare_groups_with(
+                &sys,
+                &ctx,
+                Mode::Apply,
+                None,
+                &reading(&[]),
+                &standing,
+                no_grants,
+                move |_| Ok(port as Arc<dyn crate::init_secrets::SecretsOps>),
+            )
+            .unwrap()
+            .0;
+            let rows = run(
+                &sys,
+                &ctx,
+                Base::none(),
+                &groups,
+                Mode::Apply,
+                &mut NoJournal,
+            )
+            .unwrap();
+            assert_eq!(vault.probes(), u32::from(asks), "{decided:?}: the look");
+            assert_eq!(
+                sys.calls().iter().any(|call| call == MDFIND),
+                asks,
+                "{decided:?}: {:?}",
+                sys.calls()
+            );
+            let row = rows
+                .iter()
+                .find(|row| row.id.starts_with("init.secrets@"))
+                .expect("the vault row");
+            assert_eq!(
+                crate::init_secrets::waits_for_local_network(row),
+                !asks,
+                "{decided:?}: {row:?}"
+            );
+            if !asks {
+                assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
+                assert_eq!(status(&rows, Action::Apply), 0, "{rows:?}");
+            }
+        }
+    }
+
+    /// The package follow-up's words ([`PACKAGE_FOLLOW_UP`]) are one run init accepts: an apply
+    /// whose base items stand aside for a pass holding the store, that still joins the vault
+    /// and, on an ALab Mac, clones the repositories, and that signs out of nothing and changes
+    /// no workstation preference on any Mac. NEGATIVE CONTROL: without `--no-sign-out` an ALab
+    /// Mac's run signs out.
+    #[test]
+    fn the_package_follow_up_signs_out_of_nothing_and_changes_no_preference() {
+        let words = |words: &[&str]| words.iter().map(OsString::from).collect::<Vec<_>>();
+        let follow_up = options(&words(&PACKAGE_FOLLOW_UP)).unwrap();
+        assert_eq!(follow_up.action, Action::Apply);
+        assert_eq!(follow_up.base_lock(true), BaseLock::Try);
+        assert!(follow_up.joins());
+        let alab = follow_up.picks.choice(true);
+        assert_eq!(
+            alab,
+            Choice {
+                profile: false,
+                sign_out: false,
+                clone: true,
+            }
+        );
+        assert_eq!(follow_up.picks.choice(false), Choice::NONE);
+        let runs = alab.selection();
+        assert!(runs.contains(Setting::Repositories), "{runs:?}");
+        for left in [
+            Setting::Messages,
+            Setting::FaceTime,
+            Setting::CapsLock,
+            Setting::NaturalScrolling,
+            Setting::TrackpadScrolling,
+            Setting::Desktop,
+            Setting::Widgets,
+            Setting::Dock,
+        ] {
+            assert!(!runs.contains(left), "{left:?}: {runs:?}");
+        }
+        let signs_out = options(&words(&["--no-wait", "--no-profile"])).unwrap();
+        assert!(signs_out.picks.choice(true).sign_out);
     }
 
     /// Before macOS has an answer to aterm's Local Network question, an agent's tab does not
@@ -7641,6 +7822,7 @@ mod tests {
             let groups = groups(
                 &ctx,
                 Presence::AtConsole,
+                Decider::Person,
                 crate::init_secrets::Secrets {
                     items: Vec::new(),
                     waited_on: None,
@@ -9297,7 +9479,8 @@ mod tests {
                     place(Class::Preference),
                 ),
                 (
-                    crate::init_spotlight::items(ctx).unwrap(),
+                    crate::init_spotlight::items(ctx, crate::init_spotlight::Projects::Noted)
+                        .unwrap(),
                     place(Class::Asked),
                 ),
             ]
@@ -9347,6 +9530,7 @@ mod tests {
             let groups = groups(
                 &alice,
                 Presence::AtConsole,
+                Decider::Person,
                 crate::init_secrets::Secrets {
                     items: Vec::new(),
                     waited_on: None,
@@ -9429,6 +9613,7 @@ mod tests {
         let accounts = self::groups(
             &ctx,
             Presence::NoTerminal,
+            Decider::Person,
             crate::init_secrets::Secrets {
                 items: Vec::new(),
                 waited_on: None,
@@ -9492,6 +9677,7 @@ mod tests {
         let groups = groups(
             &ctx,
             Presence::AtConsole,
+            Decider::Person,
             crate::init_secrets::Secrets {
                 items: Vec::new(),
                 waited_on: None,
@@ -9735,6 +9921,7 @@ mod tests {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let ports = crate::sync::tests::Inert::new(scratch.path());
         let host = Host {
+            decided: Decider::Person,
             base: &|_| panic!("the tab's run composed init's base layer first"),
             full_disk_access: &|| panic!("the tab's run measured Full Disk Access"),
             records: &NoRecords,
@@ -9855,7 +10042,7 @@ mod tests {
             }
             said.push(format!("{}\n", why.line()));
             assert_eq!(run.said, said, "{why:?}");
-            assert_eq!(run.code, 1, "{why:?}");
+            assert_eq!(run.code, why.tab_exit(), "{why:?}");
         };
         let sudo = tab_sudo();
         for (ran, why) in [
@@ -10392,6 +10579,7 @@ mod tests {
             let mut off = Selection::none();
             off.set(Setting::Dock, true);
             let standing = Standing {
+                decided: Decider::Person,
                 alab: &|| true,
                 present: &|| true,
                 holds: Holds { off, ..Holds::NONE },

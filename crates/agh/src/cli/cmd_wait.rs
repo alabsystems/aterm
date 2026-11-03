@@ -10,6 +10,8 @@ use super::args::Invocation;
 use super::verbs::Noun;
 use super::{Answer, Ctx, Outcome, Receipt, out};
 use crate::error::{Error, Kind, Result, quote};
+use crate::github::How;
+use crate::notify::{self, Notice};
 use crate::policy::Access;
 use crate::wait::{
     Backoff, Condition, Poller, ReleaseCond, WaitEnd, WaitEvent, refuse_tag, release_condition,
@@ -25,7 +27,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1800);
 const HEARTBEAT: Duration = Duration::from_secs(60);
 const BLIND_LIMIT: Duration = Duration::from_secs(60);
 
-/// `agh release wait REPO TAG COND… [--include-drafts] [--timeout DUR]`.
+/// `agh release wait REPO TAG COND… [--include-drafts] [--timeout DUR] [--notify]`.
 ///
 /// # Errors
 ///
@@ -72,6 +74,7 @@ pub(crate) fn release_wait(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         blind_limit: BLIND_LIMIT,
     };
     let repo = slug.to_string();
+    let held: Vec<&str> = fors.iter().map(String::as_str).collect();
     let fors = fors.join(",");
     let end = poller.run(&gh, &mut conditions, &mut |event| {
         if let WaitEvent::Heartbeat { elapsed, last } = event {
@@ -85,6 +88,11 @@ pub(crate) fn release_wait(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
             out::note(ctx, &line);
         }
     });
+    if let WaitEnd::Held(state) = &end {
+        let (n, id) = first_observed(state);
+        let how = How::default().notify(inv.has("--notify"));
+        notify::settled(&gh, &how, &Notice::wait(&slug, tag, &held, n, id));
+    }
     let receipt = Receipt::for_repo(inv, &gh, &slug);
     let answer = match end {
         WaitEnd::Held(state) => Answer::Object {
@@ -136,4 +144,30 @@ pub(crate) fn release_wait(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         WaitEnd::Impossible(error) => return Err(error),
     };
     Ok(Outcome { answer, receipt })
+}
+
+/// A held wait's `(n, id)` for its notice: the numeric `id` of the first condition whose
+/// observation has one, and that observation's `assets` count when it has one.
+fn first_observed(state: &aterm_json::Value) -> (Option<u32>, Option<u64>) {
+    let observed = state
+        .get("conditions")
+        .and_then(aterm_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|condition| condition.get("observed"))
+        .find(|observed| {
+            observed
+                .get("id")
+                .and_then(aterm_json::Value::as_u64)
+                .is_some()
+        });
+    let Some(observed) = observed else {
+        return (None, None);
+    };
+    let id = observed.get("id").and_then(aterm_json::Value::as_u64);
+    let n = observed
+        .get("assets")
+        .and_then(aterm_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok());
+    (n, id)
 }

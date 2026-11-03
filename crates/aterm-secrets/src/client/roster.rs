@@ -14,7 +14,18 @@ use crate::swarm_roster::{
 ///
 /// # Errors
 /// Local state or the verified cache cannot be read safely, or `aterm-swarm-roster` is malformed.
-pub(super) fn base_swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
+#[cfg(test)]
+fn base_swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
+    let Some(lock) = StateLock::observe(paths)? else {
+        return Ok(None);
+    };
+    base_swarm_roster_held(paths, &lock)
+}
+
+pub(super) fn base_swarm_roster_held(
+    paths: &Paths,
+    _lock: &StateLock,
+) -> crate::Result<Option<SwarmRoster>> {
     let Some(expected) = config(paths)? else {
         return Ok(None);
     };
@@ -25,9 +36,11 @@ pub(super) fn base_swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRost
     let log_only_bound = state.digest.is_none()
         && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing
         && state.source_identity == Some(source_identity(&expected));
-    let cached = source_bound(&expected, &state)
-        .then(|| held_copy(paths, &expected, &state))
-        .flatten();
+    let cached = if source_bound(&expected, &state) {
+        read_held_copy(paths, &expected, &state)?
+    } else {
+        None
+    };
     let envelope_bound = cached.is_some();
     if state.membership == Stored::In
         && !state.failed
@@ -66,12 +79,81 @@ pub(super) fn base_swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRost
 }
 
 pub fn swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
-    // A lock an older build left wide is narrowed first, as the deny list's read narrows it.
+    swarm_roster_with(paths, || {}, || {})
+}
+
+pub(crate) enum RosterObservation<'a> {
+    Held(&'a StateLock),
+    Standalone,
+}
+
+impl<'a> RosterObservation<'a> {
+    pub(crate) fn state_lock(self) -> Option<&'a StateLock> {
+        match self {
+            Self::Held(lock) => Some(lock),
+            Self::Standalone => None,
+        }
+    }
+}
+
+/// Run a local read under the vault lock, or a checked absence of a configured vault.
+pub(crate) fn with_roster_observation<T>(
+    paths: &Paths,
+    read: impl FnOnce(RosterObservation<'_>) -> crate::Result<T>,
+) -> crate::Result<Option<T>> {
     StateLock::narrow_owned(paths)?;
+    match StateLock::observe_classified(paths)? {
+        StateObservation::Held(lock) => read(RosterObservation::Held(&lock)).map(Some),
+        StateObservation::Busy => Ok(None),
+        StateObservation::Absent => {
+            if config(paths)?.is_some() {
+                return Ok(None);
+            }
+            let value = read(RosterObservation::Standalone)?;
+            Ok((matches!(
+                StateLock::observe_classified(paths)?,
+                StateObservation::Absent
+            ) && config(paths)?.is_none())
+            .then_some(value))
+        }
+    }
+}
+
+fn swarm_roster_with(
+    paths: &Paths,
+    after_config: impl FnOnce(),
+    after_base: impl FnOnce(),
+) -> crate::Result<Option<SwarmRoster>> {
+    with_roster_observation(paths, |observation| match observation {
+        RosterObservation::Held(lock) => {
+            swarm_roster_held_with(paths, lock, after_config, after_base)
+        }
+        RosterObservation::Standalone => Ok(None),
+    })
+    .map(Option::flatten)
+}
+
+/// Read while the caller retains the state lock for this vault, shared or exclusive.
+pub(super) fn swarm_roster_held(
+    paths: &Paths,
+    lock: &StateLock,
+) -> crate::Result<Option<SwarmRoster>> {
+    swarm_roster_held_with(paths, lock, || {}, || {})
+}
+
+fn swarm_roster_held_with(
+    paths: &Paths,
+    lock: &StateLock,
+    after_config: impl FnOnce(),
+    after_base: impl FnOnce(),
+) -> crate::Result<Option<SwarmRoster>> {
     let Some(expected) = config(paths)? else {
         return Ok(None);
     };
-    if let Some(mut roster) = base_swarm_roster(paths)? {
+    after_config();
+    let base = base_swarm_roster_held(paths, lock)?;
+    after_base();
+    if let Some(mut roster) = base {
         if let Some(log) = log_entries::trusted_local_log(paths, &expected)? {
             overlay_log_membership(&log, &mut roster);
         } else {
@@ -105,7 +187,7 @@ pub fn swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
         && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing
         && state.source_identity == Some(source_identity(&expected));
     let envelope_bound =
-        source_bound(&expected, &state) && held_copy(paths, &expected, &state).is_some();
+        source_bound(&expected, &state) && read_held_copy(paths, &expected, &state)?.is_some();
     if state.membership == Stored::In
         && !state.failed
         && state.pending.is_empty()
@@ -636,6 +718,7 @@ pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &
             label: canonical,
             aliases: Vec::new(),
             hint: None,
+            hw_hint: None,
             admitted_ms: log.genesis().authored_ms(),
             claimed_label: None,
             claimed_at_ms: None,
@@ -776,6 +859,7 @@ pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &
             label: canonical,
             aliases: Vec::new(),
             hint: None,
+            hw_hint: None,
             admitted_ms,
             claimed_label: None,
             claimed_at_ms: None,
@@ -1334,6 +1418,143 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_log_read_before_an_authority_change_cannot_supply_the_new_roster() {
+        let macs = super::super::log_entries_tests::two_macs(&[]);
+        let paths = &macs.m22;
+        let store = load_records(paths).unwrap();
+        let log = store.log().unwrap();
+        assert!(
+            log_entries::local_swarm_roster_for_log(paths, log)
+                .unwrap()
+                .is_some()
+        );
+        {
+            let lock = StateLock::take(paths).unwrap();
+            let mut next = config(paths).unwrap().unwrap();
+            next.signer = Some([77; 32]);
+            next.followed.clear();
+            let mut state = load_state(paths).unwrap();
+            state.source_identity = Some(source_identity(&next));
+            save_state(paths, &state).unwrap();
+            save_config(paths, &next).unwrap();
+            assert!(log_entries::local_swarm_roster_for_log_held(paths, log, &lock).is_err());
+        }
+        assert!(log_entries::local_swarm_roster_for_log(paths, log).is_err());
+        macs.server.stop();
+    }
+
+    #[test]
+    fn an_unreadable_membership_log_cannot_admit_a_cached_admin() {
+        struct FailedReads(PathBuf);
+        impl Drop for FailedReads {
+            fn drop(&mut self) {
+                fsx::fail_reads(&self.0, 0);
+            }
+        }
+        let macs = super::super::log_entries_tests::two_macs(&[]);
+        let paths = &macs.m22;
+        let admin = admin_open(paths).unwrap();
+        let identity = read_identity(paths).unwrap().unwrap();
+        let bytes = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
+            .unwrap()
+            .unwrap();
+        let envelope = envelope::parse(bytes.as_slice()).unwrap();
+        assert!(
+            log_entries::trusted_seeded_log(paths, &admin.config, &envelope)
+                .unwrap()
+                .is_some()
+        );
+        let refused = || {
+            super::super::admin_removed_in_log(
+                paths,
+                &admin.config,
+                &envelope,
+                &identity,
+                &admin.doc,
+            )
+        };
+        assert!(!refused());
+        let fault = FailedReads(paths.records_file());
+        fsx::fail_reads(&fault.0, usize::MAX);
+        assert!(refused());
+        drop(fault);
+        assert!(!refused());
+        macs.server.stop();
+    }
+
+    #[test]
+    fn a_source_move_during_a_roster_read_cannot_lose_log_removals() {
+        let macs = super::super::log_entries_tests::two_macs(&[]);
+        let paths = &macs.m22;
+        let before = admin_seed_swarm_roster(paths, &[]).unwrap();
+        assert!(before.member_by_label_or_alias("m7").is_some());
+        super::super::remove::test_remove_unposted(paths, "m7").unwrap();
+        // Keep the earlier roster entry: its removed row is excluded by the log overlay,
+        // independently of when a writer next refreshes that entry.
+        super::super::remove::test_put_everyone(paths, ROSTER_ENTRY, before.to_toml().as_bytes())
+            .unwrap();
+        let safe = |roster: Option<&SwarmRoster>| {
+            roster.is_none_or(|roster| {
+                roster.is_label_denied("m7")
+                    && roster
+                        .member_by_label_or_alias("m7")
+                        .is_none_or(|member| roster.is_member_denied(member))
+            })
+        };
+        let raw = base_swarm_roster(paths).unwrap().unwrap();
+        assert!(raw.member_by_label_or_alias("m7").is_some());
+        assert!(!raw.is_label_denied("m7"));
+        assert!(safe(Some(&swarm_roster(paths).unwrap().unwrap())));
+
+        let mut exposed = Vec::new();
+        for after_base in [false, true] {
+            let move_source = || {
+                let Some(_writer) = StateLock::try_take(paths).unwrap() else {
+                    return;
+                };
+                let mut next = config(paths).unwrap().unwrap();
+                next.source = Source::Path(
+                    macs.root
+                        .path()
+                        .join(if after_base {
+                            "after-base"
+                        } else {
+                            "after-config"
+                        })
+                        .join("alab.vault"),
+                );
+                let mut state = load_state(paths).unwrap();
+                state.source_identity = Some(source_identity(&next));
+                save_state(paths, &state).unwrap();
+                save_config(paths, &next).unwrap();
+            };
+            let raced = swarm_roster_with(
+                paths,
+                || {
+                    if !after_base {
+                        move_source();
+                    }
+                },
+                || {
+                    if after_base {
+                        move_source();
+                    }
+                },
+            )
+            .unwrap();
+            if !safe(raced.as_ref()) {
+                exposed.push(after_base);
+            }
+            assert!(safe(Some(&swarm_roster(paths).unwrap().unwrap())));
+        }
+        macs.server.stop();
+        assert!(
+            exposed.is_empty(),
+            "source move lost the log overlay: {exposed:?}"
+        );
+    }
+
+    #[test]
     fn overlay_keeps_a_members_denial_when_its_log_node_key_replaces_the_roster_key() {
         use crate::commons::binding::Request;
         use crate::membership_log::{Entrant, Founder, Log, Record, Root};
@@ -1375,6 +1596,7 @@ mod tests {
                         label: "m2".to_owned(),
                         aliases: vec!["m20".to_owned()],
                         hint: None,
+                        hw_hint: None,
                         admitted_ms: 1,
                         claimed_label: None,
                         claimed_at_ms: None,
@@ -1587,8 +1809,9 @@ email = "one@example.org"
             Some("m22")
         );
         {
-            let _lock = StateLock::take(&member_m4_paths).unwrap();
-            let under_lock = swarm_roster(&member_m4_paths)
+            let lock = StateLock::take(&member_m4_paths).unwrap();
+            assert!(swarm_roster(&member_m4_paths).unwrap().is_none());
+            let under_lock = swarm_roster_held(&member_m4_paths, &lock)
                 .unwrap()
                 .expect("roster remains readable by same-thread StateLock holder");
             assert!(
@@ -1740,6 +1963,7 @@ email = "one@example.org"
                     label: "m1".to_owned(),
                     aliases: Vec::new(),
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 1_000,
                     claimed_label: None,
                     claimed_at_ms: None,
@@ -1752,6 +1976,7 @@ email = "one@example.org"
                     label: "m2".to_owned(),
                     aliases: vec!["m9".to_owned()],
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 1_000,
                     claimed_label: Some("m10".to_owned()),
                     claimed_at_ms: Some(1_000),
@@ -1837,6 +2062,7 @@ email = "one@example.org"
                     label: "m2".to_owned(),
                     aliases: vec!["m20".to_owned()],
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 1,
                     claimed_label: Some("m21".to_owned()),
                     claimed_at_ms: Some(1),
@@ -1923,6 +2149,7 @@ email = "one@example.org"
                     label: "m1".to_owned(),
                     aliases: Vec::new(),
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 1_000,
                     claimed_label: None,
                     claimed_at_ms: None,
@@ -1935,6 +2162,7 @@ email = "one@example.org"
                     label: "m2".to_owned(),
                     aliases: Vec::new(),
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 1_000,
                     claimed_label: None,
                     claimed_at_ms: None,
@@ -1947,6 +2175,7 @@ email = "one@example.org"
                     label: "m70".to_owned(),
                     aliases: Vec::new(),
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 1_000,
                     claimed_label: None,
                     claimed_at_ms: None,
@@ -2104,6 +2333,7 @@ email = "one@example.org"
                     label: "m1".to_owned(),
                     aliases: Vec::new(),
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 1_000,
                     claimed_label: None,
                     claimed_at_ms: None,
@@ -2116,6 +2346,7 @@ email = "one@example.org"
                     label: "m2".to_owned(),
                     aliases: Vec::new(),
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 1_000,
                     claimed_label: Some("m1-3fa2".to_owned()),
                     claimed_at_ms: Some(1_500),
@@ -2128,6 +2359,7 @@ email = "one@example.org"
                     label: "m3".to_owned(),
                     aliases: Vec::new(),
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 1_000,
                     claimed_label: None,
                     claimed_at_ms: None,
@@ -2190,6 +2422,7 @@ email = "one@example.org"
                 label: "m9".to_owned(),
                 aliases: Vec::new(),
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 1_000,
                 claimed_label: Some("m3".to_owned()),
                 claimed_at_ms: Some(1_500),
@@ -2222,6 +2455,7 @@ email = "one@example.org"
                     label: "m40".to_owned(),
                     aliases: Vec::new(),
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 500,
                     claimed_label: None,
                     claimed_at_ms: None,
@@ -2234,6 +2468,7 @@ email = "one@example.org"
                     label: "m1".to_owned(),
                     aliases: Vec::new(),
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 1_000,
                     claimed_label: None,
                     claimed_at_ms: None,

@@ -303,7 +303,8 @@ pub(super) fn roster_keeps_out(
     opened: Option<&OpenedAudienceEntries>,
     binding: &crate::commons::binding::Binding,
     node: [u8; 32],
-) -> Option<String> {
+    lock: Option<&StateLock>,
+) -> crate::Result<Option<String>> {
     let hex_node = (node != [0; 32]).then(|| aterm_codec::hex::encode_lower(&node));
     let hex_writer = aterm_codec::hex::encode_lower(binding.writer());
     let hex_incarnation = aterm_codec::hex::encode_lower(binding.incarnation());
@@ -317,29 +318,27 @@ pub(super) fn roster_keeps_out(
             || r.member_by_recipient(&rec_str)
                 .is_some_and(|m| steward::member_is_denied_in_roster(r, m))
     };
-    let denied = swarm_roster(paths)
-        .ok()
-        .flatten()
-        .is_some_and(|r| check_roster(&r))
-        || log_entries::roster_from_doc_or_opened(
-            None,
-            opened,
-            config(paths)
-                .ok()
-                .flatten()
-                .and_then(|cfg| log_entries::trusted_local_log(paths, &cfg).ok().flatten())
-                .as_ref(),
-        )
-        .is_some_and(|mut r| {
-            if let Ok(Some(denied_nodes)) = swarm_denied_nodes(paths) {
-                r.deny_nodes.extend(denied_nodes);
-                r.canonicalize();
-            }
-            check_roster(&r)
-        });
-    denied.then(|| {
+    let roster = match lock {
+        Some(lock) => roster::swarm_roster_held(paths, lock),
+        None => swarm_roster(paths),
+    }?;
+    let local_log = config(paths)?
+        .map(|cfg| log_entries::trusted_local_log(paths, &cfg))
+        .transpose()?
+        .flatten();
+    let denied = roster.as_ref().is_some_and(check_roster)
+        || log_entries::roster_from_doc_or_opened(None, opened, local_log.as_ref()).is_some_and(
+            |mut r| {
+                if let Ok(Some(denied_nodes)) = swarm_denied_nodes(paths) {
+                    r.deny_nodes.extend(denied_nodes);
+                    r.canonicalize();
+                }
+                check_roster(&r)
+            },
+        );
+    Ok(denied.then(|| {
         "the vault removed this Mac, and an Allow does not let a removed Mac back in".to_owned()
-    })
+    }))
 }
 
 fn trusted_log_keeps_out(
@@ -347,6 +346,7 @@ fn trusted_log_keeps_out(
     binding: &crate::commons::binding::Binding,
     node: [u8; 32],
     restore: bool,
+    lock: Option<&StateLock>,
 ) -> crate::Result<Option<String>> {
     let log = match config(paths)? {
         Some(config) => log_entries::trusted_local_log(paths, &config)?,
@@ -355,7 +355,7 @@ fn trusted_log_keeps_out(
     if !log
         .as_ref()
         .is_some_and(|log| restoring(log, binding, node, restore))
-        && let Some(why) = roster_keeps_out(paths, None, binding, node)
+        && let Some(why) = roster_keeps_out(paths, None, binding, node, lock)?
     {
         return Ok(Some(why));
     }
@@ -429,11 +429,12 @@ fn log_path(
 ) -> crate::Result<ByLog> {
     if !sign {
         return Ok(
-            trusted_log_keeps_out(paths, request.binding(), node, restore)?
+            trusted_log_keeps_out(paths, request.binding(), node, restore, None)?
                 .map_or(ByLog::NotHere, ByLog::KeptOut),
         );
     }
-    let _lock = match held.filter(|held| held.holds(paths)) {
+    let held = held.filter(|held| held.holds(paths));
+    let owned_lock = match held {
         Some(_) => None,
         None => match StateLock::try_take_until(paths, Instant::now() + super::HANDOVER_LOCK_WAIT)?
         {
@@ -441,21 +442,27 @@ fn log_path(
             None => return Ok(ByLog::Busy),
         },
     };
+    let lock = held
+        .map(super::HandoverHold::state_lock)
+        .or(owned_lock.as_ref())
+        .ok_or_else(|| Error::new("the admission has no held vault state"))?;
     let Some((mut store, mut log, _, opened)) = held_log(paths)? else {
         return Ok(
-            trusted_log_keeps_out(paths, request.binding(), node, restore)?
+            trusted_log_keeps_out(paths, request.binding(), node, restore, Some(lock))?
                 .map_or(ByLog::NotHere, ByLog::KeptOut),
         );
     };
-    if let Some(why) = kept_out_with_node(&log, request.binding(), node, restore).or_else(|| {
-        (!restoring(&log, request.binding(), node, restore))
-            .then(|| roster_keeps_out(paths, Some(&opened), request.binding(), node))
-            .flatten()
-    }) {
+    if let Some(why) = kept_out_with_node(&log, request.binding(), node, restore) {
+        return Ok(ByLog::KeptOut(why));
+    }
+    if !restoring(&log, request.binding(), node, restore)
+        && let Some(why) =
+            roster_keeps_out(paths, Some(&opened), request.binding(), node, Some(lock))?
+    {
         return Ok(ByLog::KeptOut(why));
     }
     if let Some(already) = log.membership().get(&request.binding().actor())
-        && (log_entries::local_swarm_roster_for_log(paths, &log)
+        && (log_entries::local_swarm_roster_for_log_held(paths, &log, lock)?
             .is_some_and(|r| log_entries::member_denied_by_roster(&r, already))
             || log_entries::roster_from_doc_or_opened(None, Some(&opened), Some(&log))
                 .is_some_and(|r| log_entries::member_denied_by_roster(&r, already)))
@@ -465,7 +472,8 @@ fn log_path(
                 .to_owned(),
         ));
     }
-    let Some((actor, device, incarnation)) = log_entries::open_local_member_signer(paths, &log)?
+    let Some((actor, device, incarnation)) =
+        log_entries::open_local_member_signer_held(paths, &log, lock)?
     else {
         return Ok(ByLog::NotHere);
     };
@@ -658,7 +666,7 @@ pub fn log_admitted_actors(paths: &Paths) -> BTreeSet<crate::membership_log::Mem
         let Some(log) = log_entries::trusted_local_log(paths, &config)? else {
             return Ok(BTreeSet::new());
         };
-        let roster = log_entries::local_swarm_roster_for_log(paths, &log);
+        let roster = log_entries::local_swarm_roster_for_log(paths, &log)?;
         let membership = log.membership();
         Ok(membership
             .members()
@@ -761,12 +769,24 @@ pub(super) fn log_bundle(
 }
 
 /// Post every record this Mac holds to every vault server it reaches (its configured and browsed
-/// servers and the policy's): how an admission and a closed wrap gap reach the Macs that do not
-/// share its log yet. Servers keep what they lack and ignore the rest.
+/// servers and the policy's), all of them at once ([`super::fan_out::post_records_to`]): how an
+/// admission and a closed wrap gap reach the Macs that do not share its log yet. Servers keep
+/// what they lack and ignore the rest. However many servers take the post and never answer, the
+/// posts end within one exchange deadline.
 ///
 /// # Errors
 /// No vault is configured, or every server refused the records.
 pub fn post_records_to_servers(paths: &Paths) -> crate::Result<usize> {
+    post_records_to_servers_by(paths, super::fan_out::one_exchange())
+}
+
+/// [`post_records_to_servers`], every post ending by `by`: a deadline the caller's other posts
+/// share, so that however many rounds of posts a command makes, servers that never answer hold
+/// it for that one deadline.
+///
+/// # Errors
+/// As [`post_records_to_servers`].
+pub(super) fn post_records_to_servers_by(paths: &Paths, by: Instant) -> crate::Result<usize> {
     let config = config(paths)?.ok_or_else(|| Error::new("no vault configured"))?;
     let store = load_records(paths)?;
     if store.is_empty() {
@@ -781,9 +801,9 @@ pub fn post_records_to_servers(paths: &Paths) -> crate::Result<usize> {
     }
     let mut posted = 0;
     let mut first_err = None;
-    for url in &urls {
-        match transport::post_records(url, &wire) {
-            Ok(_) => posted += 1,
+    for answered in super::fan_out::post_records_to(&urls, &wire, by) {
+        match answered {
+            Ok(()) => posted += 1,
             Err(err) if first_err.is_none() => first_err = Some(err),
             Err(_) => {}
         }
@@ -1030,6 +1050,7 @@ mod tests {
                     label: "m41".to_owned(),
                     aliases: Vec::new(),
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 0,
                     claimed_label: Some("m42".to_owned()),
                     claimed_at_ms: Some(1_000),
@@ -1042,6 +1063,7 @@ mod tests {
                     label: "m9".to_owned(),
                     aliases: Vec::new(),
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 0,
                     claimed_label: Some("m99".to_owned()),
                     claimed_at_ms: Some(1_000),

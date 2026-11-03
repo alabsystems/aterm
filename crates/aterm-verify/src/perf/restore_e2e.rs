@@ -270,7 +270,7 @@ fn run_arm(
     )?;
     let read = |name: &str| {
         let path = scratch.path().join(name);
-        std::fs::read_to_string(&path)
+        crate::read_regular_text(&path)
             .map_err(|e| format!("the bench wrote no {}: {e}", path.display()))
     };
     let tables = read("restore.md")?;

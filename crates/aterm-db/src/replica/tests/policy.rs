@@ -266,7 +266,7 @@ impl Fixture {
             round.send_batch(
                 &mut stream,
                 self.peer,
-                std::slice::from_ref(&self.original),
+                |_| Ok(vec![self.original.clone()]),
                 BatchKind::Operation,
                 &mut report,
             )
@@ -317,6 +317,50 @@ impl Fixture {
             (self.scope, self.directory.path(self.scope).unwrap()),
         );
         Ok(round)
+    }
+}
+
+#[test]
+fn outbound_policy_is_rechecked_after_preparing_payload() {
+    for policy in [1, 3, 4, 6] {
+        let fixture = Fixture::new();
+        let replica =
+            Replica::commons(fixture.lab.paths[0].clone(), fixture.config.clone()).unwrap();
+        let round = fixture.round(&replica).unwrap();
+        round.active_table.set(Some(fixture.scope.digest()));
+        let mut receipt = Sha256::digest(&fixture.original).to_vec();
+        receipt.push(1);
+        let mut stream = Stream {
+            input: Cursor::new(receipt),
+            ..Stream::default()
+        };
+        let mut report = Report::default();
+        let result = round.send_batch(
+            &mut stream,
+            fixture.peer,
+            |_| {
+                aterm_secrets::fsx::write_atomic(&fixture.config, &fixture.config(policy), 0o600)
+                    .unwrap();
+                Ok(vec![fixture.original.clone()])
+            },
+            BatchKind::Operation,
+            &mut report,
+        );
+        if policy == 1 {
+            result.expect("a semantically identical policy still permits the payload");
+            assert_eq!(report.sent, 1);
+            assert!(!stream.output.is_empty());
+        } else {
+            assert!(
+                result.is_err(),
+                "a policy change during preparation must refuse"
+            );
+            assert!(
+                stream.output.is_empty(),
+                "refusal must precede the batch header"
+            );
+            assert_eq!(report, Report::default());
+        }
     }
 }
 

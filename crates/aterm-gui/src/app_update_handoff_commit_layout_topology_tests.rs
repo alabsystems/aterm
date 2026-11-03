@@ -27,6 +27,7 @@ fn captured(position: Option<(i32, i32)>, cwd: Option<&str>, title: &str) -> Res
         native_tabs: Vec::new(),
         tab_order: vec![TabOrderEntry::Terminal { index: 0 }],
         active_item: Some(0),
+        workers_in_front: false,
         restored_tabs: vec![RestoredTab {
             root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
                 sid: None,
@@ -54,9 +55,11 @@ fn captured(position: Option<(i32, i32)>, cwd: Option<&str>, title: &str) -> Res
                 claim_ended: false,
                 not_claim_worker: false,
                 claim_worker: None,
+                task: None,
             })),
             focused_path: Vec::new(),
             zoomed: false,
+            parked: false,
         }],
     }])
 }
@@ -188,6 +191,7 @@ fn a_real_topology_change_still_rejects_the_commit() {
             claim_ended: false,
             not_claim_worker: false,
             claim_worker: None,
+            task: None,
         }));
     assert_ne!(
         commit_layout_topology(&committed),

@@ -35,6 +35,48 @@ use crate::verdict::{EXIT_USAGE, PhaseReport, Report};
 /// Default build directory for the oracle workspace (`*.noindex` so Spotlight skips it).
 const ORACLE_TARGET: &str = "libc-oracle/target.noindex";
 
+/// Maximum size (256 MiB) accepted when reading source, union, log, or rustdoc JSON files.
+pub(crate) const MAX_ORACLE_FILE_BYTES: u64 = 256 << 20;
+
+pub(crate) fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    if meta.len() > MAX_ORACLE_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds 256 MiB limit",
+        ));
+    }
+    let cap = usize::try_from(meta.len().min(MAX_ORACLE_FILE_BYTES)).unwrap_or(0);
+    let mut buf = Vec::with_capacity(cap);
+    file.take(MAX_ORACLE_FILE_BYTES + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_ORACLE_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file grew past 256 MiB limit while reading",
+        ));
+    }
+    Ok(buf)
+}
+
+pub(crate) fn read_regular_text(path: &Path) -> std::io::Result<String> {
+    String::from_utf8(read_regular_file(path)?)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 const USAGE: &str = "\
 aterm-libc-oracle — check crates/aterm-libc against reference libc 0.2.186 on the native ABI cell
 (`targo --unverified verify libc` runs this gate)
@@ -253,7 +295,7 @@ fn harvest_verb(root: PathBuf, args: Args) -> ExitCode {
         return ExitCode::from(EXIT_USAGE);
     };
     let log_path = args.log.clone().unwrap_or_default();
-    let log = match std::fs::read(&log_path) {
+    let log = match read_regular_file(&log_path) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(error) => {
             eprintln!("aterm-libc-oracle: {}: {error}", log_path.display());

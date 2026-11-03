@@ -4894,6 +4894,7 @@ fn a_ledger_row_round_trips_as_one_bounded_line() {
         to: Some(long.clone()),
         sid: Some(format!("s-1\u{2028}{long}")),
         why: format!("failed:\r\n\t{long}"),
+        pk: None,
     };
     let line = hostile.to_json_line();
     assert!(!line.contains(['\n', '\r', '\u{2028}']));

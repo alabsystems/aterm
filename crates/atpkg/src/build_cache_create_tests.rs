@@ -446,6 +446,455 @@ fn an_explicit_managed_producer_refuses_unknown_output_but_queries_and_defaults_
     );
 }
 
+/// What cargo writes into `CACHEDIR.TAG` as it makes a build directory itself (it writes none
+/// into a folder that stood before it was named), as cargo 1.47 onward and targo write it.
+const CARGO_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
+                         # This file is a cache directory tag created by cargo.\n\
+                         # For information about cache directory tags see https://bford.info/cachedir/\n";
+
+/// `root` as a build left it before any registration: the folder cargo made, its tag, the
+/// rustc facts it keeps, and one profile with its lock and an artifact.
+fn cargo_laid(root: &Path) {
+    std::fs::DirBuilder::new().mode(0o755).create(root).unwrap();
+    std::fs::write(root.join("CACHEDIR.TAG"), CARGO_TAG).unwrap();
+    std::fs::write(root.join(".rustc_info.json"), b"{}").unwrap();
+    std::fs::create_dir_all(root.join("debug/deps")).unwrap();
+    std::fs::write(root.join("debug/.cargo-lock"), b"").unwrap();
+    std::fs::write(root.join("debug/deps/libprobe.rlib"), b"reusable output").unwrap();
+}
+
+fn producer_machine(world: &World) -> super::super::super::Machine<'_> {
+    super::super::super::Machine {
+        home: Some(&world.home),
+        root: None,
+        cwd: Some(&world.owner),
+        env: &|_| None,
+        read: &|_| Ok(None),
+        writable: &|_| Some(true),
+    }
+}
+
+fn build_into(world: &World, target: &Path) -> Vec<String> {
+    vec![
+        "--unverified".into(),
+        "build".into(),
+        format!(
+            "--manifest-path={}",
+            world.owner.join("Cargo.toml").display()
+        ),
+        format!("--target-dir={}", target.display()),
+    ]
+}
+
+#[test]
+fn a_target_cargo_made_before_registration_is_adopted_where_it_stands() {
+    // A build keeps its rustc facts at the target's top, or in the build leaf cargo also makes
+    // when the shim names it.
+    for facts in ["top", "leaf"] {
+        let world = World::new();
+        cargo_laid(&world.target);
+        if facts == "leaf" {
+            let leaf = world.target.join(super::super::super::TARGET_BUILD_LEAF);
+            std::fs::DirBuilder::new()
+                .mode(0o755)
+                .create(&leaf)
+                .unwrap();
+            std::fs::write(leaf.join("CACHEDIR.TAG"), CARGO_TAG).unwrap();
+            std::fs::rename(
+                world.target.join(".rustc_info.json"),
+                leaf.join(".rustc_info.json"),
+            )
+            .unwrap();
+        }
+        let before = identity(&world.target).unwrap();
+        let machine = producer_machine(&world);
+        let tool = super::super::super::Tool::Targo;
+        let args = build_into(&world, &world.target);
+        assert!(
+            super::super::observe_for_producer(&args, tool, &world.home, &machine, true).unwrap(),
+            "{facts}: a target cargo made is admitted, not refused"
+        );
+        assert_eq!(
+            identity(&world.target),
+            Some(before.clone()),
+            "{facts}: the same folder, neither moved nor replaced"
+        );
+        assert_eq!(
+            std::fs::read(world.target.join("debug/deps/libprobe.rlib")).unwrap(),
+            b"reusable output"
+        );
+        assert_eq!(
+            std::fs::read_to_string(world.target.join("CACHEDIR.TAG")).unwrap(),
+            CARGO_TAG,
+            "{facts}: cargo's tag is left as cargo wrote it"
+        );
+        let receipt = read(&world.record()).unwrap();
+        assert!(super::super::same(&world.home, &receipt), "{facts}");
+        assert_eq!(receipt.identity, before);
+        assert_eq!(receipt.owners, vec![world.owner.clone()]);
+        assert!(!receipt.owners_unknown && receipt.package.is_none() && !receipt.retained);
+        assert_eq!(roots(&world.home).len(), 1);
+        let recorded = std::fs::read(world.record()).unwrap();
+        assert!(
+            super::super::observe_for_producer(&args, tool, &world.home, &machine, true).unwrap(),
+            "{facts}: the next build is admitted from the record"
+        );
+        assert_eq!(std::fs::read(world.record()).unwrap(), recorded);
+    }
+}
+
+#[test]
+fn a_folder_cargo_did_not_make_as_its_build_directory_is_never_adopted() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for case in [
+        "untagged",
+        "atpkg-tag",
+        "other-tag",
+        "linked-tag",
+        "tag-group-writable",
+        "tag-hardlinked",
+        "never-built",
+        "linked-rustc-info",
+        "source",
+        "shared",
+        "marked",
+        "coordinator",
+        "leaf-marked",
+        "leaf-linked",
+        "nested",
+        "shared-cache",
+    ] {
+        let mut world = World::new();
+        if case == "shared-cache" {
+            world.target = super::super::super::cache_root(&world.home).join("legacy.noindex");
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(world.target.parent().unwrap())
+                .unwrap();
+        }
+        cargo_laid(&world.target);
+        let tag = world.target.join("CACHEDIR.TAG");
+        match case {
+            "untagged" => std::fs::remove_file(&tag).unwrap(),
+            "atpkg-tag" => std::fs::write(&tag, cache_tag_bytes()).unwrap(),
+            "other-tag" => std::fs::write(
+                &tag,
+                "Signature: 8a477f597d28d172789f06886806bc55\n# made by another tool\n",
+            )
+            .unwrap(),
+            "linked-tag" => {
+                let elsewhere = world.home.join("CACHEDIR.TAG");
+                std::fs::rename(&tag, &elsewhere).unwrap();
+                std::os::unix::fs::symlink(&elsewhere, &tag).unwrap();
+            }
+            "tag-group-writable" => {
+                std::fs::set_permissions(&tag, std::fs::Permissions::from_mode(0o664)).unwrap();
+            }
+            "tag-hardlinked" => std::fs::hard_link(&tag, world.home.join("CACHEDIR.TAG")).unwrap(),
+            // Cargo tags its home's git and registry caches where they stand, and never builds
+            // in them: `~/.cargo/git` holds the tag, `db` and `checkouts`, and no rustc facts.
+            "never-built" => {
+                std::fs::remove_file(world.target.join(".rustc_info.json")).unwrap();
+                std::fs::create_dir(world.target.join("db")).unwrap();
+                std::fs::create_dir(world.target.join("checkouts")).unwrap();
+            }
+            "linked-rustc-info" => {
+                let facts = world.target.join(".rustc_info.json");
+                let elsewhere = world.home.join("rustc_info.json");
+                std::fs::rename(&facts, &elsewhere).unwrap();
+                std::os::unix::fs::symlink(&elsewhere, &facts).unwrap();
+            }
+            "source" => std::fs::write(world.target.join("Cargo.lock"), b"").unwrap(),
+            "shared" => {
+                std::fs::set_permissions(&world.target, std::fs::Permissions::from_mode(0o775))
+                    .unwrap();
+            }
+            "marked" => std::fs::write(world.target.join(MARKER), b"unknown schema").unwrap(),
+            "coordinator" => {
+                std::fs::write(world.target.join(super::super::package::COORDINATOR), b"").unwrap();
+            }
+            "leaf-marked" => {
+                let leaf = world.target.join(super::super::super::TARGET_BUILD_LEAF);
+                std::fs::create_dir(&leaf).unwrap();
+                std::fs::write(leaf.join(super::super::package::COORDINATOR), b"").unwrap();
+            }
+            "leaf-linked" => {
+                let elsewhere = world.home.join("leaf.noindex");
+                std::fs::create_dir(&elsewhere).unwrap();
+                std::os::unix::fs::symlink(
+                    &elsewhere,
+                    world.target.join(super::super::super::TARGET_BUILD_LEAF),
+                )
+                .unwrap();
+            }
+            "nested" => {
+                assert!(
+                    create_checked(
+                        &world.home,
+                        &world.target.join("inner.noindex"),
+                        &world.owner
+                    )
+                    .unwrap()
+                );
+            }
+            "shared-cache" => {}
+            _ => unreachable!(),
+        }
+        let held = std::fs::read(world.target.join("debug/deps/libprobe.rlib")).unwrap();
+        let registered = roots(&world.home).len();
+        let admitted = create_checked(&world.home, &world.target, &world.owner);
+        if case == "marked" {
+            assert!(
+                admitted.is_err(),
+                "{case}: declared custody it cannot record stops the build"
+            );
+        } else {
+            assert!(!admitted.unwrap(), "{case}: not adopted");
+        }
+        if case != "marked" {
+            assert!(
+                !world.target.join(MARKER).exists(),
+                "{case}: no custody declared"
+            );
+        }
+        assert!(read(&world.record()).is_none(), "{case}: nothing recorded");
+        assert_eq!(roots(&world.home).len(), registered, "{case}");
+        assert_eq!(
+            std::fs::read(world.target.join("debug/deps/libprobe.rlib")).unwrap(),
+            held,
+            "{case}: its contents stand"
+        );
+    }
+}
+
+#[test]
+fn an_adopted_target_stays_while_its_workspace_does_and_is_retired_once_it_goes() {
+    let world = World::new();
+    cargo_laid(&world.target);
+    assert!(world.admit().unwrap());
+    let later = std::time::SystemTime::now() + Duration::from_secs(2 * 24 * 60 * 60);
+    let pass = || {
+        super::super::reclaim(
+            &world.home,
+            later,
+            super::super::super::RECLAIM_GONE,
+            None,
+            &mut |_, _| true,
+        )
+    };
+    assert!(pass().is_empty(), "its workspace stands");
+    assert_eq!(
+        std::fs::read(world.target.join("debug/deps/libprobe.rlib")).unwrap(),
+        b"reusable output"
+    );
+    std::fs::remove_dir_all(&world.owner).unwrap();
+    assert!(
+        matches!(pass().as_slice(), [(path, super::super::super::Unused::Gone { .. })] if path == &world.target),
+        "the registered authority retires what ordinary cleanup no longer may"
+    );
+    assert!(!world.target.exists());
+}
+
+#[test]
+fn a_folder_renamed_away_while_it_is_adopted_keeps_no_marker() {
+    let world = World::new();
+    cargo_laid(&world.target);
+    let target = world.target.clone();
+    let aside = world.home.join("aside.noindex");
+    let moved = aside.clone();
+    faults::set(move |point| {
+        if point == Point::Adopted {
+            std::fs::rename(&target, &moved).unwrap();
+        }
+        Some(())
+    });
+    let fault = Fault;
+    assert!(
+        world.admit().is_err(),
+        "no build admitted on a folder that moved"
+    );
+    drop(fault);
+    assert!(
+        !aside.join(MARKER).exists(),
+        "no marker names a path its folder left"
+    );
+    assert_eq!(
+        std::fs::read(aside.join("debug/deps/libprobe.rlib")).unwrap(),
+        b"reusable output"
+    );
+    assert!(!super::super::same(
+        &world.home,
+        &read(&world.record()).unwrap()
+    ));
+}
+
+#[test]
+fn a_marker_that_appears_while_a_folder_is_adopted_is_never_replaced() {
+    let world = World::new();
+    cargo_laid(&world.target);
+    let marker = world.target.join(MARKER);
+    let written = marker.clone();
+    faults::set(move |point| {
+        if point == Point::Adopted {
+            std::fs::write(&written, b"another custody").unwrap();
+        }
+        Some(())
+    });
+    let fault = Fault;
+    assert!(world.admit().is_err());
+    drop(fault);
+    assert_eq!(std::fs::read(&marker).unwrap(), b"another custody");
+    assert!(
+        std::fs::read_dir(&world.target).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".aterm-adopting-")),
+        "the unpublished marker file is gone"
+    );
+}
+
+#[test]
+fn an_adoption_on_record_is_never_finished_on_another_folder() {
+    let world = World::new();
+    cargo_laid(&world.target);
+    let fault = stop_at(Point::Adopted);
+    assert!(world.admit().is_err());
+    drop(fault);
+    let intent = read(&world.record()).unwrap();
+    std::fs::rename(&world.target, world.home.join("first.noindex")).unwrap();
+    cargo_laid(&world.target);
+    let second = identity(&world.target).unwrap();
+    assert!(
+        world.admit().unwrap(),
+        "the folder now at the path is adopted in its own right"
+    );
+    let adopted = read(&world.record()).unwrap();
+    assert_eq!(adopted.identity, second);
+    assert_ne!(
+        adopted.nonce, intent.nonce,
+        "a receipt of another inode finishes nothing here"
+    );
+    assert!(super::super::same(&world.home, &adopted));
+    assert!(!world.home.join("first.noindex").join(MARKER).exists());
+}
+
+#[test]
+fn a_registered_target_cargo_made_again_after_it_went_is_adopted_anew() {
+    for case in ["rebuilt", "kept", "untagged"] {
+        let world = World::new();
+        assert!(
+            world.admit().unwrap(),
+            "{case}: a fresh creation registers it"
+        );
+        let first = read(&world.record()).unwrap();
+        // The new folder is made while the first still stands, so it never reuses its inode.
+        let gone = world.home.join("gone.noindex");
+        std::fs::rename(&world.target, &gone).unwrap();
+        cargo_laid(&world.target);
+        std::fs::remove_dir_all(&gone).unwrap();
+        match case {
+            "rebuilt" => {}
+            // A keep is a person's, never ordinary custody a build may replace.
+            "kept" => {
+                let mut kept = first.clone();
+                kept.schema = 4;
+                kept.retained = true;
+                write(&world.record(), &kept).unwrap();
+            }
+            "untagged" => std::fs::remove_file(world.target.join("CACHEDIR.TAG")).unwrap(),
+            _ => unreachable!(),
+        }
+        let rebuilt = identity(&world.target).unwrap();
+        let recorded = std::fs::read(world.record()).unwrap();
+        if case == "rebuilt" {
+            assert!(
+                world.admit().unwrap(),
+                "a target a build outside atpkg made again is adopted, not refused"
+            );
+            let receipt = read(&world.record()).unwrap();
+            assert!(super::super::same(&world.home, &receipt));
+            assert_eq!(receipt.identity, rebuilt);
+            assert_ne!(receipt.nonce, first.nonce);
+            assert_eq!(receipt.owners, vec![world.owner.clone()]);
+            assert_eq!(
+                std::fs::read(world.target.join("debug/deps/libprobe.rlib")).unwrap(),
+                b"reusable output"
+            );
+        } else {
+            assert!(!world.admit().unwrap(), "{case}: not adopted");
+            assert!(!world.target.join(MARKER).exists(), "{case}");
+            assert_eq!(
+                std::fs::read(world.record()).unwrap(),
+                recorded,
+                "{case}: the record stands"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_record_of_this_very_folder_that_adoption_did_not_write_is_neither_finished_nor_replaced() {
+    for case in ["owners-unknown", "no-owner"] {
+        let world = World::new();
+        cargo_laid(&world.target);
+        let fault = stop_at(Point::Adopted);
+        assert!(world.admit().is_err());
+        drop(fault);
+        let mut changed = read(&world.record()).unwrap();
+        match case {
+            "owners-unknown" => changed.owners_unknown = true,
+            "no-owner" => changed.owners.clear(),
+            _ => unreachable!(),
+        }
+        write(&world.record(), &changed).unwrap();
+        let recorded = std::fs::read(world.record()).unwrap();
+        assert!(!world.admit().unwrap(), "{case}: not adopted");
+        assert!(!world.target.join(MARKER).exists(), "{case}");
+        assert_eq!(
+            std::fs::read(world.record()).unwrap(),
+            recorded,
+            "{case}: the record stands"
+        );
+    }
+}
+
+#[test]
+fn an_adoption_stopped_before_its_marker_is_finished_by_the_next_build() {
+    let world = World::new();
+    cargo_laid(&world.target);
+    let before = identity(&world.target).unwrap();
+    let fault = stop_at(Point::Adopted);
+    assert!(world.admit().is_err(), "no build admitted on failure");
+    drop(fault);
+    let intent = read(&world.record()).unwrap();
+    assert!(!world.target.join(MARKER).exists());
+    assert!(
+        !super::super::same(&world.home, &intent),
+        "a receipt without its marker grants nothing"
+    );
+    assert!(roots(&world.home).is_empty());
+    assert!(
+        ordinary_clearance(&world.home, &world.target).is_err(),
+        "ordinary cleaners already stay out"
+    );
+    assert!(
+        world.admit().unwrap(),
+        "a later build finishes the adoption"
+    );
+    let after = read(&world.record()).unwrap();
+    assert_eq!(after, intent, "the adoption on record is the one finished");
+    assert!(super::super::same(&world.home, &after));
+    assert_eq!(identity(&world.target), Some(before));
+
+    // A receipt whose marker went while its folder no longer proves cargo made it stays unfinished.
+    std::fs::remove_file(world.target.join(MARKER)).unwrap();
+    std::fs::remove_file(world.target.join("CACHEDIR.TAG")).unwrap();
+    assert!(!world.admit().unwrap());
+    assert!(!world.target.join(MARKER).exists());
+}
+
 const CHILD_HOME: &str = "ATPKG_TEST_CREATION_HOME";
 const CHILD_POINT: &str = "ATPKG_TEST_CREATION_POINT";
 const CHILD_REGISTRAR: &str = "ATPKG_TEST_CREATION_REGISTRAR";
@@ -534,6 +983,37 @@ fn legacy_and_required_shim_argv_cannot_acknowledge_unmanaged_explicit_output() 
         } else {
             assert!(!world.target.exists(), "a help query creates no target");
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_shims_registrar_admits_a_target_cargo_made_before_registration() {
+    for mode in ["legacy", "required"] {
+        let world = World::new();
+        cargo_laid(&world.target);
+        let before = identity(&world.target).unwrap();
+        let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "build_cache::registered::creation::tests::creation_crash_child_if_asked",
+                "--nocapture",
+            ])
+            .current_dir(&world.owner)
+            .env_clear()
+            .env("HOME", &world.home)
+            .env(CHILD_HOME, &world.home)
+            .env(CHILD_REGISTRAR, mode);
+        let result = aterm_uds::deadline::ends_within(&mut command, HANG);
+        assert_eq!(result.status.code(), Some(0), "{mode}: {result:?}");
+        let receipt = read(&world.record()).unwrap();
+        assert!(super::super::same(&world.home, &receipt), "{mode}");
+        assert_eq!(receipt.identity, before, "{mode}");
+        assert_eq!(
+            std::fs::read(world.target.join("debug/deps/libprobe.rlib")).unwrap(),
+            b"reusable output"
+        );
     }
 }
 

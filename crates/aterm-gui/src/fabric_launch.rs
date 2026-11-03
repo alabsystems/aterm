@@ -157,7 +157,13 @@ pub(crate) fn spawn_supervisor(config: &crate::app_config::Config) -> bool {
 #[cfg(not(test))]
 pub(crate) fn command_on_disk() -> Option<Vec<String>> {
     let config = crate::app_config::config_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|path| {
+            aterm_uds::atomic_file::read_regular_text(
+                &path,
+                aterm_uds::atomic_file::MAX_CONFIG_BYTES,
+            )
+            .ok()
+        })
         .and_then(|text| crate::app_config::Config::parse(&text).ok())
         .unwrap_or_default();
     configured_command(&config)

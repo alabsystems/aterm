@@ -324,7 +324,46 @@ fn api_refusals_print_the_report_and_exit_by_kind() {
         "ref=refs/tags/v1",
     ]);
     assert_eq!(ran.exit, 4, "stderr {}", ran.stderr);
+    // The permit's refusal prints the report too, as every write verb's does (§4.6.20).
+    assert_eq!(ran.report()["outcome"], Value::from("refused"));
+    assert_eq!(ran.report()["dry_run"], Value::from(false));
+    // A dry run's refusal says it was a dry run, as the release verbs' reports do.
+    let ran = bare.run(&[
+        "api",
+        "-X",
+        "POST",
+        "/repos/alabsystems/aterm/git/refs",
+        "-f",
+        "ref=refs/tags/v1",
+        "--dry-run",
+    ]);
+    assert_eq!(ran.exit, 4, "stderr {}", ran.stderr);
+    assert_eq!(ran.report()["outcome"], Value::from("refused"));
+    assert_eq!(ran.report()["dry_run"], Value::from(true));
     assert!(bare.fake.seen().is_empty(), "{:?}", bare.fake.seen());
+}
+
+/// A Usage refusal of the permit prints no report, as every write verb's does (plan §10
+/// body 1.5): `--anonymous` on a write, dry run or not, is exit 2 with nothing sent.
+#[test]
+fn an_anonymous_api_write_prints_no_report() {
+    let w = World::new("api-anonymous", true);
+    for dry_run in [false, true] {
+        let mut typed = post_tag("v1");
+        typed.push("--anonymous".into());
+        if dry_run {
+            typed.push("--dry-run".into());
+        }
+        let ran = w.run(&args(&typed));
+        assert_eq!(ran.exit, 2, "dry run {dry_run}: stderr {}", ran.stderr);
+        assert_eq!(ran.stdout, "", "dry run {dry_run}");
+        assert_eq!(
+            ran.error()["sub"],
+            Value::from("policy.anonymous_writer_read"),
+            "dry run {dry_run}"
+        );
+    }
+    assert!(w.fake.seen().is_empty(), "{:?}", w.fake.seen());
 }
 
 #[test]

@@ -242,7 +242,7 @@ fn built_by_cargo(root: &Path, rel: &str) -> bool {
     else {
         return false;
     };
-    let Ok(manifest) = std::fs::read_to_string(root.join(dir).join("Cargo.toml")) else {
+    let Ok(manifest) = crate::read_regular_text(root.join(dir).join("Cargo.toml")) else {
         return false;
     };
     let Ok(inside) = path.strip_prefix(dir) else {
@@ -444,7 +444,7 @@ pub struct Editions {
 impl Editions {
     #[must_use]
     pub fn new(root: &Path) -> Self {
-        let workspace = std::fs::read_to_string(root.join("Cargo.toml"))
+        let workspace = crate::read_regular_text(root.join("Cargo.toml"))
             .ok()
             .and_then(|t| toml_edition(&t))
             .unwrap_or_else(|| "2024".to_string());
@@ -468,7 +468,7 @@ impl Editions {
         let found = dir
             .ancestors()
             .find_map(|d| {
-                let text = std::fs::read_to_string(self.root.join(d).join("Cargo.toml")).ok()?;
+                let text = crate::read_regular_text(self.root.join(d).join("Cargo.toml")).ok()?;
                 if toml_workspace_edition(&text) {
                     Some(self.workspace.clone())
                 } else {
@@ -493,7 +493,7 @@ impl Editions {
             .ancestors()
             .find_map(|d| {
                 ["rustfmt.toml", ".rustfmt.toml"].iter().find_map(|name| {
-                    toml_edition(&std::fs::read_to_string(self.root.join(d).join(name)).ok()?)
+                    toml_edition(&crate::read_regular_text(self.root.join(d).join(name)).ok()?)
                 })
             })
             .unwrap_or_else(|| "2015".to_string());

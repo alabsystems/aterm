@@ -6,7 +6,12 @@ use crate::native_updater_service::ApplyMode;
 #[test]
 fn a_worker_that_skips_verification_offers_the_grant_the_lane_admitted() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
-    for grant_chunks in [true, false] {
+    for (grant_chunks, grant_empty, sessionless) in [
+        (true, false, false),
+        (false, false, false),
+        (false, true, true),
+        (true, true, false),
+    ] {
         let mut app = crate::App::headless_for_test();
         let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
             crate::running_build_number().saturating_add(1),
@@ -30,6 +35,8 @@ fn a_worker_that_skips_verification_offers_the_grant_the_lane_admitted() {
             command: std::process::Command::new("/usr/bin/true"),
             verify_staged_candidate: false,
             grant_chunks,
+            grant_empty,
+            sessionless,
             installed_activation: false,
             bundle: None,
             cancel,
@@ -42,8 +49,16 @@ fn a_worker_that_skips_verification_offers_the_grant_the_lane_admitted() {
         let job = job_rx.try_recv().expect("the worker's job was sent");
         assert!(!job.verify_staged_candidate, "PRECONDITION");
         assert_eq!(
-            job.successor_grant_chunks, grant_chunks,
+            (job.successor_grant_chunks, job.successor_grant_empty),
+            (grant_chunks, grant_empty),
             "the successor is offered exactly the grant the lane admitted"
+        );
+        assert_eq!(
+            app.update_handoff_prelaunch
+                .as_ref()
+                .map(|prelaunch| prelaunch.sessionless),
+            Some(sessionless),
+            "a zero-session prelaunch is recorded as one, so its late park hands over none"
         );
         app.update_handoff_prelaunch = None;
     }
@@ -75,6 +90,8 @@ fn a_worker_that_skips_verification_still_refuses_a_raised_floor() {
         command: std::process::Command::new("/usr/bin/true"),
         verify_staged_candidate: false,
         grant_chunks: false,
+        grant_empty: false,
+        sessionless: false,
         installed_activation: false,
         bundle: None,
         cancel,
@@ -204,6 +221,8 @@ fn a_worker_that_verifies_keeps_its_verdict_for_the_booking() {
         command: std::process::Command::new("/usr/bin/true"),
         verify_staged_candidate: true,
         grant_chunks: false,
+        grant_empty: false,
+        sessionless: false,
         installed_activation: false,
         bundle: None,
         cancel,

@@ -3,6 +3,7 @@
 
 //! Whole-app capture property.
 
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::PoisonError;
 
 use aterm_core::terminal::TerminalCheckpoint;
@@ -45,23 +46,37 @@ fn enter_scratch(label: &str) -> ScratchEnv {
     ScratchEnv::home(&format!("app-{label}"))
 }
 
-fn openpty() -> (i32, i32) {
-    aterm_pty::open_pty_pair().expect("open_pty_pair")
+fn openpty() -> (OwnedFd, OwnedFd) {
+    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+    // SAFETY: open_pty_pair returned two newly owned descriptors. Fixtures only
+    // lend the master to stubs; these owners close both ends even on unwind.
+    unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
 }
 
 /// Every session of a desk on its own real, quiet PTY. The capture polls a
 /// mid-sequence session's master for queued output (a stub's `-1` would read
 /// as activity), and the manifest writer refuses a descriptor below 3.
-#[derive(Default)]
 struct DeskPtys {
-    pairs: Vec<(u64, i32, i32)>,
+    // The stubs borrow these masters and have no live shell/reader that owns
+    // them. Close both ends on unwind, before releasing the shared PTY lease.
+    pairs: Vec<(u64, OwnedFd, OwnedFd)>,
+    _lease: aterm_pty::test_budget::Lease,
+}
+
+impl Default for DeskPtys {
+    fn default() -> Self {
+        Self {
+            pairs: Vec::new(),
+            _lease: aterm_pty::test_budget::Lease::take().expect("dense PTY fixture lease"),
+        }
+    }
 }
 
 impl DeskPtys {
     fn window_session(&mut self, id: u64) -> crate::Session {
         let (master, slave) = openpty();
         let mut session = crate::stub_session(id);
-        session.master = master;
+        session.master = master.as_raw_fd();
         self.pairs.push((id, master, slave));
         session
     }
@@ -81,7 +96,7 @@ impl DeskPtys {
                 .get_mut(&id)
                 .expect("the session is pooled")
                 .session
-                .master = master;
+                .master = master.as_raw_fd();
             self.pairs.push((id, master, slave));
         }
     }
@@ -93,10 +108,7 @@ impl DeskPtys {
             }
         }
         drop(app);
-        for (_, master, slave) in self.pairs {
-            aterm_pty::close_fd(master);
-            aterm_pty::close_fd(slave);
-        }
+        drop(self);
     }
 }
 

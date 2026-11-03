@@ -324,6 +324,21 @@ fn terminal_tab_ids(
         .collect()
 }
 
+/// Put terminal tab `tab` and its pane tree into `ws` as the front tab, where [`crate::tab_model::TabSet::push`] seats it: the projection follows the suffix of parked tabs, so `layouts` stays in canonical order.
+pub(crate) fn land_terminal_tab(
+    ws: &mut WindowState,
+    views: &crate::tab_model::ViewStore,
+    tree: pane::PaneTree,
+    tab: crate::tab_model::Tab,
+) -> Result<(), crate::tab_model::DuplicateTabId> {
+    let id = tab.id;
+    ws.tab_set.push(tab)?;
+    let at = terminal_projection_index(&ws.tab_set, views, id).unwrap_or(ws.layouts.len());
+    ws.layouts.insert(at, tree);
+    ws.tabs = TabIndex::new(at, ws.layouts.len());
+    Ok(())
+}
+
 /// If canonical focus names a terminal, point the compatibility mirror at the corresponding terminal projection entry.
 pub(crate) fn align_terminal_projection_to_active(
     ws: &mut WindowState,
@@ -345,6 +360,55 @@ fn remove_terminal_projection(ws: &mut WindowState, projection_index: usize) {
         let was_last = ws.tabs.close(projection_index);
         debug_assert!(!was_last);
     }
+}
+
+/// Apply `change`, which moves tab `moved` within `ws.tab_set`, and carry its pane tree and the mirror's active entry along with it. Whether `change` moved anything.
+pub(crate) fn reorder_with_projection(
+    ws: &mut WindowState,
+    views: &crate::tab_model::ViewStore,
+    moved: crate::tab_model::TabId,
+    change: impl FnOnce(&mut crate::tab_model::TabSet) -> bool,
+) -> bool {
+    let terminal_before = terminal_tab_ids(&ws.tab_set, views);
+    let held = terminal_before.get(ws.tabs.active).copied();
+    if !change(&mut ws.tab_set) {
+        return false;
+    }
+    let terminal_after = terminal_tab_ids(&ws.tab_set, views);
+    if let (Some(old), Some(new)) = (
+        terminal_before.iter().position(|id| *id == moved),
+        terminal_after.iter().position(|id| *id == moved),
+    ) && old != new
+    {
+        let tree = ws.layouts.remove(old);
+        ws.layouts.insert(new, tree);
+    }
+    if let Some(held) = held
+        && let Some(index) = terminal_after.iter().position(|id| *id == held)
+    {
+        ws.tabs.active = index;
+    }
+    align_terminal_projection_to_active(ws, views);
+    true
+}
+
+/// The tab a chip's menu and marks speak for: `tab`, except that the Workers chip speaks for the worker it shows in place of the list.
+fn chip_subject<'a>(
+    ws: &'a WindowState,
+    tab: &'a crate::tab_model::Tab,
+) -> &'a crate::tab_model::Tab {
+    if ws.tab_set.home() == Some(tab.id)
+        && let Some(shown) = ws.tab_set.active().filter(|active| active.parked)
+    {
+        return shown;
+    }
+    tab
+}
+
+/// Whether `ws`'s active tab cannot leave for another window: a parked worker, which moves to a tab first, or the Workers tab, with workers or without. A list is its window's own: only the window's [`crate::tab_model::TabSet::home`] is published to and retired, and the other window, with no home of its own or one already, would hold a list nothing reads or two.
+fn workers_stay_in_window(ws: &WindowState) -> bool {
+    ws.tab_set.active_is_parked()
+        || (ws.tab_set.home().is_some() && ws.tab_set.home() == ws.tab_set.active_id())
 }
 
 /// Cancel a DEFERRED last-tab close on `ws`.
@@ -452,6 +516,10 @@ impl App {
             .pool
             .get(session)
             .and_then(|session| session.handoff_local_id);
+        let sid = self
+            .pool
+            .get(session)
+            .map(|session| session.ctx.self_id.as_str().to_string());
         if self.pool.views(session) == Some(1) {
             self.rewind_end(session, "the pane Rewind showed closed");
         }
@@ -464,6 +532,9 @@ impl App {
             self.chrome_labels.retire(session);
             self.retire_session_status(session);
             self.retire_presence(session);
+            if let Some(sid) = sid {
+                self.note_manager_gone(&sid);
+            }
             crate::harness_host::look_at_upgrades_soon();
             self.session_chrome.remove(&session);
             self.session_chrome_retry.remove(&session);
@@ -578,12 +649,17 @@ impl App {
         true
     }
 
+    /// Keeps a closed tab on the person's reopen stack, never a worker's: a parked tab is not one
+    /// the person had, whoever closed it, and a manager closing its workers would bury theirs.
     fn retain_closed_tab(
         &mut self,
         window: WindowId,
         original_index: usize,
         tab: crate::restore::RestoredTab,
     ) {
+        if tab.parked {
+            return;
+        }
         let now_ms = self.lat_epoch.elapsed().as_millis() as u64;
         self.closed_recovery.tabs.push(
             crate::closed_recovery::ClosedTab {
@@ -1039,7 +1115,7 @@ impl App {
         ));
         let presentation = crate::tab_model::TabPresentation {
             title: "System State".into(),
-            icon: Some(crate::tab_model::TabIconKind::Settings),
+            icon: Some(crate::tab_model::TabIconKind::SystemState),
             indicators: crate::tab_model::TabIndicators::default(),
             conn: None,
             closable: true,
@@ -1363,6 +1439,9 @@ impl App {
             .tabs()
             .iter()
             .map(|tab| {
+                if let Some(title) = self.workers_chip_title(ws, tab) {
+                    return (title, None, None);
+                }
                 let fallback = if !tab.presentation.title.is_empty() {
                     tab.presentation.title.clone()
                 } else {
@@ -1546,18 +1625,24 @@ impl App {
         let tabs: Vec<(
             Option<crate::session_chrome::TerminalMenuOrigin>,
             Option<String>,
+            Option<crate::tab_model::TabId>,
         )> = self.windows.get(&wid).map_or_else(Vec::new, |ws| {
             ws.tab_set
                 .tabs()
                 .iter()
                 .map(|tab| {
+                    // The Workers chip's menu is the shown worker's, as its title names it, so
+                    // each of its rows acts on the worker's tab.
+                    let subject = chip_subject(ws, tab);
+                    let menu_tab = (subject.id != tab.id).then_some(subject.id);
+                    let focus = subject.focus;
                     let origin = self
                         .view_store
-                        .get(tab.focus)
+                        .get(focus)
                         .copied()
                         .and_then(crate::tab_model::View::terminal_session)
                         .map(|session| crate::session_chrome::TerminalMenuOrigin {
-                            view: tab.focus,
+                            view: focus,
                             session,
                         });
                     let tooltip = if origin.is_none() {
@@ -1565,7 +1650,7 @@ impl App {
                     } else {
                         None
                     };
-                    (origin, tooltip)
+                    (origin, tooltip, menu_tab)
                 })
                 .collect()
         });
@@ -1573,23 +1658,31 @@ impl App {
         let ext: Vec<crate::session_chrome::TabChromeExt> = tabs
             .iter()
             .enumerate()
-            .map(|(i, (origin, presentation_tooltip))| match origin {
-                Some(origin) => {
-                    let label = titles.get(i).map_or("", String::as_str);
-                    let mut ext =
-                        self.composed_session_chrome(wid, origin.session, label, &mut edges);
-                    ext.bind_terminal_origin(*origin);
-                    ext
-                }
-                None => crate::session_chrome::TabChromeExt {
-                    tooltip: presentation_tooltip.clone(),
-                    menu: Vec::new(),
+            .map(
+                |(i, (origin, presentation_tooltip, menu_tab))| match origin {
+                    Some(origin) => {
+                        let label = titles.get(i).map_or("", String::as_str);
+                        let mut ext =
+                            self.composed_session_chrome(wid, origin.session, label, &mut edges);
+                        ext.bind_terminal_origin(*origin);
+                        ext.menu_tab = *menu_tab;
+                        ext
+                    }
+                    None => crate::session_chrome::TabChromeExt {
+                        tooltip: presentation_tooltip.clone(),
+                        menu: Vec::new(),
+                        menu_tab: None,
+                    },
                 },
-            })
+            )
             .collect();
         if let Some(ws) = self.windows.get_mut(&wid) {
-            for (i, ((origin, _), ext)) in tabs.iter().zip(&ext).enumerate() {
+            for (i, ((origin, ..), ext)) in tabs.iter().zip(&ext).enumerate() {
                 if origin.is_some()
+                    && ws
+                        .tab_set
+                        .home()
+                        .is_none_or(|home| ws.tab_set.tab_at(i).is_none_or(|tab| tab.id != home))
                     && let Some(tab) = ws.tab_set.tab_at_mut(i)
                     && tab.presentation.tooltip != ext.tooltip
                 {
@@ -1848,6 +1941,7 @@ impl App {
         let ext = chrome::TabChromeExt {
             tooltip: chrome::compose_tooltip(&input),
             menu: chrome::compose_tab_menu(&input),
+            menu_tab: None,
         };
         self.session_chrome.insert(
             session,
@@ -1975,7 +2069,7 @@ impl App {
         let active = self
             .windows
             .get(&wid)
-            .and_then(|ws| ws.tab_set.active_index())
+            .and_then(|ws| ws.tab_set.strip_active())
             .unwrap_or(0);
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2111,7 +2205,7 @@ impl App {
     fn detach_active_tab_in_window_logical(&mut self, wid_a: WindowId) -> Option<WindowId> {
         let (stable_tab, terminal_index, tree, rows, cols) = {
             let ws = self.windows.get(&wid_a)?;
-            if ws.tab_set.len() <= 1 {
+            if ws.tab_set.len() <= 1 || workers_stay_in_window(ws) {
                 return None;
             }
             let stable_tab = ws.tab_set.active()?.clone();
@@ -2219,14 +2313,14 @@ impl App {
         {
             if is_terminal_tab(&tab, &self.view_store) {
                 let tree = tree.expect("detached terminal tab keeps its PaneTree projection");
-                ws_a.layouts.push(tree);
-                ws_a.tabs.add();
+                land_terminal_tab(ws_a, &self.view_store, tree, tab)
+                    .expect("returned tab id remains unique");
             } else {
                 debug_assert!(tree.is_none());
+                ws_a.tab_set
+                    .push(tab)
+                    .expect("returned tab id remains unique");
             }
-            ws_a.tab_set
-                .push(tab)
-                .expect("returned tab id remains unique");
             align_terminal_projection_to_active(ws_a, &self.view_store);
         }
         self.winit_to_window.retain(|_, &mut v| v != wid_b);
@@ -2270,6 +2364,13 @@ impl App {
             let Some(ws) = self.windows.get(&wid_a) else {
                 return Err("the focused window is gone");
             };
+            if workers_stay_in_window(ws) {
+                return Err(if ws.tab_set.active_is_parked() {
+                    "a worker moves to a tab before it moves to another window"
+                } else {
+                    "the Workers tab stays in its window: it lists only that window's workers"
+                });
+            }
             let Some(stable_tab) = ws.tab_set.active().cloned() else {
                 return Err("this window has no active tab to move");
             };
@@ -2294,13 +2395,11 @@ impl App {
             align_terminal_projection_to_active(ws, &self.view_store);
         }
         if let Some(ws) = self.windows.get_mut(&wid_b) {
-            if let Some(tree) = tree.as_ref() {
-                ws.layouts.push(tree.clone());
-                ws.tabs.add();
+            match tree.as_ref() {
+                Some(tree) => land_terminal_tab(ws, &self.view_store, tree.clone(), stable_tab),
+                None => ws.tab_set.push(stable_tab).map(|_| ()),
             }
-            ws.tab_set
-                .push(stable_tab)
-                .expect("moved tab id is process-unique");
+            .expect("moved tab id is process-unique");
             align_terminal_projection_to_active(ws, &self.view_store);
         }
         // `frontmost_window` is left to the OS: B's `Focused(true)` moves it
@@ -2396,6 +2495,29 @@ impl App {
     #[cfg(test)]
     pub(crate) fn push_stub_tab(&mut self, wid: WindowId, session: crate::Session) {
         self.install_new_tab(wid, session);
+    }
+
+    /// Test-only: close the tab holding `session` as its program's end does.
+    #[cfg(test)]
+    pub(crate) fn close_session_tab_for_test(&mut self, session: u64) -> bool {
+        let found = self.windows.iter().find_map(|(wid, ws)| {
+            ws.tab_set
+                .tabs()
+                .iter()
+                .position(|tab| {
+                    self.view_store
+                        .get(tab.focus)
+                        .copied()
+                        .and_then(crate::tab_model::View::terminal_session)
+                        == Some(session)
+                })
+                .map(|at| (*wid, at))
+        });
+        let Some((wid, at)) = found else {
+            return false;
+        };
+        self.close_tab_via_verb(wid, Some(at));
+        true
     }
 
     /// Test-only: split window `wid`'s active tab vertically, spawning a stub session for the new focused pane, through the [`Self::install_split_session`] body a split lands through ([`Self::install_split_pane`]).
@@ -2731,12 +2853,14 @@ impl App {
                 tl.task().map(|t| crate::status_item::TaskRow {
                     state: t.state,
                     why: t.why,
+                    finished: t.finished,
                     from: t.from.clone(),
                     entered: t.entered,
                     since_unix_ms: t.since_unix_ms,
                     result_bytes: t.result_bytes,
                     result_path: t.result_path.clone(),
                     seen: false,
+                    own_report: crate::task_record::reports_its_own_end(t.trusted_cwd.as_deref()),
                 }),
                 glass_end.and_then(|end| tl.task_face_at(end.face.task_face())),
                 receipt,
@@ -2926,7 +3050,7 @@ impl App {
             }
         }
         if let (Some(done), Some(task)) = (carry.done, &row.task)
-            && task.state == crate::task_record::TaskState::Done
+            && task.state.has_an_end_to_read()
             && task.since_unix_ms == done
         {
             self.mark_done_seen(session, task.entered);
@@ -3075,9 +3199,7 @@ impl App {
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .task()
-                        .filter(|t| {
-                            t.state == crate::task_record::TaskState::Done && t.entered == *entered
-                        })
+                        .filter(|t| t.state.has_an_end_to_read() && t.entered == *entered)
                         .map(|t| t.since_unix_ms)
                 });
                 (id, carry, banner)
@@ -3309,7 +3431,7 @@ impl App {
                     .task()
                     .map(|t| (t.state, t.entered))
             })
-            .filter(|(state, _)| *state == crate::task_record::TaskState::Done)
+            .filter(|(state, _)| state.has_an_end_to_read())
             .map(|(_, entered)| entered);
         if let Some(entered) = done {
             self.mark_done_seen(session, entered);
@@ -3995,7 +4117,7 @@ impl App {
         session: crate::Session,
         parent: Option<aterm_session::SessionId>,
     ) {
-        self.install_tab_session_at(owner, session, parent, None);
+        self.install_tab_session_at(owner, session, parent, None, false);
     }
 
     /// [`Self::install_tab_session`] for a tab that lands behind the one at index `kept` (a wire `spawn` that does not raise).
@@ -4006,7 +4128,21 @@ impl App {
         parent: Option<aterm_session::SessionId>,
         kept: usize,
     ) {
-        self.install_tab_session_at(owner, session, parent, Some(kept));
+        self.install_tab_session_at(owner, session, parent, Some(kept), false);
+    }
+
+    /// [`Self::install_tab_session`] for a worker: its tab lands parked, behind what the window shows, and the sync that follows opens the window's Workers tab when this is its first.
+    pub(crate) fn install_tab_session_parked(
+        &mut self,
+        owner: WindowId,
+        session: crate::Session,
+        parent: Option<aterm_session::SessionId>,
+    ) {
+        let kept = self
+            .windows
+            .get(&owner)
+            .and_then(|ws| ws.tab_set.active_index());
+        self.install_tab_session_at(owner, session, parent, kept, true);
     }
 
     fn install_tab_session_at(
@@ -4015,21 +4151,23 @@ impl App {
         session: crate::Session,
         parent: Option<aterm_session::SessionId>,
         behind: Option<usize>,
+        parked: bool,
     ) {
         let id = session.id;
         Self::register_session(&self.store, &session, parent);
         let layout = pane::PaneTree::new(id);
-        let tab = crate::register_terminal_tab(&mut self.tab_ids, &mut self.view_store, &layout)
-            .expect("tab/view identity space");
+        let mut tab =
+            crate::register_terminal_tab(&mut self.tab_ids, &mut self.view_store, &layout)
+                .expect("tab/view identity space");
+        tab.parked = parked;
         self.pool_insert(session);
         if let Some(ws) = self.windows.get_mut(&owner) {
-            ws.layouts.push(layout);
-            ws.tabs.add();
-            ws.tab_set.push(tab).expect("fresh tab id");
-            if let Some(front) = behind
+            // By identity: a shown tab seated at the boundary moves a parked front along.
+            let front = behind
                 .and_then(|kept| ws.tab_set.tab_at(kept))
-                .map(|t| t.id)
-            {
+                .map(|t| t.id);
+            land_terminal_tab(ws, &self.view_store, layout, tab).expect("fresh tab id");
+            if let Some(front) = front {
                 let switched = ws.tab_set.switch_to(front);
                 debug_assert!(switched);
                 if let Some(index) = terminal_projection_index(&ws.tab_set, &self.view_store, front)
@@ -4075,6 +4213,17 @@ impl App {
         self.palette_sync_native_scope(wid);
     }
 
+    /// Cmd-1..9: the `i`th tab the strip draws; past them, nothing (a parked worker has no chip).
+    pub(crate) fn switch_shown_tab_in(&mut self, wid: WindowId, i: usize) {
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| i < ws.tab_set.shown_len())
+        {
+            self.switch_tab_in(wid, i);
+        }
+    }
+
     /// Cmd-Shift-] / Cmd-Shift-[: cycle to the next/previous tab, wrapping.
     #[cfg_attr(
         any(test, debug_assertions),
@@ -4096,20 +4245,13 @@ impl App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        if ws.tab_set.len() <= 1 {
+        if ws.tab_set.shown_len() <= 1 && !ws.tab_set.active_is_parked() {
             return;
         }
-        let terminal_only = ws.tab_set.len() == ws.layouts.len();
-        let Some(next) = ws.tab_set.cycle(forward) else {
+        let Some(next) = ws.tab_set.cycle_shown(forward) else {
             return;
         };
-        if terminal_only {
-            let projected = ws.tabs.cycle(forward);
-            debug_assert_eq!(
-                terminal_projection_index(&ws.tab_set, &self.view_store, next),
-                Some(projected)
-            );
-        } else if let Some(index) = terminal_projection_index(&ws.tab_set, &self.view_store, next) {
+        if let Some(index) = terminal_projection_index(&ws.tab_set, &self.view_store, next) {
             ws.tabs.switch_to(index);
         }
         if self.frontmost_window == Some(wid) {
@@ -4219,6 +4361,16 @@ impl App {
                 if to >= count {
                     return Err(no_such(to));
                 }
+                let shown = self
+                    .windows
+                    .get(&wid)
+                    .map_or(count, |ws| ws.tab_set.shown_len());
+                if (from < shown) != (to < shown) {
+                    return Err(format!(
+                        "tab move: {from} and {to} sit either side of the parked workers \
+                         (from {shown}); a worker leaves them by Move to Tab"
+                    ));
+                }
                 self.move_tab(wid, from, to);
             }
         }
@@ -4270,26 +4422,10 @@ impl App {
         if from >= n || to >= n || from == to {
             return;
         }
-        let terminal_before = terminal_tab_ids(&ws.tab_set, views);
-        let parked = terminal_before.get(ws.tabs.active).copied();
         let stable_id = ws.tab_set.tab_at(from).expect("canonical tab in range").id;
-        let reordered = ws.tab_set.reorder(stable_id, to);
-        debug_assert!(reordered);
-        let terminal_after = terminal_tab_ids(&ws.tab_set, views);
-        if let (Some(old), Some(new)) = (
-            terminal_before.iter().position(|id| *id == stable_id),
-            terminal_after.iter().position(|id| *id == stable_id),
-        ) && old != new
-        {
-            let tree = ws.layouts.remove(old);
-            ws.layouts.insert(new, tree);
+        if !reorder_with_projection(ws, views, stable_id, |tabs| tabs.reorder(stable_id, to)) {
+            return;
         }
-        if let Some(parked) = parked
-            && let Some(index) = terminal_after.iter().position(|id| *id == parked)
-        {
-            ws.tabs.active = index;
-        }
-        align_terminal_projection_to_active(ws, views);
         if self.frontmost_window == Some(wid) {
             self.sync_active_session();
         } else {
@@ -4362,14 +4498,18 @@ impl App {
         let active = self
             .windows
             .get(&wid)
-            .and_then(|ws| ws.tab_set.active_index())
+            .and_then(|ws| ws.tab_set.strip_active())
             .unwrap_or(0);
+        let shown = self
+            .windows
+            .get(&wid)
+            .map_or(titles.len(), |ws| ws.tab_set.shown_len());
         let ids: Vec<crate::tab_model::TabId> =
             self.windows.get(&wid).map_or_else(Vec::new, |ws| {
                 ws.tab_set.tabs().iter().map(|tab| tab.id).collect()
             });
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.strip_shadow.set((titles.len(), active));
+            ws.strip_shadow.set((shown, active));
             ws.tab_title_epochs
                 .retain(|sid, _| label_sessions.contains(&Some(*sid)));
             ws.tab_chrome_titles
@@ -4403,11 +4543,11 @@ impl App {
             self.apprt.set_toolbar_tabs(
                 handle,
                 crate::platform::ToolbarTabsModel {
-                    titles: &chrome_titles,
-                    ids: &ids,
-                    metadata: &metadata,
-                    tooltips: &tooltips,
-                    ext: &ext,
+                    titles: &chrome_titles[..shown.min(chrome_titles.len())],
+                    ids: &ids[..shown.min(ids.len())],
+                    metadata: &metadata[..shown.min(metadata.len())],
+                    tooltips: &tooltips[..shown.min(tooltips.len())],
+                    ext: &ext[..shown.min(ext.len())],
                     active,
                     pill: pill.as_ref(),
                 },
@@ -4504,6 +4644,10 @@ impl App {
             return None;
         }
         if self.active_native_view(window).is_some() {
+            if self.workers_tab_holds(window, stable_tab) {
+                self.workers_tab_close_refused();
+                return None;
+            }
             let was_last = self
                 .windows
                 .get(&window)
@@ -5072,6 +5216,9 @@ impl App {
                 Some((tab.id, tab.root.leaves(), window.tab_set.len() == 1))
             })
             .ok_or_else(|| "window has no active tab".to_string())?;
+        if self.workers_tab_holds(wid, tab_id) {
+            return Err(crate::app_workers::WORKERS_TAB_STAYS.to_string());
+        }
         if self.defer_pending_update_handoff_teardown(crate::DeferredHandoffTeardown::mutation(
             crate::DeferredHandoffMutation::CloseTab {
                 window: wid,
@@ -5320,6 +5467,7 @@ impl App {
                     root: crate::restore::RestoredSplitTree::leaf(candidate.value.view.clone()),
                     focused_path: Vec::new(),
                     zoomed: false,
+                    parked: false,
                 },
                 index,
             )?;
@@ -5809,6 +5957,16 @@ impl App {
         if !self.tab_strip_enabled() {
             return false;
         }
+        // The Workers chip's press means the worker it shows, without going back to the list.
+        let index = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| {
+                let tab = ws.tab_set.tabs().get(index)?;
+                let subject = chip_subject(ws, tab).id;
+                ws.tab_set.tabs().iter().position(|tab| tab.id == subject)
+            })
+            .unwrap_or(index);
         let Some(tab) = self
             .windows
             .get(&wid)
@@ -5855,14 +6013,14 @@ impl App {
 
     /// The keyboard entry point (the Menu key; Shift+F10 too under `tab_menu_chord = "on"`).
     pub(crate) fn open_active_tab_context_menu(&mut self, wid: WindowId) -> bool {
-        let Some(index) = self
+        let Some((index, chip)) = self
             .windows
             .get(&wid)
-            .and_then(|ws| ws.tab_set.active_index())
+            .and_then(|ws| Some((ws.tab_set.active_index()?, ws.tab_set.strip_active()?)))
         else {
             return false;
         };
-        let anchor = self.tab_chip_anchor_col(wid, index);
+        let anchor = self.tab_chip_anchor_col(wid, chip);
         self.open_tab_context_menu(wid, index, anchor, true)
     }
 

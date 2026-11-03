@@ -8,7 +8,7 @@ use crate::harness::footer;
 /// How long one shift+tab of a mode return may take to show on Claude's screen before the host calls it failed.
 pub const SETTLE_MS: u64 = 2500;
 
-/// How many shift+tab presses a mode toggle may spend on its way back to an expected mode.
+/// How many shift+tab presses a mode toggle may spend on its way to its [`Goal`].
 pub const MAX_MODE_PRESSES: u8 = 5;
 
 /// One light of the row; the permission mode is the only one.
@@ -30,13 +30,68 @@ impl Light {
         }
     }
 
-    /// The title a hover or the keyboard selection shows.
+    /// The light's name, as an accessibility label names it (`Permission mode: yolo.`); the
+    /// glass title says what the state does instead ([`Mode::gist`]), beside a chip that already
+    /// shows the state's word.
     #[must_use]
     pub const fn title(self) -> &'static str {
         match self {
             Light::Mode => "Permission mode",
         }
     }
+}
+
+/// Where a click on a light sends it: the state it does not show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Goal {
+    /// Back to an expected mode (bypass or auto): the click on an Off light.
+    On,
+    /// To manual mode (`lame` on a rewritten row): the click on an On light.
+    Off,
+}
+
+impl Goal {
+    /// The goal a click on the light showing `mode` has, the state it does not show:
+    /// [`Goal::Off`] from an expected mode (the light On), [`Goal::On`] from any other.
+    #[must_use]
+    pub const fn of_mode(mode: Mode) -> Goal {
+        if mode.is_expected() {
+            Goal::Off
+        } else {
+            Goal::On
+        }
+    }
+
+    /// Whether `mode` is where the toggle is going: an expected mode for [`Goal::On`], manual
+    /// mode for [`Goal::Off`].
+    #[must_use]
+    pub const fn reached(self, mode: Mode) -> bool {
+        match self {
+            Goal::On => mode.is_expected(),
+            Goal::Off => matches!(mode, Mode::Manual),
+        }
+    }
+
+    /// Where it goes, as a title's click clause names it (`yolo or auto`, `lame`; on Claude's own
+    /// row `bypass or auto`, `manual`).
+    #[must_use]
+    pub fn words(self, rewritten: bool) -> String {
+        match self {
+            Goal::On => format!("{} or auto", Mode::Bypass.word_on_glass(rewritten)),
+            Goal::Off => Mode::Manual.word_on_glass(rewritten).to_owned(),
+        }
+    }
+}
+
+/// The ink a mode's chip is drawn in ([`Mode::ink`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModeInk {
+    /// The ink of the composer's bottom rule the chip sits on: bypass, the default, named quietly.
+    Rule,
+    /// The mode's own hue, as Claude's pill wears it (auto's warning amber).
+    Hue([u8; 3]),
+    /// The row's plain ink: a mode the owner does not expect, drawn as plainly as Claude's text.
+    Row,
 }
 
 /// What a light shows.
@@ -111,15 +166,50 @@ impl Mode {
         }
     }
 
-    /// How a title names the mode as a place (`stopped in plan mode`): the word and ` mode`, but a rewritten row's word alone (`stopped in manual mode`), which is a state already ([`Self::word_on_glass`]).
+    /// The glyph the light draws before its word: none on a rewritten row for the two ends of a
+    /// click, an expected mode and manual (`yolo`, `auto`, `lame`), so the toggle between them is a
+    /// word for a word; Claude's pill glyph ([`Self::glyph`]) everywhere else (`⏸ plan`).
     #[must_use]
-    pub fn named_on_glass(self, rewritten: bool) -> std::borrow::Cow<'static, str> {
-        let word = self.word_on_glass(rewritten);
-        if word == self.word() {
-            format!("{word} mode").into()
+    pub fn glyph_on_glass(self, rewritten: bool) -> &'static str {
+        if rewritten && (self.is_expected() || matches!(self, Mode::Manual)) {
+            ""
         } else {
-            word.into()
+            self.glyph()
         }
+    }
+
+    /// How a title names the mode as a place: its word on glass and ` mode` (`stopped in plan mode`, `stopped in lame mode`, [`Self::word_on_glass`]).
+    #[must_use]
+    pub fn named_on_glass(self, rewritten: bool) -> String {
+        format!("{} mode", self.word_on_glass(rewritten))
+    }
+
+    /// What the mode does, as the light's title says it first: a phrase with no ` — ` or ` · `,
+    /// so a title cut to its head ([`Self::claude_name`] and the click clause follow it) is this.
+    #[must_use]
+    pub const fn gist(self) -> &'static str {
+        match self {
+            Mode::Bypass => "no permission prompts",
+            Mode::Auto => "a classifier answers prompts",
+            Mode::AcceptEdits => "edits without asking",
+            Mode::DontAsk => "denies unapproved",
+            Mode::Plan => "plans before it acts",
+            Mode::Manual => "asks before each tool",
+        }
+    }
+
+    /// Claude Code's own name for the mode: its pill's words without the trailing ` on`
+    /// (`bypass permissions`, `manual mode`), which a title gives where the chip wears aterm's word
+    /// for it instead (`yolo`, `lame`).
+    #[must_use]
+    pub fn claude_name(self) -> &'static str {
+        footer::PILLS
+            .iter()
+            .find(|pill| Mode::of_indicator(pill.id) == Some(self))
+            .map_or("", |pill| {
+                let words = aterm_phase::anchor(pill.id);
+                words.strip_suffix(" on").unwrap_or(words)
+            })
     }
 
     /// The pill glyph Claude draws before the mode, from the vendor's table (`footer::PILLS`): `⏸` for plan and manual, `⏵⏵` for the rest.
@@ -131,13 +221,15 @@ impl Mode {
             .map_or("", |pill| pill.glyph)
     }
 
-    /// The mode's own ink where Claude gives it one (bypass's red, auto's warning amber); `None` draws it in the row's plain ink.
+    /// The ink the mode's chip is drawn in: bypass in the rule's own ink (`yolo` is the default
+    /// and reads as quietly as the rule it sits on, never Claude's red; the owner, 2026-11-02),
+    /// auto in its pill's warning amber, every other mode in the row's plain ink.
     #[must_use]
-    pub const fn hue(self) -> Option<[u8; 3]> {
+    pub const fn ink(self) -> ModeInk {
         match self {
-            Mode::Bypass => Some([0xE0, 0x5A, 0x5A]),
-            Mode::Auto => Some([0xE8, 0xB0, 0x3C]),
-            _ => None,
+            Mode::Bypass => ModeInk::Rule,
+            Mode::Auto => ModeInk::Hue([0xE8, 0xB0, 0x3C]),
+            _ => ModeInk::Row,
         }
     }
 }
@@ -234,7 +326,7 @@ impl Reading {
     }
 }
 
-/// Whether `light` shows something the owner does not expect: the one reason a light is drawn at rest, and the one state a click acts in.
+/// Whether `light` shows something the owner does not expect: the reason a light is drawn at rest on Claude's own row (on a row the glass rewrites every known mode is drawn, the light being the mode's one home); a click acts in either state ([`Goal::of_mode`]).
 #[must_use]
 pub fn deviates(light: Light, reading: &Reading) -> bool {
     reading.state(light) == LightState::Off
@@ -249,7 +341,7 @@ pub fn read(screen: Option<&Screen>) -> Reading {
     })
 }
 
-/// shift+tab, as a terminal sends it: the mode light's one input.
+/// shift+tab, as a terminal sends it: the mode light's one input, pressed until its [`Goal`].
 pub const SHIFT_TAB: &[u8] = b"\x1b[Z";
 
 #[cfg(test)]
@@ -319,26 +411,106 @@ mod tests {
     }
 
     /// THE LIGHT IS THE MODE'S ONE NAME (review C8): where the glass rewrites the
-    /// mode row bypass reads `yolo` and manual `manual mode`, and a title names them
-    /// by the word alone (`manual mode`, not `manual mode mode`).
+    /// mode row bypass reads `yolo` and manual `lame`, each with no glyph, and a title
+    /// names every mode as its word and ` mode` (`stopped in lame mode`).
     #[test]
     fn the_lights_word_follows_the_rewritten_row_and_only_under_its_gate() {
         assert_eq!(Mode::Bypass.word_on_glass(true), footer::YOLO_ON);
         assert_eq!(Mode::Bypass.word_on_glass(true), "yolo");
         assert_eq!(Mode::Manual.word_on_glass(true), footer::YOLO_OFF);
-        assert_eq!(Mode::Manual.named_on_glass(true), "manual mode");
+        assert_eq!(Mode::Manual.word_on_glass(true), "lame");
+        assert_eq!(Mode::Manual.named_on_glass(true), "lame mode");
         assert_eq!(Mode::Bypass.word_on_glass(false), "bypass");
         assert_eq!(Mode::Manual.word_on_glass(false), "manual");
         assert_eq!(Mode::Manual.named_on_glass(false), "manual mode");
         for mode in [Mode::Auto, Mode::AcceptEdits, Mode::DontAsk, Mode::Plan] {
             for rewritten in [true, false] {
                 assert_eq!(mode.word_on_glass(rewritten), mode.word(), "{mode:?}");
+            }
+        }
+        for mode in ALL_MODES {
+            for rewritten in [true, false] {
                 assert_eq!(
                     mode.named_on_glass(rewritten),
-                    format!("{} mode", mode.word()),
+                    format!("{} mode", mode.word_on_glass(rewritten)),
                     "{mode:?}"
                 );
             }
+            let bare = mode.is_expected() || mode == Mode::Manual;
+            assert_eq!(mode.glyph_on_glass(true).is_empty(), bare, "{mode:?}");
+            assert_eq!(mode.glyph_on_glass(false), mode.glyph(), "{mode:?}");
+        }
+    }
+
+    /// Every mode, in the order Claude's pill table lists them.
+    const ALL_MODES: [Mode; 6] = [
+        Mode::Bypass,
+        Mode::Auto,
+        Mode::AcceptEdits,
+        Mode::DontAsk,
+        Mode::Plan,
+        Mode::Manual,
+    ];
+
+    /// WHAT THE LIGHT'S TITLE SAYS: each mode's gist is a phrase a title can be cut to (no
+    /// ` — `, no ` · `), Claude's own name is its pill's words without ` on`, and the click's
+    /// goal is the state the light does not show: yolo and auto go to manual (`lame`), every
+    /// other mode back to yolo or auto.
+    #[test]
+    fn each_mode_says_what_it_does_and_where_a_click_takes_it() {
+        for mode in ALL_MODES {
+            let gist = mode.gist();
+            assert!(
+                !gist.is_empty() && !gist.contains(" \u{2014} ") && !gist.contains(" \u{b7} "),
+                "{mode:?}: {gist:?}"
+            );
+            let id = footer::PILLS
+                .iter()
+                .find(|pill| Mode::of_indicator(pill.id) == Some(mode))
+                .expect("a pill")
+                .id;
+            assert_eq!(
+                format!("{} on", mode.claude_name()),
+                aterm_phase::anchor(id),
+                "{mode:?}"
+            );
+            let at = Reading {
+                mode: Some(mode),
+                pill: true,
+            };
+            let goal = Goal::of_mode(mode);
+            assert_eq!(
+                goal == Goal::Off,
+                at.state(Light::Mode) == LightState::On,
+                "{mode:?}"
+            );
+            assert!(
+                !goal.reached(mode),
+                "{mode:?}: a click always moves the mode"
+            );
+        }
+        assert_eq!(Mode::Bypass.claude_name(), "bypass permissions");
+        assert_eq!(Mode::Manual.claude_name(), "manual mode");
+        assert!(Goal::Off.reached(Mode::Manual));
+        assert!(Goal::On.reached(Mode::Bypass) && Goal::On.reached(Mode::Auto));
+        assert_eq!(Goal::On.words(true), "yolo or auto");
+        assert_eq!(Goal::Off.words(true), "lame");
+        assert_eq!(Goal::On.words(false), "bypass or auto");
+        assert_eq!(Goal::Off.words(false), "manual");
+    }
+
+    /// YOLO IS DRAWN IN THE RULE'S INK, NEVER RED (the owner, 2026-11-02): bypass takes the
+    /// rule's own ink, auto keeps its pill's amber, every other mode the row's plain ink.
+    #[test]
+    fn yolo_wears_the_rules_ink_and_auto_its_amber() {
+        assert_eq!(Mode::Bypass.ink(), ModeInk::Rule);
+        assert_eq!(Mode::Auto.ink(), ModeInk::Hue([0xE8, 0xB0, 0x3C]));
+        for mode in ALL_MODES {
+            assert_eq!(
+                matches!(mode.ink(), ModeInk::Row),
+                !mode.is_expected(),
+                "{mode:?}"
+            );
         }
     }
 
@@ -352,10 +524,10 @@ mod tests {
         }
     }
 
-    /// The mode light deviates in every mode but bypass and auto, so a click
-    /// never presses away from either.
+    /// The mode light deviates in every mode but bypass and auto (on Claude's own row, the reason
+    /// it is drawn at rest).
     #[test]
-    fn each_toggle_is_claudes_own_input() {
+    fn only_a_mode_the_owner_does_not_expect_deviates() {
         let at = |mode: Mode| Reading {
             mode: Some(mode),
             pill: true,
@@ -364,10 +536,7 @@ mod tests {
             assert!(deviates(Light::Mode, &at(mode)), "{mode:?}");
         }
         for mode in [Mode::Bypass, Mode::Auto] {
-            assert!(
-                !deviates(Light::Mode, &at(mode)),
-                "{mode:?}: never pressed away from"
-            );
+            assert!(!deviates(Light::Mode, &at(mode)), "{mode:?}: expected");
         }
     }
 

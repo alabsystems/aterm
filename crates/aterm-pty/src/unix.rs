@@ -896,6 +896,164 @@ fn fresh_kit(ws: &libc::winsize) -> io::Result<SpawnKit> {
     Ok(kit)
 }
 
+#[cfg(any(test, debug_assertions))]
+fn ensure_above_stdio(fd: &mut libc::c_int) -> io::Result<()> {
+    if *fd > libc::STDERR_FILENO {
+        return Ok(());
+    }
+    // SAFETY: `*fd` is an open descriptor owned by the caller's `SpawnKit`; `F_DUPFD_CLOEXEC`
+    // duplicates it onto the lowest free descriptor `> STDERR_FILENO` with `FD_CLOEXEC`.
+    let moved = unsafe { libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, libc::STDERR_FILENO + 1) };
+    if moved < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: closing the old descriptor number now that `moved` owns the duplicate.
+    unsafe {
+        libc::close(*fd);
+    }
+    *fd = moved;
+    Ok(())
+}
+
+/// Spawns a test's session-leading child on a fresh close-on-exec PTY `(master, slave)` whose
+/// slave is the child's controlling terminal (`setsid` + `TIOCSCTTY` on stdin, with all
+/// descriptors above stdio stripped via [`aterm_uds::spawnfd::InheritNothing`]).
+///
+/// Guards against XNU's pty minor-teardown race (`ATERM-KI-1028-4`) up to `exec` the same way
+/// [`spawn_shell_with_pid_cell_px`] does: checks [`dead_pty`] before each fork, checks
+/// `TIOCSCTTY` (`T`) and post-`TIOCSCTTY` `fstat`/`tcgetattr` on stdin (`D`) in the child, and
+/// replaces at most [`DEAD_PTY_REPLACEMENTS`] dead pty while still holding the dead one open so
+/// the replacement gets a distinct minor. Any non-pty spawn error (such as `setsid` or `exec`
+/// failing) returns `Err` immediately with no replacement.
+///
+/// # Errors
+/// Returns an `io::Error` if opening or replacing a pty fails, if `build` fails on a live pty,
+/// if two consecutive ptys die before `exec`, or if `Command::spawn` fails for a non-pty reason.
+#[cfg(any(test, debug_assertions))]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn spawn_session_leader_on_pty(
+    mut build: impl FnMut(&std::os::fd::OwnedFd) -> io::Result<aterm_uds::spawnfd::StdCommand>,
+) -> io::Result<(
+    std::os::fd::OwnedFd,
+    std::os::fd::OwnedFd,
+    std::process::Child,
+)> {
+    use aterm_uds::spawnfd::InheritNothing as _;
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    use std::os::unix::process::CommandExt as _;
+
+    let ws = libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let mut kit = fresh_kit(&ws)?;
+    let mut deaths: Vec<String> = Vec::new();
+    loop {
+        if let Some(died_of) = dead_pty(kit.master, kit.slave) {
+            let dead = std::mem::replace(&mut kit, replace_dead_pty(&mut deaths, died_of, &ws)?);
+            drop(dead);
+            continue;
+        }
+        ensure_above_stdio(&mut kit.status_wr)?;
+        // SAFETY: `kit.slave` is owned by `kit` across `slave_fd`'s whole lifetime, and
+        // `ManuallyDrop` ensures `slave_fd` never closes `kit.slave`.
+        let slave_fd = std::mem::ManuallyDrop::new(unsafe { OwnedFd::from_raw_fd(kit.slave) });
+        let prep = build(&slave_fd).and_then(|mut cmd| {
+            cmd.stdin(std::process::Stdio::from(slave_fd.try_clone()?));
+            Ok(cmd)
+        });
+        let mut cmd = match prep {
+            Ok(cmd) => cmd,
+            Err(err) => match dead_pty(kit.master, kit.slave) {
+                Some(died_of) => {
+                    let dead =
+                        std::mem::replace(&mut kit, replace_dead_pty(&mut deaths, died_of, &ws)?);
+                    drop(dead);
+                    continue;
+                }
+                None => return Err(err),
+            },
+        };
+        cmd.inherit_nothing();
+        #[cfg(test)]
+        spawn_trace::forking_onto(kit.master);
+        #[cfg(all(test, target_os = "macos"))]
+        let strikes = pty_race::child_strikes(kit.master);
+        let status_wr = kit.status_wr;
+        // SAFETY: runs in the forked child before exec (after `std` placed `slave` onto fd 0
+        // and after `inherit_nothing` marked descriptors >= 3 `FD_CLOEXEC`, leaving `status_wr`
+        // open until exec). Calls only async-signal-safe `setsid`, `ioctl`, `fstat`, `tcgetattr`,
+        // and `write` on stack locals; allocates nothing and takes no locks.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                #[cfg(all(test, target_os = "macos"))]
+                pty_race::in_child(strikes.0.as_ref());
+                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0 {
+                    let err = io::Error::last_os_error();
+                    let b: u8 = b'T';
+                    libc::write(status_wr, ptr::addr_of!(b).cast::<libc::c_void>(), 1);
+                    return Err(err);
+                }
+                #[cfg(all(test, target_os = "macos"))]
+                pty_race::in_child(strikes.1.as_ref());
+                let mut st: libc::stat = std::mem::zeroed();
+                let mut t: libc::termios = std::mem::zeroed();
+                if libc::fstat(libc::STDIN_FILENO, &mut st) != 0
+                    || libc::tcgetattr(libc::STDIN_FILENO, &mut t) != 0
+                {
+                    let err = io::Error::last_os_error();
+                    let b: u8 = b'D';
+                    libc::write(status_wr, ptr::addr_of!(b).cast::<libc::c_void>(), 1);
+                    return Err(err);
+                }
+                Ok(())
+            });
+        }
+        let spawning = aterm_uds::spawn_lock::spawning();
+        let spawned = cmd.spawn();
+        drop(spawning);
+        drop(cmd);
+        match spawned {
+            Ok(child) => {
+                let (master, slave, status_rd, status_wr) = kit.into_raw();
+                // SAFETY: `status_rd` and `status_wr` are owned exclusively by `kit`, which
+                // `into_raw` consumed without dropping; `master` and `slave` transfer to
+                // `OwnedFd`.
+                unsafe {
+                    libc::close(status_rd);
+                    libc::close(status_wr);
+                    return Ok((
+                        OwnedFd::from_raw_fd(master),
+                        OwnedFd::from_raw_fd(slave),
+                        child,
+                    ));
+                }
+            }
+            Err(spawn_err) => {
+                let how = match read_exec_status_now(kit.status_rd) {
+                    Some(ExecStatus::FailedBeforeExec(b'T')) => {
+                        "the child could not make it its controlling terminal (TIOCSCTTY failed)"
+                    }
+                    Some(ExecStatus::FailedBeforeExec(b'D')) => {
+                        "it died once the child had made it its controlling terminal (fstat or \
+                         tcgetattr on it failed in the child)"
+                    }
+                    _ => return Err(spawn_err),
+                };
+                let died_of = format!("{}: {how} ({spawn_err})", pty_label(kit.master));
+                let dead =
+                    std::mem::replace(&mut kit, replace_dead_pty(&mut deaths, died_of, &ws)?);
+                drop(dead);
+            }
+        }
+    }
+}
+
 /// What this thread's spawns forked onto (tests): the name of each pty a spawn forked a child
 /// onto, in order, read in the parent before the fork.
 #[cfg(test)]

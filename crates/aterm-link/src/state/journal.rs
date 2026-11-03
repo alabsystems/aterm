@@ -101,7 +101,8 @@ pub(crate) enum Frame {
         pin: PublishPin,
     },
     /// A post's reservation forgotten, once aterm retired the post
-    /// ([`super::StateDir::clear_post_seq`]).
+    /// ([`super::StateDir::clear_post_seq`]), or once its session ended in an earlier boot
+    /// ([`super::StateDir::sweep_sessions_of_an_earlier_boot`]).
     Retire { sid: String, id: u64 },
     /// A record in flight onto this node's own lanes ([`super::StateDir::set_in_flight`]); a later
     /// one at the same sequence replaces it.

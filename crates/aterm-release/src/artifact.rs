@@ -13,7 +13,7 @@ use crate::snapshot::CacheRoot;
 mod in_use;
 
 /// The record's schema, and what the key and the bundle digest are taken under.
-pub const SCHEMA: &str = "aterm-release-artifact-v1";
+pub const SCHEMA: &str = "aterm-release-artifact-v2";
 
 /// The store entry's record, written last.
 pub const COMPLETE_FILE: &str = "COMPLETE";
@@ -29,11 +29,13 @@ pub struct Identity {
     pub commit: String,
 }
 
-/// The two compilers a build runs: the native slice's Trust `trustc` and the x86_64 slice's upstream stable `rustc`, each by its `-vV` commit-hash.
+/// The two compilers' reported commits and the content identity of their tools, libraries and SDK.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Compilers {
     pub trustc: String,
     pub rustc: String,
+    /// Content identity of the compilers, standard libraries and native SDK/tools.
+    pub inputs: String,
 }
 
 /// One slice's build, as the record keeps it.
@@ -43,6 +45,10 @@ pub struct SliceRecord {
     pub secs: u64,
     #[serde(default)]
     pub peak_bytes: Option<u64>,
+    /// Reaped build-child CPU, including descendants it waited for; absent in
+    /// older records or on hosts without resource accounting, never inferred.
+    #[serde(default)]
+    pub cpu_ns: Option<u64>,
 }
 
 /// A complete build: what it was built as, from and with, and the digests of what it made.
@@ -55,6 +61,7 @@ pub struct Complete {
     pub commit: String,
     pub trustc: String,
     pub rustc: String,
+    pub inputs: String,
     /// The snapshot digest the bytes were built from.
     pub snapshot: String,
     /// `lipo -archs` of the executable.
@@ -118,6 +125,7 @@ pub fn key(identity: &Identity, compilers: &Compilers) -> String {
         identity.commit.as_str(),
         compilers.trustc.as_str(),
         compilers.rustc.as_str(),
+        compilers.inputs.as_str(),
         "universal",
     ] {
         h.update(part.as_bytes());
@@ -217,6 +225,21 @@ pub fn read(store: &Path, key: &str) -> Result<Option<Complete>, String> {
             complete.key,
             complete.schema
         ));
+    }
+    let calculated = self::key(
+        &Identity {
+            version: complete.version.clone(),
+            build: complete.build,
+            commit: complete.commit.clone(),
+        },
+        &Compilers {
+            trustc: complete.trustc.clone(),
+            rustc: complete.rustc.clone(),
+            inputs: complete.inputs.clone(),
+        },
+    );
+    if calculated != key {
+        return Err("the COMPLETE record's build inputs do not match its cache key".into());
     }
     prove(&complete, &app_in(&dir))?;
     Ok(Some(complete))
@@ -363,6 +386,12 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
             dir.display()
         ));
     }
+    if self::compilers()? != compilers {
+        return Err(
+            "compiler or SDK inputs changed during the build; no COMPLETE record was written"
+                .into(),
+        );
+    }
     let complete = Complete {
         schema: SCHEMA.to_string(),
         key: key.clone(),
@@ -371,6 +400,7 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
         commit: identity.commit.clone(),
         trustc: compilers.trustc,
         rustc: compilers.rustc,
+        inputs: compilers.inputs,
         snapshot: built.snapshot_digest,
         archs: built.archs,
         compiler_line: built.compiler_line,
@@ -383,6 +413,7 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
                 triple: s.triple.to_string(),
                 secs: s.secs,
                 peak_bytes: s.peak_bytes,
+                cpu_ns: s.cpu_ns,
             })
             .collect(),
         index_hint,
@@ -420,6 +451,7 @@ pub fn compilers() -> Result<Compilers, String> {
     Ok(Compilers {
         trustc,
         rustc: crate::buildplan::stable_rustc_commit()?,
+        inputs: crate::build_inputs::current()?,
     })
 }
 
@@ -547,7 +579,8 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
         }
         return set_mode(to, &meta);
     }
-    let bytes = std::fs::read(from).map_err(|e| format!("read {}: {e}", from.display()))?;
+    let bytes =
+        crate::durable::read_file(from).map_err(|e| format!("read {}: {e}", from.display()))?;
     std::fs::write(to, bytes).map_err(|e| format!("write {}: {e}", to.display()))?;
     set_mode(to, &meta)
 }

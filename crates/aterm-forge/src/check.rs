@@ -913,7 +913,7 @@ fn classify(
 /// `[patch.crates-io]`, split into path forks and everything else.
 fn read_manifest_patches(root: &Path) -> Result<(Vec<PatchEntry>, Vec<String>), String> {
     let manifest = root.join("Cargo.toml");
-    let text = std::fs::read_to_string(&manifest).map_err(|e| {
+    let text = crate::read_regular_text(&manifest).map_err(|e| {
         format!(
             "cannot read {}: {e} — `targo --unverified forge check` must run against a workspace root. Fix: \
              pass `--root <workspace dir>`.",
@@ -963,7 +963,7 @@ fn read_carve_ledger(root: &Path) -> Result<Vec<Carved>, String> {
     if !file.is_file() {
         return Ok(Vec::new());
     }
-    let text = std::fs::read_to_string(&file)
+    let text = crate::read_regular_text(&file)
         .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
     parse_carve_ledger(&text, &file)
 }
@@ -1208,7 +1208,7 @@ fn dev_dependency_oracles(root: &Path, name: &str) -> Vec<(String, String)> {
 
     let mut out = Vec::new();
     for manifest in manifests {
-        let Ok(text) = std::fs::read_to_string(&manifest) else {
+        let Ok(text) = crate::read_regular_text(&manifest) else {
             continue;
         };
         let Ok(doc) = text.parse::<DocumentMut>() else {

@@ -70,7 +70,7 @@ lab-parse-launch	contract	lab::parse_launch	∀ args: parse_launch(args) = Ok(l)
 lexical-validators	contract	door::lab_socket_shape, paths::valid_tag	∀ s: lab_socket_shape(s) ⇔ ∃ n: s = "/tmp/at." ++ n ++ "/a.sock" ∧ n ≠ "" ∧ '/' ∉ n. ∀ t: valid_tag(t) ⇔ t ≠ "" ∧ |t|_bytes ≤ 24 ∧ ∀ c ∈ t: c ∈ [A-Za-z0-9_-].	door.rs::only_a_lab_shaped_socket_passes, paths.rs::tags_are_short_plain_words	strip_prefix/strip_suffix, Option::is_some_and, chars().all	1,5,7
 door-wire-pattern	contract	door::wire_pattern	∀ p: wire_pattern(p) escapes every ASCII whitespace char and '=' as "\\x" ++ hex2(c), folding a preceding unescaped '\\' into the hex escape, so the output holds no ASCII whitespace and no '='. Semantic clause: for every valid Regex(p), Regex(wire_pattern(p)) and Regex(p) denote the same language.	door.rs::a_pattern_crosses_the_wire_as_one_token	chars loop, String push/pop/push_str, format!("{:02x}"), char as u32; regex semantics	1,5,7,12
 footers-mode-word	contract	footers::mode_word, aterm_phase::anchor	∀ screen: let row = the LAST line of screen containing "⏵⏵ " or "⏸ ". mode_word(screen) = None if no such row; else the word w of the FIRST entry (glyph, id, w) of the fixed table [bypass, auto, accept-edits, dont-ask (⏵⏵); plan, manual (⏸)] such that row contains glyph ++ " " ++ anchor(id); None if no entry matches.	footers.rs::the_mode_row_names_its_mode	lines().rev().find, array-literal iterator find, format!, &'static str result, cross-crate anchor table	1,5,7,12
-footers-footer-row-pattern	contract	footers::footer_row_pattern, aterm_phase::anchors::guard_regex	∀ screen: footer_row_pattern(screen) = None ⇔ every line of screen is blank after trim; else Some(guard_regex(r)) with r = trim of the last non-blank line, and Regex(guard_regex(r)) matches r (guard_regex is a literal pattern: metacharacters escaped, whitespace as '.').	footers.rs::the_footer_row_is_the_last_row_with_text_as_a_literal_pattern	lines().rev().map(trim).find, Option::map, cross-crate regex builder	1,5,7,12
+footers-mode-row-pattern	contract	footers::mode_row_pattern, aterm_phase::anchors::guard_regex	∀ screen: let row = the LAST line of screen containing "⏵⏵ " or "⏸ " (mode_word's row). mode_row_pattern(screen) = None if no such row; else Some(guard_regex(r)) with r = trim of row, and Regex(guard_regex(r)) matches r (guard_regex is a literal pattern: metacharacters escaped, whitespace as '.'); a row under it (Claude's effort hint wrapped onto a row of its own) is never r, so a press that changes the mode and leaves that row standing is seen to change the mode row.	footers.rs::the_mode_row_is_the_pattern_a_press_waits_on	lines().rev().find, Option::map, cross-crate regex builder	1,5,7,12
 footers-done-row-pattern	equivalence	footers::DONE_ROW, screen::is_done_row, aterm_regex::Regex::is_match	∀ r: &str: Regex(DONE_ROW).is_match(r) ⇔ Regex(wire_pattern(DONE_ROW)).is_match(r) ⇔ is_done_row(r). is_done_row itself is specified in screen-idle-status.	footers.rs::the_done_row_pattern_reads_what_the_done_row_reader_reads	strip_prefix, match_indices, char-boundary slicing, a regex semantics model	1,5,7,12
 footers-opts-parse	contract	footers::Opts::parse, footers::Opts::variant	∀ args: Opts::parse(args) = Ok(o) ⇔ args matches ("--out" V | "--no-turn" | "--no-bypass" | "--columns" V | "--lines" V | "--subscriber" | "--settings" V)* with every --settings V parsing as a JSON object; o = the defaults (turn, bypass true; cols 80; lines 24; subscriber false; settings None) overridden by the flags in order (last wins). Every Err has code 2 (usage). variant(o) = "settings " ++ dump(settings, COMPACT) if settings is Some, else "the lab's default settings".	footers.rs::the_variant_is_parsed_and_named	slice iterator with a capturing FnMut closure, match on &str, JSON parse, Result<_, Fail>, PathBuf (from_caller reads the cwd: an effect)	1,3,7,8,12,13
 jail-render-rules	contract	jail::render, protected::protected_paths, paths::physical	∀ spec whose run/sockdir/state/user_tmp exist, whose quoted paths are profile_safe, whose mark is valid and whose R(run) is not inside_protected: render(spec) = Ok(p) where (a) the "(deny file-read* file-write* (" lines are exactly one per entry of Prot(home, ccsocks), in order; (b) the "(deny mach-lookup" lines are exactly MACH_DENY ++ MACH_DENY_OPEN ++ [mark]; (c) no '@' template hole survives; (d) file-write* is allowed under R(run)/scratch with a literal rule per SCRATCH_DIRS entry, and xcrun_db and unlink of R(user_tmp) are denied; (e) one trusted-write deny rule lists R(state), every lab_dir subpath, the aterm literal, the repo_target literal and physical(target)/debug and /release subpaths; (f) the unlink-deny parents rule lists every proper ancestor of those trusted paths; (g) for each agent binary b = S/name/build/… under S = home/Library/Application Support/aterm/pkg/store: file-read* is allowed on S/name/build and file-read-metadata on each ancestor from S/name up to home/Library/Application Support/aterm, none above; an agent outside the store gets no read rule; (h) a home under /private/tmp/(at|labprobe).<x>/ gets a file-write* allow on its own subpath.	jail.rs::every_protected_entry_and_mach_service_becomes_one_rule, jail.rs::the_agents_under_test_are_readable_inside_the_store_they_live_in, jail.rs::a_replica_home_in_tmp_is_left_to_its_own_rules	large format! template, Vec<String> joins, closures, Path parent walks, fs::canonicalize (effect)	1,3,5,7,8,13
@@ -196,7 +196,7 @@ src/codex.rs	a_binary_names_the_flag_across_a_block_seam	launcher-argv
 src/door.rs	only_a_lab_shaped_socket_passes	lexical-validators	
 src/door.rs	a_pattern_crosses_the_wire_as_one_token	door-wire-pattern	
 src/footers.rs	the_mode_row_names_its_mode	footers-mode-word	
-src/footers.rs	the_footer_row_is_the_last_row_with_text_as_a_literal_pattern	footers-footer-row-pattern	
+src/footers.rs	the_mode_row_is_the_pattern_a_press_waits_on	footers-mode-row-pattern	
 src/footers.rs	the_done_row_pattern_reads_what_the_done_row_reader_reads	footers-done-row-pattern	screen-idle-status
 src/footers.rs	the_variant_is_parsed_and_named	footers-opts-parse	pyjson-dumps-refines-python
 src/jail.rs	every_protected_entry_and_mach_service_becomes_one_rule	jail-render-rules	protected-inside
@@ -1123,4 +1123,22 @@ trail-contrast-judged	contract	trail_contrast::{judged,measure_cell,solid_ink_ra
 ```tsv
 file	test	primary	also
 src/trail_contrast_tests.rs	a_light_away_from_the_strokes_leaves_the_letter_its_reading	trail-contrast-judged	
+```
+
+## 26. Added 2026-11-03: what the effects did, apart from the page's own dim text
+
+`trail-contrast --lowered-min X` counts a glyph cell only where the effects took it down: its
+judged reading (§25) under X and under `LOWERED_SHARE` (0.97, the letter guard's `OWN_SHARE`) of the
+same reading on its clean twin, `clean_local_contrast`. A page's own low-contrast text (a coloured
+prompt segment) reads the same with and without the effects, and is not counted. Without a clean
+twin it is an error, never a pass. Read the same way as §1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+trail-contrast-lowered	contract	trail_contrast::{clean_judged,lowered_under,measure_cell,report}	For every measured cell c with a clean twin: report counts c under --lowered-min X iff judged(c) < X and judged(c) < LOWERED_SHARE * clean_judged(c), where clean_judged(c) = c.clean_local_contrast where measure_cell gave one, else c.clean_contrast; a cell whose reading the effects left unchanged is never counted, and --lowered-min with no clean twin is a report error.	-	1	-
+```
+
+```tsv
+file	test	primary	also
+src/trail_contrast_tests.rs	lowered_min_counts_only_the_glyphs_the_effects_took_down	trail-contrast-lowered	
 ```

@@ -2529,6 +2529,9 @@ mod tests {
             fn fleet_mail_path(&self) -> Option<std::path::PathBuf> {
                 Some(self.path.clone())
             }
+            fn fleet_mail_ready(&self) -> bool {
+                self.ctx.fleet_mail_ready()
+            }
         }
         let scratch = aterm_tempfile::tempdir().unwrap();
         let h = crate::session_store::test_handle(7);

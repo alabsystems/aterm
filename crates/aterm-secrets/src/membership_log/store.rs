@@ -12,6 +12,9 @@ use crate::{Error, Result};
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(unix)]
+mod framed;
+
 /// Largest concatenated record stream [`decode_records`] reads (`64 MiB`).
 pub const MAX_RECORDS_STREAM: usize = 64 * 1024 * 1024;
 
@@ -489,9 +492,8 @@ impl Store {
     /// [`Store::also_under`] made it.
     #[must_use]
     pub fn recovering(self, bytes: &[u8]) -> Self {
-        let mut store = self;
-        if store.ingest(bytes).is_ok() {
-            return store;
+        if let Ok(records) = decode_records(bytes) {
+            return self.recover_decoded(records, true);
         }
         let mut records = Vec::new();
         let mut at = 0usize;
@@ -510,10 +512,17 @@ impl Store {
             }
             at = end;
         }
-        for record in causal(records, |_| false) {
-            let _ = store.insert(record);
+        self.recover_decoded(records, false)
+    }
+
+    fn recover_decoded(mut self, records: Vec<Record>, strict: bool) -> Self {
+        if strict && self.ingest_records(records.clone()).is_ok() {
+            return self;
         }
-        store
+        for record in causal(records, |_| false) {
+            let _ = self.insert(record);
+        }
+        self
     }
 
     /// Encode every stored record in deterministic order: causally complete records from genesis
@@ -572,6 +581,21 @@ impl Store {
             Some(log) => log.order.len() + log.waiting.len(),
             None => self.unrooted.len(),
         }
+    }
+
+    /// Bytes in the existing wire encoding, without allocating another copy.
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) fn encoded_len(&self) -> usize {
+        self.log.as_ref().map_or_else(
+            || {
+                self.unrooted
+                    .values()
+                    .map(|record| record.bytes().len())
+                    .sum()
+            },
+            |log| log.total_bytes(),
+        )
     }
 
     /// The network's [`Log`] once its genesis is held.
@@ -813,7 +837,10 @@ impl Store {
                 && (log.order.len() + log.waiting.len() >= MAX_RECORDS
                     || log.total_bytes().saturating_add(record.bytes().len()) > MAX_RECORDS_STREAM)
             {
-                return Err(Error::new("membership log holds its limit of records"));
+                return Err(Error::of_kind(
+                    crate::ErrorKind::MembershipCapacity,
+                    "membership log holds its limit of records",
+                ));
             }
             let inserted = log.insert(record)?;
             make_room(log);
@@ -851,7 +878,8 @@ impl Store {
         if self.unrooted.len() >= MAX_WAITING - 1
             || unrooted_bytes.saturating_add(record.bytes().len()) > MAX_RECORDS_STREAM - MAX_RECORD
         {
-            return Err(Error::new(
+            return Err(Error::of_kind(
+                crate::ErrorKind::MembershipCapacity,
                 "membership log holds its limit of waiting records",
             ));
         }

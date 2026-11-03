@@ -53,13 +53,47 @@ pub(crate) fn grant_chunks_judged(
     path: &Path,
     read: std::io::Result<Option<String>>,
 ) -> Result<bool, String> {
+    grant_judged(path, read, plist_declares_grant_chunks)
+}
+
+/// What the read of the `Info.plist` at `path` says by `declares`: an absent plist, or one
+/// the system refuses for good (for example `EACCES`), declares nothing, and a momentary
+/// read error is an `Err`.
+fn grant_judged(
+    path: &Path,
+    read: std::io::Result<Option<String>>,
+    declares: fn(&str) -> bool,
+) -> Result<bool, String> {
     match read {
-        Ok(text) => Ok(text.is_some_and(|text| plist_declares_grant_chunks(&text))),
+        Ok(text) => Ok(text.is_some_and(|text| declares(&text))),
         Err(error) if aterm_update_core::handoff_policy::is_momentary_read_error(&error) => {
             Err(format!("{}: unreadable: {error}", path.display()))
         }
         Err(_) => Ok(false),
     }
+}
+
+/// The `Info.plist` key by which a bundle declares it takes a sessionless rendezvous grant.
+pub const HANDOFF_GRANT_EMPTY_KEY: &str = "<key>ATermHandoffGrantEmpty</key>";
+
+/// The value [`HANDOFF_GRANT_EMPTY_KEY`] carries in a bundle that reads sessionless grants.
+pub const HANDOFF_GRANT_EMPTY_TOKEN: &str = "empty1";
+
+/// Whether an `Info.plist`'s text declares the sessionless grant.
+#[must_use]
+pub fn plist_declares_grant_empty(text: &str) -> bool {
+    crate::manifest::xml_plist_string(text, HANDOFF_GRANT_EMPTY_KEY)
+        .is_some_and(|value| value == HANDOFF_GRANT_EMPTY_TOKEN)
+}
+
+/// Read the sessionless-grant declaration off a bundle whose signature was just verified.
+pub(crate) fn declares_grant_empty(app_root: &Path) -> Result<bool, String> {
+    let path = app_root.join("Contents/Info.plist");
+    grant_judged(
+        &path,
+        crate::read_ledger_text_checked(&path),
+        plist_declares_grant_empty,
+    )
 }
 
 /// Resolve the installed bundle the updater may replace, or `None` when it must not act:
@@ -369,5 +403,43 @@ mod tests {
     fn the_shipped_info_plist_declares_the_chunked_grant() {
         let template = include_str!("../../../apps/aterm-mac/Info.plist");
         assert!(plist_declares_grant_chunks(template));
+    }
+
+    #[test]
+    fn the_sessionless_grant_is_declared_only_by_its_exact_token() {
+        let plist = |body: &str| {
+            format!(
+                "<plist><dict><key>CFBundleVersion</key><string>7</string>{body}</dict></plist>"
+            )
+        };
+        assert!(plist_declares_grant_empty(&plist(
+            "<key>ATermHandoffGrantEmpty</key>\n\t<string>empty1</string>"
+        )));
+        for undeclared in [
+            "",
+            "<key>ATermHandoffGrantEmpty</key><string></string>",
+            "<key>ATermHandoffGrantEmpty</key><string>empty2</string>",
+            "<key>ATermHandoffGrantEmpty</key><string>true</string>",
+            "<key>ATermHandoffGrantEmpty</key><key>Other</key><string>empty1</string>",
+            "<key>ATermHandoffGrantChunks</key><string>chunks1</string>",
+        ] {
+            assert!(
+                !plist_declares_grant_empty(&plist(undeclared)),
+                "{undeclared:?} declares nothing"
+            );
+        }
+        assert!(!plist_declares_grant_empty("\u{0}bplist00 binary garbage"));
+        let both = plist(
+            "<key>ATermHandoffGrantChunks</key><string>chunks1</string>\
+             <key>ATermHandoffGrantEmpty</key><string>empty1</string>",
+        );
+        assert!(plist_declares_grant_empty(&both) && plist_declares_grant_chunks(&both));
+    }
+
+    /// This build reads sessionless grants, so the bundle it ships in declares them.
+    #[test]
+    fn the_shipped_info_plist_declares_the_sessionless_grant() {
+        let template = include_str!("../../../apps/aterm-mac/Info.plist");
+        assert!(plist_declares_grant_empty(template));
     }
 }

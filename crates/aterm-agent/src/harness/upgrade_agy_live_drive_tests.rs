@@ -136,6 +136,7 @@ struct Knobs {
 struct LiveKernel {
     exited: Arc<AtomicBool>,
     relaunched: Arc<AtomicBool>,
+    relaunched_same: Arc<AtomicBool>,
     moved: Arc<AtomicBool>,
     /// The hand was taken: a [`Between`] change stands from here on.
     changed: Arc<AtomicBool>,
@@ -198,6 +199,7 @@ impl AgyKernel for LiveKernel {
     fn exe(&self, pid: u32) -> Option<PathBuf> {
         match pid {
             TUI => Some(self.exe.clone()),
+            NEW if self.relaunched_same.load(Ordering::SeqCst) => Some(self.exe.clone()),
             NEW => Some(self.new_exe.clone()),
             _ => None,
         }
@@ -269,10 +271,15 @@ impl AgyKernel for LiveKernel {
 
     fn agy_children(&self, _: u32) -> Vec<(u32, Vec<String>)> {
         if self.relaunched.load(Ordering::SeqCst) {
+            let launched = if self.relaunched_same.load(Ordering::SeqCst) {
+                &self.exe
+            } else {
+                &self.new_exe
+            };
             vec![(
                 NEW,
                 vec![
-                    self.new_exe.to_string_lossy().into_owned(),
+                    launched.to_string_lossy().into_owned(),
                     "--effort".to_string(),
                     "high".to_string(),
                     format!("--conversation={C1}"),
@@ -588,6 +595,7 @@ impl LiveRig {
         .expect("twin");
         let exited = Arc::new(AtomicBool::new(false));
         let relaunched = Arc::new(AtomicBool::new(false));
+        let relaunched_same = Arc::new(AtomicBool::new(knobs.twin == Some(Twin::Same)));
         let moved = Arc::new(AtomicBool::new(false));
         let changed = Arc::new(AtomicBool::new(false));
         let at_signal = Arc::new(Mutex::new(None));
@@ -599,13 +607,15 @@ impl LiveRig {
         let statuses = std::sync::atomic::AtomicUsize::new(0);
         let busy = served(aterm_phase::agy::fixtures::lab::BUSY_THINKING);
         let (sock, asked) = {
-            let (exited, relaunched, moved, changed, at_signal) = (
+            let (exited, relaunched, relaunched_same, moved, changed, at_signal) = (
                 Arc::clone(&exited),
                 Arc::clone(&relaunched),
+                Arc::clone(&relaunched_same),
                 Arc::clone(&moved),
                 Arc::clone(&changed),
                 Arc::clone(&at_signal),
             );
+            let exe_str = exe.to_string_lossy().into_owned();
             let generated = generated.clone();
             let record = state.join("upgrade").join(format!("agy-{TAB}.json"));
             let knobs = knobs.clone();
@@ -686,6 +696,9 @@ impl LiveRig {
                     }
                     "turn" => {
                         if line.contains("'--conversation=") {
+                            if line.contains(&exe_str) {
+                                relaunched_same.store(true, Ordering::SeqCst);
+                            }
                             relaunched.store(true, Ordering::SeqCst);
                         }
                         "OK 0 turn submitted=1 status=settled seq=1 id=1".to_string()
@@ -727,6 +740,7 @@ impl LiveRig {
             kernel: LiveKernel {
                 exited,
                 relaunched,
+                relaunched_same,
                 moved,
                 changed,
                 lock,
@@ -2336,4 +2350,79 @@ fn an_agy_switched_via_slash_model_with_a_large_transcript_rotates_at_an_individ
         "{}",
         typed[0]
     );
+}
+
+/// NEGATIVE CONTROL: when the owner skips or defers a newer `agy` build, hitting a quota wall
+/// rotates models on the running executable instead of upgrading onto the held twin, and the kept
+/// word continues to hold idle upgrade sweeps for that target while letting a still-newer build
+/// through.
+#[test]
+fn an_agy_behind_a_held_twin_at_a_quota_wall_rotates_on_its_running_build_and_keeps_the_word() {
+    for (ask, step) in [
+        (Ask::Skip, "wait:skipped"),
+        (Ask::Defer(3600), "wait:deferred"),
+    ] {
+        let rig = LiveRig::new(Knobs {
+            versions: Some(("1.4.0-R6427.1", "1.4.0-R6500.1")),
+            twin: Some(Twin::Newer),
+            screen: Some(aterm_phase::agy::fixtures::lab::ERROR_429_INDIVIDUAL),
+            summary: Some(Ok(format!("{C1}|CASCADE_RUN_STATUS_RUNNING|0|\n"))),
+            quota_at_wall_to: Some("claude-opus-5-5-medium"),
+            ..Knobs::default()
+        });
+        let claim = rig.failed_claim();
+        rig.store(&claim);
+        let row =
+            ask_for(&rig.opts, TAB, ask, "1.4.0-R6500.1", &key(TAB)).expect("owner build hold");
+
+        let r = rig.visit();
+        assert_eq!(r.step, "continued", "{ask:?}: {r:?}");
+        assert_eq!(
+            (r.from.as_str(), r.to.as_str()),
+            ("gemini-4-argon-high", "claude-opus-5-5-medium(quota)")
+        );
+        let st = rig.record().expect("rotation record");
+        assert_eq!(
+            (st.from.as_str(), st.to.as_str(), st.source.as_str()),
+            (
+                "1.4.0-R6427.1",
+                "1.4.0-R6427.1",
+                crate::harness::upgrade_drive::SAME_PROGRAM
+            )
+        );
+        assert_eq!(st.request, row.request, "{ask:?}");
+        let typed = rig.asked("turn");
+        assert!(
+            typed[0].contains(&rig.kernel.exe.display().to_string()),
+            "must launch running build, not held twin: {}",
+            typed[0]
+        );
+        assert!(
+            !typed[0].contains(&rig.twin.display().to_string()),
+            "must not launch held twin: {}",
+            typed[0]
+        );
+
+        let idle_rig = LiveRig::new(Knobs {
+            versions: Some(("1.4.0-R6427.1", "1.4.0-R6500.1")),
+            twin: Some(Twin::Newer),
+            ..Knobs::default()
+        });
+        idle_rig.store(&st);
+        let after = idle_rig.visit();
+        assert_eq!(after.step, step, "{ask:?}: {after:?}");
+        assert!(idle_rig.asked("signal").is_empty());
+
+        if ask == Ask::Skip {
+            let newer_rig = LiveRig::new(Knobs {
+                versions: Some(("1.4.0-R6427.1", "1.4.0-R6600.1")),
+                twin: Some(Twin::Newer),
+                ..Knobs::default()
+            });
+            newer_rig.store(&st);
+            let moved = newer_rig.visit();
+            assert_eq!(moved.step, "done:resumed", "{moved:?}");
+            assert_eq!(newer_rig.asked("signal").len(), 1);
+        }
+    }
 }

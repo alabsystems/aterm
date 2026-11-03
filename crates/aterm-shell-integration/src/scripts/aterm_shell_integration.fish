@@ -22,13 +22,13 @@
 # pinned 4.9.3 that `targo --unverified verify provision` builds. (`return`
 # outside a function needs 3.4; `string escape --style=url` needs 3.1.)
 
-# A fish started inside a tab while aterm installs Apple's Command Line Tools
+# A fish started inside a tab while Apple's Command Line Tools are missing
 # (`fish -l -c ...`, an agent's own shell) reads this file from aterm's
 # `vendor_conf.d` after its login `/etc/paths` put `/usr/bin` back in front of
 # the shim, and returns below before the integration loads: the shim goes back
 # to just ahead of the first `/usr/bin` (else `/bin`) here, never ahead of an
 # earlier entry, as the tab's own shell does further on. Only while its
-# `.wanted` mark is there: without it nothing installs them.
+# `.wanted` mark is there: without it the tools exist.
 if test -n "$ATERM_CLT_SHIM"; and test -d "$ATERM_CLT_SHIM"; and test -f (string replace -r '/+$' '' -- "$ATERM_CLT_SHIM").wanted
     if not status is-interactive; or test -n "$ATERM_SHELL_INTEGRATION_INSTALLED"
         set -l __aterm_rest
@@ -284,12 +284,12 @@ function __aterm_path_front --argument-names dir
     end
     set -gx PATH "$dir" $rest
 end
-# While aterm installs Apple's Command Line Tools, `$ATERM_CLT_SHIM` names the
-# directory whose `git`, `cc` and kin say the tools are on their way instead of
+# While Apple's Command Line Tools are missing, `$ATERM_CLT_SHIM` names the
+# directory whose `git`, `cc` and kin fail plainly instead of
 # raising Apple's install dialog, and its `.wanted` mark is there. A login fish
 # puts `/etc/paths` (`/usr/bin`) back in front of it, so it moves to just ahead
 # of the first `/usr/bin` (else `/bin`): never ahead of a person's own earlier
-# entry. Without the mark nothing installs them: the shim is put back nowhere.
+# entry. Without the mark the tools exist: the shim is put back nowhere.
 function __aterm_clt_shim_place
     set -l dir "$ATERM_CLT_SHIM"
     __aterm_clt_bash_env "$dir"

@@ -12,11 +12,35 @@ use crate::ladder::{Finding, Outcome, Report, Severity};
 /// How many findings a failed check lists before pointing at the log.
 pub const FINDINGS_SHOWN: usize = 10;
 
+/// A stage admitted to execute, paired with its completion by the run-local index.
+#[must_use]
+pub fn stage_started(index: usize, title: &str) -> String {
+    format!(
+        "verify-event: {}\n",
+        aterm_json::json!({
+            "schema": 1,
+            "event": "stage-started",
+            "stage_index": index,
+            "stage": title,
+            "started_at_unix_ms": aterm_time::unix_millis(),
+        })
+    )
+}
+
 /// A completed stage's decisions and timing, emitted before sibling stages finish.
 /// Waiting is time from the run's start until this stage actually starts executing;
 /// it includes dependencies and resource admission, not CPU time.
+/// Child CPU is a sampled lower bound, excluding verifier work and descendants
+/// missed between samples. With no observed process counter, the field is JSON
+/// null rather than zero.
 #[must_use]
-pub fn stage_event(report: &Report, waiting: Duration, execution: Duration) -> String {
+pub fn stage_event(
+    index: usize,
+    report: &Report,
+    waiting: Duration,
+    execution: Duration,
+    cpu: Option<crate::memory::ObservedCpu>,
+) -> String {
     let decisions: Vec<_> = report
         .outcomes()
         .map(|(outcome, label)| aterm_json::json!({"outcome": word(outcome), "detail": label}))
@@ -26,9 +50,16 @@ pub fn stage_event(report: &Report, waiting: Duration, execution: Duration) -> S
         aterm_json::json!({
             "schema": 1,
             "event": "stage-finished",
+            "stage_index": index,
             "stage": report.title,
             "waiting_s": waiting.as_secs_f64(),
             "execution_s": execution.as_secs_f64(),
+            "child_cpu": cpu.map(|cpu| aterm_json::json!({
+                "scope": "sampled-child-process-groups",
+                "coverage": "lower-bound",
+                "observed_s": Duration::from_nanos(cpu.nanoseconds).as_secs_f64(),
+                "observed_processes": cpu.processes,
+            })),
             "decisions": decisions,
         })
     )
@@ -280,17 +311,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_started_stage_carries_its_index_without_claiming_a_result() {
+        let line = stage_started(7, "compile \"helper\"");
+        let event: aterm_json::Value =
+            aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap();
+        assert_eq!(event["event"].as_str(), Some("stage-started"));
+        assert_eq!(event["stage_index"].as_u64(), Some(7));
+        assert_eq!(event["stage"].as_str(), Some("compile \"helper\""));
+        assert!(event["started_at_unix_ms"].as_u64().is_some());
+        assert!(event.get("decisions").is_none());
+        assert!(event.get("outcome").is_none());
+    }
+
+    #[test]
     fn live_stage_event_keeps_findings_and_unavailable_checks_distinct() {
         let mut report = Report::new("measurement");
         report.fail("throughput below floor");
         report.cannot_run("window never focused");
-        let line = stage_event(&report, Duration::from_secs(12), Duration::from_secs(3));
+        let line = stage_event(
+            7,
+            &report,
+            Duration::from_secs(12),
+            Duration::from_secs(3),
+            None,
+        );
         let event: aterm_json::Value =
             aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap();
         assert_eq!(event["waiting_s"].as_f64(), Some(12.0));
+        assert_eq!(event["stage_index"].as_u64(), Some(7));
         assert_eq!(event["execution_s"].as_f64(), Some(3.0));
+        assert!(event["child_cpu"].is_null());
         assert_eq!(event["decisions"][0]["outcome"].as_str(), Some("FAIL"));
         assert_eq!(event["decisions"][1]["outcome"].as_str(), Some("NOT RUN"));
+    }
+
+    #[test]
+    fn observed_cpu_is_a_separate_lower_bound_not_execution_wall_time() {
+        let line = stage_event(
+            8,
+            &Report::new("parallel build"),
+            Duration::from_secs(12),
+            Duration::from_secs(3),
+            Some(crate::memory::ObservedCpu {
+                nanoseconds: 8_000_000_000,
+                processes: 4,
+            }),
+        );
+        let event: aterm_json::Value =
+            aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap();
+        assert_eq!(event["child_cpu"]["observed_s"].as_f64(), Some(8.0));
+        assert_eq!(event["child_cpu"]["observed_processes"].as_u64(), Some(4));
+        assert_eq!(event["child_cpu"]["coverage"].as_str(), Some("lower-bound"));
+        assert_eq!(event["execution_s"].as_f64(), Some(3.0));
     }
 
     fn result(check: Check, outcome: Outcome) -> CheckResult {

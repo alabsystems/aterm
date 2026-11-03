@@ -230,9 +230,8 @@ impl Poller<'_> {
             if observed_any {
                 last_success = now;
             } else if now.saturating_sub(last_success) >= self.blind_limit {
-                let last_error = last_error.unwrap_or_else(|| {
-                    Error::could_not_run("no condition was observed").with_sub(Sub::Local)
-                });
+                let last_error =
+                    last_error.unwrap_or_else(|| Error::local("no condition was observed"));
                 return WaitEnd::Blind { last_error };
             }
             for what in changes {

@@ -112,21 +112,55 @@ impl Transcript {
     }
 }
 
+/// Slice `bytes` down to at most `keep` trailing bytes, advancing to the start of the first whole
+/// line when one fits inside the kept tail (or else to the first UTF-8 codepoint boundary).
+fn trim_tail(bytes: &[u8], keep: usize) -> &[u8] {
+    if bytes.len() <= keep {
+        return bytes;
+    }
+    let tail = &bytes[bytes.len() - keep..];
+    if let Some(nl) = tail.iter().position(|&b| b == b'\n')
+        && nl + 1 < tail.len()
+    {
+        return &tail[nl + 1..];
+    }
+    let mut start = 0;
+    while start < tail.len() && start < 4 && (tail[start] & 0b1100_0000) == 0b1000_0000 {
+        start += 1;
+    }
+    &tail[start..]
+}
+
+fn write_staged_new(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)?;
+    file.write_all(bytes)
+}
+
 fn trim_log(path: &Path) {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let Ok((mut file, meta)) = crate::identity::open_regular_nonblock(path) else {
         return;
     };
-    if !meta.is_file() || meta.len() <= LOG_MAX {
+    if meta.len() <= LOG_MAX {
         return;
     }
-    let Ok(bytes) = std::fs::read(path) else {
+    let window = LOG_KEEP.saturating_add(1);
+    let offset = meta.len().saturating_sub(window);
+    if file.seek(SeekFrom::Start(offset)).is_err() {
         return;
-    };
+    }
+    let mut bytes = Vec::new();
+    if file.take(window).read_to_end(&mut bytes).is_err() {
+        return;
+    }
     let keep = usize::try_from(LOG_KEEP).unwrap_or(usize::MAX);
-    let tail = &bytes[bytes.len().saturating_sub(keep)..];
+    let tail = trim_tail(&bytes, keep);
     let tmp = unique_tmp(path);
     let _ = std::fs::remove_file(&tmp);
-    if std::fs::write(&tmp, tail).is_err() || std::fs::rename(&tmp, path).is_err() {
+    if write_staged_new(&tmp, tail).is_err() || std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -194,7 +228,8 @@ pub fn record_once(
     let message: String = message.replace('\n', " ").chars().take(200).collect();
     let day = utc_day(now_unix);
     let file = dir.join(format!("notified-{day}"));
-    let seen = std::fs::read_to_string(&file).unwrap_or_default();
+    let seen = crate::identity::read_regular_text(&file, crate::identity::MAX_META_BYTES)
+        .unwrap_or_default();
     if seen.lines().any(|l| l == message) {
         return;
     }
@@ -270,7 +305,7 @@ pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     let tmp = unique_tmp(path);
     let _ = std::fs::remove_file(&tmp);
-    std::fs::write(&tmp, bytes).map_err(|e| {
+    write_staged_new(&tmp, bytes).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         Error::io(format!("write {}", tmp.display()), &e)
     })?;
@@ -278,4 +313,54 @@ pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
         Error::io(format!("rename {} into place", path.display()), &e)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NEGATIVE CONTROL: `trim_tail` aligns on a whole line (or UTF-8 codepoint boundary when a
+    /// single line spans the kept window) instead of splitting multi-byte UTF-8 characters like
+    /// `—` (`0xE2 0x80 0x94`) into invalid UTF-8 or leaving a torn leading fragment.
+    #[test]
+    fn trim_tail_preserves_whole_lines_and_utf8_boundaries() {
+        let log = "lane: WARNING — first line\nlane: WARNING — second line\n";
+        let trimmed = trim_tail(log.as_bytes(), 36);
+        assert_eq!(
+            std::str::from_utf8(trimmed).expect("valid UTF-8"),
+            "lane: WARNING — second line\n"
+        );
+
+        let single_line = "——————end\n";
+        // Cut 1 byte into the multi-byte `—` sequence with only a trailing newline in `tail`.
+        let kept = single_line.len() - 1;
+        let single_trimmed = trim_tail(single_line.as_bytes(), kept);
+        assert_eq!(
+            std::str::from_utf8(single_trimmed).expect("valid UTF-8 without mid-codepoint tear"),
+            "—————end\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_bytes_replaces_symlink_target_path_without_following() {
+        let root = aterm_tempfile::Builder::new()
+            .prefix("atpkg-report-atomic-")
+            .tempdir()
+            .expect("scratch dir");
+        let outside = root.path().join("outside.txt");
+        std::fs::write(&outside, b"keep-me").expect("write outside");
+        let dest = root.path().join("state.txt");
+        std::os::unix::fs::symlink(&outside, &dest).expect("symlink dest");
+
+        write_atomic(&dest, "fresh\n").expect("atomic write");
+        assert!(
+            std::fs::symlink_metadata(&dest)
+                .expect("dest meta")
+                .file_type()
+                .is_file()
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "fresh\n");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep-me");
+    }
 }

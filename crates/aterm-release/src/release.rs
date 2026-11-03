@@ -851,6 +851,8 @@ pub trait Backend {
     fn say(&mut self, line: &str);
     fn interrupted(&mut self) -> Option<i32>;
     fn entered(&mut self, _step: Step) {}
+    /// Record bounded operational observations before any release preparation.
+    fn observe_operational(&mut self) {}
     fn log_path(&mut self, step: Step) -> PathBuf;
     fn me(&mut self) -> (u32, String);
     fn started_of(&mut self, pid: u32) -> Option<String>;
@@ -861,7 +863,7 @@ pub trait Backend {
     fn record_time(&mut self, version: &str, step: Step, secs: u64);
 
     fn prover(&mut self, journaled: Option<&str>) -> Result<Prover, String>;
-    fn lease(&mut self, prover: &Prover);
+    fn lease(&mut self, prover: &Prover) -> Result<(), String>;
     fn cleared_env(&mut self) -> Vec<String>;
     fn machine(&mut self, creds: &Path, explicit: bool) -> (String, Vec<Refusal>);
     fn fetch(&mut self) -> Result<String, Refusal>;
@@ -1113,6 +1115,7 @@ impl Run<'_> {
         }
 
         self.begin(Step::Checks)?;
+        self.b.observe_operational();
         let note = self.checks()?;
         self.finish(&note);
 
@@ -2004,8 +2007,10 @@ impl Run<'_> {
             .map(|j| j.prover.clone());
         match self.b.prover(journaled.as_deref()) {
             Ok(p) => {
-                if !self.dry {
-                    self.b.lease(&p);
+                if !self.dry
+                    && let Err(error) = self.b.lease(&p)
+                {
+                    self.refuse_hard(Refusal::new(error, "restore the toolchain lease and retry"))?;
                 }
                 self.prover = Some(p);
             }

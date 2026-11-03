@@ -159,74 +159,6 @@ fn unreadable_login_bindings_produce_a_structured_refusal_for_every_pool() {
 
 struct NoUsage;
 
-struct FreshUsage;
-
-impl AccountsHost for FreshUsage {
-    fn stdin_is_terminal(&self) -> bool {
-        false
-    }
-    fn auth_status(&self, _: &str) -> Result<Captured, String> {
-        panic!("no auth probe")
-    }
-    fn unaskable(&self) -> Option<String> {
-        None
-    }
-    fn login(&self, _: Option<&str>) -> Result<i32, String> {
-        panic!("no login")
-    }
-    fn now(&self) -> i64 {
-        0
-    }
-    fn usage_reader(&self) -> Option<crate::harness::accounts_pool::ReadUsage<'static>> {
-        Some(&|_: Cli, _: &Path, _: Option<&str>, now: i64| {
-            Some(crate::harness::codex_app_login::Usage {
-                sample: accounts::Sample {
-                    session_pct: Some(100),
-                    at: now,
-                    ..accounts::Sample::default()
-                },
-                walls: vec![("five_hour", Some(now + 3600))],
-            })
-        })
-    }
-}
-
-#[test]
-fn statistics_refuse_when_the_usage_snapshot_lock_is_held() {
-    let tmp = tmp_dir("stats-write-refusal");
-    let env = env_at(&tmp);
-    std::fs::write(
-        env.accounts_roster_for(Cli::Codex).unwrap(),
-        "[[account]]\nlabel='main'\nclass='dedicated'\n",
-    )
-    .unwrap();
-    let store = env.accounts_store_for(Cli::Codex).unwrap();
-    store
-        .transact(env.now, &mut None, |s| {
-            s.active = Some("main".to_owned());
-            Ok(Vec::new())
-        })
-        .unwrap();
-    let held = store.acquire().unwrap();
-    let before = every_file(tmp.path());
-    for json in [false, true] {
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        assert_eq!(
-            run_accounts_stats_of(Cli::Codex, &env, &FreshUsage, json, &mut out, &mut err),
-            ExitCode::from(1)
-        );
-        assert!(!err.is_empty());
-        if json {
-            let doc: Value = aterm_json::from_slice(&out).unwrap();
-            assert!(doc["rows"].as_array().unwrap().is_empty());
-        } else {
-            assert!(out.is_empty());
-        }
-    }
-    assert_eq!(every_file(tmp.path()), before);
-    drop(held);
-}
-
 impl AccountsHost for NoUsage {
     fn stdin_is_terminal(&self) -> bool {
         false
@@ -242,15 +174,6 @@ impl AccountsHost for NoUsage {
     }
     fn now(&self) -> i64 {
         0
-    }
-    fn usage_reader(&self) -> Option<crate::harness::accounts_pool::ReadUsage<'static>> {
-        Some(&|_: Cli,
-               _: &Path,
-               _: Option<&str>,
-               _: i64|
-         -> Option<crate::harness::codex_app_login::Usage> {
-            panic!("an unreadable pool must not start a usage probe")
-        })
     }
 }
 
@@ -291,7 +214,7 @@ fn unreadable_pools_refuse_statistics_before_provider_io() {
                 let mut out = Vec::new();
                 let mut err = Vec::new();
                 assert_eq!(
-                    run_accounts_stats_of(cli, &env, &NoUsage, json, &mut out, &mut err),
+                    run_accounts_stats_of(cli, &env, json, &mut out, &mut err),
                     ExitCode::from(1)
                 );
                 assert!(!err.is_empty());

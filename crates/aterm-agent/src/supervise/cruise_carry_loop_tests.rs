@@ -751,6 +751,48 @@ fn the_captured_stall_screen_is_carried_once_under_cruise() {
     );
 }
 
+/// THE BREAK OF THE TAB OF 2026-10-27, whose composer held `ok, keep going` over a shell its turn
+/// left, with an idle compaction under the done row, is a break either way the words were drawn:
+/// Claude Code's dim suggestion is no draft, so Cruise carries the break once; the same words
+/// typed by a person hold it.
+#[test]
+fn the_break_under_an_idle_compaction_is_carried_over_a_suggestion_and_held_by_a_draft() {
+    use aterm_phase::prompt::fixtures::{IDLE_COMPACTED_OVER_A_SHELL_2_1_312, screen};
+    let drawn = |_: usize| screen(IDLE_COMPACTED_OVER_A_SHELL_2_1_312);
+    let suggested = captured_run(
+        "carry-compacted",
+        Autopilot::Cruise,
+        &drawn,
+        "dim",
+        &[0, 30, 3600],
+        &mut nothing,
+    );
+    assert_eq!(
+        entered(&suggested),
+        1,
+        "{:#?}\n{:#?}",
+        suggested.writes(),
+        suggested.noted
+    );
+    let drafted = captured_run(
+        "carry-compacted-draft",
+        Autopilot::Cruise,
+        &drawn,
+        "none",
+        &[0, 30, 3600],
+        &mut nothing,
+    );
+    assert!(drafted.writes().is_empty(), "{:#?}", drafted.writes());
+    assert!(
+        drafted
+            .noted
+            .iter()
+            .any(|l| l.starts_with("DEFERRED ") && l.ends_with("held:draft")),
+        "{:#?}",
+        drafted.noted
+    );
+}
+
 /// A WAKE'S TURN END IS CARRIED TOO: the agent takes the carry (or the work it waits on ends and
 /// Claude Code wakes it with a notification turn), works, and its turn ends over its work again:
 /// that end is carried at once after real work, and once.

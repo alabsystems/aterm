@@ -327,6 +327,72 @@ fn idle_performance_wait_is_shown_even_for_unbackgrounded_workers() {
 }
 
 #[test]
+fn cpu_accounting_scope_identity_and_unknowns_survive_both_reports() {
+    use crate::model::CpuAccounting;
+    let mut s = snapshot();
+    let w = world();
+    let c = CpuAccounting {
+        self_ns: Some(0),
+        reaped_children_ns: Some(u64::MAX),
+        auto_reaps_children: Some(true),
+        sampled_at_ns: Some(17),
+        start: Some(23),
+        exec_version: Some(42),
+    };
+    s.procs
+        .iter_mut()
+        .find(|p| p.pid == 201)
+        .unwrap()
+        .cpu_accounting = c;
+    let ctx = ctx(&w, Some(&s), true, true);
+    let json = render_json(&query(View::Procs, true), &ctx);
+    let text = all_text(&render_text(&query(View::Procs, false), &ctx));
+    assert!(text.contains("cpu_mc_scope=process_self"));
+    let accounting = cpu_accounting_json(&c, "macOS");
+    let procs = json.get("procs").unwrap();
+    assert_eq!(procs.get("cpu_mc_scope"), Some(&Jv::s("process_self")));
+    let Some(Jv::Arr(rows)) = procs.get("rows") else {
+        panic!("missing process rows");
+    };
+    let worker = rows
+        .iter()
+        .find(|p| p.get("pid") == Some(&Jv::u(201)))
+        .unwrap();
+    assert_eq!(worker.get("cpu_mc_scope"), Some(&Jv::s("process_self")));
+    assert_eq!(worker.get("cpu_accounting"), Some(&accounting));
+    assert_eq!(accounting.get("self_ns"), Some(&Jv::s("0")));
+    assert_eq!(
+        accounting.get("reaped_children_ns"),
+        Some(&Jv::s("18446744073709551615"))
+    );
+    assert_eq!(accounting.get("auto_reaps_children"), Some(&Jv::Bool(true)));
+    assert_eq!(accounting.get("counter_at_ns"), Some(&Jv::s("17")));
+    assert_eq!(accounting.get("pid_start"), Some(&Jv::s("23")));
+    assert_eq!(accounting.get("exec_version"), Some(&Jv::Int(42)));
+    let report = crate::sys::hardware::current_report_json(&s);
+    let Some(Jv::Arr(workers)) = report.get("workers") else {
+        panic!("missing report workers");
+    };
+    let worker = workers
+        .iter()
+        .find(|p| p.get("pid") == Some(&Jv::u(201)))
+        .unwrap();
+    assert_eq!(worker.get("cpu_accounting"), Some(&accounting));
+    let unknown = cpu_accounting_json(&CpuAccounting::default(), "macOS");
+    assert_eq!(unknown.get("self_ns"), Some(&Jv::why("refused")));
+    assert_eq!(
+        unknown.get("reaped_children_ns"),
+        Some(&Jv::why("not_sampled"))
+    );
+    let unsupported = cpu_accounting_json(&CpuAccounting::default(), "Linux");
+    assert_eq!(
+        unsupported.get("reaped_children_ns"),
+        Some(&Jv::why("unsupported"))
+    );
+    assert!(contract_violations(&json).is_empty());
+}
+
+#[test]
 fn scheduling_held_core_is_unavailable_in_core_cluster_and_global_views() {
     let mut model = Vitals::new();
     model.absorb(&sample(10, &[0, 0, 0, 0], 0));

@@ -30,30 +30,31 @@ StandardOutput=journal+console
 WantedBy=multi-user.target
 ";
 
+/// Maximum size accepted when reading an existing guest systemd unit on disk.
+const MAX_UNIT_BYTES: usize = 64 * 1024;
+
 /// Rewrite the unit at `path` to `carried` when it holds other text, for the next boot:
 /// `Ok(true)` when it did. A missing unit is the bake's to write, and stays missing.
 ///
 /// # Errors
 /// The unit could not be read, or the new text written and renamed over it.
 pub fn refresh_unit(path: &Path, carried: &str) -> io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "unit path is a symbolic link",
-            ));
-        }
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
-    }
-    let on_disk = match std::fs::read(path) {
+    let on_disk = match crate::read_bounded_regular(path, MAX_UNIT_BYTES) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
     if on_disk == carried.as_bytes() {
         return Ok(false);
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    if !std::fs::symlink_metadata(parent).is_ok_and(|m| m.file_type().is_dir()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unit parent is not a real directory",
+        ));
     }
     let name = path
         .file_name()
@@ -79,6 +80,14 @@ pub fn refresh_unit(path: &Path, carried: &str) -> io::Result<bool> {
         f.sync_all()?;
     }
     std::fs::rename(&partial, path)?;
+    #[cfg(unix)]
+    if let Ok(dir_file) = std::fs::File::open(parent) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "std-only for the musl guest build: aterm-durable is not in its graph; the parent directory is synced after the rename"
+        )]
+        let _ = dir_file.sync_all();
+    }
     Ok(true)
 }
 
@@ -165,6 +174,11 @@ mod tests {
             std::os::unix::fs::symlink(&decoy, &unit_link).unwrap();
             assert!(refresh_unit(&unit_link, UNIT).is_err());
             assert_eq!(std::fs::read_to_string(&decoy).unwrap(), "untouched");
+
+            assert!(refresh_unit(Path::new("/dev/null"), UNIT).is_err());
         }
+        let oversized = dir.path().join("oversized.service");
+        std::fs::write(&oversized, vec![b'x'; MAX_UNIT_BYTES + 1]).unwrap();
+        assert!(refresh_unit(&oversized, UNIT).is_err());
     }
 }

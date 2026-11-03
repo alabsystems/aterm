@@ -362,6 +362,12 @@ pub struct Hashes {
     changed: bool,
 }
 
+pub(crate) fn open_regular_file(
+    path: &Path,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    aterm_uds::regular_file::open(path)
+}
+
 impl Hashes {
     /// The cache in `file` (none when it is not there or does not decode).
     #[must_use]
@@ -370,15 +376,9 @@ impl Hashes {
             file: file.map(Path::to_path_buf),
             ..Hashes::default()
         };
-        let Some(text) = file.and_then(|f| {
-            let mut text = String::new();
-            std::fs::File::open(f)
-                .ok()?
-                .take(MAX_HASH_FILE_BYTES)
-                .read_to_string(&mut text)
-                .ok()?;
-            Some(text)
-        }) else {
+        let Some(text) = file
+            .and_then(|f| aterm_uds::runs::read_bounded_regular_text(f, MAX_HASH_FILE_BYTES).ok())
+        else {
             return out;
         };
         let Ok(v) = aterm_json::from_str::<Value>(&text) else {
@@ -422,11 +422,7 @@ impl Hashes {
     /// It could not be opened or read, is not a regular file, or moved while it was read.
     pub fn digest(&mut self, path: &Path) -> Result<(u64, String), String> {
         let err = |e: std::io::Error| format!("{} could not be read: {e}", path.display());
-        let mut file = std::fs::File::open(path).map_err(err)?;
-        let before = file.metadata().map_err(err)?;
-        if !before.is_file() {
-            return Err(format!("{} is not a regular file", path.display()));
-        }
+        let (mut file, before) = open_regular_file(path).map_err(err)?;
         let stamp = Stamp::of(&file, &before);
         let key = path.to_string_lossy().into_owned();
         self.used.insert(key.clone());

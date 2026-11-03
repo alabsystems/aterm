@@ -647,6 +647,12 @@ fn links(_meta: &std::fs::Metadata) -> u64 {
 pub fn turn_off(layout: &Layout) -> io::Result<()> {
     let off = layout.units_off();
     if std::fs::symlink_metadata(&off).is_err() {
+        if std::fs::symlink_metadata(&layout.prefix).is_ok_and(|m| !m.file_type().is_dir()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "prefix is not a real directory",
+            ));
+        }
         layout.ensure_dir(&layout.prefix)?;
         let mut record = crate::platform::open_create_write(&off, 0o600)?;
         writeln!(
@@ -662,19 +668,27 @@ pub fn turn_off(layout: &Layout) -> io::Result<()> {
         crate::store::remove_tree(&units)?;
     }
     let store = layout.prefix.join("store");
-    for program in std::fs::read_dir(store).into_iter().flatten().flatten() {
-        for entry in std::fs::read_dir(program.path())
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let name = entry.file_name();
-            if name
-                .to_str()
-                .and_then(|n| n.strip_suffix(UNIT_SUFFIX))
-                .is_some_and(|build| crate::store::parse_build_name(build).is_some())
+    if std::fs::symlink_metadata(&store).is_ok_and(|m| m.file_type().is_dir()) {
+        for program in std::fs::read_dir(store).into_iter().flatten().flatten() {
+            if !program.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            for entry in std::fs::read_dir(program.path())
+                .into_iter()
+                .flatten()
+                .flatten()
             {
-                let _ = std::fs::remove_file(entry.path());
+                if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
+                let name = entry.file_name();
+                if name
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(UNIT_SUFFIX))
+                    .is_some_and(|build| crate::store::parse_build_name(build).is_some())
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
             }
         }
     }

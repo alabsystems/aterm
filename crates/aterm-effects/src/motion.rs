@@ -81,6 +81,10 @@ pub enum MotionEffect {
     /// Serious Mode, load shedding and Low Power keep, since a dissolve tells a change apart
     /// without moving anything.
     NativeFade,
+    /// The fade of the mode's name a click on the Autopilot chip brings up beside its glyph
+    /// (`⤓ land` back to `⤓`, `aterm-gui`'s `claude_lights::ChipWord`): at 0 the name still shows
+    /// (it says what the click did) but goes at once when its hold ends.
+    ChipWord,
 }
 
 /// The longest crossfade [`MotionEffect::NativeFade`] admits, in milliseconds (§5.5).
@@ -89,7 +93,7 @@ pub const NATIVE_FADE_MAX_MS: u32 = 150;
 impl MotionEffect {
     /// The complete governed-effect set, which the totality proof iterates.
     #[cfg(test)]
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::CursorGlow,
         Self::WordSparkles,
         Self::SmoothScroll,
@@ -103,6 +107,7 @@ impl MotionEffect {
         Self::NativeInPlace,
         Self::NativeTravel,
         Self::NativeFade,
+        Self::ChipWord,
     ];
 
     /// Whether this effect is functional motion the host's load-shed latch (`perf_reduced`) must
@@ -122,7 +127,8 @@ impl MotionEffect {
             | Self::DeckLive
             | Self::NativeInPlace
             | Self::NativeTravel
-            | Self::NativeFade => false,
+            | Self::NativeFade
+            | Self::ChipWord => false,
         }
     }
 }
@@ -261,7 +267,8 @@ impl MotionPolicy {
                 | MotionEffect::DeckLive
                 | MotionEffect::NativeInPlace
                 | MotionEffect::NativeTravel
-                | MotionEffect::NativeFade => 0.0,
+                | MotionEffect::NativeFade
+                | MotionEffect::ChipWord => 0.0,
             },
         }
     }

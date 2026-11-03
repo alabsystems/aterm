@@ -500,7 +500,27 @@ enum Inner {
     Tls(Box<rustls::StreamOwned<rustls::ClientConnection, Bounded>>),
 }
 
+/// A cancellation handle which can close a stream's socket but cannot read or write it.
+#[derive(Debug)]
+pub struct Interrupt {
+    socket: TcpStream,
+}
+
+impl Interrupt {
+    /// Wake pending I/O and prevent further network operations on the stream.
+    pub fn interrupt(&self) {
+        let _ = self.socket.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 impl Stream {
+    /// A separate handle that wakes blocked I/O when a background operation is cancelled.
+    pub fn interruptor(&self) -> io::Result<Interrupt> {
+        Ok(Interrupt {
+            socket: self.socket().sock.try_clone()?,
+        })
+    }
+
     /// Wraps an established plaintext [`TcpStream`].
     #[must_use]
     pub fn plain(tcp: TcpStream, guard: Arc<dyn Guard>, deadline: Deadline) -> Self {
@@ -569,7 +589,7 @@ impl Stream {
     }
 
     /// Replaces the active [`Deadline`] on this stream.
-    pub(crate) fn set_deadline(&mut self, deadline: Deadline) {
+    pub fn set_deadline(&mut self, deadline: Deadline) {
         match &mut self.inner {
             Inner::Plain(bounded) => bounded.deadline = deadline,
             Inner::Tls(tls) => tls.sock.deadline = deadline,
@@ -660,6 +680,41 @@ mod tests {
 
     /// A wait for something that must happen is a hang detector, never a latency budget.
     const HANG_DETECTOR: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn cancellation_wakes_a_silent_socket_and_prevents_writes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let mut stream = Stream::plain(
+            tcp,
+            Arc::new(AlwaysAuthorized),
+            Deadline::after(HANG_DETECTOR),
+        );
+        let interrupt = stream.interruptor().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let read = stream.read(&mut [0; 1]);
+            let write = stream.write_all(b"must not reach the peer");
+            done_tx.send((read, write)).unwrap();
+        });
+        ready_rx.recv_timeout(HANG_DETECTOR).unwrap();
+        interrupt.interrupt();
+        let (read, write) = done_rx.recv_timeout(HANG_DETECTOR).unwrap();
+        assert!(
+            matches!(read, Ok(0))
+                || read.is_err_and(|error| matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::NotConnected
+                ))
+        );
+        assert!(write.is_err());
+        worker.join().unwrap();
+    }
 
     #[derive(Debug)]
     struct Revocable(AtomicBool);

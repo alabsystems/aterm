@@ -51,9 +51,28 @@ pub(super) struct Line<'a> {
 
 impl<'a> Line<'a> {
     pub(super) fn parse(line: &'a str) -> Self {
+        let invalid = || Self {
+            verb: "",
+            fields: Vec::new(),
+        };
+        let line = line.strip_suffix('\n').unwrap_or(line);
         let mut words = line.split(' ');
-        let verb = words.next().unwrap_or("");
-        let fields = words.filter_map(|word| word.split_once('=')).collect();
+        let Some(verb) = words
+            .next()
+            .filter(|verb| !verb.is_empty() && !verb.contains('='))
+        else {
+            return invalid();
+        };
+        let mut fields: Vec<(&'a str, &'a str)> = Vec::new();
+        for word in words {
+            let Some((key, value)) = word.split_once('=') else {
+                return invalid();
+            };
+            if key.is_empty() || fields.iter().any(|(seen, _)| *seen == key) {
+                return invalid();
+            }
+            fields.push((key, value));
+        }
         Self { verb, fields }
     }
 
@@ -178,7 +197,11 @@ pub(super) fn busy_refusal(why: &str, left: Duration) -> String {
 /// The phrase life a busy answer `line` names (`left=`, [`busy_refusal`]); `None` from a member
 /// that names none.
 pub(super) fn busy_left(line: &str) -> Option<Duration> {
-    let left = Line::parse(line).get("left").ok()?;
+    let parsed = Line::parse(line);
+    if parsed.verb != "NO" || parsed.get("busy") != Ok("1") {
+        return None;
+    }
+    let left = parsed.get("left").ok()?;
     Some(left)
         .filter(|left| {
             !left.is_empty() && left.len() <= 10 && left.bytes().all(|b| b.is_ascii_digit())
@@ -224,5 +247,37 @@ mod tests {
             assert_eq!(unescape(&escaped).unwrap(), text);
         }
         assert!(unescape("%0A").is_err(), "a control character is refused");
+    }
+
+    /// NEGATIVE CONTROL: `Line::parse` ignoring bare words and keeping duplicate keys lets
+    /// `"OK state=asking state=allowed"` or `"OK state=asking stray"` pass `answer(...)`.
+    #[test]
+    fn line_parse_rejects_bare_words_empty_keys_and_duplicate_keys() {
+        let ok = answer("OK state=asking\n").expect("single trailing newline");
+        assert_eq!(ok.get("state").unwrap(), "asking");
+
+        for malformed in [
+            "",
+            " OK state=asking",
+            "OK  state=asking",
+            "OK state=asking ",
+            "OK state=asking stray",
+            "OK =1 state=asking",
+            "OK state=asking state=allowed",
+            "k=v state=asking",
+        ] {
+            assert!(
+                answer(malformed).is_err(),
+                "malformed line was accepted: {malformed:?}"
+            );
+        }
+
+        assert_eq!(
+            busy_left("NO busy=1 left=90 why=busy"),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(busy_left("OK left=90"), None);
+        assert_eq!(busy_left("NO left=90 why=refused"), None);
+        assert_eq!(busy_left("NO busy=1 busy=0 left=90 why=busy"), None);
     }
 }

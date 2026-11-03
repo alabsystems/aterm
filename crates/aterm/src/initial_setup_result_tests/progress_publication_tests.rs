@@ -152,7 +152,7 @@ fn startup_progress_a_renamed_checkpoint_remains_stoppable_when_its_flush_return
             let revision = host.setup.recover().unwrap();
             assert!(revision > staged.revision);
             let admitted = host.setup.snapshot().unwrap();
-            assert!(!admitted.finished && admitted.permissions_allowed);
+            assert!(!admitted.finished && admitted.run_allowed);
         }
         assert!(
             script().runs.is_empty(),

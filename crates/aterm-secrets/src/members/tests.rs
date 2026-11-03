@@ -1303,7 +1303,18 @@ fn node_signer(seed: u8) -> (impl Fn(&[u8]) -> [u8; 64] + Sync, [u8; 32]) {
 /// [`files_bundle`] signed by `signer`, the member's own device) while `joiner` speaks.
 fn proving<T>(
     desk: &Mutex<Desk>,
-    fleet: Option<[u8; 32]>,
+    fleet: Option<desk::Fleet>,
+    decide: &(dyn Fn(&desk::Proving<'_>) -> Result<SecretBytes> + Sync),
+    joiner: impl FnOnce(&mut UnixStream) -> T,
+) -> (Result<Option<desk::Let>>, T) {
+    proving_checked(desk, (fleet, address(5)), &|_| None, decide, joiner)
+}
+
+/// [`proving`] from `from`, the member's check before possession `refuses`.
+fn proving_checked<T>(
+    desk: &Mutex<Desk>,
+    (fleet, from): (Option<desk::Fleet>, IpAddr),
+    refuses: &(dyn Fn(&desk::Proving<'_>) -> Option<String> + Sync),
     decide: &(dyn Fn(&desk::Proving<'_>) -> Result<SecretBytes> + Sync),
     joiner: impl FnOnce(&mut UnixStream) -> T,
 ) -> (Result<Option<desk::Let>>, T) {
@@ -1318,11 +1329,11 @@ fn proving<T>(
             desk::serve_with(
                 desk,
                 &mut ours,
-                address(5),
+                from,
                 &bundle,
                 Some(desk::Proof {
                     decide,
-                    refuses: &|_| None,
+                    refuses,
                     fleet,
                 }),
             )
@@ -1344,6 +1355,109 @@ fn hands(paths: &Paths, value: &str) -> impl Fn(&desk::Proving<'_>) -> Result<Se
             .with_seed(|seed| Allowed::sign(proving.request.binding(), proving.name, seed))?;
         files_bundle(&allowed, &value)
     }
+}
+
+/// Deliver the possession line, then lose the flush result after the member decided it.
+struct FailsPossessionFlush {
+    inner: UnixStream,
+    possessing: bool,
+    decided: std::sync::mpsc::Receiver<()>,
+}
+
+impl std::io::Read for FailsPossessionFlush {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut self.inner, bytes)
+    }
+}
+
+impl std::io::Write for FailsPossessionFlush {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.possessing |= bytes.starts_with(b"possess ");
+        std::io::Write::write(&mut self.inner, bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.inner)?;
+        if self.possessing {
+            self.decided
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the member decided the delivered possession proof");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "lost possession flush result",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn a_failed_possession_flush_cannot_send_the_mac_to_a_second_member() {
+    use super::join::{self, Stream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let desk = member(root.path(), "member");
+    let (paths, device) = mac(root.path(), "newcomer");
+    let (sign_node, node) = node_signer(0x36);
+    let joining = joining(&device, node, "newcomer");
+    let dials = AtomicUsize::new(0);
+    let decisions = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        let dial = |at: &str| -> Result<Box<dyn Stream>> {
+            dials.fetch_add(1, Ordering::SeqCst);
+            if at != "a-member:7" {
+                return Err(crate::Error::new("a second member was dialed"));
+            }
+            let (mut ours, theirs) = UnixStream::pair()?;
+            for end in [&ours, &theirs] {
+                end.set_read_timeout(Some(Duration::from_secs(60)))?;
+                end.set_write_timeout(Some(Duration::from_secs(60)))?;
+            }
+            let (decided, heard) = std::sync::mpsc::channel();
+            let (desk, decisions) = (&desk, &decisions);
+            scope.spawn(move || {
+                let decide = |_: &desk::Proving<'_>| {
+                    decisions.fetch_add(1, Ordering::SeqCst);
+                    decided.send(()).expect("joiner waits for the decision");
+                    Err(crate::Error::new(
+                        "decision reached before the flush failed",
+                    ))
+                };
+                let result = desk::serve_with(
+                    desk,
+                    &mut ours,
+                    address(5),
+                    &|_| Err(crate::Error::new("no phrase here")),
+                    Some(desk::Proof {
+                        decide: &decide,
+                        refuses: &|_| None,
+                        fleet: None,
+                    }),
+                );
+                assert!(result.is_err(), "the test decision refuses its bundle");
+            });
+            Ok(Box::new(FailsPossessionFlush {
+                inner: theirs,
+                possessing: false,
+                decided: heard,
+            }))
+        };
+        let missed = join::prove_first(
+            &paths,
+            &dial,
+            &joining,
+            &sign_node,
+            &["a-member:7".into(), "b-member:7".into()],
+        )
+        .expect_err("the possession flush failed");
+        assert_eq!(decisions.load(Ordering::SeqCst), 1);
+        assert!(missed.signed_maybe, "{missed:?}");
+        assert_eq!(dials.load(Ordering::SeqCst), 1, "{missed:?}");
+        assert_eq!(missed.refused.len(), 1);
+        assert!(missed.refused[0].1.contains("lost possession flush result"));
+    });
 }
 
 /// A Mac that signs this connection's challenge with its writer key and its fleet node key, and
@@ -1389,6 +1503,119 @@ fn a_mac_that_proves_its_node_key_gets_the_bundle_sealed_to_it() {
         seen.lock().unwrap().clone(),
         Some((node, false, "m7".to_owned()))
     );
+}
+
+/// A proof that comes from another host on the member's home ALab LAN reaches `decide` marked
+/// `lan`, which lets a new Mac in for being there. One from a private address off the member's
+/// home subnet (another interface's network, a phone hotspot, a VM bridge) is not marked, nor is
+/// any proof to the same member on no home ALab LAN, so a Mac with no seat and no fleet key gets
+/// nothing there.
+///
+/// NEGATIVE CONTROLS: `prove` setting `lan: false` in place of
+/// `held.local.automatically_admits(from)`: the home-LAN proof reaches `decide` unmarked and the
+/// first assert fails. `Local::automatically_admits` taking every private source
+/// (`self.automatic_lan && matches!(from, IpAddr::V4(ip) if ip.is_private())`): the proof from
+/// `10.0.0.9` reaches `decide` marked and the "off the home subnet" assert fails. It taking any
+/// source while the member has no home (`self.home.is_none_or(…)`): the "no home ALab LAN"
+/// assert fails for `192.168.1.40`.
+#[test]
+fn a_proof_from_the_home_lan_reaches_decide_marked_lan() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (m_paths, _) = mac(root.path(), "m");
+    let (_, j_device) = mac(root.path(), "j");
+    let (sign_node, node) = node_signer(0x32);
+    let j = joining(&j_device, node, "m7");
+    let value = token();
+    let handed = hands(&m_paths, &value);
+    // A fresh desk of the same member (its `decide` signs as it) for each proof, at home on the
+    // test home network (`HomeNet::test`, 192.168.1.20/24) or on none.
+    let lan_of = |at_home: bool, from: IpAddr| {
+        let device = Device::open(&m_paths).unwrap().expect("member device");
+        let local = Local::with(device, TRUST, true, "m")
+            .expect("member")
+            .with_automatic_lan([]);
+        let desk = Mutex::new(Desk::new(if at_home {
+            local
+        } else {
+            local.with_home(None)
+        }));
+        let seen = Mutex::new(None);
+        let decide = |proving: &desk::Proving<'_>| {
+            *seen.lock().unwrap() = Some(proving.lan);
+            handed(proving)
+        };
+        let (served, got) = proving_checked(&desk, (None, from), &|_| None, &decide, |stream| {
+            let greeting = joiner::greeting(stream)?;
+            joiner::prove(stream, &greeting, &j, &sign_node, &mut false)
+        });
+        served.expect("the member served the proof");
+        got.expect("the Mac took its bundle");
+        seen.into_inner().unwrap().expect("decide ran")
+    };
+    let on_home = IpAddr::from([192, 168, 1, 40]);
+    assert!(
+        lan_of(true, on_home),
+        "a proof from the member's home ALab LAN is marked lan"
+    );
+    for off in [
+        [10, 0, 0, 9],
+        [172, 20, 0, 5],
+        [172, 20, 10, 5],
+        [192, 168, 64, 3],
+    ] {
+        let from = IpAddr::from(off);
+        assert!(!lan_of(true, from), "off the home subnet: {from}");
+    }
+    for from in [on_home, IpAddr::from([10, 0, 0, 9])] {
+        assert!(
+            !lan_of(false, from),
+            "a member on no home ALab LAN marks no proof lan: {from}"
+        );
+    }
+}
+
+/// What the check before possession read of the vault on a connection reaches the decision after
+/// it on that connection ([`desk::Proving::fresh`]), so one exchange reads the vault's newest
+/// records once, inside the fleet listener's handshake watchdog; a connection whose check read
+/// nothing hands its decision no read.
+///
+/// NEGATIVE CONTROL: `prove` handing `decide` a fresh `Cell` of its own in place of the one
+/// `refuses` saw: the decision reads `false` and the first assert fails.
+#[test]
+fn the_check_before_possession_hands_its_read_to_the_decision() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (m_paths, device) = mac(root.path(), "m");
+    let desk = Mutex::new(Desk::new(
+        Local::with(device, TRUST, true, "m").expect("member"),
+    ));
+    let (_, j_device) = mac(root.path(), "j");
+    let (sign_node, node) = node_signer(0x33);
+    let j = joining(&j_device, node, "m7");
+    let value = token();
+    let handed = hands(&m_paths, &value);
+    let fresh_of = |reads: bool| {
+        let seen = Mutex::new(None);
+        let refuses = |proving: &desk::Proving<'_>| {
+            if reads {
+                proving.fresh.set(true);
+            }
+            None
+        };
+        let decide = |proving: &desk::Proving<'_>| {
+            *seen.lock().unwrap() = Some(proving.fresh.get());
+            handed(proving)
+        };
+        let (served, got) =
+            proving_checked(&desk, (None, address(5)), &refuses, &decide, |stream| {
+                let greeting = joiner::greeting(stream)?;
+                joiner::prove(stream, &greeting, &j, &sign_node, &mut false)
+            });
+        served.expect("the member served the proof");
+        got.expect("the Mac took its bundle");
+        seen.into_inner().unwrap().expect("decide ran")
+    };
+    assert!(fresh_of(true), "the check's read reaches the decision");
+    assert!(!fresh_of(false), "a check that read nothing hands no read");
 }
 
 /// A proof proves nothing on another connection or for another Mac: a `prove` line replayed on a
@@ -1474,18 +1701,65 @@ fn a_proof_over_the_fleet_names_the_node_key_its_channel_proved() {
         handed(proving)
     };
     let j = joining(&j_device, node, "m7");
-    let (served, got) = proving(&desk, Some([0x44; 32]), &decide, |stream| {
-        let greeting = joiner::greeting(stream)?;
-        joiner::prove(stream, &greeting, &j, &sign_node, &mut false)
-    });
-    assert!(
-        served.is_err() && got.is_err(),
-        "a proof of another node key than the channel's"
+    for (idx, current) in [true, false].into_iter().enumerate() {
+        let from = address(u8::try_from(9 + idx).expect("host octet"));
+        let (served, got) = proving_checked(
+            &desk,
+            (
+                Some(desk::Fleet {
+                    node: [0x44; 32],
+                    current,
+                }),
+                from,
+            ),
+            &|_| None,
+            &decide,
+            |stream| {
+                let greeting = joiner::greeting(stream)?;
+                joiner::prove(stream, &greeting, &j, &sign_node, &mut false)
+            },
+        );
+        assert!(
+            served.is_err() && got.is_err(),
+            "a proof of another node key than the channel's (current={current})"
+        );
+    }
+    let (served, got) = proving_checked(
+        &desk,
+        (
+            Some(desk::Fleet {
+                node,
+                current: false,
+            }),
+            address(11),
+        ),
+        &|_| None,
+        &decide,
+        |stream| {
+            let greeting = joiner::greeting(stream)?;
+            joiner::prove(stream, &greeting, &j, &sign_node, &mut false)
+        },
     );
-    let (served, got) = proving(&desk, Some(node), &decide, |stream| {
-        let greeting = joiner::greeting(stream)?;
-        joiner::prove(stream, &greeting, &j, &sign_node, &mut false)
-    });
+    served.expect("served under stale fleet code");
+    got.expect("the bundle under stale fleet code");
+    assert!(!fleet_seen.load(std::sync::atomic::Ordering::SeqCst));
+
+    let (served, got) = proving_checked(
+        &desk,
+        (
+            Some(desk::Fleet {
+                node,
+                current: true,
+            }),
+            address(12),
+        ),
+        &|_| None,
+        &decide,
+        |stream| {
+            let greeting = joiner::greeting(stream)?;
+            joiner::prove(stream, &greeting, &j, &sign_node, &mut false)
+        },
+    );
     served.expect("served");
     got.expect("the bundle");
     assert!(fleet_seen.load(std::sync::atomic::Ordering::SeqCst));

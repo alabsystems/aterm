@@ -170,6 +170,14 @@ fn mode_on(paths: &Paths) -> bool {
 /// Releases any running update-restart bridge by removing the bridge PID file.
 pub(super) fn release(paths: &Paths) {
     let file = paths.bridge_file();
+    match crate::paths::existing_real_dir(&paths.state_dir) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            aterm_log::warn!("acaffiene: could not remove {}: {e}", file.display());
+            return;
+        }
+    }
     match std::fs::remove_file(&file) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -185,6 +193,9 @@ fn forget(file: &Path, me: u32) {
 
 fn read_pid(file: &Path) -> Option<u32> {
     use std::os::unix::fs::OpenOptionsExt as _;
+    if !crate::paths::parent_is_real_dir(file) {
+        return None;
+    }
     let opened = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -206,13 +217,24 @@ fn read_pid(file: &Path) -> Option<u32> {
 }
 
 fn write_pid(file: &Path, pid: u32) -> io::Result<()> {
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent)?;
+    if let Some(parent) = file.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        crate::paths::ensure_real_dir(parent)?;
     }
     let (tmp, mut out) = aterm_uds::atomic_file::create_temp_beside(file, 0o600)?;
-    let written = out
-        .write_all(format!("{pid}\n").as_bytes())
-        .and_then(|()| std::fs::rename(&tmp, file));
+    let written = out.write_all(format!("{pid}\n").as_bytes()).and_then(|()| {
+        if let Some(parent) = file.parent()
+            && !parent.as_os_str().is_empty()
+            && !crate::paths::existing_real_dir(parent)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} does not exist", parent.display()),
+            ));
+        }
+        std::fs::rename(&tmp, file)
+    });
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }

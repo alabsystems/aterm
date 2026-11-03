@@ -12,6 +12,14 @@ use crate::membership_log::{
 };
 use aterm_digest::Sha256;
 
+#[cfg(test)]
+#[path = "log_entries_commit_tests.rs"]
+mod commit_tests;
+
+#[cfg(test)]
+#[path = "log_entries/held_draft_tests.rs"]
+mod held_draft_tests;
+
 const HEADS_DIGEST_MAGIC: &[u8; 5] = b"ALHD1";
 
 /// Deterministic SHA-256 digest over a [`Log`]'s current head [`RecordId`]s.
@@ -117,7 +125,7 @@ pub(super) fn trusted_local_log(paths: &Paths, config: &Config) -> crate::Result
     if !super::source_bound(config, &state) || !super::pin_admitted(config, None) {
         return Ok(None);
     }
-    let Some(cached) = super::held_copy(paths, config, &state) else {
+    let Some(cached) = super::read_held_copy(paths, config, &state)? else {
         return Ok(None);
     };
     let envelope = super::envelope::parse(&cached)?;
@@ -357,42 +365,7 @@ pub(super) fn addressed_to(envelope: &Envelope, identity: &Identity) -> crate::R
 /// epoch leaves it out on purpose ([`Log::left_out`]). A Mac a member admitted into the log
 /// (F15) has no envelope locker, and reads the log; one an admin's rotation left out does not.
 pub(super) fn log_alone_admits(log: &Log, identity: &Identity) -> crate::Result<bool> {
-    let me = identity.recipient();
-    if log.recipient_is_removed(&me)
-        || log.audience_left_out_recipient(&EpochAudience::Everyone, &me)
-    {
-        return Ok(false);
-    }
-    let membership = log.membership();
-    let has_active_seat = membership
-        .members()
-        .values()
-        .any(|member| member.binding.recipient() == me && !membership.member_node_removed(member));
-    let has_unproved_seat = !has_active_seat
-        && membership.unproved().iter().any(|f| {
-            f.recipient == me
-                && !f.node_key.is_some_and(|nk| {
-                    nk != [0; 32]
-                        && matches!(
-                            membership.node(&nk),
-                            crate::membership_log::NodeStanding::Removed(_)
-                        )
-                })
-        });
-    if !has_active_seat && !has_unproved_seat {
-        return Ok(false);
-    }
-    let Some(opened) = log.open_audience_entries(identity)? else {
-        return Ok(false);
-    };
-    if has_active_seat {
-        return Ok(membership.members().iter().any(|(actor, member)| {
-            member.binding.recipient() == me
-                && !membership.member_node_removed(member)
-                && !log.left_out(&opened, &EpochAudience::Everyone, actor)
-        }));
-    }
-    Ok(true)
+    log.admits_without_locker(identity)
 }
 
 /// How a seeded log stands to an envelope: whether it holds every record the envelope's entries
@@ -447,11 +420,32 @@ pub(super) fn open_entries_preferring_log(
     envelope: &Envelope,
     identity: &Identity,
 ) -> crate::Result<OpenedWithDigest> {
+    open_entries_preferring_log_selected(paths, config, envelope, identity, None)
+}
+
+pub(super) fn open_named_entries_preferring_log(
+    paths: &Paths,
+    config: &Config,
+    envelope: &Envelope,
+    identity: &Identity,
+    names: &[&str],
+) -> crate::Result<OpenedWithDigest> {
+    open_entries_preferring_log_selected(paths, config, envelope, identity, Some(names))
+}
+
+fn open_entries_preferring_log_selected(
+    paths: &Paths,
+    config: &Config,
+    envelope: &Envelope,
+    identity: &Identity,
+    names: Option<&[&str]>,
+) -> crate::Result<OpenedWithDigest> {
     let seeded = trusted_seeded_log(paths, config, envelope)?;
     open_entries_with_log(
         seeded.as_ref().map(|(log, digest)| (log, *digest)),
         envelope,
         identity,
+        names,
     )
 }
 
@@ -459,6 +453,7 @@ fn open_entries_with_log(
     seeded: Option<(&Log, [u8; 32])>,
     envelope: &Envelope,
     identity: &Identity,
+    names: Option<&[&str]>,
 ) -> crate::Result<OpenedWithDigest> {
     if let Some((log, digest)) = seeded
         && (log.removes(&identity.recipient())
@@ -473,9 +468,21 @@ fn open_entries_with_log(
         && log_base(Some(log), envelope, identity)? == LogBase::Covers
         && reads_log(log, identity)
     {
-        return Ok((log.open_entries(identity)?, Some(digest)));
+        let entries = match names {
+            Some(names) => log.open_entries_named(identity, names)?,
+            None => log.open_entries(identity)?,
+        };
+        return Ok((entries, Some(digest)));
     }
-    Ok((super::open_lockers(envelope, identity)?, None))
+    // An envelope still validates its complete locker view before selection. This only
+    // limits the returned entries; it does not make envelope parsing a selective read.
+    let entries = super::open_lockers(envelope, identity)?.map(|mut entries| {
+        if let Some(names) = names {
+            entries.retain(|entry| names.contains(&entry.name.as_str()));
+        }
+        entries
+    });
+    Ok((entries, None))
 }
 
 #[derive(Clone, Default)]
@@ -594,7 +601,12 @@ fn roster_with_log(
         },
         identity,
         || {
-            let (entries, digest) = open_entries_with_log(seeded, envelope, identity)?;
+            let (entries, digest) = open_entries_with_log(
+                seeded,
+                envelope,
+                identity,
+                Some(&[crate::swarm_roster::ROSTER_ENTRY]),
+            )?;
             let mut result = RosterRead::from_entries(entries);
             result.log_digest = digest;
             Ok(result)
@@ -611,7 +623,12 @@ pub(super) fn roster_from_log(log: &Log, identity: &Identity) -> crate::Result<R
             heads: records_heads_digest(log),
         },
         identity,
-        || Ok(RosterRead::from_entries(log.open_entries(identity)?)),
+        || {
+            Ok(RosterRead::from_entries(log.open_entries_named(
+                identity,
+                &[crate::swarm_roster::ROSTER_ENTRY],
+            )?))
+        },
     )
 }
 
@@ -1228,19 +1245,25 @@ pub(super) fn roster_from_doc_or_opened(
     opened: Option<&crate::membership_log::entries::OpenedAudienceEntries>,
     log: Option<&Log>,
 ) -> Option<crate::swarm_roster::SwarmRoster> {
+    let opened_entry = opened.and_then(|opened| {
+        opened
+            .by_audience
+            .get(&Audience::Everyone)?
+            .get(crate::swarm_roster::ROSTER_ENTRY)
+    });
+    roster_from_doc_or_entry(doc, opened_entry, log)
+}
+
+fn roster_from_doc_or_entry(
+    doc: Option<&Document>,
+    opened: Option<&Entry>,
+    log: Option<&Log>,
+) -> Option<crate::swarm_roster::SwarmRoster> {
     let mut combined: Option<crate::swarm_roster::SwarmRoster> = None;
-    let doc_bytes = doc
-        .and_then(|d| d.entry(&Audience::Everyone, crate::swarm_roster::ROSTER_ENTRY))
-        .map(|e| e.value.clone());
-    let opened_bytes = opened
-        .and_then(|o| {
-            o.by_audience
-                .get(&Audience::Everyone)?
-                .get(crate::swarm_roster::ROSTER_ENTRY)
-        })
-        .map(|e| e.value.clone());
-    for bytes in [doc_bytes, opened_bytes].into_iter().flatten() {
-        let Ok(text) = std::str::from_utf8(bytes.as_slice()) else {
+    let doc_entry =
+        doc.and_then(|doc| doc.entry(&Audience::Everyone, crate::swarm_roster::ROSTER_ENTRY));
+    for entry in [doc_entry, opened].into_iter().flatten() {
+        let Ok(text) = std::str::from_utf8(entry.value.as_slice()) else {
             continue;
         };
         let Ok(roster) = crate::swarm_roster::SwarmRoster::from_toml(text) else {
@@ -1260,11 +1283,42 @@ pub(super) fn roster_from_doc_or_opened(
 pub fn local_swarm_roster_for_log(
     paths: &Paths,
     log: &Log,
-) -> Option<crate::swarm_roster::SwarmRoster> {
-    let mut combined = super::roster::base_swarm_roster(paths).ok().flatten();
-    if let Ok(Some(identity)) = super::read_identity(paths)
-        && let Ok(Some(opened)) = log.open_audience_entries(&identity)
-        && let Some(r) = roster_from_doc_or_opened(None, Some(&opened), Some(log))
+) -> crate::Result<Option<crate::swarm_roster::SwarmRoster>> {
+    StateLock::narrow_owned(paths)?;
+    let lock = StateLock::observe(paths)?.ok_or_else(|| {
+        Error::new("the vault state is busy or unavailable while reading its roster")
+    })?;
+    local_swarm_roster_for_log_held(paths, log, &lock)
+}
+
+pub(crate) fn local_swarm_roster_for_log_held(
+    paths: &Paths,
+    log: &Log,
+    lock: &StateLock,
+) -> crate::Result<Option<crate::swarm_roster::SwarmRoster>> {
+    if !commons_log_matches_local_lineage(paths, log)? {
+        return Err(Error::new(
+            "the roster log belongs to another configured vault authority",
+        ));
+    }
+    // A held head has all its parents, so retaining every current head retains the
+    // current log's whole causal past. A caller's uncommitted draft may extend it.
+    if let Some(expected) = super::config(paths)?
+        && let Some(current) = trusted_local_log(paths, &expected)?
+        && current.heads().iter().any(|head| log.get(head).is_none())
+    {
+        return Err(Error::new(
+            "the caller's membership log is behind the current vault snapshot",
+        ));
+    }
+    let mut combined = super::roster::base_swarm_roster_held(paths, lock)?;
+    if let Some(identity) = super::read_identity(paths)?
+        && let Some(entries) = log.open_audience_entries_named(
+            &identity,
+            &Audience::Everyone,
+            &[crate::swarm_roster::ROSTER_ENTRY],
+        )?
+        && let Some(r) = roster_from_doc_or_entry(None, entries.first(), Some(log))
     {
         match &mut combined {
             None => combined = Some(r),
@@ -1273,8 +1327,10 @@ pub fn local_swarm_roster_for_log(
     }
     let mut roster = combined.unwrap_or_default();
     super::roster::overlay_log_membership(log, &mut roster);
-    (!roster.members.is_empty() || !roster.deny_labels.is_empty() || !roster.deny_nodes.is_empty())
-        .then_some(roster)
+    Ok((!roster.members.is_empty()
+        || !roster.deny_labels.is_empty()
+        || !roster.deny_nodes.is_empty())
+    .then_some(roster))
 }
 
 pub(super) fn open_local_member_signer(
@@ -1290,6 +1346,28 @@ fn open_local_member_signer_until(
     deadline: Option<std::time::Instant>,
 ) -> crate::Result<Option<(MemberId, Device, [u8; 16])>> {
     super::publication_current(deadline)?;
+    StateLock::narrow_owned(paths)?;
+    let lock = StateLock::observe(paths)?.ok_or_else(|| {
+        Error::new("the vault state is busy or unavailable while reading its signer")
+    })?;
+    open_local_member_signer_held_until(paths, log, &lock, deadline)
+}
+
+pub(super) fn open_local_member_signer_held(
+    paths: &Paths,
+    log: &Log,
+    lock: &StateLock,
+) -> crate::Result<Option<(MemberId, Device, [u8; 16])>> {
+    open_local_member_signer_held_until(paths, log, lock, None)
+}
+
+fn open_local_member_signer_held_until(
+    paths: &Paths,
+    log: &Log,
+    lock: &StateLock,
+    deadline: Option<std::time::Instant>,
+) -> crate::Result<Option<(MemberId, Device, [u8; 16])>> {
+    super::publication_current(deadline)?;
     if fsx::kind(&paths.dir.join("commons").join("device.age"))? != fsx::Kind::File {
         return Ok(None);
     }
@@ -1298,9 +1376,9 @@ fn open_local_member_signer_until(
         |deadline| Device::open_existing_until(paths, deadline),
     ) {
         Ok(device) => device,
-        Err(_) => {
+        Err(error) => {
             super::publication_current(deadline)?;
-            return Ok(None);
+            return Err(error);
         }
     };
     let Body::Genesis { root, .. } = log.genesis().body() else {
@@ -1318,18 +1396,18 @@ fn open_local_member_signer_until(
         || membership.member_node_removed(member)
         || log.audience_left_out(&EpochAudience::Everyone, &actor)
         || log.audience_left_out_recipient(&EpochAudience::Everyone, &member.binding.recipient())
-        || super::local_recipient_denied_in_roster(paths)
+        || super::steward::local_recipient_denial_held(paths, lock)?
     {
         return Ok(None);
     }
-    if local_swarm_roster_for_log(paths, log).is_some_and(|roster| {
+    let config = super::config(paths)?;
+    if local_swarm_roster_for_log_held(paths, log, lock)?.is_some_and(|roster| {
         let rec_str = member.binding.recipient().to_bech32();
         member_denied_by_roster(&roster, member)
             || (roster.member_by_recipient(&rec_str).is_none()
                 && crate::swarm_roster::leading_m_label(&member.label).is_none()
-                && super::config(paths)
-                    .ok()
-                    .flatten()
+                && config
+                    .as_ref()
                     .is_some_and(|cfg| roster.is_label_denied(&cfg.host)))
     }) {
         return Ok(None);
@@ -1445,57 +1523,9 @@ fn pending_remove_cutoffs(
     out
 }
 
-/// Take the Mac whose age recipient is `recipient` out of this Mac's membership log as an admin's
-/// revoke takes it out of the envelope: a [`Body::Remove`] whose cutoff is the last of its records
-/// this log holds, else the record that let it in, saved to `paths.records_file()`, so the publish
-/// that follows stamps it and sends it with its own records. Once it is in, every record that Mac
-/// signs outside the cutoff's past stops counting on every Mac, and it unwraps nothing: it can no
-/// longer write an entry under an epoch it still holds. `false` where this Mac has no seat in a
-/// seeded log of this lineage, or the log holds no other member with that recipient.
-///
-/// # Errors
-/// The records file cannot be read or written, or the record cannot be signed.
-pub(super) fn remove_from_log(
-    paths: &Paths,
-    config: &Config,
-    envelope_signer: &[u8; 32],
-    handoff: &[([u8; 32], [u8; 64])],
-    recipient: &Recipient,
-) -> crate::Result<bool> {
-    let (_, _, removed) = author_and_commit_records(paths, |store| {
-        let Some(log) = store.log() else {
-            return Ok((Vec::new(), false));
-        };
-        if !genesis_matches_lineage(log, config, envelope_signer, handoff) || !log.has_epochs() {
-            return Ok((Vec::new(), false));
-        }
-        let Some((actor, device, incarnation)) = open_local_member_signer(paths, log)? else {
-            return Ok((Vec::new(), false));
-        };
-        let targets = pending_remove_cutoffs(log, &actor, |r| r == recipient);
-        if targets.is_empty() {
-            return Ok((Vec::new(), false));
-        }
-        let authored_ms = aterm_time::unix_millis().unwrap_or(0);
-        let mut log = log.clone();
-        let mut minted = Vec::with_capacity(targets.len());
-        device.with_seed(|seed| -> crate::Result<()> {
-            for (member, cutoff) in targets {
-                let record = log
-                    .draft(&actor, authored_ms, Body::Remove { member, cutoff })
-                    .sign(seed, incarnation)?;
-                let _ = log.insert(record.clone())?;
-                minted.push(record);
-            }
-            Ok(())
-        })?;
-        Ok((minted, true))
-    })?;
-    Ok(removed)
-}
-
 /// Records a writer drafted for a document and has not kept yet, and the log's heads once they are
 /// in: what the envelope sealed with them stamps ([`stamp_line`]).
+#[derive(Clone)]
 pub(super) struct Drafted {
     pub(super) records: Vec<Record>,
     pub(super) heads: Vec<RecordId>,
@@ -1590,23 +1620,35 @@ pub(super) fn adopt_held_draft(
 }
 
 /// Keep what [`draft_document_diff`] drafted once a server holds the envelope stamped with it:
-/// add the records to `paths.records_file()`, then send the whole local store to `urls`.
+/// add the records to `paths.records_file()`, then send the whole local store to `urls`, every
+/// one of them at once and by `posts_by` (one exchange from now where none is given,
+/// [`super::fan_out::post_records_to`]): a server that takes the post and never reads it holds
+/// the command whose version has landed for that one deadline, not one each.
 ///
 /// # Errors
-/// The records file cannot be written.
+/// The complete draft cannot be retained, or the records file cannot be read or written.
 pub(super) fn keep_drafted_until(
     paths: &Paths,
     drafted: &Drafted,
     urls: &[String],
     deadline: Option<std::time::Instant>,
+    posts_by: Option<std::time::Instant>,
 ) -> crate::Result<()> {
     if !drafted.records.is_empty() {
-        if let Some(deadline) = deadline {
-            let _lock = super::StateLock::take_at_until(paths, &paths.lock_file(), deadline)?;
-            super::save_records_unlocked(paths, &encode_records(&drafted.records))?;
-        } else {
-            super::save_records(paths, &encode_records(&drafted.records))?;
-        }
+        let _lock = match deadline {
+            Some(deadline) => StateLock::take_at_until(paths, &paths.lock_file(), deadline)?,
+            None => StateLock::take(paths)?,
+        };
+        let mut current = super::load_records(paths)?;
+        // The envelope already names these exact signed records. Peer ingress
+        // may have consumed their room since drafting; a partial keep must not
+        // let the publisher discard its only complete recovery copy.
+        commit_authored_records(
+            paths,
+            &mut current,
+            &encode_records(&drafted.records),
+            &drafted.records,
+        )?;
     }
     if urls.is_empty() || deadline.is_some() {
         // The normal subscriber transfers this durable log. A bounded caller
@@ -1617,10 +1659,8 @@ pub(super) fn keep_drafted_until(
     if store.is_empty() {
         return Ok(());
     }
-    let wire = store.encode();
-    for url in urls {
-        let _ = transport::post_records(url, &wire);
-    }
+    let by = posts_by.unwrap_or_else(super::fan_out::one_exchange);
+    let _ = super::fan_out::post_records_to(urls, &store.encode(), by);
     Ok(())
 }
 
@@ -1861,6 +1901,21 @@ pub(super) fn draft_document_diff_until(
     let Some((store, _)) = trusted_seeded_store(paths, config, envelope_signer, handoff)? else {
         return Ok(None);
     };
+    draft_document_diff_in_store(paths, &store, identity, doc, base, deadline)
+}
+
+/// The document planner over an already authenticated, state-held snapshot.
+/// A removal plans its retirement first, then diffs the final publication against
+/// that same in-memory store, without publishing or reloading the earlier store.
+pub(super) fn draft_document_diff_in_store(
+    paths: &Paths,
+    store: &Store,
+    identity: &Identity,
+    doc: &Document,
+    base: Base<'_>,
+    deadline: Option<std::time::Instant>,
+) -> crate::Result<Option<Drafted>> {
+    super::publication_current(deadline)?;
     let Some(mut log) = store.log().cloned() else {
         return Ok(None);
     };
@@ -2509,7 +2564,7 @@ pub fn trusted_commons_log(
     trusted_commons_log_from_store(paths, &store, trust)
 }
 
-fn trusted_commons_log_from_store(
+pub(super) fn trusted_commons_log_from_store(
     paths: &Paths,
     store: &Store,
     trust: crate::commons::journal::Trust,
@@ -2538,7 +2593,7 @@ fn trusted_commons_log_from_store(
     Ok(Some((log.clone(), digest)))
 }
 
-struct RecordsAuthorLock(std::fs::File);
+pub(super) struct RecordsAuthorLock(std::fs::File);
 
 impl RecordsAuthorLock {
     fn open_lock_file(paths: &Paths) -> crate::Result<(std::path::PathBuf, std::fs::File)> {
@@ -2548,7 +2603,7 @@ impl RecordsAuthorLock {
         Ok((path, file))
     }
 
-    fn take(paths: &Paths) -> crate::Result<Self> {
+    pub(super) fn take(paths: &Paths) -> crate::Result<Self> {
         let (path, raw) = Self::open_lock_file(paths)?;
         let file: std::fs::File = raw;
         #[expect(
@@ -2576,7 +2631,7 @@ impl RecordsAuthorLock {
         }
     }
 
-    fn try_take_until(paths: &Paths, deadline: Instant) -> crate::Result<Option<Self>> {
+    pub(super) fn try_take_until(paths: &Paths, deadline: Instant) -> crate::Result<Option<Self>> {
         let mut backoff = Duration::from_millis(1);
         loop {
             if let Some(lock) = Self::try_take(paths)? {
@@ -2600,7 +2655,7 @@ impl Drop for RecordsAuthorLock {
 
 /// Serialize local membership-log authoring under [`RecordsAuthorLock`] and commit `minted`
 /// records under [`StateLock`], re-drafting up to 3 times if concurrent peer ingress extended
-/// `paths.records_file()` while signing.
+/// `paths.records_file()` while signing. A batch that cannot be held whole is not written.
 pub(super) fn author_and_commit_records<T>(
     paths: &Paths,
     mut draft: impl FnMut(&Store) -> crate::Result<(Vec<Record>, T)>,
@@ -2614,18 +2669,39 @@ pub(super) fn author_and_commit_records<T>(
             return Ok((minted, snapshot, out));
         }
         let wire = encode_records(&minted);
+        #[cfg(test)]
+        author_batch_tests::before_commit();
         let _state = StateLock::take(paths)?;
         let mut current = super::load_records(paths)?;
         if attempt < 3 && current.inventory() != before {
             continue;
         }
-        let added = current.ingest(&wire)?;
-        if added > 0 {
-            fsx::write_atomic(&paths.records_file(), &current.encode(), 0o600)?;
-        }
+        commit_authored_records(paths, &mut current, &wire, &minted)?;
         return Ok((minted, current, out));
     }
     unreachable!("bounded loop returns on attempt == 3")
+}
+
+/// Network ingress may keep the valid part of an offered stream. Local authoring
+/// promises the complete signed operation, including its wraps and resealed
+/// values. Check causal retention, allowing already-held records, before any
+/// write; a capacity or validation failure discards this in-memory candidate.
+pub(super) fn commit_authored_records(
+    paths: &Paths,
+    current: &mut Store,
+    wire: &[u8],
+    minted: &[Record],
+) -> crate::Result<()> {
+    let added = current.ingest(wire)?;
+    if minted.iter().any(|record| !current.holds(record.id())) {
+        return Err(Error::new(
+            "authored membership batch could not be retained completely",
+        ));
+    }
+    if added > 0 {
+        fsx::write_atomic(&paths.records_file(), &current.encode(), 0o600)?;
+    }
+    Ok(())
 }
 
 /// Bounded variant of [`author_and_commit_records`] that waits at most until `deadline` for
@@ -2640,13 +2716,21 @@ fn author_and_commit_records_until<T>(
         return Ok(None);
     };
     for attempt in 0..4 {
+        // Draft authorization reads share one observation. A busy writer yields within
+        // the caller's deadline instead of turning its unavailable roster into an error.
+        let Some(observation) = StateLock::observe_until(paths, deadline)? else {
+            return Ok(None);
+        };
         let snapshot = super::load_records(paths)?;
         let before = snapshot.inventory();
         let (minted, out) = draft(&snapshot)?;
+        drop(observation);
         if minted.is_empty() {
             return Ok(Some((minted, snapshot, out)));
         }
         let wire = encode_records(&minted);
+        #[cfg(test)]
+        author_batch_tests::before_commit();
         let Some(_state) = StateLock::try_take_until(paths, deadline)? else {
             return Ok(None);
         };
@@ -2654,10 +2738,7 @@ fn author_and_commit_records_until<T>(
         if attempt < 3 && current.inventory() != before {
             continue;
         }
-        let added = current.ingest(&wire)?;
-        if added > 0 {
-            fsx::write_atomic(&paths.records_file(), &current.encode(), 0o600)?;
-        }
+        commit_authored_records(paths, &mut current, &wire, &minted)?;
         return Ok(Some((minted, current, out)));
     }
     unreachable!("bounded loop returns on attempt == 3")
@@ -2677,19 +2758,136 @@ pub(super) fn genesis_signer_matches_local_lineage(
     if let Some(cfg) = super::config(paths)? {
         let mut lineage_ok = cfg.signer.as_ref() == Some(signer) || cfg.followed.contains(signer);
         if !lineage_ok
+            && let Some(pin) = &cfg.signer
             && let Ok(Some(bytes)) = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
-            && let Ok(env) = envelope::parse(bytes.as_slice())
+            && let Ok((env, _, _)) =
+                envelope::verify_for_reader(bytes.as_slice(), &cfg.name, pin, &cfg.followed, None)
         {
-            lineage_ok = signer == &env.signer
-                || cfg.signer.as_ref() == Some(signer)
-                || cfg.followed.contains(signer)
-                || env.handoff.iter().any(|(key, _)| key == signer);
+            // A current signer can carry a broken older prefix before the
+            // trusted pin. Only verified predecessors belong to its lineage.
+            lineage_ok = signer == &env.signer || env.reached_from().contains(signer);
         }
         if cfg.signer.is_some() && !lineage_ok {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod lineage_tests {
+    use super::*;
+
+    const PIN: [u8; 32] = [53; 32];
+    const NEXT: [u8; 32] = [67; 32];
+    const UNRELATED: [u8; 32] = [71; 32];
+    const VAULT: &str = "lineage-test";
+
+    fn wire(name: &str, seeds: &[[u8; 32]]) -> Vec<u8> {
+        signed(
+            name,
+            seeds.last().unwrap(),
+            envelope::test_chain(name, seeds),
+        )
+    }
+
+    fn signed(name: &str, seed: &[u8; 32], handoff: Vec<([u8; 32], [u8; 64])>) -> Vec<u8> {
+        envelope::sign_unchecked(
+            &envelope::Unsigned {
+                name: name.into(),
+                seq: 1,
+                time: 1,
+                handoff,
+                parents: Vec::new(),
+                lockers: vec![envelope::Locker {
+                    label: "admin".into(),
+                    armored: envelope::test_armor(b"inert lineage fixture"),
+                }],
+            },
+            seed,
+        )
+        .unwrap()
+    }
+
+    fn configured() -> (aterm_tempfile::TempDir, Paths) {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(home.path());
+        super::super::save_config(
+            &paths,
+            &Config {
+                source: Source::Path(home.path().join("unused.secrets")),
+                name: VAULT.into(),
+                signer: Some(envelope::signer_public(&PIN).unwrap()),
+                followed: Vec::new(),
+                host: "m1".into(),
+            },
+        )
+        .unwrap();
+        (home, paths)
+    }
+
+    #[test]
+    fn genesis_lineage_accepts_an_endorsed_rotation_before_the_pin_is_updated() {
+        let (_home, paths) = configured();
+        let pin = envelope::signer_public(&PIN).unwrap();
+        assert!(genesis_signer_matches_local_lineage(&paths, &pin).unwrap());
+        let bytes = wire(VAULT, &[PIN, NEXT]);
+        fsx::write_atomic(&paths.cache_file(), &bytes, 0o600).unwrap();
+        assert!(
+            genesis_signer_matches_local_lineage(&paths, &envelope::signer_public(&NEXT).unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn genesis_lineage_refuses_unverified_or_unrelated_cached_claims() {
+        let valid = wire(VAULT, &[PIN, NEXT]);
+        let damaged = String::from_utf8(valid.clone())
+            .unwrap()
+            .replace("seq: 1\n", "seq: 2\n")
+            .into_bytes();
+        assert_ne!(valid, damaged, "the negative fixture changed signed bytes");
+        let cases = [
+            ("unrelated signer", wire(VAULT, &[NEXT])),
+            ("other vault", wire("other-vault", &[PIN, NEXT])),
+            ("damaged signature", damaged),
+            ("unrelated handoff", wire(VAULT, &[UNRELATED, NEXT])),
+        ];
+        for (why, bytes) in cases {
+            let (_home, paths) = configured();
+            fsx::write_atomic(&paths.cache_file(), &bytes, 0o600).unwrap();
+            assert!(
+                !genesis_signer_matches_local_lineage(
+                    &paths,
+                    &envelope::signer_public(&NEXT).unwrap()
+                )
+                .unwrap(),
+                "accepted {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn genesis_lineage_does_not_admit_a_broken_prefix_before_the_trusted_pin() {
+        let (_home, paths) = configured();
+        let mut handoff = envelope::test_chain(VAULT, &[UNRELATED, PIN, NEXT]);
+        handoff[0].1[0] ^= 1;
+        let bytes = signed(VAULT, &NEXT, handoff);
+        fsx::write_atomic(&paths.cache_file(), &bytes, 0o600).unwrap();
+        assert!(
+            genesis_signer_matches_local_lineage(&paths, &envelope::signer_public(&NEXT).unwrap())
+                .unwrap(),
+            "the valid suffix from the pinned key remains usable"
+        );
+        assert!(
+            !genesis_signer_matches_local_lineage(
+                &paths,
+                &envelope::signer_public(&UNRELATED).unwrap()
+            )
+            .unwrap(),
+            "a forged predecessor is not part of the verified suffix"
+        );
+    }
 }
 
 pub(super) fn post_records_best_effort(paths: &Paths, wire: &[u8]) {
@@ -2783,17 +2981,21 @@ pub fn publish_local_node_key(
     if node_key == [0; 32] {
         return Ok(None);
     }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let Some(observation) = StateLock::observe_until(paths, deadline)? else {
+        return Ok(None);
+    };
     let store = load_records(paths)?;
     let Some(log) = store.log() else {
         return Ok(None);
     };
-    let Some((actor, _, _)) = open_local_member_signer(paths, log)? else {
+    let Some((actor, _, _)) = open_local_member_signer_held(paths, log, &observation)? else {
         return Ok(None);
     };
     if log.membership().get(&actor).and_then(|m| m.node_key) == Some(node_key) {
         return Ok(None);
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    drop(observation);
     let Some((minted, _, ())) = author_and_commit_records_until(paths, deadline, |store| {
         let Some(mut log) = store.log().cloned() else {
             return Ok((Vec::new(), ()));
@@ -2901,7 +3103,7 @@ fn draft_admit_member_in_log(
             "the vault's newest key leaves this Mac out on purpose, and an Admit does not let it back in",
         ));
     }
-    let local_roster = local_swarm_roster_for_log(paths, &log);
+    let local_roster = local_swarm_roster_for_log(paths, &log)?;
     let opened_roster = roster_from_doc_or_opened(None, Some(&opened), Some(&log));
     let node_hex = aterm_codec::hex::encode_lower(&entrant.node_key);
     let writer_hex = aterm_codec::hex::encode_lower(entrant.request.binding().writer());
@@ -2995,13 +3197,21 @@ pub fn remove_member_in_log(paths: &Paths, target: MemberId) -> crate::Result<Ve
     Ok(minted)
 }
 
+#[cfg(test)]
 pub(super) fn retire_recipients_in_log_local(
     paths: &Paths,
+    lock: &StateLock,
     active_targets: &[MemberId],
     exclude_recipients: &BTreeSet<Recipient>,
 ) -> crate::Result<Vec<Record>> {
     let store = super::load_records(paths)?;
-    let minted = draft_retire_in_log(paths, &store, active_targets, exclude_recipients)?;
+    let minted = draft_retire_in_log_with(
+        paths,
+        &store,
+        active_targets,
+        exclude_recipients,
+        Some(lock),
+    )?;
     if !minted.is_empty() {
         let wire = encode_records(&minted);
         let _ = super::save_records_unlocked(paths, &wire)?;
@@ -3017,6 +3227,16 @@ pub(super) fn draft_retire_in_log(
     targets: &[MemberId],
     exclude_recipients: &BTreeSet<Recipient>,
 ) -> crate::Result<Vec<Record>> {
+    draft_retire_in_log_with(paths, store, targets, exclude_recipients, None)
+}
+
+pub(super) fn draft_retire_in_log_with(
+    paths: &Paths,
+    store: &Store,
+    targets: &[MemberId],
+    exclude_recipients: &BTreeSet<Recipient>,
+    lock: Option<&StateLock>,
+) -> crate::Result<Vec<Record>> {
     let Some(mut log) = store.log().cloned() else {
         return Err(Error::new("this machine holds no membership log"));
     };
@@ -3025,7 +3245,11 @@ pub(super) fn draft_retire_in_log(
             "this membership log has no Commons control epochs",
         ));
     }
-    let Some((actor, device, incarnation)) = open_local_member_signer(paths, &log)? else {
+    let signer = match lock {
+        Some(lock) => open_local_member_signer_held(paths, &log, lock),
+        None => open_local_member_signer(paths, &log),
+    }?;
+    let Some((actor, device, incarnation)) = signer else {
         return Err(Error::new(
             "this machine is not an active bound member in the membership log",
         ));
@@ -3529,7 +3753,7 @@ fn draft_reconcile_commons_log(
     let Some(identity) = super::read_identity(paths)? else {
         return Ok(Vec::new());
     };
-    let local_roster = local_swarm_roster_for_log(paths, &log);
+    let local_roster = local_swarm_roster_for_log(paths, &log)?;
     let active_recipients: BTreeSet<Recipient> = log
         .membership()
         .members()
@@ -3811,7 +4035,9 @@ pub(super) fn reseal_audience(
 
 /// The coverage rule of §3.3.7 for `[everyone]` and Commons: where an audience has two or more
 /// newest epochs, or a newest epoch still wrapped to a Mac the log removed, mint one higher epoch
-/// that covers them, wrapped to the recipients it carries over. Its entries are resealed under it
+/// that covers them, wrapped to the recipients it carries over, only when this Mac opens every
+/// newest epoch. An unobserved wrap does not prove that an unopened epoch has no holder.
+/// Its entries are resealed under it
 /// only where this Mac opens the whole audience, and an audience with an uncovered keyed epoch this
 /// Mac does not open is left to a holder's reseal (F21 rule 7). With `reseal` (the vault pass's
 /// ranked tender, `tend_epochs_at`), where this Mac holds every uncovered keyed epoch of an
@@ -3852,24 +4078,12 @@ pub(super) fn coalesce_concurrent_commons_epochs(
         .get(&EpochAudience::Everyone)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let holds_any_everyone = log.records().skip(1).any(|r| {
-        matches!(
-            r.body(),
-            Body::Epoch {
-                audience: EpochAudience::Everyone,
-                ..
-            }
-        ) && opened.unwrapped_keys.contains_key(r.id())
-    });
+    // An absent wrap may still be in flight. Neither an empty recipient set nor one
+    // containing no currently active member proves that an unopened epoch may be replaced.
     let can_open_all_max_everyone = !max_everyone.is_empty()
-        && holds_any_everyone
-        && max_everyone.iter().all(|ep_id| {
-            opened.unwrapped_keys.contains_key(ep_id)
-                || opened
-                    .wrapped_recipients
-                    .get(ep_id)
-                    .is_none_or(|set| set.is_disjoint(active_recipients))
-        });
+        && max_everyone
+            .iter()
+            .all(|ep_id| opened.unwrapped_keys.contains_key(ep_id));
     let everyone_wraps_removed = !removed.is_empty()
         && max_everyone.iter().any(|ep_id| {
             opened
@@ -3909,15 +4123,10 @@ pub(super) fn coalesce_concurrent_commons_epochs(
         .get(&EpochAudience::Commons)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let holds_any_commons = log.records().skip(1).any(|r| {
-        matches!(
-            r.body(),
-            Body::Epoch {
-                audience: EpochAudience::Commons,
-                ..
-            }
-        ) && opened.unwrapped_keys.contains_key(r.id())
-    });
+    let can_open_all_max_commons = !max_commons.is_empty()
+        && max_commons
+            .iter()
+            .all(|ep_id| opened.unwrapped_keys.contains_key(ep_id));
     let commons_wraps_removed = !removed.is_empty()
         && max_commons.iter().any(|ep_id| {
             opened
@@ -3927,7 +4136,7 @@ pub(super) fn coalesce_concurrent_commons_epochs(
         });
     if tender_only(&EpochAudience::Commons)
         || (!reseal_ready(opened, &EpochAudience::Commons)
-            && (!holds_any_commons
+            && (!can_open_all_max_commons
                 || opened.awaits_reseal(&EpochAudience::Commons)
                 || (max_commons.len() <= 1 && !commons_wraps_removed)))
     {
@@ -3969,34 +4178,34 @@ fn is_enrollment_denied_by_roster(
     binding: &crate::commons::binding::Binding,
     labels: &[&str],
     node_key: Option<&[u8; 32]>,
-) -> bool {
-    let Some(roster) = local_swarm_roster_for_log(paths, log) else {
-        return false;
+) -> crate::Result<bool> {
+    let Some(roster) = local_swarm_roster_for_log(paths, log)? else {
+        return Ok(false);
     };
     if roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.writer()))
         || roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.incarnation()))
         || roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.machine()))
     {
-        return true;
+        return Ok(true);
     }
     if let Some(key) = node_key
         && *key != [0; 32]
         && roster.is_node_denied(&aterm_codec::hex::encode_lower(key))
     {
-        return true;
+        return Ok(true);
     }
     let rec_str = binding.recipient().to_bech32();
     if let Some(row) = roster.member_by_recipient(&rec_str) {
-        return super::steward::member_is_denied_in_roster(&roster, row);
+        return Ok(super::steward::member_is_denied_in_roster(&roster, row));
     }
     if labels.iter().any(|l| roster.is_label_denied(l)) {
-        return true;
+        return Ok(true);
     }
-    labels.iter().any(|l| {
+    Ok(labels.iter().any(|l| {
         roster
             .member_by_label_or_alias(l)
             .is_some_and(|row| super::steward::member_is_denied_in_roster(&roster, row))
-    })
+    }))
 }
 
 fn plan_log_enrollment(
@@ -4041,7 +4250,7 @@ fn plan_log_enrollment(
                 binding,
                 &[&existing.label, &existing.name],
                 existing.node_key.as_ref(),
-            )
+            )?
         {
             return Err(Error::new("Commons enrollment recipient is not admitted"));
         }
@@ -4068,7 +4277,7 @@ fn plan_log_enrollment(
                 binding,
                 &[&founder.label, &founder.name],
                 founder.node_key.as_ref(),
-            )
+            )?
         {
             return Err(Error::new("Commons enrollment recipient is not admitted"));
         }
@@ -4103,11 +4312,11 @@ fn plan_log_enrollment(
         {
             return Err(Error::new("Commons enrollment recipient is not admitted"));
         }
-        if is_enrollment_denied_by_roster(paths, log, binding, &[&machine.name], None) {
+        if is_enrollment_denied_by_roster(paths, log, binding, &[&machine.name], None)? {
             return Err(Error::new("Commons enrollment recipient is not admitted"));
         }
         let rec_str = binding.recipient().to_bech32();
-        let mut combined_roster = local_swarm_roster_for_log(paths, log).unwrap_or_default();
+        let mut combined_roster = local_swarm_roster_for_log(paths, log)?.unwrap_or_default();
         if let Ok(Some(doc_roster)) =
             crate::swarm_roster::SwarmRoster::from_document(&admin.published_doc)
         {
@@ -4162,7 +4371,7 @@ fn plan_log_enrollment(
         let label = log
             .next_label(preferred_label, &taken, &BTreeSet::new())
             .ok_or_else(|| Error::new("no m<N> label up to m99999 is free"))?;
-        if is_enrollment_denied_by_roster(paths, log, binding, &[&machine.name, &label], None) {
+        if is_enrollment_denied_by_roster(paths, log, binding, &[&machine.name, &label], None)? {
             return Err(Error::new("Commons enrollment recipient is not admitted"));
         }
         return Ok(LogEnrollPlan::VaultMachine {
@@ -4443,7 +4652,7 @@ pub(super) fn heard_across(urls: &[String], now: u64) -> Option<transport::Heard
 pub fn admin_mirror_log(paths: &Paths, extra_urls: &[String]) -> crate::Result<Option<u64>> {
     let outcome = mirror_log_to_servers(paths, extra_urls)?;
     if outcome.is_some() {
-        let _ = super::sync_without_reconcile(paths, extra_urls);
+        let _ = super::sync_without_reconcile(paths, extra_urls, None);
     }
     Ok(outcome)
 }
@@ -4464,10 +4673,11 @@ pub(super) fn mirror_log_to_servers(
         if let Ok(store) = super::load_records(paths)
             && !store.is_empty()
         {
-            let wire = store.encode();
-            for url in &candidate_urls {
-                let _ = transport::post_records(url, &wire);
-            }
+            let _ = super::fan_out::post_records_to(
+                &candidate_urls,
+                &store.encode(),
+                super::fan_out::one_exchange(),
+            );
         }
     }
 
@@ -4706,10 +4916,11 @@ fn mirror_heads(
     if let Some(drafted) = &drafted
         && !drafted.records.is_empty()
     {
-        let wire = encode_records(&drafted.records);
-        for url in candidate_urls {
-            let _ = transport::post_records(url, &wire);
-        }
+        let _ = super::fan_out::post_records_to(
+            candidate_urls,
+            &encode_records(&drafted.records),
+            super::fan_out::one_exchange(),
+        );
     }
 
     let mut urls: Vec<String> = heads
@@ -4898,12 +5109,12 @@ fn write_gap_mark(
     )
 )]
 pub(super) fn close_wrap_gaps(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> {
-    if !wrap_gaps_pass(paths, now_ms, false)?.0 {
+    if !wrap_gaps_pass(paths, now_ms, None)?.0 {
         return Ok(Vec::new());
     }
     let _author = RecordsAuthorLock::take(paths)?;
-    let _lock = StateLock::take(paths)?;
-    Ok(wrap_gaps_pass(paths, now_ms, true)?.1)
+    let lock = StateLock::take(paths)?;
+    Ok(wrap_gaps_pass(paths, now_ms, Some(&lock))?.1)
 }
 
 /// Host for `KeyedEpochs`' environment markers (F21), so `spec_xref_closure` accounts for every
@@ -4932,7 +5143,12 @@ pub fn keyed_epochs_environment() {}
 /// writes the gap mark with when this Mac first saw each gap it holds a rank for, so the next
 /// pass counts from there, and the next pass with no new record and nothing due stops at the
 /// digest.
-fn wrap_gaps_pass(paths: &Paths, now_ms: u64, sign: bool) -> crate::Result<(bool, Vec<Record>)> {
+fn wrap_gaps_pass(
+    paths: &Paths,
+    now_ms: u64,
+    lock: Option<&StateLock>,
+) -> crate::Result<(bool, Vec<Record>)> {
+    let sign = lock.is_some();
     let nothing = Ok((false, Vec::new()));
     let Some(config) = super::config(paths)? else {
         return nothing;
@@ -4960,7 +5176,10 @@ fn wrap_gaps_pass(paths: &Paths, now_ms: u64, sign: bool) -> crate::Result<(bool
     };
     let none_seen = BTreeMap::new();
     let (Some((actor, device, incarnation)), Some(identity)) = (
-        open_local_member_signer(paths, &log)?,
+        match lock {
+            Some(lock) => open_local_member_signer_held(paths, &log, lock)?,
+            None => open_local_member_signer(paths, &log)?,
+        },
         read_identity(paths)?,
     ) else {
         write_gap_mark(paths, &digest, 0, &none_seen)?;
@@ -4970,7 +5189,10 @@ fn wrap_gaps_pass(paths: &Paths, now_ms: u64, sign: bool) -> crate::Result<(bool
         write_gap_mark(paths, &digest, 0, &none_seen)?;
         return nothing;
     };
-    let local_roster = local_swarm_roster_for_log(paths, &log);
+    let local_roster = match lock {
+        Some(lock) => local_swarm_roster_for_log_held(paths, &log, lock),
+        None => local_swarm_roster_for_log(paths, &log),
+    }?;
     let opened_roster = roster_from_doc_or_opened(None, Some(&opened), Some(&log));
     let membership = log.membership();
     let audiences = crate::membership_log::admission_audiences(&opened);
@@ -5038,14 +5260,20 @@ fn wrap_gaps_pass(paths: &Paths, now_ms: u64, sign: bool) -> crate::Result<(bool
 }
 
 /// [`close_wrap_gaps`] at the wall clock, and the `Wrap`s it signed posted to every vault server
-/// this Mac reaches ([`super::post_records_to_servers`]): the subscriber's pass after it pulls
-/// records. Best effort: a pass that fails here tries again on the next.
-pub(super) fn tend_wrap_gaps(paths: &Paths) {
+/// this Mac reaches by `posts_by` (one exchange from when it posts where none is given,
+/// [`super::admit::post_records_to_servers_by`]): the subscriber's pass after it pulls records.
+/// Best effort: a pass that fails here tries again on the next.
+pub(super) fn tend_wrap_gaps(paths: &Paths, posts_by: Option<std::time::Instant>) {
     let now_ms = aterm_time::unix_millis().unwrap_or(0);
     if close_wrap_gaps(paths, now_ms).is_ok_and(|signed| !signed.is_empty()) {
-        let _ = super::post_records_to_servers(paths);
+        let by = posts_by.unwrap_or_else(super::fan_out::one_exchange);
+        let _ = super::admit::post_records_to_servers_by(paths, by);
     }
 }
+
+#[cfg(test)]
+#[path = "log_entries/author_batch_tests.rs"]
+mod author_batch_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5310,6 +5538,7 @@ mod tests {
             label: "m5".to_owned(),
             aliases: vec!["m50".to_owned()],
             hint: None,
+            hw_hint: None,
             admitted_ms: 100,
             claimed_label: None,
             claimed_at_ms: None,
@@ -5322,6 +5551,7 @@ mod tests {
             label: "m8".to_owned(),
             aliases: Vec::new(),
             hint: None,
+            hw_hint: None,
             admitted_ms: 200,
             claimed_label: None,
             claimed_at_ms: None,

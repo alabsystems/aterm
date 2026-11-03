@@ -530,7 +530,8 @@ pub const COMMAND_LINE_TOOLS_INSTALLING: &str =
 /// window types [`COMMAND_LINE_TOOLS_TAB_GO`] (once the tab has landed), then speaks to a person
 /// in plain words: one line before macOS asks for the Mac password, a plain password prompt, and
 /// one line saying how it ended. It exits 0 once it said the tools are installed and 1 once it
-/// said why the install did not finish; any other end said nothing, and the window ends the tab
+/// said why the install did not finish (Low Data Mode, an account that may not install them and a
+/// stop each with a code of its own); any other end said nothing, and the window ends the tab
 /// with [`COMMAND_LINE_TOOLS_NOT_FINISHED`] and [`COMMAND_LINE_TOOLS_TRY_AGAIN`].
 pub const COMMAND_LINE_TOOLS_TAB: &str = "ATERM_COMMAND_LINE_TOOLS_TAB";
 
@@ -555,11 +556,37 @@ pub const COMMAND_LINE_TOOLS_TAB_LOW_DATA: u8 = 3;
 /// says so, and offers no Install… that would only say it again.
 pub const COMMAND_LINE_TOOLS_TAB_NOT_ADMIN: u8 = 4;
 
+/// What the Command Line Tools tab's program exits with once it said a stop ended its install
+/// before the tools arrived: a Ctrl-C in the tab, at the password prompt or during the install.
+/// A person declined: the window keeps the account's opening spent, as it does for a closed
+/// tab, and no launch reopens it by itself.
+pub const COMMAND_LINE_TOOLS_TAB_STOPPED: u8 = 5;
+
 /// The tail of Apple's own installer app's executable (`Install Command Line Developer Tools`,
 /// which `xcode-select --install` and the `/usr/bin` stubs open), which holds the placeholder
-/// once its install starts.
+/// once its install starts. Its window can also stay open, unpressed, beside a placeholder an
+/// ended install left, so aterm counts it as an install only while it or the placeholder is
+/// younger than [`APPLE_WINDOW_INSTALL_BOUND`] ([`ToolsInstaller::installs`]).
 pub const APPLE_TOOLS_INSTALLER: &str =
     "Install Command Line Developer Tools.app/Contents/MacOS/Install Command Line Developer Tools";
+
+/// How long Apple's installer window ([`APPLE_TOOLS_INSTALLER`]) beside the on-demand placeholder
+/// counts as an install ([`ToolsInstaller::installs`]), measured twice: from the start the kernel
+/// recorded for the window's process, and from the placeholder's status change time (`st_ctime`
+/// of an `lstat`, which follows no link). The window opens before any press and can wait for one
+/// for hours, while the press that starts its install is what creates the placeholder, so the
+/// placeholder's age dates a press in a window opened long before. The change time, not the
+/// modification time: it moves on every write and every `touch`, including one that sets the
+/// modification time back, and no call sets it back, so a placeholder never reads older by it.
+/// While either age is under this bound, or cannot be read, the window installs: a press, its
+/// download of about half a gigabyte and its install end well within two hours (a root install
+/// gives `softwareupdate -i` the same). A window older than this beside a placeholder also older
+/// than this is no install: it waits for a press, for hours or days, beside a placeholder an
+/// ended install left, so `aterm init` plans its own install, the root half replaces that
+/// placeholder and System State asks the person to finish in the window. A press in such a window
+/// that leaves the old placeholder unchanged is not seen.
+pub const APPLE_WINDOW_INSTALL_BOUND: std::time::Duration =
+    std::time::Duration::from_secs(2 * 60 * 60);
 
 /// What a running process is to an install of Apple's Command Line Tools, read from its
 /// executable's path alone: never run, and never by name, so a program merely called
@@ -573,6 +600,32 @@ pub enum ToolsInstaller {
     CommandLine,
     /// Apple's own installer app ([`APPLE_TOOLS_INSTALLER`]).
     AppleWindow,
+}
+
+impl ToolsInstaller {
+    /// Whether a process of this kind that started at `started` installs the tools at `now`,
+    /// beside the on-demand placeholder last changed at `placeholder_changed` (each in Unix
+    /// seconds; `None` where it cannot be read): a command-line installer always, and Apple's
+    /// window while it or the placeholder is younger than [`APPLE_WINDOW_INSTALL_BOUND`], so a
+    /// press in a window opened long before counts from the placeholder it creates. An age that
+    /// cannot be read (no time, or a `now` before it: a clock set back, or one read as `0`) is
+    /// young, so no reader takes over or duplicates an install nobody can rule out; only a window
+    /// and a placeholder both past the bound are no install.
+    #[must_use]
+    pub fn installs(
+        self,
+        started: Option<u64>,
+        placeholder_changed: Option<u64>,
+        now: u64,
+    ) -> bool {
+        let young = |at: Option<u64>| {
+            at.is_none_or(|at| now.saturating_sub(at) < APPLE_WINDOW_INSTALL_BOUND.as_secs())
+        };
+        match self {
+            Self::CommandLine => true,
+            Self::AppleWindow => young(started) || young(placeholder_changed),
+        }
+    }
 }
 
 /// [`ToolsInstaller`] for the process whose executable is `exe`: only an absolute path, one
@@ -594,21 +647,29 @@ pub fn tools_installer(
     }
 }
 
-/// Whether an install of Apple's Command Line Tools runs now: the on-demand placeholder
-/// ([`COMMAND_LINE_TOOLS_INSTALLING`]) is there (`placeholder`) and one of the processes whose
-/// executables are `exes` installs ([`tools_installer`]). The one predicate the window's page,
-/// `aterm init` and the root half's own install share, so a placeholder left behind beside some
-/// other program is no install anywhere.
+/// Whether an install of Apple's Command Line Tools runs now (`now`, Unix seconds): the
+/// on-demand placeholder ([`COMMAND_LINE_TOOLS_INSTALLING`]) is there (`placeholder`) and one of
+/// `processes`, each a pid and its executable, installs ([`tools_installer`],
+/// [`ToolsInstaller::installs`] with the start `started` reads of it and the placeholder's last
+/// change, `placeholder_changed`): a command-line installer, or Apple's installer window while it
+/// or the placeholder is younger than [`APPLE_WINDOW_INSTALL_BOUND`]; a window older than that
+/// beside a placeholder also older waits for a press beside a placeholder an ended install left.
+/// The one predicate the window's page, `aterm init` and the root half's own install share, so a
+/// placeholder left behind beside some other program is no install anywhere.
 #[must_use]
 pub fn tools_install_running(
     placeholder: bool,
-    exes: impl IntoIterator<Item = impl AsRef<std::path::Path>>,
+    placeholder_changed: Option<u64>,
+    processes: impl IntoIterator<Item = (u32, impl AsRef<std::path::Path>)>,
     is_install_process: impl Fn(&std::path::Path) -> bool,
+    started: impl Fn(u32) -> Option<u64>,
+    now: u64,
 ) -> bool {
     placeholder
-        && exes
-            .into_iter()
-            .any(|exe| tools_installer(exe.as_ref(), &is_install_process).is_some())
+        && processes.into_iter().any(|(pid, exe)| {
+            tools_installer(exe.as_ref(), &is_install_process)
+                .is_some_and(|installer| installer.installs(started(pid), placeholder_changed, now))
+        })
 }
 
 /// The longest stamp a run of the root half writes into the placeholder it holds
@@ -905,6 +966,11 @@ pub const BASE_PLAN: Selection = {
     selection.set(Setting::Spotlight, true);
     selection
 };
+
+/// An Access row's note while no person asked for macOS's grants: setup goes on and finishes
+/// without it, and the page's one press asks for the whole batch (System State's offer).
+pub const ACCESS_OFFERED: &str =
+    "macOS needs you to answer this one, so aterm offers it. Nothing else waits for it.";
 
 /// Persisted first-launch setup plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3041,21 +3107,79 @@ mod tests {
     use super::*;
 
     /// A placeholder counts as an install only beside one of Apple's command-line installers (as
-    /// the caller's exact comparison names them: a stand-in here) or Apple's own installer app,
-    /// by absolute path: a stale placeholder beside another program, even one named like an
-    /// installer, is no install.
+    /// the caller's exact comparison names them: a stand-in here), whatever its age or the
+    /// placeholder's, or Apple's own installer app while it or the placeholder is younger than
+    /// [`APPLE_WINDOW_INSTALL_BOUND`] (or of an age nothing can read), by absolute path: a stale
+    /// placeholder beside another program, even one named like an installer, or beside Apple's
+    /// window left open past the bound, both older than it, is no install.
     #[test]
     fn an_install_runs_only_beside_the_tools_own_installers() {
         let cli = |exe: &std::path::Path| exe == std::path::Path::new("/stand-in/installs");
         let apple = "/System/Library/CoreServices/Install Command Line Developer Tools.app/\
                      Contents/MacOS/Install Command Line Developer Tools";
-        assert!(tools_install_running(true, ["/stand-in/installs"], cli));
-        assert!(tools_install_running(true, ["/bin/zsh", apple], cli));
-        assert!(!tools_install_running(
+        let now = 1_800_000_000;
+        let bound = APPLE_WINDOW_INSTALL_BOUND.as_secs();
+        let inside = Some(now - bound + 1);
+        let at = Some(now - bound);
+        // Pid 1 started just inside the bound, 2 just at it, 3 cannot be read, 4 after `now`.
+        let started = |pid: u32| match pid {
+            1 => inside,
+            2 => at,
+            4 => Some(now + 60),
+            _ => None,
+        };
+        let running = |placeholder: bool, changed: Option<u64>, processes: &[(u32, &str)]| {
+            tools_install_running(
+                placeholder,
+                changed,
+                processes.iter().copied(),
+                cli,
+                started,
+                now,
+            )
+        };
+        assert!(
+            running(true, at, &[(2, "/stand-in/installs")]),
+            "at any age"
+        );
+        assert!(
+            running(true, at, &[(9, "/bin/zsh"), (1, apple)]),
+            "a young window"
+        );
+        assert!(
+            !running(true, at, &[(9, "/bin/zsh"), (2, apple)]),
+            "one left open beside a placeholder an ended install left"
+        );
+        assert!(
+            running(true, inside, &[(9, "/bin/zsh"), (2, apple)]),
+            "one left open, pressed: the placeholder its press created dates its install"
+        );
+        assert!(
+            running(true, None, &[(2, apple)]),
+            "a placeholder's change nothing can read is young"
+        );
+        assert!(
+            running(true, Some(now + 60), &[(2, apple)]),
+            "so is one past a clock set back"
+        );
+        assert!(
+            running(true, at, &[(3, apple)]),
+            "a start nothing can read is young"
+        );
+        assert!(
+            running(true, at, &[(4, apple)]),
+            "so is one past a clock set back"
+        );
+        assert!(!running(
             false,
-            ["/stand-in/installs", apple],
-            cli
+            inside,
+            &[(1, "/stand-in/installs"), (1, apple)]
         ));
+        assert!(
+            !ToolsInstaller::AppleWindow.installs(at, at, now),
+            "both past the bound: the 18 h window beside its leftover placeholder"
+        );
+        assert!(ToolsInstaller::CommandLine.installs(at, at, now));
         assert_eq!(
             tools_installer(std::path::Path::new("/stand-in/installs"), cli),
             Some(ToolsInstaller::CommandLine)
@@ -3070,18 +3194,14 @@ mod tests {
             "/System/Library/CoreServices/Software Update.app/Contents/Resources/softwareupdated",
             "Install Command Line Developer Tools.app/Contents/MacOS/Install Command Line Developer Tools",
         ] {
-            assert!(!tools_install_running(true, [other], cli), "{other}");
+            assert!(!running(true, inside, &[(1, other)]), "{other}");
             assert_eq!(
                 tools_installer(std::path::Path::new(other), cli),
                 None,
                 "{other}"
             );
         }
-        assert!(!tools_install_running(
-            true,
-            std::iter::empty::<&str>(),
-            cli
-        ));
+        assert!(!running(true, None, &[]));
     }
 
     /// A placeholder is a live run's only when its stamp names a process alive from the start

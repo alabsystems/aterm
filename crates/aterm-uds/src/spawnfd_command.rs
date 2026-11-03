@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`Command`], [`Stdio`] and [`Child`]: `std::process`'s shapes for a child that holds its stdio and nothing else of this process, started on Darwin by one `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`, so this process never forks for it.
+//! [`Command`], [`Stdio`] and [`Child`]: explicit stdio and guard inheritance, started on
+//! Darwin by one `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`, with no parent fork.
 
 use super::{DISCLAIM_SPI, F_GETFL, F_SETFL, fcntl};
 use std::collections::BTreeMap;
@@ -155,7 +156,7 @@ impl Env {
     }
 }
 
-/// `std::process::Command`, whose child holds its stdio and nothing else.
+/// `std::process::Command`, whose child holds stdio and only explicitly named guards.
 pub struct Command {
     program: OsString,
     arg0: Option<OsString>,
@@ -165,6 +166,8 @@ pub struct Command {
     stdin: Option<Stdio>,
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
+    #[cfg(unix)]
+    guards: Vec<std::os::fd::OwnedFd>,
     pgroup: Option<i32>,
     setsid: bool,
     /// The SPI that makes the child its own responsible process, when asked
@@ -197,6 +200,8 @@ impl Command {
             stdin: None,
             stdout: None,
             stderr: None,
+            #[cfg(unix)]
+            guards: Vec::new(),
             pgroup: None,
             setsid: false,
             disclaim: None,
@@ -289,6 +294,39 @@ impl Command {
         self
     }
 
+    /// Inherit only these explicitly named guard descriptions at [`Self::guard_targets`].
+    /// Each descriptor retains its already occupied number, so inheritance cannot clobber
+    /// stdio, a bridge lane or a native spawn's private status pipe.
+    /// The child receives non-close-on-exec slots; they close when it closes them or exits.
+    ///
+    /// # Errors
+    /// Too many guards, an unplaceable descriptor, or failure to keep its parent description
+    /// out of other children.
+    #[cfg(unix)]
+    pub fn inherit_guards(&mut self, guards: Vec<std::os::fd::OwnedFd>) -> io::Result<&mut Self> {
+        if guards.len() > super::MAX_GUARD_FDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many explicit spawn guards",
+            ));
+        }
+        let mut placed = Vec::with_capacity(guards.len());
+        for guard in guards {
+            let guard = super::off_the_targets(guard)?;
+            crate::keep_out_of_children(&guard)?;
+            placed.push(guard);
+        }
+        self.guards = placed;
+        Ok(self)
+    }
+
+    /// Stable child descriptor numbers after [`Self::inherit_guards`], available before spawn
+    /// so an authenticated launch can journal each actual guard's identity and position.
+    #[cfg(unix)]
+    pub fn guard_targets(&self) -> impl ExactSizeIterator<Item = RawFd> + '_ {
+        self.guards.iter().map(AsRawFd::as_raw_fd)
+    }
+
     /// Start the child in a new session of its own (`setsid`), with no controlling terminal.
     pub const fn setsid(&mut self, setsid: bool) -> &mut Self {
         self.setsid = setsid;
@@ -357,6 +395,36 @@ impl Command {
     /// As `std`'s: `InvalidInput` for a NUL, `NotFound` for a program (or a working directory) that does not exist, `PermissionDenied` for one that may not be run, and whatever else the spawn answers.
     pub fn spawn(&mut self) -> io::Result<Child> {
         self.start(Fallback::Inherit, true)
+    }
+
+    /// Consume one actual attempt and observe this command's actual spawn outcome without
+    /// changing its configured process group or session policy. Persist the key before calling
+    /// when this launch carries a durable obligation. The result supplies an owned child,
+    /// not a dedicated-group birth proof.
+    ///
+    /// # Errors
+    /// This attempt's process or scope changed, or the same controlled spawn errors as
+    /// [`Self::spawn`]. Only a current failed attempt supplies a no-child receipt.
+    pub fn spawn_observed(
+        &mut self,
+        attempt: super::BirthAttempt,
+    ) -> Result<super::ObservedSpawned, super::SpawnFailure> {
+        super::birth::observe(attempt, || self.spawn())
+    }
+
+    /// Consume one actual attempt and start a child in a new, self-led process group. Persist
+    /// the attempt's key before calling; bind the returned actual child before acknowledging
+    /// its work. An error is an opaque receipt for this attempt alone, not a reusable flag.
+    ///
+    /// # Errors
+    /// This attempt's process or scope changed, or the same controlled spawn errors as
+    /// [`Self::spawn`]. No target program runs on an error.
+    pub fn spawn_cohort(
+        &mut self,
+        attempt: super::BirthAttempt,
+    ) -> Result<super::Spawned, super::SpawnFailure> {
+        self.process_group(0);
+        super::birth::observe_cohort(attempt, || self.spawn())
     }
 
     /// Run the child to its end with stdin `/dev/null` and stdout and stderr captured (unless set otherwise).
@@ -506,6 +574,13 @@ impl Child {
         self.handle.kill()
     }
 
+    /// `SIGTERM` the child, so it can pass the signal on; once it is reaped, signal nothing.
+    /// # Errors
+    /// `kill`'s.
+    pub fn terminate(&mut self) -> io::Result<()> {
+        self.handle.terminate()
+    }
+
     /// Run a child started stopped ([`Command::start_suspended`]): `SIGCONT`, which a running child carries on through.
     /// # Errors
     /// `kill`'s.
@@ -647,7 +722,8 @@ type Handle = super::LaneChild;
 
 #[cfg(target_vendor = "apple")]
 impl Command {
-    /// Replace this process with the program (`POSIX_SPAWN_SETEXEC`): it holds this process's stdio and nothing else, and this process's own table is untouched if the exec fails.
+    /// Replace this process with the program (`POSIX_SPAWN_SETEXEC`): it holds this process's
+    /// stdio and explicitly named guards. This process's own table is untouched if exec fails.
     pub fn exec(&mut self) -> io::Error {
         match self.launch(Fallback::Inherit, true, true) {
             Ok(_) => io::Error::other("the exec returned a child"),
@@ -694,6 +770,12 @@ impl Command {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "a tethered child is spawned running: neither an exec nor a suspended start",
+            ));
+        }
+        if self.tether && !self.guards.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "tethered commands do not forward explicit guards",
             ));
         }
         let routed = if self.tether {
@@ -770,6 +852,20 @@ impl Command {
                 }
             };
         }
+        let exec_source = |fd| -> io::Result<OwnedFd> {
+            let copy = placeable_copy(fd)?;
+            // SAFETY: the command exclusively owns this fresh copy throughout the query.
+            let flags = unsafe { fcntl(copy.as_raw_fd(), F_GETFD) };
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: change only this owned copy. Keep its fork-exclusion mark until
+            // spawn_lock::handing lifts it for this dispatch, and clear only CLOEXEC.
+            if unsafe { fcntl(copy.as_raw_fd(), F_SETFD, flags & !FD_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(copy)
+        };
         if replace {
             for (target, source) in (0..).zip(sources.iter_mut()) {
                 let fd = match *source {
@@ -782,20 +878,31 @@ impl Command {
                 if flags < 0 || flags & FD_CLOEXEC == 0 {
                     continue;
                 }
-                let copy = placeable_copy(fd)?;
-                // SAFETY: `F_SETFD` clears close-on-exec on the copy made here.
-                if unsafe { fcntl(copy.as_raw_fd(), F_SETFD, 0) } < 0 {
-                    return Err(io::Error::last_os_error());
-                }
+                let copy = exec_source(fd)?;
                 *source = Source::Fd(copy.as_raw_fd());
                 handed.push(copy);
             }
+        }
+        let mut guards = Vec::with_capacity(self.guards.len());
+        for target in self.guard_targets() {
+            let source = if replace {
+                // SETEXEC cannot inherit a CLOEXEC source directly. Hand a private temporary
+                // copy to the original advertised number without changing the parent's slot.
+                let copy = exec_source(target)?;
+                let source = copy.as_raw_fd();
+                handed.push(copy);
+                source
+            } else {
+                target
+            };
+            guards.push((source, target));
         }
         let pid = super::platform::spawn(
             &image,
             &Placement {
                 stdio: sources,
                 lanes: &[],
+                guards: &guards,
                 cwd: cwd.as_deref(),
                 base: base.as_deref(),
                 pgroup: self.group(),
@@ -836,13 +943,21 @@ impl Handle {
         }
     }
 
+    fn terminate(&mut self) -> io::Result<()> {
+        self.signal(super::SIGTERM)
+    }
+
     fn resume(&mut self) -> io::Result<()> {
+        self.signal(super::SIGCONT)
+    }
+
+    fn signal(&mut self, signal: i32) -> io::Result<()> {
         if self.status.is_some() {
             return Ok(());
         }
         let pid = i32::try_from(self.id()).map_err(io::Error::other)?;
         // SAFETY: two integers; the pid is our own unreaped child.
-        if unsafe { super::kill(pid, super::SIGCONT) } == 0 {
+        if unsafe { super::kill(pid, signal) } == 0 {
             Ok(())
         } else {
             Err(io::Error::last_os_error())
@@ -903,9 +1018,15 @@ const SIG_SETMASK: i32 = 2;
 
 #[cfg(not(target_vendor = "apple"))]
 impl Command {
-    /// Replace this process with the program: [`super::InheritStrip`] marks this process's own table first, so a failed exec leaves every descriptor close-on-exec ([`super::InheritNothing`] says what that means).
+    /// Replace this process with the program: [`super::InheritStrip`] marks this process's own table first, so a failed exec leaves every descriptor close-on-exec ([`super::InheritNothing`] says what that means). Explicit guards are refused before that strip: their fork-only inheritance hook cannot safely modify this process's table on an exec failure.
     pub fn exec(&mut self) -> io::Error {
         use std::os::unix::process::CommandExt as _;
+        if !self.guards.is_empty() {
+            return io::Error::new(
+                io::ErrorKind::Unsupported,
+                "explicit guards require a spawned child on this platform",
+            );
+        }
         if self.tether {
             return io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -965,6 +1086,12 @@ impl Command {
                 "starting a child stopped at its exec is Darwin's: no child is started",
             ));
         }
+        if self.tether && !self.guards.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "tethered commands do not forward explicit guards",
+            ));
+        }
         #[expect(
             clippy::disallowed_types,
             reason = "spawnfd's own Command, started through std's fork with the strip installed first"
@@ -999,19 +1126,31 @@ impl Command {
             command.process_group(pgroup);
         }
         let setsid = self.setsid;
+        let guards: Vec<_> = self.guard_targets().collect();
         #[cfg(target_os = "linux")]
         let tether = self
             .tether
             .then(|| i32::try_from(std::process::id()))
             .transpose()
             .map_err(io::Error::other)?;
-        // SAFETY: the hook runs between fork and exec and calls only `sigprocmask`, `setsid`, `prctl` and `getppid`, async-signal-safe, on a stack array.
+        // SAFETY: the hook runs between fork and exec and calls only signal/session queries,
+        // the tether's prctl/getppid, and fcntl over pre-captured descriptors. Command owns
+        // those occupied guard numbers throughout this private forked command's spawn/exec;
+        // no allocation, lock or descriptor replacement occurs in the child hook.
         unsafe {
             command.pre_exec(move || {
                 let empty = [0u64; 16];
                 sigprocmask(SIG_SETMASK, empty.as_ptr(), std::ptr::null_mut());
                 if setsid && new_session() < 0 {
                     return Err(io::Error::last_os_error());
+                }
+                for &guard in &guards {
+                    let flags = super::fcntl(guard, super::F_GETFD);
+                    if flags < 0
+                        || super::fcntl(guard, super::F_SETFD, flags & !super::FD_CLOEXEC) < 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
                 #[cfg(target_os = "linux")]
                 if let Some(parent) = tether {

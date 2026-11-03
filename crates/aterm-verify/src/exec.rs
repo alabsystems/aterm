@@ -1121,10 +1121,19 @@ fn finish(
 ) -> (Run, Option<String>) {
     let (ceiling, stage_groups) = (env.child_ceiling, env.stage_groups);
     let read_log = |log: Option<&Path>| {
-        log.map(|p| String::from_utf8_lossy(&std::fs::read(p).unwrap_or_default()).into_owned())
+        log.map(|p| {
+            String::from_utf8_lossy(&crate::read_captured(p).unwrap_or_default()).into_owned()
+        })
     };
     #[cfg(unix)]
     let sweep = |pgid: u32| {
+        // The unreaped leader still has its final counters. Descendants which
+        // exited between earlier samples remain absent from this lower bound.
+        if let Some(meter) = crate::memory::current()
+            && let Some(members) = env.host.group_usage(pgid)
+        {
+            meter.book(pgid, &members);
+        }
         if let Some(groups) = stage_groups {
             groups.group_ended(pgid, label);
         }
@@ -3791,8 +3800,13 @@ mod tests {
     ) -> Result<aterm_capacity::Claim, aterm_capacity::Error> {
         crate::admit_in(
             &aterm_capacity::Ledger::at(BOUNDED_QUIET.get().expect("scratch ledger")),
-            &aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(24, 20, 14)),
-            aterm_capacity::Pace::default(),
+            &crate::timing_test_machine::Measured::new(&aterm_capacity::Fixed::new(
+                aterm_capacity::Reading::of_gib(24, 20, 14),
+            )),
+            aterm_capacity::Pace {
+                poll: Duration::from_millis(20),
+                ..aterm_capacity::Pace::default()
+            },
             need,
             mode,
             &mut |_| {},
@@ -3823,7 +3837,7 @@ mod tests {
             crate::EnvSnapshot::default(),
             dir.path().join("scratch"),
         )
-        .with_quiet(Some(aterm_capacity::Admit::Now));
+        .with_quiet(Some(aterm_capacity::Admit::Wait));
         let last_stage = || {
             std::sync::Mutex::new(crate::Quiet {
                 claim: None,

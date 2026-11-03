@@ -22,6 +22,8 @@ pub mod shared;
 
 #[path = "accounts_sync_commit.rs"]
 mod sync_commit;
+#[cfg(test)]
+pub(super) use sync_commit::CUT as SYNC_COMMIT_CUT;
 pub(super) use sync_commit::SyncTarget;
 use sync_commit::usage_target;
 
@@ -1149,21 +1151,20 @@ pub fn enrolled(roster: &Roster) -> BTreeSet<String> {
 
 /// Returns the set of `cli`'s roster labels whose logins are made on this machine ([`enrolled`]
 /// for Claude Code's): another CLI's row is enrolled once its directory holds the file the CLI
-/// keeps its login in ([`crate::ai::connector::Connector::stores`]), since an overlay home holds
+/// keeps its login in ([`crate::ai::connector::stored_login_file`]), since an overlay home holds
 /// links and scratch before any sign-in.
 #[must_use]
 pub fn enrolled_for(cli: Cli, roster: &Roster) -> BTreeSet<String> {
     if cli == Cli::Claude {
         return enrolled(roster);
     }
-    let stores = cli.connector().stores;
     roster
         .rows
         .iter()
         .filter(|r| {
-            r.dir
-                .as_deref()
-                .is_none_or(|d| stores.iter().any(|f| Path::new(d).join(f).is_file()))
+            r.dir.as_deref().is_none_or(|d| {
+                crate::ai::connector::stored_login_file(cli.connector(), Path::new(d)).is_some()
+            })
         })
         .map(|r| r.label.clone())
         .collect()
@@ -1185,14 +1186,11 @@ pub fn enrolled_in(cli: Cli, roster: &Roster, home: &Path) -> BTreeSet<String> {
 }
 
 /// Whether `cli`'s default home under the user home `home` holds the file the CLI keeps its
-/// login in ([`crate::ai::connector::Connector::stores`]).
+/// login in ([`crate::ai::connector::stored_login_file`]).
 #[must_use]
 pub fn default_login_made(cli: Cli, home: &Path) -> bool {
     let dir = home.join(cli.accounts().default_home);
-    cli.connector()
-        .stores
-        .iter()
-        .any(|file| dir.join(file).is_file())
+    crate::ai::connector::stored_login_file(cli.connector(), &dir).is_some()
 }
 
 /// Returns whether `dir` contains an entry other than aterm's renewal bookkeeping.
@@ -2973,6 +2971,32 @@ pub fn failing_sign_ins(
         .collect()
 }
 
+/// Whether some Claude Code login works here, so a row's failed sign-in leaves nothing broken: a
+/// row on a login of its own that a session was seen on and that is not signed out, or the
+/// default login (`default_signed_in`) where no row on it is recorded signed out.
+#[must_use]
+pub fn claude_serves(
+    roster: &Roster,
+    state: &State,
+    enrolled: &BTreeSet<String>,
+    default_signed_in: bool,
+    now: i64,
+) -> bool {
+    let of = |row: &Row| condition(row, state, is_enrolled(row, enrolled), now);
+    roster.rows.iter().any(|row| {
+        row.dir.is_some()
+            && row.held_by.is_none()
+            && matches!(
+                of(row),
+                Condition::Usable | Condition::Low | Condition::Limited { .. }
+            )
+    }) || (default_signed_in
+        && !roster
+            .rows
+            .iter()
+            .any(|row| row.dir.is_none() && of(row) == Condition::SignedOut))
+}
+
 /// Records a login wall hit at `at` on `label`'s bound login and updates learned lifetime.
 pub fn note_login_end(state: &mut State, logins: &mut Logins, label: &str, at: i64) -> Vec<Event> {
     let mut out = if state.account(label).auth == Auth::SignedOut {
@@ -3851,6 +3875,10 @@ pub struct Account {
     pub keyed_at: Option<i64>,
     /// Observation: each window's figure ([`WindowFig`], [`Self::sample`]).
     pub windows: BTreeMap<String, WindowFig>,
+    /// The lab model's canonical account key (`ac-<16hex>`), learned from the roster row a
+    /// transaction read ([`super::journal::learn`]): what the journal and the ledger name this
+    /// account by beside its label, so its history survives a relabel or a forgotten row.
+    pub pk: Option<String>,
 }
 
 impl Account {
@@ -4134,6 +4162,49 @@ impl PinRequest {
     }
 }
 
+/// What this Mac's peers say of its clock, where it limits its claims
+/// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F22): a peer's clock that agrees asks nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClockStanding {
+    /// No strict majority of the peers it reads agrees with its clock, and none says it is off
+    /// one way: it uses and claims its home accounts only.
+    Split,
+    /// A strict majority says its clock is off, ahead or behind: it writes no claim row, uses its
+    /// home accounts whatever its own view says, and no other account.
+    Off {
+        /// Its clock reads ahead of theirs.
+        ahead: bool,
+    },
+}
+
+impl ClockStanding {
+    /// Its word in the store's `claims_clock` record.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Split => "split",
+            Self::Off { .. } => "off",
+        }
+    }
+}
+
+/// This Mac's clock as its last claims read judged it (`claims::touch`, F22), kept until `until`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Clock {
+    /// Split or Off.
+    pub standing: ClockStanding,
+    /// Under Off, at least how far off (seconds); otherwise zero.
+    pub by_s: i64,
+    /// The decisive readings against its clock.
+    pub against: u32,
+    /// The decisive readings counted.
+    pub of: u32,
+    /// The labels of the Macs whose clocks disagree with this one's (Split), for a person to check.
+    pub peers: Vec<String>,
+    /// Past this instant (Unix seconds) the record says nothing.
+    pub until: i64,
+}
+
 /// The Mac that holds a roster account, as the account claims settle it
 /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F19, `claims::settle`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4201,6 +4272,9 @@ pub struct State {
     /// session's usage tap), within `claims::IDLE_S`: its use, which keeps its claim
     /// (`claims::in_use`).
     pub claimed_at: BTreeMap<String, i64>,
+    /// Machine-local: this Mac's clock where its peers read it Split or Off at its last claims
+    /// read (`docs/DESIGN-fluid-swarm-2026-10-28.md` F22), until the record's `until`.
+    pub clock: Option<Clock>,
 }
 
 impl Default for State {
@@ -4228,6 +4302,7 @@ impl Default for State {
             swarm_aliases: Vec::new(),
             unrecorded: false,
             claimed_at: BTreeMap::new(),
+            clock: None,
         }
     }
 }
@@ -4443,6 +4518,9 @@ fn account_json(a: &Account) -> Value {
     );
     o.insert("key".to_owned(), Value::from(a.key.map(|k| k.to_string())));
     o.insert("keyed_at".to_owned(), Value::from(a.keyed_at));
+    if let Some(pk) = &a.pk {
+        o.insert("pk".to_owned(), Value::from(pk.as_str()));
+    }
     o.insert(
         "windows".to_owned(),
         Value::Object(
@@ -4571,6 +4649,11 @@ fn account_of(v: &Value, now: i64) -> Account {
             .and_then(Value::as_str)
             .and_then(super::profile::AccountKey::parse),
         keyed_at: stamp(v.get("keyed_at"), now),
+        pk: v
+            .get("pk")
+            .and_then(Value::as_str)
+            .filter(|pk| super::journal::Key::new(pk).is_some())
+            .map(str::to_owned),
         windows: windows.into_iter().collect(),
         walls: walls.into_iter().collect(),
         sample: v.get("sample").and_then(|s| sample_of(s, cap)),
@@ -4752,6 +4835,28 @@ impl State {
                 ),
             );
         }
+        if let Some(clock) = &self.clock {
+            let mut c = Map::new();
+            c.insert("standing".to_owned(), Value::from(clock.standing.word()));
+            if let ClockStanding::Off { ahead } = clock.standing {
+                c.insert("ahead".to_owned(), Value::from(ahead));
+            }
+            c.insert("by_s".to_owned(), Value::from(clock.by_s));
+            c.insert("against".to_owned(), Value::from(clock.against));
+            c.insert("of".to_owned(), Value::from(clock.of));
+            c.insert(
+                "peers".to_owned(),
+                Value::Array(
+                    clock
+                        .peers
+                        .iter()
+                        .map(|p| Value::from(p.as_str()))
+                        .collect(),
+                ),
+            );
+            c.insert("until".to_owned(), Value::from(clock.until));
+            o.insert("claims_clock".to_owned(), Value::Object(c));
+        }
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| String::from("{}"))
     }
 
@@ -4920,6 +5025,31 @@ impl State {
             .filter_map(|(label, at)| Some((label.clone(), at.as_i64()?)))
             .take(MAX_ACCOUNTS)
             .collect();
+        // A record past its `until` says nothing, so it is not kept.
+        let clock = doc.get("claims_clock").and_then(|c| {
+            let standing = match c.get("standing")?.as_str()? {
+                "split" => ClockStanding::Split,
+                "off" => ClockStanding::Off {
+                    ahead: c.get("ahead")?.as_bool()?,
+                },
+                _ => return None,
+            };
+            Some(Clock {
+                standing,
+                by_s: int(c.get("by_s"))?.max(0),
+                against: u32::try_from(c.get("against")?.as_u64()?).ok()?,
+                of: u32::try_from(c.get("of")?.as_u64()?).ok()?,
+                peers: c
+                    .get("peers")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|p| word(Some(p), WORD_MAX))
+                    .take(MAX_ACCOUNTS)
+                    .collect(),
+                until: int(c.get("until"))?,
+            })
+            .filter(|clock| clock.until > now)
+        });
         Ok(State {
             schema: SCHEMA,
             machine: doc
@@ -4958,6 +5088,7 @@ impl State {
             swarm_aliases,
             unrecorded,
             claimed_at,
+            clock,
         })
     }
 
@@ -5009,10 +5140,43 @@ impl State {
     ///
     /// - [`WhyNot::PreparationOnly`] when a shared credential has no separate execution grant.
     /// - [`WhyNot::LeasedElsewhere`] when another Mac's live claim on `label` is the senior one.
+    /// - [`WhyNot::ClockOff`] when this Mac's peers read its clock Off and `label` is not one of
+    ///   its home accounts, or Split and `label` is not one of its home accounts
+    ///   (`docs/DESIGN-fluid-swarm-2026-10-28.md` F22). Under Off a home account is `Ok` whatever
+    ///   the claims this Mac sees: each peer whose reading counted it Off holds its home rows for
+    ///   it, so none of those takes one anew; a peer with no direct round, one whose clock sits
+    ///   with this Mac's wrong one, and a lease taken before it went Off (until that peer's next
+    ///   turn end) are not covered (the design's §4.2, F22 items 4, 6 and 8). Under Split a home
+    ///   account follows the rules below.
     /// - [`WhyNot::Unclaimed`] when this Mac cannot record its claims (`self.unrecorded`) and
     ///   neither holds a live claim on `label` nor is `label`'s home Mac (`warm[0]`).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountClaimClock",
+            action = "Verdict",
+            project = "aterm_agent::harness::claims::tests::claim_clock_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountClaimClock",
+            action = "Launch",
+            project = "aterm_agent::harness::claims::tests::claim_clock_transition"
+        )
+    )]
     pub fn lease_verdict(&self, label: &str, now: i64) -> Result<(), WhyNot> {
         self.execution_verdict(label)?;
+        if let Some(clock) = self.clock_at(now) {
+            let home = self.home_accounts.contains(label);
+            match clock.standing {
+                ClockStanding::Off { .. } if home => return Ok(()),
+                ClockStanding::Off { .. } => return Err(WhyNot::ClockOff),
+                ClockStanding::Split if !home => return Err(WhyNot::ClockOff),
+                ClockStanding::Split => {}
+            }
+        }
         if let Some(lease) = self.leases.get(label)
             && lease.until > now
         {
@@ -5026,6 +5190,12 @@ impl State {
             return Err(WhyNot::Unclaimed);
         }
         Ok(())
+    }
+
+    /// This Mac's clock record where it still counts at `now` ([`State::clock`]).
+    #[must_use]
+    pub fn clock_at(&self, now: i64) -> Option<&Clock> {
+        self.clock.as_ref().filter(|clock| clock.until > now)
     }
 
     /// Records or renews a lease on `label` held by `holder` until `until`.
@@ -5497,6 +5667,9 @@ pub enum WhyNot {
     },
     /// This Mac cannot record a claim, holds none on this account, and is not its home Mac.
     Unclaimed,
+    /// This Mac's peers read its clock as off, or are split over it, and this is not one of its
+    /// home accounts (`docs/DESIGN-fluid-swarm-2026-10-28.md` F22).
+    ClockOff,
     /// `low`, and the point is not a wall.
     LowAheadOfAWall,
     /// `low`, and an account becomes usable within [`LOW_ONLY_AFTER_S`].
@@ -5519,6 +5692,7 @@ impl WhyNot {
             WhyNot::Limited { .. } => "limited",
             WhyNot::LeasedElsewhere { .. } => "leased-elsewhere",
             WhyNot::Unclaimed => "unclaimed",
+            WhyNot::ClockOff => "clock-off: its peers disagree with this Mac's clock",
             WhyNot::LowAheadOfAWall => "low: used only at a wall",
             WhyNot::LowWhileOneIsNear { .. } => "low: an account is usable within 15 minutes",
         }
@@ -5549,13 +5723,21 @@ fn effective_usable_at(row: &Row, state: &State, cond: Condition, now: i64) -> O
     }
 }
 
-fn row_available_here(row: &Row, state: &State, now: i64) -> bool {
+pub(super) fn row_available_here(row: &Row, state: &State, now: i64) -> bool {
     row.held_by.is_none() && state.lease_verdict(&row.label, now).is_ok()
 }
 
 /// The trigger used to rank replacements for this session. A turn end that must
 /// yield its current account admits low-budget replacements as a wall does.
 #[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountClaimClock",
+        action = "TurnEnd",
+        project = "aterm_agent::harness::claims::tests::claim_clock_transition"
+    )
+)]
 pub fn effective_ranking_point<'a>(
     roster: &Roster,
     state: &State,
@@ -6426,6 +6608,9 @@ pub struct Event {
     pub sid: Option<String>,
     /// The reason, one bounded line.
     pub why: String,
+    /// The account's lab key (`ac-<16hex>`), set when the row is published from the account's
+    /// learned key ([`Account::pk`], [`super::journal::observe`]).
+    pub pk: Option<String>,
 }
 
 impl Event {
@@ -6439,6 +6624,7 @@ impl Event {
             to: None,
             sid: None,
             why: String::new(),
+            pk: None,
         }
     }
 
@@ -6516,6 +6702,13 @@ impl Event {
             "why".to_owned(),
             Value::from(one_line(&self.why, LEDGER_WHY_MAX)),
         );
+        if let Some(pk) = self
+            .pk
+            .as_deref()
+            .filter(|pk| super::journal::Key::new(pk).is_some())
+        {
+            o.insert("pk".to_owned(), Value::from(pk));
+        }
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| String::from("{}"))
     }
 
@@ -6533,6 +6726,11 @@ impl Event {
             to: word(doc.get("to"), LABEL_MAX),
             sid: word(doc.get("sid"), WORD_MAX),
             why: word(doc.get("why"), LEDGER_WHY_MAX).unwrap_or_default(),
+            pk: doc
+                .get("pk")
+                .and_then(Value::as_str)
+                .filter(|pk| super::journal::Key::new(pk).is_some())
+                .map(str::to_owned),
         })
     }
 }
@@ -6828,6 +7026,7 @@ pub fn note_reading_held(
             key: _,
             keyed_at: _,
             windows: _,
+            pk,
         } = std::mem::take(record);
         *record = Account {
             auth,
@@ -6836,6 +7035,7 @@ pub fn note_reading_held(
             keyed_at: Some(now),
             ran_at,
             credits_day,
+            pk,
             ..Account::default()
         };
         events.push(
@@ -9036,6 +9236,11 @@ impl Store {
                         };
                         let event = Event::of_json_line(line).ok_or_else(invalid)?;
                         let doc: Value = aterm_json::from_str(line).map_err(|_| invalid())?;
+                        if doc.get("pk").is_some_and(|pk| {
+                            pk.as_str().and_then(super::journal::Key::new).is_none()
+                        }) {
+                            return Err(invalid());
+                        }
                         for (key, max) in [
                             ("account", LABEL_MAX),
                             ("to", LABEL_MAX),

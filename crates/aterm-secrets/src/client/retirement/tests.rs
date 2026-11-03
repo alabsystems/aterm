@@ -4,6 +4,346 @@
 use super::*;
 use crate::commons::{binding::Pending, node::Edit, roster::Role};
 
+/// A revoke must fit its whole security operation before retiring the recipient.
+/// The retirement itself fits here; the changed envelope's cascade needs more
+/// records afterwards. Discarding that later draft error would publish an
+/// unstamped envelope after already making the retirement durable.
+#[test]
+fn a_revoke_that_cannot_fit_its_cascade_refuses_before_retirement() {
+    use crate::membership_log::{Body, MAX_RECORDS};
+
+    let lab = Lab::new(true, Custody::Founded);
+    let paths = &lab.paths[0];
+    let owner = lab.bootstrap(0);
+    let peer = lab.bootstrap(1);
+    let binding = peer.request().unwrap();
+    let target = binding.binding().actor();
+    let recipient = binding.binding().recipient();
+    let admin = admin_cached(paths).unwrap();
+    let mut doc = admin.published_doc.clone();
+    let code = encode_fleet_join_code(&[7; FLEET_SECRET_LEN], Some("127.0.0.1:7199"));
+    doc.set_entry(
+        &Audience::Everyone,
+        crate::client::fleet::FLEET_CODE_ENTRY,
+        code.as_bytes(),
+    )
+    .unwrap();
+    admin_publish(paths, &admin, &doc).unwrap();
+    seed_vault_genesis(paths, &lab.root.path().join("vault.genesis")).unwrap();
+    assert!(
+        crate::client::log_entries::trusted_commons_log(paths, owner.trust())
+            .unwrap()
+            .is_some()
+    );
+
+    let mut store = load_records(paths).unwrap();
+    assert!(store.log().unwrap().has_commons_epochs());
+    assert!(store.log().unwrap().membership().contains(&target));
+    let excludes = std::collections::BTreeSet::from([recipient]);
+    let retirement =
+        crate::client::log_entries::draft_retire_in_log(paths, &store, &[target], &excludes)
+            .unwrap();
+    assert!(!retirement.is_empty());
+    let room = MAX_RECORDS.checked_sub(retirement.len()).unwrap();
+    let request = owner.request().unwrap();
+    owner.device().with_seed(|seed| {
+        while store.log().unwrap().held_count() < room {
+            let record = store
+                .log()
+                .unwrap()
+                .draft(
+                    &request.binding().actor(),
+                    2_000,
+                    Body::Name { name: "m1".into() },
+                )
+                .sign(seed, *request.binding().incarnation())
+                .unwrap();
+            assert!(store.insert(record).unwrap());
+        }
+    });
+    assert_eq!(store.log().unwrap().held_count(), room);
+    fsx::write_atomic(&paths.records_file(), &store.encode(), 0o600).unwrap();
+    let before_records = std::fs::read(paths.records_file()).unwrap();
+    let before_source = std::fs::read(&lab.source).unwrap();
+    let admin = admin_cached(paths).unwrap();
+
+    // Prove both sides of the capacity boundary on a private copy: retirement
+    // fits, but the final document needs an additional record after it.
+    let preview = Paths::for_home(&lab.root.path().join("preview"));
+    crate::client::log_entries_tests::copy_private_tree(&paths.home, &preview.home);
+    let mut wanted = admin.published_doc.clone();
+    wanted.remove_machine("m2", false).unwrap();
+    apply_swarm_revoke_cascade(&preview, &admin, &mut wanted, "m2", &recipient).unwrap();
+    assert!(
+        retire_cached(&preview, &admin, &wanted, &[recipient])
+            .unwrap()
+            .is_some_and(|retired| retired.changed)
+    );
+    assert_eq!(
+        load_records(&preview).unwrap().log().unwrap().held_count(),
+        MAX_RECORDS
+    );
+    assert!(
+        crate::client::log_entries::draft_document_diff(
+            &preview,
+            &admin.config,
+            &envelope::signer_public(&admin.seed).unwrap(),
+            &admin.handoff,
+            &read_identity(&preview).unwrap().unwrap(),
+            &wanted,
+            crate::client::log_entries::Base {
+                doc: Some(&admin.published_doc),
+                resolve: Some(&admin.resolve),
+                readmit: None,
+            },
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(&lab.source).unwrap(), before_source);
+
+    let outcome = admin_revoke(paths, &admin, "m2", false);
+
+    assert!(outcome.is_err(), "a full revoke cannot fit");
+    assert_eq!(std::fs::read(paths.records_file()).unwrap(), before_records);
+    assert_eq!(std::fs::read(&lab.source).unwrap(), before_source);
+    assert!(
+        load_records(paths)
+            .unwrap()
+            .log()
+            .unwrap()
+            .membership()
+            .contains(&target)
+    );
+}
+
+fn planned_revoke() -> (Lab, Admin, Document, Recipient) {
+    let lab = Lab::new(true, Custody::Founded);
+    seed_vault_genesis(&lab.paths[0], &lab.root.path().join("planned.genesis")).unwrap();
+    let admin = admin_cached(&lab.paths[0]).unwrap();
+    let recipient = read_identity(&lab.paths[1]).unwrap().unwrap().recipient();
+    let mut doc = admin.published_doc.clone();
+    doc.remove_machine("m2", false).unwrap();
+    apply_swarm_revoke_cascade(&lab.paths[0], &admin, &mut doc, "m2", &recipient).unwrap();
+    (lab, admin, doc, recipient)
+}
+
+#[test]
+fn removal_preflight_reports_the_exact_batch_without_writing_it() {
+    let (lab, admin, doc, recipient) = planned_revoke();
+    let paths = &lab.paths[0];
+    let identity = read_identity(paths).unwrap().unwrap();
+    let before = std::fs::read(paths.records_file()).unwrap();
+    let source = std::fs::read(&lab.source).unwrap();
+    let plan =
+        crate::client::removal_plan::prepare(paths, &admin, &doc, &identity, &[recipient], None)
+            .unwrap();
+    let cost = plan.cost;
+    assert!(cost.after.complete_records > cost.before.complete_records);
+    assert!(cost.after.encoded_bytes > cost.before.encoded_bytes);
+    assert_eq!(std::fs::read(paths.records_file()).unwrap(), before);
+    assert_eq!(std::fs::read(&lab.source).unwrap(), source);
+    assert!(matches!(
+        plan.commit(paths, &admin, &doc, None).unwrap(),
+        crate::client::removal_plan::Committed::Done(Some(_))
+    ));
+    let committed = load_records(paths).unwrap();
+    assert_eq!(
+        committed.log().unwrap().held_count(),
+        cost.after.complete_records
+    );
+    assert_eq!(committed.len(), cost.after.stored_records);
+    assert_eq!(committed.encode().len(), cost.after.encoded_bytes);
+    assert!(committed.log().unwrap().recipient_is_removed(&recipient));
+    assert_eq!(std::fs::read(&lab.source).unwrap(), source);
+}
+
+#[test]
+fn removal_preflight_refuses_a_different_config_before_retirement() {
+    let (lab, admin, doc, recipient) = planned_revoke();
+    let paths = &lab.paths[0];
+    let identity = read_identity(paths).unwrap().unwrap();
+    let before = std::fs::read(paths.records_file()).unwrap();
+    let source = std::fs::read(&lab.source).unwrap();
+    let plan =
+        crate::client::removal_plan::prepare(paths, &admin, &doc, &identity, &[recipient], None)
+            .unwrap();
+    let mut moved = admin.config.clone();
+    moved.source = Source::Path(lab.root.path().join("different-vault"));
+    {
+        let _state = StateLock::take(paths).unwrap();
+        save_config(paths, &moved).unwrap();
+    }
+    assert!(plan.commit(paths, &admin, &doc, None).is_err());
+    assert_eq!(std::fs::read(paths.records_file()).unwrap(), before);
+    assert_eq!(std::fs::read(&lab.source).unwrap(), source);
+}
+
+#[test]
+fn removal_preflight_refuses_an_already_replaced_same_sequence_envelope() {
+    let (lab, admin, doc, recipient) = planned_revoke();
+    let paths = &lab.paths[0];
+    let identity = read_identity(paths).unwrap().unwrap();
+    let records = std::fs::read(paths.records_file()).unwrap();
+    let mut other = admin.published_doc.clone();
+    other
+        .set_entry(&Audience::Everyone, "another-write", b"same-sequence")
+        .unwrap();
+    let replacement = seal_with_admissions_and_parents(
+        &admin.config.name,
+        admin.seq,
+        &admin.seed,
+        &admin.commons_seed,
+        admin.commons_bound,
+        &other,
+        &admin.handoff,
+        &admin.opened_heads,
+        &admin.admissions,
+    )
+    .unwrap();
+    let digest = envelope::parse(&replacement).unwrap().digest();
+    assert_ne!(admin.opened_heads.first(), Some(&digest));
+    {
+        let _state = StateLock::take(paths).unwrap();
+        fsx::write_atomic(&paths.cache_file(), &replacement, 0o600).unwrap();
+        let mut state = load_state(paths).unwrap();
+        state.seq = admin.seq;
+        state.digest = Some(digest);
+        save_state(paths, &state).unwrap();
+    }
+    let result =
+        crate::client::removal_plan::prepare(paths, &admin, &doc, &identity, &[recipient], None);
+    assert!(matches!(result, Err(error) if error.kind() == crate::ErrorKind::VaultChanged));
+    assert_eq!(std::fs::read(paths.records_file()).unwrap(), records);
+    assert_eq!(std::fs::read(paths.cache_file()).unwrap(), replacement);
+}
+
+#[test]
+fn removal_preflight_accepts_the_existing_log_only_source_binding() {
+    let (lab, admin, doc, recipient) = planned_revoke();
+    let paths = &lab.paths[0];
+    let identity = read_identity(paths).unwrap().unwrap();
+    {
+        let _state = StateLock::take(paths).unwrap();
+        let mut state = load_state(paths).unwrap();
+        assert!(state.records_digest.is_some());
+        state.digest = None;
+        std::fs::remove_file(paths.cache_file()).unwrap();
+        save_state(paths, &state).unwrap();
+    }
+    let plan =
+        crate::client::removal_plan::prepare(paths, &admin, &doc, &identity, &[recipient], None)
+            .unwrap();
+    assert!(matches!(
+        plan.commit(paths, &admin, &doc, None).unwrap(),
+        crate::client::removal_plan::Committed::Done(Some(_))
+    ));
+    assert!(
+        load_records(paths)
+            .unwrap()
+            .log()
+            .unwrap()
+            .recipient_is_removed(&recipient)
+    );
+}
+
+#[test]
+fn removal_preflight_refuses_changed_commons_custody_with_the_same_age_identity() {
+    let (lab, admin, doc, recipient) = planned_revoke();
+    let paths = &lab.paths[0];
+    let identity = read_identity(paths).unwrap().unwrap();
+    let before = std::fs::read(paths.records_file()).unwrap();
+    let source = std::fs::read(&lab.source).unwrap();
+    let plan =
+        crate::client::removal_plan::prepare(paths, &admin, &doc, &identity, &[recipient], None)
+            .unwrap();
+
+    let replacement = Paths::for_home(&lab.root.path().join("different-device"));
+    crate::client::log_entries_tests::clone_identity_to(paths, &replacement);
+    let other = crate::commons::bootstrap::Device::open(&replacement)
+        .unwrap()
+        .unwrap();
+    let original = lab.bootstrap(0).request().unwrap();
+    let changed = other
+        .request(
+            *original.binding().network(),
+            *original.binding().authority(),
+        )
+        .unwrap();
+    assert_ne!(original.binding(), changed.binding());
+    assert_eq!(
+        original.binding().recipient(),
+        changed.binding().recipient()
+    );
+    {
+        let _state = StateLock::take(paths).unwrap();
+        for name in ["device.age", "device.claim"] {
+            let bytes = std::fs::read(replacement.dir.join("commons").join(name)).unwrap();
+            fsx::write_atomic(&paths.dir.join("commons").join(name), &bytes, 0o600).unwrap();
+        }
+    }
+    assert!(plan.commit(paths, &admin, &doc, None).is_err());
+    assert_eq!(std::fs::read(paths.records_file()).unwrap(), before);
+    assert_eq!(std::fs::read(&lab.source).unwrap(), source);
+}
+
+#[test]
+fn removal_preflight_discards_a_plan_when_peer_ingress_changes_its_inventory() {
+    let (lab, admin, doc, recipient) = planned_revoke();
+    let paths = &lab.paths[0];
+    let identity = read_identity(paths).unwrap().unwrap();
+    let plan =
+        crate::client::removal_plan::prepare(paths, &admin, &doc, &identity, &[recipient], None)
+            .unwrap();
+    let peer = lab.bootstrap(1);
+    let request = peer.request().unwrap();
+    let store = load_records(paths).unwrap();
+    let incoming = peer.device().with_seed(|seed| {
+        store
+            .log()
+            .unwrap()
+            .draft(
+                &request.binding().actor(),
+                4_000,
+                crate::membership_log::Body::Name { name: "m2".into() },
+            )
+            .sign(seed, *request.binding().incarnation())
+            .unwrap()
+    });
+    save_records(paths, incoming.bytes()).unwrap();
+    let with_ingress = std::fs::read(paths.records_file()).unwrap();
+    assert!(matches!(
+        plan.commit(paths, &admin, &doc, None).unwrap(),
+        crate::client::removal_plan::Committed::Changed
+    ));
+    assert_eq!(std::fs::read(paths.records_file()).unwrap(), with_ingress);
+    assert!(
+        !load_records(paths)
+            .unwrap()
+            .log()
+            .unwrap()
+            .recipient_is_removed(&recipient)
+    );
+    let fresh =
+        crate::client::removal_plan::prepare(paths, &admin, &doc, &identity, &[recipient], None)
+            .unwrap();
+    assert!(matches!(
+        fresh.commit(paths, &admin, &doc, None).unwrap(),
+        crate::client::removal_plan::Committed::Done(Some(_))
+    ));
+    assert!(load_records(paths).unwrap().holds(incoming.id()));
+    assert!(
+        load_records(paths)
+            .unwrap()
+            .log()
+            .unwrap()
+            .records()
+            .any(|record| {
+                matches!(record.body(), crate::membership_log::Body::Remove { member, cutoff }
+            if *member == request.binding().actor() && cutoff == incoming.id())
+            })
+    );
+}
+
 struct Lab {
     root: aterm_tempfile::TempDir,
     paths: [Paths; 2],
@@ -1054,6 +1394,7 @@ fn repair_half_done_revokes_expires_steward_lease_held_by_denied_member() {
                 node_id: None,
                 node_key: None,
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 1000,
                 aliases: Vec::new(),
                 claimed_label: None,
@@ -1066,6 +1407,7 @@ fn repair_half_done_revokes_expires_steward_lease_held_by_denied_member() {
                 node_id: None,
                 node_key: None,
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 1000,
                 aliases: Vec::new(),
                 claimed_label: None,
@@ -1128,6 +1470,7 @@ fn repair_half_done_revokes_retires_node_denied_member_and_strips_pool_and_lease
                 node_id: None,
                 node_key: None,
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 1000,
                 aliases: Vec::new(),
                 claimed_label: None,
@@ -1140,6 +1483,7 @@ fn repair_half_done_revokes_retires_node_denied_member_and_strips_pool_and_lease
                 node_id: None,
                 node_key: Some(nk2.clone()),
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 1000,
                 aliases: vec!["m20".to_owned()],
                 claimed_label: None,
@@ -1218,6 +1562,7 @@ fn repair_and_cascade_protect_surviving_canonical_label_from_suffixed_stale_clai
                 node_id: None,
                 node_key: None,
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 1000,
                 aliases: Vec::new(),
                 claimed_label: None,
@@ -1230,6 +1575,7 @@ fn repair_and_cascade_protect_surviving_canonical_label_from_suffixed_stale_clai
                 node_id: None,
                 node_key: None,
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 1000,
                 aliases: Vec::new(),
                 claimed_label: Some("m1-3fa2".to_owned()),
@@ -1306,6 +1652,7 @@ fn repair_and_cascade_protect_surviving_canonical_label_from_suffixed_stale_clai
                 node_id: Some(shared_node.to_owned()),
                 node_key: Some(shared_nk.clone()),
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 2000,
                 aliases: Vec::new(),
                 claimed_label: None,
@@ -1318,6 +1665,7 @@ fn repair_and_cascade_protect_surviving_canonical_label_from_suffixed_stale_clai
                 node_id: Some(shared_node.to_owned()),
                 node_key: Some(shared_nk.clone()),
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 1000,
                 aliases: Vec::new(),
                 claimed_label: None,
@@ -1356,6 +1704,7 @@ fn repair_and_cascade_protect_surviving_canonical_label_from_suffixed_stale_clai
             node_id: None,
             node_key: None,
             hint: None,
+            hw_hint: None,
             admitted_ms: 1000,
             aliases: Vec::new(),
             claimed_label: Some("m1".to_owned()),
@@ -1402,6 +1751,7 @@ fn a_plain_removal_rotates_the_fleet_code_and_denies_nothing() {
             node_id: Some("00000000000000000000000000000009".to_owned()),
             node_key: Some("09".repeat(32)),
             hint: None,
+            hw_hint: None,
             admitted_ms: 1000,
             aliases: Vec::new(),
             claimed_label: None,

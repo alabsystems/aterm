@@ -305,3 +305,34 @@ fn guarded_wire_reader_requires_one_complete_bounded_frame() {
         b"OK\n"
     );
 }
+
+#[test]
+fn a_command_survives_the_line_protocol_word_for_word() {
+    let words: Vec<String> = ["/usr/bin/true", "a b", "new\nline", "", "caf\u{e9}"]
+        .map(String::from)
+        .to_vec();
+    let line = encode_command("/tmp/a dir", &words);
+    assert!(!line.contains('\n'), "{line}");
+    assert_eq!(
+        decode_command(&line),
+        Some(("/tmp/a dir".to_string(), words))
+    );
+}
+
+#[test]
+fn a_malformed_command_never_decodes() {
+    let cwd = hex_word("/tmp");
+    for rest in [
+        String::new(),
+        cwd.clone(),
+        format!("{cwd} 74"),
+        format!("{cwd} x7"),
+        format!("{cwd} xzz"),
+        format!("{cwd} x00"),
+        format!("{cwd} xff"),
+        format!("{cwd}  {}", hex_word("true")),
+    ] {
+        assert_eq!(decode_command(&rest), None, "{rest:?}");
+    }
+    assert!(decode_command(&format!("{cwd} {}", hex_word("true"))).is_some());
+}

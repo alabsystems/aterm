@@ -187,6 +187,7 @@ src/pristine.rs	a_published_crate_is_fetched_held_to_the_index_and_cached	pristi
 src/pristine.rs	a_tampered_archive_or_a_wrong_sha_is_refused	pristine-held	
 src/pristine.rs	a_member_outside_the_package_or_a_link_refuses_the_unpack	pristine-held	
 src/pristine.rs	offline_there_is_no_copy_and_the_reason_says_why	pristine-held	
+src/pristine.rs	pristine_refuses_symlinked_cache_conflicting_headers_and_smuggled_trailer	pristine-held	
 src/blame.rs	every_path_is_counted_and_the_shortest_come_first	blame-shortest-paths	blame-count-paths
 src/blame.rs	write_path_respects_w_line_for_short_segments	report-line-width	
 src/budget.rs	a_raise_without_a_reason_is_red_and_writes_nothing	budget-ratchet-plan	

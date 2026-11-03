@@ -35,6 +35,12 @@ pub trait FabricSession: Send + Sync {
     fn fleet_mail_path(&self) -> Option<std::path::PathBuf> {
         None
     }
+    /// Whether this process has committed ownership of its session's direct mailbox.
+    /// An overlap-handoff candidate must remain inactive until Commit. Implementations that
+    /// own direct storage must opt in; an endpoint alone grants no mailbox ownership.
+    fn fleet_mail_ready(&self) -> bool {
+        false
+    }
 }
 
 impl<T: FabricSession + ?Sized> FabricSession for Arc<T> {
@@ -55,6 +61,9 @@ impl<T: FabricSession + ?Sized> FabricSession for Arc<T> {
     }
     fn fleet_mail_path(&self) -> Option<std::path::PathBuf> {
         (**self).fleet_mail_path()
+    }
+    fn fleet_mail_ready(&self) -> bool {
+        (**self).fleet_mail_ready()
     }
 }
 
@@ -157,6 +166,9 @@ pub enum FabricFact<'a> {
 pub trait Registry: Send + Sync + 'static {
     fn sessions(&self) -> Vec<Arc<dyn FabricSession>>;
     fn session(&self, sid: &SessionId) -> Option<Arc<dyn FabricSession>>;
+    /// The roster's generation: it moves on every change a bridge's roster read could see, a
+    /// session's arrival, its exit and a replace that changes its row (`outbox`'s `roster=`).
+    fn roster_seq(&self) -> u64;
     fn bridge_lost_advised(&self, sessions: usize);
     fn torn_state_set_aside(&self, files: u64, told_when_empty: bool);
     fn torn_state_held(&self, files: u64);
@@ -732,6 +744,10 @@ fn caller_sized_bytes(body: &str, via: Option<&str>) -> usize {
 pub struct Inbox {
     /// A body-free copy of the durable direct mailbox, maintained on worker lanes.
     direct_mail: fleet_mail::Metadata,
+    /// The mailbox file [`Self::direct_mail`] was taken from, as the transaction that cached it
+    /// saw it under the mailbox's lock: `None` before one, or when it found no file.
+    #[cfg(unix)]
+    direct_stamp: Option<fleet_mail::Stamp>,
     pub rows: VecDeque<InboxRow>,
     pub posts: VecDeque<PostRow>,
     outbox_turn: u64,
@@ -1428,6 +1444,13 @@ pub struct SessionFabric {
     fence_waits: AtomicU64,
     #[cfg(any(test, debug_assertions))]
     fence_bound: Mutex<Option<Option<std::time::Duration>>>,
+    /// How often an `await inbox` parked on [`Self::changed`]: counted under the ring's lock
+    /// before the park, so a test that reads it and then takes the lock knows the waiter waits.
+    #[cfg(test)]
+    inbox_parks: AtomicU64,
+    /// The bound the latest of those parks was given ([`Self::park_inbox`]).
+    #[cfg(test)]
+    inbox_park_until: Mutex<Option<std::time::Instant>>,
 }
 
 impl SessionFabric {
@@ -1468,6 +1491,28 @@ impl SessionFabric {
     #[cfg(any(test, debug_assertions))]
     pub fn fence_bound(&self) -> Option<Option<std::time::Duration>> {
         *self.fence_bound.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Park an `await inbox` on [`Self::changed`] until `until`, unless a ring wakes it first.
+    fn park_inbox<'a>(
+        &'a self,
+        guard: std::sync::MutexGuard<'a, Inbox>,
+        until: std::time::Instant,
+    ) -> std::sync::MutexGuard<'a, Inbox> {
+        #[cfg(test)]
+        {
+            self.inbox_parks.fetch_add(1, Ordering::SeqCst);
+            *self
+                .inbox_park_until
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(until);
+        }
+        aterm_control::park::park_guarded(
+            &self.changed,
+            guard,
+            until,
+            aterm_control::park::Lane::SERVED,
+        )
     }
 
     /// Wake every waiter parked on this session's condvar without changing anything.
@@ -3751,7 +3796,8 @@ fn halted(ctx: &dyn FabricSession, holds: &Holds, hold: &Hold, found: Option<&Ho
     let lifts = match holds.remote().filter(|_| hold.origin == REMOTE_ORIGIN) {
         Some(remote) => {
             let (host, sid) = (&remote.host, ctx.self_id().as_str());
-            let (node, short) = (&remote.node, remote.node.get(..8).unwrap_or(&remote.node));
+            // The holder's name already carries its node's head (`<host> (node <head>)`).
+            let node = &remote.node;
             let lifts = remote_lifts(sid, host, node);
             match found {
                 Some(Holder::Drives) => format!(
@@ -3765,7 +3811,7 @@ fn halted(ctx: &dyn FabricSession, holds: &Holds, hold: &Hold, found: Option<&Ho
                 ),
                 Some(Holder::Gone(_)) | None => format!(
                     " (held by {host} over the fleet: {lifts}; so does `aterm ctl hold {sid} off` \
-                     on this session's Mac once node {short} may drive it no more)"
+                     on this session's Mac once that node may drive it no more)"
                 ),
             }
         }
@@ -5132,7 +5178,12 @@ pub fn cmd_outbox(store: &impl AsStore, rest: &str) -> String {
     if more {
         payload.push_str("more\n");
     }
-    format!("OK {}\n{payload}", payload.len())
+    // READ AFTER THE LISTING, where the bridge's own re-read would stand: a session that left
+    // before a post listed here was queued has moved this count, so the bridge looks before it
+    // routes that post ([`Registry::roster_seq`]). Read with the snapshot above, an exit during
+    // the walk would go unseen beside a post queued after it.
+    let roster = store.read().unwrap_or_else(|p| p.into_inner()).roster_seq();
+    format!("OK {} roster={roster}\n{payload}", payload.len())
 }
 
 /// `outbox sent <sid> <post-id> off=<n|-> [dup=1] [reason=<word>]`.
@@ -6404,31 +6455,40 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
     }
     let hold_at_arm = guard.holds.is_held();
     let named = re.map(|off| guard.watch(off, true));
-    loop {
-        let epoch = ctx.fabric().direct_epoch.load(Ordering::Acquire);
-        drop(guard);
-        let direct = if re.is_none() && topic.is_none() {
-            fleet_mail::pending(ctx, fleet_since, accepts)
-        } else {
-            Ok(None)
-        };
-        guard = ctx.fabric().lock();
-        if epoch != ctx.fabric().direct_epoch.load(Ordering::Acquire) {
-            continue;
-        }
-        // The named post's record must still be on the log (a moved generation below the fork
-        // keeps it).
+    // The named post's record must still be on the log (a moved generation below the fork keeps
+    // it), and then a latching row answers. Both are asked under the guard before the direct
+    // mailbox is read, and again after, so a bus answer reads no file.
+    let latched = |inbox: &mut Inbox, spans: &handler_tally::AwaitSpans| {
         if let Some(post) = &named
             && !post.on_log()
         {
-            return format!("ERR log-replaced re={}\n", post.off);
+            return Some(format!("ERR log-replaced re={}\n", post.off));
         }
-        if !direct_only
-            && let Some(id) = guard.rows.iter().filter(|r| latches(r)).map(|r| r.id).max()
-        {
-            spans.answers(&mut guard.arrived);
-            return format!("OK inbox {id}\n");
+        let id = (!direct_only)
+            .then(|| inbox.rows.iter().filter(|r| latches(r)).map(|r| r.id).max())
+            .flatten()?;
+        spans.answers(&mut inbox.arrived);
+        Some(format!("OK inbox {id}\n"))
+    };
+    loop {
+        if let Some(reply) = latched(&mut guard, &spans) {
+            return reply;
         }
+        let direct = if re.is_none() && topic.is_none() {
+            let epoch = ctx.fabric().direct_epoch.load(Ordering::Acquire);
+            drop(guard);
+            let direct = fleet_mail::pending(ctx, fleet_since, accepts);
+            guard = ctx.fabric().lock();
+            if epoch != ctx.fabric().direct_epoch.load(Ordering::Acquire) {
+                continue;
+            }
+            if let Some(reply) = latched(&mut guard, &spans) {
+                return reply;
+            }
+            direct
+        } else {
+            Ok(None)
+        };
         let direct = match direct {
             Ok(pending) => pending,
             Err(why) if direct_only => return fleet_mail::refusal(why),
@@ -6449,20 +6509,12 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
         if std::time::Instant::now() >= deadline {
             return "OK timeout\n".to_string();
         }
-        // Another aterm process may own the same durable mailbox during handoff. Its
-        // writes cannot signal this process's condvar, so recheck the file periodically.
-        let wake = if re.is_none() && topic.is_none() && ctx.fleet_mail_path().is_some() {
-            deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(1))
-        } else {
-            deadline
-        };
+        // Another aterm process may own the same durable mailbox during handoff. Its writes
+        // cannot signal this process's condvar; the session's fleet-mail watcher sees the
+        // file's stamp move, and its refresh rings it ([`fleet_mail::restore`]). Nothing else
+        // ends the park before the wait's own deadline.
         spans.parks();
-        guard = aterm_control::park::park_guarded(
-            &ctx.fabric().changed,
-            guard,
-            wake,
-            aterm_control::park::Lane::SERVED,
-        );
+        guard = ctx.fabric().park_inbox(guard, deadline);
     }
 }
 
@@ -6765,6 +6817,9 @@ mod test_support {
                 .values()
                 .find(|c| &c.self_id == sid)
                 .map(|c| Arc::clone(c) as Arc<dyn FabricSession>)
+        }
+        fn roster_seq(&self) -> u64 {
+            0
         }
         fn bridge_lost_advised(&self, _sessions: usize) {}
         fn torn_state_set_aside(&self, files: u64, told_when_empty: bool) {
@@ -7701,6 +7756,61 @@ mod inbox_hold {
         });
     }
 
+    /// `outbox`'s `roster=` is read after its listing: a session that left during the walk has
+    /// moved the count it names, so a bridge looks before it routes a post queued after that
+    /// exit. Read with the walk's snapshot it would name 0 here, the count before the walk.
+    #[test]
+    fn outbox_names_the_roster_count_as_it_stands_after_the_listing() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct Walked {
+            inner: Arc<SessionCtx>,
+            seq: Arc<AtomicU64>,
+        }
+        impl FabricSession for Walked {
+            fn self_id(&self) -> &SessionId {
+                self.inner.self_id()
+            }
+            fn fabric(&self) -> &SessionFabric {
+                self.seq.fetch_add(1, Ordering::SeqCst);
+                self.inner.fabric()
+            }
+            fn record_fact(&self, kind: &'static str, fact: FabricFact<'_>) -> bool {
+                self.inner.record_fact(kind, fact)
+            }
+            fn fabric_changed(&self) {}
+            fn holder_token(&self) -> Option<String> {
+                None
+            }
+        }
+        struct OneWalked(Arc<dyn FabricSession>, Arc<AtomicU64>);
+        impl Registry for OneWalked {
+            fn sessions(&self) -> Vec<Arc<dyn FabricSession>> {
+                vec![Arc::clone(&self.0)]
+            }
+            fn session(&self, _: &SessionId) -> Option<Arc<dyn FabricSession>> {
+                Some(Arc::clone(&self.0))
+            }
+            fn roster_seq(&self) -> u64 {
+                self.1.load(Ordering::SeqCst)
+            }
+            fn bridge_lost_advised(&self, _: usize) {}
+            fn torn_state_set_aside(&self, _: u64, _: bool) {}
+            fn torn_state_held(&self, _: u64) {}
+        }
+
+        let seq = Arc::new(AtomicU64::new(0));
+        let walked = Walked {
+            inner: test_handle(1).ctx,
+            seq: Arc::clone(&seq),
+        };
+        let store = Arc::new(RwLock::new(OneWalked(Arc::new(walked), Arc::clone(&seq))));
+        let reply = cmd_outbox(&store, "");
+        let moved = seq.load(Ordering::SeqCst);
+        assert!(moved > 0, "the walk reached the session");
+        assert_eq!(reply, format!("OK 0 roster={moved}\n"));
+    }
+
     #[test]
     fn a_set_aside_count_reaches_the_registry_only_from_the_owning_lane() {
         struct ReplaceDuringPublication {
@@ -7715,6 +7825,9 @@ mod inbox_hold {
             }
             fn session(&self, _: &SessionId) -> Option<Arc<dyn FabricSession>> {
                 None
+            }
+            fn roster_seq(&self) -> u64 {
+                0
             }
             fn bridge_lost_advised(&self, _: usize) {}
             fn torn_state_set_aside(&self, files: u64, _: bool) {
@@ -12473,6 +12586,7 @@ mod inbox_hold {
         let (head, payload) = reply.split_once('\n').expect("a header line");
         let declared: usize = head
             .strip_prefix("OK ")
+            .and_then(|rest| rest.split(' ').next())
             .and_then(|n| n.parse().ok())
             .unwrap_or_else(|| panic!("bad outbox header {head:?}"));
         assert_eq!(

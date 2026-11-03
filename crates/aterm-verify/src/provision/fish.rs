@@ -142,6 +142,7 @@ pub(super) fn build(
             url,
             program: &target.join("release/fish"),
             licence: &src.join("COPYING"),
+            version_args: &["--version"],
             answers: &|first| first.ends_with(&format!(" {version}")),
         },
     )

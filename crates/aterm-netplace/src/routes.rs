@@ -381,6 +381,9 @@ mod tests {
             member: member_key(Lane::Fleet, "heard-here"),
             addr: ip("192.168.4.9"),
             via: Some(HOTSPOT_ADDR),
+            iface: Some("en0".to_owned()),
+            network: None,
+            logged: true,
             began_ms: 1_000_500,
             at_ms: 1_001_000,
         });
@@ -389,6 +392,9 @@ mod tests {
             member: member_key(Lane::Fleet, "heard-at-home"),
             addr: ip("192.168.4.10"),
             via: Some(Ipv4Addr::new(192, 168, 4, 31)),
+            iface: Some("en0".to_owned()),
+            network: None,
+            logged: true,
             began_ms: 500_000,
             at_ms: 500_100,
         });

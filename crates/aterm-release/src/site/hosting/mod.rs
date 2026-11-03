@@ -15,6 +15,7 @@
 //!
 //! A failure before the last call leaves the live site on its previous release.
 
+pub mod access;
 pub mod config;
 pub mod files;
 pub mod key;
@@ -41,6 +42,14 @@ const POPULATE_BATCH: usize = 1000;
 
 /// The longest release message Hosting keeps.
 const MESSAGE_MAX: usize = 512;
+
+/// Authenticates a key, discarding the token without calling the Hosting API.
+///
+/// # Errors
+/// The key cannot sign, its endpoint is not admitted, or no usable token returns.
+pub fn check_key(client: &Client, key: &Key, now: u64) -> Result<(), Failed> {
+    client.token(key, now).map(drop)
+}
 
 /// What one deploy publishes.
 #[derive(Clone, Debug, PartialEq)]
@@ -197,6 +206,8 @@ pub fn site(in_config: Option<&str>, configured: Option<&str>) -> Result<Option<
 fn site_id(id: &str) -> Result<&str, String> {
     let ok = !id.is_empty()
         && id.len() <= 63
+        && !id.starts_with('-')
+        && !id.ends_with('-')
         && id
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
@@ -451,10 +462,18 @@ pub fn deploy(
     let doc = released
         .json()
         .map_err(|_| release_failed(released.said()))?;
+    let release_prefix = format!("sites/{site}/releases/");
     let release = doc
         .get("name")
         .and_then(Value::as_str)
-        .filter(|n| n.starts_with(&format!("sites/{site}/releases/")))
+        .filter(|n| {
+            n.strip_prefix(&release_prefix).is_some_and(|id| {
+                !id.is_empty()
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
+        })
         .ok_or_else(|| release_failed("Hosting answered no release name".into()))?
         .to_string();
     let _ = writeln!(out, "  hosting: released {version} as {release}");

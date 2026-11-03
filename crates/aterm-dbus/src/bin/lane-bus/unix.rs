@@ -1379,8 +1379,43 @@ fn one_frame(node: u32, out: &Path) -> Result<(), Fail> {
     }
 }
 
+fn read_small_text(path: &str) -> Result<String, String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    const MAX_MOTION_BYTES: u64 = 64 * 1024;
+    let go = || -> std::io::Result<String> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        if meta.len() > MAX_MOTION_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file exceeds 64 KiB limit",
+            ));
+        }
+        let mut buf = Vec::new();
+        file.take(MAX_MOTION_BYTES + 1).read_to_end(&mut buf)?;
+        if buf.len() as u64 > MAX_MOTION_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file grew past 64 KiB limit while reading",
+            ));
+        }
+        String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    };
+    go().map_err(|e| format!("{path}: {e}"))
+}
+
 fn motion_from(path: &str) -> Result<(i32, i32), String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let text = read_small_text(path)?;
     motion(&text).ok_or_else(|| format!("{path}: not `DX DY` ({text:?})"))
 }
 
@@ -1504,11 +1539,9 @@ fn record_monitor(conn: &mut Connection, rd: &str, session: &str) -> Result<Stri
 fn point(at: &Point) -> Result<(f64, f64), String> {
     let (x, y) = match at {
         Point::At(x, y) => (*x, *y),
-        Point::From(path) => std::fs::read_to_string(path)
-            .map_err(|e| format!("{path}: {e}"))
-            .and_then(|text| {
-                motion(&text).ok_or_else(|| format!("{path}: not `X Y` ({text:?})"))
-            })?,
+        Point::From(path) => read_small_text(path).and_then(|text| {
+            motion(&text).ok_or_else(|| format!("{path}: not `X Y` ({text:?})"))
+        })?,
     };
     Ok((f64::from(x), f64::from(y)))
 }

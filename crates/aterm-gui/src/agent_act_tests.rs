@@ -572,19 +572,13 @@ fn the_team_is_read_only_where_no_layout_confirms_the_image() {
 /// the kernel holds valid, yet the kernel validates it as no Developer ID, so its team (none, or
 /// one its code directory claims) vouches for nothing; the status flags alone could not say it
 /// (the kernel reports no `CS_ADHOC` for it). NEGATIVE CONTROL (run): with `vouches` reading the
-/// status flags (`CS_VALID` and no `CS_ADHOC`), the copy vouches.
+/// status flags (`CS_VALID` and no `CS_ADHOC`), the copy vouches. The copy is `sleep`'s kept
+/// stand-in, run in place: the child is killed at once, maybe while macOS still assesses its
+/// exec, and a copy unlinked then crashes `syspolicyd`, stranding every exec it was assessing.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_kernel_vouches_for_no_ad_hoc_signature() {
-    let dir = aterm_tempfile::tempdir().expect("scratch");
-    let copy = dir.path().join("claude");
-    std::fs::copy("/bin/sleep", &copy).expect("a copy of sleep");
-    let signed = aterm_uds::spawnfd::command("/usr/bin/codesign")
-        .args(["--force", "--sign", "-"])
-        .arg(&copy)
-        .output()
-        .expect("codesign runs");
-    assert!(signed.status.success(), "{signed:?}");
+    let copy = aterm_uds::deadline::stand_in(std::path::Path::new("/bin/sleep"));
     let mut child = aterm_uds::spawnfd::command(&copy)
         .arg("30")
         .spawn()

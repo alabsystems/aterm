@@ -3717,15 +3717,32 @@ pub fn scan_target(
 }
 
 fn cachedir_tag_signed(p: &Path) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(p) else {
+    use std::io::Read as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+        return false;
+    }
+    let Ok(file) = opts.open(p) else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
         return false;
     };
     if !meta.is_file() || meta.len() > 4096 {
         return false;
     }
-    std::fs::read_to_string(p)
-        .map(|t| t.starts_with(CACHEDIR_SIGNATURE))
-        .unwrap_or(false)
+    let mut buf = Vec::with_capacity(CACHEDIR_SIGNATURE.len());
+    file.take(CACHEDIR_SIGNATURE.len() as u64)
+        .read_to_end(&mut buf)
+        .is_ok()
+        && buf == CACHEDIR_SIGNATURE.as_bytes()
 }
 
 fn mtime_of(p: &Path) -> Option<i64> {

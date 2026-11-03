@@ -273,6 +273,8 @@ struct Fake {
     live: PathBuf,
     home: PathBuf,
     engine: EngineFault,
+    /// A concurrent configuration commit while the engine builds.
+    hosting_update: Option<(PathBuf, String)>,
     deploy: Deploy,
     git: Git,
     signals: Rc<Signals>,
@@ -391,6 +393,11 @@ impl World for Fake {
 
     fn optimise(&mut self, wasm: &Path, _out: &mut dyn std::io::Write) -> Result<(), String> {
         self.calls.push(Call::Optimise);
+        if let Some((path, text)) = self.hosting_update.take() {
+            std::fs::write(&path, text).unwrap();
+            self.git
+                .commit_all(path.parent().unwrap(), "site: concurrent hosting settings");
+        }
         if self.engine != EngineFault::OptimiseNothing {
             let mut bytes = std::fs::read(wasm).unwrap();
             bytes.extend(optimised_mark());
@@ -702,6 +709,7 @@ impl Lab {
             live: self.live.clone(),
             home: self.root.join("home"),
             engine: EngineFault::None,
+            hosting_update: None,
             deploy: Deploy::Ok,
             git: self.git.clone(),
             signals: Rc::default(),
@@ -1316,6 +1324,36 @@ fn redeploy_deploys_the_committed_site_when_nothing_changed() {
     assert!(out.contains("--redeploy: nothing changed"), "{out}");
     assert_eq!(world.deploys(), [the_deploy(&lab)]);
     assert_eq!(lab.head(), head, "no commit");
+}
+
+#[test]
+fn a_concurrent_hosting_change_is_not_deployed_with_stale_settings() {
+    let lab = Lab::new();
+    let mut world = lab.fake("releases-fat.json");
+    let mut settings: aterm_json::Value =
+        aterm_json::from_str(&read(&lab.site.join("firebase.json"))).unwrap();
+    settings
+        .as_object_mut()
+        .unwrap()
+        .get_mut("hosting")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("cleanUrls".into(), aterm_json::Value::Bool(false));
+    world.hosting_update = Some((lab.site.join("firebase.json"), settings.to_string()));
+    let (ended, out) = lab.run(&mut world);
+    let refused = failure(ended, &out);
+    assert!(
+        refused.to_string().contains("settings changed"),
+        "{refused}"
+    );
+    assert!(world.deploys().is_empty());
+    assert!(lab.owed_marker().exists());
+    world.calls.clear();
+    let (ended, out) = lab.run(&mut world);
+    deployed(&ended, &out);
+    assert_eq!(world.deploys().len(), 1);
+    assert!(!lab.owed_marker().exists());
 }
 
 #[test]

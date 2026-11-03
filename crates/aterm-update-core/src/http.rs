@@ -1459,11 +1459,30 @@ impl Drop for VendorScratch {
 
 fn read_capped(path: &Path, cap: u64, url: &str) -> Result<Vec<u8>, HttpError> {
     use std::io::Read;
-    let file = match std::fs::File::open(path) {
+    #[cfg(unix)]
+    let open = || {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let open = || std::fs::File::open(path);
+    let file = match open() {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(HttpError::Transport(format!("read vendor body: {e}"))),
     };
+    if !file
+        .metadata()
+        .map_err(|e| HttpError::Transport(format!("read vendor body: {e}")))?
+        .is_file()
+    {
+        return Err(HttpError::Transport(
+            "read vendor body: not a regular file".to_string(),
+        ));
+    }
     let mut bytes = Vec::new();
     file.take(cap.saturating_add(1))
         .read_to_end(&mut bytes)
@@ -1542,7 +1561,7 @@ fn vendor_get_within(
         let _ = std::fs::remove_file(&body);
         let _ = std::fs::remove_file(&headers);
         let out = vendor_fetch(&args, url).map_err(HttpError::Transport)?;
-        let dump = std::fs::read(&headers).unwrap_or_default();
+        let dump = read_capped(&headers, 64 * 1024, url).unwrap_or_default();
         let (stdout, stderr) = (
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),

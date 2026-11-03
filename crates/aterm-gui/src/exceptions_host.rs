@@ -186,9 +186,11 @@ impl App {
                 self.sweep_resume_asks();
                 self.hand_api_outage();
                 self.restate_long_holds();
+                self.agh_needs.restate();
             }
         }
         self.hand_long_holds();
+        self.hand_agh_needs(now);
         if self.ripening.iter().all(|claim| claim.due > now) {
             return;
         }
@@ -245,6 +247,7 @@ impl App {
     }
 
     /// Whether an exception under `key` is currently open or pending ripening.
+    #[cfg(test)]
     pub(crate) fn owes_exception(&self, key: &str) -> bool {
         self.ripening.iter().any(|claim| claim.key == key)
             || self
@@ -252,6 +255,13 @@ impl App {
                 .digest_keys_under(key)
                 .iter()
                 .any(|k| k == key)
+    }
+
+    /// An exception whose cause still needs an end observation: pending, open or filed while
+    /// unresolved. A caller can avoid probing that cause when nothing is waiting on its answer.
+    pub(crate) fn has_unresolved_exception(&self, key: &str) -> bool {
+        self.ripening.iter().any(|claim| claim.key == key)
+            || self.messages.has_unresolved_exception(key)
     }
 
     /// Ends an open exception under `key` and cancels any pending ripening claim.
@@ -627,6 +637,17 @@ impl App {
     /// Processes a [`HostNote`] from a harness host thread (`Wake::HostNote`).
     pub(crate) fn note_harness_host(&mut self, note: HostNote) {
         match note {
+            HostNote::RestoredOver { sid } => {
+                let local = self
+                    .store
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .by_sid(&aterm_session::SessionId::new(&sid))
+                    .map(|handle| handle.local_id);
+                if let Some(local) = local {
+                    self.restored_agent_over(local);
+                }
+            }
             HostNote::SupervisorFailing { sid, why, pause } => {
                 let now = Instant::now();
                 if let Some(fail) = self.supervisor_failing.get_mut(&sid) {
@@ -805,6 +826,30 @@ impl App {
             }
             HostNote::DiskWorker { task, folder } => self.start_disk_worker(task, &folder),
             HostNote::DiskWorkerExpired { sid } => self.disk_worker_expired(&sid),
+            HostNote::DiskWorkerOver {
+                sid,
+                volume,
+                why,
+                rose,
+                target_met,
+                removed,
+                report,
+            } => {
+                let place = sid
+                    .as_deref()
+                    .map_or_else(String::new, |sid| self.upgrade_place(sid));
+                self.record_message(message_reporters::disk_worker_over_record(
+                    sid.as_deref().unwrap_or(&volume),
+                    &place,
+                    &message_reporters::DiskWorkerEnd {
+                        why: &why,
+                        rose,
+                        target_met,
+                        removed,
+                        report: &report,
+                    },
+                ));
+            }
             HostNote::CreditClaim { sid, offer } => self.start_credit_claim(&sid, offer),
             HostNote::ProgramCheckStuck { workers, limit } => {
                 self.post_message(message_reporters::program_check_stuck(workers, limit));
@@ -932,7 +977,7 @@ impl App {
                 let refused = said == AccountsSaid::Refused;
                 let logins_unread = said == AccountsSaid::LoginsUnread;
                 let unread = refused || logins_unread;
-                let (labels, credits, full, due, none_soon, wrong, no_sign_in) = match said {
+                let (labels, credits, full, due, none_soon, wrong, no_sign_in, clock) = match said {
                     AccountsSaid::Nothing | AccountsSaid::Refused | AccountsSaid::LoginsUnread => {
                         Default::default()
                     }
@@ -944,6 +989,7 @@ impl App {
                         none_soon,
                         wrong,
                         no_sign_in,
+                        clock,
                     } => (
                         signed_out,
                         credits,
@@ -952,6 +998,7 @@ impl App {
                         none_soon,
                         wrong,
                         no_sign_in,
+                        clock,
                     ),
                 };
                 let lines = [
@@ -974,6 +1021,28 @@ impl App {
                     (
                         message_reporters::ACCOUNTS_NO_SIGN_IN_KEY,
                         message_reporters::accounts_no_sign_in_entry(&no_sign_in),
+                    ),
+                    (
+                        message_reporters::ACCOUNTS_CLOCK_OFF_KEY,
+                        clock
+                            .as_ref()
+                            .filter(|clock| {
+                                matches!(
+                                    clock.standing,
+                                    aterm_agent::harness::accounts::ClockStanding::Off { .. }
+                                )
+                            })
+                            .map(message_reporters::accounts_clock_entry),
+                    ),
+                    (
+                        message_reporters::ACCOUNTS_CLOCK_SPLIT_KEY,
+                        clock
+                            .as_ref()
+                            .filter(|clock| {
+                                clock.standing
+                                    == aterm_agent::harness::accounts::ClockStanding::Split
+                            })
+                            .map(message_reporters::accounts_clock_entry),
                     ),
                     (
                         message_reporters::ACCOUNTS_WINDOW_FULL_KEY,
@@ -1024,41 +1093,8 @@ impl App {
                 }
             }
             HostNote::Pools(said) => {
-                for cli in aterm_agent::harness::accounts_sync::OTHER_CLIS {
-                    let pool = said.iter().find(|pool| pool.cli == cli);
-                    let due = pool.map_or(&[][..], |pool| pool.due.as_slice());
-                    let wrong = pool.map_or(&[][..], |pool| pool.wrong.as_slice());
-                    let sign_in = pool.map_or(&[][..], |pool| pool.sign_in.as_slice());
-                    // Where a renewal cannot approve the page itself (Grok's), the due entry asks
-                    // for each login's sign-in; a login whose renewal already stopped for it is
-                    // that task's ask, so the due entry leaves it out and the person is asked once.
-                    let due: Vec<String> = due
-                        .iter()
-                        .filter(|label| {
-                            cli.renews_headlessly()
-                                || !sign_in.iter().any(|(task, _)| task == *label)
-                        })
-                        .cloned()
-                        .collect();
-                    for (cause, entry) in [
-                        ("due", message_reporters::accounts_due_entry_for(cli, &due)),
-                        (
-                            "wrong-account",
-                            message_reporters::accounts_wrong_entry_for(cli, wrong),
-                        ),
-                        (
-                            "sign-in",
-                            message_reporters::accounts_sign_in_entry_for(cli, sign_in),
-                        ),
-                    ] {
-                        match entry {
-                            Some(entry) => self.except(&entry),
-                            None => {
-                                self.except_clear(&message_reporters::pool_notice_key(cli, cause))
-                            }
-                        }
-                    }
-                }
+                self.ai_screen.pools = said;
+                self.hand_pool_entries();
             }
             HostNote::SheetConflicts(conflicts) => {
                 match message_reporters::accounts_sheet_conflict_entry(&conflicts) {
@@ -1218,6 +1254,14 @@ impl App {
                     restarted,
                     command.as_deref(),
                     None,
+                ));
+            }
+            RelaunchSay::Left { end } => {
+                // A journal record alone: nobody is asked to act on an end aterm leaves.
+                self.record_message(message_reporters::relaunch_record(
+                    sid,
+                    &spot.place,
+                    &format!("the agent exited and aterm leaves it: {}", end.reason()),
                 ));
             }
             RelaunchSay::Back => self.except_clear(&lost),
@@ -1522,8 +1566,28 @@ impl App {
         }
     }
 
-    /// Ends relaunch exceptions and pending claims for tabs that have closed.
+    /// Ends the failed worker facts of tabs that have closed: their row shows a tab no longer
+    /// there, and `await task` and Messages keep what was said.
+    fn end_worker_failed_lines_of_closed_tabs(&mut self) {
+        let live: std::collections::HashSet<String> = self
+            .shown_session_sids()
+            .iter()
+            .map(|sid| message_reporters::worker_failed_key(sid))
+            .collect();
+        for key in self
+            .messages
+            .digest_keys_under(&Family::Supervisor.prefix())
+        {
+            if key.ends_with(".worker-failed") && !live.contains(&key) {
+                self.except_clear(&key);
+            }
+        }
+    }
+
+    /// Ends relaunch exceptions and pending claims for tabs that have closed, and the failed
+    /// worker facts of the same tabs.
     pub(crate) fn end_relaunch_lines_of_closed_tabs(&mut self) {
+        self.end_worker_failed_lines_of_closed_tabs();
         let mut keys: Vec<String> = self
             .messages
             .digest_keys_under(&Family::Supervisor.prefix())

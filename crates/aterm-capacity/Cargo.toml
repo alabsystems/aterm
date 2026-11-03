@@ -18,11 +18,14 @@ publish = false
 description = "aterm's host-capacity reader (cores, load, available and physical memory, swap, free disk and the volume's floor) and the per-user admission ledger every heavy or timing-sensitive tool takes a claim in before it starts"
 
 [dependencies]
+aterm-spec-anchor = { workspace = true }
 # The machine's readers: the load average, available and physical memory, swap,
 # the cluster layout, one volume's free space, and the process sweep (each
 # process's parent, footprint and bytes written) a claim's own use is read from.
 # Workspace crate; aterm-json and libc only.
 aterm-sysprobe = { workspace = true }
+# Reuse the existing pure quiet CPU criterion; no platform or GUI dependency.
+aterm-vitals = { workspace = true }
 # `record_lock::RecordLock`: a claim is a flock on a file whose record (pid,
 # start, checkout, what, need) other processes read; the kernel lets the lock
 # go when its holder dies, however it dies. `interrupt::Watch`: SIGINT, SIGTERM
@@ -48,6 +51,8 @@ aterm-tempfile = { workspace = true }
 aterm-durable = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+# Physical isolation from readers that reap a free v1 lock before decoding a claim.
+aterm-dirfd = { workspace = true }
 # The ledger lives under the account database's home (`account::home`), not
 # `$HOME`, so a tool run under a scratch home claims in the one ledger.
 # Workspace crate; aterm-types already links it.
@@ -57,6 +62,7 @@ aterm-uds = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+aterm-models-capacity = { workspace = true }
 # The stand-in holder dies by `kill_self_now()`, and is started by
 # `spawnfd::command`; the one-minute hang detector (`aterm_spec::wait`).
 aterm-uds = { workspace = true }

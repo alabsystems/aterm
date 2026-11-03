@@ -1801,3 +1801,59 @@ fn a_clear_or_a_reflow_in_the_tail_leaves_no_head() {
         .expect("nothing moved past the keyframe");
     assert_eq!(facts.export, None, "a stale ring is no export");
 }
+
+/// NEGATIVE CONTROL: a corrupt shared-memory `BYTES` tail header whose `payload_len` exceeds
+/// `MAX_BYTES_PAYLOAD` within a large tail ring must stop with `TailFault::BadLength` before
+/// `walk_tail` allocates or reads the oversized payload slice.
+#[test]
+fn walk_tail_rejects_oversized_bytes_header_before_reading_payload() {
+    struct NoLargePayloadRead<V> {
+        inner: V,
+        tail_payload_at: usize,
+    }
+    impl<V: RegionView> RegionView for NoLargePayloadRead<V> {
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+        fn load_u64_acquire(&self, offset: usize) -> Result<u64, crate::store::StoreError> {
+            self.inner.load_u64_acquire(offset)
+        }
+        fn read(&self, offset: usize, dst: &mut [u8]) -> Result<(), crate::store::StoreError> {
+            assert!(
+                !(offset == self.tail_payload_at && dst.len() > crate::records::MAX_BYTES_PAYLOAD),
+                "walk_tail attempted to read oversized {}B tail payload before validating header",
+                dst.len()
+            );
+            self.inner.read(offset, dst)
+        }
+    }
+
+    let mut live = Live::v1(4, 20);
+    live.keyframe(0);
+    let dead = live.writer.store().snapshot();
+    let geometry = read_header(&dead).expect("header").geometry;
+    let payload_len = (crate::records::MAX_BYTES_PAYLOAD + 8) as u32;
+    let record_len = u64::from(payload_len) + TAIL_RECORD_HEADER as u64;
+    let mut bad_head = [0u8; TAIL_RECORD_HEADER];
+    bad_head[0] = crate::records::KIND_BYTES;
+    bad_head[4..8].copy_from_slice(&payload_len.to_le_bytes());
+    bad_head[8..16].copy_from_slice(&u64::from(payload_len).to_le_bytes());
+    dead.write(geometry.tail_off, &bad_head).expect("tail head");
+    dead.store_u64_release(OFF_TAIL_FLOOR, 0).expect("floor");
+    dead.store_u64_release(OFF_TAIL_COMMIT, record_len)
+        .expect("commit");
+    let guarded = NoLargePayloadRead {
+        inner: dead,
+        tail_payload_at: geometry.tail_off + TAIL_RECORD_HEADER,
+    };
+    let r = restored(recover(
+        &guarded,
+        RecoverPolicy {
+            tail: true,
+            config_fp: CONFIG,
+            scratch_nonce: [0xA5; 32],
+        },
+        Terminal::new,
+    ));
+    assert_eq!(r.losses.tail_fault, Some(TailFault::BadLength));
+}

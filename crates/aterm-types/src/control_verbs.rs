@@ -12,6 +12,9 @@ pub const MAX_TASK_BYTES: usize = 64 * 1024;
 /// The longest `timeout=` a `turn` over another Mac's drive takes (the step-in).
 pub const DRIVE_TURN_MAX_MS: u64 = 22_000;
 
+/// How long a `turn` waits for a Claude Code composer to show the text it typed, from the first look that finds the program has read the text and again from each look that finds it unread, a minute after the typing at most; a text the composer does not show by then leaves the screen to judge the Enter.
+pub const TURN_ECHO_CAP_MS: u64 = 5_000;
+
 /// The head, before why, of a drive's admission refusal where no grant on the driven Mac admits the dialer's node as its grants and books read then stand (no grant names it, its grant holds another key, or no book binds it); a book it could not read, and a request's refusal, answer `ERR denied: `.
 pub const DRIVE_UNGRANTED: &str = "ERR denied grant=none: ";
 
@@ -668,7 +671,7 @@ const fn bytes_eq(a: &[u8], b: &[u8], len: usize) -> bool {
 }
 
 /// The budget for the short catalog's rows put together (every [`catalog_lines`] row, `\n`-terminated).
-pub const SHORT_CATALOG_MAX_BYTES: usize = 14800;
+pub const SHORT_CATALOG_MAX_BYTES: usize = 16 * 1024;
 
 /// The `subscribe` stream vocabulary: frame sources, then the two modifiers.
 pub const SUBSCRIBE_STREAMS: &[&str] = &[
@@ -935,10 +938,11 @@ pub const VERBS: &[VerbSpec] = &[
          `linux_installed_build= linux_staged_build= linux_trial=<phase|none> linux_trial_starts= \
          linux_trial_healthy=`, `apply_refusal= apply_refusal_at= apply_failure= trial_wait=`, the \
          handoff timings `freeze_seed_ms= handoff_capture_ms= handoff_park_ms=`, and `changelog=` \
-         (prose pct-encoded). `apply_posture`: `automatic`, `automatic-idle`, `waits-terminal` \
-         (installs once a terminal tab opens), `manual-config`, `disabled-env`, `retry-wait`, \
-         `manual-only`, `handoff-unavailable`, `applying`, `unreconciled`, `none`, `disabled`, \
-         `unknown`. `apply_phase`: `prefer-idle`, `prefer-output-gap`, `keys-only`, then `land` \
+         (prose pct-encoded). `apply_posture`: `automatic`, `automatic-idle`, `next-launch` \
+         (installs once aterm is quit and opened again), `manual-config`, `disabled-env`, \
+         `retry-wait`, `manual-only`, `handoff-unavailable`, `applying`, `unreconciled`, `none`, \
+         `disabled`, `unknown`. `apply_phase`: `prefer-idle`, `prefer-output-gap`, `keys-only`, \
+         then `land` \
          within a minute of arming; `apply_held=restored-agents` holds the apply (up to 7 min) \
          while reopened tabs' agents relaunch. `check` (Owner-only) runs one channel check and \
          answers the same line. `apply` (Owner-only) queues the staged build on macOS (a \
@@ -1523,7 +1527,7 @@ pub const VERBS: &[VerbSpec] = &[
         OwnerOnly,
         "members <requests|allow|invite|ignore> …: Macs asking to join",
         "— Owner-only. `members requests` lists the Macs asking that this Mac hears (`OK <n>` \
-         then `request name=<n> model=<m> from=<ip> code=<code> state=<asking|joining|allowed|removed \
+         then `request name=<n> model=<m> from=<ip> code=<code> state=<asking|allowed|removed \
          by=<labels>[ quorum=1]>`, free text pct-encoded; `removed` is a Mac the membership log \
          removed). `members allow <name|code>` and `members invite` show a phrase in a sheet on \
          this Mac's own screen and answer only `OK the phrase is on this Mac's screen, for <n> \
@@ -1771,12 +1775,29 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         OwnerOnly,
-        "askpass: prompt on the session's tab for a no-tty sudo password",
+        "askpass: the sudo helper's password sheet",
         "— `aterm-askpass` (`SUDO_ASKPASS`) asks it when `sudo` has no tty on macOS. Once the \
          kernel shows the caller is a child of `/usr/bin/sudo`, it raises a native password \
          sheet on that tab and returns the password once, never stored or logged. Owner only: \
          child edges, the bridge, headless instances and held sessions are refused (`aterm help \
          sudo`).",
+    )
+    .lane(Wait)
+    .input(Input::PTY),
+    va(
+        "sudo",
+        Owner,
+        Status,
+        Meta,
+        OwnerOnly,
+        "sudo -- <command>: run one command as root, password on a sheet",
+        "— macOS only. aterm itself starts `/usr/bin/sudo -k -A` on these exact words with this \
+         process's stdin, stdout, stderr and directory; the sheet on this tab shows them and the \
+         password authorizes them alone. Exits as the command did (`128+n` for a signal). \
+         Hanging up withdraws the sheet and sends the command `SIGTERM`; one that ignores it runs \
+         on to its own end. A plain `sudo` with no terminal is refused \
+         `command-unreadable`, because macOS does not show aterm that sudo's arguments. A direct \
+         debugger target is refused (`aterm help sudo`). Not `@<sid>`, not `--host`.",
     )
     .lane(Wait)
     .input(Input::PTY),
@@ -1855,7 +1876,7 @@ pub const VERBS: &[VerbSpec] = &[
          projection. Its handler does not read or refresh producers; normal event-loop \
          housekeeping may run before handling the request. It supplies no frame or presentation \
          correspondence. `tabs` prints each tab's \
-         0-based `index=` (`tab <N>` / `tab close <N>`).",
+         one-based `index=` (`tab <N>` / `tab close <N>`), matching its Cmd-<N> shortcut.",
     ),
     v(
         "cast",
@@ -2074,7 +2095,8 @@ pub const VERBS: &[VerbSpec] = &[
          autopilot` (Owner-only; aliases `forever`/`infinity` and `wrap-up`/`wrapup`/`wrap`; \
          `until=` goes with `cruise` only) sets the session's Autopilot (`OK`, plus \
          `land_at=<unix s> local=<date>T<HH:MM><offset>` for `until=`, plus `journaled=0` when \
-         the disk sync took over 5 s); a finished Land sets `task=landed`.",
+         the disk sync took over 5 s); a finished Land sets `task=landed`, and a worker's own \
+         failed conclusion under Land (`Could not finish:`, `why=repeated`) `task=failed`.",
     )
     .forms(&[form(AnyOf(&["set", "unset"])).op(Write)]),
     v(
@@ -2148,9 +2170,12 @@ pub const VERBS: &[VerbSpec] = &[
          an older one is read again before the reply (which waits at most 10 ms for it), and \
          `-` is no word: the package manager is inert, no store location resolves (no home \
          directory), or no read has landed in the last 4 s). Setup: \
-         `setup=<done|pending|pending:<row,…>|->` (this Mac's first-run setup, \
-         read from the last status its worker published: no probe, nothing changed; rows \
-         `fda`, `devtools`, `debugger`, `lan`, `ax`, `vault`, `repos`, …). Network: \
+         `setup=<done[;asking:<row,…>][;offered:<row,…>]|pending|pending:<row,…>|->` \
+         (this Mac's first-run setup, read from the last status its worker published: no \
+         probe, nothing changed; `done` leaves nothing for anyone to do now, `;asking:` names \
+         what a parked run still asks for again by itself (an absent vault), `;offered:` the \
+         macOS grants on offer, which nothing waits for; rows `fda`, `devtools`, `debugger`, \
+         `lan`, `ax`, `vault`, `repos`, …). Network: \
          `net=<alab-lan|remote|offline|checking|-> net_kind=<hotspot|lan|cellular|vpn|-> \
          net_since_ms= internet=<ok|down|path-up|unknown|-> internet_ms= \
          members=<reachable>/<known>|- away_since_ms=` (this Mac's network place, one Mac-wide \
@@ -2601,7 +2626,12 @@ pub const VERBS: &[VerbSpec] = &[
              cursor leaving the row the text was typed on; a press that shows neither is \
              pressed again, and a turn none of whose presses showed is `submitted=0 … \
              pressed=<n>`, the Enters it pressed. A verified submit says what showed it: \
-             `submit_by=claim|composer|block|screen`. \
+             `submit_by=claim|composer|block|screen`. A block-verified submit also says \
+             `block=<id>` when the exact input block was retained and exactly one command \
+             started since Enter was armed; it is absent when that association is unavailable \
+             or ambiguous. This shell block ID feeds `blocktext`; the reply's `id=` is instead \
+             the turn ledger ID (`history`), unrelated to shell block IDs or a leading \
+             exactly-once request `id=epoch:producer:seq`. \
              `submit=guarded:<re>` presses Enter \
              only while the cursor row matches `<re>`, under the same terminal lock (as `key \
              if=`; a first-press miss is `OK 0 turn skipped reason=guard submitted=0 seq=<n> \
@@ -2644,7 +2674,7 @@ pub const VERBS: &[VerbSpec] = &[
              typed; a later one is `ERR paste delivery failed` or `ERR key delivery failed`. \
              Reply: a verdict line (`id= \
              submitted=<0|1> status=settled|timeout|submitted seq= dur_ms= hash=<FNV16>[ \
-             submit_by=<claim|composer|block|screen>][ task_rev=<n>][ agent_rev=<n>][ \
+             submit_by=<claim|composer|block|screen>][ block=<shell-block-id>][ task_rev=<n>][ agent_rev=<n>][ \
              frame=open][ trimmed=<k>]`; `agent_rev=` feeds \
              `await agent <words> since=<n>`, except on a codex, whose `agent=` stays `unknown`: \
              read `status log_seq= log_ep= log_base=` before the `turn` and wait with `await \
@@ -2684,7 +2714,8 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "write text to the PTY; reply `OK seq=<n>`",
         "— `seq=<n>` is the content baseline (`await seq <n+1>` waits for resulting output). A \
-         trailing `\\n` (backslash, n) is written as Enter (CR); no other escape is decoded. \
+         trailing `\\n` (backslash, n) or newline is written as Enter (CR), from `send -` on \
+         stdin too; no other escape is decoded, and `feed-bin` keeps every byte. \
          Leading options (before `--`): `[id=<epoch>:<producer>:<seq>] [if=<re>] \
          [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] [if-supervisor=<holder>] \
          [unread=ok] [cause=@<off>|<seq>] [act=approve|deny|answer] [as=person]`. `id=` (shared \
@@ -2932,6 +2963,14 @@ pub const VERBS: &[VerbSpec] = &[
          `text` reads one; `OK frame=open` when one is still unfinished.",
     ),
     v(
+        "codex-renewal",
+        Signal,
+        Status,
+        Session,
+        "same-account Codex renewal",
+        "A kernel-authenticated idle login wall may follow only its native account's committed renewal. No caller paths, commands or credentials are accepted.",
+    ).input(Input::NONE),
+    v(
         "native-act",
         Signal,
         Status,
@@ -3064,8 +3103,9 @@ pub const VERBS: &[VerbSpec] = &[
         App,
         "drive a window's tabs (new|N|next|prev|close [N]|move <from> <to>)",
         "— flagless drives the front window; `@<sid> tab …` drives the window hosting `<sid>`. \
-         `N`, `<from>`, `<to>` and `<active>` in `OK <active> <count>` are 0-based (`inspect \
-         app/v1 tabs` `index=`). Refuses closing a tab with a running job (`ERR close refused (a \
+         `N`, `<from>`, `<to>` and `<active>` in `OK <active> <count>` are one-based (`inspect \
+         app/v1 tabs` `index=`), matching the Cmd-<N> shortcuts; 0 is a usage error. Refuses \
+         closing a tab with a running job (`ERR close refused (a \
          running job armed the last-tab confirm)` or `ERR close refused (a running job in that \
          tab)`) or an uncheckpointed native doc (`--headless` never refuses).",
     )
@@ -3085,7 +3125,7 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "open a tab app: `open app about|settings`",
+        "open a tab app: `open app mail|about|settings`",
         concat!(
             "`open app settings [/route]` selects a Settings page; `open app system-state` \
              opens setup; `open app markdown|editor <local-file-uri>` opens a document. \
@@ -3181,15 +3221,12 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "invoke <action>: fire a menu action by name (enabled-gated; names via `controls menu`)",
-        "— `Paste` honors the unread-input gate (it takes a leading `unread=ok`). Off macOS, \
-         `CloseTab` or `Quit` over a running job (and a multi-tab `Quit` on Windows) parks an \
-         in-window confirmation, replying `OK confirm pending \
-         kind=<quit|close-window|close-tab|close-pane> window=<n>; …`; `confirm yes|no` answers \
-         it. On macOS a windowed instance's `Quit`, and a close over a running job, raise the \
-         native alert, which only the person at the Mac answers (`confirm` cannot): the call \
-         waits on it (`ERR main-thread reply did not arrive within 30s`) and later calls that \
-         need the main thread reply `ERR aterm is showing a dialog; answer it, then retry`. A \
-         `--headless` instance asks nothing.",
+        "— `Paste` honors the unread-input gate (it takes a leading `unread=ok`). A close or \
+         quit that needs confirmation parks an in-window question and replies `OK confirm \
+         pending kind=<quit|close-window|close-tab|close-pane> window=<n>; …`; `confirm \
+         yes|no` answers a control client's question. The main thread keeps serving other \
+         requests. A macOS windowed `Quit` always asks; Windows also asks for a multi-tab \
+         quit, and running jobs require confirmation. A `--headless` instance asks nothing.",
     )
     .input(Input::PTY.with(Input::APP_UNREAD)),
     v(
@@ -3373,7 +3410,12 @@ pub const VERBS: &[VerbSpec] = &[
          connection with `of=<sid>` (`controller` sets `ATERM_OBSERVE_SESSION_ID`; `place=window` \
          is `ERR headless` without a GUI). Worker form (Owner-only): `spawn … \
          agent=<claude|codex|agy|muse|grok> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] \
-         len=<n>` replies `GO <n>`, reads `<n>` task bytes (`1..=65536`, no NUL; `ERR spawn \
+         len=<n>` lands its tab under the window's Workers tab, behind what the window shows \
+         whatever `raise=` says, not on the strip (`raise <sid>` or the row opens it, and the row's \
+         Move to Tab puts it among the person's tabs; `inspect app/v1 tabs` says `parked=`; with \
+         `split=` it is a pane of the tab in front instead, and any `split=` while a worker is in \
+         front answers `ERR spawn split= does not land beside a worker under the Workers tab: …`), \
+         replies `GO <n>`, reads `<n>` task bytes (`1..=65536`, no NUL; `ERR spawn \
          agent=<word>: the task is <n> bytes (max 65536)` beyond; `agent=gemini`, the retired \
          Gemini CLI, is `ERR spawn agent=gemini: Gemini CLI is no longer supported: agy replaces \
          it (agent=agy)`; `aterm ctl spawn agent=<word> \
@@ -3386,8 +3428,9 @@ pub const VERBS: &[VerbSpec] = &[
          session itself, `supervisor_proven=1`, and whose landing marks `task` `done \
          why=landed` with its rollout's report). Sets `task` to `working` (`from=<sid|ctl>`) \
          and `autopilot` to `land` (or `autopilot=cruise`; `meta set autopilot land` switches \
-         later); marks `stalled why=shell` if its shell ends or a person uses it before its \
-         first prompt, `stalled why=startup` if no agent composer (for `codex`, no proven \
+         later, on this Mac alone: a fleet drive names it at spawn and serves no `meta`); \
+         marks `stalled why=shell` if its shell ends or a person uses it before its first \
+         prompt, `stalled why=startup` if no agent composer (for `codex`, no proven \
          claim) within 120 s of `since_ms=`, a shell still drawing no prompt included, or \
          `stalled why=held` if stuck 120 s at an unhandled screen. Refuses with `ERR \
          unsupervised: <switch>` when the window harness cannot supervise (`[harness] enabled = \
@@ -3405,8 +3448,10 @@ pub const VERBS: &[VerbSpec] = &[
          Packages, or the toolset removed by `aterm pkg uninstall --all`) keeps it off, nothing \
          is installed, the launch note says so and the line runs any copy of the shell's own. \
          The startup deadline waits while it installs, and a launcher whose task is no longer \
-         `working` types nothing. Over an authenticated fleet drive, `aterm ctl --host <h> \
-         spawn cwd=/absolute` opens a background plain shell with no task or AI requirement. \
+         `working` types nothing. Over an authenticated fleet drive, a worker's spawn takes \
+         `agent=`, `model=`, `autopilot=`, an absolute `cwd=`, `from=` and `raise=false` alone, \
+         and each `ERR denied:` names the word it refused. There, `aterm ctl --host <h> spawn \
+         cwd=/absolute` opens a background plain shell with no task or AI requirement. \
          It requires the named folder, clears the host's global `-e` command, and accepts only \
          `cwd=` and optional `raise=false`; no stdin frame, command, model or implicit folder. \
          The creating node can close this shell while no person has adopted it and no foreground job runs. \
@@ -3439,14 +3484,26 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "task [mark <state> …]: a worker's task record: OK task rev= state= from= since_ms=",
         concat!(
-            "— `result_bytes= [why=] [checked=] [exit=] [result_path=] [fact= fact_rev=] agent= program_state= \
+            "— `result_bytes= [conclusion=] [why=] [checked=] [exit=] [result_path=] [fact= fact_rev=] agent= program_state= \
          attention=` (or `OK task -` when the session has no task; `program_state=` is `status \
          program_state=`, a codex's or Grok Build's own report, `-` otherwise). `state=`: `working`, `done` (under Land, a clean `Nothing left:` \
          defense and a `git` check that found nothing left to land where it could read; `aterm help \
          harness` names where it cannot), `exited` (`exit=<code>`), or `stalled` \
          (`why=startup|shell|held|signin|install`; it resumes `working why=moved` or `working \
-         why=turn`; a claim worker a restore brings back is `working why=restored`). `why=` is \
-         `landed|marker|done-check|exit|shell|startup|held|turn|moved|signin|install|restored`. \
+         why=turn`; a worker a restart brings back is `working why=restored`, or `exited` \
+         where its agent does not come back), or `failed`: \
+         the work ended unfinished with its agent still there (`why=could-not-finish`, a Land \
+         worker's reply whose first line starts `Could not finish: <why>`; `why=off`, a person \
+         turned its Autopilot Off and it stayed Off 3 s, `why=off-ctl`, a manager or a script \
+         did, and turning it on again reopens either; `why=expired`, the disk \
+         worker's time ran out; `why=repeated`, Land stopped typing to a reply that came back \
+         the same with no work), reopened `working why=turn` by a turn into it or by Cruise set \
+         after it failed. `conclusion=` \
+         says how any ended task ended, once it has: `finished` for `done` and for `exited` \
+         after any `done` (which keeps that `why=` and `checked=`), `failed` for `failed`, \
+         `stalled` (until it resumes) and any other `exited`. `why=` is \
+         `landed|marker|done-check|exit|shell|startup|held|turn|moved|signin|install|restored|\
+         could-not-finish|off|off-ctl|expired|repeated`. \
          `checked=` is what aterm checked at the landing that marked it `done` \
          (also on `await task` rows): `<head>@<ref>` where `HEAD`'s 12 digits were on the remote \
          main git named (`3f9a1c2e4b7d@origin/main`), else `pushed`, `no-remote`, `no-repo` or \
@@ -3461,12 +3518,13 @@ pub const VERBS: &[VerbSpec] = &[
          word for a managed worker's line the harness held for its manager (written under the \
          owner's `[harness] occupancy = \"prompt\"` alone), shown once first edited on the reply, \
          `await task` rows and the event (`fact= fact_rev=` at their end); `fact_rev=` moves on its \
-         own, never `rev=`, and no verb takes `fact=` as input. `task mark <working|done|exited|stalled> [from=<s-…|ctl>] \
+         own, never `rev=`, and no verb takes `fact=` as input. `task mark <working|done|exited|stalled|failed> [from=<s-…|ctl>] \
          [why=<word>] [checked=<word>] [exit=<n>] [result_bytes=<n>] [result_path=<pct>]` \
          (Owner-only; `checked=` on `done` alone and from aterm's own loop alone: a hand mark \
          naming it is refused, `ERR task mark: ",
             checked_by_hand!(),
-            "`; `ERR denied` \
+            "`; a hand's `failed` is refused while a loop carries the session, whose Autopilot Off \
+         stops the typing and fails the task; `ERR denied` \
          for edges; `ERR busy update-committing` if a seamless handoff blocks > 10 s) updates the \
          record and replies with `changed=<0|1>`.",
         ),
@@ -3559,9 +3617,11 @@ pub const VERBS: &[VerbSpec] = &[
          whose ask stands (never a `kind=wait` entry), with `facts=1` a fact word noted past \
          `fact_since=` (by default the `fact_rev` at the wait; a clear wakes nothing), or the \
          session closing (`OK <n>`, or `OK <n> status=timeout`, then `@<sid> rev=<n> \
-         state=<working|done|exited|stalled|-|closed> agent=<word> program_state=<word|-> \
-         attention=<pct|-> result_bytes=<n> [checked=<word>] [fact=<word|-> fact_rev=<n>] \
-         task_news=<0|1>` rows, `checked=` as `task` says; \
+         state=<working|done|exited|stalled|failed|-|closed> agent=<word> \
+         program_state=<word|-> attention=<pct|-> result_bytes=<n> \
+         [conclusion=<finished|failed>] [why=<word>] [checked=<word>] [fact=<word|-> \
+         fact_rev=<n>] task_news=<0|1>` rows, `conclusion=`, `why=` and `checked=` as `task` says \
+         (a tab closed on a task with no conclusion reads `conclusion=failed`); \
          `program_state=` is `status program_state=`, a claim that never wakes it). \
          `await wake [timeout=<ms>]`: \
          the session's next ready wake (`wake`), its `need=` holding, a build slot reserved where \
@@ -3862,9 +3922,9 @@ pub const VERBS: &[VerbSpec] = &[
              session answers `ERR halted reason=<r> \
              origin=<person|remote|fleet|local>` from ANY scope — `send key ctrl feed feed-bin \
              paste paste-bin mouse pointer resize focus signal end restart reset turn close \
-             invoke hwkey pane tab confirm askpass` — and while any session is held the \
+             invoke hwkey pane tab confirm askpass sudo` — and while any session is held the \
              session-independent window verbs (`invoke`, `hwkey`, `pane`, `pointer`, `tab`, \
-             `confirm`, `askpass`, and `open \
+             `confirm`, `askpass`, `sudo`, and `open \
              menu|palette|tab-menu|autopilot-menu|fact-menu|overview|connections`) are refused \
              across the instance: \"",
             hold_cost!(),
@@ -3885,11 +3945,13 @@ pub const VERBS: &[VerbSpec] = &[
         BridgeOnly,
         "outbox [<max>] [earlier-receipts=1]: drain the queued outbound posts, bodies included",
         "— Bridge-only peek, up to `<max>` posts or 4 MiB, retiring nothing until `outbox \
-         sent`: `OK <nbytes>`, then each `post sid= id= to= kind= … len=<n>` line and its body, \
-         then `receipt sid= rid= off= verdict= kind= from=` and `fetch sid= off=` lines, and a \
-         final `more` line when `<max>` or the budget left posts queued. `earlier-receipts=1` \
-         adds the receipts owed for inbox rows from an earlier bus log, each \
-         ending ` log=earlier`.",
+         sent`: `OK <nbytes> roster=<seq>`, then each `post sid= id= to= kind= … len=<n>` line \
+         and its body, then `receipt sid= rid= off= verdict= kind= from=` and `fetch sid= off=` \
+         lines, and a final `more` line when `<max>` or the budget left posts queued. `roster=` \
+         is the roster's generation read after the listing, the same count `sessions bridge`'s \
+         header names, so a bridge holding that count holds a roster current after this \
+         listing. `earlier-receipts=1` adds the receipts owed for inbox rows from an earlier bus \
+         log, each ending ` log=earlier`.",
     ),
     va(
         "outbox sent",
@@ -3931,7 +3993,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         OwnerOnly,
-        "fabric status|attach [<command...>]|retire <sid>...: the bridge of a RUNNING instance",
+        "fabric status|attach|retire: the running bridge",
         "— Owner-only. `fabric status` replies `OK \
          state=<absent|connected|stale|stalled|disconnected> supervised=<0|1> command=<pct|-> \
          argv=<pct|-> reason=<token|-> rtt_ms=<n|-> link_age_ms=<n|-> build=<token> \
@@ -3955,12 +4017,28 @@ pub const VERBS: &[VerbSpec] = &[
     )
     .input(Input::NONE),
     va(
+        "vault",
+        Owner,
+        Lines,
+        Meta,
+        OwnerOnly,
+        "vault status|approve: signed admissions",
+        "— Local owner or authenticated fleet Drive. Requires local vault administrator custody. \
+         Status reports value-free admin capability and public vault identity; a reported signer \
+         is not a replacement for a separately trusted pin. Approve names exactly one joining \
+         machine and a correlation nonce. Held or removed identities \
+         require their existing local recovery procedure. Returns a signed publication receipt; \
+         this does not claim that the recipient has applied credentials.",
+    )
+    .lane(Lane::Wait)
+    .input(Input::NONE),
+    va(
         "accounts-renew",
         Owner,
         Lines,
         Meta,
         OwnerOnly,
-        "accounts-renew start=<hex32>|poll=<hex32>: the machine's unattended due renewal",
+        "accounts-renew: due renewal (start|poll)",
         "— Local owner or admitted native fleet Drive only. Starts the fixed local \
          `harness accounts renew --due --here` with closed stdin; interactive rows stay pending. \
          Replies `OK 1` and a schema-1 JSON object with request, state (working|done|failed), \
@@ -3970,6 +4048,22 @@ pub const VERBS: &[VerbSpec] = &[
          15 minutes and 64 KiB per output. \
          After a lost reply, poll the same ID: an unknown ID never establishes completion. \
          Accepts no command, account, path, environment, selector or input body.",
+    )
+    .lane(Lane::Wait)
+    .input(Input::NONE),
+    va(
+        "service-repair",
+        Owner,
+        Lines,
+        Meta,
+        OwnerOnly,
+        "service-repair <json>: bounded signed service activation over native Drive",
+        "— Authenticated native fleet Drive only. Schema 1 accepts inspect, prepare, \
+         activate and recover with operation-specific JSON, at most 48 KiB. The binary \
+         rechecks current signed membership and grants. Replies OK 1 and one JSON object, \
+         at most 512 KiB, preserving signed request and result identities. An uncertain \
+         activation is retried only with its original signed nonce. No shell command, \
+         environment, selector or remote input/output path is accepted.",
     )
     .lane(Lane::Wait)
     .input(Input::NONE),
@@ -3996,9 +4090,10 @@ pub const VERBS: &[VerbSpec] = &[
          claim announced, as `status` prints them; `-` otherwise), `autopilot=<off|cruise|land|->`, \
          `path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->`, `copy=<managed|foreign|->`, \
          `upgrade=<-|<state>/<to>/<why>/<age>>`, `land_at=<unix-s|-> task=<open|landed|theirs|-> \
-         pause=<unix-s|->`, and `task_state=<working|done|exited|stalled|-> task_rev=<n>`. \
+         pause=<unix-s|->`, and `task_state=<working|done|exited|stalled|failed|-> task_rev=<n>`. \
          `sessions bridge` returns identity-only `<local> <sid> nonce=<hex32>` rows without \
-         main-thread or terminal locks. `sessions status` returns `<local> <sid> <nonce> \
+         main-thread or terminal locks, under `OK <n> roster=<seq>`, the roster's generation \
+         (it moves when a session comes, goes or changes its row). `sessions status` returns `<local> <sid> <nonce> \
          sid=<local> revision=<n> hold=<0|1> hold_origin=<person|remote|fleet|local, \
          comma-joined, or -> detail=<pct|-> agent=<word|->`.",
     )
@@ -4037,7 +4132,8 @@ pub const VERBS: &[VerbSpec] = &[
          program=<pct|-> program_kind=<agent|shell|program|-> wait=<memory|-> \
          wait_gib=<GiB|-> wait_ahead=<n|-> agent=<word|-> agent_detail=<pct|-> \
          agent_ms=<ms> human_ms=<ms|-> bg=<n|-> task=<state|-> task_rev=<n> task_from=<pct|-> \
-         task_ms=<ms|-> model=<pct|-> effort=<pct|-> ctx_left_pct=<n|-> usage_5h_pct=<n|-> \
+         task_ms=<ms|-> task_conclusion=<finished|failed|-> model=<pct|-> effort=<pct|-> \
+         ctx_left_pct=<n|-> usage_5h_pct=<n|-> \
          usage_7d_pct=<n|-> account=<pct|-> detail=<pct|-> \
          doing=<pct|-> role=<pct|-> supervisor=<pct|-> attention=<1|pct|-> goal=<1|pct|-> needs=<word|-> \
          needs_by=<program|harness|-> hold_by=<word|-> held_from=<32 hex|-> typed_by=<pct|-> \
@@ -4285,8 +4381,9 @@ pub fn json_verbs() -> impl Iterator<Item = &'static str> {
         .map(|s| s.name)
 }
 
-/// The bridge lane's grammar generation, which the bridge and the instance serving it each state in `hello` (`lane=`) so either can tell which side reads less of the lane.
-pub const BRIDGE_LANE: u32 = 8;
+/// The grammar generation each side states in `hello` (`lane=`) to identify its private protocol.
+/// Generation 10 removes compatibility notices; generation 9 is not reused for another grammar.
+pub const BRIDGE_LANE: u32 = 10;
 
 /// The lane that added `link quarantine torn=<k>` (5 in [`BRIDGE_LANE`]'s list), for both sides.
 pub const LINK_QUARANTINE_LANE: u32 = 5;

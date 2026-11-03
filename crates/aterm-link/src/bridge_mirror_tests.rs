@@ -1800,6 +1800,117 @@ fn a_collision_re_pins_the_slot_and_every_later_one_of_its_session_in_order() {
     );
 }
 
+/// The publisher's stream with a cut ahead: its first write of more than one whole frame
+/// passes the first `pass` frames whole and is cut there, as `write_all` is once a broker
+/// that stopped reading leaves the socket's buffer full past the write timeout (or exits
+/// mid-burst); every write after the cut fails too.
+struct CutBurst {
+    inner: Box<dyn transport::Stream>,
+    pass: usize,
+    cut: bool,
+}
+
+impl std::io::Read for CutBurst {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Write for CutBurst {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.cut {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the write timed out: the broker stopped reading",
+            ));
+        }
+        let (mut ends, mut at) = (Vec::new(), 0);
+        while let Ok(Some(d)) = astream_wire::Frame::decode(&buf[at..]) {
+            at += d.consumed;
+            ends.push(at);
+        }
+        if ends.len() <= self.pass {
+            return self.inner.write(buf);
+        }
+        self.cut = true;
+        let upto = ends[self.pass - 1];
+        self.inner.write_all(&buf[..upto])?;
+        Ok(upto)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A burst cut short after its first whole frame lands that slot at its pinned sequence;
+/// once the link is back, its resend's dedup is read back as this bridge's own record, and
+/// every slot lands once, with no collision and no re-pin (critic item C13 review).
+#[test]
+fn a_burst_cut_after_a_whole_frame_is_resent_as_sent_and_lands_each_slot_once() {
+    let mut w = World::new();
+    w.append();
+    w.append();
+    w.bridge.mirror = Some(MirrorRun::acked_for_tests(&w.bridge.state, 3));
+    w.take();
+    let pinned: Vec<u64> = w
+        .bridge
+        .mirror
+        .as_deref()
+        .unwrap()
+        .batch()
+        .0
+        .iter()
+        .map(|s| s.pseq)
+        .collect();
+    assert_eq!(pinned.len(), 3, "PRECONDITION: one burst of three slots");
+    let (conn, _) = w.bridge.connect().expect("a connection");
+    let cut = CutBurst {
+        inner: conn.into_stream(),
+        pass: 1,
+        cut: false,
+    };
+    w.bridge.conn = Some(Conn::from_stream(Box::new(cut) as Box<dyn transport::Stream>).into());
+    w.bridge.mirror_send();
+    assert!(
+        w.bridge.conn.is_none(),
+        "PRECONDITION: the cut burst dropped the link"
+    );
+    let face = subject::session_face("f", &w.bridge.node, SID, "ev");
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the burst's first slot on the face",
+        || {
+            let (rows, _) = w.client().fetch(0, &face, 100).ok()?;
+            (rows.len() == 1).then_some(())
+        },
+    );
+    let (conn, _) = w.bridge.connect().expect("a reattach");
+    w.bridge.conn = Some(conn.into());
+    w.publish();
+    assert!(
+        w.bridge.collided.is_none() && w.bridge.conn.is_some(),
+        "the resent slot is this bridge's own record, not another writer's"
+    );
+    let outcomes = w.bridge.mirror.as_deref().unwrap().batch().1.to_vec();
+    assert!(
+        matches!(
+            outcomes[..],
+            [Outcome::Deduped(_), Outcome::OnBus(_), Outcome::OnBus(_)]
+        ),
+        "the landed slot deduped, to be read back; the rest appended: {outcomes:?}"
+    );
+    w.settle();
+    assert_eq!(
+        w.lane.mirror.lock().unwrap().logs[SID]
+            .mirror_landed()
+            .map(|c| c.ms),
+        Some(3),
+        "every slot landed"
+    );
+    assert_eq!(w.view(), ([1, 1, 1], [0, 0, 0]), "each once, none missing");
+}
+
 /// A republished slot's dedup is read back, and a foreign record at the pinned seq is detected as a collision.
 #[test]
 fn a_republished_slots_dedup_is_read_back_and_a_foreign_one_is_a_collision() {
@@ -2009,6 +2120,64 @@ fn a_session_the_budget_refuses_waits_and_opens_with_no_hole() {
     );
     assert!(view.holes().is_empty(), "{:?}", view.holes());
     assert_eq!(view.max_ms(), 2);
+}
+
+/// The new faces one pass opens are counted against the mirror's reserve together: with
+/// room for one subject past it, a batch of two new sessions opens one face, the other
+/// waits, and the reserve stays whole (critic item C13 review).
+#[test]
+fn the_faces_one_pass_opens_are_counted_against_the_reserve_together() {
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+    let max = astream_broker::store::MAX_SUBJECTS_PER_PRODUCER as u64;
+    let reserve = max / 4;
+    let (_broker, _server) = seeded_broker(&lane, &mut bridge, &[], &[], max - reserve - 1);
+    bridge.mirror = Some(MirrorRun::acked_for_tests(&bridge.state, 8));
+    for sid in ["s-a", "s-b"] {
+        let mut log = opened_log();
+        log.mark(
+            Mark::new(Kind::Seen, Src::Status, Conf::Strong),
+            Stamp::new(2, 2),
+        )
+        .expect("a seen");
+        lane.mirror
+            .lock()
+            .unwrap()
+            .logs
+            .insert(sid.to_string(), log);
+    }
+    bridge.mirror_take();
+    bridge.mirror_send();
+    bridge.settle_acks();
+    let (slots, outcomes) = bridge.mirror.as_deref().unwrap().batch();
+    let sids = |landed: bool| -> BTreeSet<&str> {
+        slots
+            .iter()
+            .zip(outcomes)
+            .filter(|(_, o)| {
+                if landed {
+                    matches!(o, Outcome::OnBus(_))
+                } else {
+                    **o == Outcome::Refused
+                }
+            })
+            .map(|(s, _)| s.sid.as_str())
+            .collect()
+    };
+    let (opened, waits) = (sids(true), sids(false));
+    assert!(
+        opened.len() == 1 && waits.len() == 1 && opened.is_disjoint(&waits),
+        "one face opened, the other refused: {slots:?} {outcomes:?}"
+    );
+    let (mut god, _) = bridge.connect().expect("a connection");
+    let budget = god
+        .subject_budget(bridge.producer_id)
+        .expect("the budget read")
+        .expect("a budget");
+    assert_eq!(
+        budget.remaining(),
+        reserve,
+        "the mirror's reserve stays whole"
+    );
 }
 
 /// A retake after a subject-budget refusal still owes the session's snapshot.

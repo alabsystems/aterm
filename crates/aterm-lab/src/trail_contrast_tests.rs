@@ -488,6 +488,52 @@ fn the_report_reads_the_sidecars_and_turns_ratios_into_failures() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--lowered-min` judges what the effects did: under a bar every glyph reads below, only the one
+/// the ribbon took under its own clean reading fails; the two the page draws as they always were
+/// are not the trail's (the negative control: `--min` at the same bar counts all three). With no
+/// clean twin there is nothing to judge it by, and it is an error.
+#[test]
+fn lowered_min_counts_only_the_glyphs_the_effects_took_down() {
+    let dir = scratch("lowered");
+    let png = gallery_files(&dir, &trail_frame());
+    let png_s = png.to_string_lossy().into_owned();
+    let r = report(&parse_args(&args(&[&png_s, "--find", "abc", "--lowered-min", "21"])).unwrap())
+        .unwrap();
+    for cell in r.get("cells").and_then(J::as_arr).unwrap() {
+        let own = field(cell, "clean_local_contrast");
+        if cell.get("char").and_then(J::as_str) == Some("c") {
+            assert!(field(cell, "local_contrast") < own * LOWERED_SHARE);
+        } else {
+            assert_eq!(field(cell, "local_contrast"), own);
+        }
+    }
+    assert_eq!(
+        r.get("failures"),
+        Some(&J::Arr(vec![J::s(
+            "1 glyph cell(s) the effects took under 21.00:1"
+        )]))
+    );
+    let all =
+        report(&parse_args(&args(&[&png_s, "--find", "abc", "--min", "21"])).unwrap()).unwrap();
+    assert_eq!(
+        all.get("failures"),
+        Some(&J::Arr(vec![J::s(
+            "3 measured glyph cell(s) under 21.00:1"
+        )]))
+    );
+    let blind = parse_args(&args(&[
+        &png_s,
+        "--find",
+        "abc",
+        "--lowered-min",
+        "3",
+        "--no-clean",
+    ]))
+    .unwrap();
+    assert!(report(&blind).unwrap_err().starts_with("--lowered-min"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A Settings frame's grid is its cursor scene card, a small part of the window: the page the
 /// caret is judged on is the card's, the grid's most common colour, not the window chrome that
 /// fills the most of the frame (the negative control).

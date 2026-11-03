@@ -110,8 +110,9 @@ pub(crate) fn prepare<'a>(
     ))
 }
 
-/// Run `build_args`'s bench (`targo bench -q …`) with `words` in `env`, echoing its stderr lines
-/// that start with `progress`: its stdout.
+/// Build `build_args`'s bench without executing it, obtain fresh measurement-entry evidence,
+/// then execute Cargo's exact artifact with `words` in `env`. Echo stderr lines beginning
+/// with `progress`, and return stdout.
 ///
 /// # Errors
 /// A bench that does not start, or exits unsuccessfully (`what` names it, with both tails).
@@ -123,20 +124,30 @@ pub(crate) fn run_bench(
     progress: &str,
     what: &str,
 ) -> Result<String, Halt> {
-    let mut bench_args = vec!["-q"];
+    let mut bench_args = vec!["-q", "--no-run", "--message-format=json-render-diagnostics"];
     bench_args.extend_from_slice(build_args);
+    eprintln!("  $ {}", targo.display("bench", &bench_args));
+    let messages = targo.output("bench", &bench_args, "the measurement executable build")?;
+    let name = build_args
+        .windows(2)
+        .find(|args| args[0] == "--bench")
+        .map(|args| args[1])
+        .ok_or_else(|| Halt::Fail("measurement build names no bench target".into()))?;
+    let executable = built_executable(&messages, name, "bench")?;
     eprintln!(
         "  $ {env}=\"{words}\" {}",
-        targo.display("bench", &bench_args)
+        format_args!("{} --bench", executable.display())
     );
-    let mut child = targo
-        .command("bench")
-        .args(bench_args)
+    let mut command = aterm_uds::spawnfd::command(&executable);
+    targo.environment(&mut command);
+    command.current_dir(workspace_root()).arg("--bench");
+    let _entry = super::measurement_entry().map_err(Halt::Timing)?;
+    let mut child = command
         .env(env, words)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not run targo: {e}"))?;
+        .map_err(|e| format!("could not execute {}: {e}", executable.display()))?;
     let stdout = child.stdout.take().map(|out| {
         std::thread::spawn(move || {
             let mut text = String::new();
@@ -158,8 +169,11 @@ pub(crate) fn run_bench(
     }
     let status = child
         .wait()
-        .map_err(|e| format!("could not wait for targo: {e}"))?;
+        .map_err(|e| format!("could not wait for measurement executable: {e}"))?;
     let stdout = stdout.and_then(|h| h.join().ok()).unwrap_or_default();
+    _entry
+        .timing_admission()
+        .map_err(|why| Halt::Timing(why.to_string()))?;
     if !status.success() {
         let out_tail: Vec<&str> = stdout.lines().rev().take(TAIL).collect();
         return Err(Halt::Fail(format!(
@@ -209,6 +223,11 @@ impl<'a> Targo<'a> {
     pub(crate) fn command(&self, verb: &str) -> Command {
         let mut cmd = aterm_uds::spawnfd::command(&self.driver.program);
         cmd.args(self.lead(verb)).current_dir(workspace_root());
+        self.environment(&mut cmd);
+        cmd
+    }
+
+    pub(crate) fn environment(&self, cmd: &mut Command) {
         for (key, _) in std::env::vars_os() {
             if key.to_str().is_some_and(flags::is_env_source) {
                 cmd.env_remove(key);
@@ -217,7 +236,6 @@ impl<'a> Targo<'a> {
         for (key, value) in &self.git_facts {
             cmd.env(key, value);
         }
-        cmd
     }
 
     pub(crate) fn display(&self, verb: &str, args: &[&str]) -> String {
@@ -338,6 +356,11 @@ fn build_bench(targo: &Targo<'_>, build_args: &[&str]) -> Result<PathBuf, Halt> 
 }
 
 fn built_binary(messages: &str, name: &str) -> Result<PathBuf, String> {
+    built_executable(messages, name, "bin")
+}
+
+/// Cargo's exact executable artifact, matched by both target name and target kind.
+pub(crate) fn built_executable(messages: &str, name: &str, kind: &str) -> Result<PathBuf, String> {
     for line in messages.lines() {
         let Ok(message) = aterm_json::from_str::<aterm_json::Value>(line) else {
             continue;
@@ -353,13 +376,14 @@ fn built_binary(messages: &str, name: &str) -> Result<PathBuf, String> {
         let bin = target
             .and_then(|t| t.get("kind"))
             .and_then(aterm_json::Value::as_array)
-            .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some("bin")));
-        if named && bin {
-            return message
+            .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some(kind)));
+        if named
+            && bin
+            && let Some(path) = message
                 .get("executable")
                 .and_then(aterm_json::Value::as_str)
-                .map(PathBuf::from)
-                .ok_or_else(|| format!("cargo built the `{name}` binary and named no executable"));
+        {
+            return Ok(PathBuf::from(path));
         }
     }
     Err(format!("cargo reported no `{name}` binary"))
@@ -572,6 +596,27 @@ mod tests {
         assert!(built_binary(&messages, "aterm-ctl").is_err());
         let nameless = r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"aterm"},"executable":null}"#;
         assert!(built_binary(nameless, "aterm").is_err());
+        assert_eq!(
+            built_executable(&messages, "fabric_bench", "bench"),
+            Ok(PathBuf::from(
+                "/c/.cargo-build/opt-test/deps/fabric_bench-7b2c"
+            ))
+        );
+        assert!(built_executable(&messages, "fabric_bench", "example").is_err());
+        let examples = r#"{"reason":"compiler-artifact","target":{"kind":["example"],"name":"probe"},"executable":"/cache/probe","fresh":true}"#;
+        assert_eq!(
+            built_executable(examples, "probe", "example"),
+            Ok(PathBuf::from("/cache/probe"))
+        );
+        assert!(built_executable(examples, "probe", "lib").is_err());
+        let library_tests=[
+            r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"aterm_db"},"profile":{"test":false},"executable":null}"#,
+            r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"aterm_db"},"profile":{"test":true},"executable":"/cache/deps/aterm_db-test"}"#,
+        ].join("\n");
+        assert_eq!(
+            built_executable(&library_tests, "aterm_db", "lib"),
+            Ok(PathBuf::from("/cache/deps/aterm_db-test"))
+        );
     }
 
     #[test]

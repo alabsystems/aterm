@@ -32,7 +32,9 @@ libc = { workspace = true }
 # admission and object scan, and the toolchain lease are its library functions — never
 # a copy. Pack-time relocation and the LINEAGE stamp are producer-only (artifact::).
 atpkg = { workspace = true }
-# The release host over agh (host::agh::AghHost): its read half in M1, used by tests only.
+# The release host over agh (host::agh::AghHost), reads and writes, chosen per builder by --host
+# (docs/PLAN-agh-m2-2026-10-20.md §16.1); and agh's CLI, which "atpkg-publish agh" forwards to for
+# the lanes' git credential helper.
 agh = { workspace = true }
 # The signer as a library: `sign`/`pubkey_b64` over the machine key, `verify_signed` for
 # an ALab release's SHA256SUMS, and (tests) `generate` + `roster_ops`.

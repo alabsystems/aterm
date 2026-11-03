@@ -19,7 +19,7 @@ use crate::api::{Baseline, Build, Delta, IndexRequest, Indexer, Published, Tripl
 use crate::artifact::{pkgdoc, upload};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
-use crate::host::{HostError, Probe, Replace};
+use crate::host::{HostError, HostRole, Probe, Replace, gh_serves};
 use crate::identity::signer_for;
 use crate::programs::{self, POLICY};
 use crate::quad::{self, Freshness, QUAD_FILES, VerifiedQuad, index_tag};
@@ -79,7 +79,7 @@ impl Base {
     /// # Errors
     /// A refusal naming the block count or the keys it cannot carry.
     pub fn of_head(quad: &VerifiedQuad) -> Result<Self> {
-        let raw = std::fs::read_to_string(quad.file(QUAD_FILES[0]))
+        let raw = crate::identity::read_regular_text(&quad.file(QUAD_FILES[0]), MANIFEST_CAP)
             .map_err(|e| Error::io("read the head's index.toml", &e))?;
         let value: aterm_toml::Value = raw.parse().map_err(|e| {
             Error::refused(format!(
@@ -951,8 +951,10 @@ pub fn newest_roster(ctx: &Ctx, candidates: &[PathBuf], log: &mut Log) -> Result
     for path in candidates {
         let mut sig_path = path.as_os_str().to_owned();
         sig_path.push(".sig");
-        let (Ok(bytes), Ok(sig)) = (std::fs::read(path), std::fs::read(PathBuf::from(sig_path)))
-        else {
+        let (Ok(bytes), Ok(sig)) = (
+            crate::identity::read_regular_bytes(path, MANIFEST_CAP),
+            crate::identity::read_regular_bytes(&PathBuf::from(sig_path), MANIFEST_CAP),
+        ) else {
             continue;
         };
         let verdict = aterm_update_core::verify_roster(&anchor, bytes.clone(), &sig)
@@ -1042,7 +1044,16 @@ pub fn publish_with(ctx: &Ctx, request: &IndexRequest, log: &mut Log) -> Result<
              `atpkg-keys setup --id <id>` on the first machine)",
         ));
     }
-    if request.upload {
+    if request.upload && !gh_serves(ctx, HostRole::Channel) {
+        let slug = ctx.index_slug();
+        ctx.hosts.channel.write_preflight(&slug).map_err(|e| {
+            Error::refused(format!(
+                "--upload needs the public owner's writer on {slug}: {e} — the index and the \
+                 packs it pins are published to {}",
+                ctx.accounts.public
+            ))
+        })?;
+    } else if request.upload {
         match ctx.usable_token(&ctx.tokens.channel) {
             Ok(true) => {}
             Ok(false) => {
@@ -1442,8 +1453,10 @@ pub fn compare_and_swap(ctx: &Ctx, plan: &Plan, out: &Path, log: &mut Log) -> Re
         )
     })?;
     for name in &present {
-        let theirs = std::fs::read(cmp.join(name)).map_err(|e| Error::io(name, &e))?;
-        let ours = std::fs::read(out.join(name)).map_err(|e| Error::io(name, &e))?;
+        let theirs = crate::identity::read_regular_bytes(&cmp.join(name), MANIFEST_CAP)
+            .map_err(|e| Error::io(name, &e))?;
+        let ours = crate::identity::read_regular_bytes(&out.join(name), MANIFEST_CAP)
+            .map_err(|e| Error::io(name, &e))?;
         if theirs != ours {
             return Err(Error::refused(format!(
                 "{tag} already exists on {slug} with DIFFERENT bytes ({name}) — another \
@@ -1533,8 +1546,8 @@ fn read_manifest(
     } else {
         return None;
     };
-    let bytes = std::fs::read(from.join(&mf)).ok()?;
-    let sig = std::fs::read(from.join(&sig)).ok()?;
+    let bytes = crate::identity::read_regular_bytes(&from.join(&mf), MANIFEST_CAP).ok()?;
+    let sig = crate::identity::read_regular_bytes(&from.join(&sig), MANIFEST_CAP).ok()?;
     quad.verify_pkg(&bytes, &sig).ok()
 }
 

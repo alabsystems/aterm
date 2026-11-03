@@ -2682,7 +2682,7 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
     }
     match key {
         EDIT_AMACS_DEFAULT_EDITOR => boolean(Some(cfg.amacs.config.default_editor), true),
-        EDIT_KEEPER_ENABLED => boolean(Some(cfg.keeper_enabled()), false),
+        EDIT_KEEPER_ENABLED => boolean(Some(cfg.keeper_enabled()), crate::keeper_link::DEFAULT_ON),
         EDIT_SESSION_LOG_JOURNAL => boolean(Some(cfg.session_log_journal()), true),
         EDIT_SESSION_LOG_CLAUSE => boolean(Some(cfg.session_log_clause()), true),
         EDIT_UPDATE_ENABLED => boolean(upd.and_then(|u| u.enabled), true),
@@ -3209,7 +3209,7 @@ pub(crate) fn footnote_of(key: &str) -> Option<&'static str> {
              wins."
         }
         EDIT_KEEPER_ENABLED => {
-            "Requires the PTY keeper service (`aterm keeper start`); this switch alone does not start it. Reopening a saved layout alone starts new shells."
+            "Each launch starts the PTY keeper if none runs. Turning this off takes effect next launch; `aterm keeper stop` ends the one running. Reopening a saved layout alone starts new shells."
         }
         EDIT_SESSION_LOG_JOURNAL => {
             "Saves session activity, including command metadata, on disk while session restore is enabled. Removes eligible inactive files toward a 64 MiB / 2,048-file target; live or locked journals can keep it above target. Turning this off takes effect next launch and keeps existing files."

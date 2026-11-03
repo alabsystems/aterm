@@ -670,7 +670,7 @@ fn lock(dir: &Path, layout: &Layout, deadline: Instant) -> io::Result<WriterLock
     let (file, metadata) =
         aterm_uds::kept_out(|| private_file::open_private(dir, &layout.file("lock")))
             .map_err(|_| io::Error::other("journal lock is not private"))?;
-    private_file::lock_exclusive_until_with(
+    aterm_uds::file_lock::lock_exclusive_until_with(
         &file,
         deadline,
         "another local journal writer is active",

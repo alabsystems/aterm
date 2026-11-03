@@ -67,6 +67,9 @@ pub struct InitialSetupHandlers {
     /// subscriber, removes the record of the person's opt-out and reads the
     /// row again (design §3.3). Returns whether that worker started.
     pub sync_on: fn() -> bool,
+    /// A person pressed for macOS's grants: save that durably and read the Access rows again.
+    /// Returns whether it was saved.
+    pub ask_access: fn() -> bool,
     /// The Command Line Tools tab said Apple's Command Line Tools are installed (design §3.3):
     /// read the GitHub repositories row again at once and wake the run waiting on them, so the
     /// page moves on without waiting for its next look.
@@ -96,6 +99,7 @@ impl InitialSetupHandlers {
             settle: || {},
             cut_off: |_| {},
             sync_on: || false,
+            ask_access: || false,
             tools_installed: || {},
             fda_granted: || {},
             join_phrase: |_, _| false,
@@ -645,7 +649,11 @@ impl Host {
     /// long over, so this asking is a new one).
     fn asked_before(&self, now: Instant) -> Option<Instant> {
         let path = self.asking_record.as_ref()?;
-        let then: u64 = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+        let then: u64 = crate::proxy::read_private_text(path)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
         let ago = Duration::from_millis(aterm_time::unix_millis()?.checked_sub(then)?);
         (ago < Duration::from_secs(60 * 60)).then(|| now.checked_sub(ago).unwrap_or(now))
     }
@@ -664,7 +672,9 @@ impl Host {
                     return;
                 };
                 // A record lost to a crash only starts the quiet again: no flush is owed.
-                if let Err(error) = std::fs::write(path, then.to_string()) {
+                if let Err(error) =
+                    aterm_agent::harness::upgrade_models::write_atomic(path, &then.to_string())
+                {
                     aterm_log::info!("system state: the join's asking start was not kept: {error}");
                 }
             }
@@ -1054,10 +1064,12 @@ impl App {
         // The page and the menu line read where the Command Line Tools install stands, which
         // the window alone knows (its tab, Apple's installer); a scenario keeps its own.
         if !self.system_state_host.showing_fixture() {
+            self.settle_missing_tools_exception();
             if status.repositories_tools_wait().is_some() {
                 status.developer_tools = self.developer_tools_install_step(&status);
             } else {
-                // A reading with the tools there ends the calm kept since the tab installed them.
+                // A reading past the repositories' tools wait ends the calm kept since the tab
+                // installed them.
                 self.workstation_setup
                     .developer_tools_after
                     .settle(status.repositories_reading(), Instant::now());
@@ -1809,6 +1821,25 @@ impl App {
                     aterm_log::info!("system state: Turn On Sync did not start");
                 }
             }
+            SystemStateAction::AskForAccess { by_person } => {
+                let press = self.take_system_state_press();
+                if !by_person || press != crate::workstation_setup::PagePress::Person {
+                    aterm_log::info!("system state: Turn On… refused: not a person's press");
+                    return;
+                }
+                if !handlers.is_some_and(|handlers| (handlers.ask_access)()) {
+                    aterm_log::info!("system state: a person's ask for macOS's grants not saved");
+                    return;
+                }
+                // Only a status read after the record releases the steps, with this press as
+                // their admission: the one in flight was read before it.
+                self.person_asked_for_access();
+                self.system_state_host.generation =
+                    self.system_state_host.generation.wrapping_add(1);
+                self.system_state_host.status_in_flight = false;
+                self.system_state_host.next_status = Some(Instant::now());
+                self.request_redraw_all_windows();
+            }
             SystemStateAction::InstallDeveloperTools { by_person } => {
                 let press = self.take_system_state_press();
                 if !by_person || press != crate::workstation_setup::PagePress::Person {
@@ -1861,16 +1892,7 @@ impl App {
                 let WorkstationSetupDecision::Begin(plan) = &answer.decision else {
                     return;
                 };
-                let mut plan = plan.clone();
-                if admission == Admission::Automatic
-                    && plan.selection.contains(Setting::Permissions)
-                {
-                    plan.selection.set(Setting::Permissions, false);
-                    answer.decision = WorkstationSetupDecision::Begin(plan.clone());
-                    aterm_log::info!(
-                        "system state: automatic setup deferred permission acquisition; continuing with available work"
-                    );
-                }
+                let plan = plan.clone();
                 let Some(instance) = self.native_runtime.instance_by_kind(AppKind::SystemState)
                 else {
                     return;
@@ -1915,6 +1937,18 @@ impl App {
                 // reach this plan's own run.
                 self.begin_system_state_action(true, !resume_answer);
                 self.note_system_state_apply(admission);
+                // A person turning the Permissions group on asks for macOS's grants, as the offer's
+                // press does. Any other Apply (the page's automatic answer, Set up now, a Join, a
+                // press on another group) puts no macOS prompt up (AGENTS.md).
+                if self.system_state_apply_is_a_persons()
+                    && plan.selection.contains(Setting::Permissions)
+                    && answer
+                        .changed
+                        .is_some_and(|changed| changed.contains(Setting::Permissions))
+                    && !handlers.is_some_and(|handlers| (handlers.ask_access)())
+                {
+                    aterm_log::info!("system state: a person's ask for macOS's grants not saved");
+                }
                 self.system_state_host.operation = None;
                 aterm_log::info!("system state: submitting a plan ({admission:?})");
                 let password = answer.password.as_ref().and_then(|_| {

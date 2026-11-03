@@ -234,11 +234,21 @@ fn diagnostics_keep_live_policy_and_owner_lease_separate_from_the_observer() {
         |_| {},
     )
     .unwrap();
-    wait(Status::Refused("writer recovery"));
+    wait(refused_at("writer recovery"));
     runtime.stop();
     assert_eq!(opens.load(Ordering::SeqCst), 0);
     assert_eq!(std::fs::read(&selection).unwrap(), b"incomplete recovery");
     drop((lease, live_observer));
+}
+
+/// The wait `refusals` gives after a try that ended with `status`, having served for `served`
+/// ([`Refusals::after`]).
+fn wait_after(
+    refusals: &mut Refusals,
+    mut status: Option<Status>,
+    served: Option<Duration>,
+) -> Duration {
+    refusals.after(status.as_mut(), served)
 }
 
 /// How many tries an owner makes in ten virtual minutes of one persistent refusal, each try
@@ -268,7 +278,7 @@ fn local_writer_contention_keeps_a_bounded_retry_instead_of_failure_backoff() {
             .expect("the other local session owns the control journal");
         let status = refusal("control endpoint")(error);
         assert_eq!(status, Status::Retrying("control endpoint"));
-        waits.push(refusals.after(Some(status), None));
+        waits.push(wait_after(&mut refusals, Some(status), None));
     }
     assert_eq!(
         waits,
@@ -290,8 +300,47 @@ fn local_writer_contention_keeps_a_bounded_retry_instead_of_failure_backoff() {
         .expect("the other custody observation still owns its lock");
     let status = refusal("secrets custody")(error);
     assert_eq!(status, Status::Retrying("secrets custody"));
-    assert_eq!(refusals.after(Some(status), None), POLL);
+    assert_eq!(wait_after(&mut refusals, Some(status), None), POLL);
     drop(custody);
+}
+
+/// A vault writer held while the control endpoint revalidates its custody is local contention,
+/// as it is to a table session: the owner retries after [`POLL`], and the endpoint's error keeps
+/// the error custody gave. NEGATIVE CONTROL: the endpoint's generic adapter for a peer's evidence
+/// dropped both, so this owner backed off as refused and warned `control endpoint` with no reason.
+#[test]
+fn a_vault_writer_at_endpoint_revalidation_is_contention_with_its_error() {
+    let lab = crate::table::tests::Lab::new(&[aterm_secrets::commons::roster::Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let vault = aterm_uds::private_file::PrivateLock::take(
+        &lab.paths[0].dir,
+        ".lock",
+        Duration::ZERO,
+        "held",
+    )
+    .unwrap();
+    let custody = bootstrap
+        .revalidate_custody()
+        .expect_err("a held vault writer is no current observation");
+    let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let error = Endpoint::from_bootstrap_until(&bootstrap, deadline)
+        .err()
+        .expect("custody revalidation refuses while the vault writer holds");
+    assert!(error.is_busy(), "{error}");
+    assert!(
+        error.to_string().contains(&custody.to_string()),
+        "{error} lost {custody}"
+    );
+    let mut refusals = Refusals::new(false);
+    let status = refusal("control endpoint")(error);
+    assert_eq!(status, Status::Retrying("control endpoint"));
+    assert_eq!(wait_after(&mut refusals, Some(status), None), POLL);
+    drop(vault);
+    assert!(
+        Endpoint::from_bootstrap_until(&bootstrap, deadline)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -311,8 +360,11 @@ fn unclassified_io_and_error_words_keep_persistent_refusal_backoff() {
     let waits: Vec<_> = statuses
         .into_iter()
         .map(|status| {
-            assert_eq!(status, Status::Refused("transport"));
-            refusals.after(Some(status), None)
+            assert!(
+                matches!(&status, Status::Refused(refusal) if refusal.step == "transport"),
+                "{status:?}"
+            );
+            wait_after(&mut refusals, Some(status), None)
         })
         .collect();
     let base = TICK * 2;
@@ -331,7 +383,7 @@ fn a_persistent_refusal_backs_off_to_thirty_seconds_and_a_served_run_resets_it()
     for each in [Duration::ZERO, POLL + base] {
         let mut refusals = Refusals::new(false);
         let doubling = tries_in_ten_minutes(each, || {
-            refusals.after(Some(Status::Refused("generation guard")), None)
+            wait_after(&mut refusals, Some(refused_at("generation guard")), None)
         });
         let fixed = tries_in_ten_minutes(each, || base);
         assert!(doubling <= 27, "{doubling} tries after {each:?} each");
@@ -339,8 +391,10 @@ fn a_persistent_refusal_backs_off_to_thirty_seconds_and_a_served_run_resets_it()
     }
 
     let mut refusals = Refusals::new(false);
-    let refused = Some(Status::Refused("custody"));
-    let waits: Vec<_> = (0..10).map(|_| refusals.after(refused, None)).collect();
+    let refused = || Some(refused_at("custody"));
+    let waits: Vec<_> = (0..10)
+        .map(|_| wait_after(&mut refusals, refused(), None))
+        .collect();
     assert_eq!(waits[0], base, "the first refusal is tried again as before");
     assert_eq!(waits[1], base * 2);
     assert_eq!(waits[2], base * 4);
@@ -348,20 +402,23 @@ fn a_persistent_refusal_backs_off_to_thirty_seconds_and_a_served_run_resets_it()
     // A try that served briefly before it was refused (an owner refused at each poll) keeps the
     // doubling; one that served for the longest wait, or one that ended to rebuild, resets it.
     assert_eq!(
-        refusals.after(refused, Some(POLL)),
+        wait_after(&mut refusals, refused(), Some(POLL)),
         REFUSED_MAX,
         "a refusal at the first poll reset the backoff"
     );
-    assert_eq!(refusals.after(refused, Some(REFUSED_MAX)), base);
-    assert_eq!(refusals.after(refused, None), base * 2);
-    assert_eq!(refusals.after(None, None), base);
-    assert_eq!(refusals.after(refused, None), base);
+    assert_eq!(
+        wait_after(&mut refusals, refused(), Some(REFUSED_MAX)),
+        base
+    );
+    assert_eq!(wait_after(&mut refusals, refused(), None), base * 2);
+    assert_eq!(wait_after(&mut refusals, None, None), base);
+    assert_eq!(wait_after(&mut refusals, refused(), None), base);
     // An offline outcome keeps the mode's wait and the streak.
-    assert_eq!(refusals.after(Some(Status::Offline), None), base);
-    assert_eq!(refusals.after(refused, None), base * 2);
+    assert_eq!(wait_after(&mut refusals, Some(Status::Offline), None), base);
+    assert_eq!(wait_after(&mut refusals, refused(), None), base * 2);
     let mut background = Refusals::new(true);
     assert!(
-        (0..6).all(|_| background.after(refused, None) == POLL),
+        (0..6).all(|_| wait_after(&mut background, refused(), None) == POLL),
         "the background owner backed off"
     );
 }
@@ -406,7 +463,7 @@ fn the_owner_loop_waits_out_a_persistent_refusal_at_a_doubling_interval() {
             |_| {},
         )
         .unwrap();
-        wait(Status::Refused(refused));
+        wait(refused_at(refused));
         let until = Instant::now() + Duration::from_secs(60);
         while retries.lock().unwrap().len() < expected.len() {
             assert!(
@@ -422,6 +479,196 @@ fn the_owner_loop_waits_out_a_persistent_refusal_at_a_doubling_interval() {
             retries[..expected.len()],
             *expected,
             "{refused}, background {background}"
+        );
+    }
+}
+
+/// A refusal carries the step that refused and the error that step gave, from either error type a
+/// step fails with, and so does the LAN gate's refusal of a configuration it could not read; local
+/// contention is still a retry. NEGATIVE CONTROL: the adapter that kept only the step gave two
+/// different errors one status, so a host could log only the step.
+#[test]
+fn a_refusal_carries_the_error_its_step_gave() {
+    let refused = |step, error: &str| {
+        Status::Refused(Refusal {
+            step,
+            error: error.into(),
+            standing: false,
+        })
+    };
+    assert_eq!(
+        refusal("transport")(crate::Error::new("first")),
+        refused("transport", "first")
+    );
+    assert_eq!(
+        refusal("transport")(std::io::Error::other("second")),
+        refused("transport", "second")
+    );
+    assert_ne!(
+        refusal("transport")(crate::Error::new("first")),
+        refusal("transport")(crate::Error::new("second")),
+    );
+    assert_eq!(
+        refusal("transport")(crate::Error::busy()),
+        Status::Retrying("transport")
+    );
+    let home = aterm_tempfile::tempdir().unwrap();
+    let unreadable = home.path().join("aterm.toml");
+    fsx::write_atomic(&unreadable, b"[commons\n", 0o600).unwrap();
+    let error = enabled(&unreadable).expect_err("an unreadable configuration");
+    let (_, _, status) = LanGate::open()
+        .held(&unreadable)
+        .expect("the gate holds an unreadable configuration");
+    assert_eq!(status, refused("configuration", &error.to_string()));
+}
+
+/// A streak of refusals is one standing refusal while its cause holds ([`Refusals`]). An owner
+/// refused at each poll serves briefly, and its tries pass through other statuses, between two
+/// refusals: each after the first stands. A refusal at another step or with another error is
+/// news, and so is the first cause when it returns; a try that served for [`REFUSED_MAX`], one
+/// that ended to rebuild, or a disabled Commons lifted the refusal, so the next is news. Both modes
+/// mark alike.
+/// NEGATIVE CONTROL: with no refusal marked standing, every refusal of an owner refused at each
+/// poll is news, and its host warned of each.
+#[test]
+fn a_refusal_stands_until_its_cause_changes_or_lifts() {
+    let refused = |step, error: &str| {
+        Some(Status::Refused(Refusal {
+            step,
+            error: error.into(),
+            standing: false,
+        }))
+    };
+    let custody = || refused("custody", "Commons immutable custody changed");
+    let lost = || {
+        refused(
+            "custody",
+            "Commons established history is missing or not private",
+        )
+    };
+    let lease = || refused("owner lease", "Commons owner lease was replaced");
+    for background in [false, true] {
+        let mut refusals = Refusals::new(background);
+        let mut stands = |mut status: Option<Status>, served: Option<Duration>| {
+            refusals.after(status.as_mut(), served);
+            match status {
+                Some(Status::Refused(refusal)) => Some(refusal.standing),
+                _ => None,
+            }
+        };
+        let news = Some(false);
+        let standing = Some(true);
+        assert_eq!(
+            stands(custody(), None),
+            news,
+            "the first refusal of a streak"
+        );
+        assert_eq!(
+            stands(custody(), Some(POLL)),
+            standing,
+            "refused at its first poll"
+        );
+        for between in [
+            Status::Offline,
+            Status::Pending,
+            Status::Retrying("control endpoint"),
+            Status::Waiting,
+            Status::LanHeld,
+        ] {
+            assert_eq!(stands(Some(between), None), None);
+            assert_eq!(
+                stands(custody(), Some(POLL)),
+                standing,
+                "background {background}"
+            );
+        }
+        assert_eq!(stands(lease(), None), news, "another step");
+        assert_eq!(stands(custody(), None), news, "the first cause returned");
+        assert_eq!(stands(lost(), None), news, "the same step, another error");
+        assert_eq!(stands(lost(), None), standing);
+        assert_eq!(
+            stands(lost(), Some(REFUSED_MAX)),
+            news,
+            "served the longest wait"
+        );
+        assert_eq!(stands(None, None), None);
+        assert_eq!(stands(lost(), None), news, "ended to rebuild");
+        assert_eq!(stands(lost(), None), standing);
+        assert_eq!(stands(Some(Status::Disabled), None), None);
+        assert_eq!(stands(lost(), None), news, "Commons was switched off");
+        assert_eq!(stands(lost(), None), standing);
+    }
+}
+
+/// An owner's refusal reaches its host with the error its step gave, once per standing cause. A
+/// window's owner and the background owner, refused at their transport's open, report it as news;
+/// after tries that waited on another owner's lease, they report the same refusal again as
+/// standing, which their host logs at debug: of all they report, one refusal is news
+/// ([`Status::news`], what their host warns of). NEGATIVE CONTROL: an owner that marked no refusal
+/// standing reported the refusal after the wait as it reported the first, a second warning of one
+/// standing cause, the re-post its hosts made whenever its tries passed through another status.
+#[test]
+fn an_owner_reports_a_standing_refusal_once_with_its_error() {
+    for background in [false, true] {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let lab = crate::table::tests::Lab::new(&[aterm_secrets::commons::roster::Role::Writer]);
+        let paths = lab.paths[0].clone();
+        let config = home.path().join("aterm.toml");
+        fsx::write_atomic(&config, b"[commons]\nenabled=true\n", 0o600).unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let runtime = Runtime::start_mode_with_sources(
+            paths.clone(),
+            config.clone(),
+            (config.clone(), true),
+            move |status| {
+                let _ = send.send(status);
+            },
+            Network {
+                open_fails: true,
+                ..Network::default()
+            },
+            background,
+            |_| {},
+        )
+        .unwrap();
+        let reported = std::cell::RefCell::new(Vec::new());
+        let next = || {
+            let status = receive.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+            reported.borrow_mut().push(status.clone());
+            status
+        };
+        let open_refused = |standing| Refusal {
+            step: "transport",
+            error: crate::Error::new(OPEN_FAILS).to_string(),
+            standing,
+        };
+        let transport = |standing| Status::Refused(open_refused(standing));
+        assert_eq!(next(), transport(false), "background {background}");
+        let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let lease = loop {
+            if let Some(lease) = owner::Lease::acquire(&paths.dir.join("commons")).unwrap() {
+                break lease;
+            }
+            assert!(Instant::now() < until, "the owner kept its lease");
+            thread::sleep(TICK / 10);
+        };
+        // A try refused before the test held the lease already stood.
+        loop {
+            match next() {
+                Status::Waiting => break,
+                status => assert_eq!(status, transport(true), "background {background}"),
+            }
+        }
+        drop(lease);
+        assert_eq!(next(), transport(true), "background {background}");
+        runtime.stop();
+        let mut reported = reported.into_inner();
+        reported.extend(receive.try_iter());
+        let news: Vec<_> = reported.iter().filter_map(Status::news).collect();
+        assert_eq!(
+            news,
+            [&open_refused(false)],
+            "background {background}: {reported:?}"
         );
     }
 }
@@ -682,7 +929,8 @@ fn test_gate(turn: &Arc<Mutex<LanTurn>>) -> (LanGate, std::sync::mpsc::Receiver<
     (gate, looks)
 }
 
-/// Each status the owner reports, in order, and a one-minute hang detector to wait for one.
+/// Each status the owner reports, in order, and a one-minute hang detector to wait for one. A
+/// refusal is waited for by its step and whether it stands ([`refused_at`]), not its error's words.
 fn statuses() -> (impl Fn(Status) + Send + 'static, impl Fn(Status)) {
     let (send, receive) = std::sync::mpsc::channel();
     let receive = Mutex::new(receive);
@@ -691,16 +939,38 @@ fn statuses() -> (impl Fn(Status) + Send + 'static, impl Fn(Status)) {
             let _ = send.send(status);
         },
         move |expected| {
+            let status = receive
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(60))
+                .unwrap();
             assert_eq!(
-                receive
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(60))
-                    .unwrap(),
-                expected
+                without_error(status.clone()),
+                without_error(expected),
+                "{status:?}"
             );
         },
     )
+}
+
+/// `status` with a refusal's error left out.
+fn without_error(status: Status) -> Status {
+    match status {
+        Status::Refused(refusal) => Status::Refused(Refusal {
+            error: String::new(),
+            ..refusal
+        }),
+        status => status,
+    }
+}
+
+/// The first refusal of a streak at `step`, its error left out ([`statuses`]).
+fn refused_at(step: &'static str) -> Status {
+    Status::Refused(Refusal {
+        step,
+        error: String::new(),
+        standing: false,
+    })
 }
 
 const HELD: &str = "Waits for the test to hand it the LAN";
@@ -828,6 +1098,62 @@ fn a_background_owner_yields_to_a_window_before_asking_its_gate() {
         LanTurn::Held(HELD)
     );
     assert!(!crate::network_state::history_exists(&config));
+    runtime.stop();
+}
+
+/// The gate's refusal stands as a try's does ([`Refusals`]). `aterm node serve`, refused at its
+/// gate by an unreadable configuration and then waiting on a window that claimed Commons, reports
+/// the same refusal as standing once the window is gone, and as news again only after Commons was
+/// switched off. NEGATIVE CONTROL: a gate that marked a copy of its status and reported the
+/// unmarked one made each refusal after a window's claim news, a warning every cycle; an owner
+/// whose cause outlived a disabled Commons reported the refusal after it as standing.
+#[test]
+fn a_gate_refusal_stands_across_a_windows_claim_until_commons_is_switched_off() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(home.path());
+    let config = home.path().join("aterm.toml");
+    fsx::write_atomic(&config, b"[commons\n", 0o600).unwrap();
+    let error = enabled(&config)
+        .expect_err("an unreadable configuration")
+        .to_string();
+    let (send, receive) = std::sync::mpsc::channel();
+    let runtime = Runtime::start_background_on(
+        paths,
+        config.clone(),
+        move |status| {
+            let _ = send.send(status);
+        },
+        Network::default(),
+    )
+    .unwrap();
+    let next = || receive.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+    let configuration = |standing| {
+        Status::Refused(Refusal {
+            step: "configuration",
+            error: error.clone(),
+            standing,
+        })
+    };
+    // Statuses until `last`, each of which the standing refusal may precede.
+    let until = |last: Status| loop {
+        match next() {
+            status if status == last => break,
+            status => assert_eq!(status, configuration(true), "before {last:?}"),
+        }
+    };
+    assert_eq!(next(), configuration(false));
+    let claim = owner::WindowClaim::acquire(&crate::network_state::directory(&config)).unwrap();
+    until(Status::Waiting);
+    drop(claim);
+    assert_eq!(
+        next(),
+        configuration(true),
+        "a window's claim lifted the refusal"
+    );
+    fsx::write_atomic(&config, b"[commons]\nenabled=false\n", 0o600).unwrap();
+    until(Status::Disabled);
+    fsx::write_atomic(&config, b"[commons\n", 0o600).unwrap();
+    assert_eq!(next(), configuration(false), "Commons was switched off");
     runtime.stop();
 }
 

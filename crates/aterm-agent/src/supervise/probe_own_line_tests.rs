@@ -96,6 +96,11 @@ fn late_draw(
     );
     let rows = probe_rows(&ledger);
     let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        host.said("inform:"),
+        Vec::<String>::new(),
+        "{tag}: a `/usage` held raises no host note"
+    );
     let sent = m.first_send_at.expect("the probe's write");
     let at = world(&mut m).drawn_late_at.expect("drawn late");
     assert!(
@@ -109,7 +114,8 @@ fn late_draw(
 }
 
 /// What a probe's `/usage` drawn late must come to ([`late_draw`]): given up on at the echo's
-/// hang (one `SKIPPED … typed, not submitted` record), sent within seconds of its draw by the
+/// hang and held in custody (one `SKIPPED … typed, not submitted (…) … held until the worker draws
+/// it` record; [`late_draw`] holds it to no host note), sent within seconds of its draw by the
 /// probe's own Enter (`TYPED … left typed`), no person's grace waited on it and no act's booking,
 /// its panel closed unsampled and the ledger's owed row closed.
 fn sent_as_its_own(
@@ -128,8 +134,10 @@ fn sent_as_its_own(
         .filter(|l| l.contains(&format!("rule={RULE_USAGE_PROBE} typed, not submitted")))
         .collect();
     assert!(
-        left.len() == 1 && left[0].contains(ECHO_HUNG),
-        "{tag}: given up on at the echo's hang: {journal:#?}"
+        left.len() == 1
+            && left[0].contains(ECHO_HUNG)
+            && left[0].contains(crate::supervise::journal::LINE_HELD),
+        "{tag}: given up on at the echo's hang, held: {journal:#?}"
     );
     assert_eq!(
         person_waits(&journal),

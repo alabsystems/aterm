@@ -618,6 +618,8 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
     };
     let ran = {
         let mut s = Session::new(&mut ctl, Some(format!("@{sid}")));
+        // The loop counts none of this machine's sleep: a closed lid's wakes are no test's.
+        s.set_host_awake();
         s.set_approval_ledger(Some(inst.tmp.join("approvals.jsonl")));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut out: Vec<u8> = Vec::new();

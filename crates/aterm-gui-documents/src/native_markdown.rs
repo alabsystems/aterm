@@ -148,16 +148,69 @@ pub enum MarkdownImageAction {
     Denied { message: &'static str },
 }
 
+fn has_http_authority(after_slashes: &str) -> bool {
+    let authority_end = after_slashes
+        .find(['/', '?', '#', '\\'])
+        .unwrap_or(after_slashes.len());
+    let authority = &after_slashes[..authority_end];
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, rest)| rest);
+    !host_port.is_empty() && !host_port.starts_with(':')
+}
+
+fn percent_decode_utf8(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = char::from(*bytes.get(i + 1)?).to_digit(16)?;
+            let lo = char::from(*bytes.get(i + 2)?).to_digit(16)?;
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn safe_local_image_path(uri: &str) -> bool {
+    if uri.is_empty()
+        || uri.len() > 4_096
+        || uri.starts_with('/')
+        || uri.starts_with('\\')
+        || uri.starts_with('#')
+        || uri.contains(':')
+        || uri.chars().any(|c| c.is_whitespace() || c.is_control())
+        || uri.split(['/', '\\']).any(|component| component == "..")
+    {
+        return false;
+    }
+    let Some(decoded) = percent_decode_utf8(uri) else {
+        return false;
+    };
+    !decoded.starts_with('/')
+        && !decoded.starts_with('\\')
+        && !decoded.starts_with('#')
+        && !decoded.contains(':')
+        && !decoded.chars().any(char::is_control)
+        && !decoded
+            .split(['/', '\\'])
+            .any(|component| component == "..")
+}
+
 /// Pure image-policy reducer.
 pub fn reduce_image_action(image: &MarkdownImage, user_initiated: bool) -> MarkdownImageAction {
     if image.remote {
         let lower = image.source_uri.to_ascii_lowercase();
-        let host = lower
+        let after_slashes = lower
             .strip_prefix("https://")
-            .or_else(|| lower.strip_prefix("http://"))
-            .unwrap_or("");
+            .or_else(|| lower.strip_prefix("http://"));
         let safe = image.source_uri.len() <= 2_048
-            && !host.is_empty()
+            && after_slashes.is_some_and(has_http_authority)
             && !image
                 .source_uri
                 .chars()
@@ -177,28 +230,18 @@ pub fn reduce_image_action(image: &MarkdownImage, user_initiated: bool) -> Markd
         };
     }
 
-    let local = !image.source_uri.is_empty()
-        && image.source_uri.len() <= 4_096
-        && !image.source_uri.starts_with('/')
-        && !image.source_uri.starts_with('\\')
-        && !image.source_uri.starts_with('#')
-        && !image.source_uri.contains(':')
-        && !image
-            .source_uri
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control())
-        && !image
-            .source_uri
-            .split(['/', '\\'])
-            .any(|component| component == "..");
-    if local {
-        MarkdownImageAction::SelectLocalSource {
-            range: image.source.clone(),
-        }
-    } else {
-        MarkdownImageAction::Denied {
+    if !safe_local_image_path(&image.source_uri) {
+        return MarkdownImageAction::Denied {
             message: "image path escapes the document capability",
-        }
+        };
+    }
+    if !user_initiated {
+        return MarkdownImageAction::Denied {
+            message: "image actions require an explicit user gesture",
+        };
+    }
+    MarkdownImageAction::SelectLocalSource {
+        range: image.source.clone(),
     }
 }
 
@@ -1707,17 +1750,23 @@ fn link_policy(destination: &str) -> LinkPolicy {
     if destination.starts_with('#') {
         return LinkPolicy::LocalAnchor;
     }
-    if destination.starts_with("//") || destination.starts_with('\\') {
+    if destination.starts_with("//")
+        || destination.starts_with("/\\")
+        || destination.starts_with('\\')
+    {
         return LinkPolicy::DeniedScheme;
     }
     let Some((scheme, rest)) = destination.split_once(':') else {
         return LinkPolicy::LocalDocument;
     };
     match scheme.to_ascii_lowercase().as_str() {
-        "https" | "http" if rest.starts_with("//") && rest.len() > 2 => {
-            LinkPolicy::ExplicitExternal
-        }
-        "mailto" if !rest.is_empty() => LinkPolicy::ExplicitExternal,
+        "https" | "http" => match rest.strip_prefix("//") {
+            Some(after_slashes) if has_http_authority(after_slashes) => {
+                LinkPolicy::ExplicitExternal
+            }
+            _ => LinkPolicy::DeniedScheme,
+        },
+        "mailto" if !rest.is_empty() && !rest.starts_with("//") => LinkPolicy::ExplicitExternal,
         _ => LinkPolicy::DeniedScheme,
     }
 }
@@ -2209,10 +2258,7 @@ fn find_emphasis_close(bytes: &[u8], mut index: usize, marker: u8, wanted: usize
 }
 
 fn is_autolink(value: &str) -> bool {
-    !value.bytes().any(|byte| byte.is_ascii_whitespace())
-        && (value.starts_with("https://")
-            || value.starts_with("http://")
-            || value.starts_with("mailto:"))
+    matches!(link_policy(value), LinkPolicy::ExplicitExternal)
 }
 
 fn looks_like_html_tag(value: &str) -> bool {
@@ -3395,5 +3441,77 @@ mod tests {
                 message: "unsupported or oversized remote image URL",
             }
         );
+    }
+
+    /// Image actions always require an explicit user gesture, remote URLs require a non-empty
+    /// authority, and local image paths reject percent-encoded parent traversal or separators.
+    /// NEGATIVE CONTROL: omitting `!user_initiated` on local images allows ungestured source
+    /// selection, and checking only raw `split(['/', '\\'])` admits `..%2fsecret.png` and
+    /// `https:///etc/passwd`.
+    #[test]
+    fn gesture_authority_and_percent_encoded_traversal_guards_hold() {
+        let local = MarkdownImage {
+            alt: None,
+            source_uri: "assets/diagram.png".to_string(),
+            source: 0..20,
+            remote: false,
+        };
+        assert_eq!(
+            reduce_image_action(&local, false),
+            MarkdownImageAction::Denied {
+                message: "image actions require an explicit user gesture",
+            }
+        );
+        for escaped in [
+            "..%2f..%2fsecret.png",
+            "%2e%2e/secret.png",
+            "%2fetc/passwd",
+            "%5cevil\\x.png",
+            "file%3a///etc/passwd",
+            "img%00.png",
+            "bad%2",
+        ] {
+            let candidate = MarkdownImage {
+                alt: None,
+                source_uri: escaped.to_string(),
+                source: 0..10,
+                remote: false,
+            };
+            assert!(
+                matches!(
+                    reduce_image_action(&candidate, true),
+                    MarkdownImageAction::Denied { .. }
+                ),
+                "percent-encoded escape must be denied: {escaped}"
+            );
+        }
+        for empty_host in [
+            "https:///etc/passwd",
+            "https://?query",
+            "https://#frag",
+            "https://user@/path",
+            "https://:443/path",
+            "mailto://evil",
+            "/\\evil\\share",
+        ] {
+            assert_eq!(
+                link_policy(empty_host),
+                LinkPolicy::DeniedScheme,
+                "{empty_host}"
+            );
+        }
+        let remote_empty_host = MarkdownImage {
+            alt: None,
+            source_uri: "https:///etc/passwd".to_string(),
+            source: 0..20,
+            remote: true,
+        };
+        assert!(matches!(
+            reduce_image_action(&remote_empty_host, true),
+            MarkdownImageAction::Denied { .. }
+        ));
+        let doc = parse("<HTTPS://example.com> <https:///etc/passwd>");
+        assert_eq!(doc.links.len(), 1);
+        assert_eq!(doc.links[0].destination, "HTTPS://example.com");
     }
 }

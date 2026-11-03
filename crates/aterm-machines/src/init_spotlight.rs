@@ -35,11 +35,26 @@ const DOCS_ASIDE: &str = "html.noindex";
 const REMOVE_IN_BACKGROUND: &str =
     "\"$1\" component remove rust-docs --toolchain \"$2\" && /bin/rm -rf -- \"$3\"";
 
-/// Keep this login's Rust docs and aterm's build caches out of Spotlight.
+/// Whether the build-cache row searches this login's home folder for the person's own project
+/// build folders that Spotlight indexes, which its line notes ([`BuildNoindex`]). Spotlight's
+/// answer may place one in a folder macOS guards (Documents, Desktop, Downloads, iCloud Drive,
+/// another app's data), and the first read of a file there can put macOS's question about that
+/// folder on the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Projects {
+    /// Search, and note what Spotlight indexes.
+    Noted,
+    /// Search nothing, and note none: a run nobody asked for
+    /// ([`crate::init::Decider::Aterm`]), which puts no question of macOS's on the screen.
+    Unread,
+}
+
+/// Keep this login's Rust docs and aterm's build caches out of Spotlight, the build-cache row
+/// searching for the person's project build folders as `projects` says.
 ///
 /// # Errors
 /// Init did not resolve exactly one user.
-pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
+pub fn items(ctx: &Ctx, projects: Projects) -> Result<Vec<Box<dyn Item>>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("aterm init Rust toolchain settings require exactly one local user".into());
     };
@@ -66,6 +81,7 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
         home.to_path_buf(),
         pkg,
         rustup.cargo_home.clone(),
+        projects,
     );
     Ok(vec![
         Box::new(Profile(rustup.clone())),
@@ -80,7 +96,7 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
 /// # Errors
 /// As [`items`].
 pub(crate) fn rust_docs_item(ctx: &Ctx) -> Result<Box<dyn Item>, String> {
-    items(ctx)?
+    items(ctx, Projects::Unread)?
         .into_iter()
         .find(|item| item.id().starts_with("init.spotlight.rust-docs@"))
         .ok_or_else(|| "aterm init composes no rust-docs item".to_owned())
@@ -223,18 +239,27 @@ struct BuildNoindex {
     cargo_home: PathBuf,
     /// The last probe's reading, which is System State's.
     reading: LastReading,
+    /// Whether the row searches for the person's project build folders ([`Projects`]).
+    projects: Projects,
     /// The Spotlight search for project build folders, shared for [`INVENTORY_AGE`].
     inventory: Arc<Inventory>,
 }
 
 impl BuildNoindex {
-    fn new(user: User, home: PathBuf, pkg: PathBuf, cargo_home: PathBuf) -> Self {
+    fn new(
+        user: User,
+        home: PathBuf,
+        pkg: PathBuf,
+        cargo_home: PathBuf,
+        projects: Projects,
+    ) -> Self {
         Self {
             user,
             home,
             pkg,
             cargo_home,
             reading: LastReading::default(),
+            projects,
             inventory: Inventory::shared(),
         }
     }
@@ -319,9 +344,13 @@ impl BuildNoindex {
     }
 
     /// The person's own cargo build folders under `self.home` that Spotlight indexes, from
-    /// the [`Inventory`] (`None` when Spotlight could not be asked, which costs only the
-    /// row's note), less any gone since the search.
+    /// the [`Inventory`] (`None` when Spotlight could not be asked, or this row searches
+    /// nothing ([`Projects::Unread`]), which costs only the row's note), less any gone since
+    /// the search.
     fn spotlit_projects(&self, sys: &dyn System) -> Option<Vec<PathBuf>> {
+        if self.projects == Projects::Unread {
+            return None;
+        }
         let indexed = self
             .inventory
             .read(&self.home, sys.now(), || self.search(sys))
@@ -1068,6 +1097,7 @@ mod tests {
                 "/Users//alice".into(),
                 self.path().to_path_buf(),
                 "/Users//alice/.cargo".into(),
+                Projects::Noted,
             ))]
         }
     }
@@ -1131,11 +1161,18 @@ mod tests {
 
     /// [`alice_builds`] with `CARGO_HOME` at `cargo_home`.
     fn cargo_home_builds(cargo_home: &str) -> Vec<Box<dyn Item>> {
+        searching(cargo_home, Projects::Noted)
+    }
+
+    /// The item on a Mac with no atpkg prefix, `CARGO_HOME` at `cargo_home`, searching for the
+    /// person's project build folders as `projects` says.
+    fn searching(cargo_home: &str, projects: Projects) -> Vec<Box<dyn Item>> {
         vec![Box::new(BuildNoindex::new(
             user("alice", 501),
             "/Users//alice".into(),
             "/Users//alice/Library/Application Support/aterm/pkg".into(),
             cargo_home.into(),
+            projects,
         ))]
     }
 
@@ -1264,6 +1301,40 @@ mod tests {
         assert_eq!(rows[0].outcome, Outcome::Ok, "{rows:?}");
         assert_eq!(Reading::of(&rows[0]), None, "nothing to note");
         assert_eq!(row_of(&rows).note, None);
+    }
+
+    /// A run nobody asked for ([`Projects::Unread`]) puts no question of macOS's on the screen:
+    /// it neither asks Spotlight for the person's build folders nor reads one, so a project
+    /// `target` in Documents, whose first read can raise macOS's question about that folder, is
+    /// never reached, and the row still reads aterm's caches as in place. CONTROL: the row that
+    /// notes them searches, reads that folder's cache tag and notes it.
+    #[test]
+    fn a_run_nobody_asked_for_reads_no_folder_of_the_persons() {
+        let documents = "/Users//alice/Documents/demo/target";
+        for (projects, reads) in [(Projects::Unread, false), (Projects::Noted, true)] {
+            let sys = spotlit(&[documents]);
+            let items = searching("/Users//alice/.cargo", projects);
+            let rows = engine::run(&items, Mode::Apply, &sys, &context(), &mut NoJournal);
+            assert_eq!(rows[0].outcome, Outcome::Ok, "{projects:?}: {rows:?}");
+            let searched = sys.calls().iter().any(|call| call == MDFIND);
+            assert_eq!(searched, reads, "{projects:?}: {:?}", sys.calls());
+            let noted = Reading::of(&rows[0]).is_some_and(|reading| {
+                reading
+                    == Reading::KeptOut {
+                        projects: 1,
+                        toolchain: false,
+                    }
+            });
+            assert_eq!(noted, reads, "{projects:?}: {rows:?}");
+            assert_eq!(
+                rows[0]
+                    .to
+                    .as_deref()
+                    .is_some_and(|to| to.contains(documents)),
+                reads,
+                "{projects:?}: {rows:?}"
+            );
+        }
     }
 
     /// The person's indexed project `target` is a quiet note with the folder named in its detail,
@@ -1679,6 +1750,7 @@ mod tests {
                 "/Users//alice".into(),
                 "/Users//alice/Library/Application Support/aterm/pkg".into(),
                 "/Users//alice/.cargo".into(),
+                Projects::Noted,
             )
         };
         let items: Vec<Box<dyn Item>> = vec![Box::new(item)];

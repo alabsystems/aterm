@@ -21,8 +21,6 @@ use aterm_json::{Map, Value};
 use crate::config::Dirs;
 use crate::error::{Error, Kind, Result, Sub};
 use crate::fx::Fx;
-#[cfg(unix)]
-use crate::fx::Mode;
 use crate::policy::Permit;
 use crate::redact::Redactor;
 use crate::slug::Slug;
@@ -77,10 +75,7 @@ impl IntentId {
         let (step, hash) = text.split_once('-')?;
         let digits = !step.is_empty() && step.bytes().all(|b| b.is_ascii_digit());
         let no_leading_zero = step == "0" || !step.starts_with('0');
-        let hex = hash.len() == 12
-            && hash
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        let hex = aterm_codec::hex::is_lower(hash, 12);
         (digits && no_leading_zero && hex && step.parse::<u64>().is_ok())
             .then(|| IntentId(text.to_string()))
     }
@@ -407,16 +402,13 @@ impl Journal {
     pub fn open(dirs: &Dirs, slug: &Slug, fx: &Arc<Fx>) -> Result<Journal> {
         #[cfg(unix)]
         {
-            if matches!(
-                fx.mode(),
-                Mode::Recording | Mode::Replaying | Mode::Rerecording
-            ) {
+            if fx.mode().is_taped() {
                 return Ok(Journal::taped(slug, fx));
             }
+            let path = path_of(dirs, slug);
             let owner_dir = dirs.journal().join(slug.owner_key());
-            let path = owner_dir.join(format!("{}.steps", slug.repo().to_ascii_lowercase()));
             crate::config::make_state_subdir(dirs, &owner_dir).map_err(|e| {
-                local(format!(
+                Error::local(format!(
                     "the write journal {} could not be made: {e}",
                     path.display()
                 ))
@@ -625,7 +617,7 @@ impl Journal {
     ) -> Result<u64> {
         let mut records = lock(taped);
         let step = u64::try_from(records.len())
-            .map_err(|_| local("the taped journal holds more records than a step counts"))?;
+            .map_err(|_| Error::local("the taped journal holds more records than a step counts"))?;
         let record = build(&records, step)?;
         refuse_shaped(&record)?;
         let body = encode(&record);
@@ -634,7 +626,7 @@ impl Journal {
         }
         reads_back(&record, 0, step, &body)?;
         let Some(taped_step) = self.fx.emit_journal(&body)? else {
-            return Err(local("the tape gave the journal no step"));
+            return Err(Error::local("the tape gave the journal no step"));
         };
         records.push((step, record));
         Ok(taped_step)
@@ -681,7 +673,7 @@ impl Journal {
         build: impl FnOnce(&[(u64, JournalRecord)], u64) -> Result<JournalRecord>,
     ) -> Result<u64> {
         let Some(mut scan) = self.scan(true)? else {
-            return Err(local(format!(
+            return Err(Error::local(format!(
                 "the write journal {} vanished while it was locked",
                 self.path.display()
             )));
@@ -732,12 +724,12 @@ impl Journal {
             return Err(self.full(scan.valid_len));
         }
         let frame = astream_wire::steps::encode_step(step, &body)
-            .map_err(|e| local(format!("the journal record cannot be framed: {e}")))?;
+            .map_err(|e| Error::local(format!("the journal record cannot be framed: {e}")))?;
         let written = self.write_frame(scan, &frame);
         if let Err(e) = written {
             // Best effort: no caller is told the record was written, so its bytes go.
             let _ = scan.file.set_len(scan.valid_len);
-            return Err(local(format!(
+            return Err(Error::local(format!(
                 "the write journal {} could not be written: {e}",
                 self.path.display()
             )));
@@ -798,12 +790,12 @@ impl Journal {
         );
         let lock = held.map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
-                local(format!(
+                Error::local(format!(
                     "another agh is writing {}; run this again",
                     self.path.display()
                 ))
             } else {
-                local(format!(
+                Error::local(format!(
                     "the write journal {} could not be locked: {e}",
                     self.path.display()
                 ))
@@ -814,7 +806,7 @@ impl Journal {
             return Ok(None);
         }
         let file = aterm_uds::private_file::open_private_rw(&owner_dir, &name).map_err(|e| {
-            local(format!(
+            Error::local(format!(
                 "the write journal {} cannot be opened: {e}",
                 self.path.display()
             ))
@@ -953,7 +945,7 @@ impl Journal {
     #[cfg(unix)]
     /// could_not_run for an offset this platform does not address.
     fn too_far(&self) -> Error {
-        local(format!(
+        Error::local(format!(
             "the write journal {} is longer than this platform addresses",
             self.path.display()
         ))
@@ -962,7 +954,7 @@ impl Journal {
     /// could_not_run for an I/O error on the journal.
     #[cfg(unix)]
     fn io(&self, e: &std::io::Error) -> Error {
-        local(format!(
+        Error::local(format!(
             "the write journal {} could not be read or repaired: {e}",
             self.path.display()
         ))
@@ -1064,7 +1056,7 @@ impl IntentStore for Journal {
                 at_secs,
             })))
         })?;
-        minted.ok_or_else(|| local("the journal appended an intent and minted no id"))
+        minted.ok_or_else(|| Error::local("the journal appended an intent and minted no id"))
     }
 
     fn settle(&self, id: &IntentId, outcome: &Settled) -> Result<()> {
@@ -1157,11 +1149,6 @@ const RECORD_MAX: usize = 4096;
 /// A frame's bytes before its body: the frame header and the step header.
 #[cfg(unix)]
 const FRAME_OVERHEAD: usize = astream_wire::frame::HEADER_SIZE + astream_wire::steps::STEP_HEADER;
-
-/// could_not_run, `Sub::Local`.
-fn local(why: impl Into<String>) -> Error {
-    Error::could_not_run(why).with_sub(Sub::Local)
-}
 
 /// The lock of a taped journal's records; a poisoned lock still holds whole records.
 #[cfg(unix)]
@@ -1413,6 +1400,15 @@ pub struct IntentView {
     pub open: bool,
 }
 
+/// The journal file of `slug` under `dirs`: `<journal>/<owner>/<repo>.steps`, owner and repo
+/// lowercased. `Journal::open` writes there and a dry run looks there, so the two never part.
+#[must_use]
+pub(crate) fn path_of(dirs: &Dirs, slug: &Slug) -> PathBuf {
+    dirs.journal()
+        .join(slug.owner_key())
+        .join(format!("{}.steps", slug.repo().to_ascii_lowercase()))
+}
+
 /// Every journal under `dirs.journal()`, by slug: the `*.steps` files two levels down, in
 /// slug order. A name that is not a slug is skipped.
 ///
@@ -1422,7 +1418,7 @@ pub struct IntentView {
 pub fn journals(dirs: &Dirs) -> Result<Vec<(Slug, PathBuf)>> {
     let root = dirs.journal();
     let listed = |dir: &Path, e: &std::io::Error| {
-        local(format!(
+        Error::local(format!(
             "the write journals under {} cannot be listed: {e}",
             dir.display()
         ))

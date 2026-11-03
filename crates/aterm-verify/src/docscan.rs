@@ -86,7 +86,7 @@ pub fn src_holds_a_doctest(src: &Path) -> bool {
     let krate = src.parent().unwrap_or(src);
     let mut seen: BTreeSet<PathBuf> = files.iter().cloned().collect();
     while let Some(file) = files.pop() {
-        let Ok(text) = std::fs::read_to_string(&file) else {
+        let Ok(text) = crate::read_regular_text(&file) else {
             return true;
         };
         if docs_hold_a_doctest(&text) {

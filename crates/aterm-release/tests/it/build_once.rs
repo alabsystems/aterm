@@ -72,6 +72,7 @@ fn compilers() -> Compilers {
     Compilers {
         trustc: "a".repeat(40),
         rustc: "b".repeat(40),
+        inputs: "c".repeat(64),
     }
 }
 
@@ -99,6 +100,7 @@ fn complete_entry(store: &Path, identity: &Identity, exe: &[u8]) -> Complete {
         commit: identity.commit.clone(),
         trustc: compilers().trustc,
         rustc: compilers().rustc,
+        inputs: compilers().inputs,
         snapshot: "d".repeat(64),
         archs: "x86_64 arm64".to_string(),
         compiler_line: "Trust 1.95.0".to_string(),
@@ -199,6 +201,12 @@ fn an_entry_without_its_record_is_no_build() {
     assert_eq!(artifact::read(&store, &"0".repeat(64)).unwrap(), None);
     fs::write(&record, text.replace(&complete.key, &"e".repeat(64))).unwrap();
     artifact::read(&store, &complete.key).unwrap_err();
+    fs::write(&record, text.replace(&complete.inputs, &"e".repeat(64))).unwrap();
+    assert!(
+        artifact::read(&store, &complete.key)
+            .unwrap_err()
+            .contains("build inputs")
+    );
 }
 
 /// `artifact::key` changes whenever the version, build number, commit, or compiler hashes change.
@@ -208,6 +216,13 @@ fn the_key_is_what_the_bytes_were_built_as() {
     assert_eq!(base, artifact::key(&identity(7), &compilers()));
     assert_eq!(base.len(), 64);
     let mut others = vec![
+        artifact::key(
+            &identity(7),
+            &Compilers {
+                inputs: "d".repeat(64),
+                ..compilers()
+            },
+        ),
         artifact::key(&identity(8), &compilers()),
         artifact::key(
             &Identity {
@@ -241,7 +256,7 @@ fn the_key_is_what_the_bytes_were_built_as() {
     assert!(others.iter().all(|k| *k != base));
     others.sort();
     others.dedup();
-    assert_eq!(others.len(), 5);
+    assert_eq!(others.len(), 6);
 }
 
 /// `artifact::place_records` replaces existing `dist/` records and removes absent ones.
@@ -292,20 +307,30 @@ fn the_verified_judge_reads_the_record_of_the_tree_on_these_bytes() {
     let other = git(&repo, &["rev-parse", "HEAD"]);
     let g = Git::new(&repo);
     let macho = "ab".repeat(32);
-    let judge = |commit: &str| crate::gates::verified(&g, commit, &macho).unwrap();
+    let judge = |commit: &str| {
+        crate::gates::verified_with_inputs(&g, commit, &macho, || Ok(compilers().inputs)).unwrap()
+    };
 
     let (yes, why) = judge(&r);
     assert!(!yes, "{why}");
-    let at = crate::gates::record_verified(&g, &r, &"cd".repeat(32)).unwrap();
+    let at = crate::gates::record_verified(&g, &r, &"cd".repeat(32), &compilers().inputs).unwrap();
     let (yes, why) = judge(&r);
     assert!(!yes, "{why}");
     fs::write(&at, "not a record").unwrap();
     let (yes, why) = judge(&r);
     assert!(!yes, "{why}");
 
-    crate::gates::record_verified(&g, &r, &macho).unwrap();
+    crate::gates::record_verified(&g, &r, &macho, &compilers().inputs).unwrap();
+    assert!(
+        !crate::gates::verified_with_inputs(&g, &r, &macho, || Ok("changed compiler bytes".into()))
+            .unwrap()
+            .0
+    );
     let (yes, why) = judge(&r);
     assert!(yes, "{why}");
+    fs::write(&at, format!("commit = {r:?}\nexecutable = {macho:?}\n")).unwrap();
+    assert!(!judge(&r).0, "a legacy receipt has no input identity");
+    crate::gates::record_verified(&g, &r, &macho, &compilers().inputs).unwrap();
     assert!(judge(&twin).0, "the same tree is the same record");
     let (yes, why) = judge(&other);
     assert!(!yes, "another tree: {why}");
@@ -370,17 +395,24 @@ impl Clone {
     }
 
     fn verify(&self, macho: &str) {
-        crate::gates::record_verified(&Git::new(&self.repo), &self.source, macho).unwrap();
+        crate::gates::record_verified(
+            &Git::new(&self.repo),
+            &self.source,
+            macho,
+            &compilers().inputs,
+        )
+        .unwrap();
     }
 
     /// The bundle a cut whose prover is `toolchain` would sign.
     fn bundle_for(&self, toolchain: &str) -> Result<crate::publish::VerifiedBundle, String> {
-        crate::publish::verified_release_bundle(
+        crate::publish::verified_release_bundle_with_inputs(
             &Git::new(&self.repo),
             &self.repo,
             &self.source,
             VERSION,
             toolchain,
+            || Ok(compilers().inputs),
         )
         .map_err(|e| e.to_string())
     }

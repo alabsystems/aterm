@@ -2197,4 +2197,64 @@ fn linux_inet_diag_rtt_parser_extracts_non_loopback_median_and_skips_loopback() 
         crate::linux::parse_inet_diag_rtts(&huge_len, &mut seq2_rtts),
         None
     );
+
+    // NEGATIVE CONTROL: interrupted dumps (`NLM_F_DUMP_INTR`), negative `NLMSG_DONE` errnos,
+    // `NLMSG_OVERRUN`, truncated `SOCK_DIAG_BY_FAMILY` headers, and malformed attributes fail
+    // the datagram without leaving partial readings in `rtts`.
+    let baseline = seq2_rtts.clone();
+    let mut intr = diag_msg(2, 1, v4_remote, 40_000);
+    intr[6..8].copy_from_slice(&16u16.to_ne_bytes()); // NLM_F_DUMP_INTR
+    assert_eq!(
+        crate::linux::parse_inet_diag_rtts(&intr, &mut seq2_rtts),
+        None
+    );
+    assert_eq!(seq2_rtts, baseline);
+
+    let mut done_err = vec![0u8; 20];
+    done_err[0..4].copy_from_slice(&20u32.to_ne_bytes());
+    done_err[4..6].copy_from_slice(&3u16.to_ne_bytes()); // NLMSG_DONE
+    done_err[16..20].copy_from_slice(&(-16i32).to_ne_bytes()); // -EBUSY
+    let mut partial_then_err = diag_msg(2, 1, v4_remote, 40_000);
+    partial_then_err.extend_from_slice(&done_err);
+    assert_eq!(
+        crate::linux::parse_inet_diag_rtts(&partial_then_err, &mut seq2_rtts),
+        None
+    );
+    assert_eq!(seq2_rtts, baseline);
+
+    let mut overrun = vec![0u8; 16];
+    overrun[0..4].copy_from_slice(&16u32.to_ne_bytes());
+    overrun[4..6].copy_from_slice(&4u16.to_ne_bytes()); // NLMSG_OVERRUN
+    assert_eq!(
+        crate::linux::parse_inet_diag_rtts(&overrun, &mut seq2_rtts),
+        None
+    );
+    assert_eq!(seq2_rtts, baseline);
+
+    let mut short_diag = vec![0u8; 20];
+    short_diag[0..4].copy_from_slice(&20u32.to_ne_bytes());
+    short_diag[4..6].copy_from_slice(&20u16.to_ne_bytes()); // SOCK_DIAG_BY_FAMILY < 72B payload
+    assert_eq!(
+        crate::linux::parse_inet_diag_rtts(&short_diag, &mut seq2_rtts),
+        None
+    );
+    assert_eq!(seq2_rtts, baseline);
+}
+
+/// The OS's major version is the leading number of the first word that has one, and words
+/// with none (or an unreadable OS) give none.
+/// NEGATIVE CONTROL: with `os_major` parsing the whole word (no `split('.')`), `macOS 27.0.1`
+/// reads as none: `` left: None right: Some(27) ``.
+#[test]
+fn the_os_major_version_is_the_leading_number() {
+    let words = |os: Option<&str>| machine::MachineWords {
+        cpu: None,
+        os: os.map(str::to_owned),
+    };
+    assert_eq!(words(Some("macOS 27.0.1")).os_major(), Some(27));
+    assert_eq!(words(Some("macOS 15")).os_major(), Some(15));
+    assert_eq!(words(Some("Ubuntu 24.04 LTS")).os_major(), Some(24));
+    assert_eq!(words(Some("macOS")).os_major(), None);
+    assert_eq!(words(Some("macOS x.1")).os_major(), None);
+    assert_eq!(words(None).os_major(), None);
 }

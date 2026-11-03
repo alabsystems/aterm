@@ -18,6 +18,7 @@ use super::*;
 use crate::config::{self, Dirs, OwnerRule, Validated};
 use crate::identity::vault::{self, Slot};
 use crate::identity::{self, Credential, MapEnv};
+use crate::test_fixtures::{setup_file, write_config};
 use crate::wire::door::AuthHeader;
 use crate::wire::hop;
 use crate::wire::{Deadlines, Endpoints, Method, WireRequest};
@@ -160,18 +161,6 @@ struct World {
     text_router: Option<Router>,
 }
 
-fn setup_file(path: &std::path::Path, bytes: &[u8]) {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .and_then(|mut f| f.write_all(bytes))
-        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-}
-
 /// The canonical agh.toml with the grant, and with `relread` the release profile at the head of
 /// the release owner's read chain, read back by `config::load` (origin `File`).
 fn world(dev: bool, rel: bool, relread: bool) -> World {
@@ -180,7 +169,7 @@ fn world(dev: bool, rel: bool, relread: bool) -> World {
         .tempdir()
         .expect("a scratch root");
     let base = root.path();
-    let mut text = super::tests::canonical_text(base);
+    let mut text = crate::test_fixtures::canonical_text(base);
     if relread {
         text = text.replacen(
             "read = [\"dev\", \"anonymous\"]",
@@ -190,10 +179,7 @@ fn world(dev: bool, rel: bool, relread: bool) -> World {
     }
     text.push_str(WRITERS);
     let dirs = Dirs::under(base);
-    let parent = dirs.config.parent().expect("the config's parent");
-    std::fs::create_dir_all(parent).expect("the config's parent");
-    aterm_uds::private_file::create_private_dir(&dirs.config).expect("the config directory");
-    setup_file(&dirs.config.join("agh.toml"), text.as_bytes());
+    write_config(&dirs, &text);
     let token = |dir: &str, name: &str, seed: &str| {
         let dir = base.join(dir);
         aterm_uds::private_file::create_private_dir(&dir).expect("a token directory");

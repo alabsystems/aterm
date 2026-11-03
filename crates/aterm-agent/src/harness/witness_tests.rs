@@ -79,6 +79,14 @@ fn a_base_url_names_its_endpoint() {
                 tls: false,
             }),
         ),
+        (
+            "http://[2001:0DB8:0:0::1]:7000/x",
+            Some(Target {
+                host: "2001:db8::1".into(),
+                port: 7000,
+                tls: false,
+            }),
+        ),
         ("https://user:pw@gw.example.test", None),
         ("ftp://example.test", None),
         ("https://", None),
@@ -496,13 +504,39 @@ fn no_proxy_spares_the_hosts_it_names() {
         ("example.test", true),
         (".example.test", true),
         ("*.example.test", true),
+        ("*.example.test:443", true),
+        ("*.example.test:8443", false),
         ("api.example.test:443", true),
         ("api.example.test:8443", false),
+        ("api.example.test:", false),
+        ("api.example.test:0", false),
+        ("api.example.test:99999", false),
+        ("api.example.test:abc", false),
+        ("*ample.test", false),
+        (".", false),
+        ("*.", false),
+        ("..example.test", false),
         ("other.test, localhost", false),
         ("xample.test", false),
         ("", false),
     ] {
         assert_eq!(no_proxy_names(list, &t), spared, "{list:?}");
+    }
+    let v6 = Target::of_url("http://[0:0:0:0:0:0:0:1]:7000/v1").expect("canonical ipv6");
+    assert_eq!(v6.host, "::1");
+    for (list, spared) in [
+        ("[::1]", true),
+        ("::1", true),
+        ("0:0:0:0:0:0:0:1", true),
+        ("[0:0::1]:7000", true),
+        ("[::1]:7000", true),
+        ("[::1]:7001", false),
+        ("[::1]:", false),
+        ("[::1]:0", false),
+        ("[::1]:99999", false),
+        ("[::1]extra", false),
+    ] {
+        assert_eq!(no_proxy_names(list, &v6), spared, "ipv6 {list:?}");
     }
 }
 
@@ -827,4 +861,28 @@ fn muse_endpoint_follows_option_arity_provider_and_transport_overrides() {
             "{non_direct:?} should be a gap"
         );
     }
+
+    // Conflicting `NO_PROXY` and `no_proxy` fail closed to `Endpoint::Gap` because `reqwest`
+    // (`muse`) reads `no_proxy` first while Go (`agy`) reads `NO_PROXY` first; matching values
+    // continue to spare the target.
+    let disagree_lower = lab_env(&["no_proxy=other.example.test"]);
+    assert!(matches!(
+        endpoint_of(
+            Program::Muse,
+            &words("muse --base-url http://127.0.0.1:4100"),
+            Some(&disagree_lower),
+            unread_claude,
+        ),
+        Endpoint::Gap(ref why) if why.contains("HTTP_PROXY carries")
+    ));
+    let agree_both = lab_env(&["no_proxy=127.0.0.1,localhost"]);
+    assert_eq!(
+        endpoint_of(
+            Program::Muse,
+            &words("muse --base-url http://127.0.0.1:4100"),
+            Some(&agree_both),
+            unread_claude,
+        ),
+        Endpoint::Named(base(4100))
+    );
 }

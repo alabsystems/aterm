@@ -72,6 +72,30 @@ fn bounded(collection: &Collection, value: &Value) -> bool {
 
 /// Each key's latest row of an owned collection, keeping only rows whose key names the
 /// machine `resolve` finds for the record's (roster, actor).
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "OwnA",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "OwnB",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "ForgeB",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
 pub fn read_owned(
     collection: &Collection,
     ops: &[Op],
@@ -299,6 +323,38 @@ pub struct Quota {
 /// before it to join a wide frontier, so merges cannot carry a writer's automatic writes past
 /// the records the quota leaves the owner (design §3.9); a record whose cost passes the quota
 /// is inert.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "Merge",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "Automatic",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "Owner",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "Revert",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
 pub fn quota(table: &Table, ops: &[Op], merges: &[(Actor, u64)]) -> Quota {
     let mut business = BTreeMap::<Actor, BTreeSet<u64>>::new();
     for op in ops {

@@ -40,6 +40,270 @@ fn mac48() -> Fixed {
     Fixed::new(Reading::of_gib(48, 40, 14))
 }
 
+/// Scripted counter reads; the ledger and all machine data stay isolated from the live host.
+pub(crate) struct TimingMachine {
+    base: Fixed,
+    points: std::cell::RefCell<std::collections::VecDeque<crate::CpuPoint>>,
+    reads: std::cell::Cell<usize>,
+}
+
+impl TimingMachine {
+    pub(crate) fn new(counters: &[(u64, u64)]) -> Self {
+        let now = std::time::Instant::now();
+        let epoch = aterm_time::unix_millis().expect("test clock");
+        let mut reading = Reading::of_gib(48, 40, 14);
+        reading.load1 = Some(1.0);
+        Self {
+            base: Fixed::new(reading),
+            reads: std::cell::Cell::new(0),
+            points: std::cell::RefCell::new(
+                counters
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (busy, idle))| crate::CpuPoint {
+                        at: now + Duration::from_secs(i as u64 + 1),
+                        unix_ms: epoch + i as u64,
+                        ticks: vec![aterm_sysprobe::CoreTicks {
+                            user: *busy,
+                            idle: *idle,
+                            ..Default::default()
+                        }],
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl crate::Machine for TimingMachine {
+    fn read(&self, path: Option<&Path>) -> Reading {
+        crate::Machine::read(&self.base, path)
+    }
+    fn procs(&self) -> Option<Procs> {
+        crate::Machine::procs(&self.base)
+    }
+    fn cpu_point(&self) -> Option<crate::CpuPoint> {
+        self.reads.set(self.reads.get() + 1);
+        self.points.borrow_mut().pop_front()
+    }
+}
+
+fn timed_claim(s: &Scratch, m: &TimingMachine) -> crate::Claim {
+    timed_in(&s.ledger, m)
+}
+
+pub(crate) fn timed_in(ledger: &Ledger, m: &TimingMachine) -> crate::Claim {
+    let waiter = Waiter::enter(ledger, m, Need::timing("measured test")).unwrap();
+    let waiter = match waiter.poll(m) {
+        Polled::Waiting(w, short) => {
+            assert!(
+                short
+                    .shorts
+                    .iter()
+                    .any(|s| matches!(s, Short::Timing(crate::TimingIssue::Warming)))
+            );
+            w
+        }
+        _ => panic!("first counter point cannot qualify"),
+    };
+    match waiter.poll(m) {
+        Polled::Admitted(claim) => claim,
+        _ => panic!("checked idle interval must admit"),
+    }
+}
+
+#[test]
+fn postcompile_entry_uses_new_points_and_waits_through_a_busy_interval() {
+    let s = scratch("fresh-entry");
+    let m = TimingMachine::new(&[(0, 0), (1, 99), (100, 100), (200, 100), (201, 199)]);
+    let mut claim = timed_claim(&s, &m);
+    let admission = claim.timing_admission().unwrap();
+    assert_eq!(m.reads.get(), 2);
+    let mut sleeps = 0;
+    let entry = claim
+        .measurement_entry_on(&m, Pace::default(), &mut |_| {
+            sleeps += 1;
+            false
+        })
+        .unwrap();
+    assert_eq!(
+        sleeps, 2,
+        "first point and busy interval both require another point"
+    );
+    assert_eq!(m.reads.get(), 5);
+    assert!(entry.observed_ms > admission.observed_ms);
+    assert_eq!(entry.busy_ticks, 1);
+    let records = s.ledger.list().unwrap();
+    let retained = records
+        .iter()
+        .find(|r| r.need.what == "measured test")
+        .unwrap();
+    assert_eq!(retained.timing.entry, Some(entry));
+    assert_eq!(retained.timing.admission, Some(admission));
+}
+
+#[test]
+fn unavailable_entry_never_reuses_an_admission_or_prior_entry_sample() {
+    let s = scratch("entry-unavailable");
+    let m = TimingMachine::new(&[(0, 0), (1, 99), (2, 198), (3, 297)]);
+    let mut claim = timed_claim(&s, &m);
+    claim
+        .measurement_entry_on(&m, Pace::default(), &mut |_| false)
+        .unwrap();
+    assert_eq!(
+        claim.measurement_entry_on(&m, Pace::default(), &mut |_| false),
+        Err(crate::TimingIssue::Unavailable)
+    );
+    assert!(
+        s.ledger
+            .list()
+            .unwrap()
+            .iter()
+            .all(|r| r.timing.entry.is_none())
+    );
+}
+
+#[test]
+fn a_weak_parent_covers_resources_but_never_supplies_child_cpu_readiness() {
+    let s = scratch("weak-parent");
+    let m = TimingMachine::new(&[(0, 0), (1, 99)]);
+    let parent = admit_with(
+        &s.ledger,
+        &m,
+        Need::new("load parent").quiet(100.0),
+        Admit::Wait,
+        Pace::default(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(m.reads.get(), 0, "Load does not require CPU probes");
+    let child = timed_claim(&s, &m);
+    assert_eq!(
+        m.reads.get(),
+        2,
+        "child measures its own readiness without waiting on parent"
+    );
+    assert!(child.timing_admission().is_ok());
+    assert_eq!(
+        parent.timing_admission(),
+        Err(crate::TimingIssue::UnknownAdmission)
+    );
+}
+
+#[test]
+fn unknown_cpu_and_now_refuse_timing_without_affecting_explicit_load_admission() {
+    let s = scratch("unknown-timing");
+    let m = mac48();
+    assert!(matches!(
+        Waiter::enter(&s.ledger, &m, Need::timing("unknown"))
+            .unwrap()
+            .poll(&m),
+        Polled::Unqualified(crate::TimingIssue::Unavailable)
+    ));
+    assert!(matches!(
+        admit_with(
+            &s.ledger,
+            &m,
+            Need::timing("now"),
+            Admit::Now,
+            Pace::default(),
+            &mut |_| {}
+        ),
+        Err(Error::Timing(crate::TimingIssue::Now))
+    ));
+    let _load = admitted(enter(&s, &m, Need::new("explicit load").quiet(100.0)), &m);
+}
+
+#[test]
+fn a_forced_patience_bound_never_qualifies_timing_work() {
+    let s = scratch("timing-bound");
+    let m = TimingMachine::new(&[(0, 0), (100, 0)]);
+    let need = Need::timing("forced bound").patience(Patience {
+        reserve: Duration::ZERO,
+        start: Duration::ZERO,
+        hold: crate::QUIET_PATIENCE.hold,
+    });
+    let first = Waiter::enter(&s.ledger, &m, need).unwrap();
+    let waiting = match first.poll(&m) {
+        Polled::Waiting(waiting, _) => waiting,
+        _ => panic!("first sample warms"),
+    };
+    assert!(matches!(
+        waiting.poll(&m),
+        Polled::Unqualified(crate::TimingIssue::Bound)
+    ));
+    assert!(
+        s.ledger.list().unwrap().is_empty(),
+        "forced, unqualified claim was released"
+    );
+}
+
+#[test]
+fn fast_held_timing_reserves_from_explicit_admission_only() {
+    let mut timing = record(1, 100, Need::timing("timing"), Some(1));
+    timing.held.as_mut().unwrap().admitted_ms = 200;
+    assert_eq!(
+        timing.reserves(200),
+        None,
+        "legacy time fallback is not proof"
+    );
+    timing.timing.admitted_ms = Some(200);
+    let hold = timing.need.patience.unwrap().hold;
+    assert_eq!(timing.reserves(200), Some(hold));
+    assert_eq!(timing.reserves(200 + hold.as_millis() as u64), None);
+    timing.need.quiet_policy = crate::QuietPolicy::Load;
+    assert_eq!(
+        timing.reserves(200),
+        None,
+        "explicit Load retains its waiting-age semantics"
+    );
+}
+
+#[test]
+fn malformed_timing_observations_keep_the_live_quiet_claim_but_invalidate_proof() {
+    let s = scratch("malformed-proof");
+    let m = TimingMachine::new(&[(0, 0), (1, 99)]);
+    let claim = timed_claim(&s, &m);
+    let text = std::fs::read_to_string(claim.path()).unwrap();
+    for tail in ["{\"timing\":{}}\n", "{\"timing\":", "{\"timing\":null}\n"] {
+        let retained =
+            Record::decode(&format!("{text}{tail}"), true).expect("live reservation retained");
+        assert_eq!(retained.need.quiet, claim.record().need.quiet);
+        assert!(retained.held.is_some());
+        assert_eq!(retained.timing.cause, crate::TimingCause::Unknown);
+        assert!(retained.timing.admission.is_none() && retained.timing.entry.is_none());
+        assert_eq!(
+            retained.timing.admitted_ms,
+            claim.record().timing.admitted_ms
+        );
+        let now = aterm_time::unix_millis().unwrap();
+        assert!(
+            retained.reserves(now).is_some(),
+            "corrupt proof cannot erase fast-held exclusion"
+        );
+        let ordinary = record(
+            retained.pid.saturating_add(1),
+            retained.start_ms.saturating_add(1),
+            Need::new("nonkin ordinary build").cores(1),
+            None,
+        );
+        assert!(
+            crate::admit::reserving(&ordinary, &[&retained], &|_| false, now).is_some(),
+            "ordinary nonkin work remains blocked"
+        );
+    }
+    let mut lines = text.lines();
+    let mut head: aterm_json::Value = aterm_json::from_str(lines.next().unwrap()).unwrap();
+    head.as_object_mut().unwrap().insert(
+        "quiet_policy".into(),
+        aterm_json::json!({"future":"policy"}),
+    );
+    let text = format!("{head}\n{}\n", lines.collect::<Vec<_>>().join("\n"));
+    let retained = Record::decode(&text, true).unwrap();
+    assert_eq!(retained.need.quiet_policy, crate::QuietPolicy::Unknown);
+    assert_eq!(retained.need.quiet, claim.record().need.quiet);
+}
+
 /// A waiter for `need`, entered now.
 fn enter(s: &Scratch, m: &Fixed, need: Need) -> Waiter {
     Waiter::enter(&s.ledger, m, need).expect("entered")
@@ -60,6 +324,7 @@ fn admitted(w: Waiter, m: &Fixed) -> crate::Claim {
         Polled::Admitted(c) => c,
         Polled::Waiting(_, short) => panic!("expected admission, waits: {short}"),
         Polled::Gone(e) => panic!("expected admission, gone: {e}"),
+        Polled::Unqualified(why) => panic!("expected admission, unqualified: {why}"),
     }
 }
 
@@ -70,6 +335,7 @@ fn waits(w: Waiter, m: &Fixed) -> (Waiter, crate::Shortfall) {
         Polled::Waiting(w, short) => (w, short),
         Polled::Admitted(c) => panic!("expected a wait, admitted: {:?}", c.record()),
         Polled::Gone(e) => panic!("expected a wait, gone: {e}"),
+        Polled::Unqualified(why) => panic!("expected a wait, unqualified: {why}"),
     }
 }
 
@@ -658,8 +924,55 @@ fn admit_now_takes_the_claim_and_says_what_it_would_wait_for() {
     assert_eq!(Admit::parse("later"), None);
 }
 
+/// An explicit resource override does not authorize concurrent decisions or unreadable
+/// ledger state. The same request can override a resource shortage once the ledger works.
+#[test]
+fn admit_now_requires_a_real_admission_turn_and_readable_ledger() {
+    let s = scratch("now-turn");
+    let m = mac48();
+    let turn = s.ledger.try_turn().unwrap().unwrap();
+    let denied = admit_with(
+        &s.ledger,
+        &m,
+        Need::new("busy turn").mem_gib(60),
+        Admit::Now,
+        Pace::default(),
+        &mut |_| {},
+    );
+    assert!(matches!(denied, Err(Error::Ledger(ref error))
+        if error.kind() == std::io::ErrorKind::WouldBlock));
+    assert!(s.ledger.list().unwrap().is_empty());
+    drop(turn);
+    let path = s.ledger.dir().join("ledger.lock");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let denied = admit_with(
+        &s.ledger,
+        &m,
+        Need::new("unreadable turn").mem_gib(60),
+        Admit::Now,
+        Pace::default(),
+        &mut |_| {},
+    );
+    assert!(matches!(denied, Err(Error::Ledger(_))));
+    assert!(s.ledger.list().unwrap().is_empty());
+    std::fs::remove_dir(&path).unwrap();
+    let claim = admit_with(
+        &s.ledger,
+        &m,
+        Need::new("repaired turn").mem_gib(60),
+        Admit::Now,
+        Pace::default(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert!(claim.record().held.is_some());
+}
+
 fn record(pid: u32, start_ms: u64, need: Need, held: Option<u32>) -> Record {
     Record {
+        timing: crate::TimingEvidence::default(),
+        accounting: crate::Accounting::Holder,
         pid,
         start_ms,
         seq: 0,
@@ -2941,6 +3254,7 @@ fn a_waiter_polled_by_hand_whose_claim_file_is_removed_is_gone() {
             looks += 1;
             match w.poll(&m) {
                 Polled::Gone(e) => break Some(e),
+                Polled::Unqualified(why) => panic!("load-only claim unqualified: {why}"),
                 Polled::Waiting(again, _) if looks < 3 => w = again,
                 Polled::Waiting(..) => break None,
                 Polled::Admitted(c) => panic!("removed {remove}: admitted {:?}", c.record()),
@@ -3324,6 +3638,34 @@ fn vol(total: u64, free: u64, floor: u64) -> Volume {
         floor: floor * GIB,
         room: 2 * GIB,
     }
+}
+
+#[test]
+fn retained_custody_reserves_the_whole_peak_despite_unrelated_pid_use_and_writes() {
+    let mut r = record(
+        100,
+        1,
+        Need::new("compiler cohort")
+            .mem(30 * GIB)
+            .disk(30 * GIB, "/vol"),
+        Some(1),
+    );
+    r.accounting = crate::Accounting::Whole;
+    r.credit = vec![200];
+    r.wrote = Some(u64::MAX);
+    let mut trees = std::collections::HashMap::new();
+    for pid in [100, 200] {
+        trees.insert(
+            pid,
+            TreeUse {
+                footprint: u64::MAX,
+                written: u64::MAX,
+            },
+        );
+    }
+    let held = crate::reserved(&[r], Some(&trees), &[vol(1000, 800, 100)]);
+    assert_eq!(held[0].mem, 30 * GIB);
+    assert_eq!(held[0].disk, Some(30 * GIB));
 }
 
 /// A machine whose volume is `vol`.

@@ -76,6 +76,11 @@ pub struct SessionSetup {
     /// The window's host confirms the session's agent by its image, and the loop types only while
     /// it does ([`Session::set_confirms_agent`]).
     pub(super) confirms_agent: bool,
+    /// The loop reads the clocks of a host that never sleeps (`Session::set_host_awake`), and so
+    /// does every door made from the setup ([`Self::live_fx`]): a live test's instance, whose
+    /// machine's sleep is no part of what it tests. A build without debug assertions reads the
+    /// system's either way.
+    pub(super) host_awake: bool,
     /// Where the approval ledger goes ([`Session::set_approval_ledger`]); `None` keeps none — until a hosted loop takes its options' own ([`Session::run_hosted`]).
     pub(super) ledger_path: Option<PathBuf>,
     /// What the approval policy takes from the supervisor's own process (the owner's home, uid and `$TMPDIR`; fixed in tests).
@@ -138,6 +143,7 @@ impl SessionSetup {
             beside: None,
             builtin_duties: false,
             confirms_agent: false,
+            host_awake: false,
             handover: Handover::default(),
             types_under_hand: false,
             ledger_path: None,
@@ -201,6 +207,18 @@ impl SessionSetup {
         &self.approval_env
     }
 
+    /// The live door a loop of this setup reads its world through: the system's clocks, or a
+    /// host's that never sleeps from now ([`Self::host_awake`]).
+    pub(crate) fn live_fx(&self) -> Fx {
+        #[cfg(any(test, debug_assertions))]
+        if self.host_awake {
+            let mut fx = Fx::os();
+            fx.awake();
+            return fx;
+        }
+        Fx::os()
+    }
+
     /// The same setup with its ledger at `ledger_path`: a tape's header holds the path the loop
     /// opens ([`Header::capture`](crate::supervise::tape::header::Header::capture)).
     #[must_use]
@@ -221,6 +239,7 @@ impl SessionSetup {
             types_under_hand,
             builtin_duties,
             confirms_agent,
+            host_awake,
             ledger_path,
             approval_env,
             reconnect,
@@ -260,6 +279,9 @@ impl SessionSetup {
         }
         if *confirms_agent {
             w.shown("confirms_agent", true);
+        }
+        if *host_awake {
+            w.shown("host_awake", true);
         }
         w.opt_path("ledger", ledger_path.as_deref(), roots);
         w.duration("reconnect", *reconnect);
@@ -405,6 +427,7 @@ impl SessionSetup {
         let confirms_agent = r
             .optional_parsed::<bool>("confirms_agent")?
             .unwrap_or(false);
+        let host_awake = r.optional_parsed::<bool>("host_awake")?.unwrap_or(false);
         let ledger_path = r.opt_io_path("ledger", roots)?;
         let reconnect = r.duration("reconnect")?;
         let pause = r.duration("pause")?;
@@ -520,6 +543,7 @@ impl SessionSetup {
             types_under_hand,
             builtin_duties,
             confirms_agent,
+            host_awake,
             ledger_path,
             approval_env,
             reconnect,

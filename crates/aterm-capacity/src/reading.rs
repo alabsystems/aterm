@@ -356,6 +356,11 @@ pub trait Machine {
     /// Every process now; `None` where the platform has no sweep.
     fn procs(&self) -> Option<Procs>;
 
+    /// One actual CPU counter point; unsupported/injected machines report unknown by default.
+    fn cpu_point(&self) -> Option<crate::CpuPoint> {
+        None
+    }
+
     /// `pid` and the processes it descends from, as far as they are read: what deciding whether
     /// an ancestor's claim covers `pid` needs ([`crate::covering`]), with no footprints. By
     /// default the whole sweep ([`Self::procs`]).
@@ -401,6 +406,14 @@ thread_local! {
 pub struct Live;
 
 impl Machine for Live {
+    fn cpu_point(&self) -> Option<crate::CpuPoint> {
+        let ticks = aterm_sysprobe::Probe::new().core_ticks()?;
+        Some(crate::CpuPoint {
+            at: std::time::Instant::now(),
+            unix_ms: aterm_time::unix_millis()?,
+            ticks,
+        })
+    }
     fn read(&self, path: Option<&Path>) -> Reading {
         let cores = cores();
         let load = aterm_sysprobe::load_average();

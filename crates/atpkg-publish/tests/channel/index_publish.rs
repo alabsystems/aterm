@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex};
 use atpkg_publish::api::{Baseline, Delta, IndexRequest};
 use atpkg_publish::channel::index::{Outcome, parse_delta, publish_with};
 use atpkg_publish::channel::{Log, SERVE_PROBES};
+use atpkg_publish::ctx::HostChoice;
 use atpkg_publish::error::{Error, Result};
-use atpkg_publish::host::fake::FakeHost;
+use atpkg_publish::host::fake::{FakeFail, FakeHost, FakeOp};
 use atpkg_publish::host::{HostError, Probe, Release, ReleaseHost, Replace, Slug};
 use atpkg_publish::quad::{QUAD_FILES, index_tag};
 use atpkg_publish::testkit::FAR_FUTURE;
@@ -214,6 +215,24 @@ fn upload_needs_the_channel_token_before_anything_is_signed() {
         "{e}"
     );
     assert!(rig.host.calls().is_empty(), "{:?}", rig.host.calls());
+    assert!(!rig.path("out").join("index.toml").exists());
+}
+
+#[test]
+fn upload_asks_the_channel_writer_under_agh() {
+    let mut rig = live("idx-writer");
+    std::fs::remove_file(&rig.ctx.tokens.channel).expect("rm token");
+    rig.ctx = rig.ctx.clone().with_host_choice(HostChoice::Agh);
+    rig.host.fail_next(FakeOp::Preflight, FakeFail::Refuse);
+    let (e, _) = refused(&rig, &request(&rig, "out", true, Delta::default()));
+    assert!(matches!(e, Error::Refused(_)), "{e}");
+    let slug = rig.index_slug();
+    let why = e.to_string();
+    assert!(why.contains(&format!("writer on {slug}")), "{why}");
+    assert!(why.contains("refused by the test"), "{why}");
+    let calls = rig.host.calls();
+    assert!(calls.contains(&format!("preflight {slug}")), "{calls:?}");
+    assert!(writes(&rig.host).is_empty(), "{calls:?}");
     assert!(!rig.path("out").join("index.toml").exists());
 }
 

@@ -343,7 +343,7 @@ fn finding(path: &str, line: usize, detail: String) -> Finding {
 /// The rule over `tree`, with the engine's baseline as this host reads it (`Err`
 /// when it has none, which holds the text to the export's own rows).
 fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mut Vec<Finding>) {
-    let read = |rel: &str| match std::fs::read_to_string(tree.root.join(rel)) {
+    let read = |rel: &str| match crate::tree::read_to_string(&tree.root.join(rel)) {
         Ok(text) => Ok(Some(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(finding(
@@ -444,7 +444,7 @@ fn judge(tree: &Tree<'_>, rel: &str, held: &Held<'_>, out: &mut Vec<Finding>) {
             ));
         }
     }
-    let bytes = match std::fs::read(tree.root.join(rel)) {
+    let bytes = match crate::tree::read_bytes(&tree.root.join(rel)) {
         Ok(bytes) => bytes,
         Err(e) => {
             out.push(finding(rel, 0, format!("unreadable: {e}")));

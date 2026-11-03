@@ -40,7 +40,7 @@ use crate::grid::{CellFlags, MAX_GRID_COLS, MAX_GRID_ROWS, PackedColor};
 use crate::scrollback::{deserialize_lines_strict, max_linked_record_bytes};
 
 /// The version [`TerminalCheckpoint::canonical`] writes after its magic.
-pub const CHECKPOINT_CANON_VERSION: u32 = 1;
+pub const CHECKPOINT_CANON_VERSION: u32 = 2;
 
 /// The version [`TerminalConfig::canonical`] writes after its magic.
 pub const CONFIG_CANON_VERSION: u32 = 1;
@@ -725,6 +725,7 @@ fn enc_grid_cursor(w: &mut W, c: &GridCursorRepr) {
         cursor_row,
         cursor_col,
         pending_wrap,
+        follows_glyph,
         scroll_top,
         scroll_bottom,
         margin_left,
@@ -737,6 +738,7 @@ fn enc_grid_cursor(w: &mut W, c: &GridCursorRepr) {
     w.u16(*cursor_row);
     w.u16(*cursor_col);
     w.bool(*pending_wrap);
+    w.bool(*follows_glyph);
     w.u16(*scroll_top);
     w.u16(*scroll_bottom);
     w.u16(*margin_left);
@@ -756,6 +758,7 @@ fn dec_grid_cursor(d: &mut R<'_>) -> Result<GridCursorRepr, CanonFault> {
         cursor_row: d.u16(f)?,
         cursor_col: d.u16(f)?,
         pending_wrap: d.bool(f)?,
+        follows_glyph: d.bool(f)?,
         scroll_top: d.u16(f)?,
         scroll_bottom: d.u16(f)?,
         margin_left: d.u16(f)?,
@@ -3783,6 +3786,9 @@ mod tests {
         });
         p("tab stops", |c| {
             c.cursor.tab_stops[0] = !c.cursor.tab_stops[0]
+        });
+        p("glyph before the cursor", |c| {
+            c.cursor.follows_glyph = !c.cursor.follows_glyph
         });
         p("grid", |c| {
             let last = c.grid.len() - 1;

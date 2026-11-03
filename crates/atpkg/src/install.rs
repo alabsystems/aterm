@@ -937,7 +937,7 @@ pub(crate) fn stage_payload_modes(
     let cap = size_cap(artifact);
     let folded: Option<TreeAccumulator> = match artifact.payload.as_str() {
         _ if streams(artifact) => {
-            let file = std::fs::File::open(archive)
+            let file = crate::metadata_io::open_regular(archive)
                 .map_err(|e| StageError::Extract(ExtractError::from(e)))?;
             tar_lane(artifact, file, dest).transpose()?
         }
@@ -1070,7 +1070,7 @@ fn stage_binary(
             npm.written
         }
         _ => {
-            let file = std::fs::File::open(archive).map_err(StageError::Io)?;
+            let file = crate::metadata_io::open_regular(archive).map_err(StageError::Io)?;
             crate::extract::stage_file(file, &target, 0o755, cap).map_err(StageError::Extract)?
         }
     };

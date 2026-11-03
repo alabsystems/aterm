@@ -2123,7 +2123,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
         super::super::headless_oauth::poll_mailbox_config_for_credential(
             &std_maildir_cfg,
             Some("user-b@example.test"),
-            Duration::from_millis(50),
+            aterm_spec::wait::MUST_HAPPEN,
         ),
         Ok(super::super::headless_oauth::MailboxCredential::Otp(
             "778899".to_owned()
@@ -2914,7 +2914,7 @@ m27_2_pass = "flat-m27-2-pw"
             super::super::headless_oauth::poll_mailbox_config_for_credential(
                 &mbox_cfg,
                 Some("sol-m27@proton.me"),
-                Duration::from_millis(50),
+                aterm_spec::wait::MUST_HAPPEN,
             ),
             Ok(MailboxCredential::Otp("908172".to_owned())),
             "mbox file returns newest appended message for target recipient"
@@ -2931,7 +2931,7 @@ m27_2_pass = "flat-m27-2-pw"
             super::super::headless_oauth::poll_mailbox_config_for_credential(
                 &mbox_cfg,
                 Some("sol-m27@proton.me"),
-                Duration::from_millis(50),
+                aterm_spec::wait::MUST_HAPPEN,
             ),
             Ok(MailboxCredential::Otp("432109".to_owned())),
             "appending a new message to an mbox file is picked up on subsequent polls"

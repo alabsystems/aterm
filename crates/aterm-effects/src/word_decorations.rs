@@ -510,22 +510,27 @@ impl KittyCursorPlacement {
         let nudged = if in_cell || inked_xy.is_some() {
             None
         } else {
-            [
+            let candidates = [
                 (x >= caret_box.1, (kept.1, y)),
                 (x + w <= caret_box.0, (kept.0 - w, y)),
                 (y + h <= caret_box.2, (x, kept.2 - h - 1)),
                 (y >= caret_box.3, (x, kept.3)),
-            ]
-            .into_iter()
-            .filter(|&(side, (nx, ny))| {
-                side && nx >= 0
-                    && nx + w <= grid_w
-                    && ny >= 0
-                    && ny + h <= grid_h
-                    && is_clear(nx, ny)
-            })
-            .map(|(_, at)| at)
-            .min_by_key(|&(nx, ny)| (nx - x).abs() + (ny - y).abs())
+            ];
+            let mut best_dist = i32::MAX;
+            let mut best_at = None;
+            let mut ci = 0;
+            while ci < candidates.len() {
+                let (side, (nx, ny)) = candidates[ci];
+                if side && nx >= 0 && nx + w <= grid_w && ny >= 0 && ny + h <= grid_h {
+                    let dist = (nx - x).abs() + (ny - y).abs();
+                    if dist < best_dist && is_clear(nx, ny) {
+                        best_dist = dist;
+                        best_at = Some((nx, ny));
+                    }
+                }
+                ci += 1;
+            }
+            best_at
         };
         // A head off the caret's ring that grazes a lettered row by a bob's
         // few pixels (no more than the ring's width) steps back off it by the
@@ -1556,6 +1561,13 @@ impl ScanMemo {
                 self.hits += 1;
             }
             return Some(m.len());
+        }
+        if self.cold.is_empty() {
+            #[cfg(test)]
+            {
+                self.misses += 1;
+            }
+            return None;
         }
         let Some((key, value)) = self.cold.remove_entry(text) else {
             #[cfg(test)]
@@ -2959,10 +2971,7 @@ impl WordDecorations {
             };
             let host = key.host_id();
             let resolved_tile = match self.pet_baker.tile(&key) {
-                Some(rgba) => match self.cat_baker.host_tile(host, nat_w, nat_h, rgba) {
-                    Some(t) => Some(t),
-                    None => self.cat_baker.host_peek(host),
-                },
+                Some(rgba) => self.cat_baker.host_tile(host, nat_w, nat_h, rgba),
                 None => self.cat_baker.host_peek(host),
             };
             let resolved_art = match resolved_tile {
@@ -3197,10 +3206,7 @@ impl WordDecorations {
         };
         let host = key.host_id();
         let resolved_tile = match self.pet_baker.tile(&key) {
-            Some(rgba) => match self.cat_baker.host_tile(host, nat_w, nat_h, rgba) {
-                Some(t) => Some(t),
-                None => self.cat_baker.host_peek(host),
-            },
+            Some(rgba) => self.cat_baker.host_tile(host, nat_w, nat_h, rgba),
             None => self.cat_baker.host_peek(host),
         };
         let art = match resolved_tile {
@@ -3592,10 +3598,7 @@ impl WordDecorations {
         };
         let host = key.host_id();
         let resolved_tile = match self.dog_baker.tile(&key) {
-            Some(rgba) => match self.cat_baker.host_tile(host, w, h, rgba) {
-                Some(t) => Some(t),
-                None => self.cat_baker.host_peek(host),
-            },
+            Some(rgba) => self.cat_baker.host_tile(host, w, h, rgba),
             None => self.cat_baker.host_peek(host),
         };
         let art = match resolved_tile {
@@ -7382,10 +7385,7 @@ fn emit_animal(
             };
             let host = key.host_id();
             match ctx.animal_baker.tile(&key) {
-                Some(rgba) => match ctx.baker.host_tile(host, key.w, key.h, rgba) {
-                    Some(t) => Some(t),
-                    None => ctx.baker.host_peek(host),
-                },
+                Some(rgba) => ctx.baker.host_tile(host, key.w, key.h, rgba),
                 None => ctx.baker.host_peek(host),
             }
         },

@@ -1928,12 +1928,16 @@ impl Config {
                 .is_none_or(FleetConfig::watch_or_default)
     }
 
-    /// Whether the PTY keeper is on (`[keeper] enabled`, default `false`).
+    /// What `[keeper] enabled` says, if anything: a launch reads it with what it is
+    /// (`keeper_link::part`).
+    pub(crate) fn keeper_setting(&self) -> Option<bool> {
+        self.keeper.as_ref().and_then(|keeper| keeper.enabled)
+    }
+
+    /// Whether the PTY keeper is on (`[keeper] enabled`, default on where a keeper exists, macOS).
     pub(crate) fn keeper_enabled(&self) -> bool {
-        self.keeper
-            .as_ref()
-            .and_then(|keeper| keeper.enabled)
-            .unwrap_or(false)
+        self.keeper_setting()
+            .unwrap_or(crate::keeper_link::DEFAULT_ON)
     }
 }
 
@@ -7019,6 +7023,30 @@ impl App {
                 crate::toolbar::set_strip_accent(handle, strip_accent);
             }
         }
+        self.publish_app_tiles();
+    }
+
+    /// Push the application tile's inks to every window's native strip: resolved after its appearance, which decides the selected pill they stand on.
+    pub(crate) fn publish_app_tiles(&self) {
+        for wid in self._toolbars.keys() {
+            self.publish_app_tiles_to(*wid);
+        }
+    }
+
+    /// [`Self::publish_app_tiles`] for one window.
+    pub(crate) fn publish_app_tiles_to(&self, wid: WindowId) {
+        let Some(handle) = self._toolbars.get(&wid) else {
+            return;
+        };
+        // The native strip stands on the terminal theme, whatever `window_theme` forces elsewhere: its appearance, ground and accent floor all follow `self.theme`.
+        let palette = self.chrome_palette(crate::app_render::ChromeSurface::Grid);
+        let bg = crate::settings::u32_rgb(self.theme.bg);
+        let active = self.native_strip_chrome().0.active_tab.unwrap_or_else(|| {
+            crate::toolbar::native_selected_pill_rgb(handle).map_or(bg, |pill| {
+                crate::chrome_band::mix3(bg, pill, crate::tab_bar::NATIVE_PILL_AUTO_ALPHA)
+            })
+        });
+        crate::toolbar::set_app_tiles(handle, crate::tab_bar::native_app_tiles(palette, active));
     }
 
     /// Handle `WindowEvent::ScaleFactorChanged`.
@@ -7614,6 +7642,7 @@ impl App {
                 crate::toolbar::set_active_tab_color(handle, authored.active_tab);
                 crate::toolbar::set_strip_accent(handle, strip_accent);
             }
+            self.publish_app_tiles();
             for ws in self.windows.values_mut() {
                 ws.last_strip_fp = None;
                 ws.last_present = None;

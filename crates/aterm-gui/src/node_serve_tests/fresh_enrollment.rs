@@ -146,7 +146,7 @@ fn enroll(issuer: &Machine, newcomer: &Machine, source: String) {
             host: Some("m2".to_owned()),
             interactive: false,
             wait: Duration::ZERO,
-            confirm: &|_| panic!("automatic admission must ask no person"),
+            confirm: &|_| panic!("a join with no terminal asks nobody here"),
             password: JoinPassword::Given(None),
             fetched: None,
             requested: &|| {},
@@ -156,11 +156,11 @@ fn enroll(issuer: &Machine, newcomer: &Machine, source: String) {
     .unwrap();
     assert!(matches!(joined, JoinOutcome::Pending { .. }));
     assert!(client::test_alab_fleet(&newcomer.vault).unwrap().is_none());
+    let waiting = client::requests(&issuer.vault, None).unwrap();
+    assert_eq!(waiting.len(), 1, "{waiting:?}");
     assert_eq!(
-        client::test_auto_approve_alab_lan(&issuer.vault)
-            .unwrap()
-            .approved,
-        ["m2"]
+        client::approve_request(&issuer.vault, &waiting[0].recipient).unwrap(),
+        "m2"
     );
     client::sync(&newcomer.vault, None).unwrap();
     assert!(matches!(
@@ -228,7 +228,7 @@ fn a_fresh_vault_member_joins_the_default_fleet_and_can_be_driven() {
             issuer.addr
         ),
     );
-    let server = aterm_secrets::server::start_at_home(
+    let server = aterm_secrets::server::start_with_join_change_gap(
         TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
         &aterm_secrets::server::Options {
             listen: "127.0.0.1:0".parse().unwrap(),

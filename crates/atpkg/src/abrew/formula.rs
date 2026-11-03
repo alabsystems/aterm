@@ -28,6 +28,9 @@ pub struct Formula {
     pub pour_needs: Option<String>,
     /// `conflicts_with` names, evaluated against abrew's census at install.
     pub conflicts: Vec<String>,
+    /// `conflicts_with_reasons`, parallel to `conflicts`
+    /// (empty string where the record gives none).
+    pub conflict_reasons: Vec<String>,
     /// Requirements in the plain data forms abrew evaluates at install.
     pub requirements: Vec<Requirement>,
     /// `pour_bottle_only_if: :clt_installed`.
@@ -403,6 +406,7 @@ impl Formula {
         let parsed_conflicts = plain_names(v.get("conflicts_with"));
         let conflicts_plain = parsed_conflicts.is_some();
         let conflicts = parsed_conflicts.unwrap_or_default();
+        let conflict_reasons = str_list(v.get("conflicts_with_reasons"));
         let pour_needs = if !matches!(
             v.get("post_install_defined"),
             None | Some(Value::Bool(false))
@@ -457,6 +461,7 @@ impl Formula {
                 .unwrap_or(0),
             pour_needs,
             conflicts,
+            conflict_reasons,
             requirements: requirements.unwrap_or_default(),
             pour_requires_clt,
             variations: parse_formula_variations(v.get("variations")),
@@ -581,6 +586,16 @@ impl Formula {
     #[must_use]
     pub fn short_name(full: &str) -> &str {
         full.rsplit('/').next().unwrap_or(full)
+    }
+
+    /// Whether `request` (bare or tap-qualified) names this formula's
+    /// canonical name, one of its aliases, or one of its `oldnames`.
+    #[must_use]
+    pub fn matches_name(&self, request: &str) -> bool {
+        let short = Self::short_name(request);
+        self.name == short
+            || self.aliases.iter().any(|a| a == short)
+            || self.oldnames.iter().any(|o| o == short)
     }
 }
 
@@ -1465,7 +1480,8 @@ fn prerelease_rank(t: &str) -> Option<u8> {
     match t.to_ascii_lowercase().as_str() {
         "alpha" | "a" => Some(0),
         "beta" | "b" => Some(1),
-        "pre" | "preview" | "rc" => Some(2),
+        "pre" | "preview" => Some(2),
+        "rc" => Some(3),
         _ => None,
     }
 }
@@ -1483,20 +1499,11 @@ fn token_cmp(x: &str, y: &str) -> Ordering {
     match (xn, yn) {
         (Some(a), Some(b)) => a.cmp(&b),
         (None, Some(0)) | (Some(0), None) if x.is_empty() || y.is_empty() => Ordering::Equal,
-        (Some(_), None) => {
-            if y.is_empty() || prerelease_rank(y).is_some() {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (None, Some(_)) => {
-            if x.is_empty() || prerelease_rank(x).is_some() {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
+        // Brew's NumericToken outranks every string token
+        // (including the composite pre-release tokens), so a
+        // numeric token always wins this position.
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
         (None, None) => match (prerelease_rank(x), prerelease_rank(y)) {
             (Some(a), Some(b)) => a.cmp(&b),
             (Some(_), None) => Ordering::Less,
@@ -1588,6 +1595,10 @@ mod tests {
             Ordering::Less
         );
         assert_eq!(version_cmp("1-2", "1.1"), Ordering::Greater);
+        // Brew's NumericToken outranks any string token.
+        assert_eq!(version_cmp("3.54.1", "latest"), Ordering::Greater);
+        assert_eq!(version_cmp("1.0foo", "1.0.1"), Ordering::Less);
+        assert_eq!(version_cmp("1.0pre1", "1.0rc1"), Ordering::Less);
     }
 
     #[test]
@@ -1627,12 +1638,13 @@ mod tests {
             );
         }
         value = aterm_json::from_str(
-            r#"{"name":"demo","conflicts_with":["other"],"requirements":[{"name":"macos","version":"13","contexts":[],"specs":["stable","head"]},{"name":"xcode","contexts":["build","test"]},{"name":"xcode","version":"14.0","contexts":[],"specs":["stable"]}],"pour_bottle_only_if":"clt_installed","bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
+            r#"{"name":"demo","conflicts_with":["other"],"conflicts_with_reasons":["both install `x`"],"requirements":[{"name":"macos","version":"13","contexts":[],"specs":["stable","head"]},{"name":"xcode","contexts":["build","test"]},{"name":"xcode","version":"14.0","contexts":[],"specs":["stable"]}],"pour_bottle_only_if":"clt_installed","bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
         )
         .unwrap();
         let f = Formula::from_api(&value).unwrap();
         assert_eq!(native(&f).as_deref(), Ok("all"));
         assert_eq!(f.conflicts, ["other"]);
+        assert_eq!(f.conflict_reasons, ["both install `x`"]);
         assert_eq!(
             f.requirements,
             [

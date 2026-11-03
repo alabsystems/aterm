@@ -73,6 +73,7 @@ fn fixture() -> (HostHandle, Arc<Mutex<Kept>>) {
         born: Some(BORN),
         state: None,
         labels: BTreeSet::new(),
+        rows: Arc::from([]),
         policy: Arc::clone(&kept.account.progress_policy),
         execution_until: None,
         value,
@@ -301,21 +302,28 @@ fn an_unavailable_activity_read_without_a_gate_remains_unavailable() {
 
 #[test]
 fn recent_login_activity_keeps_the_blocker_and_filters_unrelated_or_invalid_times() {
-    use aterm_agent::harness::accounts_sync::LoginActivity;
+    use aterm_agent::harness::accounts_sync::{LoginActivity, LoginIdentity};
     let mut value = AccountProgress::unknown(100);
     value.phase = ProgressPhase::Waiting;
     value.details.push("existing blocker".into());
     let labels = BTreeSet::from(["current".into()]);
+    let row = accounts::Row {
+        label: "current".into(),
+        ..accounts::Row::default()
+    };
     let activity = |label: &str, at| LoginActivity {
         label: label.into(),
+        identity: Some(LoginIdentity::for_test(&row)),
         route: None,
         active: false,
         observed_at: at,
         next_at: Some(150),
+        diagnostic: None,
     };
     apply_login_activity(
         &mut value,
         &labels,
+        std::slice::from_ref(&row),
         vec![
             activity("other", 90),
             activity("current", 0),
@@ -358,8 +366,251 @@ fn recent_login_activity_keeps_the_blocker_and_filters_unrelated_or_invalid_time
 }
 
 #[test]
+fn login_activity_requires_one_exact_captured_account_row() {
+    use aterm_agent::harness::accounts_sync::{LoginActivity, LoginIdentity};
+    let original = accounts::Row {
+        label: "current".into(),
+        email: Some("expected@example.test".into()),
+        dir: Some("/synthetic/original-login".into()),
+        ..accounts::Row::default()
+    };
+    let mut changed_email = original.clone();
+    changed_email.email = Some("replacement@example.test".into());
+    let mut changed_dir = original.clone();
+    changed_dir.dir = Some("/synthetic/replacement-login".into());
+    let identity = || Some(LoginIdentity::for_test(&original));
+    for (rows, captured, label, admitted) in [
+        (vec![original.clone()], identity(), "current", true),
+        (vec![changed_email], identity(), "current", false),
+        (vec![changed_dir], identity(), "current", false),
+        (
+            vec![original.clone(), original.clone()],
+            identity(),
+            "current",
+            false,
+        ),
+        (vec![], identity(), "current", false),
+        (vec![original.clone()], None, "current", false),
+        (vec![original.clone()], identity(), "different", false),
+    ] {
+        for active in [false, true] {
+            let (host, kept) = fixture();
+            let retained = {
+                let mut kept = kept.lock().unwrap();
+                let bound = kept.account.progress.as_mut().unwrap();
+                bound.state = Some("/synthetic/state".into());
+                bound.labels = BTreeSet::from([original.label.clone()]);
+                bound.rows = rows.clone().into();
+                bound.value.phase = ProgressPhase::Waiting;
+                bound.value.account = Some(original.label.clone());
+                bound.value.known = Some(2);
+                bound.value.eligible = Some(0);
+                bound.value.next_at = Some(160);
+                bound.value.details = vec!["existing blocker".into()];
+                bound.value.clone()
+            };
+            let read = |activity| {
+                host.account_progress_with_activity(
+                    SID,
+                    4242,
+                    Some(BORN),
+                    Some(CONVERSATION),
+                    || (Instant::now(), Some(100)),
+                    |_, _, _| Some(activity),
+                )
+                .unwrap()
+                .unwrap()
+            };
+            let baseline = read(Vec::new());
+            let got = read(vec![LoginActivity {
+                label: label.into(),
+                identity: captured.clone(),
+                route: Some("mailbox".into()),
+                active,
+                observed_at: 90,
+                next_at: Some(150),
+                diagnostic: None,
+            }]);
+            if admitted {
+                assert_eq!(
+                    got.phase,
+                    if active {
+                        ProgressPhase::SigningIn {
+                            label: "current".into(),
+                            route: Some("mailbox".into()),
+                        }
+                    } else {
+                        baseline.phase.clone()
+                    }
+                );
+                assert_eq!(got.next_at, Some(150));
+                assert_eq!(got.details.len(), baseline.details.len() + 2);
+                assert_eq!(got.details[0], baseline.details[0]);
+                assert_eq!(got.observed_at, baseline.observed_at);
+                assert_eq!(got.known, baseline.known);
+                assert_eq!(got.eligible, baseline.eligible);
+            } else {
+                assert_eq!(
+                    got, baseline,
+                    "unbound or replaced activity changed current recovery"
+                );
+            }
+            assert_eq!(
+                kept.lock()
+                    .unwrap()
+                    .account
+                    .progress
+                    .as_ref()
+                    .unwrap()
+                    .value,
+                retained
+            );
+        }
+    }
+}
+
+#[test]
+fn completed_login_diagnostics_reach_the_menu_only_for_the_captured_account() {
+    use aterm_agent::harness::accounts_sync::{LoginActivity, LoginDiagnostic, LoginIdentity};
+    use aterm_agent::harness::open_url::{Met, MetWord};
+
+    let row = accounts::Row {
+        label: "shared".into(),
+        email: Some("expected@example.test".into()),
+        dir: Some("/synthetic/login".into()),
+        ..accounts::Row::default()
+    };
+    let diagnosis = |at| {
+        LoginDiagnostic::from_exit_for_test(
+            &row,
+            at,
+            1,
+            Some(Met {
+                word: MetWord::BrowserControl,
+                host: Some("https://must-not-appear.invalid/token".into()),
+            }),
+        )
+    };
+    let activity = |diagnostic, active| LoginActivity {
+        label: row.label.clone(),
+        identity: Some(LoginIdentity::for_test(&row)),
+        route: Some("mailbox".into()),
+        active,
+        observed_at: 70,
+        next_at: Some(150),
+        diagnostic,
+    };
+    let project = |rows: &[accounts::Row], entry| {
+        let mut value = AccountProgress::unknown(100);
+        value.phase = ProgressPhase::Waiting;
+        value.known = Some(2);
+        value.eligible = Some(0);
+        value.next_at = Some(160);
+        value.details.push("existing blocker".into());
+        apply_login_activity(
+            &mut value,
+            &BTreeSet::from([row.label.clone()]),
+            rows,
+            vec![entry],
+            100,
+        );
+        value
+    };
+    let rows = [row.clone()];
+    let value = project(&rows, activity(Some(diagnosis(80)), false));
+    let control = project(&rows, activity(None, false));
+    assert_eq!(value.phase, control.phase);
+    assert_eq!(value.eligible, control.eligible);
+    assert_eq!(value.known, control.known);
+    assert_eq!(value.next_at, control.next_at);
+    assert_eq!(value.observed_at, control.observed_at);
+    assert_eq!(value.details[0], "existing blocker");
+    assert_eq!(value.details, control.details);
+    assert_eq!(value.login_diagnostics.len(), 1);
+    let text = value.login_diagnostics[0].words();
+    assert!(text.contains("headless browser"), "{text}");
+    assert!(!text.contains("must-not-appear"));
+    assert!(!text.contains("expected@example.test"));
+    assert!(!text.contains("/synthetic/login"));
+    let lab = crate::lab_screen::progress_facts_at(Some(&value), Some(100));
+    let lab_text = format!("{lab:?}");
+    assert!(lab_text.contains("headless browser"));
+    assert!(!lab_text.contains("must-not-appear"));
+    assert!(!lab_text.contains("expected@example.test"));
+    assert!(!lab_text.contains("/synthetic/login"));
+    let mut spoofed = control.clone();
+    spoofed
+        .details
+        .push(format!("Last local sign-in for shared: {text}"));
+    let spoofed_lab = crate::lab_screen::progress_facts_at(Some(&spoofed), Some(100));
+    assert!(!format!("{spoofed_lab:?}").contains("headless browser"));
+    for at in [0, 101] {
+        let mut invalid = value.clone();
+        invalid.login_diagnostics[0].completed_at = at;
+        let lab = crate::lab_screen::progress_facts_at(Some(&invalid), Some(100));
+        assert!(!format!("{lab:?}").contains("headless browser"));
+    }
+
+    let mut replaced = row.clone();
+    replaced.email = Some("replacement@example.test".into());
+    let mut relocated = row.clone();
+    relocated.dir = Some("/synthetic/replacement".into());
+    for candidates in [
+        vec![],
+        vec![replaced],
+        vec![relocated],
+        vec![row.clone(), row.clone()],
+    ] {
+        assert_eq!(
+            project(&candidates, activity(Some(diagnosis(80)), false)),
+            project(&candidates, activity(None, false)),
+        );
+    }
+    for at in [0, 101] {
+        assert_eq!(
+            project(&rows, activity(Some(diagnosis(at)), false)),
+            control,
+        );
+    }
+    assert_eq!(
+        project(&rows, activity(Some(diagnosis(80)), true)),
+        project(&rows, activity(None, true)),
+    );
+
+    let facts = crate::fact_menu::FactMenuFacts {
+        account_progress: Some(value),
+        ..Default::default()
+    };
+    let menu = crate::fact_menu::rows(crate::claude_lights::Fact::Account, &facts);
+    let theme = aterm_render::Theme {
+        fg: 0x00E0_E0E0,
+        bg: 0x0018_1818,
+        cursor: 0x00FF_FFFF,
+        selection: 0x0044_4466,
+    };
+    for cols in [60, 120] {
+        let rect = crate::autopilot_menu::place(&menu, (25, 0), (0..26, 0..cols), (cols, 26), 0)
+            .expect("account menu fits");
+        let painted = crate::autopilot_menu::paint(rect, &menu, None, theme);
+        let text: String = painted
+            .iter()
+            .flat_map(|line| line.iter().map(|cell| cell.ch))
+            .collect();
+        assert!(
+            text.contains("headless") && text.contains("browser"),
+            "{text}"
+        );
+        assert!(!text.contains("must-not-appear"));
+    }
+}
+
+#[test]
 fn recent_login_activity_does_not_replace_an_account_move() {
-    use aterm_agent::harness::accounts_sync::LoginActivity;
+    use aterm_agent::harness::accounts_sync::{LoginActivity, LoginIdentity};
+    let row = accounts::Row {
+        label: "current".into(),
+        ..accounts::Row::default()
+    };
     for phase in [
         ProgressPhase::Switching { to: "next".into() },
         ProgressPhase::Verifying { to: "next".into() },
@@ -369,12 +620,15 @@ fn recent_login_activity_does_not_replace_an_account_move() {
         apply_login_activity(
             &mut value,
             &BTreeSet::from(["current".into()]),
+            std::slice::from_ref(&row),
             vec![LoginActivity {
                 label: "current".into(),
+                identity: Some(LoginIdentity::for_test(&row)),
                 route: Some("profile".into()),
                 active: true,
                 observed_at: 90,
                 next_at: None,
+                diagnostic: None,
             }],
             100,
         );
@@ -423,6 +677,7 @@ fn account_progress_fences_current_process_conversation_and_generation() {
 fn account_progress_only_reports_a_probe_owned_by_the_current_process() {
     let (host, kept) = fixture();
     kept.lock().unwrap().account.probing = Some(Probing {
+        at: 0,
         label: "current".into(),
         pid: 4243,
         start: "process-a".into(),
@@ -506,6 +761,136 @@ fn account_progress_distinguishes_refused_and_in_flight_restarts() {
 }
 
 #[test]
+fn a_retired_judgment_keeps_independently_observed_work_visible() {
+    use aterm_agent::harness::accounts_sync::{LoginActivity, LoginDiagnostic, LoginIdentity};
+    let row = accounts::Row {
+        label: "alternate".into(),
+        ..accounts::Row::default()
+    };
+    for kind in 0..4 {
+        let (host, kept) = fixture();
+        let origin = AccountContext {
+            roster: None,
+            state: "/synthetic/state".into(),
+            home: "/synthetic/home".into(),
+        };
+        let retired = {
+            let mut held = kept.lock().unwrap();
+            let bound = held.account.progress.as_mut().unwrap();
+            bound.state = Some("/synthetic/state".into());
+            bound.labels = BTreeSet::from([row.label.clone()]);
+            bound.rows = vec![row.clone()].into();
+            bound.value.phase = ProgressPhase::Ready;
+            bound.value.eligible = Some(1);
+            bound.value.next_at = Some(200);
+            bound
+                .value
+                .login_diagnostics
+                .push(LoginDiagnostic::from_exit_for_test(&row, 9, 1, None));
+            retire_judgment(&mut bound.value, AccountPoint::TurnEnd);
+            let retired = bound.value.clone();
+            match kind {
+                0 => {
+                    held.account.probing = Some(Probing {
+                        at: 0,
+                        label: row.label.clone(),
+                        pid: 4242,
+                        start: "process-a".into(),
+                        row: row.clone(),
+                        who: accounts::ProcessLogin {
+                            login: None,
+                            default_home: true,
+                            stored_login: true,
+                        },
+                        roster: "/synthetic/roster".into(),
+                        state: "/synthetic/state".into(),
+                    })
+                }
+                1 => {
+                    held.account.flying = Some(Flying {
+                        origin,
+                        to: row.label.clone(),
+                        at: AccountAt::Wall,
+                        login: None,
+                        pid: 4242,
+                        start: "process-a".into(),
+                        rejected: None,
+                    })
+                }
+                2 => {
+                    held.account.moved = Some(Moved {
+                        id: MoveId::default(),
+                        origin,
+                        to: row.label.clone(),
+                        at: AccountAt::Wall,
+                        login: None,
+                        process: held.snapshot.clone().unwrap(),
+                        answered: false,
+                        untold: false,
+                    })
+                }
+                _ => {}
+            }
+            retired
+        };
+        let value = host
+            .account_progress_with_activity(
+                SID,
+                4242,
+                Some(BORN),
+                Some(CONVERSATION),
+                || (Instant::now(), Some(100)),
+                |_, _, _| {
+                    Some(if kind == 3 {
+                        vec![LoginActivity {
+                            label: row.label.clone(),
+                            identity: Some(LoginIdentity::for_test(&row)),
+                            route: Some("mailbox".into()),
+                            active: true,
+                            observed_at: 90,
+                            next_at: None,
+                            diagnostic: None,
+                        }]
+                    } else {
+                        Vec::new()
+                    })
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            value.phase,
+            match kind {
+                0 => ProgressPhase::Probing,
+                1 => ProgressPhase::Switching {
+                    to: row.label.clone()
+                },
+                2 => ProgressPhase::Verifying {
+                    to: row.label.clone()
+                },
+                _ => ProgressPhase::SigningIn {
+                    label: row.label.clone(),
+                    route: Some("mailbox".into())
+                },
+            }
+        );
+        assert_eq!(value.next_at, None);
+        assert_eq!(value.eligible, None);
+        assert_eq!(value.login_diagnostics, retired.login_diagnostics);
+        assert_eq!(
+            kept.lock()
+                .unwrap()
+                .account
+                .progress
+                .as_ref()
+                .unwrap()
+                .value,
+            retired
+        );
+    }
+}
+
+#[test]
 fn account_progress_distinguishes_current_policy_from_an_old_disabled_observation() {
     let (host, kept) = fixture();
     kept.lock()
@@ -558,7 +943,7 @@ fn account_progress_contention_is_unavailable_and_never_waits_for_a_writer() {
 #[test]
 fn service_progress_retries_a_busy_activity_read_and_then_shows_sign_in() {
     use aterm_agent::harness::account_progress::EXECUTION_PREPARED_FINDING;
-    use aterm_agent::harness::accounts_sync::LoginActivity;
+    use aterm_agent::harness::accounts_sync::{LoginActivity, LoginIdentity};
     use aterm_agent::harness::footer::{FactsOwner, FooterFacts};
 
     for discard_contention in [false, true] {
@@ -569,6 +954,10 @@ fn service_progress_retries_a_busy_activity_read_and_then_shows_sign_in() {
         let ctx = app.pool.get(local).unwrap().ctx.clone();
         let sid = app.session_sid(local).unwrap();
         let (host, kept) = fixture();
+        let activity_row = accounts::Row {
+            label: "alternate".into(),
+            ..accounts::Row::default()
+        };
         host.shared
             .switches
             .account_controls
@@ -585,6 +974,7 @@ fn service_progress_retries_a_busy_activity_read_and_then_shows_sign_in() {
             bound.snapshot.tab = sid.clone();
             bound.state = Some("/synthetic/state".into());
             bound.labels.insert("alternate".into());
+            bound.rows = vec![activity_row.clone()].into();
             bound.value.phase = ProgressPhase::Waiting;
             bound.value.observed_at = 100;
             bound.value.next_at = Some(200);
@@ -631,10 +1021,12 @@ fn service_progress_retries_a_busy_activity_read_and_then_shows_sign_in() {
                                 0 => None,
                                 1 => Some(vec![LoginActivity {
                                     label: "alternate".into(),
+                                    identity: Some(LoginIdentity::for_test(&activity_row)),
                                     route: None,
                                     active: true,
                                     observed_at: stamp,
                                     next_at: None,
+                                    diagnostic: None,
                                 }]),
                                 _ => Some(Vec::new()),
                             },

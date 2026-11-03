@@ -23,6 +23,9 @@ mod apple;
 #[path = "../../src/artifact.rs"]
 #[allow(dead_code)]
 mod artifact;
+#[path = "../../src/build_inputs.rs"]
+#[allow(dead_code)]
+mod build_inputs;
 #[path = "../../src/buildplan.rs"]
 #[allow(dead_code)]
 mod buildplan;
@@ -104,6 +107,12 @@ mod release_status;
 #[path = "../../src/release_steps.rs"]
 #[allow(dead_code)]
 mod release_steps;
+#[path = "../../src/service_qualification.rs"]
+#[allow(
+    dead_code,
+    reason = "integration tests mount the binary's private modules"
+)]
+mod service_qualification;
 
 #[path = "../../src/sign.rs"]
 #[allow(dead_code)]
@@ -114,6 +123,15 @@ mod site;
 #[path = "../../src/snapshot.rs"]
 #[allow(dead_code)]
 mod snapshot;
+#[path = "../../src/source_signing.rs"]
+#[allow(dead_code)]
+mod source_signing;
+#[path = "../../src/stage_local.rs"]
+#[allow(
+    dead_code,
+    reason = "integration tests mount the binary's private modules"
+)]
+mod stage_local;
 #[path = "../../src/tap.rs"]
 #[allow(dead_code)]
 mod tap;

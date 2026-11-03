@@ -1199,7 +1199,8 @@ impl RecordingIndex {
     /// # Errors
     /// The file cannot be read or parsed.
     pub fn load(path: &Path) -> Result<Self, String> {
-        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let bytes = crate::measure::read_regular_file(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         Self::parse(&bytes)
     }
 }

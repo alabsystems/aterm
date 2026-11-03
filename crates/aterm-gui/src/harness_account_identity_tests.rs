@@ -252,6 +252,7 @@ fn recovery_counts_keep_the_identity_verdict_of_the_actual_decision() {
 
 #[test]
 fn recovery_counts_decline_a_judgment_after_same_label_binding_changes() {
+    use aterm_agent::harness::account_progress::{ProgressPhase, RECOVERY_HISTORY_PREFIX};
     for change_directory in [false, true] {
         let (a, idle, target, _) = setup_progress(Case {
             default: false,
@@ -265,6 +266,31 @@ fn recovery_counts_decline_a_judgment_after_same_label_binding_changes() {
         let mut judged = None;
         let advice = idle.account_advice(usage_wall(), false, &mut judged);
         assert_eq!(selected(&advice, &target), 1);
+        let common_details = idle
+            .read_account_progress(&request, usage_wall(), None, judged.as_mut())
+            .unwrap()
+            .value
+            .details;
+        let until = Instant::now() + Duration::from_secs(3600);
+        let alternatives = [
+            advice.unwrap(),
+            AccountAdvice::Resume {
+                cleared_at: a.clock(),
+            },
+            AccountAdvice::Wait { until },
+            AccountAdvice::Hold { until },
+        ];
+        let before: Vec<_> = alternatives
+            .iter()
+            .map(|advice| {
+                idle.read_account_progress(&request, usage_wall(), Some(advice), judged.as_mut())
+                    .unwrap()
+                    .value
+            })
+            .collect();
+        assert_eq!(before[0].phase, ProgressPhase::Ready);
+        assert!(before[2].next_at.is_some());
+        assert!(before[3].next_at.is_some());
         let mut roster = accounts::Roster::load(&a.roster_path()).unwrap();
         let row = roster
             .rows
@@ -285,12 +311,57 @@ fn recovery_counts_decline_a_judgment_after_same_label_binding_changes() {
         )
         .unwrap();
         let auth = a.state().account(&target).auth;
-        let progress = idle
-            .read_account_progress(&request, usage_wall(), advice.as_ref(), judged.as_mut())
-            .unwrap()
-            .value;
-        assert_progress_projection(&progress, None);
-        assert_eq!(progress.known, Some(3));
+        for (advice, before) in alternatives.iter().zip(&before) {
+            let progress = idle
+                .read_account_progress(&request, usage_wall(), Some(advice), judged.as_mut())
+                .unwrap()
+                .value;
+            assert_progress_projection(&progress, None);
+            assert_eq!(progress.phase, ProgressPhase::Unknown);
+            assert_eq!(progress.known, Some(3));
+            assert_eq!(progress.next_at, None);
+            assert!(
+                progress.wall.is_some(),
+                "the observed limit survives a stale Resume"
+            );
+            assert_eq!(progress.observed_at, before.observed_at);
+            assert_eq!(progress.login_diagnostics, before.login_diagnostics);
+            for detail in before
+                .details
+                .iter()
+                .filter(|detail| !common_details.contains(detail))
+            {
+                assert!(
+                    progress
+                        .details
+                        .contains(&format!("{RECOVERY_HISTORY_PREFIX}{detail}"))
+                );
+                assert!(!progress.details.contains(detail));
+            }
+            let reply =
+                crate::harness_recovery_verb::cmd("recovery", true, || Ok(Some(progress.clone())));
+            let fields: std::collections::BTreeMap<_, _> = reply
+                .split_whitespace()
+                .filter_map(|word| word.split_once('='))
+                .collect();
+            assert_eq!(fields.get("phase"), Some(&"unknown"));
+            for field in ["target", "route", "eligible", "next_at"] {
+                assert_eq!(fields.get(field), Some(&"-"), "{reply}");
+            }
+            let expected = aterm_agent::harness::footer::account_progress_phase(
+                &aterm_agent::harness::account_progress::AccountProgress::unknown(
+                    progress.observed_at,
+                ),
+            );
+            let menu = crate::fact_menu::rows(
+                crate::claude_lights::Fact::Account,
+                &crate::fact_menu::FactMenuFacts {
+                    account_progress: Some(progress),
+                    ..Default::default()
+                },
+            );
+            assert!(menu.iter().any(|row| matches!(row, crate::autopilot_menu::MenuRow::Note { text, .. } if text.contains(&expected))));
+        }
         let advice = idle.account(usage_wall());
         assert_eq!(selected(&advice, &target), 0);
         assert_progress_projection(&observed_progress(&idle), Some(0));

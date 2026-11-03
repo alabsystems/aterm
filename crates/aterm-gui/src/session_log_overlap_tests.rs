@@ -65,7 +65,10 @@ const SCRIPTED: [&str; 7] = [
 /// The scripted session's [`EXACT`] rows, `<kind> <payload>` a line, oldest
 /// first ([`as_lines`]): the ring's own rows at 5b3bb8c388 (6G-5's parent,
 /// where each writer formatted its ring row itself and the ring was held to
-/// the log), so the view is held to an oracle its grammar did not write.
+/// the log), so the view is held to an oracle its grammar did not write. The
+/// two exit rows say `why=marker` since an exit after a finished task keeps
+/// how it ended (DESIGN-sessions-as-subagents §2), a record's move, not the
+/// grammar's.
 const SCRIPTED_GOLDEN: &str = concat!(
     "spawned state=spawning\n",
     "status-change phase=idle outcome=failure exit_code=1 signal=- confidence=strong\n",
@@ -78,9 +81,9 @@ const SCRIPTED_GOLDEN: &str = concat!(
     "inbox 2 from=s-peer@n-lab kind=ask off=8\n",
     "task-change rev=1 state=working attention=0\n",
     "task-change rev=2 state=done attention=0 why=marker\n",
-    "task-change rev=3 state=exited attention=0 why=exit exit=2\n",
+    "task-change rev=3 state=exited attention=0 why=marker exit=2\n",
     "meta-change field=attention value=look%20here\n",
-    "task-change rev=4 state=exited attention=1 why=exit exit=2\n",
+    "task-change rev=4 state=exited attention=1 why=marker exit=2\n",
     "harness-act act=approve-all@v1 holder=codex-alab@1\n",
     "harness-act act=finished@v1 holder=codex-alab@1\n",
     "harness-act act=usage-resume@v1 holder=codex-alab@1\n",

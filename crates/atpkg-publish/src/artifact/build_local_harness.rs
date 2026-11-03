@@ -94,7 +94,9 @@ fn payload(path: &Path, private: bool) -> Result<Payload> {
             .map_err(|e| Error::refused(format!("private harness executable: {e}")))?
             .0
     } else {
-        std::fs::File::open(path).map_err(|e| Error::io("open compiler output", &e))?
+        crate::identity::open_regular_nonblock(path)
+            .map_err(|e| Error::io("open compiler output", &e))?
+            .0
     };
     let opened = file
         .metadata()
@@ -147,11 +149,8 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn copy_new(from: &Path, to: &Path) -> Result<()> {
-    let mut input =
-        std::fs::File::open(from).map_err(|e| Error::io(format!("open {}", from.display()), &e))?;
-    let meta = input
-        .metadata()
-        .map_err(|e| Error::io("executable metadata", &e))?;
+    let (mut input, meta) = crate::identity::open_regular_nonblock(from)
+        .map_err(|e| Error::io(format!("open {}", from.display()), &e))?;
     if !meta.is_file() || !atpkg::platform::dir_meta_is_private(&meta) {
         return Err(Error::refused(
             "the compiler output is not a regular executable",

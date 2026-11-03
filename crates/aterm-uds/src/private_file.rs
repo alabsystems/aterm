@@ -757,90 +757,6 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     check_private_dir(dir)
 }
 
-/// Acquire an exclusive lock on an already validated file, waiting only for
-/// actual lock contention until `deadline`. A first attempt is always made,
-/// including when the deadline has passed. Other I/O errors return immediately.
-/// The caller must keep the file private, recheck its identity after acquisition,
-/// and explicitly unlock it before closing or transferring ownership.
-///
-/// # Errors
-/// Returns `WouldBlock` with `busy` when the lock remains held at the deadline,
-/// or the original error of attempting the lock.
-pub fn lock_exclusive_until(file: &std::fs::File, deadline: Instant, busy: &str) -> io::Result<()> {
-    lock_exclusive_until_with(file, deadline, busy, || {})
-}
-
-/// [`lock_exclusive_until`], calling `held` after each actual contention result
-/// before waiting. A test may release its holder there without timing assumptions.
-///
-/// # Errors
-/// Returns [`lock_exclusive_until`]'s errors.
-pub fn lock_exclusive_until_with(
-    file: &std::fs::File,
-    deadline: Instant,
-    busy: &str,
-    mut held: impl FnMut(),
-) -> io::Result<()> {
-    crate::keep_out_of_children(file)?;
-    let mut backoff = Duration::from_millis(1);
-    loop {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the caller retains the validated file and explicitly unlocks before close"
-        )]
-        let taken = file.try_lock();
-        match taken {
-            Ok(()) => return Ok(()),
-            Err(std::fs::TryLockError::Error(error)) => return Err(error),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(io::Error::new(io::ErrorKind::WouldBlock, busy.to_owned()));
-                }
-                #[cfg(any(test, debug_assertions))]
-                LOCK_WAIT_OBSERVER.with(|observer| {
-                    if let Some(observer) = observer.borrow_mut().as_mut() {
-                        observer(file);
-                    }
-                });
-                held();
-                std::thread::sleep(backoff.min(remaining));
-                backoff = (backoff * 2).min(Duration::from_millis(50));
-            }
-        }
-    }
-}
-
-#[cfg(any(test, debug_assertions))]
-type LockWaitObserver = Box<dyn FnMut(&std::fs::File)>;
-
-#[cfg(any(test, debug_assertions))]
-std::thread_local! {
-    static LOCK_WAIT_OBSERVER: std::cell::RefCell<Option<LockWaitObserver>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Test support: observe actual, unexpired lock contention on this thread while
-/// `run` executes. The previous observer is restored even if `run` unwinds.
-/// The observer must not recursively acquire a contended lock on this thread.
-#[cfg(any(test, debug_assertions))]
-pub fn with_lock_wait_observer<T>(
-    observer: impl FnMut(&std::fs::File) + 'static,
-    run: impl FnOnce() -> T,
-) -> T {
-    struct Restore(Option<LockWaitObserver>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            LOCK_WAIT_OBSERVER.with(|observer| {
-                *observer.borrow_mut() = self.0.take();
-            });
-        }
-    }
-    let previous = LOCK_WAIT_OBSERVER.with(|current| current.replace(Some(Box::new(observer))));
-    let _restore = Restore(previous);
-    run()
-}
-
 /// An exclusive lock on `<dir>/<name>`, lifted from aterm-net's `fleet_member` (`BookLock`).
 ///
 /// - **How it is opened.** `name` must be one path component, and `dir` must pass
@@ -888,7 +804,7 @@ impl PrivateLock {
         name: &str,
         within: Duration,
         busy: &str,
-        mut held: impl FnMut(),
+        held: impl FnMut(),
     ) -> io::Result<PrivateLock> {
         one_component_io(name)?;
         check_private_dir(dir)?;
@@ -900,31 +816,10 @@ impl PrivateLock {
                 format!("{} is no regular file", path.display()),
             ));
         }
-        crate::keep_out_of_children(&file)?;
         // `None`: a wait no clock can represent, which has no deadline.
         let deadline = Instant::now().checked_add(within);
-        let mut backoff = Duration::from_millis(1);
-        loop {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "the guard's own take: its Drop releases by LOCK_UN"
-            )]
-            let taken = file.try_lock();
-            match taken {
-                Ok(()) => return Ok(Self(file)),
-                Err(std::fs::TryLockError::Error(e)) => return Err(e),
-                Err(std::fs::TryLockError::WouldBlock)
-                    if deadline.is_none_or(|d| Instant::now() < d) =>
-                {
-                    held();
-                    std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(Duration::from_millis(50));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(io::Error::new(io::ErrorKind::WouldBlock, busy.to_owned()));
-                }
-            }
-        }
+        crate::file_lock::lock_exclusive_with_deadline(&file, deadline, busy, held)?;
+        Ok(Self(file))
     }
 }
 
@@ -936,8 +831,10 @@ impl Drop for PrivateLock {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     use super::{
         OwnedRead, PrivateDir, PrivateFileError, PrivateLock, PrivateRead, create_private_dir,
@@ -949,6 +846,45 @@ mod tests {
     const BUSY: &str = "another holder has it";
 
     #[test]
+    fn lock_wait_stops_when_hook_or_backoff_exhausts_the_budget() {
+        for release_in_hook in [true, false] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let dir = dir_in(root.path(), "state", 0o700);
+            let first = std::cell::RefCell::new(Some(
+                PrivateLock::take(&dir, ".lock", Duration::ZERO, BUSY).unwrap(),
+            ));
+            let (second, _) = super::open_private(&dir, ".lock").unwrap();
+            let start = Instant::now();
+            let deadline = start + Duration::from_secs(60);
+            let clock = std::cell::Cell::new(start);
+            let pauses = std::cell::Cell::new(0);
+            let refused = crate::file_lock::lock_exclusive_with_clock(
+                &second,
+                Some(deadline),
+                BUSY,
+                || {
+                    if release_in_hook {
+                        drop(first.borrow_mut().take());
+                        clock.set(deadline);
+                    }
+                },
+                || clock.get(),
+                |_| {
+                    pauses.set(pauses.get() + 1);
+                    drop(first.borrow_mut().take());
+                    clock.set(deadline);
+                },
+            )
+            .unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(refused.to_string(), BUSY);
+            assert_eq!(pauses.get(), usize::from(!release_in_hook));
+            assert!(first.borrow().is_none());
+            let _free = PrivateLock::take(&dir, ".lock", Duration::ZERO, BUSY).unwrap();
+        }
+    }
+
+    #[test]
     fn exclusive_wait_observes_contention_and_acquires_after_release() {
         let root = aterm_tempfile::tempdir().unwrap();
         let dir = dir_in(root.path(), "state", 0o700);
@@ -956,7 +892,7 @@ mod tests {
             Some(PrivateLock::take(&dir, ".lock", std::time::Duration::ZERO, BUSY).unwrap());
         let (second, _) = super::open_private(&dir, ".lock").unwrap();
         let mut told = 0;
-        super::lock_exclusive_until_with(
+        crate::file_lock::lock_exclusive_until_with(
             &second,
             std::time::Instant::now() + std::time::Duration::from_secs(60),
             BUSY,
@@ -968,7 +904,7 @@ mod tests {
         .unwrap();
         assert_eq!(told, 1, "only actual lock contention is waited for");
         let mut retried = false;
-        let refused = super::lock_exclusive_until_with(
+        let refused = crate::file_lock::lock_exclusive_until_with(
             &super::open_private(&dir, ".lock").unwrap().0,
             std::time::Instant::now(),
             BUSY,

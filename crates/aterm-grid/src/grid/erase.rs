@@ -444,13 +444,14 @@ impl Grid {
     }
 
     /// Reset the deferred wrap the way xterm's protected erase (`ClearInLine2`)
-    /// does: only when some cell of the erase's span is unprotected.
+    /// does: only when some cell of the erase's span is unprotected. A glyph the cursor follows
+    /// goes the same way as the wrap ([`Self::cursor_follows_glyph`]).
     fn reset_wrap_unless_span_protected(
         &mut self,
         full_rows: core::ops::Range<u16>,
         partial: Option<(u16, u16)>,
     ) {
-        if !self.storage.pending_wrap() {
+        if !self.storage.pending_wrap() && !self.storage.follows_glyph {
             return;
         }
         let cols = self.storage.cols;

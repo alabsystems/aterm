@@ -50,6 +50,8 @@ struct At<'a> {
     rate: Option<u64>,
     worker_ok: bool,
     spawned: Option<Spawned>,
+    /// The free bytes a worker claimed at this look is told to reach.
+    target: Option<u64>,
 }
 
 impl<'a> At<'a> {
@@ -66,6 +68,7 @@ impl<'a> At<'a> {
             rate: None,
             worker_ok: true,
             spawned: None,
+            target: None,
         }
     }
 
@@ -127,6 +130,7 @@ impl<'a> At<'a> {
                 worker_ok: self.worker_ok,
                 task: Some(&task),
                 spawned: self.spawned.as_ref(),
+                target: self.target,
             },
         };
         f(&look)
@@ -297,9 +301,11 @@ fn a_worker_is_due_only_where_the_lease_reads_one_of_its_reasons() {
                 sid: Some("w-1".to_owned()),
                 at_ms: T0 - WORKER_COOLDOWN_MS + WORKER_MS,
                 rose: 0,
+                target_met: None,
             },
             orphan_ms: None,
             free_at_claim: None,
+            target: None,
         }),
         ..cooled(T0 - WORKER_COOLDOWN_MS)
     };
@@ -546,15 +552,18 @@ fn no_look_ends_an_episode_while_its_worker_works() {
     assert_eq!(said, Said::Spent);
     assert!(matches!(started, Some(WorkerSaid::Started { .. })));
     at.spawned = None;
-    at.worker = Some(("w-1".to_owned(), TaskSeen::Stalled("sign-in".to_owned())));
     let (said, over) = at.look(&mut lease, now + 180_000);
     assert_eq!(said, Said::Spent, "the step reads the worker still running");
+    assert_eq!(over, None);
+    at.worker = Some(("w-1".to_owned(), TaskSeen::Ended));
+    let (said, over) = at.look(&mut lease, now + 240_000);
+    assert_eq!(said, Said::Spent, "the step reads the worker still running");
     assert!(
-        matches!(&over, Some(WorkerSaid::Over { why, .. }) if why == "stalled:sign-in"),
+        matches!(&over, Some(WorkerSaid::Over { why, .. }) if why == "finished"),
         "{over:?}"
     );
     assert_eq!(
-        at.look(&mut lease, now + 240_000).0,
+        at.look(&mut lease, now + 300_000).0,
         Said::Ended { asks: 0 },
         "once it is over the episode ends"
     );
@@ -569,6 +578,67 @@ fn no_look_ends_an_episode_while_its_worker_works() {
     );
 }
 
+/// A STALL IS NO END: a worker stopped at a screen reads working (the window's read of a stalled
+/// record), so the lease keeps it running, the rounds keep waiting on it, and it is over once,
+/// `finished`, when it moves on and lands; it once ended `stalled:held` at the stall, said it did
+/// not finish beside a worker that went on to land, and lost its time bound. CONTROL: one that
+/// stays stalled is over once, `expired`, at [`WORKER_MS`], and never again.
+#[test]
+fn a_stalled_worker_runs_on_and_is_over_once_when_it_ends_or_its_time_runs_out() {
+    let start = |lease: &mut Lease, at: &mut At<'_>| {
+        let (now, said) = out(lease, at);
+        assert_eq!(said, Some(WorkerSaid::Claimed));
+        at.spawned = Some(Spawned {
+            at_ms: now,
+            outcome: Ok("w-1".to_owned()),
+        });
+        at.worker = Some(("w-1".to_owned(), TaskSeen::Working));
+        let now = now + 60_000;
+        assert!(matches!(
+            at.look(lease, now).1,
+            Some(WorkerSaid::Started { .. })
+        ));
+        at.spawned = None;
+        now
+    };
+    let h = host(1);
+
+    let mut lease = Lease::default();
+    let mut at = At::short(&h);
+    let started = start(&mut lease, &mut at);
+    let mut overs = Vec::new();
+    let mut now = started;
+    for _ in 0..10 {
+        now += 60_000;
+        overs.extend(at.look(&mut lease, now).1);
+    }
+    assert!(overs.is_empty(), "a stall ends nothing: {overs:?}");
+    assert!(worker(&lease).works(), "{:?}", worker(&lease).state);
+    at.worker = Some(("w-1".to_owned(), TaskSeen::Ended));
+    for _ in 0..3 {
+        now += 60_000;
+        overs.extend(at.look(&mut lease, now).1);
+    }
+    assert!(
+        matches!(overs.as_slice(), [WorkerSaid::Over { why, here: true, .. }] if why == "finished"),
+        "{overs:?}"
+    );
+
+    let mut lease = Lease::default();
+    let mut at = At::short(&h);
+    let started = start(&mut lease, &mut at);
+    let mut overs = Vec::new();
+    let mut now = started;
+    while now < started + WORKER_MS + 180_000 {
+        now += 60_000;
+        overs.extend(at.look(&mut lease, now).1);
+    }
+    assert!(
+        matches!(overs.as_slice(), [WorkerSaid::Over { why, here: true, .. }] if why == "expired"),
+        "{overs:?}"
+    );
+}
+
 #[test]
 fn closing_an_episode_keeps_a_working_worker_and_drops_one_that_is_over() {
     let h = host(1);
@@ -579,6 +649,7 @@ fn closing_an_episode_keeps_a_working_worker_and_drops_one_that_is_over() {
             state,
             orphan_ms: None,
             free_at_claim: None,
+            target: None,
         }),
         last_worker_ms: Some(T0),
         last_ask_ms: Some(T0 - 60_000),
@@ -617,6 +688,7 @@ fn closing_an_episode_keeps_a_working_worker_and_drops_one_that_is_over() {
         sid: Some("w-1".to_owned()),
         at_ms: T0 + WORKER_MS,
         rose: 0,
+        target_met: None,
     });
     over.close();
     assert_eq!(over.worker, None);
@@ -765,6 +837,7 @@ fn the_workers_task_fits_its_cap_in_plain_characters_and_asks_for_its_report() {
         for said in [
             "aterm harness disk free",
             "Nothing left:",
+            "Could not finish:",
             "disk-free filling:",
             "disk-free owner-only:",
             "(rule disk-free@v1 worker)",
@@ -818,6 +891,7 @@ fn with_a_step_in_hand_the_owner_is_needed_only_when_the_fill_outruns_its_window
                 state,
                 orphan_ms: None,
                 free_at_claim: None,
+                target: None,
             }),
             last_worker_ms: Some(started),
             ..open_in(Phase::Out {
@@ -873,4 +947,146 @@ fn with_a_step_in_hand_the_owner_is_needed_only_when_the_fill_outruns_its_window
     assert!(at.needed(&asked, now), "5 minutes left");
     at.done = None;
     assert!(!at.needed(&asked, now), "aterm may still free space");
+}
+
+/// A DISK WORKER THAT COULD NOT FINISH IS OVER, AND SAYS SO: its record's failed conclusion ends the
+/// worker with `failed:<why>` and the rounds go on, the rise beside it being the volume's, and
+/// whether that reached what it was told to reach. NEGATIVE CONTROL: a worker that finished short of
+/// the target says `finished` and that it did not reach it, and a lease with no target says nothing
+/// of one.
+#[test]
+fn a_disk_worker_that_could_not_finish_ends_failed_with_its_rise_and_its_target() {
+    let run = |seen: TaskSeen, target: Option<u64>, free_at_end: u64| {
+        let h = host(1);
+        let mut lease = Lease::default();
+        let mut at = At::short(&h);
+        at.target = target;
+        at.held = vec![("s-a".to_owned(), HeldBy::Limit)];
+        at.look(&mut lease, T0);
+        let mut now = T0 + NOMINATE_MS;
+        let (_, claimed) = at.look(&mut lease, now);
+        assert_eq!(claimed, Some(WorkerSaid::Claimed));
+        at.spawned = Some(Spawned {
+            at_ms: now,
+            outcome: Ok("w-1".to_owned()),
+        });
+        at.worker = Some(("w-1".to_owned(), TaskSeen::Working));
+        now += 60_000;
+        at.look(&mut lease, now);
+        at.spawned = None;
+        at.worker = Some(("w-1".to_owned(), seen));
+        at.reads(free_at_end);
+        now += 60_000;
+        let (_, over) = at.look(&mut lease, now);
+        // No `disk-free` row of the worker's in the ledger: it removed nothing itself.
+        let lines = why_lines(&lease, &[], &[], now);
+        (over.expect("over"), lines)
+    };
+    let (over, lines) = run(
+        TaskSeen::Failed("could-not-finish".to_owned()),
+        Some(40 * GIB),
+        23 * GIB,
+    );
+    assert!(
+        matches!(
+            &over,
+            WorkerSaid::Over { why, rose, target_met: Some(false), here: true, .. }
+                if why == "failed:could-not-finish" && *rose == 3 * GIB
+        ),
+        "{over:?}"
+    );
+    let said = over.describe();
+    assert!(said.contains("did not reach its target"), "{said}");
+    let line = lines
+        .iter()
+        .find(|l| l.contains("worker:"))
+        .expect("a worker line");
+    assert!(
+        line.contains("failed: it said it could not finish") && line.contains("whoever freed it"),
+        "{line}"
+    );
+    assert!(line.contains("it removed 0 B itself"), "{line}");
+
+    let (over, lines) = run(TaskSeen::Ended, Some(40 * GIB), 41 * GIB);
+    assert!(
+        matches!(&over, WorkerSaid::Over { why, target_met: Some(true), .. } if why == "finished"),
+        "{over:?}"
+    );
+    let line = lines
+        .iter()
+        .find(|l| l.contains("worker:"))
+        .expect("a line");
+    assert!(line.contains("finished: it finished its task"), "{line}");
+    assert!(line.contains("reached its target"), "{line}");
+
+    let (over, _) = run(TaskSeen::Ended, Some(40 * GIB), 21 * GIB);
+    assert!(
+        matches!(&over, WorkerSaid::Over { why, target_met: Some(false), .. } if why == "finished"),
+        "{over:?}"
+    );
+    let (over, _) = run(TaskSeen::Ended, None, 21 * GIB);
+    assert!(
+        matches!(
+            &over,
+            WorkerSaid::Over {
+                target_met: None,
+                ..
+            }
+        ),
+        "{over:?}"
+    );
+    assert!(!over.describe().contains("target"));
+}
+
+/// A person reads every end word; only `finished` is one that finished.
+#[test]
+fn a_workers_end_words_say_how_it_ended() {
+    for (why, finished, words) in [
+        ("finished", true, "it finished its task"),
+        (
+            "failed:could-not-finish",
+            false,
+            "it said it could not finish",
+        ),
+        ("failed:exit", false, "it exited before finishing"),
+        ("failed:off", false, "a person turned its Autopilot off"),
+        (
+            "failed:off-ctl",
+            false,
+            "a manager or a script turned its Autopilot off",
+        ),
+        ("failed:repeated", false, "it kept repeating the same reply"),
+        ("failed:expired", false, "its time ran out"),
+        ("failed:held", false, "it ended unfinished (held)"),
+        ("stalled:held", false, "it ended unfinished (stalled:held)"),
+        (
+            "gone",
+            false,
+            "its tab or the aterm running it ended before it finished",
+        ),
+        ("expired", false, "its time ran out"),
+        ("lost", false, "it never started"),
+        ("spawn:refused", false, "it could not start (refused)"),
+    ] {
+        assert_eq!(worker_end_words(why), (finished, words.to_owned()), "{why}");
+    }
+}
+
+/// A lease a build before this one wrote reads: no target, and an end with no word on one.
+#[test]
+fn a_lease_without_a_target_still_reads() {
+    let w: WorkerState =
+        aterm_json::from_str(r#"{"state":"over","why":"finished","sid":"w-1","at_ms":5,"rose":7}"#)
+            .expect("an older worker state");
+    assert!(
+        matches!(
+            w,
+            WorkerState::Over {
+                target_met: None,
+                rose: 7,
+                ..
+            }
+        ),
+        "{w:?}"
+    );
 }

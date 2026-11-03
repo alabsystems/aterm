@@ -11,6 +11,7 @@ impl Grid {
     /// Tab (move to next tab stop).
     #[inline]
     pub fn tab(&mut self) {
+        self.storage.cursor_state.follows_glyph = false;
         let max_col = self.storage.max_col_for_row(self.storage.cursor.row);
         let start = usize::from(self.storage.cursor.col.saturating_add(1));
         let end = usize::from(max_col);
@@ -40,6 +41,7 @@ impl Grid {
             self.tab();
             return;
         }
+        self.storage.cursor_state.follows_glyph = false;
         let margins = self.storage.horizontal_margins();
         let max_col = self.storage.max_col_for_row(self.storage.cursor.row);
         let col = self.storage.cursor.col;
@@ -100,6 +102,7 @@ impl Grid {
     /// Back tab (CBT, CSI Ps Z): move to the previous tab stop, or column 0.
     #[inline]
     pub fn back_tab(&mut self) {
+        self.storage.cursor_state.follows_glyph = false;
         let max_col = usize::from(self.storage.max_col_for_row(self.storage.cursor.row));
         let current = usize::from(self.storage.cursor.col).min(max_col);
         if current == 0 {
@@ -121,6 +124,7 @@ impl Grid {
             self.back_tab();
             return;
         }
+        self.storage.cursor_state.follows_glyph = false;
         let margins = self.storage.horizontal_margins();
         let max_col = usize::from(self.storage.max_col_for_row(self.storage.cursor.row));
         let current = usize::from(self.storage.cursor.col).min(max_col);

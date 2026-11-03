@@ -493,6 +493,7 @@ fn the_harness_route_renders_its_cards_and_controls() {
         product,
         claude: id == "claude",
         wanted: true,
+        asked: true,
         state,
         mark: aterm_agent::ai::state::Mark::Note,
         fact: fact.to_string(),

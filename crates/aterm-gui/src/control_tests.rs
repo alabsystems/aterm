@@ -4893,8 +4893,8 @@ fn app_route_denies_an_edge_before_it_looks() {
         "@0 spawn",
         "@0 spawn raise=maybe",
         "@s-abc spawn cwd=/w split=v",
-        "@0 tab close 0",
-        "@s-abc tab move 0 1",
+        "@0 tab close 1",
+        "@s-abc tab move 1 2",
         "@0 panes",
         "@0 hover on",
         "spawn",
@@ -6789,21 +6789,25 @@ fn tab_parses_each_form() {
     assert_eq!(parse_tab("new"), Some(TabAction::New));
     assert_eq!(parse_tab("next"), Some(TabAction::Next));
     assert_eq!(parse_tab("prev"), Some(TabAction::Prev));
-    assert_eq!(parse_tab("0"), Some(TabAction::Select(0)));
-    assert_eq!(parse_tab("3"), Some(TabAction::Select(3)));
-    assert_eq!(parse_tab("  2 "), Some(TabAction::Select(2)));
+    assert_eq!(parse_tab("1"), Some(TabAction::Select(0)));
+    assert_eq!(parse_tab("3"), Some(TabAction::Select(2)));
+    assert_eq!(parse_tab("  2 "), Some(TabAction::Select(1)));
     assert_eq!(parse_tab("close"), Some(TabAction::Close(None)));
-    assert_eq!(parse_tab("close 1"), Some(TabAction::Close(Some(1))));
-    assert_eq!(parse_tab("  close 0 "), Some(TabAction::Close(Some(0))));
+    assert_eq!(parse_tab("close 1"), Some(TabAction::Close(Some(0))));
+    assert_eq!(parse_tab("  close 2 "), Some(TabAction::Close(Some(1))));
     assert_eq!(
-        parse_tab("move 2 0"),
-        Some(TabAction::Move { from: 2, to: 0 })
+        parse_tab("move 2 1"),
+        Some(TabAction::Move { from: 1, to: 0 })
     );
     assert_eq!(
-        parse_tab("move 0 3"),
-        Some(TabAction::Move { from: 0, to: 3 })
+        parse_tab("move 1 3"),
+        Some(TabAction::Move { from: 0, to: 2 })
     );
     assert_eq!(parse_tab(""), None);
+    assert_eq!(parse_tab("0"), None);
+    assert_eq!(parse_tab("close 0"), None);
+    assert_eq!(parse_tab("move 0 1"), None);
+    assert_eq!(parse_tab("move 1 0"), None);
     assert_eq!(parse_tab("bogus"), None);
     assert_eq!(parse_tab("-1"), None);
     assert_eq!(parse_tab("close x"), None);
@@ -6813,6 +6817,21 @@ fn tab_parses_each_form() {
     assert_eq!(parse_tab("move 1 2 3"), None);
     assert_eq!(parse_tab("new x"), None);
     assert_eq!(parse_tab("next y"), None);
+}
+
+#[test]
+fn tab_replies_and_refusals_use_the_same_one_based_numbers() {
+    assert_eq!(super::control_input::tab_state_reply(0, 3), "OK 1 3\n");
+    assert_eq!(super::control_input::tab_state_reply(2, 3), "OK 3 3\n");
+    assert_eq!(super::control_input::tab_state_reply(0, 0), "OK 0 0\n");
+    assert_eq!(
+        super::control_input::no_such_tab(3, 3),
+        "no tab at index 4: this window has 3 tabs, indexes 1..=3"
+    );
+    assert_eq!(
+        super::control_input::no_such_tab(1, 1),
+        "no tab at index 2: this window has 1 tab, index 1"
+    );
 }
 
 fn selection_of_cell(term: &Arc<Mutex<Terminal>>, row: i32, col: u16) -> String {
@@ -12994,6 +13013,75 @@ fn turn_settle_gone_rows() {
 }
 
 #[test]
+fn turn_reports_only_the_exact_retained_shell_block_witness() {
+    const PROMPT: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07";
+    for scenario in ["complete", "running", "multiple", "reset", "screen"] {
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, PROMPT);
+        store.write().unwrap().register(h.clone());
+        let block = h.term.lock().unwrap().current_block().unwrap().id;
+        let paste = |text: &str| {
+            h.term.lock().unwrap().process(text.as_bytes());
+            true
+        };
+        let press = |_: &str| {
+            let mut t = h.term.lock().unwrap();
+            if scenario == "screen" {
+                t.process(b"\r\nworking\r\n");
+            } else {
+                // Ordinary command output latches the existing verification watcher;
+                // the one-minute window is only a hang detector, never an expected wait.
+                t.process(b"\r\n\x1b]133;C\x07working\r\n");
+                if scenario != "running" {
+                    t.process(b"done\r\n\x1b]133;D;0\x07");
+                    t.process(PROMPT);
+                }
+                if scenario == "multiple" {
+                    t.process(b"again\r\n\x1b]133;C\x07");
+                } else if scenario == "reset" {
+                    t.reset();
+                }
+            }
+            true
+        };
+        let verify = if scenario == "screen" { "seq" } else { "block" };
+        let out = cmd_turn(
+            &h.term,
+            &store,
+            0,
+            &format!(
+                "settle=submitted submit_verify={verify} submit_window=60000 timeout=60000 echo hi"
+            ),
+            &h.ctx,
+            &TurnIo {
+                paste: &paste,
+                press: &press,
+                ..TurnIo::paste_only()
+            },
+        );
+        let verdict = out.lines().next().unwrap_or("");
+        assert!(verdict.contains("submitted=1"), "{scenario}: {out}");
+        let reported = verdict
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("block="));
+        let expected = if scenario == "screen" {
+            "screen"
+        } else {
+            "block"
+        };
+        assert!(
+            verdict.contains(&format!(" submit_by={expected}")),
+            "{scenario}: {out}"
+        );
+        if matches!(scenario, "complete" | "running") {
+            assert_eq!(reported, Some(block.to_string().as_str()), "{out}");
+        } else {
+            assert!(reported.is_none(), "{scenario}: {out}");
+        }
+    }
+}
+
+#[test]
 fn turn_settle_submitted_answers_at_the_verified_submit_on_a_screen_that_never_rests() {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -14826,10 +14914,17 @@ fn the_bridge_verbs_refuse_every_scope_but_the_bridge_body() {
         ),
         "OK 1\n"
     );
+    let empty = run(Scope::Bridge, "outbox");
+    let (header, body) = empty.split_once('\n').expect("a framed outbox reply");
+    let mut fields = header.split_whitespace();
     assert_eq!(
-        run(Scope::Bridge, "outbox"),
-        "OK 0\n",
-        "an empty outbox is a zero-length frame, not a refusal"
+        (fields.next(), fields.next()),
+        (Some("OK"), Some("0")),
+        "an empty outbox is a zero-length frame: {empty:?}"
+    );
+    assert!(
+        body.is_empty(),
+        "a zero-length frame has no body: {empty:?}"
     );
     assert_eq!(
         run(Scope::Bridge, &format!("outbox sent {sid} 1 off=9")),
@@ -14852,6 +14947,25 @@ fn the_bridge_verbs_refuse_every_scope_but_the_bridge_body() {
                 spec.name
             );
         }
+    }
+}
+
+#[test]
+fn a_bridge_verb_counts_in_the_handler_row_the_bridges_own_tally_splits_it_by() {
+    use handler_tally::Row;
+    for (verb, rest, row) in [
+        ("deliver", "s-b receipt=3 off=9", Row::Deliver),
+        ("deliver", "s-b fetched=9 err=refused", Row::Deliver),
+        ("outbox", "sent s-a 4 off=17", Row::Sent),
+        ("outbox", "sent s-a 4 off=- reason=refused", Row::Sent),
+        ("outbox", "", Row::Outbox),
+        ("outbox", "earlier-receipts=1", Row::Outbox),
+        ("link", "mirror on", Row::OtherBridge),
+        ("hello", "lane=2 build=x", Row::OtherBridge),
+        ("log-take", "", Row::OtherBridge),
+        ("log-landed", "", Row::OtherBridge),
+    ] {
+        assert_eq!(bridge_tally_row(verb, rest), row, "{verb} {rest}");
     }
 }
 
@@ -16517,6 +16631,7 @@ fn refused_guarded_escape_leaves_vim_custody_unchanged() {
 #[test]
 #[cfg(unix)]
 fn a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does() {
+    use crate::task_launch::Untyped;
     let (h, rx) = guarded_pipe_session(1);
     // SAFETY: guarded_pipe_session returned this new write descriptor; the
     // session/sink borrow it and no other owner closes it. No writer is pending.
@@ -16588,7 +16703,7 @@ fn a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does() 
         |prompt| crate::task_launch::type_launch_line(&store, &h.sid, h.nonce, prompt, "worker");
     let observed = observe();
     assert!(
-        launch(observed).is_err_and(|why| why.contains("no task record")),
+        matches!(launch(observed), Err(Untyped::Refused(why)) if why.contains("no task record")),
         "a session with no task record is no worker to launch"
     );
     assert!(drain_pipe(&rx).is_empty());
@@ -16631,15 +16746,22 @@ fn a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does() 
     );
     assert!(drain_pipe(&rx).is_empty());
 
+    // A SCREEN THAT MOVED OFF THE OBSERVATION WROTE NOTHING, so its launcher may look again
+    // (`task_launch::type_at_prompt`); every other refusal is the worker's stall.
     let observed = observe();
     crate::term_lock(&h.term).process(b"changed");
-    assert!(launch(observed).is_err(), "output replaced the observation");
+    assert_eq!(
+        launch(observed),
+        Err(Untyped::Unsettled),
+        "output replaced the observation"
+    );
     assert!(drain_pipe(&rx).is_empty());
 
     let observed = observe();
     crate::term_lock(&h.term).process(b"\x1b]133;C\x07");
-    assert!(
-        launch(observed).is_err(),
+    assert_eq!(
+        launch(observed),
+        Err(Untyped::Unsettled),
         "a command already started on the prompt"
     );
     assert!(drain_pipe(&rx).is_empty());
@@ -16655,8 +16777,11 @@ fn a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does() 
     // been told is not there, beside any it spawned again.
     mark(crate::task_record::TaskState::Stalled, Some("startup"));
     let observed = observe();
-    let refused = launch(observed).expect_err("a stalled task");
-    assert!(refused.contains("stalled why=startup"), "{refused}");
+    let refused = launch(observed);
+    assert!(
+        matches!(&refused, Err(Untyped::Refused(why)) if why.contains("stalled why=startup")),
+        "{refused:?}"
+    );
     assert!(drain_pipe(&rx).is_empty());
     mark(crate::task_record::TaskState::Working, None);
     let observed = observe();
@@ -20556,6 +20681,23 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
     };
     assert_eq!(gate("survey"), Ok(DriveLine::Fleet));
     assert_eq!(gate("version"), Ok(DriveLine::Fleet));
+    #[cfg(unix)]
+    {
+        assert_eq!(wrote("vault status"), None);
+        assert_eq!(
+            wrote("vault approve abcd-efgh-ijkl-mnop 0123456789abcdef0123456789abcdef"),
+            Some("vault")
+        );
+        for refused in [
+            "vault",
+            "vault approve --all",
+            "vault edit",
+            "vault approve abcd-efgh-ijkl-mnop 0123456789abcdef0123456789abcdef command=sh",
+            "@s-00000000000000aa vault approve abcd-efgh-ijkl-mnop 0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(gate(refused).is_err(), "{refused}");
+        }
+    }
     assert_eq!(
         wrote("accounts-renew start=0123456789abcdef0123456789abcdef"),
         Some("accounts-renew")
@@ -20741,6 +20883,146 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         Some("spawn"),
         "recognized worker grammar leaves supervision admission to the launch path"
     );
+}
+
+/// EVERY DRIVE REFUSAL NAMES WHAT IT REFUSES: a remote lead's worker spawn with an option the
+/// gate does not serve was answered with the bare worker form, and this Mac's audit line carried
+/// the same words, so neither side could say which option was refused (2 refused from one Mac on
+/// 2026-11-02). Each refusal of the gate's own grammar names the word it refused, a verb, a
+/// `key=value` or a session, after `; not` in backticks, which `drive_admission` sends the
+/// driver and writes in the audit line alike. A worker's spawn names its Autopilot as on one Mac,
+/// and a word the spawn handler's own grammar refuses (a repeated `autopilot=`) is the gate's
+/// refusal too, named in both, never admitted to reach the handler's bare usage line.
+#[test]
+fn every_drive_refusal_names_the_word_it_refuses() {
+    const W: &str = "s-00000000000000aa";
+    const MINE: &str = "s-00000000000000bb";
+    const GONE: &str = "s-00000000000000cc";
+    // An absolute folder: Windows' names a drive.
+    const CWD: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+    let hosts = |sid: &SessionId| [W, MINE].contains(&sid.as_str());
+    let spawned = |sid: &SessionId| sid.as_str() == W;
+    let gate = |line: &str| drive_gate(line, &hosts, &spawned, &|_| false);
+    // Each refused line and the word its refusal names.
+    let mut refusals: Vec<(String, String)> = [
+        ("spawn agent=claude identity=x len=5", "identity=x"),
+        ("spawn agent=claude autopilot=off len=5", "autopilot=off"),
+        ("spawn agent=claude autopilot=Land len=5", "autopilot=Land"),
+        ("spawn agent=bogus len=5", "agent=bogus"),
+        ("spawn agent=claude raise=true len=5", "raise=true"),
+        ("spawn agent=claude cwd=src len=5", "cwd=src"),
+        ("spawn agent=claude window=1 len=5", "window=1"),
+        ("spawn agent=claude len=5 -", "-"),
+        ("spawn agent=claude \"model=x", "\"model=x"),
+        (
+            "spawn agent=claude autopilot=cruise autopilot=land len=5",
+            "autopilot=land",
+        ),
+        ("spawn agent=claude model=--yolo len=5", "model=--yolo"),
+        ("spawn agent=claude from=ctl len=5", "from=ctl"),
+        // Named as every reply names a peer's words, a forged `trust=` field escaped.
+        ("spawn agent=claude trust=x len=5", "trust\\=x"),
+        ("@1 status", "@1"),
+        ("@self text", "@self"),
+        ("settings set columns 80", "settings"),
+        ("await inbox", "await inbox"),
+    ]
+    .map(|(line, word)| (line.to_owned(), word.to_owned()))
+    .into();
+    refusals.extend([
+        (
+            format!("spawn agent=claude from={MINE} len=5"),
+            format!("from={MINE}"),
+        ),
+        (format!("spawn cwd={CWD} len=5"), "len=5".to_owned()),
+        (format!("spawn cwd={CWD} theme=x"), "theme=x".to_owned()),
+        (format!("spawn cwd={CWD} cwd={CWD}"), format!("cwd={CWD}")),
+        (format!("@{W} meta set autopilot cruise"), "meta".to_owned()),
+        (format!("@{W} restart"), "restart".to_owned()),
+        (format!("@{W} feed-bin 5"), "feed-bin".to_owned()),
+        (
+            format!("hold {W} on origin=local"),
+            "origin=local".to_owned(),
+        ),
+        (format!("hold {W} maybe"), "maybe".to_owned()),
+        (format!("hold {GONE} on"), GONE.to_owned()),
+        (format!("hold @{W} on"), format!("@{W}")),
+        (format!("@{W} hold {W} on"), format!("@{W}")),
+        (format!("@{GONE} status"), format!("@{GONE}")),
+        (format!("@{W} close now"), "now".to_owned()),
+        (format!("@{MINE} close"), format!("@{MINE}")),
+        (format!("@{W} blocks"), "blocks".to_owned()),
+        (format!("await task @{W},@1"), "@1".to_owned()),
+    ]);
+    let mut unnamed: Vec<String> = refusals
+        .iter()
+        .filter_map(|(line, word)| {
+            let refused = gate(line).expect_err(line);
+            assert!(!refused.contains('\n'), "{line:?}: one line: {refused:?}");
+            (!refused.contains(&format!("`{word}`")))
+                .then(|| format!("{line:?} names no `{word}`: {refused:?}"))
+        })
+        .collect();
+    // A read of the driver's own untouched shell that its grammar refuses.
+    let read = format!("@{W} blocks many");
+    let refused = drive_gate(&read, &hosts, &spawned, &|_| true).expect_err(&read);
+    if !refused.contains("`blocks many`") {
+        unnamed.push(format!("{read:?} names no `blocks many`: {refused:?}"));
+    }
+    assert!(unnamed.is_empty(), "{unnamed:#?}");
+    let long = format!("spawn agent=claude x{}=1 len=5", "y".repeat(400));
+    let refused = gate(&long).expect_err("an unknown key");
+    assert!(
+        refused.len() < 400 && refused.contains("`xyyy"),
+        "a long word is named by its head alone: {refused}"
+    );
+    assert!(gate("spawn agent=claude").is_err(), "no task frame");
+    for (line, admitted) in [
+        (
+            "spawn agent=claude autopilot=cruise len=5",
+            "spawn agent=claude autopilot=cruise len=5 raise=false",
+        ),
+        (
+            "spawn agent=codex autopilot=land raise=false len=5",
+            "spawn agent=codex autopilot=land raise=false len=5",
+        ),
+    ] {
+        match gate(line) {
+            Ok(DriveLine::Act {
+                line,
+                write: Some(DriveAct { verb: "spawn", .. }),
+            }) => assert_eq!(line, admitted),
+            other => panic!("{line}: a worker's Autopilot was refused: {other:?}"),
+        }
+    }
+    #[cfg(unix)]
+    {
+        let store = crate::session_store::new_store();
+        let _driving = crate::fabric::DrivingAs::enter(crate::fabric::Driver {
+            node: "03".repeat(16),
+            host: "mac-03".to_owned(),
+        });
+        FLEET_AUDITED.with(|audited| audited.borrow_mut().clear());
+        let Err(refused) = drive_admission(
+            Request::parse("spawn agent=claude identity=x len=5".to_owned()),
+            Scope::Fleet {
+                content: true,
+                drive: true,
+            },
+            &store,
+        ) else {
+            panic!("an option the gate does not serve was admitted");
+        };
+        assert!(
+            refused.starts_with("ERR denied: ") && refused.contains("`identity=x`"),
+            "the driver reads the refused word: {refused:?}"
+        );
+        let audited = FLEET_AUDITED.with(|audited| audited.take());
+        assert!(
+            matches!(audited.as_slice(), [line] if line.contains("`identity=x`")),
+            "this Mac's audit line names it too: {audited:?}"
+        );
+    }
 }
 
 #[test]
@@ -20975,6 +21257,127 @@ fn a_drives_record_names_what_moved() {
 }
 
 #[test]
+fn a_driven_worker_stays_its_nodes_to_close_after_this_process_forgets_it() {
+    let dir = aterm_tempfile::tempdir().expect("a scratch folder");
+    DRIVE_WORKERS_DIR.with(|d| *d.borrow_mut() = Some(dir.path().join("drive-workers")));
+    let store = crate::session_store::new_store();
+    let driver = crate::fabric::Driver {
+        node: "0a".repeat(16),
+        host: "mac-0a".to_owned(),
+    };
+    let _driving = crate::fabric::DrivingAs::enter(driver.clone());
+    let worker = SessionId::new("s-0000000000f00d01");
+    let forget = || {
+        DRIVE_SPAWNED
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|spawned| spawned.sid != worker);
+    };
+    assert_eq!(drive_owned(&worker, &driver.node), None, "not spawned yet");
+    let spawn = DriveAct {
+        shell: false,
+        verb: "spawn",
+        sid: None,
+        hold: None,
+    };
+    note_drive_act(&spawn, &format!("OK {}\n", worker.as_str()), &store);
+    forget();
+    assert_eq!(drive_owned(&worker, &driver.node), Some(false));
+    assert!(drive_may_close(&store, &worker, &driver.node));
+    assert_eq!(drive_owned(&worker, "foreign"), None, "another node's");
+    let other = SessionId::new("s-0000000000f00d02");
+    assert_eq!(drive_owned(&other, &driver.node), None, "another session");
+    let close = DriveAct {
+        shell: false,
+        verb: "close",
+        sid: Some(worker.clone()),
+        hold: None,
+    };
+    note_drive_act(&close, "ERR close deferred\n", &store);
+    assert_eq!(drive_owned(&worker, &driver.node), Some(false), "refused");
+    note_drive_act(&close, "OK closed\n", &store);
+    assert_eq!(drive_owned(&worker, &driver.node), None, "closed");
+
+    let shell = SessionId::new("s-0000000000f00d03");
+    let opened = DriveAct {
+        shell: true,
+        verb: "spawn",
+        sid: None,
+        hold: None,
+    };
+    note_drive_act(&opened, &format!("OK {}\n", shell.as_str()), &store);
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("drive-workers"))
+            .expect("the folder")
+            .count(),
+        0,
+        "a plain shell's ownership does not outlive this process"
+    );
+    DRIVE_WORKERS_DIR.with(|d| *d.borrow_mut() = None);
+}
+
+/// A worker still hosted keeps its ownership file at any age; only a gone one's old file goes.
+#[cfg(unix)]
+#[test]
+fn a_still_hosted_workers_old_file_outlives_the_prune() {
+    let dir = aterm_tempfile::tempdir().expect("a scratch folder");
+    let workers = dir.path().join("drive-workers");
+    DRIVE_WORKERS_DIR.with(|d| *d.borrow_mut() = Some(workers.clone()));
+    let store = crate::session_store::new_store();
+    let (handle, _output) = pipe_session(8231);
+    let stalled = handle.sid.clone();
+    store.write().unwrap().register(handle);
+    let gone = SessionId::new("s-0000000000f00d11");
+    std::fs::create_dir_all(&workers).expect("the folder");
+    let old =
+        std::time::SystemTime::now() - DRIVE_WORKER_FILE_AGE - std::time::Duration::from_secs(3600);
+    for sid in [&stalled, &gone] {
+        let file = workers.join(sid.as_str());
+        std::fs::write(&file, "0b".repeat(16)).expect("a record");
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|f| f.set_modified(old))
+            .expect("an old mtime");
+    }
+    let driver = crate::fabric::Driver {
+        node: "0b".repeat(16),
+        host: "mac-0b".to_owned(),
+    };
+    let _driving = crate::fabric::DrivingAs::enter(driver);
+    let fresh = SessionId::new("s-0000000000f00d12");
+    let spawn = DriveAct {
+        shell: false,
+        verb: "spawn",
+        sid: None,
+        hold: None,
+    };
+    note_drive_act(&spawn, &format!("OK {}\n", fresh.as_str()), &store);
+    assert!(
+        workers.join(stalled.as_str()).exists(),
+        "a hosted worker keeps its record"
+    );
+    assert!(
+        !workers.join(gone.as_str()).exists(),
+        "a gone worker's old record goes"
+    );
+    assert!(
+        workers.join(fresh.as_str()).exists(),
+        "the new worker is recorded"
+    );
+    DRIVE_WORKERS_DIR.with(|d| *d.borrow_mut() = None);
+}
+
+#[test]
+fn a_drives_close_named_after_its_verb_is_told_the_form() {
+    let no = |_: &SessionId| false;
+    let refusal = drive_gate("close s-00000000000000aa", &no, &no, &no).expect_err("no selector");
+    assert!(refusal.contains("@s-… close"), "{refusal}");
+    let other = drive_gate("frobnicate", &no, &no, &no).expect_err("another verb");
+    assert!(!other.contains("@s-… close"), "{other}");
+}
+
+#[test]
 fn a_drives_typing_is_credited_to_its_host_over_the_fleet() {
     let ctx = test_ctx();
     let driver = crate::fabric::Driver {
@@ -20986,6 +21389,64 @@ fn a_drives_typing_is_credited_to_its_host_over_the_fleet() {
     assert_eq!(
         caller.who,
         crate::typed_by::Who::Word("mac-03 over the fleet".to_owned())
+    );
+}
+
+/// The `signal` verb names the program whose connection asked (`from=`, which the harness host
+/// records when it leaves an agent that stop ended) as its typing is credited, never aterm's own
+/// harness: an `aterm ctl` a tab's agent ran is that tab's, past the CLI's own process, and one
+/// run from no tab is the program's own words.
+#[test]
+fn a_signal_names_the_program_that_asked_it_but_never_the_harness() {
+    use crate::typed_by::{Caller, Who};
+    let ctx = test_ctx();
+    let store = session_store::new_store();
+    let mut lab = session_store::test_handle(7431);
+    lab.shell_identity = aterm_pty::ShellIdentity::unproven(700);
+    lab.ctx.meta.lock().unwrap().role = Some("lab-sweep".into());
+    store.write().unwrap().register(lab);
+    {
+        let _harness = ServingPrincipal::enter(Principal::Harness);
+        assert_eq!(
+            signal_from(Scope::Owner, &ctx, &store),
+            None,
+            "the harness's own"
+        );
+    }
+    let group = |pid: i32| Some(pid);
+    let comm = |pid: i32| (pid == 900).then(|| "aterm".to_string());
+    // `aterm ctl` (pid 900) run by a Claude Code (800) under the lab tab's shell (700), and the
+    // same CLI run from no tab.
+    let in_tab = |pid: i32| match pid {
+        900 => Some(800),
+        800 => Some(700),
+        _ => Some(1),
+    };
+    let no_tab = |_: i32| Some(1);
+    for (parent, named) in [
+        (&in_tab as &dyn Fn(i32) -> Option<i32>, "lab-sweep"),
+        (&no_tab, "aterm (pid 900)"),
+    ] {
+        let mut memo = Some(Caller::new(Who::client_with(
+            Some(900),
+            1,
+            parent,
+            &group,
+            &comm,
+        )));
+        let _serving = ServingCaller::enter(&mut memo);
+        assert_eq!(
+            signal_from(Scope::Owner, &ctx, &store).as_deref(),
+            Some(named)
+        );
+    }
+    let _driving = crate::fabric::DrivingAs::enter(crate::fabric::Driver {
+        node: "03".repeat(16),
+        host: "mac-03".to_owned(),
+    });
+    assert_eq!(
+        signal_from(Scope::Owner, &ctx, &store).as_deref(),
+        Some("mac-03 over the fleet")
     );
 }
 

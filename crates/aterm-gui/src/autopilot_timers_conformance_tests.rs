@@ -291,6 +291,7 @@ impl TimerDrive {
             claim_ended: false,
             not_claim_worker: false,
             claim_worker: None,
+            task: None,
         }
     }
 

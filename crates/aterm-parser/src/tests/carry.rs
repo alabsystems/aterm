@@ -437,6 +437,22 @@ fn restore_carry_refuses_every_invalid_carry() {
             CarryRefusal::SubparamMask,
         ),
         (
+            "the cap's mark on a list that is not full",
+            ParserCarry {
+                subparam_mask: 1 << MAX_PARAMS,
+                ..csi(vec![1; MAX_PARAMS - 1])
+            },
+            CarryRefusal::SubparamMask,
+        ),
+        (
+            "a bit past the cap's mark",
+            ParserCarry {
+                subparam_mask: 1 << (MAX_PARAMS + 1),
+                ..csi(vec![1; MAX_PARAMS])
+            },
+            CarryRefusal::SubparamMask,
+        ),
+        (
             "a mask with no params",
             ParserCarry {
                 subparam_mask: 1,
@@ -704,7 +720,7 @@ fn restore_carry_accepts_the_edge_of_every_bound() {
         ParserCarry {
             state: State::CsiParam,
             params: vec![u16::MAX; MAX_PARAMS],
-            subparam_mask: (1 << MAX_PARAMS) - 1,
+            subparam_mask: (1 << (MAX_PARAMS + 1)) - 1,
             current_param: u32::MAX,
             param_started: true,
             last_was_colon: true,
@@ -951,9 +967,8 @@ fn assert_restored_state_is_safe(parser: &Parser, at: &str) {
         !parser.dcs_active && !parser.apc_active,
         "{at}: a consumer is armed"
     );
-    assert_eq!(
-        parser.subparam_mask >> parser.params.len(),
-        0,
+    assert!(
+        crate::csi::subparam_mask_fits(parser.subparam_mask, parser.params.len()),
         "{at}: subparameter bits past the parameters"
     );
     assert!(

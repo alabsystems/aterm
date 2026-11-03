@@ -70,6 +70,79 @@ mod native {
         }
     }
 
+    /// One native mailbox shared by readers in this process. The profile has one owner.
+    pub type SharedMailbox = std::sync::Arc<std::sync::Mutex<aterm_mail::proton::Proton>>;
+    type Slot = std::sync::Arc<
+        std::sync::Mutex<std::sync::Weak<std::sync::Mutex<aterm_mail::proton::Proton>>>,
+    >;
+
+    /// Remaining operation budget capped for one bounded step.
+    pub fn operation_remaining(end: Option<Instant>, cap: Duration) -> Result<Duration, String> {
+        let left = end.map_or(cap, |end| {
+            end.saturating_duration_since(Instant::now()).min(cap)
+        });
+        if left.is_zero() {
+            Err("Mail operation deadline expired".into())
+        } else {
+            Ok(left)
+        }
+    }
+
+    pub fn shared_mailbox(
+        home: &Path,
+        credentials: Credentials<'_>,
+    ) -> Result<SharedMailbox, String> {
+        shared_mailbox_until(home, credentials, None)
+    }
+
+    pub fn shared_mailbox_until(
+        home: &Path,
+        credentials: Credentials<'_>,
+        end: Option<Instant>,
+    ) -> Result<SharedMailbox, String> {
+        static SLOTS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<std::path::PathBuf, Slot>>> =
+            std::sync::OnceLock::new();
+        let profile = HeadlessMail::profile_path(home, credentials.email);
+        let slot = {
+            let registry = SLOTS.get_or_init(Default::default);
+            let mut slots = loop {
+                let pause = operation_remaining(end, Duration::from_millis(10))?;
+                match registry.try_lock() {
+                    Ok(slots) => break slots,
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err("Mail registry lock failed".into());
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(pause),
+                }
+            };
+            slots.retain(|_, slot| {
+                std::sync::Arc::strong_count(slot) > 1
+                    || slot
+                        .try_lock()
+                        .map_or(true, |session| session.strong_count() != 0)
+            });
+            slots.entry(profile).or_default().clone()
+        };
+        let mut slot = loop {
+            let pause = operation_remaining(end, Duration::from_millis(10))?;
+            match slot.try_lock() {
+                Ok(slot) => break slot,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err("Mail account lock failed".into());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(pause),
+            }
+        };
+        if let Some(mailbox) = slot.upgrade() {
+            return Ok(mailbox);
+        }
+        let mailbox =
+            HeadlessMail::connect_until(home, credentials, |_| {}, end)?.into_mailbox()?;
+        let mailbox = std::sync::Arc::new(std::sync::Mutex::new(mailbox));
+        *slot = std::sync::Arc::downgrade(&mailbox);
+        Ok(mailbox)
+    }
+
     pub struct HeadlessMail {
         cdp: browser::CdpClient,
         child: browser::BrowserChild,
@@ -80,6 +153,7 @@ mod native {
         home: std::path::PathBuf,
         credentials: Option<StoredCredentials>,
         api_headers: BTreeMap<String, Secret>,
+        operation_deadline: Option<Instant>,
     }
 
     impl HeadlessMail {
@@ -131,13 +205,34 @@ mod native {
             credentials: Credentials<'_>,
             progress: impl FnMut(&str),
         ) -> Result<Self, String> {
+            Self::connect_until(home, credentials, progress, None)
+        }
+
+        fn within(&self, cap: Duration) -> Result<Duration, String> {
+            operation_remaining(self.operation_deadline, cap)
+        }
+
+        fn connect_until(
+            home: &Path,
+            credentials: Credentials<'_>,
+            progress: impl FnMut(&str),
+            end: Option<Instant>,
+        ) -> Result<Self, String> {
+            if end.is_some_and(|end| Instant::now() >= end) {
+                return Err("Mail operation deadline expired".into());
+            }
             let profile = Self::profile_path(home, credentials.email);
-            let executable = headless_fetch::ensure_headless_browser(
-                Some(home),
-                &mut headless_fetch::Curl,
-                &|| false,
-            )?;
-            let mut result = Self::launch(home, &profile, executable)?;
+            let executable = if end.is_some() {
+                browser::find_headless_browser(Some(home))
+                    .ok_or("No headless browser installed for bounded mail connection")?
+            } else {
+                headless_fetch::ensure_headless_browser(
+                    Some(home),
+                    &mut headless_fetch::Curl,
+                    &|| false,
+                )?
+            };
+            let mut result = Self::launch(home, &profile, executable, end)?;
             result.credentials = Some(credentials.into());
             result.navigate("https://mail.proton.me/")?;
             result.authenticate(progress)?;
@@ -156,14 +251,14 @@ mod native {
             let totp_secret = credentials.totp_secret.as_ref().map(Secret::expose);
             let mut submitted = (false, false, false, false);
             let mut last_state = String::new();
-            let deadline = Instant::now() + Duration::from_secs(60);
+            let deadline = Instant::now() + self.within(Duration::from_secs(60))?;
             loop {
                 if Instant::now() >= deadline {
                     return Err("Headless Proton sign-in did not reach the inbox".into());
                 }
                 let snapshot = self.evaluate(SNAPSHOT)?;
                 if snapshot.is_null() {
-                    std::thread::sleep(Duration::from_millis(250));
+                    std::thread::sleep(self.within(Duration::from_millis(250))?);
                     continue;
                 }
                 let page_url = snapshot["url"].as_str().unwrap_or("");
@@ -197,7 +292,7 @@ mod native {
                         self.local_id = account.into();
                         let marker = self.profile_path.join("mail-session-ready");
                         if !marker.is_file() {
-                            std::fs::write(marker, b"1")
+                            crate::harness::upgrade_models::write_atomic(&marker, "1")
                                 .map_err(|_| "Could not save browser session readiness")?;
                         }
                         progress("Headless mailbox identity verified");
@@ -244,9 +339,14 @@ mod native {
                     Some("needs_totp") => {
                         return Err("Headless mailbox requires an unavailable second factor".into());
                     }
+                    Some("needs_mailbox_password") => {
+                        return Err(
+                            "Headless mailbox requires an unavailable second password".into()
+                        );
+                    }
                     _ => {}
                 }
-                std::thread::sleep(Duration::from_millis(250));
+                std::thread::sleep(self.within(Duration::from_millis(250))?);
             }
         }
 
@@ -254,11 +354,16 @@ mod native {
             home: &Path,
             profile: &Path,
             executable: browser::HeadlessBrowser,
+            end: Option<Instant>,
         ) -> Result<Self, String> {
             aterm_types::fs_restricted::ensure_private_dir(profile)
                 .map_err(|_| "Could not create private mail browser profile")?;
-            let lock = ProfileLock::claim(profile)
-                .map_err(|_| "The mail browser profile is already in use")?;
+            let lock = ProfileLock::claim(profile).map_err(|error| match error {
+                super::super::browser_window::Refusal::Held(_) => {
+                    "The mail browser profile is already in use"
+                }
+                _ => "Could not lock the private mail browser profile",
+            })?;
             let (command_read, command_write) =
                 std::io::pipe().map_err(|_| "Could not create browser command pipe")?;
             let (event_read, event_write) =
@@ -282,33 +387,43 @@ mod native {
                 home: home.to_path_buf(),
                 credentials: None,
                 api_headers: BTreeMap::new(),
+                operation_deadline: end,
             };
             let target = result.cdp.call(
                 None,
                 "Target.createTarget",
                 json!({"url":"about:blank"}),
-                WAIT,
+                result.within(WAIT)?,
             )?;
             let target = target["targetId"].as_str().ok_or("No browser page")?;
             let attached = result.cdp.call(
                 None,
                 "Target.attachToTarget",
                 json!({"targetId":target,"flatten":true}),
-                WAIT,
+                result.within(WAIT)?,
             )?;
             result.session = attached["sessionId"]
                 .as_str()
                 .ok_or("No browser session")?
                 .into();
-            result
-                .cdp
-                .call(Some(&result.session), "Page.enable", json!({}), WAIT)?;
-            result
-                .cdp
-                .call(Some(&result.session), "Runtime.enable", json!({}), WAIT)?;
-            result
-                .cdp
-                .call(Some(&result.session), "Network.enable", json!({}), WAIT)?;
+            result.cdp.call(
+                Some(&result.session),
+                "Page.enable",
+                json!({}),
+                result.within(WAIT)?,
+            )?;
+            result.cdp.call(
+                Some(&result.session),
+                "Runtime.enable",
+                json!({}),
+                result.within(WAIT)?,
+            )?;
+            result.cdp.call(
+                Some(&result.session),
+                "Network.enable",
+                json!({}),
+                result.within(WAIT)?,
+            )?;
             result.cdp.call(
                 Some(&result.session),
                 "Fetch.enable",
@@ -316,7 +431,7 @@ mod native {
                     {"urlPattern":"*","resourceType":"Image","requestStage":"Request"},
                     {"urlPattern":"*","resourceType":"Media","requestStage":"Request"}
                 ]}),
-                WAIT,
+                result.within(WAIT)?,
             )?;
             Ok(result)
         }
@@ -327,7 +442,7 @@ mod native {
                     Some(&self.session),
                     "Page.navigate",
                     json!({"url":url}),
-                    WAIT,
+                    self.within(WAIT)?,
                 )
                 .map(|_| ())
                 .map_err(|error| format!("Opening mail page: {error}"))
@@ -337,7 +452,7 @@ mod native {
                 Some(&self.session),
                 "Runtime.evaluate",
                 json!({"expression":script,"awaitPromise":true,"returnByValue":true}),
-                WAIT,
+                self.within(WAIT)?,
             ) {
                 Ok(answer) => answer,
                 // The outer operation polls the new document within its existing
@@ -348,7 +463,7 @@ mod native {
             if answer.get("exceptionDetails").is_some() {
                 return Err("Headless mail page operation failed".into());
             }
-            let deadline = Instant::now() + WAIT;
+            let deadline = Instant::now() + self.within(WAIT)?;
             loop {
                 let requests = self
                     .cdp
@@ -413,6 +528,7 @@ mod native {
             let headers = aterm_json::to_string(&headers).map_err(|_| "Invalid session headers")?;
             let local =
                 aterm_json::to_string(&self.local_id).map_err(|_| "Invalid account route")?;
+            let timeout_ms = self.within(Duration::from_secs(25))?.as_millis().max(1);
             let value=self.evaluate(&format!(r#"(async () => {{
                 const local={local};
                 if(local===undefined) throw new Error('No account route');
@@ -421,7 +537,7 @@ mod native {
                 const headers={headers};
                 if(headers['x-pm-uid'] && session.UID!==headers['x-pm-uid']) throw new Error('Different session');
                 headers['x-pm-uid']=session.UID;
-                const response=await fetch('/api/auth/v4/sessions/local/key',{{headers,credentials:'include',redirect:'error',signal:AbortSignal.timeout(25000)}});
+                const response=await fetch('/api/auth/v4/sessions/local/key',{{headers,credentials:'include',redirect:'error',signal:AbortSignal.timeout({timeout_ms})}});
                 if(!response.ok) throw new Error('Session key unavailable');
                 const result=await response.json();
                 const bytes=value=>Uint8Array.from(atob(value),c=>c.charCodeAt(0));
@@ -480,8 +596,9 @@ mod native {
                 .transpose()
                 .map_err(|_| "Invalid API body")?
                 .unwrap_or_else(|| "undefined".into());
+            let timeout_ms = self.within(Duration::from_secs(25))?.as_millis().max(1);
             let response = self.evaluate(&format!(r#"(async () => {{
-              const signal=AbortSignal.timeout(25000);
+              const signal=AbortSignal.timeout({timeout_ms});
               const target=new URL({url});
               if(target.origin!=='https://mail.proton.me' || !/^\/api\/(core|mail)\/v4\//.test(target.pathname)) throw new Error('Invalid mail API URL');
               const response=await fetch(target.href, {{method:{method},body:{body},headers:{headers},credentials:'include',cache:'no-store',redirect:'error',signal}});
@@ -522,11 +639,19 @@ mod native {
                 .clone();
             let password = self.mailbox_key_password()?;
             let transport = BrowserTransport::new(self)?;
+            let end = transport.operation_deadline;
             let mut mailbox = aterm_mail::proton::Proton::with_transport(Box::new(transport));
-            if !mailbox.has_address(&email)? {
-                return Err("API session belongs to a different mailbox".into());
+            let unlock = |mailbox: &mut aterm_mail::proton::Proton| {
+                if !mailbox.has_address(&email)? {
+                    return Err("API session belongs to a different mailbox".into());
+                }
+                mailbox.unlock_mailbox_with_key_password(&password)
+            };
+            if let Some(end) = end {
+                mailbox.run_until(end, unlock)?;
+            } else {
+                unlock(&mut mailbox)?;
             }
-            mailbox.unlock_mailbox_with_key_password(&password)?;
             Ok(mailbox)
         }
     }
@@ -535,6 +660,7 @@ mod native {
         home: std::path::PathBuf,
         credentials: StoredCredentials,
         session: Option<HeadlessMail>,
+        operation_deadline: Option<Instant>,
     }
 
     impl BrowserTransport {
@@ -545,17 +671,22 @@ mod native {
                     .credentials
                     .clone()
                     .ok_or("No browser credentials")?,
+                operation_deadline: session.operation_deadline,
                 session: Some(session),
             })
         }
 
         fn session(&mut self) -> Result<&mut HeadlessMail, String> {
             if self.session.is_none() {
-                self.session = Some(HeadlessMail::connect_with_credentials(
+                self.session = Some(HeadlessMail::connect_until(
                     &self.home,
                     self.credentials.borrowed(),
                     |_| {},
+                    self.operation_deadline,
                 )?);
+            }
+            if let Some(session) = self.session.as_mut() {
+                session.operation_deadline = self.operation_deadline;
             }
             self.session
                 .as_mut()
@@ -577,7 +708,8 @@ mod native {
             Kind::Credentials
         } else if message.contains("verification") || message.contains("second factor") {
             Kind::Verification
-        } else if disconnected(&message)
+        } else if message == "Mail operation deadline expired"
+            || disconnected(&message)
             || message == "Headless mail page operation failed"
             || message.contains("did not reach the inbox")
         {
@@ -589,6 +721,12 @@ mod native {
     }
 
     impl aterm_mail::proton::ApiTransport for BrowserTransport {
+        fn set_deadline(&mut self, end: Option<Instant>) {
+            self.operation_deadline = end;
+            if let Some(session) = self.session.as_mut() {
+                session.operation_deadline = end;
+            }
+        }
         fn request(
             &mut self,
             method: aterm_http::Method,
@@ -684,6 +822,10 @@ mod native {
         fn transport_failures_separate_credentials_from_transient_disconnects() {
             use aterm_mail::proton_error::Kind;
             assert_eq!(
+                transport_error("Mail operation deadline expired".into()).kind,
+                Kind::Network
+            );
+            assert_eq!(
                 transport_error("Proton rejected the headless browser credentials".into()).kind,
                 Kind::Credentials
             );
@@ -725,4 +867,7 @@ mod native {
 }
 
 #[cfg(unix)]
-pub use native::{Credentials, HeadlessMail};
+pub use native::{
+    Credentials, HeadlessMail, SharedMailbox, operation_remaining, shared_mailbox,
+    shared_mailbox_until,
+};

@@ -1118,12 +1118,13 @@ impl Row {
     }
 
     fn shell_gone_afresh(&self) -> bool {
-        self.answered_by_its_tabs_agent()
+        self.fresh
+            && self.answered_by_its_tabs_agent()
             && matches!(&self.phase, Phase::Failed(why) if why == "shell-gone")
     }
 
     fn answered_by_its_tabs_agent(&self) -> bool {
-        self.fresh
+        (self.fresh || self.agent.record_prefix().is_some())
             && held_again_after_exit(self.agent)
             && self.down_after_exit()
             && !self.tab.is_empty()
@@ -3240,8 +3241,8 @@ const fn attended_is_person(agent: upgrade::Agent) -> bool {
 
 const fn held_again_after_exit(agent: upgrade::Agent) -> bool {
     match agent {
-        upgrade::Agent::Claude => true,
-        upgrade::Agent::Codex | upgrade::Agent::Muse | upgrade::Agent::Agy => false,
+        upgrade::Agent::Claude | upgrade::Agent::Muse | upgrade::Agent::Agy => true,
+        upgrade::Agent::Codex => false,
     }
 }
 
@@ -3294,6 +3295,7 @@ fn claude_wait_words(wait: &str) -> Option<&'static str> {
 fn relaunch_line_words(wait: &str) -> Option<&'static str> {
     Some(match wait {
         "exiting" => "it has not exited yet",
+        "held" => "its tab is held",
         "typing" => "the prompt it returned to does not read as empty",
         "mark-elsewhere" => "its shell and its screen disagree on where its prompt is",
         "unmarked" => "aterm sees no prompt where its shell returned",
@@ -3304,7 +3306,9 @@ fn relaunch_line_words(wait: &str) -> Option<&'static str> {
         "screen-unreadable" => "aterm cannot read its screen",
         "tab-ownership-changed" => "another program holds its tab now",
         "shell-moved" => "its shell moved to another directory and its line cannot carry a cd back",
-        "conversation-owner-ambiguous" => "another process still holds its conversation",
+        "conversation-owner-ambiguous" | "session-held" | "conversation-held" | "thread-locked" => {
+            "another process still holds its conversation"
+        }
         _ => return None,
     })
 }
@@ -3390,14 +3394,24 @@ fn stop_words(agent: upgrade::Agent, why: &str) -> String {
     };
     match why {
         "signal-refused" => format!("the system refused to stop the old {who}"),
-        "no-resume" => format!("the new {who} never picked the conversation back up"),
+        "no-resume" | "relaunch-unwitnessed" => {
+            format!("the new {who} never picked the conversation back up")
+        }
         "stale-exit" => format!("{who} ended and was never started again on the new build"),
         "shell-gone" => {
             "the shell it ran in is gone, so there is no prompt to start it at".to_string()
         }
-        "exited-before-continuing" => format!("the new {who} quit before it carried on"),
-        "relaunch-refused" => {
+        "exited-before-continuing" | "relaunch-ended" => {
+            format!("the new {who} quit before it carried on")
+        }
+        "relaunch-refused" | "resume-refused" => {
             "its prompt refused the line that starts it on the new build".to_string()
+        }
+        "no-session" | "conversation-gone" => {
+            "its conversation is gone, so there is nothing to resume".to_string()
+        }
+        "started-fresh" => {
+            format!("the new {who} opened a fresh conversation instead of resuming its own")
         }
         "resumed-elsewhere" => {
             "the conversation was resumed by hand, outside this upgrade".to_string()
@@ -3759,9 +3773,6 @@ fn holders(
             })
             .collect()
     };
-    if sessions.iter().all(|s| upgrade::Agent::keyed(s).is_some()) {
-        return Some(lanes_of(sessions));
-    }
     let down = agent_down_tabs(opts, sessions, now_s());
     let lanes = if down.is_empty() {
         lanes_of(sessions)
@@ -3774,6 +3785,9 @@ fn holders(
         }));
         lanes_of(&asked)
     };
+    if down.is_empty() && sessions.iter().all(|s| upgrade::Agent::keyed(s).is_some()) {
+        return Some(lanes);
+    }
     let first = match session_files(home) {
         Some(files) => files,
         None if matches!(
@@ -3912,7 +3926,6 @@ fn holder_of(sf: &upgrade::SessionFile, tabs: Option<&[LiveTab]>) -> Holder {
 fn agent_down_tabs(opts: &Opts, sessions: &BTreeSet<String>, now: u64) -> BTreeSet<String> {
     sessions
         .iter()
-        .filter(|s| upgrade::Agent::keyed(s).is_none())
         .filter_map(|s| {
             let st = load(opts, s)?;
             let taken = !st.tab.is_empty() && overtakable(&st, super::alive);
@@ -4182,11 +4195,10 @@ fn ask_within(
         });
         let Some(h) = taken else {
             let begun = match st.agent {
-                upgrade::Agent::Claude => "once the agent is signalled",
-                upgrade::Agent::Codex => "once its `/exit` is typed",
-                upgrade::Agent::Muse | upgrade::Agent::Agy => {
-                    "by any lane: no lane moves this agent"
+                upgrade::Agent::Claude | upgrade::Agent::Muse | upgrade::Agent::Agy => {
+                    "once the agent is signalled"
                 }
+                upgrade::Agent::Codex => "once its `/exit` is typed",
             };
             return Err(format!(
                 "the restart in tab {sid} is already under way: it is not held or hurried {begun}"
@@ -4231,7 +4243,9 @@ fn ask_within(
                 rank(a).cmp(&rank(b))
             })
         });
-    let Some((session, mut st)) = pick.map(|i| candidates.swap_remove(i)) else {
+    let Some(((session, mut st), down_after_exit)) =
+        pick.map(|i| (candidates.swap_remove(i), ranked[i].1.failed_after_exit()))
+    else {
         return Err(format!(
             "no upgrade is recorded for tab {sid}; `aterm harness upgrade {sid} --dry-run` \
              shows the plan"
@@ -4259,11 +4273,7 @@ fn ask_within(
                     st.forget_markers();
                     st.noted.clear();
                 }
-                Phase::Failed(why)
-                    if st.exited_at != 0
-                        && !(held_again_after_exit(st.agent)
-                            && held.iter().any(|h| h.session == session)) =>
-                {
+                Phase::Failed(why) if down_after_exit => {
                     return Err(match st.agent {
                         upgrade::Agent::Codex => format!(
                             "the upgrade in tab {sid} stopped after its `/exit` ({}): `--now` \
@@ -4295,13 +4305,19 @@ fn ask_within(
                             word(why),
                             word(&session)
                         ),
-                        upgrade::Agent::Muse | upgrade::Agent::Agy => {
-                            format!(
-                                "the upgrade in tab {sid} stopped ({}): no lane of aterm's moves \
-                                 this agent, and `--skip` quiets this record",
-                                word(why)
-                            )
-                        }
+                        upgrade::Agent::Muse => format!(
+                            "the upgrade in tab {sid} stopped after its SIGTERM ended the agent \
+                             ({}): `--now` re-arms only one that gave up — `muse resume` in the \
+                             tab takes its session back, and `--skip` quiets this record",
+                            word(why)
+                        ),
+                        upgrade::Agent::Agy => format!(
+                            "the upgrade in tab {sid} stopped after its SIGTERM ended the agent \
+                             ({}): `--now` re-arms only one that gave up — `agy` in the tab \
+                             (then `/resume`) takes its conversation back, and `--skip` quiets \
+                             this record",
+                            word(why)
+                        ),
                     });
                 }
                 Phase::Failed(why) => {
@@ -4386,7 +4402,9 @@ fn ask_within(
         },
     );
     announce_word(opts, now);
-    Ok((Row::of(&session, &st, now).in_flow(opts, now), held))
+    let mut row = Row::of(&session, &st, now).in_flow(opts, now);
+    row.held_again(&held, true);
+    Ok((row, held))
 }
 
 /// The window's view of its tabs' upgrades, kept by its host thread (`aterm-gui`'s `harness_host`).

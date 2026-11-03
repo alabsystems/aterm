@@ -197,6 +197,62 @@ pub mod backup;
 #[cfg(unix)]
 pub mod atomic_file;
 
+/// Elsewhere, only `atomic_file`'s bounded regular-file reads, which cross-platform callers
+/// (the manual's config and shim probes) already name: the writer and the config write lock
+/// above stay unix-only, as their modes and `flock` have no counterpart here.
+#[cfg(not(unix))]
+pub mod atomic_file {
+    use std::io::{self, Read as _};
+    use std::path::Path;
+
+    /// Maximum size in bytes of a configuration or state file read by `ConfigFile` (16 MiB).
+    pub const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+
+    /// Read a regular file up to `max_bytes`, returning its bytes and open-handle metadata.
+    /// Symbolic links are followed. Use [`crate::regular_file::open`] when the final component
+    /// must itself be a regular file.
+    ///
+    /// # Errors
+    /// Returns an error if `path` cannot be opened, is not a regular file, or exceeds
+    /// `max_bytes`.
+    pub fn read_regular(path: &Path, max_bytes: u64) -> io::Result<(Vec<u8>, std::fs::Metadata)> {
+        let file = std::fs::File::open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        if meta.len() > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("file exceeds {max_bytes} bytes"),
+            ));
+        }
+        let mut buf = Vec::new();
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut buf)?;
+        if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("file exceeds {max_bytes} bytes"),
+            ));
+        }
+        Ok((buf, meta))
+    }
+
+    /// Read a regular UTF-8 file up to `max_bytes`.
+    ///
+    /// # Errors
+    /// Returns an error if `path` cannot be opened, is not a regular file, exceeds
+    /// `max_bytes`, or is not valid UTF-8.
+    pub fn read_regular_text(path: &Path, max_bytes: u64) -> io::Result<String> {
+        let (bytes, _) = read_regular(path, max_bytes)?;
+        String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+}
+
 /// This account's own home as the account database has it ([`account::home`]), whatever `$HOME` says: what a launchd job of this login runs with.
 #[cfg(unix)]
 pub mod account;
@@ -222,6 +278,9 @@ pub mod elevation;
 /// A kernel witness of another process's death with its `wait(2)` status (the PTY keeper's death classifier), and the moment of it ([`exitwatch::ExitMoment`], read by `aterm ctl subscribe`'s redial).
 pub mod exitwatch;
 pub mod fdpass;
+/// Exclusive file-lock waits with bounded contention backoff and deadline rechecks.
+#[cfg(any(unix, windows))]
+pub mod file_lock;
 /// Test support (test and debug builds): the `git` a fixture runs, isolated from this machine.
 #[cfg(all(any(test, debug_assertions), not(target_arch = "wasm32")))]
 pub mod fixture_git;
@@ -289,6 +348,8 @@ pub mod ready;
 /// Unix-only: the process-wide reaper of children nobody else waits for (a dropped `spawnfd` child still running, a PTY shell past its deadline).
 #[cfg(unix)]
 pub mod reaper;
+/// Read-only regular-file handles without following a final symlink or Windows reparse point.
+pub mod regular_file;
 /// Verify's run records read back: their format, the bounded read of an admitted snapshot, the `dead_seen` append, what the live runs claim and the A1–A7 verdict on one process; the window's `sys left` and doctor read them, and aterm-verify writes them.
 pub mod runs;
 /// Secret bytes: scrubbed on drop, a redacted `Debug`, no `Clone`; and the process's no-core-dump switch.

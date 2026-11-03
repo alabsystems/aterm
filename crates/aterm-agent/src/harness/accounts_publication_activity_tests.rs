@@ -182,7 +182,6 @@ fn publication_case(cli: Cli, case: i64) -> [bool; 3] {
         let fx = UpkeepEffects {
             fetch: &|_, _| panic!("disabled upkeep fetched a source"),
             spawn_renewal: &|_| panic!("disabled upkeep started a login"),
-            quota_refresh: &|_, _, _, _| {},
             sync_cooldown: &cooldown,
             rediscovery: &rediscovery,
             renew_guard: &guard,

@@ -2783,6 +2783,8 @@ pub(crate) mod tests {
     fn stand_in_claims(_: &aterm_capacity::Ledger) -> Option<Vec<aterm_capacity::Record>> {
         LEDGER_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let record = |pid: u32, start_ms: u64, held: bool| aterm_capacity::Record {
+            accounting: aterm_capacity::Accounting::Holder,
+            timing: aterm_capacity::TimingEvidence::default(),
             pid,
             start_ms,
             seq: 0,

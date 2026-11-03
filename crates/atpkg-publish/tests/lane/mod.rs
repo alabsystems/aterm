@@ -7,6 +7,7 @@
 
 mod alab;
 mod fixture;
+mod host_choice;
 mod install;
 mod linux;
 mod resolve;

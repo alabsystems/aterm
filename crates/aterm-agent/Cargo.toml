@@ -193,6 +193,9 @@ aterm-dirfd = { workspace = true }
 aterm-secrets = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+# Signed-service activation shares the updater's native signature, complete-image store and
+# durable revocation-floor policy with the dev acceptance lab.
+aterm-update = { workspace = true }
 # `aterm fleet init|join|peers|allow|publish|sync|census|leave` (`fleet_member`): the fleet's key
 # file, join code, book of peers and the join's handshake and registration. Not
 # a new edge in the shipped graph — aterm-gui already links it — and unix-only,
@@ -203,6 +206,7 @@ aterm-net = { workspace = true }
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-harness = { workspace = true }
+aterm-models-db = { workspace = true }
 # The upgrade tests' pseudo-terminals, both ends close-on-exec from birth
 # (`open_pty_pair`): an `openpty(3)` pair is inheritable, and the shell spawned
 # onto it kept a copy of its own master. No cycle (aterm-pty does not depend

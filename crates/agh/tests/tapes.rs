@@ -63,28 +63,13 @@ fn a_verb_a_tape_cannot_hold_is_refused_and_no_file_is_made() {
     let transport = Arc::new(ScriptedTransport::new());
     let t = tape_path(dir.path(), "t");
     let t = t.to_str().expect("a UTF-8 path");
-    for args in [
-        vec!["--record", t, "auth", "status"],
-        vec![
-            "--record",
-            t,
-            "--as",
-            "dev",
-            "release",
-            "list",
-            "fixture-dev/app",
-        ],
-        vec![
-            "--record",
-            t,
-            "release",
-            "download",
-            "fixture-dev/app",
-            "v1",
-            "--asset",
-            "x",
-        ],
-        vec!["--record", t, "whoami"],
+    for (args, names) in [
+        (vec!["--record", t, "auth", "status"], "auth status"),
+        (vec!["--record", t, "whoami"], "whoami"),
+        (
+            vec!["--record", t, "repo", "clone", "fixture-dev/app", "d"],
+            "repo clone",
+        ),
     ] {
         let (mut ctx, captured) = scripted_ctx(dir.path(), &transport);
         assert_eq!(
@@ -93,6 +78,7 @@ fn a_verb_a_tape_cannot_hold_is_refused_and_no_file_is_made() {
             "{args:?}: {}",
             captured.stderr_text()
         );
+        assert!(error_why(&captured).contains(names), "{args:?}");
         assert!(!Path::new(t).exists(), "{args:?}");
     }
     assert!(transport.requests().is_empty());
@@ -236,7 +222,7 @@ fn a_tape_that_is_missing_or_not_a_tape_stops_the_run() {
 /// replay over an empty scripted transport answers the same. Each world holds the canonical
 /// config and both token files, which a tape must not read (plan §1, rule 12: unix-only files).
 #[cfg(unix)]
-mod over_the_fake {
+pub(crate) mod over_the_fake {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -252,19 +238,19 @@ mod over_the_fake {
 
     const APP: &str = "fixture-dev/app";
 
-    struct Ran {
-        exit: u8,
-        stdout: Vec<u8>,
-        stderr: String,
+    pub(crate) struct Ran {
+        pub(crate) exit: u8,
+        pub(crate) stdout: Vec<u8>,
+        pub(crate) stderr: String,
     }
 
-    struct World {
-        root: aterm_tempfile::TempDir,
-        fake: FakeGithub,
+    pub(crate) struct World {
+        pub(crate) root: aterm_tempfile::TempDir,
+        pub(crate) fake: FakeGithub,
     }
 
     impl World {
-        fn new(label: &str) -> World {
+        pub(crate) fn new(label: &str) -> World {
             let root = common::scratch(label);
             let fake = FakeGithub::start();
             common::canonical_tokens(root.path(), &fake, true, true);
@@ -276,11 +262,11 @@ mod over_the_fake {
             World { root, fake }
         }
 
-        fn tape(&self, label: &str) -> PathBuf {
+        pub(crate) fn tape(&self, label: &str) -> PathBuf {
             common::tape_path(self.root.path(), label)
         }
 
-        fn live(&self, args: &[&str]) -> Ran {
+        pub(crate) fn live(&self, args: &[&str]) -> Ran {
             let (mut ctx, captured) = common::ctx(self.root.path(), &self.fake, common::env());
             let exit = run_cli(&mut ctx, args);
             Ran {
@@ -290,7 +276,7 @@ mod over_the_fake {
             }
         }
 
-        fn offline(&self, args: &[&str]) -> Ran {
+        pub(crate) fn offline(&self, args: &[&str]) -> Ran {
             let fresh = common::scratch("tapes-replay");
             let transport = Arc::new(ScriptedTransport::new());
             let (mut ctx, captured) = agh::cli::Ctx::for_tests(
@@ -313,16 +299,16 @@ mod over_the_fake {
         }
     }
 
-    fn arg(path: &Path) -> &str {
+    pub(crate) fn arg(path: &Path) -> &str {
         path.to_str().expect("a UTF-8 path")
     }
 
-    fn read_tape(path: &Path) -> (TapeHeader, Vec<EffectRecord>) {
+    pub(crate) fn read_tape(path: &Path) -> (TapeHeader, Vec<EffectRecord>) {
         let text = std::fs::read_to_string(path).expect("the tape");
         tape::parse(&text).unwrap_or_else(|e| panic!("{e:?}: {text}"))
     }
 
-    fn exchanges(records: &[EffectRecord], door: &str) -> Vec<EffectRecord> {
+    pub(crate) fn exchanges(records: &[EffectRecord], door: &str) -> Vec<EffectRecord> {
         records
             .iter()
             .filter(|r| matches!(r, EffectRecord::Exchange { door: d, .. } if d == door))
@@ -330,7 +316,7 @@ mod over_the_fake {
             .collect()
     }
 
-    fn emit(records: &[EffectRecord], door: &str) -> Vec<u8> {
+    pub(crate) fn emit(records: &[EffectRecord], door: &str) -> Vec<u8> {
         let emits: Vec<&Vec<u8>> = records
             .iter()
             .filter_map(|r| match r {

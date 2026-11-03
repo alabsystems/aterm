@@ -150,8 +150,16 @@ pub fn default_gateway_hw() -> Option<Box<[u8]>> {
     #[cfg(target_os = "linux")]
     {
         linux_default_routes(
-            &std::fs::read_to_string("/proc/net/route").ok()?,
-            &std::fs::read_to_string("/proc/net/arp").ok()?,
+            &crate::atomic_file::read_regular_text(
+                std::path::Path::new("/proc/net/route"),
+                1024 * 1024,
+            )
+            .ok()?,
+            &crate::atomic_file::read_regular_text(
+                std::path::Path::new("/proc/net/arp"),
+                1024 * 1024,
+            )
+            .ok()?,
         )
         .primary?
         .gateway_hw
@@ -209,10 +217,17 @@ pub fn default_routes() -> DefaultRoutes {
     }
     #[cfg(target_os = "linux")]
     {
-        let Ok(route) = std::fs::read_to_string("/proc/net/route") else {
+        let Ok(route) = crate::atomic_file::read_regular_text(
+            std::path::Path::new("/proc/net/route"),
+            1024 * 1024,
+        ) else {
             return DefaultRoutes::default();
         };
-        let arp = std::fs::read_to_string("/proc/net/arp").unwrap_or_default();
+        let arp = crate::atomic_file::read_regular_text(
+            std::path::Path::new("/proc/net/arp"),
+            1024 * 1024,
+        )
+        .unwrap_or_default();
         linux_default_routes(&route, &arp)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

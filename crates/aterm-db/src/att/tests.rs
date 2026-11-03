@@ -476,6 +476,101 @@ fn revert_restores_what_one_save_changed() {
     assert_ne!(reverted["operation"], json!(operation));
 }
 
+/// Two replicas hold an owner edit and one excess automatic edit of the same cell. The
+/// excess edit arrives either before or after the owner edit, but is inert in both views.
+fn quota_revert_pair(owner_first: bool) -> (Lab, Handle, Digest, Digest) {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let owner = Registry::at(lab.paths[0].clone());
+    owner.open().unwrap();
+    owner.write(vec![machine(MC)]).unwrap();
+    let change = vec![put(&MACHINE, MC, "location", json!("rack b"))];
+    if owner_first {
+        owner.write(vec![change.clone()]).unwrap();
+    }
+    repair_commons(&lab, 6);
+    let automatic = |column: &str, value: Value| {
+        cell::change(
+            &MACHINE,
+            cell::CellKey {
+                pk: MC,
+                col: column,
+                elem: None,
+            },
+            &cell::CellValue::automatic(1, value),
+        )
+        .unwrap()
+    };
+    let mut records: Vec<_> = (0..registry::SELF_QUOTA)
+        .map(|n| vec![automatic("note", json!(format!("observation {n}")))])
+        .collect();
+    records.push(vec![automatic("location", json!("over quota"))]);
+    Registry::at(lab.paths[1].clone()).write(records).unwrap();
+    repair_commons(&lab, 6);
+    if !owner_first {
+        owner.write(vec![change.clone()]).unwrap();
+        repair_commons(&lab, 6);
+    }
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let view = handle.view().unwrap();
+    assert!(view.complete);
+    assert_eq!(view.quota.over.len(), 1);
+    assert_eq!(
+        view.project(&MACHINE).rows[MC].get("location"),
+        Some(&json!("rack b"))
+    );
+    let target = view.ops.iter().find(|op| op.changes == change).unwrap().id;
+    let excess = *view.quota.over.first().unwrap();
+    (lab, handle, target, excess)
+}
+
+fn assert_quota_revert(owner_first: bool) {
+    let (lab, handle, target, excess) = quota_revert_pair(owner_first);
+    let before = handle.view().unwrap().ops.len();
+    let undo = handle.revert([81; 16], target).unwrap();
+    assert_eq!(handle.revert([81; 16], target).unwrap(), undo);
+    let view = handle.view().unwrap();
+    assert_eq!(view.ops.len(), before + 1);
+    assert_eq!(
+        view.project(&MACHINE).rows[MC].get("location"),
+        Some(&json!("rack a"))
+    );
+    repair_commons(&lab, 6);
+    let peer = Handle::at(lab.paths[1].clone(), &REGISTRY).view().unwrap();
+    assert_eq!(view.cells, peer.cells);
+    assert!(peer.quota.over.contains(&excess));
+    assert!(peer.ops.iter().any(|op| op.id == excess));
+}
+
+/// A later automatic record past the peer's quota cannot block undoing the owner edit
+/// which both replicas still show as the cell's only candidate.
+/// NEGATIVE CONTROL: raw compensation refuses it as an affected proposal that changed.
+#[test]
+fn typed_revert_ignores_later_over_quota_edits() {
+    assert_quota_revert(true);
+}
+
+/// Compensation restores the same preimage the typed reader saw, not an inert automatic
+/// value retained before the owner edit. Both replicas retain that excess record as history.
+/// NEGATIVE CONTROL: raw compensation restores `over quota` instead of `rack a`.
+#[test]
+fn typed_revert_restores_the_preimage_without_over_quota_edits() {
+    assert_quota_revert(false);
+}
+
+/// An automatic record which changed no visible cell is not an eligible revert target.
+/// NEGATIVE CONTROL: raw compensation accepts the excess operation and appends a record.
+#[test]
+fn typed_revert_refuses_an_over_quota_target_without_appending() {
+    let (lab, handle, _, excess) = quota_revert_pair(true);
+    let before = handle.view().unwrap();
+    assert!(handle.revert([82; 16], excess).is_err());
+    let after = handle.view().unwrap();
+    assert_eq!(before.ops, after.ops);
+    assert_eq!(before.cells, after.cells);
+    let peer = Handle::at(lab.paths[1].clone(), &REGISTRY).view().unwrap();
+    assert_eq!(after.cells, peer.cells);
+}
+
 /// A revert is the owner's verb, never an automatic record, even where it restores a value an
 /// automatic path wrote: once this Mac has spent its whole quota, reverting an owner edit that
 /// sat over a birth value still restores the birth value.
@@ -663,6 +758,303 @@ fn check_names_a_spent_quota_and_asks_for_a_roll() {
         assert_eq!(spent.len(), 1, "{found:?}");
         assert_eq!(spent[0]["mine"], json!(true));
         assert_eq!(spent[0]["spent"], json!(registry::SELF_QUOTA));
-        assert!(found.contains(&json!({"finding": "roll", "reason": "quota"})));
+        assert!(found.contains(
+            &json!({"finding": "roll", "reason": "quota", "verb": "aterm db alab roll --apply"})
+        ));
     }
+}
+
+/// A filtered `edit --where` session never drops a stale row on reopen when a peer's concurrent
+/// edit moves that row outside the filter: the reopened file still shows `⚠ mine ‖ theirs` so
+/// the owner's edit is preserved and can be resolved in the second round.
+/// NEGATIVE CONTROL: with `edit::edit` re-exporting through `filters` alone on reopen, `MC`
+/// (now `parked` in the store) is excluded from `fresh.base` and `grid::reopen` silently drops
+/// `⚠ lost ‖ parked`: `` assertion failed: reopened.contains("⚠ lost ‖ parked") ``.
+#[test]
+fn filtered_edit_reopen_keeps_a_stale_row_that_left_the_filter() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let owner = Registry::at(lab.paths[0].clone());
+    owner.open().unwrap();
+    owner.write(vec![machine(MC)]).unwrap();
+    repair_commons(&lab, 6);
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let filters = [sheet::Where::parse("status=active").unwrap()];
+    let mut reopened = String::new();
+    let mut rounds = 0;
+    let edited = edit::edit(
+        &handle,
+        &MACHINE,
+        &filters,
+        false,
+        &mut |path: &Path, line: usize| {
+            rounds += 1;
+            let held = std::fs::read_to_string(path).unwrap();
+            if rounds == 1 {
+                Registry::at(lab.paths[1].clone())
+                    .write(vec![vec![put(&MACHINE, MC, "status", json!("parked"))]])
+                    .unwrap();
+                repair_commons(&lab, 6);
+                let row = record(&held, MC);
+                std::fs::write(path, type_in(&held, row, "status", "lost")).unwrap();
+            } else {
+                assert_eq!(line, 2);
+                reopened = held.clone();
+                let row = record(&held, MC);
+                std::fs::write(path, type_in(&held, row, "status", "lost")).unwrap();
+            }
+            Ok(())
+        },
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(edited.rounds, 2);
+    assert!(reopened.contains("⚠ lost ‖ parked"), "{reopened}");
+    assert_eq!(
+        handle.view().unwrap().project(&MACHINE).rows[MC].get("status"),
+        Some(&json!("lost"))
+    );
+}
+
+/// Unchecked set elements, non-boolean 3-part cell payloads and newer-build set columns stay
+/// redacted on every verb (unknown non-secret set words stay visible and read-only), and CLI
+/// refusals never quote an address or credential passed in the wrong argument slot.
+/// NEGATIVE CONTROLS: with `change_json` returning raw `cell.x` whenever `key.elem.is_some()`,
+/// history prints `TOKEN`; with `get` or `parse` formatting `{pk}` or `{flag}`, the refusal
+/// quotes `ann.lee@example.invalid` or `TOKEN`.
+#[test]
+fn unchecked_set_cells_and_cli_refusals_never_leak_tokens_or_addresses() {
+    const TOKEN: &str = concat!("ghp", "_cccccccccccccccccccccc");
+    let lab = Lab::new(&[Role::Writer]);
+    let owner = Registry::at(lab.paths[0].clone());
+    owner.open().unwrap();
+    let mut row = machine(MC);
+    row.push(crate::database::Change {
+        collection: MACHINE.name.to_owned(),
+        key: format!("{MC}.clis.{TOKEN}"),
+        value: Some(crate::typed::cell::CellValue::owner(1, json!(true)).encode()),
+    });
+    row.push(crate::database::Change {
+        collection: MACHINE.name.to_owned(),
+        key: format!("{MC}.clis.muse"),
+        value: Some(crate::typed::cell::CellValue::owner(1, json!(TOKEN)).encode()),
+    });
+    row.push(crate::database::Change {
+        collection: MACHINE.name.to_owned(),
+        key: format!("{MC}.tags.future-tag"),
+        value: Some(crate::typed::cell::CellValue::owner(2, json!(true)).encode()),
+    });
+    row.sort_by(|a, b| (&a.collection, &a.key).cmp(&(&b.collection, &b.key)));
+    owner.write(vec![row]).unwrap();
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let file = scratch.path().join("machine.tsv");
+    let paths = &lab.paths[0];
+    for reveal in [false, true] {
+        let words = |verb: &[&str]| {
+            let mut list = verb.to_vec();
+            if reveal {
+                list.push("--show-addresses");
+            }
+            text(&run(paths, &list))
+        };
+        let seen = [
+            (
+                "scan json",
+                words(&["scan", "alab/registry", "machine", "--json"]),
+            ),
+            (
+                "scan tsv",
+                words(&["scan", "alab/registry", "machine", "--tsv"]),
+            ),
+            ("get", words(&["get", "alab/registry", "machine", MC])),
+            ("history", words(&["history", "alab/registry", "machine"])),
+            ("check", words(&["check", "alab/registry"])),
+            (
+                "export",
+                words(&[
+                    "export",
+                    "alab/registry",
+                    "machine",
+                    "--tsv",
+                    file.to_str().unwrap(),
+                ]),
+            ),
+            ("file", std::fs::read_to_string(&file).unwrap()),
+        ];
+        for (verb, shown) in &seen {
+            assert!(!shown.contains(TOKEN), "{verb}: {shown}");
+        }
+        assert!(seen[0].1.contains(sheet::REFUSED), "{}", seen[0].1);
+        assert!(seen[1].1.contains("future-tag"), "{}", seen[1].1);
+        assert!(seen[3].1.contains(sheet::REFUSED), "{}", seen[3].1);
+    }
+
+    let addr = "ann.lee@example.invalid";
+    let opt = format!("--token={TOKEN}");
+    let bad_filter = format!("{addr}=1");
+    for bad in [
+        vec![addr],
+        vec![TOKEN, "--bogus"],
+        vec!["scan", "alab/registry", "machine", &opt],
+        vec!["get", "alab/registry", addr, MC],
+        vec!["get", "alab/registry", "address", addr],
+        vec!["scan", "alab/registry", "machine", "--where", &bad_filter],
+    ] {
+        let words: Vec<String> = bad.into_iter().map(str::to_owned).collect();
+        let why = command::run(paths, &words, &mut never_open, &mut |_| {})
+            .unwrap_err()
+            .0;
+        assert!(!why.contains("ann.lee") && !why.contains(TOKEN), "{why}");
+    }
+    for bad in [
+        vec![addr, "--apply"],
+        vec!["check", &opt],
+        vec!["check", addr],
+    ] {
+        let words: Vec<String> = bad.into_iter().map(str::to_owned).collect();
+        let why = crate::alab::command::run(paths, &words, None, &mut |_| Ok(()), 0)
+            .unwrap_err()
+            .0;
+        assert!(!why.contains("ann.lee") && !why.contains(TOKEN), "{why}");
+    }
+
+    for mismatched in [
+        vec!["scan", "alab/registry", "machine", "--tsv", "--json"],
+        vec!["ls", "--publish"],
+        vec!["check", "alab/registry", "--where", "status=active"],
+        vec![
+            "export",
+            "alab/registry",
+            "machine",
+            "--tsv",
+            "one.tsv",
+            "--tsv",
+            "two.tsv",
+        ],
+    ] {
+        let words: Vec<String> = mismatched.into_iter().map(str::to_owned).collect();
+        assert!(command::run(paths, &words, &mut never_open, &mut |_| {}).is_err());
+    }
+
+    let target = scratch.path().join("real.tsv");
+    std::fs::write(&target, "label\t=pk\n").unwrap();
+    std::fs::write(command::baseline(&target), "{}").unwrap();
+    let link = scratch.path().join("linked.tsv");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    std::fs::write(
+        command::baseline(&link),
+        export_machines(paths).base.to_json().to_string(),
+    )
+    .unwrap();
+    let apply_link = vec!["apply".to_owned(), link.to_str().unwrap().to_owned()];
+    assert!(command::run(paths, &apply_link, &mut never_open, &mut |_| {}).is_err());
+}
+
+/// `scan` refuses `--where` on `Kind::Owned` collections instead of silently returning every
+/// owned row unfiltered, `read_regular_utf8` refuses symlinks and directories without following
+/// them, and `Handle::apply` omits a stale row deletion from `retired`.
+/// NEGATIVE CONTROLS: without the `Kind::Owned` filter check in `scan`, `--where pk=none`
+/// returns `Ok`; with `std::fs::metadata` + `std::fs::read` in `read_regular_utf8`, reading a
+/// symlink returns `Ok("target\n")`; with `apply` echoing `plan.retired`, a stale row deletion
+/// still reports `[MC]` in `retired`.
+#[test]
+fn scan_refuses_owned_filters_and_grid_reads_refuse_symlinks_and_stale_retirements() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let owner = Registry::at(lab.paths[0].clone());
+    owner.open().unwrap();
+    owner.write(vec![machine(MC)]).unwrap();
+    repair_commons(&lab, 6);
+
+    let filter_words: Vec<String> = [
+        "scan",
+        "alab/registry",
+        "machine-facts",
+        "--where",
+        "pk=none",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let why = command::run(&lab.paths[0], &filter_words, &mut never_open, &mut |_| {})
+        .unwrap_err()
+        .0;
+    assert!(
+        why.contains("--where filters cells collections only"),
+        "{why}"
+    );
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let target = scratch.path().join("target.tsv");
+    std::fs::write(&target, "target\n").unwrap();
+    let link = scratch.path().join("link.tsv");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert!(read_regular_utf8(&link, 64, "unreadable", "oversize", "utf8").is_err());
+    assert!(read_regular_utf8(scratch.path(), 64, "unreadable", "oversize", "utf8").is_err());
+    assert_eq!(
+        read_regular_utf8(&target, 64, "unreadable", "oversize", "utf8").unwrap(),
+        "target\n"
+    );
+    assert_eq!(
+        read_regular_utf8(&target, 3, "unreadable", "oversize", "utf8")
+            .unwrap_err()
+            .0,
+        "oversize"
+    );
+
+    let file = scratch.path().join("machine.tsv");
+    let word = file.to_str().unwrap();
+    run(
+        &lab.paths[0],
+        &["export", "alab/registry", "machine", "--tsv", word],
+    );
+    // Peer concurrently changes the row's lifecycle before the owner deletes the row in the TSV.
+    Registry::at(lab.paths[1].clone())
+        .write(vec![vec![put(&MACHINE, MC, "row", json!("retired"))]])
+        .unwrap();
+    repair_commons(&lab, 6);
+    let header_only = format!(
+        "{}\n",
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+    );
+    std::fs::write(&file, header_only).unwrap();
+    // When a peer already retired the row, deleting it in the TSV writes nothing and reports
+    // `retired: []`.
+    let Output::Json(same_retire) = run(&lab.paths[0], &["apply", word]) else {
+        panic!("apply prints JSON");
+    };
+    assert_eq!(same_retire["written"], json!(0));
+    assert_eq!(same_retire["retired"], json!([]));
+
+    // When a peer writes `"live"` concurrently, the deletion is held back as stale and `retired`
+    // stays empty.
+    Registry::at(lab.paths[0].clone())
+        .write(vec![vec![put(&MACHINE, MC, "row", json!("live"))]])
+        .unwrap();
+    repair_commons(&lab, 6);
+    run(
+        &lab.paths[0],
+        &["export", "alab/registry", "machine", "--tsv", word],
+    );
+    Registry::at(lab.paths[1].clone())
+        .write(vec![vec![put(&MACHINE, MC, "row", json!("live"))]])
+        .unwrap();
+    repair_commons(&lab, 6);
+    let header_only = format!(
+        "{}\n",
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+    );
+    std::fs::write(&file, header_only).unwrap();
+    let Output::Json(stale_retire) = run(&lab.paths[0], &["apply", word]) else {
+        panic!("apply prints JSON");
+    };
+    assert_eq!(stale_retire["written"], json!(0));
+    assert_eq!(stale_retire["retired"], json!([]));
+    assert_eq!(stale_retire["stale"], json!([{"pk": MC, "column": "row"}]));
 }

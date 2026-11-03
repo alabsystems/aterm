@@ -29,6 +29,33 @@ pub fn bell_off(config: &str) -> String {
     }
 }
 
+/// Write a world's `aterm.toml` at `path`, private enough for its reader: every reader of
+/// that file refuses a group/world-writable one (`aterm_types::dirs::aterm_config_refusal`),
+/// and a plain write takes the host umask's mode — 664 on umask-002 hosts (the Lima guest,
+/// most Linux desktops) — so the instance would silently run on defaults, not this text.
+/// # Errors
+/// The write or the mode fix failed.
+pub(crate) fn write_aterm_toml(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(text.as_bytes())?;
+    drop(f);
+    // The creating mode is umask-masked and a pre-existing file keeps its own: pin it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 /// How long an instance may take to listen.
 pub const BOOT: Duration = Duration::from_secs(60);
 
@@ -85,7 +112,7 @@ impl World {
                 std::fs::create_dir_all(d)?;
                 std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))?;
             }
-            std::fs::write(w.cfg.join("aterm/aterm.toml"), bell_off(config))?;
+            write_aterm_toml(&w.cfg.join("aterm/aterm.toml"), &bell_off(config))?;
             private_home_roots(&w.home)?;
             std::fs::write(w.home.join(".profile"), "PS1='$ '\n")?;
             std::fs::write(w.home.join(".shrc"), "PS1='$ '\n")
@@ -262,6 +289,33 @@ mod prepared_world_tests {
         drop(reopened);
         assert!(identity.exists());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn world_config_is_never_group_or_world_writable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // A loose pre-existing file is the umask-002 case (664) made host-independent:
+        // the writer must pin it to a mode its reader accepts, not keep the old one.
+        let parent = world_parent();
+        let loose = parent.path().join("aterm.toml");
+        std::fs::write(&loose, "old").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o664)).unwrap();
+        super::write_aterm_toml(&loose, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&loose).unwrap(), "new");
+        let mode = std::fs::metadata(&loose).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o022,
+            0,
+            "mode {mode:o} would be refused by aterm_config_refusal"
+        );
+
+        let world = World::create_at(&parent.path().join("world"), CONFIG_OFF).unwrap();
+        let mode = std::fs::metadata(world.cfg.join("aterm/aterm.toml"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o022, 0, "world config mode {mode:o} is writable");
+    }
 }
 
 /// The development seams every lab world sets ([`World::env`], the lab runs' `lab_vars`, the
@@ -421,6 +475,7 @@ fn windowed_quiet(l: &Launch) -> Result<Option<aterm_capacity::Claim>, String> {
         return Ok(None);
     }
     crate::admission::quiet(&format!("a window of {}", l.aterm.display()))
+        .map(Some)
         .map_err(|f| f.msg.unwrap_or_default())
 }
 
@@ -1090,8 +1145,15 @@ pub fn cmd_instance(args: &[String]) -> Res {
             |(resident, pages)| format!(" pages=cold resident_at_ready={resident}/{pages}"),
         )
     });
+    // asked after the resident pages are read, so the question touches none of them
+    let build = read({
+        let said = inst.ctl(&["version"]);
+        (said.code == 0)
+            .then(|| crate::lab::build_named(&said.stdout))
+            .flatten()
+    });
     println!(
-        "instance pid={} sock={} band={} coalition={coalition} role={role} main_pri={main_pri}{kept}{pages}\n  drive it: {} ctl --sock {} <verb>   (image, text, send --stdin, metrics percentiles, …)\n  \
+        "instance pid={} sock={} build={build} band={} coalition={coalition} role={role} main_pri={main_pri}{kept}{pages}\n  drive it: {} ctl --sock {} <verb>   (image, text, send --stdin, metrics percentiles, …)\n  \
          world:    {}{}\n  it ends when this command does (Ctrl-C, SIGTERM)",
         inst.pid,
         inst.sock.display(),

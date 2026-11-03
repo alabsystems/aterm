@@ -5652,7 +5652,7 @@ fn land_a_fails_a_wrong_window_read() {
     );
     assert_eq!(l(&s, "claude", Scenario::L3).0, "FAIL");
     let mut s = seen_land_a("claude");
-    s.window.chip[0].1 = "window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"x\"".into();
+    s.window.chip[0].1 = "window=2 program=claude face=land drawn=\"⤓\" spoken=\"x\"".into();
     assert_eq!(l(&s, "claude", Scenario::L1).0, "FAIL");
     let mut s = seen_land_a("claude");
     s.window.chip[0].1 = behind("claude", "cruise");
@@ -6574,7 +6574,7 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
     if let Some(i) = d.idle.as_mut() {
         i.holds.clear();
     }
-    let b = front("window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"x\"");
+    let b = front("window=2 program=claude face=land drawn=\"⤓\" spoken=\"x\"");
     let held = [(Chain::CruiseN, &n), (Chain::LandB, &b), (Chain::Off, &off)];
     let v = surfaces::judge_end(&d, &held, "claude");
     assert_eq!(v.word(), "UNOBSERVED", "{}", v.why());
@@ -6633,7 +6633,7 @@ fn end_takes_agys_off_tab_as_its_switch_alone() {
     );
     let (w, why) = end(
         "agy",
-        "window=2 program=agy face=off drawn=\"○ off\" spoken=\"x\"",
+        "window=2 program=agy face=off drawn=\"○\" spoken=\"x\"",
     );
     assert_eq!(
         w, "PASS",
@@ -8490,8 +8490,8 @@ fn end_wants_each_holding_chains_own_hold() {
     };
     let n = front("window=2 program=claude face=cruise drawn=\"∞\" spoken=\"x\"");
     let j_ = front("window=2 program=claude face=landed drawn=\"✓ landed\" spoken=\"x\"");
-    let b = front("window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"x\"");
-    let c = front("window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"x\"");
+    let b = front("window=2 program=claude face=land drawn=\"⤓\" spoken=\"x\"");
+    let c = front("window=2 program=claude face=land drawn=\"⤓\" spoken=\"x\"");
     let off = front("-");
     let tabs = [
         (Chain::CruiseN, &n),

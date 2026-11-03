@@ -25,6 +25,8 @@ use std::process::ExitStatus;
 /// The two descriptor numbers the fabric bridge inherits.
 pub const BRIDGE_VERB_FD: RawFd = 3;
 pub const BRIDGE_PUSH_FD: RawFd = 4;
+/// A bounded guard set, including a source worker's capacity and source/cache lock custody.
+pub const MAX_GUARD_FDS: usize = 8;
 
 const _: () = assert!(BRIDGE_VERB_FD == 3 && BRIDGE_PUSH_FD == 4);
 
@@ -249,6 +251,19 @@ impl LaneChild {
         }
     }
 
+    /// `SIGTERM` the child, so it can pass the signal on; once it is reaped, signal nothing.
+    pub fn terminate(&mut self) -> io::Result<()> {
+        if self.status.is_some() {
+            return Ok(());
+        }
+        // SAFETY: as in `kill`: two integers, and our own unreaped child.
+        if unsafe { kill(self.pid, SIGTERM) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     /// `SIGCONT` the child: a child started stopped ([`Command::start_suspended`]) runs.
     pub fn resume(&mut self) -> io::Result<()> {
         if self.status.is_some() {
@@ -385,6 +400,8 @@ enum Source {
 struct Placement<'a> {
     stdio: [Source; 3],
     lanes: &'a [OwnedFd],
+    /// Parent source and advertised child target, distinct for a guarded in-place exec.
+    guards: &'a [(RawFd, RawFd)],
     cwd: Option<&'a std::ffi::CStr>,
     base: Option<&'a std::path::Path>,
     pgroup: Option<i32>,
@@ -403,6 +420,7 @@ impl Default for Placement<'_> {
         Self {
             stdio: [Source::Inherit; 3],
             lanes: &[],
+            guards: &[],
             cwd: None,
             base: None,
             pgroup: None,
@@ -936,6 +954,14 @@ mod platform {
                     target,
                 ))?;
             }
+            for &(source, target) in place.guards {
+                objects.handed.push(source);
+                check(if source == target {
+                    posix_spawn_file_actions_addinherit_np(&mut objects.actions, target)
+                } else {
+                    posix_spawn_file_actions_adddup2(&mut objects.actions, source, target)
+                })?;
+            }
             if let Some(cwd) = place.cwd {
                 check(posix_spawn_file_actions_addchdir_np(
                     &mut objects.actions,
@@ -1248,6 +1274,7 @@ mod platform {
             || place.long_entry_ends
             || place.disclaim.is_some()
             || place.suspended
+            || !place.guards.is_empty()
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1727,6 +1754,10 @@ thread_local! {
 mod no_fork;
 pub use no_fork::{Child, Command, Rusage, Stdio};
 
+#[path = "spawnfd_birth.rs"]
+mod birth;
+pub use birth::{BirthAttempt, BirthKey, NotSpawned, ObservedSpawned, SpawnFailure, Spawned};
+
 /// A [`Command`] for `program`.
 #[must_use]
 pub fn command(program: impl AsRef<OsStr>) -> Command {
@@ -2071,6 +2102,7 @@ const WNOHANG: i32 = 1;
 const SIGKILL: i32 = 9;
 #[cfg(target_vendor = "apple")]
 const SIGCONT: i32 = 19;
+const SIGTERM: i32 = 15;
 #[cfg(not(target_vendor = "apple"))]
 const SIGCONT: i32 = 18;
 #[cfg(not(target_vendor = "apple"))]

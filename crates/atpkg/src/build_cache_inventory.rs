@@ -1,0 +1,199 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+//! One complete, bounded Cargo-lock inventory for every cache removal route.
+
+use std::path::Path;
+
+use super::{CARGO_LOCKS, Seen};
+
+// Bounds limit work and open descriptors, never the portion certified as clear. Reaching
+// any bound is uncertainty and keeps the tree. A scan holds at most one directory per level.
+const DEPTH: usize = 128;
+const ENTRIES: usize = 1_000_000;
+const LOCKS: usize = 1024;
+
+pub(super) fn scan(root: &Path) -> std::io::Result<Seen> {
+    scan_with(root, ENTRIES, DEPTH)
+}
+
+fn uncertain() -> std::io::Error {
+    std::io::Error::other("Cargo-lock inventory is incomplete or changed")
+}
+
+fn is_lock(name: &std::ffi::OsStr) -> bool {
+    CARGO_LOCKS.iter().any(|lock| {
+        name.as_encoded_bytes()
+            .eq_ignore_ascii_case(lock.as_bytes())
+    })
+}
+
+#[cfg(unix)]
+fn scan_with(root: &Path, mut left: usize, depth: usize) -> std::io::Result<Seen> {
+    use aterm_dirfd::{self as fd, Mode, OFlags};
+    let flags =
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    let root_fd = fd::openat(fd::CWD, root, flags, Mode::empty())?;
+    let mut seen = Seen {
+        newest: metadata(&root_fd)?.modified()?,
+        locks: Vec::new(),
+    };
+    walk(root_fd, root, &mut left, depth, &mut seen)?;
+    seen.locks.sort();
+    Ok(seen)
+}
+
+#[cfg(unix)]
+fn metadata(fd: &impl std::os::fd::AsFd) -> std::io::Result<std::fs::Metadata> {
+    std::fs::File::from(fd.as_fd().try_clone_to_owned()?).metadata()
+}
+
+#[cfg(unix)]
+fn stamp(metadata: &std::fs::Metadata) -> (u64, u64, i64, i64, i64, i64) {
+    use std::os::unix::fs::MetadataExt as _;
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
+#[cfg(unix)]
+fn walk(
+    directory: aterm_dirfd::OwnedFd,
+    path: &Path,
+    left: &mut usize,
+    depth: usize,
+    seen: &mut Seen,
+) -> std::io::Result<()> {
+    use aterm_dirfd::{self as fd, AtFlags, FileType, Mode, OFlags};
+    use std::os::unix::ffi::OsStrExt as _;
+    let before = metadata(&directory)?;
+    seen.newest = seen.newest.max(before.modified()?);
+    let mut listing = fd::Dir::new(directory)?;
+    while let Some(entry) = listing.next() {
+        let entry = entry?;
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        *left = left.checked_sub(1).ok_or_else(uncertain)?;
+        let name = std::ffi::OsStr::from_bytes(name.to_bytes());
+        let child_path = path.join(name);
+        if is_lock(name) {
+            if seen.locks.len() >= LOCKS {
+                return Err(uncertain());
+            }
+            // Include nonregular lock names too: hold() must refuse them, not miss them.
+            seen.locks.push(child_path);
+            continue;
+        }
+        let named = fd::fstatat(&listing, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if FileType::from_raw_mode(named.st_mode).is_dir() {
+            let next_depth = depth.checked_sub(1).ok_or_else(uncertain)?;
+            let child = fd::openat(
+                &listing,
+                name,
+                OFlags::RDONLY
+                    | OFlags::DIRECTORY
+                    | OFlags::NOFOLLOW
+                    | OFlags::CLOEXEC
+                    | OFlags::NONBLOCK,
+                Mode::empty(),
+            )?;
+            let held = fd::fstat(&child)?;
+            if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino)
+                || named.st_dev != fd::fstat(&listing)?.st_dev
+            {
+                return Err(uncertain());
+            }
+            walk(child, &child_path, left, next_depth, seen)?;
+            let after = fd::fstatat(&listing, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            if (after.st_dev, after.st_ino) != (held.st_dev, held.st_ino) {
+                return Err(uncertain());
+            }
+        }
+    }
+    if stamp(&before) != stamp(&metadata(&listing)?) {
+        return Err(uncertain());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn scan_with(root: &Path, mut left: usize, depth: usize) -> std::io::Result<Seen> {
+    fn walk(path: &Path, left: &mut usize, depth: usize, seen: &mut Seen) -> std::io::Result<()> {
+        let before = std::fs::symlink_metadata(path)?;
+        if !before.is_dir() {
+            return Err(uncertain());
+        }
+        seen.newest = seen.newest.max(before.modified()?);
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            *left = left.checked_sub(1).ok_or_else(uncertain)?;
+            if is_lock(&entry.file_name()) {
+                if seen.locks.len() >= LOCKS {
+                    return Err(uncertain());
+                }
+                seen.locks.push(entry.path());
+            } else if entry.file_type()?.is_dir() {
+                walk(
+                    &entry.path(),
+                    left,
+                    depth.checked_sub(1).ok_or_else(uncertain)?,
+                    seen,
+                )?;
+            }
+        }
+        if std::fs::symlink_metadata(path)?.modified()? != before.modified()? {
+            return Err(uncertain());
+        }
+        Ok(())
+    }
+    let mut seen = Seen {
+        newest: std::fs::symlink_metadata(root)?.modified()?,
+        locks: Vec::new(),
+    };
+    walk(root, &mut left, depth, &mut seen)?;
+    seen.locks.sort();
+    Ok(seen)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_inventories_never_certify_a_lock_free_prefix() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let root = scratch.path();
+        let deep = root.join("verify/.ubd/cells.noindex/linux/triple/debug");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join(".cargo-lock"), b"").unwrap();
+        assert!(scan_with(root, 100, 2).is_err());
+        assert!(scan_with(root, 2, 100).is_err());
+        assert_eq!(scan(root).unwrap().locks, [deep.join(".cargo-lock")]);
+        assert!(scan(&root.join("missing")).is_err());
+    }
+
+    #[test]
+    fn directory_links_are_not_walked_and_nonregular_lock_names_are_kept() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let root = scratch.path().join("root");
+        let external = scratch.path().join("external");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join(".cargo-lock"), b"").unwrap();
+        std::os::unix::fs::symlink(&external, root.join("alias")).unwrap();
+        assert!(scan(&root).unwrap().locks.is_empty());
+        assert!(scan(&root.join("alias")).is_err());
+        let obstruction = root.join(".CARGO-LOCK");
+        std::fs::create_dir(&obstruction).unwrap();
+        let seen = scan(&root).unwrap();
+        assert_eq!(seen.locks, [obstruction]);
+        assert!(super::super::hold(&seen.locks).is_none());
+    }
+}

@@ -569,9 +569,11 @@ fn read_text(
             )));
             // Combining marks lay ink the base glyph's own raster does not (an accent over
             // the `e` of `é`): a marked cell is neither short nor the base glyph's ink.
-            let marked = row_marks
-                .iter()
-                .any(|&(col, ref m)| col == c && !m.is_empty());
+            let marked = !cell.wide
+                && !row_marks.is_empty()
+                && row_marks
+                    .iter()
+                    .any(|&(col, ref m)| col == c && !m.is_empty());
             ft.short
                 .push(is_glyph && !cell.wide && !marked && super::emit::is_short_glyph(cell.ch));
             ft.glyph.push(if cell.wide || marked {

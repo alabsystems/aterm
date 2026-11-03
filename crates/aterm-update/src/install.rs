@@ -186,6 +186,27 @@ fn ditto_bounded(
 
 const STAGE_UNPACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Copy a complete service image into an absent isolated destination, preserving
+/// macOS extended attributes and the stapled notarization ticket.
+pub(crate) fn copy_service_image(from: &Path, to: &Path) -> Result<(), String> {
+    let (status, stderr) = ditto_bounded(
+        &[
+            from.as_os_str().to_os_string(),
+            to.as_os_str().to_os_string(),
+        ],
+        "materialize signed service image",
+        STAGE_UNPACK_TIMEOUT,
+    )?;
+    if !status.success() {
+        return Err(ditto_failure(
+            "materialize signed service image",
+            status,
+            &stderr,
+        ));
+    }
+    Ok(())
+}
+
 /// Slack the free-space check demands over the declared size: filesystem metadata, the extract's
 /// own scratch dir, and the verify step's writes.
 pub(crate) const STAGE_FREE_SPACE_HEADROOM: u64 = 64 * 1024 * 1024;
@@ -2907,6 +2928,141 @@ fn publish_verified_stage_within(
         .map_err(|error| format!("publish staged bundle: {error}"))?;
 
     crate::manifest::write_durable(&staging.ready, &marker, "ready marker", Flush::Ordered)
+}
+
+/// Offline staging reuses the ordinary apply lock, exchange primitive and durable marker format.
+/// The caller holds stage_lock; the apply lock serializes the installed/floor recheck and publish.
+pub(crate) fn publish_local_checked(
+    staging: &Staging,
+    incoming: &Path,
+    ready: &Ready,
+    installed_current: impl FnOnce() -> Result<(), String>,
+    observation: &crate::manifest::FloorObservation<'_>,
+) -> Result<(), String> {
+    let marker = ready.to_toml()?;
+    if u64::try_from(marker.len()).unwrap_or(u64::MAX) > crate::MAX_LEDGER_BYTES {
+        return Err("local ready marker exceeds the ordinary reader bound".into());
+    }
+    let _lock = FileLock::acquire_within(&staging.apply_lock, BACKGROUND_LOCK_WAIT)
+        .map_err(|e| verify::lock_wait_refusal("publish lock", &e))?;
+    installed_current()?;
+    let floor = crate::manifest::Floor::read_for_gate(&staging.floor())?;
+    if floor.roster_seq > ready.roster_seq.unwrap_or(0) {
+        return Err("a newer roster was admitted during local verification".into());
+    }
+    stage_withdrawn(staging, ready)?;
+    let prior = match std::fs::symlink_metadata(&staging.ready) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(format!("cannot observe the existing stage: {error}")),
+    };
+    if prior {
+        let old = Ready::read_publishable(staging)
+            .ok_or("an existing stage cannot be read or verified; refusing to replace it")?;
+        if old.build_number >= ready.build_number
+            || old.roster_seq.unwrap_or(0) > ready.roster_seq.unwrap_or(0)
+        {
+            return Err("an equal or newer verified stage already exists".into());
+        }
+    }
+    if let Some(hold) = roster_freshness_gate(ready, unix_now_secs()) {
+        return Err(format!("local stage authorization is stale: {hold:?}"));
+    }
+    // Authenticated revocations/apply floors take effect even if a copy later fails.
+    // A merely attempted candidate never raises the staged-build high water.
+    crate::manifest::Floor::observe_reporting(
+        &staging.floor(),
+        &crate::manifest::FloorObservation {
+            high_water: 0,
+            min_build: observation.min_build,
+            roster_seq: observation.roster_seq,
+            machine: observation.machine,
+            revoked: observation.revoked,
+        },
+    )?;
+    stage_withdrawn(staging, ready)?;
+    publish_local_pair(staging, incoming, &marker, |path, bytes| {
+        crate::manifest::write_durable(path, bytes, "ready marker", Flush::Ordered)
+    })?;
+    crate::manifest::Floor::observe_reporting(&staging.floor(), observation).map_err(|error| {
+        format!("verified stage published, but staged-build floor could not be recorded: {error}")
+    })
+}
+
+fn publish_local_pair(
+    staging: &Staging,
+    incoming: &Path,
+    marker: &str,
+    write_marker: impl FnOnce(&Path, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let parent = incoming
+        .parent()
+        .ok_or("incoming candidate has no owned parent")?;
+    let prior = parent.join("local-stage-prior-ready.toml");
+    let recovery = parent.join("local-stage-transaction.toml");
+    let had_ready = staging.ready.try_exists().map_err(|e| e.to_string())?;
+    let had_app = staging.staged_app.try_exists().map_err(|e| e.to_string())?;
+    if had_ready {
+        // Exclusive owned snapshot: never a hardlink to a mutable public pathname.
+        let bytes = crate::read_ledger_text(&staging.ready)
+            .ok_or("prior ready marker became unreadable")?;
+        let mut backup = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&prior)
+            .map_err(|e| format!("reserve prior marker: {e}"))?;
+        std::io::Write::write_all(&mut backup, bytes.as_bytes()).map_err(|e| e.to_string())?;
+        Flush::Durable.file(&backup).map_err(|e| e.to_string())?;
+    }
+    crate::manifest::write_durable(
+        &recovery,
+        &format!(
+            "schema=1\nincoming={:?}\nstaged_app={:?}\nready={:?}\nprior_ready={:?}\nhad_app={had_app}\nhad_ready={had_ready}\n",
+            incoming.to_string_lossy(),
+            staging.staged_app.to_string_lossy(),
+            staging.ready.to_string_lossy(),
+            prior.to_string_lossy()
+        ),
+        "local stage recovery",
+        Flush::Ordered,
+    )?;
+    if had_app {
+        checked_bundle_exchange(
+            incoming,
+            &staging.staged_app,
+            "local verified stage exchange",
+            Flush::Ordered,
+        )?;
+    } else {
+        std::fs::rename(incoming, &staging.staged_app)
+            .map_err(|e| format!("publish local candidate: {e}"))?;
+    }
+    if let Err(cause) = write_marker(&staging.ready, marker) {
+        let app_restored = if had_app {
+            checked_bundle_exchange(
+                incoming,
+                &staging.staged_app,
+                "restore prior verified stage",
+                Flush::Ordered,
+            )
+        } else {
+            std::fs::rename(&staging.staged_app, incoming).map_err(|e| e.to_string())
+        };
+        let marker_restored = if had_ready {
+            std::fs::rename(&prior, &staging.ready).map_err(|e| e.to_string())
+        } else {
+            match std::fs::remove_file(&staging.ready) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        return Err(format!(
+            "local marker publication failed: {cause}; prior app restoration={app_restored:?}; prior marker restoration={marker_restored:?}; recovery={}",
+            recovery.display()
+        ));
+    }
+    Ok(())
 }
 
 fn stage_withdrawn(staging: &Staging, ready: &Ready) -> Result<(), String> {
@@ -6065,3 +6221,7 @@ mod stage_probe_tests;
 #[cfg(debug_assertions)]
 #[path = "install_dmg_acceptance.rs"]
 pub mod dmg_acceptance;
+
+#[cfg(test)]
+#[path = "local_publish_tests.rs"]
+mod local_publish_tests;

@@ -370,7 +370,7 @@ pub(super) fn self_claimed_after_exit(
             ExitCause::Stall => CAUSE_STALL,
             ExitCause::Asked => CAUSE_ASKED,
             ExitCause::HostEnded => CAUSE_HOST,
-            ExitCause::Exit => CAUSE_EXIT,
+            ExitCause::Exit | ExitCause::Carried => CAUSE_EXIT,
         }
         .to_string(),
         salt: now,

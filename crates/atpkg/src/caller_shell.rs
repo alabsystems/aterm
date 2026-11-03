@@ -179,7 +179,13 @@ pub fn process_args(pid: u32) -> Option<ProcArgs> {
             .to_string_lossy()
             .into_owned();
         let argv = split_nul_list(&aterm_uds::process::read_cmdline(pid)?);
-        let mut env = split_nul_list(&std::fs::read(format!("/proc/{pid}/environ")).ok()?);
+        let mut env = split_nul_list(
+            &crate::metadata_io::read_bounded_regular(
+                std::path::Path::new(&format!("/proc/{pid}/environ")),
+                1024 * 1024,
+            )
+            .ok()?,
+        );
         env.retain(|kv| !kv.is_empty());
         Some(ProcArgs {
             exec_path,

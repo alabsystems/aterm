@@ -32,10 +32,15 @@ pub fn main_entry(_args: Vec<std::ffi::OsString>) -> ExitCode {
         return refuse(&why);
     }
 
-    let sid = std::env::var("ATERM_PARENT_SESSION_ID").ok();
-    let sock = match crate::resolve_sock_for(sid.as_deref()) {
+    let sock = match std::env::var(aterm_uds::sudo::ASKPASS_SOCK_ENV) {
         Ok(sock) => sock,
-        Err(e) => return refuse(&format!("no aterm instance to ask ({e})")),
+        Err(_) => {
+            let sid = std::env::var("ATERM_PARENT_SESSION_ID").ok();
+            match crate::resolve_sock_for(sid.as_deref()) {
+                Ok(sock) => sock,
+                Err(e) => return refuse(&format!("no aterm instance to ask ({e})")),
+            }
+        }
     };
 
     let reply = match send_askpass(&sock, CONNECT_WAIT, REPLY_WAIT) {
@@ -77,7 +82,24 @@ fn refusal_reply(reply: &[u8]) -> &'static str {
         b"ERR askpass refused off" => "ERR askpass refused off",
         b"ERR askpass refused owner-only" => "ERR askpass refused owner-only",
         b"ERR askpass refused debugger-as-root" => "ERR askpass refused debugger-as-root",
-        b"ERR askpass refused command-unreadable" => "ERR askpass refused command-unreadable",
+        b"ERR askpass refused command-unreadable" => {
+            "ERR askpass refused command-unreadable: macOS does not show aterm the exact arguments \
+             of a sudo it did not start, so this request gets no password sheet; run the command \
+             as `aterm ctl sudo -- <command>` (aterm help sudo)"
+        }
+        b"ERR askpass refused unattributed" => {
+            "ERR askpass refused unattributed: the caller is not a tab of this aterm, so no tab \
+             can hold its password sheet"
+        }
+        b"ERR askpass refused headless" => {
+            "ERR askpass refused headless: this aterm has no window to hold a password sheet"
+        }
+        b"ERR askpass refused no window hosts that session" => {
+            "ERR askpass refused no window hosts that session (a headless aterm has none)"
+        }
+        b"ERR askpass refused not-frontmost; focus the tab and retry" => {
+            "ERR askpass refused not-frontmost; focus the tab and retry"
+        }
         line if line.starts_with(b"ERR askpass busy ") => "ERR askpass busy",
         line if line.starts_with(b"ERR askpass refused ") => "ERR askpass refused",
         _ => "the aterm sent a reply this helper cannot read",

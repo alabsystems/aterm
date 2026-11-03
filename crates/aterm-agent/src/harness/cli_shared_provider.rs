@@ -111,7 +111,7 @@ impl ClaudeOauth {
         {
             Ok(exit) if exit.code == 0 => Execution::Completed,
             Ok(exit) => Execution::Unknown(exit.failure_words()),
-            Err(why) => Execution::Unknown(why),
+            Err(why) => Execution::Unknown(why.to_string()),
         }
     }
 }
@@ -210,7 +210,10 @@ impl Provider for ClaudeOauth {
             .email
             .as_deref()
             .ok_or("approved account has no sign-in email")?;
-        let exit = context.host.renew_outcome(path, email, browser)?;
+        let exit = context
+            .host
+            .renew_outcome(path, email, browser)
+            .map_err(|failure| failure.to_string())?;
         if exit.code != 0 {
             return Err(exit.failure_words());
         }

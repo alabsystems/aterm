@@ -172,6 +172,7 @@ fn a_build_version_is_its_record_under_its_own_build_id() {
     assert!(build_version("1.4.11-R6500.1", Some("2001004011006500002")).is_some());
     assert!(build_version("1.4.11-R6500.1", None).is_some());
     assert!(build_version("1.4.11-R6500.1", Some("2001004010006427002")).is_none());
+    assert!(build_version("1.4.10-R6427.1", Some("02001004010006427002")).is_none());
     assert!(build_version("1.4.11-R6500.1", Some("current")).is_none());
     assert!(build_version("1.4.11-R6500.x", None).is_none());
 }
@@ -565,4 +566,35 @@ fn an_open_session_name_reservation_holds_no_restart() {
         Err(Open::Task { background: false }),
         "no kind read, so work"
     );
+}
+
+#[test]
+fn a_launch_that_set_its_own_environment_is_named() {
+    for (line, want) in [
+        ("OPENAI_API_KEY=k muse", "OPENAI_API_KEY"),
+        (
+            "TBH_CA_CERTIFICATE='/a b.pem' HTTPS_PROXY=http://p:1 muse resume",
+            "TBH_CA_CERTIFICATE",
+        ),
+        ("cd ~/p && HTTPS_PROXY=http://p:1 muse", "HTTPS_PROXY"),
+        ("env OPENAI_API_KEY=k muse", "OPENAI_API_KEY"),
+        (
+            "XDG_DATA_HOME=/d XDG_CONFIG_HOME=/c HOME=/h X=1 '/p/agents/muse'",
+            "X",
+        ),
+        ("env -u OPENAI_API_KEY muse", "env -u"),
+    ] {
+        assert_eq!(inline_env(line).as_deref(), Some(want), "{line}");
+    }
+    for line in [
+        "muse",
+        "muse --trust-workspace",
+        "XDG_DATA_HOME='/s/data' XDG_CONFIG_HOME='/s/cfg' HOME='/s/home' '/p/agents/muse' 'resume' 's1'",
+        " ( cd -- '/w/proj' && XDG_DATA_HOME=/h exec '/p/agents/muse' 'resume' 's1' )",
+        "export OPENAI_API_KEY=k; muse",
+        "env -- muse",
+        "",
+    ] {
+        assert_eq!(inline_env(line), None, "{line}");
+    }
 }

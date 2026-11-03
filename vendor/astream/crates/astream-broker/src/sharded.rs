@@ -222,7 +222,7 @@ impl ShardedBroker {
 
     /// Open `shards` independent broker logs under `dir` using `opts` (capabilities,
     /// at-rest encryption with independent `<shard-i.log>.seal` bindings, anti-rollback,
-    /// health sidecars, and escalation rules).
+    /// per-shard residency budgets, health sidecars, and escalation rules).
     pub fn open_opts(
         dir: impl AsRef<Path>,
         shards: u32,
@@ -299,6 +299,30 @@ impl ShardedBroker {
     /// The shard count.
     pub const fn shards(&self) -> u32 {
         self.shards
+    }
+
+    /// Bound the decoded records each shard's log keeps resident in memory to about
+    /// `per_shard_budget` bytes ([`Broker::set_resident_budget`]).
+    pub fn set_resident_budget(&self, per_shard_budget: usize) {
+        for b in &self.brokers {
+            b.set_resident_budget(per_shard_budget);
+        }
+    }
+
+    /// Aggregate `(resident records, resident bytes, retained records)` summed across
+    /// all shards ([`Broker::residency`]).
+    #[must_use]
+    pub fn residency(&self) -> (usize, usize, usize) {
+        let mut resident = 0usize;
+        let mut bytes = 0usize;
+        let mut retained = 0usize;
+        for b in &self.brokers {
+            let (r, rb, ret) = b.residency();
+            resident = resident.saturating_add(r);
+            bytes = bytes.saturating_add(rb);
+            retained = retained.saturating_add(ret);
+        }
+        (resident, bytes, retained)
     }
 }
 

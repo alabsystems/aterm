@@ -252,25 +252,34 @@ impl RelayHeader {
                     };
                     match k {
                         "content" => {
-                            content = match v {
-                                "0" => Some(false),
-                                "1" => Some(true),
+                            let parsed = match v {
+                                "0" => false,
+                                "1" => true,
                                 _ => return Err("invalid content flag"),
                             };
+                            if content.replace(parsed).is_some() {
+                                return Err("duplicate SURVEY key");
+                            }
                         }
                         "drive" => {
-                            drive = match v {
-                                "0" => Some(false),
-                                "1" => Some(true),
+                            let parsed = match v {
+                                "0" => false,
+                                "1" => true,
                                 _ => return Err("invalid drive flag"),
                             };
+                            if drive.replace(parsed).is_some() {
+                                return Err("duplicate SURVEY key");
+                            }
                         }
                         "peer" => {
-                            peer = Some(if v == "-" {
+                            let parsed = if v == "-" {
                                 None
                             } else {
                                 Some(v.parse::<SocketAddr>().map_err(|_| "invalid peer addr")?)
-                            });
+                            };
+                            if peer.replace(parsed).is_some() {
+                                return Err("duplicate SURVEY key");
+                            }
                         }
                         _ => return Err("unknown SURVEY key"),
                     }
@@ -293,30 +302,38 @@ impl RelayHeader {
                     match k {
                         "node" => {
                             let decoded = aterm_codec::pct::decode(v);
-                            if decoded.is_empty() {
-                                return Err("empty driver node");
+                            if decoded.is_empty() || decoded.chars().any(char::is_control) {
+                                return Err("invalid driver node");
                             }
-                            node = Some(decoded);
+                            if node.replace(decoded).is_some() {
+                                return Err("duplicate DRIVE key");
+                            }
                         }
                         "host" => {
                             let decoded = aterm_codec::pct::decode(v);
-                            if decoded.is_empty() {
-                                return Err("empty driver host");
+                            if decoded.is_empty() || decoded.chars().any(char::is_control) {
+                                return Err("invalid driver host");
                             }
-                            host = Some(decoded);
+                            if host.replace(decoded).is_some() {
+                                return Err("duplicate DRIVE key");
+                            }
                         }
                         "key" => {
-                            key = Some(
-                                aterm_net::fleet::NodeKey::from_hex(v)
-                                    .ok_or("invalid driver key")?,
-                            );
+                            let parsed = aterm_net::fleet::NodeKey::from_hex(v)
+                                .ok_or("invalid driver key")?;
+                            if key.replace(parsed).is_some() {
+                                return Err("duplicate DRIVE key");
+                            }
                         }
                         "peer" => {
-                            peer = Some(if v == "-" {
+                            let parsed = if v == "-" {
                                 None
                             } else {
                                 Some(v.parse::<SocketAddr>().map_err(|_| "invalid peer addr")?)
-                            });
+                            };
+                            if peer.replace(parsed).is_some() {
+                                return Err("duplicate DRIVE key");
+                            }
                         }
                         _ => return Err("unknown DRIVE key"),
                     }
@@ -353,7 +370,10 @@ fn parse_relay_filename(name: &str) -> Option<u32> {
     let pid_str = name
         .strip_prefix(RELAY_PREFIX)?
         .strip_suffix(RELAY_SUFFIX)?;
-    (!pid_str.is_empty() && pid_str.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
+    (!pid_str.is_empty()
+        && !pid_str.starts_with('0')
+        && pid_str.bytes().all(|b| b.is_ascii_digit()))
+    .then_some(())?;
     pid_str.parse::<u32>().ok().filter(|&p| p > 0)
 }
 
@@ -420,7 +440,10 @@ fn run_window_fleet_relay() {
             if let Some(key) = key {
                 super::note_admitted_driver(&driver.node, key);
             }
-            crate::control::attach_fleet_drive(stream, peer, driver)
+            // Service repair is handled by the node before relay, where its configured
+            // vault and state can be checked. A later command on this relayed connection
+            // must not reinterpret a custom node context as the window's live context.
+            crate::control::attach_fleet_drive(stream, peer, driver, key, false)
         }
         RelayHeader::Ask { peer } => crate::members_desk::attach_relayed(stream, peer),
     });
@@ -732,15 +755,28 @@ pub(crate) fn query_window_survey_facts(
         .strip_prefix("OK ")?
         .split_ascii_whitespace()
         .next()?;
-    (!count_str.is_empty() && count_str.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
-    let count = count_str.parse::<usize>().ok()?.min(64);
-    let mut wire = String::with_capacity(head.len() + count * 128);
+    (!count_str.is_empty()
+        && (count_str == "0" || !count_str.starts_with('0'))
+        && count_str.bytes().all(|b| b.is_ascii_digit()))
+    .then_some(())?;
+    const SURVEY_FACTS_MAX_LINES: usize = 4096;
+    const SURVEY_FACTS_WIRE_MAX: usize = 1 << 20;
+    let count = count_str.parse::<usize>().ok()?;
+    if count > SURVEY_FACTS_MAX_LINES {
+        aterm_uds::hangup::hang_up(&stream);
+        return None;
+    }
+    let mut wire = String::with_capacity(head.len() + count.min(64) * 128);
     wire.push_str(&head);
     for _ in 0..count {
         let Some(line) = read_line_raw(&mut stream, 4096).ok().flatten() else {
             aterm_uds::hangup::hang_up(&stream);
             return None;
         };
+        if wire.len() + line.len() > SURVEY_FACTS_WIRE_MAX {
+            aterm_uds::hangup::hang_up(&stream);
+            return None;
+        }
         wire.push_str(&line);
     }
     aterm_uds::hangup::hang_up(&stream);
@@ -942,6 +978,12 @@ pub fn run_node_serve_with(mut cfg: NodeServeConfig) -> ExitCode {
         }
     };
     let _held_lock = lock;
+    if !cfg.stop.load(Ordering::Acquire) {
+        aterm_agent::service_repair_rpc::start_recovery_in_context(
+            cfg.vault_paths.as_ref(),
+            &cfg.state_dir,
+        );
+    }
     // This Mac's network place is kept while no window runs too (the keeper is one per Mac:
     // whichever process holds its lock). A unit test's scratch state starts none.
     #[cfg(unix)]
@@ -1468,6 +1510,9 @@ fn serve_one_node_generation(
                     let serving = serving_watch();
                     let keys = aterm_net::fleet_member::Keyring::read(&state_dir);
                     let mut log = members_watch.as_ref().and_then(|members| members.keys());
+                    if let Some(automatic) = &automatic {
+                        automatic.observe_membership(log.as_ref());
+                    }
                     let denied = denied_nodes_for(vault_paths.as_ref(), &denied_watch);
                     // No deny list read yet: every open drive or content read is cut, as the
                     // handshake refuses each new connection, until one is read.
@@ -1537,9 +1582,8 @@ fn serve_one_node_generation(
                                 &state_dir,
                                 addr,
                                 secret_watch.clone(),
-                                &hb_in_flight,
+                                (&running, &hb_in_flight),
                                 (denied, log, browse_watch.clone()),
-                                vault_paths.clone(),
                             ),
                             None => {
                                 aterm_log::debug!("node job heartbeat skipped: {DENY_LIST_UNREAD}")
@@ -1591,6 +1635,7 @@ fn serve_one_node_generation(
     let vault_for_gate = vault_paths.clone();
     let serving_for_offer = serving_fn.clone();
     let open_for_serve = Arc::clone(&open_table);
+    let serving_generation = Arc::clone(&running);
     let automatic: Option<aterm_net::fleet::AskHandler> = automatic_handle.map(|handle| {
         Arc::new(
             move |stream: &mut dyn aterm_net::fleet::Duplex, peer: SocketAddr| {
@@ -1652,7 +1697,13 @@ fn serve_one_node_generation(
                 let st = state_dir.clone();
                 return served.answer(|stream| {
                     stream.set_write_timeout(Some(HANDSHAKE))?;
-                    share_book_at(stream, &st, peer, (&denied, log.as_deref()), addr)
+                    share_book_at(
+                        stream,
+                        &st,
+                        peer,
+                        (&denied, log.as_deref()),
+                        (addr, &serving_generation),
+                    )
                 });
             }
             if op == FleetOp::Facts {
@@ -1765,6 +1816,7 @@ fn serve_one_node_generation(
                 spawn_node_drive(
                     near,
                     Arc::clone(&open),
+                    vault_paths.clone(),
                     state_dir.clone(),
                     relay_dir.clone(),
                     (driver, driver_key),
@@ -2009,6 +2061,7 @@ fn spawn_windowless_survey(
 fn spawn_node_drive(
     mut near: CtlStream,
     open: Arc<NodeOpened>,
+    vault_paths: Option<aterm_secrets::client::Paths>,
     state_dir: PathBuf,
     relay_dir: PathBuf,
     (driver, driver_key): (crate::fabric::Driver, aterm_net::fleet::NodeKey),
@@ -2049,11 +2102,29 @@ fn spawn_node_drive(
             let trimmed = first_line.trim_end_matches(['\r', '\n']).trim_start();
             let (verb, rest) = trimmed.split_once(char::is_whitespace)
                 .map_or((trimmed, ""), |(verb, rest)| (verb, rest.trim_start()));
+            if verb == "vault" {
+                let reply = aterm_secrets::client::admin_service::serve_at(
+                    vault_paths.as_ref(), &format!("fleet:{}", driver.node), rest,
+                );
+                let _ = near.write_all(reply.as_bytes());
+                let _ = near.flush();
+                aterm_uds::hangup::hang_up(&near);
+                return;
+            }
             // Machine upkeep stays in the node, even while windows open and close.
             // Forwarding polls to the newest window would lose their request book.
             if verb == aterm_agent::harness::remote_renew::VERB {
                 let reply = aterm_agent::harness::remote_renew::serve(
                     &format!("fleet:{}", driver.node), rest,
+                );
+                let _ = near.write_all(reply.as_bytes());
+                let _ = near.flush();
+                aterm_uds::hangup::hang_up(&near);
+                return;
+            }
+            if verb == aterm_agent::service_repair_rpc::VERB {
+                let reply = aterm_agent::service_repair_rpc::serve_in_context(
+                    &driver.node, &driver_key.hex(), rest, vault_paths.as_ref(), &state_dir,
                 );
                 let _ = near.write_all(reply.as_bytes());
                 let _ = near.flush();

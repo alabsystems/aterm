@@ -370,26 +370,23 @@ impl Access {
     pub fn is_current(&self, journal: &Journal) -> bool {
         let current = if let Some(paths) = &self.log_paths {
             journal.trust() == self.trust
-                && crate::client::read_identity(paths)
-                    .ok()
-                    .flatten()
-                    .filter(|id| id.recipient() == self.local().binding.recipient())
-                    .and_then(|id| {
-                        let (log, heads_digest) =
-                            crate::client::trusted_commons_log(paths, self.trust)
-                                .ok()
-                                .flatten()?;
-                        if self.log_heads_digest
-                            == Some(commons_log_state_digest(paths, heads_digest))
-                        {
-                            return Some(true);
-                        }
-                        current_from_loaded_log(paths, self.trust, &id, &log, heads_digest)
-                            .ok()
-                            .flatten()
-                            .map(|fresh| fresh.head == self.head && fresh.basis == self.basis)
-                    })
-                    .unwrap_or(false)
+                && crate::client::with_roster_observation(paths, |observation| {
+                    let Some(lock) = observation.state_lock() else {
+                        return Ok(false);
+                    };
+                    log_observation_is_current(
+                        paths,
+                        self.trust,
+                        Some(self.local().binding.recipient()),
+                        self.head,
+                        self.basis,
+                        self.log_heads_digest,
+                        lock,
+                    )
+                })
+                .ok()
+                .flatten()
+                .unwrap_or(false)
         } else {
             journal.trust() == self.trust
                 && journal.state()
@@ -407,6 +404,30 @@ impl Access {
         journal: &Journal,
         use_key: impl FnOnce(&[u8; 32]) -> T,
     ) -> Result<T> {
+        if let Some(paths) = &self.log_paths {
+            return crate::client::with_roster_observation(paths, |observation| {
+                let lock = observation
+                    .state_lock()
+                    .ok_or_else(|| Error::new("Commons roster observation is unavailable"))?;
+                if journal.trust() != self.trust
+                    || !log_observation_is_current(
+                        paths,
+                        self.trust,
+                        Some(self.local().binding.recipient()),
+                        self.head,
+                        self.basis,
+                        self.log_heads_digest,
+                        lock,
+                    )?
+                {
+                    return Err(Error::new(
+                        "Commons roster observation is no longer current",
+                    ));
+                }
+                Ok(use_key(self.key.as_slice().try_into().unwrap()))
+            })?
+            .ok_or_else(|| Error::new("Commons roster observation is unavailable"));
+        }
         if !self.is_current(journal) {
             return Err(Error::new(
                 "Commons roster observation is no longer current",
@@ -421,12 +442,6 @@ impl Access {
         identity: &Identity,
         basis: [u8; 32],
     ) -> Result<Option<Historical>> {
-        type HistoricalCacheKey = (Trust, [u8; 32], [u8; 32], [u8; 32]);
-        type HistoricalCacheVal = Option<(u64, Vec<Member>, Zeroizing<[u8; 32]>)>;
-        static HISTORICAL_CACHE: std::sync::Mutex<
-            std::collections::VecDeque<(HistoricalCacheKey, HistoricalCacheVal)>,
-        > = std::sync::Mutex::new(std::collections::VecDeque::new());
-
         let Some(paths) = &self.log_paths else {
             return Ok(None);
         };
@@ -435,11 +450,50 @@ impl Access {
                 "historical access requires the current local membership",
             ));
         }
-        let Some((log, heads_digest)) = crate::client::trusted_commons_log(paths, self.trust)?
+        let Some((log, _heads_digest)) = crate::client::trusted_commons_log(paths, self.trust)?
         else {
             return Err(Error::new("Commons membership log is unavailable"));
         };
-        let cache_key = (self.trust, identity.recipient().0, heads_digest, basis);
+        self.historical_from_history(
+            identity,
+            basis,
+            &crate::membership_log::history::HistoryView::new(&log),
+        )
+    }
+
+    // The public path checks current local membership before obtaining this immutable view.
+    fn historical_from_history(
+        &self,
+        identity: &Identity,
+        basis: [u8; 32],
+        history: &crate::membership_log::history::HistoryView<'_>,
+    ) -> Result<Option<Historical>> {
+        use crate::membership_log::history::{Generation, RecordState};
+        type HistoricalCacheKey = (Trust, [u8; 32], Generation, [u8; 32]);
+        type HistoricalCacheVal = Option<(u64, Vec<Member>, Zeroizing<[u8; 32]>)>;
+        static HISTORICAL_CACHE: std::sync::Mutex<
+            std::collections::VecDeque<(HistoricalCacheKey, HistoricalCacheVal)>,
+        > = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+        let Some(paths) = &self.log_paths else {
+            return Ok(None);
+        };
+        // Validate required history before a warm positive or negative cache entry. Pending
+        // records do not change the complete-generation digest and must not hit cached absence.
+        let lease = history.lease_complete()?;
+        let epoch = match lease.record(&basis)? {
+            RecordState::Complete(epoch) => Some(epoch),
+            RecordState::Pending => {
+                return Err(Error::new("historical Commons epoch is not complete"));
+            }
+            RecordState::Absent => None,
+        };
+        let cache_key = (
+            self.trust,
+            identity.recipient().0,
+            lease.generation(),
+            basis,
+        );
         if let Ok(cache) = HISTORICAL_CACHE.lock()
             && let Some((_, cached)) = cache.iter().find(|(k, _)| *k == cache_key)
         {
@@ -458,7 +512,11 @@ impl Access {
                     local_recipient: Some(self.local().binding.recipient()),
                 }));
         }
-        let Some((generation, bindings)) = log.historical_commons_writers(&basis) else {
+        let writers = match epoch.as_ref() {
+            Some(epoch) => lease.historical_commons_writers(epoch)?,
+            None => None,
+        };
+        let Some((generation, bindings)) = writers else {
             if let Ok(mut cache) = HISTORICAL_CACHE.lock() {
                 if cache.len() >= 16 {
                     cache.pop_front();
@@ -467,7 +525,7 @@ impl Access {
             }
             return Ok(None);
         };
-        let Some(key) = log.unwrap_commons_epoch(&basis, identity)? else {
+        let Some(key) = lease.unwrap_commons_epoch(epoch.as_ref().unwrap(), identity)? else {
             return Err(Error::new(
                 "historical Commons epoch is not wrapped to this device",
             ));
@@ -677,39 +735,36 @@ impl Historical {
         journal: &Journal,
         use_key: impl FnOnce(&[u8; 32]) -> T,
     ) -> Result<T> {
-        let current = if let Some(paths) = &self.log_paths {
-            journal.trust() == self.trust
-                && crate::client::read_identity(paths)
-                    .ok()
-                    .flatten()
-                    .filter(|id| {
-                        self.local_recipient
-                            .is_none_or(|expected| id.recipient() == expected)
-                    })
-                    .and_then(|id| {
-                        let (log, heads_digest) =
-                            crate::client::trusted_commons_log(paths, self.trust)
-                                .ok()
-                                .flatten()?;
-                        if self.log_heads_digest
-                            == Some(commons_log_state_digest(paths, heads_digest))
-                        {
-                            return Some(true);
-                        }
-                        current_from_loaded_log(paths, self.trust, &id, &log, heads_digest)
-                            .ok()
-                            .flatten()
-                            .map(|fresh| fresh.head == self.head && fresh.basis == self.basis)
-                    })
-                    .unwrap_or(false)
-        } else {
-            journal.trust() == self.trust
-                && journal.state()
-                    == (State::Ready {
-                        head: self.head,
-                        basis: self.basis,
-                    })
-        };
+        if let Some(paths) = &self.log_paths {
+            return crate::client::with_roster_observation(paths, |observation| {
+                let lock = observation
+                    .state_lock()
+                    .ok_or_else(|| Error::new("historical key observation is unavailable"))?;
+                if journal.trust() != self.trust
+                    || !log_observation_is_current(
+                        paths,
+                        self.trust,
+                        self.local_recipient,
+                        self.head,
+                        self.basis,
+                        self.log_heads_digest,
+                        lock,
+                    )?
+                {
+                    return Err(Error::new(
+                        "historical key observation is no longer current",
+                    ));
+                }
+                Ok(use_key(self.key.as_slice().try_into().unwrap()))
+            })?
+            .ok_or_else(|| Error::new("historical key observation is unavailable"));
+        }
+        let current = journal.trust() == self.trust
+            && journal.state()
+                == (State::Ready {
+                    head: self.head,
+                    basis: self.basis,
+                });
         if !current {
             return Err(Error::new(
                 "historical key observation is no longer current",
@@ -719,19 +774,48 @@ impl Historical {
     }
 }
 
-fn commons_log_state_digest(paths: &crate::client::Paths, heads_digest: [u8; 32]) -> [u8; 32] {
+fn log_observation_is_current(
+    paths: &crate::client::Paths,
+    trust: Trust,
+    recipient: Option<crate::age::Recipient>,
+    head: [u8; 32],
+    basis: [u8; 32],
+    remembered: Option<[u8; 32]>,
+    lock: &crate::client::StateLock,
+) -> Result<bool> {
+    let Some(identity) = crate::client::read_identity(paths)? else {
+        return Ok(false);
+    };
+    if recipient.is_some_and(|expected| expected != identity.recipient()) {
+        return Ok(false);
+    }
+    let Some((log, heads_digest)) = crate::client::trusted_commons_log(paths, trust)? else {
+        return Ok(false);
+    };
+    if remembered == Some(commons_log_state_digest(paths, heads_digest)?) {
+        return Ok(true);
+    }
+    Ok(
+        current_from_loaded_log(paths, trust, &identity, &log, heads_digest, lock)?
+            .is_some_and(|fresh| fresh.head == head && fresh.basis == basis),
+    )
+}
+
+fn commons_log_state_digest(
+    paths: &crate::client::Paths,
+    heads_digest: [u8; 32],
+) -> Result<[u8; 32]> {
     let mut hash = aterm_digest::Sha256::new();
     hash.update(heads_digest);
-    if let Ok(Some(bytes)) = crate::fsx::read_private(&paths.state_file(), crate::client::MAX_STATE)
-    {
+    if let Some(bytes) = crate::fsx::read_private(&paths.state_file(), crate::client::MAX_STATE)? {
         hash.update([1]);
         hash.update((bytes.len() as u64).to_le_bytes());
         hash.update(bytes.as_slice());
     } else {
         hash.update([0]);
     }
-    if let Ok(Some(bytes)) =
-        crate::fsx::read_public(&paths.dir.join("source.toml"), crate::client::MAX_STATE)
+    if let Some(bytes) =
+        crate::fsx::read_public(&paths.dir.join("source.toml"), crate::client::MAX_STATE)?
     {
         hash.update([1]);
         hash.update((bytes.len() as u64).to_le_bytes());
@@ -752,25 +836,36 @@ fn commons_log_state_digest(paths: &crate::client::Paths, heads_digest: [u8; 32]
         node_dir.join("node.key"),
         node_dir.join("node.id"),
     ] {
-        if let Ok(meta) = std::fs::symlink_metadata(&extra) {
+        let metadata = match std::fs::symlink_metadata(&extra) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(meta) = metadata {
             hash.update([1]);
             hash.update(meta.len().to_le_bytes());
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt as _;
+                hash.update(meta.dev().to_le_bytes());
                 hash.update(meta.ino().to_le_bytes());
+                hash.update(meta.mode().to_le_bytes());
+                hash.update(meta.uid().to_le_bytes());
+                hash.update(meta.gid().to_le_bytes());
+                hash.update(meta.nlink().to_le_bytes());
+                hash.update(meta.ctime().to_le_bytes());
+                hash.update(meta.ctime_nsec().to_le_bytes());
             }
-            if let Ok(dur) = meta.modified().and_then(|t| {
+            let dur = meta.modified().and_then(|t| {
                 t.duration_since(std::time::UNIX_EPOCH)
                     .map_err(std::io::Error::other)
-            }) {
-                hash.update(dur.as_nanos().to_le_bytes());
-            }
+            })?;
+            hash.update(dur.as_nanos().to_le_bytes());
         } else {
             hash.update([0]);
         }
     }
-    hash.finalize()
+    Ok(hash.finalize())
 }
 
 /// Observe current Commons membership and network key from the peer-synced membership log (`F18`).
@@ -780,6 +875,7 @@ pub(super) fn current_from_loaded_log(
     identity: &Identity,
     log: &crate::membership_log::Log,
     heads_digest: [u8; 32],
+    lock: &crate::client::StateLock,
 ) -> Result<Option<Access>> {
     type AccessCacheKey = (Trust, [u8; 32], [u8; 32]);
     type AccessCacheVal = Option<(
@@ -795,7 +891,7 @@ pub(super) fn current_from_loaded_log(
         std::collections::VecDeque<(AccessCacheKey, AccessCacheVal)>,
     > = std::sync::Mutex::new(std::collections::VecDeque::new());
 
-    let state_digest = commons_log_state_digest(paths, heads_digest);
+    let state_digest = commons_log_state_digest(paths, heads_digest)?;
     let cache_key = (trust, identity.recipient().0, state_digest);
     if let Ok(cache) = ACCESS_CACHE.lock()
         && let Some((_, cached)) = cache.iter().find(|(k, _)| *k == cache_key)
@@ -815,7 +911,7 @@ pub(super) fn current_from_loaded_log(
             },
         ));
     }
-    if crate::client::local_recipient_denied_in_roster(paths) {
+    if crate::client::local_recipient_denial_held(paths, lock)? {
         if let Ok(mut cache) = ACCESS_CACHE.lock() {
             if cache.len() >= 16 {
                 cache.pop_front();
@@ -833,7 +929,7 @@ pub(super) fn current_from_loaded_log(
         }
         return Ok(None);
     };
-    let roster = crate::client::local_swarm_roster_for_log(paths, log);
+    let roster = crate::client::local_swarm_roster_for_log_held(paths, log, lock)?;
     let membership = log.membership();
     let mut by_recipient: std::collections::BTreeMap<
         crate::age::Recipient,

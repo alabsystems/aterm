@@ -13,6 +13,7 @@ fn row(program: &str, label: &str, seven_day: Option<u64>, five_hour: Option<u64
         condition: "usable".to_owned(),
         five_hour,
         seven_day,
+        week_reset_ms: None,
         walled_until_ms: None,
     }
 }
@@ -366,4 +367,44 @@ fn a_row_read_working_goes_before_an_unseen_one() {
         Some("z-used")
     );
     assert_eq!(chosen("claude", &[unseen("m1")]), "m1.local");
+}
+
+#[test]
+fn an_expired_week_reset_ranks_and_prints_as_unused_on_the_members_clock() {
+    let reset_row = Row {
+        condition: "limited".to_owned(),
+        week_reset_ms: Some(AT),
+        walled_until_ms: Some(AT),
+        ..row("claude", "reset-week", Some(100), None)
+    };
+    let active_row = Row {
+        week_reset_ms: Some(AT + 1_000),
+        ..row("claude", "active-week", Some(50), Some(10))
+    };
+    let members = [
+        member("m2", vec![active_row.clone()]),
+        member("m1", vec![reset_row]),
+    ];
+    let picked = pick("claude", &members).expect("expired week reset qualifies as 0%");
+    assert_eq!(picked.member.host(), "m1.local");
+    assert_eq!(
+        why("claude", &picked),
+        "claude account reset-week its wall ended, 0 busy sessions; the best of 2 that can take it"
+    );
+
+    // Negative control: before `week_reset_ms`, `seven_day` still stands.
+    let unreset = Member {
+        at_ms: Some(AT - 1_000),
+        ..member(
+            "m3",
+            vec![Row {
+                week_reset_ms: Some(AT),
+                ..row("claude", "almost", Some(95), None)
+            }],
+        )
+    };
+    assert_eq!(
+        chosen("claude", &[unreset, member("m2", vec![active_row])]),
+        "m2.local"
+    );
 }

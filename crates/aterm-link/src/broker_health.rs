@@ -179,7 +179,9 @@ fn bytes(n: u64) -> String {
 #[must_use]
 pub fn supervised() -> bool {
     #[cfg(target_os = "linux")]
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok();
+    let cgroup =
+        aterm_uds::atomic_file::read_regular_text(std::path::Path::new("/proc/self/cgroup"), 65536)
+            .ok();
     #[cfg(not(target_os = "linux"))]
     let cgroup: Option<String> = None;
     supervised_by(

@@ -118,26 +118,23 @@ impl Label {
     }
 }
 
-/// One seat a label names (design §4.15): a slot on a machine, home or warm.
+/// One preference a label names (design §0, §4.15): a machine, and the order the label states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SeatRef {
+pub struct Preferred {
     pub machine: Label,
-    /// The slot, where the label says it; a two-Mac label leaves it to the importer.
-    pub slot: Option<u32>,
-    /// The account's home seat, else a warm one.
-    pub home: bool,
+    /// The slot number, an order and nothing else; a two-Mac label states none.
+    pub rank: Option<u32>,
 }
 
 /// What one label cell names: **the one parser** for every label spelling the lab's sources use
 /// (design §9), which `Name`, `Slot` and stored `label` cells all go through.
 ///
-/// - `m<N>` or `M<N>`: a machine, and as a seat its slot 1;
+/// - `m<N>` or `M<N>`: a machine, and as a preference its rank 1;
 /// - `m<N>-xxxx`, four hex digits: a machine whose number the membership log suffixed on a
 ///   clash, never a slot;
-/// - `m<N>-<k>`, one to three digits: the legacy spelling of slot k (`m27-2`);
-/// - `m<N>.<k>`: slot k;
-/// - `m<N>-m<M>`: a harness account label spanning two Macs (`m106-m38`), home on the first and
-///   warm on the second.
+/// - `m<N>-<k>`, one to three digits: the legacy spelling of number k (`m27-2`);
+/// - `m<N>.<k>`: number k on that machine, which a preference reads as rank k;
+/// - `m<N>-m<M>`: a harness account label spanning two Macs (`m106-m38`), one preference on each.
 ///
 /// Surrounding ASCII space is ignored and the result is lower-case. Labels fold through the
 /// roster's aliases (m100 and m32) only where the roster says so, which is the importer's
@@ -146,7 +143,7 @@ pub struct SeatRef {
 pub enum Reading {
     Machine(Label),
     Slot(Label, u32),
-    Pair { home: Label, warm: Label },
+    Pair { first: Label, second: Label },
 }
 
 /// The most digits a slot number has, in either spelling.
@@ -171,13 +168,13 @@ impl Reading {
                 .ok_or_else(refused);
         };
         let number = machine_number(machine).ok_or_else(refused)?;
-        if let Some(warm) = machine_number(rest) {
-            if warm == number {
+        if let Some(second) = machine_number(rest) {
+            if second == number {
                 return Err(refused());
             }
             return Ok(Self::Pair {
-                home: Label::plain(number),
-                warm: Label::plain(warm),
+                first: Label::plain(number),
+                second: Label::plain(second),
             });
         }
         if rest.len() == 4 && rest.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -192,36 +189,34 @@ impl Reading {
             .ok_or_else(refused)
     }
 
-    /// The machine it names first: the machine, the slot's machine, or a pair's home.
+    /// The machine it names first: the machine, the slot's machine, or a pair's first.
     pub const fn machine(&self) -> &Label {
         match self {
-            Self::Machine(label) | Self::Slot(label, _) | Self::Pair { home: label, .. } => label,
+            Self::Machine(label) | Self::Slot(label, _) | Self::Pair { first: label, .. } => label,
         }
     }
 
-    /// The seats it names, home first: a bare machine is its slot 1.
-    pub fn seats(&self) -> Vec<SeatRef> {
+    /// The preferences it names, in order: a bare machine is rank 1, as the sheets' `m3`, `m3.2`
+    /// order their accounts; a number is that rank; a two-Mac label is one unranked preference
+    /// on each Mac. The grammar never says what an account is, only where it is preferred.
+    pub fn preferences(&self) -> Vec<Preferred> {
         match *self {
-            Self::Machine(machine) => vec![SeatRef {
+            Self::Machine(machine) => vec![Preferred {
                 machine,
-                slot: Some(1),
-                home: true,
+                rank: Some(1),
             }],
-            Self::Slot(machine, slot) => vec![SeatRef {
+            Self::Slot(machine, rank) => vec![Preferred {
                 machine,
-                slot: Some(slot),
-                home: true,
+                rank: Some(rank),
             }],
-            Self::Pair { home, warm } => vec![
-                SeatRef {
-                    machine: home,
-                    slot: None,
-                    home: true,
+            Self::Pair { first, second } => vec![
+                Preferred {
+                    machine: first,
+                    rank: None,
                 },
-                SeatRef {
-                    machine: warm,
-                    slot: None,
-                    home: false,
+                Preferred {
+                    machine: second,
+                    rank: None,
                 },
             ],
         }
@@ -347,8 +342,8 @@ mod tests {
 
     /// The one label parser reads every spelling the lab's sources use the same way (design §9):
     /// `M109` folds to `m109`; four hex digits after a dash are the membership log's clash
-    /// suffix, one to three digits the legacy slot; a dot is a slot; `m106-m38` is a home seat on
-    /// m106 and a warm one on m38; and `Name`, `Slot` and stored label cells agree with it.
+    /// suffix, one to three digits the legacy number; a dot is a number; `m106-m38` is one
+    /// unranked preference on m106 and one on m38; and `Name`, `Slot` and stored label cells agree with it.
     /// NEGATIVE CONTROL: with the clash arm removed from `Reading::parse` (four hex digits read
     /// as a legacy slot, which has at most three), `m40-3fa2` and `m40-1234` are refused, and
     /// this fails at its `m40-3fa2` row: `` called `Result::unwrap()` on an `Err` value ``.
@@ -371,8 +366,8 @@ mod tests {
             (
                 "m106-m38",
                 Reading::Pair {
-                    home: label(106),
-                    warm: label(38),
+                    first: label(106),
+                    second: label(38),
                 },
             ),
         ] {
@@ -400,21 +395,23 @@ mod tests {
             assert!(Reading::parse(bad).is_err(), "{bad:?}");
         }
         assert_eq!(
-            Reading::parse("m106-m38").unwrap().seats(),
+            Reading::parse("m106-m38").unwrap().preferences(),
             [
-                SeatRef {
+                Preferred {
                     machine: label(106),
-                    slot: None,
-                    home: true,
+                    rank: None,
                 },
-                SeatRef {
+                Preferred {
                     machine: label(38),
-                    slot: None,
-                    home: false,
+                    rank: None,
                 },
             ]
         );
-        assert_eq!(Reading::parse("m3").unwrap().seats()[0].slot, Some(1));
+        assert_eq!(Reading::parse("m3").unwrap().preferences()[0].rank, Some(1));
+        assert_eq!(
+            Reading::parse("m27-3").unwrap().preferences()[0].rank,
+            Some(3)
+        );
         assert_eq!(Reading::parse("m27-2").unwrap().machine(), &label(27));
         // Stored cells have one spelling; Name and Slot read through the same grammar.
         assert_eq!(Label::parse("M40-3FA2").unwrap().canonical(), "m40-3fa2");

@@ -466,6 +466,8 @@ impl Grid {
             .min(sb_before);
         self.admit_resize_undo(new_rows, new_cols, policy);
         let next = NextWrite::of(self);
+        let follows = self.cursor_follows_glyph();
+        let glyph_before = follows || self.pending_wrap() || !self.cursor_starts_its_span();
         let old_rows = self.settled_rows();
         let law = self.storage.resize_law;
         let rewrap_plan = (law == ResizeLaw::Rewrap
@@ -663,7 +665,23 @@ impl Grid {
                 .reconcile_replay_carried_after_resize(sb_before, carried_before);
         }
         self.cover_retained_rows();
+        self.storage.cursor_state.follows_glyph = if new_cols == old_cols {
+            follows
+        } else {
+            // A rewrap that opens a row for the cursor's cell leaves the glyph that was before the
+            // cursor at the end of the row above, where a mark still in the stream belongs.
+            glyph_before && reflow && self.cursor_opens_a_continuation()
+        };
         self.seal_resize_undo();
+    }
+
+    /// Whether the cursor stands on column 0 of a row that continues the one above.
+    fn cursor_opens_a_continuation(&self) -> bool {
+        let row = self.storage.cursor.row;
+        self.storage.cursor.col == 0
+            && !self.storage.pending_wrap()
+            && row > 0
+            && self.row(row).is_some_and(Row::is_wrapped)
     }
 
     /// Put the cursor where the resize took its next glyph, from the column its cell `landed` on

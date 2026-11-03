@@ -465,7 +465,11 @@ impl Aliases {
         static HERE: std::sync::OnceLock<Aliases> = std::sync::OnceLock::new();
         HERE.get_or_init(|| {
             let firmlinks = if cfg!(target_os = "macos") {
-                std::fs::read_to_string("/usr/share/firmlinks").unwrap_or_default()
+                aterm_uds::atomic_file::read_regular_text(
+                    Path::new("/usr/share/firmlinks"),
+                    64 * 1024,
+                )
+                .unwrap_or_default()
             } else {
                 String::new()
             };

@@ -323,6 +323,49 @@ impl Grid {
         }
     }
 
+    /// Whether the glyph before the cursor is still the one a mark continues though the cursor
+    /// stands across an edge from it ([`crate::state::GridCursorState::follows_glyph`]). It decides
+    /// only where [`Self::cursor_starts_its_span`] holds.
+    #[must_use]
+    #[inline]
+    pub const fn cursor_follows_glyph(&self) -> bool {
+        self.storage.cursor_state.follows_glyph
+    }
+
+    /// Carry [`Self::cursor_follows_glyph`] in, as a checkpoint restores it.
+    #[inline]
+    pub const fn set_cursor_follows_glyph(&mut self, follows: bool) {
+        self.storage.cursor_state.follows_glyph = follows;
+    }
+
+    /// Whether no glyph lies left of the cursor on its side of an edge: column 0, or the left
+    /// margin.
+    #[must_use]
+    #[inline]
+    pub const fn cursor_starts_its_span(&self) -> bool {
+        let col = self.storage.cursor_state.cursor.col;
+        col == 0
+            || (self.storage.has_horizontal_margins
+                && col == self.storage.horizontal_margins().left)
+    }
+
+    /// Whether the cursor stands left of a left margin, from where a print can step onto it.
+    #[must_use]
+    #[inline]
+    pub const fn cursor_left_of_margin(&self) -> bool {
+        self.storage.has_horizontal_margins
+            && self.storage.cursor_state.cursor.col < self.storage.horizontal_margins().left
+    }
+
+    /// A print from [`Self::cursor_left_of_margin`] ended: whether it stepped onto the margin.
+    #[inline]
+    pub const fn note_print_from_left_of_margin(&mut self) {
+        let on_margin = self.storage.cursor_state.cursor.col
+            == self.storage.horizontal_margins().left
+            && !self.storage.cursor_state.pending_wrap;
+        self.storage.cursor_state.follows_glyph = on_margin;
+    }
+
     /// Resolve pending wrap: if a deferred wrap is active, perform the actual line advance now.
     #[inline]
     pub fn resolve_pending_wrap(&mut self) {

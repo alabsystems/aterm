@@ -16,7 +16,8 @@
 //! selector in front, since its words name what it waits for (`await task @a,@b`); `subscribe`
 //! already takes its targets after the verb; a meta verb (`who`, `hold <sid>`, `raise <sid>`,
 //! `survey`) takes no session selector at all, and a write (`send`, `turn`, `meta set`) keeps
-//! the one spelling the protocol defines.
+//! the one spelling the protocol defines. `close` is the one write that moves: the session is
+//! all it can name, so `close s-ab12` means nothing but `@s-ab12 close`.
 
 use aterm_types::control_request::{Selector, Sid};
 use aterm_types::control_verbs::{self, Framing, Lane, OpClass, Target};
@@ -32,6 +33,9 @@ const READ_AS: &str = "text";
 /// word to find. Only an `@` that names a session is a selector after them.
 const TEXT_AFTER_VERB: [&str; 1] = ["search"];
 
+/// The one write whose session may follow its verb ([the module](self)).
+const CLOSE: &str = "close";
+
 /// `parts` with a read's session moved in front of its verb (and [`READ`] read as `text`), or
 /// `None` when it names no session after a read's verb.
 pub(crate) fn rewrite(parts: &[String]) -> Option<Vec<String>> {
@@ -39,6 +43,7 @@ pub(crate) fn rewrite(parts: &[String]) -> Option<Vec<String>> {
         [selector, verb, rest @ ..] if selector.starts_with('@') && verb == READ => {
             (selector.clone(), READ_AS, rest)
         }
+        [verb, word] if verb == CLOSE => (session_of_close(word)?, CLOSE, &[][..]),
         [verb, word, rest @ ..] => {
             let verb = if verb == READ { READ_AS } else { verb.as_str() };
             (session_after(verb, word, rest)?, verb, rest)
@@ -65,6 +70,16 @@ fn session_after(verb: &str, word: &str, rest: &[String]) -> Option<String> {
         Some(body) if !text_after || names_a_session(body) => Some(word.to_owned()),
         None if !text_after && Sid::parse(word).is_some() => Some(format!("@{word}")),
         _ => None,
+    }
+}
+
+/// The selector `close`'s one word names: an `@` word as typed (the client's own refusal answers
+/// an empty or malformed one), or a bare session id with its `@`.
+fn session_of_close(word: &str) -> Option<String> {
+    if word.starts_with('@') {
+        Some(word.to_owned())
+    } else {
+        Sid::parse(word).map(|sid| format!("@{}", sid.as_str()))
     }
 }
 

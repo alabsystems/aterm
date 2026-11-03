@@ -249,7 +249,7 @@ pub(crate) fn file_digest(path: &Path, alg: DigestAlg) -> io::Result<String> {
 
 /// Feed `path`'s contents to `update`, one `buf` at a time.
 fn read_chunks(path: &Path, buf: &mut [u8], mut update: impl FnMut(&[u8])) -> io::Result<()> {
-    let mut f = std::fs::File::open(path)?;
+    let mut f = crate::metadata_io::open_regular(path)?;
     loop {
         let n = f.read(&mut *buf)?;
         if n == 0 {

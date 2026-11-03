@@ -92,10 +92,14 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The look a read of `screen` is (`live`: a turn runs on it): whether its composer holds a
-    /// draft (unread under a prompt, or where none is drawn) and its submit count.
+    /// draft (unread under a prompt, or where none is drawn, or while a line this loop gave up on
+    /// undrawn is held: an empty composer then says nothing of a line that may still come, so no
+    /// line it left is released while its copy may arrive) and its submit count.
     pub(in crate::supervise::run) fn left_seen(&self, screen: &Screen, live: bool) -> LeftLook {
         let reader = self.reader(&screen.rows);
-        let draft = if reader.prompt(&screen.rows).is_some() && !armed(Fault::BoxedComposerRead) {
+        let draft = if (reader.prompt(&screen.rows).is_some() && !armed(Fault::BoxedComposerRead))
+            || self.custody.is_some()
+        {
             None
         } else {
             reader

@@ -13,16 +13,32 @@ use astream_wire::Filter;
 
 use crate::BrokerRecord;
 
-/// A checked last-value read could not use the requested history.
+/// A checked last-value read could not prove its requested history or read a retained value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LastViewError {
-    TooOld { requested: u64, available: u64 },
-    NotPublished { requested: u64, published: u64 },
-    AbovePromoted { requested: u64, promoted: u64 },
-    PublishedBackwards { requested: u64, published: u64 },
+    TooOld {
+        requested: u64,
+        available: u64,
+    },
+    NotPublished {
+        requested: u64,
+        published: u64,
+    },
+    AbovePromoted {
+        requested: u64,
+        promoted: u64,
+    },
+    PublishedBackwards {
+        requested: u64,
+        published: u64,
+    },
     WrongOpen,
     ChangedFilter,
     CursorBackwards,
+    /// The last-value index still retains this offset, but its frame cannot be read.
+    UnreadableRetained {
+        offset: u64,
+    },
 }
 
 impl fmt::Display for LastViewError {

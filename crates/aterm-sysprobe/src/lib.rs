@@ -685,9 +685,24 @@ pub fn read_bounded(path: &Path) -> Option<String> {
         .map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
+pub(crate) fn open_nonblock(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::open(path)
+    }
+}
+
 /// The bytes of [`read_bounded`], undecoded (`/proc/self/auxv` is binary): at most [`READ_CAP`], one stack buffer.
 pub(crate) fn read_bounded_bytes(path: &Path) -> Result<Vec<u8>, std::io::ErrorKind> {
-    let mut f = std::fs::File::open(path).map_err(|e| e.kind())?;
+    let mut f = open_nonblock(path).map_err(|e| e.kind())?;
     let mut buf = [0u8; READ_CAP];
     let mut n = 0;
     while n < READ_CAP {
@@ -703,7 +718,7 @@ pub(crate) fn read_bounded_bytes(path: &Path) -> Result<Vec<u8>, std::io::ErrorK
 
 /// Read `path` into `buf`, at most `buf.len()` bytes, never to EOF: how many bytes were read, and whether the file holds more than the buffer (one byte past it is asked for).
 pub(crate) fn read_into(path: &Path, buf: &mut [u8]) -> Result<(usize, bool), std::io::ErrorKind> {
-    let mut f = std::fs::File::open(path).map_err(|e| e.kind())?;
+    let mut f = open_nonblock(path).map_err(|e| e.kind())?;
     let mut n = 0;
     while n < buf.len() {
         match f.read(&mut buf[n..]) {

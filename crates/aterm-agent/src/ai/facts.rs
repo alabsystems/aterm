@@ -1004,15 +1004,11 @@ pub(crate) fn codex_auth_store(home: &Path) -> Result<CodexAuthStore, String> {
 }
 
 /// A CLI's stored login file under `dir` (`stat`ed, never opened), with its write time.
-fn store_file_in(dir: &Path, stores: &[&str]) -> Option<(PathBuf, Option<i64>)> {
-    stores
-        .iter()
-        .map(|rel| dir.join(rel))
-        .find(|p| p.is_file())
-        .map(|p| {
-            let w = mtime(&p);
-            (p, w)
-        })
+fn store_file_in(dir: &Path, c: &Connector) -> Option<(PathBuf, Option<i64>)> {
+    super::connector::stored_login_file(c, dir).map(|p| {
+        let w = mtime(&p);
+        (p, w)
+    })
 }
 
 /// The end of Codex's usage limit from its own `rate_limits` readings
@@ -1055,7 +1051,7 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
     } else {
         None
     };
-    let home_login_file = home.as_ref().ok().and_then(|h| store_file_in(h, c.stores));
+    let home_login_file = home.as_ref().ok().and_then(|h| store_file_in(h, c));
     let home_var = c.home.var.and_then(m.var).filter(|s| !s.is_empty());
     let default_home = home_var.is_none();
     let (profile_signed_in, plan, accounts) = match (c.is_claude(), home.as_ref()) {
@@ -1248,7 +1244,7 @@ fn pool_for_with(
     };
     let c = cli.connector();
     let default_dir = user_home.join(cli.accounts().default_home);
-    let default_login = store_file_in(&default_dir, c.stores);
+    let default_login = store_file_in(&default_dir, c);
     let bound = accounts::bound(&roster, &logins);
     let enrolled_here = accounts::enrolled_in(cli, &bound, user_home);
     let emails = bound.rows.iter().filter(|r| r.email.is_some()).count();
@@ -1512,7 +1508,7 @@ fn pool_for_with(
         out.serving_label = Some(row.label.clone());
         out.serving_login = Some(accounts::login_env_for(cli, row));
         out.serving_login_file = match row.dir.as_deref().filter(|d| !d.is_empty()) {
-            Some(dir) => store_file_in(Path::new(dir), c.stores),
+            Some(dir) => store_file_in(Path::new(dir), c),
             None => default_login,
         };
         let cond = row_cond(row);

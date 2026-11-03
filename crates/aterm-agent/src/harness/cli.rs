@@ -29,6 +29,9 @@ use crate::supervise::run::{Ctl, Session};
 use crate::supervise::transport::{Endpoint, RelayCtl};
 use crate::supervise::{SupervisorConfig, approvals, limit};
 
+#[path = "cli_default_completion.rs"]
+pub(super) mod default_completion;
+
 #[path = "cli_shared_adoption.rs"]
 pub(in crate::harness) mod shared_adoption;
 #[path = "cli_shared_provider.rs"]
@@ -266,6 +269,10 @@ or 1 if the session cannot be read.
 
 const HELP_DISK: &str = "\
 `disk` reports reclaimable build directories and caches; it removes nothing by default.
+`disk --json` emits JSON Lines: a `disk` report, then a `disk-watch` status object;
+`--apply` adds a final `disk-apply` result. Read one JSON object per line and select
+records by `kind`.
+
 Removal needs both `disk.apply = true` in `aterm.toml` and `--apply <class>`. Every run
 journals its report, and each removal or refusal, to `<state>/disk.jsonl`. An unreadable or
 invalid `aterm.toml`, or a `[disk]` removal key (`apply`, `target_stale_days`,
@@ -431,8 +438,11 @@ const HELP_ACCOUNTS: &str = "\
 The roster is `accounts.toml` beside `aterm.toml`: `[[account]]` rows with `label`,
 `class` (`dedicated` or `shared`), optional `dir` (the one row without `dir` is the
 machine's default login), and optional `email`, `identity_email` and `browser`. An invalid roster is
-refused whole (exit 1). The report prints no credential, and no email but in Codex's JSON report
-(`--cli codex --json`), which carries each row's `email` and `identity_email`.
+refused whole (exit 1). The report prints no credential. Its rows print no email but in Codex's
+JSON report (`--cli codex --json`), which carries each row's `email` and `identity_email`; the
+retained Commons rows listed after them show a shared account's email where the catalog has
+one, and for one CLI the local label it matches (`--json`: `shared_accounts`, or
+`shared_catalog` under `--cli all` unless it finds no pool and reports Claude's alone).
 A label names one login, never a machine: a row found by itself is named for the Mac or Macs it
 runs on, with a number past the first (`m2`, `m2-2`, `m2-3`, or `m106-m38` for a shared one), and
 its `email` in the roster says which account that is.
@@ -459,6 +469,9 @@ OUTLOOK (Claude Code's pool):
   block: what the rotation's own policy would do if today's pace holds, from readings aterm
   already has; it moves nothing and reads no account. `--json` carries the same model as
   each window's `fresh` and `projection`, each row's `plan` and a top-level `outlook`.
+  `session_pct`, `week_pct` and their resets repeat the current merged windows, or null
+  for an expired or reset-cut figure. `sampled_at` is the retained sample's publication
+  time; each window's `as_of` and `source` identify the observation its figure came from.
 
 LIMIT RESET (`[harness] limit_reset = true`, default false):
   At Claude Code's usage-limit dialog on the machine's default login (no other account run
@@ -500,9 +513,12 @@ VERBS:
     default login must report that canonical address (Claude Code's subscription, Codex's
     auth.json) or nothing is written; `--email` remains the address used for sign-in.
     This records metadata, not a new credential or proof that the login will remain
-    usable. A locally owned fleet source is updated too; a read-only source is named and
-    nothing is written.
-    Retained login or account state under the label refuses adoption. Creation also
+    usable. For Claude Code, a locally owned fleet source is updated too; a read-only
+    source is named and nothing is written.
+    For Codex, repeating the existing default label completes a missing email from the
+    native login, retaining authored settings. Startup and upkeep do this too when login
+    policy allows it. Source files are unchanged; conflicting identities or holds refuse.
+    Retained login or account state under a new label refuses adoption. Creation also
     waits briefly for any managed sign-in, then refuses while it remains in flight.
   - `accounts login <label>`
     Runs `CLAUDE_CONFIG_DIR='<staging>' claude auth login` in a terminal, in a fresh staging
@@ -605,12 +621,12 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
   - `accounts list|add|adopt-default|use|stats --cli <id>` take the forms above, with
     `--region` and `--flow` on `add` and `adopt-default`; `serve` is Claude Code's alone in
     this build, and its dashboard shows every pool. `stats --cli <id>` lists each row's
-    condition, login and usage (a Codex row's read directly from OpenAI's usage API under the
-    row's `auth.json`), and `stats --cli codex` reads the default home's newest rollouts' 5h and
+    condition, login and usage as last read, with its age (no row is read for the report: a
+    Codex row is read from OpenAI's usage API only when a launch is about to start on it), and `stats --cli codex` reads the default home's newest rollouts' 5h and
     week windows too. `accounts refresh --cli kimi` starts Kimi in a temporary aterm tab,
     sends only `/usage`, records the 5h, optional weekly and monthly observations, then closes
     the tab on success or failure. No model prompt is sent and no credentials are copied.
-    Window upkeep runs that refresh in the background when an observation is at least 5m old.
+    Nothing runs that refresh for you: no timer reads a provider's usage.
   - `accounts sync --cli <id> [<source>] [--machine <mN>] [--json]` adds this machine's rows
     of the CLI's fleet to its roster, each with a login directory of its own, and changes or
     removes no row the roster has. The fleet is the source named, else
@@ -661,7 +677,7 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
   - On macOS Grok Build's sign-in runs under `sandbox-exec` with LaunchServices, Apple
     events and the pasteboard denied, so it opens no browser on the desk.
   - A Codex worker aterm starts takes the pool's pin, else its fresh active row, else the
-    next one (`next:`), once each row's usage was read under its `auth.json`;
+    next one (`next:`), reading only the row it starts on under its `auth.json`;
     `[harness] accounts = \"off\"` keeps only the pin (`next:` names it, else says the
     worker takes no row and runs on the login its starter carries, or why it is refused),
     and a login kept in the OS keyring picks none, the pin included (`next:` says so too).
@@ -959,6 +975,22 @@ fn codex_of_env(
     (thread, login)
 }
 
+/// The harness state directory: `$ATERM_HARNESS_STATE` when set (it must be absolute), else
+/// `<aterm state>/harness/claude-harness`.
+///
+/// # Errors
+/// `$ATERM_HARNESS_STATE` is relative, or the aterm state root is unknown.
+pub fn harness_state_dir() -> Result<PathBuf, String> {
+    match std::env::var_os("ATERM_HARNESS_STATE") {
+        Some(dir) if Path::new(&dir).is_absolute() => Ok(PathBuf::from(dir)),
+        Some(_) => Err("ATERM_HARNESS_STATE must be absolute".to_string()),
+        None => Ok(aterm_types::dirs::state_dir()
+            .ok_or_else(|| "the aterm state root is unknown".to_string())?
+            .join("harness")
+            .join(HARNESS)),
+    }
+}
+
 impl Env {
     /// Read the process environment.
     pub fn from_process() -> Result<Env, String> {
@@ -966,15 +998,7 @@ impl Env {
             .map(PathBuf::from)
             .filter(|h| h.is_absolute());
         let aterm_state = aterm_types::dirs::state_dir();
-        let state = match std::env::var_os("ATERM_HARNESS_STATE") {
-            Some(dir) if Path::new(&dir).is_absolute() => PathBuf::from(dir),
-            Some(_) => return Err("ATERM_HARNESS_STATE must be absolute".to_string()),
-            None => aterm_state
-                .clone()
-                .ok_or_else(|| "the aterm state root is unknown".to_string())?
-                .join("harness")
-                .join(HARNESS),
-        };
+        let state = harness_state_dir()?;
         let cwd = std::env::current_dir()
             .map_err(|e| format!("the working directory cannot be read: {e}"))?;
         let now = crate::supervise::limit::unix_now();
@@ -3150,7 +3174,14 @@ fn run_agy(
     use super::agy_quota_store as store;
     let (rotation, notes) = agy_quota::Rotation::from_path(env.config.as_deref());
     let st = agy_store(env);
-    let current = store::current(&st, source, env.now, rotation.low, refresh);
+    let current = store::current(
+        &st,
+        source,
+        env.now,
+        rotation.low,
+        refresh,
+        super::provider_read::InUse::Asked,
+    );
     let (reading, got) = match current {
         Ok(r) => r,
         Err(why) => {
@@ -3998,7 +4029,8 @@ fn run_limits(
     )
 }
 
-fn kimi_refresh_command(env: &Env) -> Result<String, String> {
+/// The row a Kimi quota tab reads, and the command that starts it there.
+fn kimi_refresh_command(env: &Env) -> Result<(String, String), String> {
     let path = env
         .accounts_roster_for(Cli::Kimi)
         .ok_or_else(|| "no Kimi account roster is known".to_owned())?;
@@ -4010,19 +4042,22 @@ fn kimi_refresh_command(env: &Env) -> Result<String, String> {
         .map_err(|why| match why {
             accounts::RosterReadError::Roster(why) | accounts::RosterReadError::Records(why) => why,
         })?;
-    let label = records.state.active.as_deref().or_else(|| {
-        records
-            .roster
-            .row_for_login(None)
-            .map(|row| row.label.as_str())
-    });
-    let Some(label) = label else {
-        return Err("no active or default Kimi account is listed".to_owned());
-    };
     let row = records
-        .roster
-        .row(label)
-        .ok_or_else(|| format!("{label} is not in the Kimi roster"))?;
+        .state
+        .active
+        .as_deref()
+        .and_then(|label| records.roster.row(label))
+        .filter(|row| row.held_by.is_none())
+        .or_else(|| {
+            records
+                .roster
+                .rows
+                .iter()
+                .find(|row| row.dir.is_none() && row.held_by.is_none())
+        })
+        .or_else(|| records.roster.rows.iter().find(|row| row.held_by.is_none()))
+        .ok_or_else(|| "no active or default Kimi account is listed".to_owned())?;
+    let label = row.label.as_str();
     let dir = records
         .logins
         .get(label)
@@ -4030,13 +4065,14 @@ fn kimi_refresh_command(env: &Env) -> Result<String, String> {
     if row.dir.is_some() && dir.is_none() {
         return Err(format!("{label} has no enrolled login here"));
     }
-    Ok(match dir {
+    let command = match dir {
         Some(dir) => format!(
             "KIMI_CODE_HOME={} exec kimi",
             super::upgrade::quote(super::upgrade::Dialect::Zsh, &dir)
         ),
         None => "exec kimi".to_owned(),
-    })
+    };
+    Ok((label.to_owned(), command))
 }
 
 fn run_kimi_refresh_with<C: Ctl>(
@@ -4046,8 +4082,8 @@ fn run_kimi_refresh_with<C: Ctl>(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let command = match kimi_refresh_command(env) {
-        Ok(command) => command,
+    let (label, command) = match kimi_refresh_command(env) {
+        Ok(found) => found,
         Err(why) => {
             let _ = writeln!(err, "aterm harness accounts refresh: {why}");
             return ExitCode::from(1);
@@ -4076,6 +4112,13 @@ fn run_kimi_refresh_with<C: Ctl>(
         );
         return ExitCode::from(1);
     };
+    super::provider_read::note(&super::provider_read::ProbeEvent {
+        at: env.now,
+        read: super::provider_read::Read::KimiPanel,
+        account: Some(label),
+        login: None,
+        why: super::provider_read::InUse::Asked,
+    });
     let target = format!("@{sid}");
     let result = (|| -> Result<(), String> {
         let mut call = |args: &[&str]| -> Result<(), String> {
@@ -4980,19 +5023,22 @@ const DISK_WHY_SCAN: usize = 4096;
 const DISK_WHY_ROWS: usize = 24;
 
 /// `disk why`: the ask's lease ([`disk::ask::read`]) as it stands, and the newest of its
-/// ledger rows ([`disk::ask::why_lines`]); `--json` prints the lease, then the rows verbatim.
+/// ledger rows ([`disk::ask::why_lines`]), with what each worker removed counted over the whole
+/// scan, whose `disk-free` rows are not the rule's own; `--json` prints the lease, then the rows
+/// verbatim.
 fn run_disk_why(env: &Env, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let path = env.disk_ledger();
-    let rows = match tail_lines(&path, DISK_WHY_SCAN) {
+    let ledger = match tail_lines(&path, DISK_WHY_SCAN) {
         Ok(rows) => rows,
         Err(e) => {
             let _ = writeln!(err, "aterm harness disk why: {}: {e}", path.display());
             return ExitCode::from(1);
         }
     };
-    let mut rows: Vec<String> = rows
-        .into_iter()
+    let mut rows: Vec<String> = ledger
+        .iter()
         .filter(|r| disk::ask::row_line(r).is_some())
+        .cloned()
         .collect();
     rows.drain(..rows.len().saturating_sub(DISK_WHY_ROWS));
     let lease = disk::ask::read(&env.state);
@@ -5002,7 +5048,7 @@ fn run_disk_why(env: &Env, json: bool, out: &mut dyn Write, err: &mut dyn Write)
             let _ = writeln!(out, "{row}");
         }
     } else {
-        for line in disk::ask::why_lines(&lease, &rows, env.now.saturating_mul(1000)) {
+        for line in disk::ask::why_lines(&lease, &rows, &ledger, env.now.saturating_mul(1000)) {
             let _ = writeln!(out, "{line}");
         }
     }
@@ -6604,8 +6650,10 @@ pub trait AccountsHost {
         home: &str,
         email: &str,
         browser: &RenewBrowser,
-    ) -> Result<RenewalExit, String> {
-        self.renew_flow(home, email, browser).map(RenewalExit::from)
+    ) -> Result<RenewalExit, RenewalFailure> {
+        self.renew_flow(home, email, browser)
+            .map(RenewalExit::from)
+            .map_err(RenewalFailure::from)
     }
 
     /// Run a native renewal through the explicit private mailbox input file.
@@ -6628,9 +6676,10 @@ pub trait AccountsHost {
         email: &str,
         browser: &RenewBrowser,
         inputs: &Path,
-    ) -> Result<RenewalExit, String> {
+    ) -> Result<RenewalExit, RenewalFailure> {
         self.renew_flow_with_inputs(home, email, browser, inputs)
             .map(RenewalExit::from)
+            .map_err(RenewalFailure::from)
     }
 
     /// The check after a renewal's flow exited 0: `claude auth status --json` in the staging home ([`accounts::HOME_ENV`] set to `home`, [`accounts::LOGIN_ENV`] removed), bounded, its exit and stdout handed back.
@@ -6722,11 +6771,6 @@ pub trait AccountsHost {
     fn vendor_login(&self, req: &super::login_drive::Request<'_>) -> Result<i32, String> {
         let _ = req;
         Err("this host runs no sign-in".to_string())
-    }
-
-    /// The reader of a pooled CLI's usage in one row's home that `accounts stats --cli` records before it reports ([`super::accounts_pool::record_usage`]); `None` reads nothing.
-    fn usage_reader(&self) -> Option<super::accounts_pool::ReadUsage<'static>> {
-        None
     }
 
     /// The email of the ChatGPT account Codex's login in `home` names (`<home>/auth.json`'s OAuth JWT claims, [`super::codex_app_login::read_account_email`]), used after terminal sign-in and by `adopt-default --cli codex` when no `--email` is given; `None` names none.
@@ -6833,14 +6877,13 @@ impl From<i32> for RenewalExit {
 impl RenewalExit {
     pub(super) fn from_capture(
         (ran, met): (Captured, Option<super::open_url::Met>),
-    ) -> Result<Self, String> {
+    ) -> Result<Self, RenewalFailure> {
         match ran.code {
             Some(code) => Ok(Self { code, met }),
             None => Err(RenewalFailure {
                 reason: "provider flow ended without an exit code".into(),
                 met,
-            }
-            .to_string()),
+            }),
         }
     }
 
@@ -6849,6 +6892,60 @@ impl RenewalExit {
             || "provider sign-in did not complete".into(),
             |met| format!("provider sign-in exited {}; {}", self.code, met.words()),
         )
+    }
+}
+
+/// Safe facts from exactly one provider invocation. These do not authorize a login,
+/// establish shared custody, or change the renewal's retry decision.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RenewalObservation {
+    exit_code: Option<i32>,
+    met: Option<super::open_url::Met>,
+    capture_failed: bool,
+}
+
+impl RenewalObservation {
+    pub(in crate::harness) fn from_outcome(outcome: &Result<RenewalExit, RenewalFailure>) -> Self {
+        let (exit_code, met, capture_failed) = match outcome {
+            Ok(exit) => (Some(exit.code), exit.met.as_ref(), false),
+            Err(failure) => (None, failure.met.as_ref(), true),
+        };
+        Self {
+            exit_code,
+            // Hosts can construct Met directly. Re-admit its closed wire form before
+            // retaining anything for process-local history or a UI reader.
+            met: met.and_then(|met| super::open_url::Met::parse(&met.line())),
+            capture_failed,
+        }
+    }
+
+    #[must_use]
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
+
+    #[must_use]
+    pub fn met(&self) -> Option<&super::open_url::Met> {
+        self.met.as_ref()
+    }
+
+    #[must_use]
+    pub fn capture_failed(&self) -> bool {
+        self.capture_failed
+    }
+
+    /// Explain validated helper facts and the process exit, never provider output.
+    #[must_use]
+    pub fn words(&self) -> String {
+        let mut words = match self.exit_code {
+            Some(code) => format!("provider sign-in exited {code}"),
+            None => "provider sign-in capture failed".into(),
+        };
+        if let Some(met) = &self.met {
+            words.push_str("; ");
+            words.push_str(&met.words());
+        }
+        words
     }
 }
 
@@ -6869,6 +6966,7 @@ impl AccountsHost for LiveAccounts {
     ) -> Result<i32, String> {
         self.renew_outcome_with_inputs(home, email, browser, inputs)
             .map(|exit| exit.code)
+            .map_err(|failure| failure.to_string())
     }
     fn renew_outcome_with_inputs(
         &self,
@@ -6876,22 +6974,19 @@ impl AccountsHost for LiveAccounts {
         email: &str,
         browser: &RenewBrowser,
         inputs: &Path,
-    ) -> Result<RenewalExit, String> {
+    ) -> Result<RenewalExit, RenewalFailure> {
         let user_home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or("provider flow has no machine home")?;
-        RenewalExit::from_capture(
-            super::accounts_sync::shared_renewal::sign_in_with_inputs(
-                &user_home,
-                home,
-                email,
-                browser,
-                true,
-                None,
-                Some(inputs),
-            )
-            .map_err(|failure| failure.to_string())?,
-        )
+        RenewalExit::from_capture(super::accounts_sync::shared_renewal::sign_in_with_inputs(
+            &user_home,
+            home,
+            email,
+            browser,
+            true,
+            None,
+            Some(inputs),
+        )?)
     }
     fn shared_claude_profile(
         &self,
@@ -6946,6 +7041,7 @@ impl AccountsHost for LiveAccounts {
     fn renew_flow(&self, home: &str, email: &str, browser: &RenewBrowser) -> Result<i32, String> {
         self.renew_outcome(home, email, browser)
             .map(|exit| exit.code)
+            .map_err(|failure| failure.to_string())
     }
 
     fn renew_outcome(
@@ -6953,7 +7049,7 @@ impl AccountsHost for LiveAccounts {
         home: &str,
         email: &str,
         browser: &RenewBrowser,
-    ) -> Result<RenewalExit, String> {
+    ) -> Result<RenewalExit, RenewalFailure> {
         let user_home = std::env::var_os("HOME").map(PathBuf::from);
         let prog = user_home
             .as_deref()
@@ -7001,10 +7097,6 @@ impl AccountsHost for LiveAccounts {
 
     fn current_exe(&self) -> Option<PathBuf> {
         std::env::current_exe().ok()
-    }
-
-    fn usage_reader(&self) -> Option<super::accounts_pool::ReadUsage<'static>> {
-        Some(&super::accounts_pool::LiveUsage)
     }
 
     fn codex_account(&self, home: &Path) -> Option<String> {
@@ -7371,7 +7463,7 @@ fn renew_flow_of(
     browser: &RenewBrowser,
     var: &dyn Fn(&str) -> Option<OsString>,
     within: Option<std::time::Duration>,
-) -> Result<RenewalExit, String> {
+) -> Result<RenewalExit, RenewalFailure> {
     let mut cmd = renew_command(program, home, email, browser);
     if within.is_some() {
         cmd.envs(unattended_renewal_environment(var)?);
@@ -7410,26 +7502,41 @@ fn renew_flow_of(
         }
     }
     if let Some(within) = within {
-        return RenewalExit::from_capture(
-            capture_unattended_renewal(cmd, within).map_err(|failure| failure.to_string())?,
-        );
+        return RenewalExit::from_capture(capture_unattended_renewal(cmd, within)?);
     }
     terminal_flow(|| cmd.spawn(), |mut child| child.wait(), || {})
         .map(exit_code)
         .map(RenewalExit::from)
-        .map_err(|e| e.to_string())
+        .map_err(|e| RenewalFailure::from(e.to_string()))
 }
 
 /// A failed provider run and the safe browser outcome recorded before it ended.
 #[derive(Debug)]
-pub(crate) struct RenewalFailure {
+pub struct RenewalFailure {
     reason: String,
     pub(super) met: Option<super::open_url::Met>,
+}
+
+impl RenewalFailure {
+    /// Keep the private failure explanation separate from its optional browser outcome.
+    #[must_use]
+    pub fn new(reason: impl Into<String>, met: Option<super::open_url::Met>) -> Self {
+        Self {
+            reason: reason.into(),
+            met,
+        }
+    }
 }
 
 impl From<String> for RenewalFailure {
     fn from(reason: String) -> Self {
         Self { reason, met: None }
+    }
+}
+
+impl From<&str> for RenewalFailure {
+    fn from(reason: &str) -> Self {
+        reason.to_owned().into()
     }
 }
 
@@ -7919,6 +8026,18 @@ impl HeldBy {
     }
 }
 
+/// A current, uncut quota figure from the report's merged window view.
+fn current_account_window<'a>(
+    view: &'a super::account_stats::View,
+    id: &str,
+    now: i64,
+) -> Option<&'a accounts::WindowFig> {
+    view.windows
+        .iter()
+        .find(|window| window.id == id)
+        .and_then(|window| window.current(now))
+}
+
 /// The account a Claude Code report's figures are read of where the roster lists one login or
 /// none: the one signed in to the default home under `home` ([`profile::default_home_key`]).
 fn report_key(home: Option<&Path>, roster: &Roster) -> Option<profile::AccountKey> {
@@ -8024,16 +8143,21 @@ pub fn survey_accounts(
         .map(|row| {
             let account = state.account(&row.label);
             let here = row.dir.is_none() || enrolled.contains(&row.label);
-            let sample = account.sample.as_ref();
-            let week = sample.and_then(|s| s.week(now));
+            let windows = HeldBy {
+                tap: super::account_stats::Tap::On,
+                key,
+            }
+            .windows(&account, &state, now);
+            let session = current_account_window(&windows, accounts::SESSION_LIMIT, now);
+            let week = current_account_window(&windows, accounts::WEEK_LIMIT, now);
             SurveyAccount {
                 label: row.label.clone(),
                 class: row.class,
                 enrolled: here,
                 condition: accounts::condition(row, &state, here, now),
-                five_hour_pct: sample.and_then(|s| s.session(now)).map(|(pct, _)| pct),
-                seven_day_pct: week.map(|(pct, _)| pct),
-                week_reset: week.map(|(_, end)| end),
+                five_hour_pct: session.map(accounts::WindowFig::whole),
+                seven_day_pct: week.map(accounts::WindowFig::whole),
+                week_reset: week.map(|f| f.reset),
                 used_at: account.ran_at,
             }
         })
@@ -8130,9 +8254,13 @@ impl Rotation {
         home: Option<&Path>,
     ) -> Rotation {
         let off_by = match config {
-            Some(path) if policy.accounts == accounts::Mode::Off => std::fs::read(path)
-                .map(|bytes| SupervisorConfig::accounts_off_by(&String::from_utf8_lossy(&bytes)))
-                .unwrap_or(Ok(Vec::new())),
+            Some(path) if policy.accounts == accounts::Mode::Off => {
+                super::ai_pool::read_bounded_bytes(path, 2 * 1024 * 1024)
+                    .map(|bytes| {
+                        SupervisorConfig::accounts_off_by(&String::from_utf8_lossy(&bytes))
+                    })
+                    .unwrap_or(Ok(Vec::new()))
+            }
             _ => Ok(Vec::new()),
         };
         Rotation {
@@ -9451,30 +9579,27 @@ fn accounts_json(
             m.insert("active".to_owned(), Value::from(mark.is_some()));
             m.insert("pinned".to_owned(), Value::from(mark == Some("pinned")));
             let sample = account.sample.as_ref();
-            let session = sample.and_then(|s| s.session(now));
-            let week = sample.and_then(|s| s.week(now));
+            let windows = by.windows(&account, state, now);
+            let session = current_account_window(&windows, accounts::SESSION_LIMIT, now);
+            let week = current_account_window(&windows, accounts::WEEK_LIMIT, now);
             m.insert(
                 "session_pct".to_owned(),
-                Value::from(session.map(|(pct, _)| pct)),
+                Value::from(session.map(accounts::WindowFig::whole)),
             );
-            put_time(
-                &mut m,
-                "session_reset",
-                session.and(sample.and_then(|s| s.session_reset)),
+            put_time(&mut m, "session_reset", session.map(|f| f.reset));
+            m.insert(
+                "week_pct".to_owned(),
+                Value::from(week.map(accounts::WindowFig::whole)),
             );
-            m.insert("week_pct".to_owned(), Value::from(week.map(|(pct, _)| pct)));
-            put_time(
-                &mut m,
-                "week_reset",
-                week.and(sample.and_then(|s| s.week_reset)),
-            );
+            put_time(&mut m, "week_reset", week.map(|f| f.reset));
+            // The sample remains history even when a newer wall supplies the current figure.
             put_time(&mut m, "sampled_at", sample.map(|s| s.at));
             let key = by.key.or(account.key);
             m.insert("key".to_owned(), Value::from(key.map(|k| k.to_string())));
             m.insert(
                 "windows".to_owned(),
                 Value::Array(
-                    by.windows(&account, state, now)
+                    windows
                         .windows
                         .iter()
                         .map(|w| {
@@ -10238,7 +10363,7 @@ fn fleet_rows_for_write(
     }
     let origin = fleet_origin(env.home.as_deref(), env.config.as_deref(), path);
     let from = match &origin {
-        FleetOrigin::Roster => return Ok(Vec::new()),
+        FleetOrigin::Roster | FleetOrigin::Alab => return Ok(Vec::new()),
         FleetOrigin::Local { files, .. } => return list_in_local_fleet(env, files, asked),
         FleetOrigin::Key(_) => "list the account there",
         FleetOrigin::Vault(_) => {
@@ -11323,6 +11448,26 @@ fn renew_one_guarded(
     err: &mut dyn Write,
     guard: &mut shared_renewal::Guard<'_>,
 ) -> Renewal {
+    renew_one_observed(
+        env, host, store, _signin, policy, own_dir, browser, out, err, guard, &mut None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn renew_one_observed(
+    env: &Env,
+    host: &dyn AccountsHost,
+    store: &accounts::Store,
+    _signin: &accounts::Lock,
+    policy: accounts::RenewalPolicy<'_>,
+    own_dir: Option<&str>,
+    browser: &RenewBrowser,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    guard: &mut shared_renewal::Guard<'_>,
+    observation: &mut Option<RenewalObservation>,
+) -> Renewal {
+    *observation = None;
     let row = policy.row;
     let label = row.label.as_str();
     let Some(email) = row.email.as_deref() else {
@@ -11416,6 +11561,7 @@ fn renew_one_guarded(
         return Renewal::Deferred;
     }
     let exited = host.renew_outcome(&staging_text, email, browser);
+    *observation = Some(RenewalObservation::from_outcome(&exited));
     let now = host.now().max(env.now);
     if let Err(why) = guard.check_policy(store, policy, now) {
         say(
@@ -11432,7 +11578,7 @@ fn renew_one_guarded(
                 err,
                 &format!(
                     "`claude` sign-in did not complete: {}",
-                    super::one_line(&why, 160)
+                    super::one_line(&why.to_string(), 160)
                 ),
             );
             return Renewal::Failed;
@@ -12607,11 +12753,7 @@ fn bind_signed_in(
     let say = |err: &mut dyn Write, what: &str| {
         let _ = writeln!(err, "aterm harness accounts {verb}: {label}: {what}");
     };
-    let has_login = || {
-        c.stores
-            .iter()
-            .any(|name| plan.staging.join(name).is_file())
-    };
+    let has_login = || crate::ai::connector::stored_login_file(c, &plan.staging).is_some();
     if !has_login() {
         drop_staging(&plan.staging, err);
         say(
@@ -12908,9 +13050,7 @@ pub(super) fn renew_one_for(
     use super::login_drive::Outcome;
     let label = row.label.as_str();
     let c = cli.connector();
-    let Some(email) = row.email.as_deref() else {
-        return Renewal::Failed;
-    };
+    let email = row.email.as_deref().unwrap_or("");
     let codex_program = report_program(cli, host);
     let plan = match sign_in_plan(
         cli,
@@ -13146,7 +13286,7 @@ fn run_accounts_renew_for(
                 );
                 return ExitCode::from(1);
             }
-            Some(row) if row.email.is_none() => {
+            Some(row) if row.email.is_none() && cli != Cli::Kimi => {
                 let _ = writeln!(
                     err,
                     "aterm harness accounts renew: `{label}` has no email, so its sign-in could \
@@ -13932,6 +14072,32 @@ pub fn run_accounts_of(
                 );
                 return ExitCode::from(1);
             }
+            if cli == Cli::Codex {
+                let asked = accounts::Row {
+                    label: label.clone(),
+                    email: email.clone(),
+                    identity_email: identity_email.clone(),
+                    browser: browser.clone(),
+                    vendor: of.vendor,
+                    ..accounts::Row::default()
+                };
+                match default_completion::complete(env, Some(&asked), |home| {
+                    host.codex_account(home)
+                }) {
+                    Ok(Some(label)) => {
+                        let _ = writeln!(
+                            out,
+                            "completed existing default account `{label}`; existing settings retained"
+                        );
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(None) => {}
+                    Err(why) => {
+                        let _ = writeln!(err, "aterm harness accounts adopt-default: {why}");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
             // An explicit canonical expectation is checked even when a login
             // alias was supplied. Adoption still records metadata, not a
             // fresh sign-in or a renewable credential proof.
@@ -13996,7 +14162,7 @@ pub fn run_accounts_of(
         }
         AccountsCmd::Use { label } => run_accounts_use((cli, host), env, Some(label), out, err),
         AccountsCmd::Auto => run_accounts_use((cli, host), env, None, out, err),
-        AccountsCmd::Stats { json } => run_accounts_stats_of(cli, env, host, *json, out, err),
+        AccountsCmd::Stats { json } => run_accounts_stats_of(cli, env, *json, out, err),
         AccountsCmd::Refresh { json } => run_kimi_refresh(env, *json, out, err),
         AccountsCmd::Renew { labels, due, on } => {
             run_accounts_renew_for(cli, env, host, (labels, *due, on.as_deref()), out, err)
@@ -14061,7 +14227,6 @@ fn accounts_stats_refused(
 fn run_accounts_stats_of(
     cli: Cli,
     env: &Env,
-    host: &dyn AccountsHost,
     json: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -14091,31 +14256,10 @@ fn run_accounts_stats_of(
                 | accounts::RosterReadError::Records(why) => why,
             })
     };
-    let mut records = match read_records() {
+    let records = match read_records() {
         Ok(records) => records,
         Err(why) => return accounts_stats_refused(cli, env.now, json, &why, out, err),
     };
-    if let (Some(read), Some(config_dir)) = (
-        host.usage_reader(),
-        env.config.as_deref().and_then(Path::parent),
-    ) {
-        let seat = super::accounts_pool::Seat {
-            config_dir,
-            state: &env.state,
-            home: user_home,
-            now: env.now,
-        };
-        let enrolled = accounts::enrolled_in(cli, &records.roster, user_home);
-        if let Err(why) =
-            super::accounts_pool::record_usage(&seat, cli, &records.roster, &enrolled, read)
-        {
-            return accounts_stats_refused(cli, env.now, json, &why, out, err);
-        }
-        records = match read_records() {
-            Ok(records) => records,
-            Err(why) => return accounts_stats_refused(cli, env.now, json, &why, out, err),
-        };
-    }
     let accounts::AccountRecords {
         roster,
         state,
@@ -14743,15 +14887,15 @@ struct LiveClaim {
 impl LiveClaim {
     /// The harness a holder names and its vendor agent: a rostered contract 3 harness
     /// ([`super::contract::holder`]) or a codex-alab self-claim; `None` for any other holder.
-    fn harness(&self) -> Option<(&'static str, &'static str, Option<u32>)> {
+    fn harness(&self) -> Option<(&'static str, &'static str, u32)> {
         if let Some((row, pid)) = super::contract::holder(&self.holder) {
-            return Some((row.id, row.vendor, Some(pid)));
+            return Some((row.id, row.vendor, pid));
         }
         let pid = self.holder.strip_prefix("codex-alab@")?;
         let parsed = pid
             .parse::<u32>()
             .ok()
-            .filter(|p| *p > 1 && p.to_string() == pid);
+            .filter(|p| *p > 1 && p.to_string() == pid)?;
         Some(("codex-alab", "codex", parsed))
     }
 }
@@ -14773,9 +14917,9 @@ fn live_claims_of(body: &str) -> Vec<LiveClaim> {
             } else if let Some(p) = token.strip_prefix("supervisor_proven=") {
                 proven = p == "1";
             } else if let Some(v) = token.strip_prefix("supervisor_version=") {
-                version = word(v);
+                version = word(v).filter(|v| super::contract::ClaimVersion::parse(v).is_some());
             } else if let Some(v) = token.strip_prefix("supervisor_vendor=") {
-                vendor = word(v);
+                vendor = word(v).filter(|v| super::contract::vendor_ok(v));
             }
         }
         let Some(holder) = holder else {
@@ -14866,23 +15010,7 @@ fn package_build_version(
             .or_else(|| atpkg::harness::store_build_version_of_exe(layout, program, exe));
     }
     atpkg::alab::agent(program)?;
-    if let Some(version) = atpkg::alab::package_version_of_exe(exe) {
-        return Some(version);
-    }
-    if let Ok(store) = std::fs::canonicalize(layout.prefix.join("store").join(program))
-        && let Ok(rest) = exe.strip_prefix(&store)
-    {
-        let build = rest.components().next()?.as_os_str().to_str()?;
-        let build = build
-            .parse::<u64>()
-            .ok()
-            .filter(|b| b.to_string() == build)?;
-        return atpkg::alab::package_version(&layout.build_dir(program, build));
-    }
-    let checkout = std::fs::canonicalize(atpkg::linked_checkout(layout, program)?).ok()?;
-    exe.starts_with(&checkout)
-        .then(|| atpkg::alab::package_version(&checkout))
-        .flatten()
+    atpkg::alab::package_version_of_exe(exe)
 }
 
 /// Render the three sections of `versions` ([`HELP_VERSIONS`]): `packages` is `None` with no
@@ -14896,10 +15024,12 @@ fn write_versions(
 ) {
     use crate::supervise::journal::json_str;
     let claim_versions = |c: &LiveClaim| {
-        let (harness, agent, pid) = c.harness().unwrap_or(("-", "-", None));
+        let Some((harness, agent, pid)) = c.harness() else {
+            return ("-", "-", None);
+        };
         let version = match (&c.version, harness) {
             (Some(v), _) => Some(v.clone()),
-            (None, "codex-alab") if c.proven => pid.and_then(codex_version),
+            (None, "codex-alab") if c.proven => codex_version(pid),
             (None, _) => None,
         };
         (harness, agent, version)

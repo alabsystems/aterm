@@ -1304,6 +1304,29 @@ fn accounts_accessibility_remains_actionable_with_permissions_left_as_is() {
     assert!(app.take_action().is_none());
 }
 
+/// The owner's screenshot (2026-11-02): "1 thing needs you" over a Permissions list of four rows
+/// all reading On, because the row that needed them had gone to the card. It stays in the list, with
+/// its words and its button in the card alone.
+#[test]
+fn a_row_the_card_asks_about_stays_in_its_list() {
+    let accessibility = Subject::Access(Access::Accessibility);
+    let mut grant = reading(accessibility, Standing::NeedsYou, Some("Off"));
+    grant.detail = Some("The Messages and FaceTime sign-outs need it to press Sign Out.".into());
+    let status = with_readings(Selection::all(), vec![grant]);
+    let mut app = SystemStateApp::new(status.plan.clone().unwrap());
+    app.publish(status);
+    let state = SystemStateViewState::default();
+    state.open_every_line();
+    let ui = compile(&app, &state, 999.0, 900.0);
+    assert!(
+        ui.semantic(&UiKey::new("system-state/card/accessibility"))
+            .is_some(),
+        "CONTROL: the card asks"
+    );
+    let row = label(&ui, "system-state/row/accessibility/info");
+    assert!(row.contains("Off"), "the list says so too: {row}");
+}
+
 #[test]
 fn accounts_accessibility_does_not_reopen_an_unneeded_or_settled_grant() {
     for (permissions, accounts, standing, opted_out) in [
@@ -1522,10 +1545,14 @@ fn a_vault_nothing_answered_for_is_set_up_and_a_typed_join_waits_for_it() {
             false
         )
     );
-    // The run still parks on the vault and asks again by itself, so it has not finished; the
-    // page says set up, and so does `setup=`, as it does once the run ends.
+    // The run still parks on the vault and asks again by itself, so it has not finished: the
+    // page says set up, and `setup=` says done and what the run still asks for by itself.
     assert!(!base.finished && !base.cancelled);
-    assert_eq!(setup_field(&base), "done");
+    assert!(
+        setup_field(&base).starts_with("done"),
+        "{}",
+        setup_field(&base)
+    );
     // While a pass goes, the page says so, and `setup=` is pending.
     let going = SetupStatus {
         busy: true,
@@ -1569,7 +1596,8 @@ fn a_vault_nothing_answered_for_is_set_up_and_a_typed_join_waits_for_it() {
         ("This Mac is set up", None, false)
     );
     assert_eq!(station(&profile), Mark::Off);
-    assert_eq!(setup_field(&profile), "done");
+    // Its run has not ended: `setup=` reads as the base plan's does.
+    assert!(setup_field(&profile).starts_with("done"));
     // With no token of the Mac's own, they wait for the vault's, as their stage does.
     let mut no_token = profile.clone();
     *reading_of(&mut no_token, Setting::Repositories) = Observation {
@@ -7228,5 +7256,44 @@ fn a_line_says_what_is_true_now_and_now_to_wanted() {
             .iter()
             .any(|line| line.mark == Mark::Pending && line.phrase.contains(" → ")),
         "{lines:#?}"
+    );
+}
+
+/// A grant on offer neither needs the person nor starts a run: the page has no card item for it
+/// and its one footer press asks for the batch. Negative control: with no offer the same press
+/// does nothing.
+#[test]
+fn grants_on_offer_ask_nothing_of_the_page_but_its_one_press() {
+    let mut status = to_change();
+    let debugger = Subject::Access(Access::Debugger);
+    if let Some(reading) = status.observed.iter_mut().find(|o| o.subject == debugger) {
+        reading.standing = Standing::NotNeeded;
+        reading.now = Some("Off".to_owned());
+        reading.note = Some(aterm_types::macos_setup::ACCESS_OFFERED.to_owned());
+    }
+    assert_eq!(offered_access(&status), [Access::Debugger]);
+    let mut app = page_reading(&status);
+    let rows = page::page_rows(&app);
+    assert!(
+        !lines::card_items(&app, &rows)
+            .iter()
+            .any(|item| item.subject == Some(debugger)),
+        "no card item for a grant on offer"
+    );
+    act(&mut app, ASK_FOR_ACCESS);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::AskForAccess { .. })
+    ));
+
+    let mut none = page_reading(&to_change());
+    assert!(offered_access(&none.status).is_empty());
+    act(&mut none, ASK_FOR_ACCESS);
+    assert!(
+        !matches!(
+            none.take_action(),
+            Some(SystemStateAction::AskForAccess { .. })
+        ),
+        "CONTROL: no offer, no ask"
     );
 }

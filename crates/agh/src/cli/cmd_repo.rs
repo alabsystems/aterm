@@ -4,10 +4,13 @@
 
 //! Repository verbs: `repo view`, `repo list` and `repo clone`.
 
+use std::path::PathBuf;
+
 use super::args::Invocation;
 use super::verbs::Noun;
 use super::{Answer, Completeness, Ctx, Outcome, Receipt};
 use crate::error::Result;
+use crate::git::GitRun;
 use crate::github::RepoListKind;
 use crate::policy::{Access, Named};
 use crate::slug::Slug;
@@ -62,12 +65,67 @@ pub(crate) fn repo_list(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     })
 }
 
-/// `agh repo clone REPO [DIR] [--depth N]`: a clone through the isolated git runner (WP7).
+/// The most `--depth` takes.
+const DEPTH_MAX: u32 = 1_000_000;
+
+/// `agh repo clone REPO [DIR] [--depth N]`: a clone through the isolated git runner. `DIR`
+/// defaults to the repository's name in the current directory, and must be absent or empty.
+/// It prints nothing; the receipt (`--meta`) notes `as={profile}`, or `as=anonymous`: the
+/// identity the git run spoke as, its one `as=` key. The run routes as agh.toml says (the read
+/// chain, or the writer for a release-tier owner), so `--anonymous` and `--as` are Usage
+/// rather than flags it would silently not honour.
 ///
 /// # Errors
 ///
-/// could_not_run until WP7.
+/// Usage for `--anonymous` or `--as`, the repository, a `DIR` that is not empty, or a
+/// `--depth` outside 1 to 1,000,000; the runner's refusals and git's failure.
 pub(crate) fn repo_clone(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
-    let _ = (ctx, inv);
-    Err(crate::error::Error::not_yet("repo clone", "WP7"))
+    if inv.global.anonymous || inv.global.as_profile.is_some() {
+        return Err(inv.usage(
+            "repo clone speaks as agh.toml routes it (the read chain, or a release-tier owner's \
+             writer): drop --anonymous and --as",
+        ));
+    }
+    let gh = ctx.github()?;
+    let (slug, named) = inv.repo(gh.router())?;
+    let depth = match inv.flag("--depth") {
+        None => None,
+        Some(text) => Some(
+            crate::path::digits::<u32>(text)
+                .filter(|n| (1..=DEPTH_MAX).contains(n))
+                .ok_or_else(|| inv.usage("--depth wants 1 to 1000000"))?,
+        ),
+    };
+    let dir = inv
+        .rest()
+        .first()
+        .map_or_else(|| PathBuf::from(slug.repo()), PathBuf::from);
+    let dir = std::path::absolute(&dir).map_err(|e| inv.usage(format!("DIR: {e}")))?;
+    let empty = match std::fs::read_dir(&dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    };
+    if !empty {
+        return Err(inv.usage(format!(
+            "{} is there and not an empty directory",
+            dir.display()
+        )));
+    }
+    let mut run = GitRun::new_clone(&slug, &dir).with_named(named);
+    if let Some(depth) = depth {
+        run = run.with_depth(depth);
+    }
+    let out = gh.run_git(&run)?;
+    let mut receipt = Receipt::for_repo(inv, &gh, &slug);
+    // The meter's identity is what the client's own requests spoke as (vault adoption's
+    // `GET /user`, say), not the git run's: the note below is the run's, and the one `as=`.
+    receipt.as_ = None;
+    receipt.notes.push((
+        "as".to_string(),
+        out.as_.unwrap_or_else(|| "anonymous".to_string()),
+    ));
+    Ok(Outcome {
+        answer: Answer::Nothing,
+        receipt,
+    })
 }

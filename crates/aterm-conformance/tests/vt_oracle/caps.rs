@@ -54,12 +54,12 @@ pub struct Caps {
     /// attributes of their own, and 21 is an underline.
     pub sgr_attrs: bool,
     /// 24-bit colour: `38;2;r;g;b` and `48;2;r;g;b`, and the colon forms with and without a
-    /// colour-space id, each channel clamped to 255.
+    /// colour-space id, on the code or on the selector, each channel clamped to 255.
     pub truecolour: bool,
     /// A zero-width combining mark attaches to a cell and moves nothing.
     pub combining_marks: bool,
-    /// A VS16 widens a text-default emoji, a VS15 narrows a wide one, a skin tone joins a wide glyph,
-    /// a regional indicator its pair, and a glyph other than ASCII a joiner before it.
+    /// A VS16 widens a text-default emoji, a VS15 narrows a wide one, a skin tone joins a wide emoji
+    /// modifier base, a regional indicator its pair, and a glyph other than ASCII a joiner before it.
     pub clusters: bool,
 }
 

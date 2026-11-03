@@ -186,7 +186,7 @@ pub(crate) struct SessionRow {
     pub end: Option<EndRow>,
     /// Its Autopilot chip's face is LANDED (`ChipFace::Landed`: under Land, a clean `Nothing left:` defense, and no repository check found work left to land), seen or not, whether or not an end was told: This Mac counts it `landed`, a worker or a plain Land tab.
     pub landed: bool,
-    /// It is LANDING (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.3 item 1): its Autopilot is Land, its chip wears `⤓ land` (the task open or unknown), and a hold stands — Land's instruction has been typed to it, by aterm or by a codex-alab under its own proven claim (`App::shown_hold`, §14.3.3).
+    /// It is LANDING (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.3 item 1): its Autopilot is Land, its chip wears Land's `⤓` (the task open or unknown), and a hold stands — Land's instruction has been typed to it, by aterm or by a codex-alab under its own proven claim (`App::shown_hold`, §14.3.3).
     pub landing: bool,
     /// What holds the landing, where a land act's yield did not land or nudges were typed, led by the stop where whoever drives it stopped typing into it in any mode (aterm, or a codex-alab under its own proven claim: `App::shown_stop`): its worker row's tip, in the hold's and the stop's words with no clock (`stopped typing: the same reply twice, no work · not landed yet: 2 unpushed commits · 3 nudges`, `ShownStop::words`' and `ShownHold::words`' tip forms; a codex-alab's stop in its name, `codex-alab stopped typing: …`, and its hold too where no stop named it first, `codex-alab: not landed yet: …`; a stopped Cruise tab's is the stop alone) — the menu keeps ages, composed at paint, and never a clock that would go stale.
     pub landing_tip: Option<String>,
@@ -246,6 +246,26 @@ pub(crate) struct TaskRow {
     pub result_path: Option<std::path::PathBuf>,
     /// The owner looked at this done (`App.done_seen` holds its rev).
     pub seen: bool,
+    /// An `exited` task that had finished first ([`crate::task_record::TaskRecord::finished`]).
+    pub finished: bool,
+    /// A worker with its own report of how it ended
+    /// ([`crate::task_record::reports_its_own_end`]): no end of it is listed for the owner.
+    pub own_report: bool,
+}
+
+impl TaskRow {
+    /// How it ended ([`TaskState::conclusion`]).
+    #[must_use]
+    pub(crate) const fn conclusion(&self) -> Option<crate::task_record::Conclusion> {
+        self.state.conclusion(self.finished)
+    }
+
+    /// Whether it ended and nothing else says so: a stall keeps its need, and a working task or a
+    /// worker with its own report has no end to list.
+    #[must_use]
+    const fn ended_quietly(&self) -> bool {
+        self.state.has_an_end_to_read() && !self.own_report
+    }
 }
 
 /// One same-Mac sibling aterm, from the last sibling scan (`sibling_scan`, its `survey facts`).
@@ -1182,6 +1202,8 @@ pub(crate) struct Here {
     pub landed: usize,
     /// Workers whose task is done by an older build's rule (`why=marker|done-check`), which no harness writes any more, or by a hand's `aterm ctl task mark done` with no `why=landed`.
     pub done: usize,
+    /// Workers whose task ended unfinished with their agent still there ([`TaskState::Failed`]).
+    pub failed: usize,
     /// Workers whose agent exited.
     pub exited: usize,
     /// Sessions no identified agent reads.
@@ -1199,13 +1221,15 @@ pub(crate) struct WorkerRow {
     pub state: TaskState,
     /// Why it moved there.
     pub why: Option<&'static str>,
+    /// An `exited` task that had finished first ([`crate::task_record::TaskRecord::finished`]).
+    pub finished: bool,
     /// Since when (unix milliseconds).
     pub since_unix_ms: u64,
     /// Its result's size.
     pub result_bytes: u64,
     /// Go to it ([`Glance::go`]).
     pub go: u16,
-    /// Read its result ([`Glance::reads`]), for a done worker with one.
+    /// Read its result ([`Glance::reads`]), for a worker that ended with one, either way.
     pub read: Option<u16>,
     /// Its session is landing ([`SessionRow::landing`]): Land's instruction was typed to it and a hold stands.
     pub landing: bool,
@@ -1213,7 +1237,9 @@ pub(crate) struct WorkerRow {
     pub tip: Option<String>,
 }
 
-const WORKER_WORDS: [&str; 6] = ["landing", "working", "landed", "done", "exited", "stalled"];
+const WORKER_WORDS: [&str; 7] = [
+    "landing", "working", "landed", "done", "failed", "exited", "stalled",
+];
 
 impl WorkerRow {
     /// What its row and its manager's count say of it: `landing` for a working task whose session is landing (Land's instruction typed, a hold standing: [`SessionRow::landing`]), `landed` for a record that reads `done why=landed` (Land landed its work), else its state's own word — a worker on its first task, before Land's instruction, says `working`, and an older build's `done why=marker|done-check` keeps `done`.
@@ -1265,6 +1291,9 @@ pub(crate) struct DoneRow {
     pub landed: bool,
     /// A landing's tip (§14.9, slice 9c) while its chip's face is landed ([`SessionRow::landed`]): what aterm checked there and what the agent said (`mode_words::landed_tip`); `None` for an older build's `done` and once the face moved off the landing, when no receipt is read.
     pub tip: Option<String>,
+    /// How it ended unfinished, in a person's words ([`crate::task_record::failed_words`]); `None`
+    /// for a row that finished.
+    pub failed: Option<String>,
 }
 
 /// One Waiting cause: every tab aterm waits out for the same reason.
@@ -1391,7 +1420,7 @@ pub(crate) struct Glance {
     pub here: Here,
     /// The managers, this aterm's in id order, then the workers of sids not here.
     pub managers: Vec<ManagerRow>,
-    /// Done for you, newest first.
+    /// Done for you, newest first: what ended, finished or failed, with nobody here waiting on it.
     pub done: Vec<DoneRow>,
     /// Waiting, one row per cause.
     pub waiting: Vec<WaitRow>,
@@ -1562,6 +1591,7 @@ impl Glance {
                 _ if row.landed => g.here.landed += 1,
                 (Some(t), _) if landed(t) => g.here.landed += 1,
                 (Some(t), _) if t.state == TaskState::Done => g.here.done += 1,
+                (Some(t), _) if t.state == TaskState::Failed => g.here.failed += 1,
                 (Some(t), _) if t.state == TaskState::Exited => g.here.exited += 1,
                 _ if row.need.is_some() => g.here.need_you += 1,
                 _ if row.waiting.is_some() => g.here.waiting += 1,
@@ -1584,7 +1614,7 @@ impl Glance {
             let Some(worker_go) = go(&mut g, row.id) else {
                 continue;
             };
-            let read = (task.state == TaskState::Done && task.result_bytes > 0)
+            let read = (task.state.has_an_end_to_read() && task.result_bytes > 0)
                 .then(|| task.result_path.clone())
                 .flatten()
                 .and_then(|path| {
@@ -1606,6 +1636,7 @@ impl Glance {
                 label: row.named(),
                 state: task.state,
                 why: task.why,
+                finished: task.finished,
                 since_unix_ms: task.since_unix_ms,
                 result_bytes: task.result_bytes,
                 go: worker_go,
@@ -1652,7 +1683,7 @@ impl Glance {
         let mut listed: Vec<u64> = Vec::new();
         for row in rows {
             let Some(task) = row.task.as_ref().filter(|t| {
-                t.state == TaskState::Done
+                t.ended_quietly()
                     && !t.seen
                     && (t.from == crate::task_record::FROM_CTL
                         || !rows.iter().any(|r| r.sid == t.from))
@@ -1681,8 +1712,12 @@ impl Glance {
                     None => continue,
                 },
             };
-            let landed =
-                task.why == Some(crate::task_record::WHY_LANDED) || row.end.is_some() || row.landed;
+            let failed = (task.conclusion() == Some(crate::task_record::Conclusion::Failed))
+                .then(|| crate::task_record::failed_words(task.state, task.why));
+            let landed = failed.is_none()
+                && (task.why == Some(crate::task_record::WHY_LANDED)
+                    || row.end.is_some()
+                    || row.landed);
             done.push(DoneRow {
                 label: row.named(),
                 since_unix_ms: task.since_unix_ms,
@@ -1692,6 +1727,7 @@ impl Glance {
                 tip: (landed && row.landed).then(|| {
                     aterm_agent::supervise::mode_words::landed_tip(row.receipt.as_deref())
                 }),
+                failed,
             });
             listed.push(row.id);
         }
@@ -1702,7 +1738,8 @@ impl Glance {
             let waited_on = row.task.as_ref().is_some_and(|t| {
                 t.from != crate::task_record::FROM_CTL && rows.iter().any(|r| r.sid == t.from)
             });
-            if waited_on {
+            // A worker with its own report of its end has only that one, a landing too.
+            if waited_on || row.task.as_ref().is_some_and(|t| t.own_report) {
                 continue;
             }
             if listed.contains(&row.id) {
@@ -1720,6 +1757,7 @@ impl Glance {
                 tip: row.landed.then(|| {
                     aterm_agent::supervise::mode_words::landed_tip(row.receipt.as_deref())
                 }),
+                failed: None,
             });
         }
         done.sort_by_key(|d| std::cmp::Reverse(d.since_unix_ms));
@@ -2142,6 +2180,7 @@ pub(crate) fn here_line(here: &Here) -> String {
         (here.resting, "resting"),
         (here.landed, "landed"),
         (here.done, "done"),
+        (here.failed, "failed"),
         (here.exited, "exited"),
     ]
     .into_iter()
@@ -2227,6 +2266,8 @@ pub(crate) fn a_landing_with_its_receipt(now_ms: u64) -> Vec<SessionRow> {
         result_bytes: 2100,
         result_path: None,
         seen: false,
+        finished: false,
+        own_report: false,
     };
     let row = |id: u64, title: &str| SessionRow {
         id,
@@ -2345,6 +2386,9 @@ fn manager_line(m: &ManagerRow) -> String {
     )
 }
 
+/// The mark of a worker that ended unfinished, in the menu's rows and the tab menu's.
+pub(crate) const FAILED_GLYPH: &str = "\u{2715}";
+
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -2365,7 +2409,24 @@ fn worker_line(w: &WorkerRow, now_unix: i64) -> String {
             bytes_words(w.result_bytes)
         ),
         TaskState::Done => format!("\u{2713} {} \u{2014} {} {age}", w.label, w.word()),
-        TaskState::Exited => format!("\u{25cb} {} \u{2014} exited {age}", w.label),
+        TaskState::Failed => format!(
+            "{FAILED_GLYPH} {} \u{2014} failed: {} \u{b7} {age}",
+            w.label,
+            crate::task_record::failed_words(w.state, w.why)
+        ),
+        TaskState::Exited if w.finished => {
+            let word = if w.why == Some(crate::task_record::WHY_LANDED) {
+                "landed"
+            } else {
+                "done"
+            };
+            format!("\u{2713} {} \u{2014} {word}, then exited {age}", w.label)
+        }
+        TaskState::Exited => format!(
+            "{FAILED_GLYPH} {} \u{2014} exited: {} \u{b7} {age}",
+            w.label,
+            crate::task_record::failed_words(w.state, w.why)
+        ),
     };
     fold_clip(&line, LINE_MAX)
 }
@@ -2376,6 +2437,15 @@ fn worker_line(w: &WorkerRow, now_unix: i64) -> String {
 )]
 fn done_line(d: &DoneRow, now_unix: i64) -> String {
     let word = if d.landed { "landed" } else { "done" };
+    let glyph = if d.failed.is_some() {
+        FAILED_GLYPH
+    } else {
+        "\u{2713}"
+    };
+    let word = d
+        .failed
+        .as_ref()
+        .map_or_else(|| word.to_string(), |words| format!("failed: {words}"));
     let age = if d.since_unix_ms == 0 {
         String::new()
     } else {
@@ -2387,7 +2457,7 @@ fn done_line(d: &DoneRow, now_unix: i64) -> String {
         String::new()
     };
     fold_clip(
-        &format!("\u{2713} {} \u{2014} {word}{age}{size}", d.label),
+        &format!("{glyph} {} \u{2014} {word}{age}{size}", d.label),
         LINE_MAX,
     )
 }
@@ -2728,9 +2798,6 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
             rows.push(StatusRow::Info(fold_clip(&network.label, LINE_MAX)));
         }
     };
-    // Away from the ALab LAN (another network, offline), a member that does not answer is no
-    // Local Network privacy setting's doing: the Network row says where this Mac is instead.
-    let away = g.network.as_ref().is_some_and(|network| network.away);
     match &g.fleet {
         FleetLine::Off => {}
         FleetLine::NotInFleet => {
@@ -2753,8 +2820,11 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
             rows.push(StatusRow::FleetSubmenu {
                 label: fleet_line(read.as_ref(), *reading, failed.is_some(), now_unix),
             });
+            // `no_route` is the read's own on-link verdict (`aterm_netplace::words::on_link`): a
+            // member on this network refused with no member there answering, wherever this Mac
+            // is; one off this network, or gone off the link, never sets it.
             rows.extend(degrade_rows(
-                *no_route && !away,
+                *no_route,
                 (member_of.as_deref(), unbound_issuer.as_deref()),
                 failed.as_deref(),
             ));
@@ -4594,9 +4664,17 @@ mod tests {
                 result_bytes: result,
                 result_path: (result > 0).then(|| std::path::PathBuf::from("/tmp/r.md")),
                 seen: false,
+                finished: false,
+                own_report: false,
             }),
             ..SessionRow::default()
         }
+    }
+
+    /// `row`, whose task finished before its agent left.
+    fn finished(mut row: SessionRow) -> SessionRow {
+        row.task.as_mut().unwrap().finished = true;
+        row
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -5552,6 +5630,130 @@ mod tests {
         assert!(matches!(g.done[0].at, DoneAt::Read(_)));
         assert!(matches!(g.done[1].at, DoneAt::Go(_)));
         assert!(g.managers.iter().any(|m| m.go.is_none()));
+    }
+
+    /// DONE FOR YOU HOLDS BOTH OUTCOMES, THE FAILED ONES MARKED: a worker nobody waits on that
+    /// could not finish, and one whose agent left before landing, list beside what finished, with
+    /// their words. A stall keeps its need instead, a credit claim's worker is the claim's, and a
+    /// landing an exit followed reads finished. This Mac counts the failed.
+    #[test]
+    fn done_for_you_holds_both_outcomes_with_the_failed_rows_marked() {
+        use crate::task_record::{FROM_CTL, WHY_COULD_NOT_FINISH, WHY_EXIT, WHY_LANDED};
+        let with_why = |mut row: SessionRow, why| {
+            row.task.as_mut().unwrap().why = Some(why);
+            row
+        };
+        let mut claim = worker(6, "claim", FROM_CTL, TaskState::Failed, 0);
+        claim.task.as_mut().unwrap().own_report = true;
+        // A worker with its own report that landed, its end unseen: still only its own report.
+        let mut disk = finished(with_why(
+            worker(8, "disk", FROM_CTL, TaskState::Done, 0),
+            WHY_LANDED,
+        ));
+        disk.task.as_mut().unwrap().own_report = true;
+        disk.landed = true;
+        disk.end = Some(EndRow {
+            serial: 1,
+            since_unix_ms: 0,
+            seen: false,
+        });
+        let g = local_glance(
+            &[
+                with_why(
+                    worker(2, "stuck", FROM_CTL, TaskState::Failed, 0),
+                    WHY_COULD_NOT_FINISH,
+                ),
+                with_why(worker(3, "left", FROM_CTL, TaskState::Exited, 0), WHY_EXIT),
+                finished(with_why(
+                    worker(4, "landed-left", FROM_CTL, TaskState::Exited, 0),
+                    WHY_LANDED,
+                )),
+                worker(5, "frozen", FROM_CTL, TaskState::Stalled, 0),
+                claim,
+                worker(7, "fine", FROM_CTL, TaskState::Done, 0),
+                disk,
+            ],
+            &[],
+            0,
+            None,
+        );
+        let rows: Vec<(&str, Option<&str>)> = g
+            .done
+            .iter()
+            .map(|d| (d.label.as_str(), d.failed.as_deref()))
+            .collect();
+        for row in [
+            ("stuck", Some("it said it could not finish")),
+            ("left", Some("its agent exited before landing")),
+            ("landed-left", None),
+            ("fine", None),
+        ] {
+            assert!(rows.contains(&row), "{row:?}: {rows:?}");
+        }
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        let line =
+            |label: &str| done_line(g.done.iter().find(|d| d.label == label).expect("listed"), 0);
+        assert!(line("stuck").starts_with(FAILED_GLYPH), "{}", line("stuck"));
+        assert!(
+            line("stuck").contains("failed: it said"),
+            "{}",
+            line("stuck")
+        );
+        assert!(line("fine").starts_with('\u{2713}'), "{}", line("fine"));
+        assert!(g.here.failed >= 1, "{:?}", g.here);
+        assert!(
+            here_line(&g.here).contains("failed"),
+            "{}",
+            here_line(&g.here)
+        );
+    }
+
+    /// A MANAGER'S WORKERS ROW SAYS HOW IT ENDED: its own glyph and the why, a landing an exit
+    /// followed keeping the finished glyph.
+    #[test]
+    fn a_workers_row_says_how_it_ended() {
+        use crate::task_record::{WHY_COULD_NOT_FINISH, WHY_EXIT, WHY_LANDED};
+        let manager = SessionRow {
+            id: 1,
+            sid: "s-manager".to_string(),
+            title: "lead".to_string(),
+            ..SessionRow::default()
+        };
+        let with_why = |mut row: SessionRow, why| {
+            row.task.as_mut().unwrap().why = Some(why);
+            row
+        };
+        let g = local_glance(
+            &[
+                manager,
+                with_why(
+                    worker(2, "stuck", "s-manager", TaskState::Failed, 0),
+                    WHY_COULD_NOT_FINISH,
+                ),
+                with_why(
+                    worker(3, "left", "s-manager", TaskState::Exited, 0),
+                    WHY_EXIT,
+                ),
+                finished(with_why(
+                    worker(4, "landed", "s-manager", TaskState::Exited, 0),
+                    WHY_LANDED,
+                )),
+            ],
+            &[],
+            0,
+            None,
+        );
+        let rows = &g.managers[0].workers;
+        let line =
+            |label: &str| worker_line(rows.iter().find(|w| w.label == label).expect("a row"), 0);
+        assert!(line("stuck").starts_with(FAILED_GLYPH), "{}", line("stuck"));
+        assert!(
+            line("stuck").contains("failed: it said it could not finish"),
+            "{}",
+            line("stuck")
+        );
+        assert!(line("left").starts_with(FAILED_GLYPH), "{}", line("left"));
+        assert!(line("landed").starts_with('\u{2713}'), "{}", line("landed"));
     }
 
     fn ended(id: u64, title: &str, at_unix: i64, seen: bool) -> SessionRow {

@@ -120,6 +120,45 @@ fn a_command_that_never_ran_is_not_started_and_one_that_exits_127_is_exited() {
     let empty = agent.request(&Frame::Exec(agent.exec(&[]))).ended();
     assert_eq!(empty.exit, Exit::NotStarted("an empty argv".into()));
 
+    let empty_program = agent.request(&Frame::Exec(agent.exec(&[b""]))).ended();
+    assert_eq!(
+        empty_program.exit,
+        Exit::NotStarted("an empty program name".into())
+    );
+
+    let nul_program = agent
+        .request(&Frame::Exec(agent.exec(&[b"/bin/echo\0bad"])))
+        .ended();
+    match &nul_program.exit {
+        Exit::NotStarted(why) => assert!(
+            why.starts_with("program ") && why.contains("holds a NUL byte"),
+            "{why}"
+        ),
+        other => panic!("NUL in program must be NotStarted: {other:?}"),
+    }
+
+    let mut nul_arg = agent.stand_in(&["exit", "0"]);
+    nul_arg.argv.push(b"arg\0bad".to_vec());
+    let ended = agent.request(&Frame::Exec(nul_arg)).ended();
+    match &ended.exit {
+        Exit::NotStarted(why) => assert!(
+            why.starts_with("argument ") && why.contains("holds a NUL byte"),
+            "{why}"
+        ),
+        other => panic!("NUL in argument must be NotStarted: {other:?}"),
+    }
+
+    let mut nul_cwd = agent.stand_in(&["exit", "0"]);
+    nul_cwd.cwd.push(0);
+    let ended = agent.request(&Frame::Exec(nul_cwd)).ended();
+    match &ended.exit {
+        Exit::NotStarted(why) => assert!(
+            why.starts_with("cwd ") && why.contains("holds a NUL byte"),
+            "{why}"
+        ),
+        other => panic!("NUL in cwd must be NotStarted: {other:?}"),
+    }
+
     for bad_env in [
         (Vec::new(), b"val".to_vec()),
         (b"BAD=KEY".to_vec(), b"val".to_vec()),

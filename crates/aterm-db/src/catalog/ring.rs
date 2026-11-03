@@ -58,8 +58,8 @@ pub(crate) const JOURNAL: Ring = Ring {
     period_s: 604_800,
 };
 
-/// Every ring the replica subscribes to.
-const RINGS: [&Ring; 3] = [&CLAIMS, &RECOVERIES, &JOURNAL];
+/// Every ring the replica subscribes to and the catalog diagnostics enumerate.
+pub(super) const RINGS: [&Ring; 3] = [&CLAIMS, &RECOVERIES, &JOURNAL];
 
 /// What one period table holds, in all and from one writer: records and wire bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -143,14 +143,7 @@ pub(crate) enum Kept {
 }
 
 impl Kept {
-    /// Why, in the words a Mac reports.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the journal publisher (lab model step 8) reports it"
-        )
-    )]
+    /// Why, in the words a Mac reports (the journal flusher keeps it for `sum` and `check`).
     pub(crate) const fn reason(self) -> &'static str {
         match self {
             Self::Unplaced(unplaced) => unplaced.reason(),
@@ -220,6 +213,61 @@ pub(crate) fn place(
     (epoch..=last)
         .find(|epoch| !full(*epoch))
         .ok_or(Unplaced::Full)
+}
+
+/// The wire bytes a sealed record of a `payload`-byte payload takes at most: the payload and
+/// one envelope (one parent, no merge).
+pub(crate) const fn record_bytes(payload: usize) -> usize {
+    payload.saturating_add(crate::crypto::MAX_OPERATION - crate::crypto::MAX_BODY)
+}
+
+/// The period table an own-chain record of a `payload`-byte payload that lapses at `until` goes
+/// into ([`place`]), by this writer's retained `used` of each window table it holds: its own
+/// latest period is the highest that holds a record of its, and a table whose share the record
+/// would pass is full. The journal flusher paces by the period this names, so a share that
+/// spilled into the next period is paced as that period's (`alab::journal::flush`).
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabJournal",
+        action = "FlushCurrent",
+        project = "aterm_db::alab::journal::model_tests::journal_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabJournal",
+        action = "FlushNext",
+        project = "aterm_db::alab::journal::model_tests::journal_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabJournal",
+        action = "FlushKept",
+        project = "aterm_db::alab::journal::model_tests::journal_transition"
+    )
+)]
+pub(crate) fn landing(
+    ring: &Ring,
+    shares: Shares,
+    state: &RingState,
+    now: u64,
+    used: &BTreeMap<u64, Used>,
+    until: u64,
+    payload: usize,
+) -> std::result::Result<u64, Unplaced> {
+    let own = used
+        .iter()
+        .filter(|(_, used)| used.writer_records > 0)
+        .map(|(epoch, _)| *epoch)
+        .max();
+    let bytes = record_bytes(payload);
+    place(ring, state, now, own, until, |epoch| {
+        shares.full(&used.get(&epoch).copied().unwrap_or_default(), 1, bytes)
+    })
 }
 
 const DOMAIN: &[u8] = b"aterm/commons/ring-table/1\0";
@@ -312,6 +360,14 @@ impl RingState {
             machine = "DbClaimRing",
             action = "Retire",
             project = "aterm_db::accounts::claims::tests::ring_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AlabJournal",
+            action = "Tick",
+            project = "aterm_db::alab::journal::model_tests::journal_transition"
         )
     )]
     pub(crate) fn ratchet(&mut self, ring: &Ring, now: u64) -> Vec<u64> {
@@ -675,13 +731,6 @@ impl Directory {
     ///
     /// # Errors
     /// No control writer, an unreadable ring state, or damaged storage.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the journal publisher (lab model step 8) appends with it"
-        )
-    )]
     pub(crate) fn append_journal(
         &self,
         session: &Session<'_>,
@@ -712,18 +761,7 @@ impl Directory {
                 used.insert(epoch, store.retained_use(session, actor)?);
             }
         }
-        let own = used
-            .iter()
-            .filter(|(_, used)| used.writer_records > 0)
-            .map(|(epoch, _)| *epoch)
-            .max();
-        // A sealed record is the payload and at most this much envelope: one parent, no merge.
-        let bytes = payload
-            .len()
-            .saturating_add(crate::crypto::MAX_OPERATION - crate::crypto::MAX_BODY);
-        let epoch = match place(ring, &state, now, own, until, |epoch| {
-            shares.full(&used.get(&epoch).copied().unwrap_or_default(), 1, bytes)
-        }) {
+        let epoch = match landing(ring, shares, &state, now, &used, until, payload.len()) {
             Ok(epoch) => epoch,
             Err(unplaced) => return Ok(Err(Kept::Unplaced(unplaced))),
         };

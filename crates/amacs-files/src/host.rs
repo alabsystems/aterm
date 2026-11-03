@@ -1803,8 +1803,24 @@ fn lock_open_touch(path: &Path) -> SaveTouch {
 /// Open one sibling write lock without following or waiting on its final
 /// component.
 #[cfg(unix)]
+fn ensure_write_lock_owner(
+    path: &Path,
+    owner_uid: u32,
+    effective_uid: u32,
+) -> Result<(), StepFailure> {
+    if owner_uid != effective_uid {
+        return Err(StepFailure::met(
+            SaveTouch::Lock,
+            format!("save lock {} is not owned by this user", path.display()),
+            std::io::ErrorKind::PermissionDenied,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn open_write_lock(path: &Path) -> Result<File, StepFailure> {
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
     let file = OpenOptions::new()
         .read(true)
@@ -1821,20 +1837,19 @@ fn open_write_lock(path: &Path) -> Result<File, StepFailure> {
                 &error,
             )
         })?;
-    if !file
-        .metadata()
-        .map_err(|error| {
-            StepFailure::io(
-                SaveTouch::Lock,
-                format!("could not inspect save lock {}: {error}", path.display()),
-                &error,
-            )
-        })?
-        .file_type()
-        .is_file()
-    {
+    let metadata = file.metadata().map_err(|error| {
+        StepFailure::io(
+            SaveTouch::Lock,
+            format!("could not inspect save lock {}: {error}", path.display()),
+            &error,
+        )
+    })?;
+    if !metadata.file_type().is_file() {
         return Err(StepFailure::own(write_lock_not_regular(path)));
     }
+    // SAFETY: `geteuid` takes no pointers or preconditions and always returns the effective UID.
+    let effective_uid = unsafe { libc::geteuid() };
+    ensure_write_lock_owner(path, metadata.uid(), effective_uid)?;
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|error| {
             StepFailure::io(
@@ -2237,13 +2252,16 @@ fn commit_atomic_bytes_with_seed(
             Err(failure) => return atomic_failed(AtomicSaveStage::CreateTemporary, failure),
         };
     let result: Result<AtomicSaveProof, AtomicCommitResult> = (|| {
-        if let Ok(metadata) = fs::metadata(path) {
-            fs::set_permissions(&temporary, metadata.permissions()).map_err(|error| {
-                atomic_failed(
-                    AtomicSaveStage::CreateTemporary,
-                    StepFailure::io(SaveTouch::Folder, error.to_string(), &error),
-                )
-            })?;
+        if let Ok(metadata) = fs::symlink_metadata(path)
+            && metadata.file_type().is_file()
+        {
+            file.set_permissions(metadata.permissions())
+                .map_err(|error| {
+                    atomic_failed(
+                        AtomicSaveStage::CreateTemporary,
+                        StepFailure::io(SaveTouch::Folder, error.to_string(), &error),
+                    )
+                })?;
         }
         file.write_all(bytes).map_err(|error| {
             atomic_failed(
@@ -2348,7 +2366,7 @@ fn commit_atomic_bytes_with_seed(
             directory_synced: true,
         })
     })();
-    if temporary.exists() {
+    if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     match result {
@@ -4274,5 +4292,24 @@ mod tests {
         );
         assert_eq!(fs::read_link(&alias).unwrap(), real);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// NEGATIVE CONTROL: a save lock owned by another UID must be refused with
+    /// [`SaveTouch::Lock`] and [`std::io::ErrorKind::PermissionDenied`] before `fchmod` or
+    /// locking, even when the caller has privilege to open it.
+    #[cfg(unix)]
+    #[test]
+    fn write_lock_owner_check_rejects_mismatched_uid_with_lock_touch() {
+        let lock_path = Path::new("/tmp/.aterm.toml.aterm-write.lock");
+        assert!(ensure_write_lock_owner(lock_path, 501, 501).is_ok());
+        let failure = ensure_write_lock_owner(lock_path, 502, 501).unwrap_err();
+        assert_eq!(
+            failure.cause,
+            Some(SaveCause {
+                kind: std::io::ErrorKind::PermissionDenied,
+                touch: SaveTouch::Lock,
+            })
+        );
+        assert!(failure.message.contains("not owned by this user"));
     }
 }

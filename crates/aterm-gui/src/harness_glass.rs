@@ -433,7 +433,7 @@ pub(crate) struct SessionGlass {
     end: Option<EndGlass>,
     /// How many ends this session told: the next end's [`EndGlass::serial`].
     ends: u32,
-    /// WHY LAND STILL HOLDS (§12.3.3 item 3), as the session's loop last told it ([`on_land_held`]), with its `since` stamped once: what the SESSIONS state line, the tab's hover and the Overview, the menu bar's worker row and the chip's title (the W4 title slice) and description say of a landing that has not landed — each only while the session's Autopilot is Land and its chip wears `⤓ land`, and all but the chip's title and description only while aterm holds its claim ([`App::shown_hold`], which shows a codex-alab's own hold in its place under that agent's proven claim, §14.3.3).
+    /// WHY LAND STILL HOLDS (§12.3.3 item 3), as the session's loop last told it ([`on_land_held`]), with its `since` stamped once: what the SESSIONS state line, the tab's hover and the Overview, the menu bar's worker row and the chip's title (the W4 title slice) and description say of a landing that has not landed — each only while the session's Autopilot is Land and its chip wears Land's `⤓`, and all but the chip's title and description only while aterm holds its claim ([`App::shown_hold`], which shows a codex-alab's own hold in its place under that agent's proven claim, §14.3.3).
     hold: Option<HeldGlass>,
     /// ATERM STOPPED TYPING INTO IT (§14.3), by which arm of ruling F's hold, as the session's loop last told its standing exception (`HostNote::ResumeException`'s `held`, [`on_stopped`]): set while the hold stands, whatever its urgency, and cleared as the loop lifts it or ends. What the chip's title and description, the state line, the hover and the Overview, a worker's tip and `status held=` say ([`stop_words`]), each only while the chip carries a mode ([`App::shown_stop`]).
     stopped: Option<HeldBy>,
@@ -445,7 +445,7 @@ pub(crate) struct SessionGlass {
     waiting: Option<WaitGlass>,
     /// LAND ASKED ONCE MORE AT THE PERSON'S SWITCH OVER A HELD TAB (v6 §14.17 item 3), as the
     /// loop told it ([`on_switch_asked`]): from Land's one ask until its answer is read, cleared
-    /// by the loop's end. Settings ▸ Harness's state line leads with it under `⤓ land`
+    /// by the loop's end. Settings ▸ Harness's state line leads with it under Land's `⤓`
     /// ([`aterm_agent::harness::acts::SWITCH_ASKED`]), and `status land_asked=` prints it.
     switch_asked: bool,
 }
@@ -465,7 +465,7 @@ impl EndFace {
     pub(crate) const fn of(face: TaskFace) -> Option<Self> {
         match face {
             TaskFace::Landed => Some(Self::Landed),
-            TaskFace::Open | TaskFace::Theirs => None,
+            TaskFace::Open | TaskFace::Theirs | TaskFace::Failed => None,
         }
     }
 
@@ -768,7 +768,7 @@ pub(crate) fn wall_today() -> (i64, i64) {
 }
 
 /// Trail title string for `session` in `glass` ([`SessionGlass::trail_text`]); without Land's
-/// own acts (`⤓ landing`, `⤓ nudged`) where `held`, a read hold shown under `⤓ land`, says them
+/// own acts (`⤓ landing`, `⤓ nudged`) where `held`, a read hold shown under Land's `⤓`, says them
 /// (`landing since 10:30, 2 nudges`; said once, §14.4).
 pub(crate) fn trail_title(
     glass: &std::collections::HashMap<u64, SessionGlass>,
@@ -803,7 +803,7 @@ pub(crate) fn trail_title(
     )
 )]
 /// Screen-reader string for the newest act of `session` in `glass` ([`SessionGlass::spoken_last`]);
-/// none where `held`, a read hold said under `⤓ land`, already says that act (one of Land's own,
+/// none where `held`, a read hold said under Land's `⤓`, already says that act (one of Land's own,
 /// [`lands_own`]: `Landing since 22:09, 1 nudge`; said once, §14.4), as the title leaves it out of
 /// `last:` ([`trail_title`]).
 pub(crate) fn spoken_last_now(
@@ -1461,7 +1461,7 @@ fn speakable(words: &str) -> String {
 }
 
 impl App {
-    /// LAND'S HOLD OF SESSION `session` AS ITS SURFACES SHOW IT (§12.3.3 item 3, 3b's contract in §12.3.10; §14.3.3), told by whoever drives it, as [`Self::shown_stop`] reads a stop — while aterm holds its claim, the hold on its glass ([`SessionGlass::hold`]); under a proven self-claim, the hold that claim told of its own landing (`meta set harness_land`, [`crate::session_timeline::SessionMeta::self_land`]) while the claim stands, named for its holder — and either only while its chip's face is `⤓ land` ([`crate::claude_lights::ChipFace::of`] over its view and glass: its own word, else the default, is Land, a harness runs it, and its task is open or unknown), so a codex-alab's own landing and a person's own exchange (`landed@v1`, `left-to-person@v1`) take its hold down as they take aterm's. Nobody's with neither claim: a hold left on aterm's glass is never shown under another's claim, nor after aterm's ends.
+    /// LAND'S HOLD OF SESSION `session` AS ITS SURFACES SHOW IT (§12.3.3 item 3, 3b's contract in §12.3.10; §14.3.3), told by whoever drives it, as [`Self::shown_stop`] reads a stop — while aterm holds its claim, the hold on its glass ([`SessionGlass::hold`]); under a proven self-claim, the hold that claim told of its own landing (`meta set harness_land`, [`crate::session_timeline::SessionMeta::self_land`]) while the claim stands, named for its holder — and either only while its chip's face is Land's `⤓` ([`crate::claude_lights::ChipFace::of`] over its view and glass: its own word, else the default, is Land, a harness runs it, and its task is open or unknown), so a codex-alab's own landing and a person's own exchange (`landed@v1`, `left-to-person@v1`) take its hold down as they take aterm's. Nobody's with neither claim: a hold left on aterm's glass is never shown under another's claim, nor after aterm's ends.
     #[must_use]
     pub(crate) fn shown_hold(&self, session: u64) -> Option<ShownHold> {
         let own = self
@@ -1503,7 +1503,7 @@ impl App {
             .then_some(hold)
     }
 
-    /// THE STOP OF SESSION `session` AS ITS SURFACES SAY IT (§14.3, §14.3.2), told by whoever drives it ([`crate::autopilot::carried`]'s rule) — while aterm holds its claim, the arm on its glass ([`SessionGlass::stopped`]); under a proven self-claim, the arm that claim told of its own typing (`meta set harness_held`, [`crate::session_timeline::SessionMeta::self_held`]) while the claim stands, named for its holder — and either only while its chip carries a mode (`∞`, `∞ ⤓18:00`, `⤓ land`: [`crate::claude_lights::ChipFace::of`] over its view and glass), never on an Off, landed or quiet chip, so `status held=` and the worker row's tip say a stop exactly where the hover, the Overview and the state line, which read the face, do: a codex-alab tells its own landing and a person's own exchange (`landed@v1`, `left-to-person@v1`) onto the same face, and its stop gives way to them as aterm's does. Nobody's with neither claim.
+    /// THE STOP OF SESSION `session` AS ITS SURFACES SAY IT (§14.3, §14.3.2), told by whoever drives it ([`crate::autopilot::carried`]'s rule) — while aterm holds its claim, the arm on its glass ([`SessionGlass::stopped`]); under a proven self-claim, the arm that claim told of its own typing (`meta set harness_held`, [`crate::session_timeline::SessionMeta::self_held`]) while the claim stands, named for its holder — and either only while its chip carries a mode (`∞`, `∞ ⤓18:00`, Land's `⤓`: [`crate::claude_lights::ChipFace::of`] over its view and glass), never on an Off, landed or quiet chip, so `status held=` and the worker row's tip say a stop exactly where the hover, the Overview and the state line, which read the face, do: a codex-alab tells its own landing and a person's own exchange (`landed@v1`, `left-to-person@v1`) onto the same face, and its stop gives way to them as aterm's does. Nobody's with neither claim.
     #[must_use]
     pub(crate) fn shown_stop(&self, session: u64) -> Option<ShownStop> {
         let own_glass = self.harness_glass.get(&session);
@@ -1553,7 +1553,7 @@ impl App {
     }
 
     /// Whether Land asked once more at the person's switch over `session`'s held tab and its
-    /// answer is still out (v6 §14.17 item 3), only while its chip reads `⤓ land`: no other face
+    /// answer is still out (v6 §14.17 item 3), only while its chip reads Land's `⤓`: no other face
     /// carries Land's ask.
     pub(crate) fn shown_switch_asked(&self, session: u64) -> bool {
         if !self

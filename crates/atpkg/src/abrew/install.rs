@@ -256,13 +256,15 @@ pub(super) fn dry_rows(
     opts: &InstallOpts,
 ) -> Result<(Option<DryRow>, Vec<DryRow>), InstallError> {
     let planned = plan(api, prefix, name, opts)?;
+    let top_f = planned.iter().rfind(|f| f.matches_name(name));
+    let top_name = top_f.map(|f| f.name.clone());
     // A plain install of an already-current top has no
     // installer in brew: warn and plan nothing, deps included.
     // Brew decides this before any per-formula checks.
     if !opts.force
         && !opts.upgrade
         && !opts.reinstall
-        && let Some(top_f) = planned.iter().find(|f| f.name == Formula::short_name(name))
+        && let Some(top_f) = top_f
         && let Some(inst) = prefix.installed_one(Kind::Formula, &top_f.name)
         && version_cmp(&inst.version, &keg_version(top_f)) != std::cmp::Ordering::Less
     {
@@ -278,7 +280,7 @@ pub(super) fn dry_rows(
             f,
             opts,
             Machine::this(),
-            f.name == Formula::short_name(name),
+            top_name.as_deref() == Some(f.name.as_str()),
         )?;
     }
     let row = |f: &Formula| -> Option<DryRow> {
@@ -303,14 +305,15 @@ pub(super) fn dry_rows(
         }
     };
     let mut rows: Vec<DryRow> = planned.iter().filter_map(row).collect();
-    let top = if rows
-        .last()
-        .is_some_and(|r| r.name == Formula::short_name(name))
+    let top = if top_name
+        .as_deref()
+        .is_some_and(|t| rows.last().is_some_and(|r| r.name == t))
     {
         rows.pop()
     } else {
         if !opts.quiet
-            && let Some(inst) = prefix.installed_one(Kind::Formula, Formula::short_name(name))
+            && let Some(t) = top_name.as_deref()
+            && let Some(inst) = prefix.installed_one(Kind::Formula, t)
         {
             let version = inst.version.clone();
             warn_already_installed(prefix, &inst, &version);
@@ -347,6 +350,7 @@ fn dependency_plan(
         visiting: Vec<String>,
         seen: BTreeSet<String>,
         pruned: BTreeSet<String>,
+        canon_of: BTreeMap<String, String>,
     }
     fn walk(
         name: &str,
@@ -379,6 +383,20 @@ fn dependency_plan(
                 "abrew: {short} is disabled upstream"
             )));
         }
+        let canon = f.name.clone();
+        state.canon_of.insert(short.clone(), canon.clone());
+        if canon != short {
+            if state.visiting.contains(&canon) {
+                return Err(InstallError::Failed(format!(
+                    "abrew: dependency cycle: {} -> {canon}",
+                    state.visiting.join(" -> ")
+                )));
+            }
+            if state.seen.contains(&canon) && !state.pruned.contains(&canon) {
+                state.seen.insert(short);
+                return Ok(());
+            }
+        }
         // A dep another parent already kept can still be pulled
         // in when this parent's bottle was built against a newer
         // version than the installed one (brew's kept-dependency
@@ -388,12 +406,16 @@ fn dependency_plan(
         {
             state.seen.insert(short.clone());
             state.pruned.insert(short);
+            state.seen.insert(canon.clone());
+            state.pruned.insert(canon);
             return Ok(());
         }
         state.pruned.remove(&short);
-        state.seen.insert(short.clone());
+        state.pruned.remove(&canon);
+        state.seen.insert(short);
+        state.seen.insert(canon.clone());
         if !ignore_dependencies {
-            state.visiting.push(short.clone());
+            state.visiting.push(canon);
             let deps: Vec<String> = f
                 .dependencies
                 .iter()
@@ -426,6 +448,7 @@ fn dependency_plan(
         visiting: Vec::new(),
         seen: BTreeSet::new(),
         pruned: BTreeSet::new(),
+        canon_of: BTreeMap::new(),
     };
     walk(
         name,
@@ -440,6 +463,7 @@ fn dependency_plan(
     // another lands after the parent that kept it; restore
     // deps-before-dependents order (stable for the common case,
     // where the walk already produced it).
+    let canon_of = state.canon_of;
     let mut out = state.out;
     let names: BTreeSet<String> = out.iter().map(|f| f.name.clone()).collect();
     let mut ordered: Vec<Formula> = Vec::with_capacity(out.len());
@@ -448,7 +472,8 @@ fn dependency_plan(
         let Some(pos) = out.iter().position(|f| {
             f.dependencies.iter().all(|d| {
                 let short = Formula::short_name(d);
-                !names.contains(short) || emitted.contains(short)
+                let canon = canon_of.get(short).map_or(short, String::as_str);
+                !names.contains(canon) || emitted.contains(canon)
             })
         }) else {
             break;
@@ -484,6 +509,8 @@ pub(super) fn preflight_refusals(
     match plan(catalog, prefix, name, opts) {
         Err(walk) => vec![walk],
         Ok(planned) => {
+            let top_f = planned.iter().rfind(|f| f.matches_name(name));
+            let top_name = top_f.map(|f| f.name.clone());
             // Brew has no installer for an already-current top
             // outside upgrade/reinstall, so nothing in its plan
             // needs gating (mirrors the early return in install).
@@ -491,17 +518,13 @@ pub(super) fn preflight_refusals(
                 && !opts.upgrade
                 && !opts.reinstall
                 && !opts.as_dependency
-                && planned
-                    .iter()
-                    .find(|f| f.name == Formula::short_name(name))
-                    .is_some_and(|f| {
-                        prefix
-                            .installed_one(Kind::Formula, &f.name)
-                            .is_some_and(|inst| {
-                                version_cmp(&inst.version, &keg_version(f))
-                                    != std::cmp::Ordering::Less
-                            })
-                    });
+                && top_f.is_some_and(|f| {
+                    prefix
+                        .installed_one(Kind::Formula, &f.name)
+                        .is_some_and(|inst| {
+                            version_cmp(&inst.version, &keg_version(f)) != std::cmp::Ordering::Less
+                        })
+                });
             if top_current {
                 return Vec::new();
             }
@@ -513,7 +536,7 @@ pub(super) fn preflight_refusals(
                         f,
                         opts,
                         catalog.machine(),
-                        f.name == Formula::short_name(name),
+                        top_name.as_deref() == Some(f.name.as_str()),
                     )
                     .err()
                 })
@@ -642,8 +665,8 @@ pub fn install(
     // already-current top is partitioned out before any of it (it
     // only warns), so the narration runs only for a plain install
     // whose top will actually pour.
-    let top_short = Formula::short_name(name).to_string();
-    let top = planned.iter().find(|f| f.name == top_short);
+    let top = planned.iter().rfind(|f| f.matches_name(name));
+    let top_short = top.map_or_else(|| Formula::short_name(name).to_string(), |f| f.name.clone());
     let top_current = !opts.force
         && top.is_some_and(|f| {
             prefix
@@ -680,15 +703,7 @@ pub fn install(
     }
     let link_states = planned
         .iter()
-        .map(|f| {
-            preflight(
-                prefix,
-                f,
-                opts,
-                Machine::this(),
-                f.name == Formula::short_name(name),
-            )
-        })
+        .map(|f| preflight(prefix, f, opts, Machine::this(), f.name == top_short))
         .collect::<Result<Vec<_>, _>>()?;
     let prior = prior_requests(prefix, planned.iter().map(|f| f.name.as_str()))?;
     if !opts.dry_run {
@@ -818,7 +833,7 @@ pub fn install(
             let on_request = if preserve {
                 prior.get(&f.name).copied().unwrap_or(false)
             } else {
-                (!opts.as_dependency && f.name == Formula::short_name(name))
+                (!opts.as_dependency && f.name == top_short)
                     || prior.get(&f.name).copied().unwrap_or(false)
             };
             if narrate && f.name != top_short {
@@ -982,7 +997,8 @@ fn linkage_leftovers(staged: &Path) -> Vec<String> {
                 walk(&path, out);
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&path) else {
+            let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, 128 * 1024 * 1024)
+            else {
                 continue;
             };
             let text = String::from_utf8_lossy(&bytes);
@@ -1272,7 +1288,7 @@ fn replace_text_placeholders(
                 continue;
             }
         }
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, 128 * 1024 * 1024) else {
             continue;
         };
         if bytes.contains(&0) || !bytes.windows(10).any(|w| w == b"@@HOMEBREW") {
@@ -1358,7 +1374,7 @@ fn relocate_staged(
         if !seen.insert((meta.dev(), meta.ino())) {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, 128 * 1024 * 1024) else {
             continue;
         };
         if !bytes.windows(10).any(|w| w == b"@@HOMEBREW") {
@@ -2705,10 +2721,21 @@ pub fn uninstall(
 /// proceed prompt and read single characters; only `y`
 /// proceeds. Without a terminal it never prompts.
 pub(super) fn ask_to_proceed(action: &str) -> Result<(), InstallError> {
+    ask_confirm(action).unwrap_or(Ok(()))
+}
+
+/// `Ask.confirm?` as a value: `None` without a terminal (no
+/// prompt shown), `Some(Ok(()))` on `y`, `Some(Err(..))` on
+/// decline/EOF (brew exits 1).
+pub(super) fn ask_confirm(action: &str) -> Option<Result<(), InstallError>> {
     use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Ok(());
+        return None;
     }
+    Some(ask_confirm_tty(action))
+}
+
+fn ask_confirm_tty(action: &str) -> Result<(), InstallError> {
     println!(
         "{}",
         super::tty::ohai(&format!("Do you want to proceed with the {action}? [y/n]"))
@@ -3905,6 +3932,275 @@ mod tests {
             Some("2"),
             "below-minimum dep must not upgrade for a current top"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn alias_and_oldname_install_treats_resolved_formula_as_top() {
+        let aliased_read = |n: &str| {
+            Ok(match n {
+                "app-alias" | "app" => Formula {
+                    name: "app".into(),
+                    aliases: vec!["app-alias".into()],
+                    dependencies: vec!["left".into(), "right".into()],
+                    ..Formula::default()
+                },
+                "left" => Formula {
+                    name: "left".into(),
+                    dependencies: vec!["shared-old".into()],
+                    ..Formula::default()
+                },
+                "right" => Formula {
+                    name: "right".into(),
+                    dependencies: vec!["shared".into()],
+                    ..Formula::default()
+                },
+                "shared-old" | "shared" => Formula {
+                    name: "shared".into(),
+                    oldnames: vec!["shared-old".into()],
+                    ..Formula::default()
+                },
+                other => Formula {
+                    name: other.into(),
+                    ..Formula::default()
+                },
+            })
+        };
+        let planned_names: Vec<String> =
+            dependency_plan("app-alias", false, false, aliased_read, |_, _| false)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.name)
+                .collect();
+        assert_eq!(planned_names, ["shared", "left", "right", "app"]);
+        let aliased_cycle = |n: &str| {
+            Ok(match n {
+                "app-alias" => Formula {
+                    name: "app".into(),
+                    aliases: vec!["app-alias".into()],
+                    dependencies: vec!["dep".into()],
+                    ..Formula::default()
+                },
+                _ => Formula {
+                    name: "dep".into(),
+                    dependencies: vec!["app".into()],
+                    ..Formula::default()
+                },
+            })
+        };
+        assert!(matches!(
+            dependency_plan("app-alias", false, false, aliased_cycle, |_, _| false),
+            Err(InstallError::Failed(msg)) if msg.contains("dependency cycle")
+        ));
+
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        prefix.ensure().unwrap();
+        std::fs::create_dir_all(prefix.cache().join("api")).unwrap();
+        let demo_archive = tmp.path().join("demo.tar.gz");
+        std::fs::write(
+            &demo_archive,
+            gzip_bytes(&tar_bytes(&[(
+                "demo/1.0/bin/demo",
+                b'0',
+                "",
+                b"#!/bin/sh\nprintf 'demo\\n'\n",
+                0o755,
+            )])),
+        )
+        .unwrap();
+        let demo_sha = fetch::sha256_file(&demo_archive).unwrap();
+        let dep_archive = tmp.path().join("dep.tar.gz");
+        std::fs::write(
+            &dep_archive,
+            gzip_bytes(&tar_bytes(&[(
+                "dep/3/bin/dep",
+                b'0',
+                "",
+                b"#!/bin/sh\nprintf 'dep\\n'\n",
+                0o755,
+            )])),
+        )
+        .unwrap();
+        let demo_record = aterm_json::json!({
+            "name": "demo",
+            "full_name": "demo",
+            "aliases": ["demo-alias"],
+            "oldnames": ["demo-legacy"],
+            "versions": { "stable": "1.0" },
+            "dependencies": ["dep"],
+            "bottle": { "stable": { "files": { "all": {
+                "url": format!("file://{}", demo_archive.display()),
+                "sha256": demo_sha,
+                "cellar": ":any_skip_relocation"
+            } } } }
+        });
+        for cache_key in [
+            "formula-demo.json",
+            "formula-demo-alias.json",
+            "formula-demo-legacy.json",
+        ] {
+            std::fs::write(
+                prefix.cache().join("api").join(cache_key),
+                aterm_json::to_vec(&demo_record).unwrap(),
+            )
+            .unwrap();
+        }
+        let dep_record = aterm_json::json!({
+            "name": "dep",
+            "full_name": "dep",
+            "versions": { "stable": "3" },
+            "bottle": { "stable": { "files": { "all": {
+                "url": format!("file://{}", dep_archive.display()),
+                "sha256": fetch::sha256_file(&dep_archive).unwrap(),
+                "cellar": ":any_skip_relocation"
+            } } } }
+        });
+        std::fs::write(
+            prefix.cache().join("api/formula-dep.json"),
+            aterm_json::to_vec(&dep_record).unwrap(),
+        )
+        .unwrap();
+        let api = Api::new(prefix.clone());
+        let (dry_top, dry_deps) = dry_rows(
+            &api,
+            &prefix,
+            "demo-alias",
+            &InstallOpts {
+                quiet: true,
+                ..InstallOpts::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(dry_top.as_ref().map(|r| r.name.as_str()), Some("demo"));
+        assert_eq!(
+            dry_deps.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["dep"]
+        );
+
+        assert_eq!(
+            install(
+                &api,
+                &prefix,
+                "demo-alias",
+                &InstallOpts {
+                    quiet: true,
+                    ..InstallOpts::default()
+                },
+            )
+            .unwrap(),
+            "1.0"
+        );
+        let demo_inst = prefix.installed_one(Kind::Formula, "demo").unwrap();
+        let dep_inst = prefix.installed_one(Kind::Formula, "dep").unwrap();
+        assert!(
+            super::super::commands::requested(&prefix, &demo_inst).unwrap(),
+            "alias install must mark the resolved formula installed_on_request"
+        );
+        assert!(
+            !super::super::commands::requested(&prefix, &dep_inst).unwrap(),
+            "dependency stays installed_on_request = false"
+        );
+
+        // With the resolved top already current, a plain alias install must short-circuit
+        // without gating or upgrading a below-minimum dependency, while marking on-request.
+        super::super::prefix::set_installed_on_request(&prefix.keg("demo", "1.0"), false).unwrap();
+        remove_owned_opt_link(&prefix, "dep").unwrap();
+        let _ = std::fs::remove_file(prefix.bin().join("dep"));
+        std::fs::remove_dir_all(prefix.keg("dep", "3")).unwrap();
+        let dep_old = prefix.keg("dep", "2");
+        std::fs::create_dir_all(dep_old.join("bin")).unwrap();
+        std::fs::write(dep_old.join("bin/dep"), b"old-dep").unwrap();
+        prefix
+            .write_receipt(
+                &dep_old,
+                &[
+                    ("installed_by", "abrew"),
+                    ("name", "dep"),
+                    ("version", "2"),
+                    ("installed_on_request", "false"),
+                ],
+            )
+            .unwrap();
+        let demo = api.formula("demo-alias").unwrap();
+        let tab = aterm_json::json!({
+            "runtime_dependencies": [{ "full_name": "dep", "pkg_version": "3" }]
+        });
+        let manifest = aterm_json::json!({
+            "manifests": [{ "annotations": {
+                "sh.brew.bottle.digest": demo_sha,
+                "sh.brew.tab": aterm_json::to_string(&tab).unwrap()
+            } }]
+        });
+        std::fs::write(
+            bottle_manifest_dest(&prefix, &demo),
+            aterm_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(preflight_plan(&api, &prefix, "demo-legacy", &InstallOpts::default()).is_ok());
+        assert_eq!(
+            dry_rows(
+                &api,
+                &prefix,
+                "demo-legacy",
+                &InstallOpts {
+                    quiet: true,
+                    ..InstallOpts::default()
+                },
+            )
+            .unwrap()
+            .0
+            .map(|r| r.name),
+            None
+        );
+        assert_eq!(
+            install(
+                &api,
+                &prefix,
+                "demo-legacy",
+                &InstallOpts {
+                    quiet: true,
+                    ..InstallOpts::default()
+                },
+            )
+            .unwrap(),
+            "1.0"
+        );
+        assert_eq!(
+            prefix.installed_one(Kind::Formula, "dep").unwrap().version,
+            "2"
+        );
+        let demo_inst = prefix.installed_one(Kind::Formula, "demo").unwrap();
+        assert!(super::super::commands::requested(&prefix, &demo_inst).unwrap());
+
+        // An outdated keg reached via alias stays gated as top in plain preflight,
+        // and outdated_linked_formula resolves it when opt-linked.
+        remove_owned_opt_link(&prefix, "demo").unwrap();
+        let _ = std::fs::remove_file(prefix.bin().join("demo"));
+        std::fs::remove_dir_all(prefix.keg("demo", "1.0")).unwrap();
+        let old_demo = prefix.keg("demo", "0.9");
+        std::fs::create_dir_all(old_demo.join("bin")).unwrap();
+        std::fs::write(old_demo.join("bin/demo"), b"old").unwrap();
+        prefix
+            .write_receipt(
+                &old_demo,
+                &[
+                    ("installed_by", "abrew"),
+                    ("name", "demo"),
+                    ("version", "0.9"),
+                    ("installed_on_request", "true"),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            preflight_plan(&api, &prefix, "demo-alias", &InstallOpts::default()),
+            Err(InstallError::Unsupported(_))
+        ));
+        point_opt(&prefix, "demo", "0.9").unwrap();
+        let (resolved, have) =
+            super::super::commands::outdated_linked_formula(&prefix, &api, "demo-alias").unwrap();
+        assert_eq!(resolved.name, "demo");
+        assert_eq!(have, "0.9");
     }
 
     #[test]

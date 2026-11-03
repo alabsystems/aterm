@@ -347,7 +347,7 @@ fn qmp(l: &Layout, command: String) -> Result<(), String> {
 }
 
 /// Press the chord `keys` (qcodes) on the USB keyboard.
-fn chord(l: &Layout, keys: &[&str]) -> Result<(), String> {
+pub(crate) fn chord(l: &Layout, keys: &[&str]) -> Result<(), String> {
     qmp(l, desk::key_command(keys, 60))?;
     std::thread::sleep(Duration::from_millis(200));
     Ok(())
@@ -386,7 +386,7 @@ fn drag(l: &Layout, d: &Display, from: (i32, i32), to: (i32, i32)) -> Result<(),
 
 /// Press the tablet's left button at `from` and move it to `to` in steps `pause_ms` apart, holding
 /// the button.
-fn press_to(
+pub(crate) fn press_to(
     l: &Layout,
     d: &Display,
     from: (i32, i32),
@@ -415,7 +415,7 @@ fn press_to(
 }
 
 /// Release the tablet's left button where it is.
-fn release(l: &Layout) -> Result<(), String> {
+pub(crate) fn release(l: &Layout) -> Result<(), String> {
     qmp(l, desk::tablet_button(false))?;
     std::thread::sleep(Duration::from_millis(300));
     Ok(())
@@ -436,6 +436,8 @@ pub(crate) struct Session<'a> {
     pub(crate) dir: String,
     task: String,
     pub(crate) pid: u32,
+    identity: Option<(String, String)>,
+    owned: bool,
 }
 
 /// The config a `--cpu` run's instance takes.
@@ -448,6 +450,26 @@ pub(crate) fn cpu_config() -> String {
 }
 
 impl<'a> Session<'a> {
+    /// A fresh owned namespace: unlike the historical smoke slots, never remove
+    /// an existing directory to make room for this instance.
+    pub(crate) fn launch_owned(
+        up: &'a Up,
+        arch: Arch,
+        n: u32,
+        config: &str,
+        cpu: bool,
+    ) -> Result<Session<'a>, String> {
+        let dir = instance_dir(arch, n);
+        let absent = up
+            .ssh
+            .run(&format!("if exist {dir} (exit /b 125) else (exit /b 0)"));
+        if !absent.ok() {
+            return Err(format!(
+                "owned instance namespace {dir} already exists or is unreadable; preserved"
+            ));
+        }
+        Self::launch_inner(up, arch, n, config, cpu, true)
+    }
     /// Starts instance `n` of `arch` in the runner's desktop and waits for `ready`.
     fn launch(up: &'a Up, arch: Arch, n: u32, cpu: bool) -> Result<Session<'a>, String> {
         let config = if cpu {
@@ -467,21 +489,42 @@ impl<'a> Session<'a> {
         config: &str,
         cpu: bool,
     ) -> Result<Session<'a>, String> {
+        Self::launch_inner(up, arch, n, config, cpu, false)
+    }
+
+    fn launch_inner(
+        up: &'a Up,
+        arch: Arch,
+        n: u32,
+        config: &str,
+        cpu: bool,
+        owned: bool,
+    ) -> Result<Session<'a>, String> {
         let dir = instance_dir(arch, n);
         let task = task_name(&format!("window-{}-{n}", arch.name()));
-        let cleared = up.ssh.run(&format!(
-            "(if exist {dir} rmdir /s /q {dir}) & if exist {dir} (echo left)"
-        ));
-        if cleared.text.contains("left") {
-            return Err(format!(
-                "{dir} is held (an earlier instance still running?): {}",
-                cleared.tail(3)
+        if !owned {
+            let cleared = up.ssh.run(&format!(
+                "(if exist {dir} rmdir /s /q {dir}) & if exist {dir} (echo left)"
             ));
+            if cleared.text.contains("left") {
+                return Err(format!(
+                    "{dir} is held (an earlier instance still running?): {}",
+                    cleared.tail(3)
+                ));
+            }
         }
         let config =
             aterm_codec::base64::encode(config.as_bytes()).map_err(|e| format!("base64: {e:?}"))?;
         let bin = bin_dir(arch);
-        let mut words = vec!["launch", &bin, &dir, &config];
+        let mut words = vec![
+            if owned { "launch-owned" } else { "launch" },
+            &bin,
+            &dir,
+            &config,
+        ];
+        if owned {
+            words.push("--no-reroute");
+        }
         if cpu {
             words.push("--cpu");
         }
@@ -499,6 +542,8 @@ impl<'a> Session<'a> {
             dir,
             task,
             pid: 0,
+            identity: None,
+            owned,
         };
         match pid {
             Ok(pid) => s.pid = pid,
@@ -506,6 +551,14 @@ impl<'a> Session<'a> {
                 s.end();
                 return Err(e);
             }
+        }
+        let identity = up.ssh.run(&format!("type {}\\identity.json", s.dir));
+        if identity.ok() {
+            s.identity = guest_identity(&identity.text, s.pid);
+        }
+        if s.identity.is_none() {
+            s.end();
+            return Err("launched process has no exact guest image/start identity".into());
         }
         let sock = format!("{}\\aterm.sock", s.dir);
         let ready = within("its control socket", || {
@@ -601,11 +654,107 @@ impl<'a> Session<'a> {
     /// Its task stopped and gone, and aterm-gui with it.
     pub(crate) fn end(&self) {
         let _ = self.up.admin.ps(&guest::desktop_stop(&self.task));
-        if self.pid != 0 && self.exit().is_none() {
-            let _ = self
-                .up
-                .admin
-                .run(&format!("taskkill /F /T /PID {}", self.pid));
+        if self.exit().is_none()
+            && let Some((birth, image)) = &self.identity
+        {
+            let out = self.up.admin.ps(&format!(
+                "$p=Get-Process -Id {} -ErrorAction SilentlyContinue; \
+                 if ($p -and $p.StartTime.ToUniversalTime().Ticks.ToString() -ceq {} \
+                 -and $p.MainModule.FileName -ieq {}) {{ $p | Stop-Process -Force }}",
+                self.pid,
+                guest::ps_quote(birth),
+                guest::ps_quote(image)
+            ));
+            if !out.ok() {
+                eprintln!(
+                    "windows: owned process cleanup unavailable: {}",
+                    out.tail(3)
+                );
+            }
+        }
+    }
+
+    /// Observe the exact launched image gone, rather than treating a missing exit
+    /// file (the helper task may have ended first) as evidence either way.
+    pub(crate) fn ended(&self) -> Result<(), String> {
+        let Some((birth, image)) = &self.identity else {
+            return Err("owned image identity is unknown".into());
+        };
+        within("owned Windows image to end", || {
+            let out = self.up.admin.ps(&format!(
+                "$ErrorActionPreference='Stop'; $p=Get-Process -Id {} -ErrorAction SilentlyContinue; \
+                 if (!$p -or $p.StartTime.ToUniversalTime().Ticks.ToString() -cne {} \
+                 -or $p.MainModule.FileName -ine {}) {{ 'owned-image-gone' }}",
+                self.pid, guest::ps_quote(birth), guest::ps_quote(image)
+            ));
+            if out.ok() && out.text.lines().any(|s| s.trim() == "owned-image-gone") {
+                Ok(())
+            } else {
+                Err(format!(
+                    "exact owned image is still present or unreadable: {}",
+                    out.tail(3)
+                ))
+            }
+        })
+    }
+
+    /// Remove only a fresh owned namespace, after retaining its evidence and
+    /// observing the launched image gone. Legacy smoke slots are never eligible.
+    pub(crate) fn remove_owned(&self) -> Result<(), String> {
+        if !self.owned {
+            return Err("a historical smoke slot is not a fresh owned namespace".into());
+        }
+        self.ended()?;
+        let Some((birth, image)) = &self.identity else {
+            return Err("unknown owned image identity".into());
+        };
+        let out = self.up.ssh.ps(&format!(
+            "$ErrorActionPreference='Stop'; $d={}; $i=Get-Content -Raw -LiteralPath (Join-Path $d 'identity.json') | ConvertFrom-Json; \
+             if ($i.pid -ne {} -or $i.birth -cne {} -or $i.image -ine {}) {{ exit 125 }}; \
+             Remove-Item -LiteralPath $d -Recurse -Force",
+            guest::ps_quote(&self.dir), self.pid, guest::ps_quote(birth), guest::ps_quote(image)
+        ));
+        if out.ok() {
+            Ok(())
+        } else {
+            Err(format!("owned namespace retained: {}", out.tail(3)))
+        }
+    }
+}
+
+fn guest_identity(text: &str, pid: u32) -> Option<(String, String)> {
+    let value: aterm_json::Value = aterm_json::from_str(text.trim()).ok()?;
+    if value.get("pid")?.as_u64()? != u64::from(pid) {
+        return None;
+    }
+    let birth = value.get("birth")?.as_str()?;
+    if birth.parse::<u64>().ok()? == 0 {
+        return None;
+    }
+    let image = value.get("image")?.as_str()?;
+    if !image.ends_with("\\aterm-gui.exe") || image.contains(['\r', '\n']) {
+        return None;
+    }
+    Some((birth.to_owned(), image.to_owned()))
+}
+
+#[cfg(test)]
+mod guest_identity_tests {
+    use super::guest_identity;
+
+    #[test]
+    fn cleanup_identity_cannot_be_a_pid_or_missing_start() {
+        let text =
+            r#"{"pid":42,"birth":"123456","image":"C:\\lane\\target\\debug\\aterm-gui.exe"}"#;
+        assert!(guest_identity(text, 42).is_some());
+        assert!(guest_identity(text, 43).is_none());
+        for text in [
+            r#"{"pid":42}"#,
+            r#"{"pid":42,"birth":"0","image":"C:\\aterm-gui.exe"}"#,
+            r#"{"pid":42,"birth":"unknown","image":"C:\\aterm-gui.exe"}"#,
+            r#"{"pid":42,"birth":"123456","image":"C:\\other.exe"}"#,
+        ] {
+            assert!(guest_identity(text, 42).is_none());
         }
     }
 }

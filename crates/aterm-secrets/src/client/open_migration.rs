@@ -5,9 +5,8 @@
 //! ([`crate::text::OPEN_NOTE`]), which aterm 0.147 and earlier read past as a comment. Their
 //! approvers then read the vault as closed, and stop letting in a request their own server took
 //! for a LAN one by its address alone (a phone hotspot's, a café's); aterm 0.148 and later read
-//! it open as before, and hold the home-LAN rule to member evidence ([`crate::home_lan`]). Only
-//! an ALab admin's ordinary approver pass publishes, once for each version that still holds the
-//! line (an earlier aterm's `password open` writes it again).
+//! it open as before. Only an ALab admin's ordinary approver pass publishes, once for each
+//! version that still holds the line (an earlier aterm's `password open` writes it again).
 
 use super::*;
 

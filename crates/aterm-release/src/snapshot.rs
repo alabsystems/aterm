@@ -103,7 +103,7 @@ impl CacheRoot {
         match aterm_update_core::FileLock::acquire_within(&lock, std::time::Duration::ZERO) {
             Ok(lock) => self.held(lock).map(Ok),
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                let who = fs::read_to_string(self.root.join("holder"))
+                let who = crate::durable::read_text(&self.root.join("holder"))
                     .ok()
                     .map(|note| note.trim().to_owned())
                     .filter(|note| !note.is_empty())
@@ -913,7 +913,9 @@ impl Syncer {
         let same = match &existing {
             Some(meta) if meta.file_type().is_file() => {
                 meta.len() == data.len() as u64
-                    && fs::read(&full).map_err(|e| format!("read {}: {e}", full.display()))? == data
+                    && crate::durable::read_file(&full)
+                        .map_err(|e| format!("read {}: {e}", full.display()))?
+                        == data
                     && {
                         set_mode(&full, meta, exec)?;
                         true
@@ -1272,7 +1274,7 @@ fn cached_archives<'a>(
         }
         for krate in locked {
             let archive = index.path().join(format!("{}.crate", krate.stem()));
-            match fs::read(&archive) {
+            match crate::durable::read_file(&archive) {
                 Ok(bytes) => {
                     let matches = sha256_hex(&bytes) == krate.checksum;
                     found.push((krate, archive, matches));
@@ -1381,7 +1383,8 @@ pub fn check_vendored(locked: &[LockedCrate], vendor: &Path) -> Result<(), Strin
             ));
         };
         let json = entry.path().join(".cargo-checksum.json");
-        let text = fs::read(&json).map_err(|e| format!("read {}: {e}", json.display()))?;
+        let text = crate::durable::read_file(&json)
+            .map_err(|e| format!("read {}: {e}", json.display()))?;
         let parsed: CargoChecksum = aterm_json::from_slice(&text)
             .map_err(|e| format!("{} does not parse: {e}", json.display()))?;
         if parsed.package.as_deref() != Some(krate.checksum.as_str()) {
@@ -1407,8 +1410,8 @@ fn vendor_into(
     sync: &mut Syncer,
 ) -> Result<usize, String> {
     let lock_path = src.join("Cargo.lock");
-    let lock_text =
-        fs::read_to_string(&lock_path).map_err(|e| format!("read {}: {e}", lock_path.display()))?;
+    let lock_text = crate::durable::read_text(&lock_path)
+        .map_err(|e| format!("read {}: {e}", lock_path.display()))?;
     let locked = locked_crates(&lock_text)?;
     refuse_root_cargo_config()?;
     let cargo_home = cache.vendor_cargo_home();
@@ -1490,7 +1493,8 @@ fn put_tree(sync: &mut Syncer, from: &Path, prefix: &Path) -> Result<(), String>
             if meta.is_dir() {
                 dirs.push((path, here));
             } else if meta.is_file() {
-                let data = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+                let data = crate::durable::read_file(&path)
+                    .map_err(|e| format!("read {}: {e}", path.display()))?;
                 sync.put(&here, &data, is_exec(&meta))?;
             } else {
                 return Err(format!(
@@ -1544,7 +1548,8 @@ fn listing(root: &Path) -> Result<Listing, String> {
                 line.extend_from_slice(&path_bytes(&target));
                 line
             } else if meta.is_file() {
-                let bytes = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+                let bytes = crate::durable::read_file(&path)
+                    .map_err(|e| format!("read {}: {e}", path.display()))?;
                 let sha = sha256_hex(&bytes);
                 format!("file\0{:o}\0{sha}", file_mode(&meta)).into_bytes()
             } else {

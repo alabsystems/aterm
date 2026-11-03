@@ -46,11 +46,11 @@ pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wa
 pub(crate) fn cmd_sessions_bridge(store: &Store) -> String {
     use std::fmt::Write as _;
 
-    let rows = store
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .bridge_roster();
-    let mut out = format!("OK {}\n", rows.len());
+    let (rows, roster) = {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        (g.bridge_roster(), g.roster_seq())
+    };
+    let mut out = format!("OK {} roster={roster}\n", rows.len());
     for (local, sid, nonce) in rows {
         writeln!(
             &mut out,
@@ -1930,15 +1930,136 @@ fn watcher_look(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PressLook {
     Latched,
-    Started,
+    Started(Option<u64>),
     /// The cursor left the row the text was typed on: a program with no command blocks took the line.
     Moved,
+}
+
+/// The shell input block standing when Enter is armed, not a later prompt.
+#[derive(Clone, Copy)]
+struct ShellSubmit {
+    started: u64,
+    block: Option<u64>,
+}
+
+impl ShellSubmit {
+    fn capture(t: &Terminal) -> Self {
+        Self {
+            started: t.started_command_seq(),
+            block: t
+                .current_block()
+                .filter(|b| b.state == aterm_core::terminal::BlockState::EnteringCommand)
+                .map(|b| b.id),
+        }
+    }
+
+    /// One accepted start and the same retained block prove the association.
+    /// Reset/eviction or multiple starts retain submit evidence, but no block claim.
+    fn block(self, t: &Terminal) -> Option<u64> {
+        if self.started.checked_add(1) != Some(t.started_command_seq()) {
+            return None;
+        }
+        let id = self.block?;
+        t.block_by_id(id)
+            .filter(|b| {
+                matches!(
+                    b.state,
+                    aterm_core::terminal::BlockState::Executing
+                        | aterm_core::terminal::BlockState::Complete
+                )
+            })
+            .map(|b| b.id)
+    }
+}
+
+#[cfg(test)]
+mod shell_submit_tests {
+    use super::*;
+
+    const PROMPT: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07";
+    const START: &[u8] = b"echo hi\r\n\x1b]133;C\x07";
+    const END: &[u8] = b"hi\r\n\x1b]133;D;0\x07";
+
+    fn entering() -> Terminal {
+        let mut t = Terminal::new(24, 80);
+        t.process(PROMPT);
+        t
+    }
+
+    #[test]
+    fn exact_started_block_survives_completion_and_the_next_prompt() {
+        let mut t = entering();
+        let armed = ShellSubmit::capture(&t);
+        assert!(armed.block.is_some());
+        assert_eq!(armed.block(&t), None, "a prompt alone is no start");
+        t.process(START);
+        assert_eq!(armed.block(&t), armed.block);
+        t.process(END);
+        t.process(PROMPT);
+        assert_ne!(t.current_block().unwrap().id, armed.block.unwrap());
+        assert_eq!(armed.block(&t), armed.block, "not the new prompt");
+        let carried = Terminal::from_checkpoint(&t.checkpoint());
+        assert_eq!(armed.block(&carried), armed.block);
+    }
+
+    #[test]
+    fn multiple_starts_never_guess_the_latest_or_first_block() {
+        let mut t = entering();
+        let armed = ShellSubmit::capture(&t);
+        t.process(START);
+        t.process(END);
+        t.process(PROMPT);
+        t.process(START);
+        assert_eq!(armed.block(&t), None);
+    }
+
+    #[test]
+    fn reset_and_eviction_cannot_reassociate_an_old_prompt() {
+        let mut t = entering();
+        let armed = ShellSubmit::capture(&t);
+        t.process(START);
+        t.reset();
+        assert_eq!(armed.block(&t), None);
+        t.process(PROMPT);
+        assert_ne!(ShellSubmit::capture(&t).block, armed.block);
+
+        let mut t = entering();
+        let armed = ShellSubmit::capture(&t);
+        t.process(START);
+        t.process(END);
+        // Prompt-only blocks evict the witnessed block without adding any starts.
+        for _ in 0..10_000 {
+            t.process(PROMPT);
+        }
+        assert!(t.block_by_id(armed.block.unwrap()).is_none());
+        assert_eq!(armed.block(&t), None);
+    }
+
+    #[test]
+    fn a_start_without_an_armed_input_block_has_no_block_claim() {
+        let mut t = Terminal::new(24, 80);
+        let armed = ShellSubmit::capture(&t);
+        t.process(PROMPT);
+        t.process(START);
+        assert!(t.started_command_seq() > armed.started);
+        assert_eq!(armed.block(&t), None);
+
+        // A carried shell phase can retain the accepted-start signal without a block.
+        let mut checkpoint = entering().checkpoint();
+        checkpoint.shell.current_block = None;
+        let mut t = Terminal::from_checkpoint(&checkpoint);
+        let armed = ShellSubmit::capture(&t);
+        t.process(START);
+        assert!(t.started_command_seq() > armed.started);
+        assert!(t.current_block().is_none());
+        assert_eq!(armed.block(&t), None);
+    }
 }
 
 fn press_look(
     term: &Arc<Mutex<Terminal>>,
     id: aterm_core::terminal::WatchId,
-    (base, typed_row): (Option<u64>, Option<u16>),
+    (base, typed_row): (Option<ShellSubmit>, Option<u16>),
 ) -> impl FnMut(std::time::Instant, bool, bool) -> (Option<PressLook>, Option<std::time::Instant>) + '_
 {
     move |now, parked, closing| {
@@ -1949,9 +2070,9 @@ fn press_look(
         if latched || moved || closing {
             t.watch_disarm(id);
         }
-        let started = closing && base.is_some_and(|base| t.started_command_seq() > base);
+        let started = closing && base.is_some_and(|base| t.started_command_seq() > base.started);
         let answer = if started {
-            Some(PressLook::Started)
+            Some(PressLook::Started(base.and_then(|base| base.block(&t))))
         } else if latched {
             Some(PressLook::Latched)
         } else if moved {
@@ -2473,7 +2594,6 @@ fn turn_attempt(
     use aterm_core::terminal::{BlockState, WatcherSpec};
 
     const ECHO_SETTLE: Duration = Duration::from_millis(150);
-    const ECHO_CAP: Duration = Duration::from_secs(5);
 
     let o = match turn_options(rest) {
         Ok(o) => o,
@@ -2694,7 +2814,8 @@ fn turn_attempt(
     let mut pasted_graphemes = 0usize;
     let cadence = Duration::from_millis(cadence_ms);
     let mut committed: Option<crate::control::CommittedInput> = None;
-    let mut echo_until = None;
+    // When the typing ended, which the echo of the text is waited for from.
+    let mut typed_end = None;
     // The caret the typing hold read just before the turn's last write, which its echo moves.
     let mut sent_from = None;
     if !text.is_empty() {
@@ -2810,9 +2931,9 @@ fn turn_attempt(
         let Some(id) = arm(WatcherSpec::IdleFor { dur: ECHO_SETTLE }) else {
             return format!("ERR {WAITS_FULL}\n");
         };
-        let until = deadline.min(Instant::now() + ECHO_CAP);
-        echo_until = Some(until);
-        match wait_committed(id, until) {
+        let typed_at = Instant::now();
+        typed_end = Some(typed_at);
+        match wait_committed(id, deadline.min(typed_at + EchoWait::CAP)) {
             Parked::Exited => return "ERR exited\n".to_string(),
             Parked::Done(_) | Parked::Deadline | Parked::HungUp => {}
         }
@@ -2825,6 +2946,7 @@ fn turn_attempt(
     }
 
     let mut submit_by: Option<SubmitBy> = None;
+    let mut submit_block = None;
     let mut pressed = 0u32;
     let mut unjudged = false;
     let task_found = task_record_of(ctx).map(|task| (task.rev, task.entered));
@@ -2846,8 +2968,14 @@ fn turn_attempt(
                 let t = crate::term_lock_whole_when(term, finishing, |_| true);
                 (composer_verify_key(&t, text), t.content_seq())
             };
+            let mut echo = typed_end.map(|typed| EchoWait::after_typing(typed, deadline));
             let wait = |after| {
-                let Some(until) = echo_until.filter(|&u| Instant::now() < u) else {
+                let Some(echo) = echo.as_mut() else {
+                    return Ok(false);
+                };
+                let Some(until) =
+                    echo.look(crate::input_stall::input_unread(&ctx.sink), Instant::now())
+                else {
                     return Ok(false);
                 };
                 let Some(id) = arm(WatcherSpec::SeqAdvanced { after }) else {
@@ -2855,8 +2983,10 @@ fn turn_attempt(
                 };
                 match wait_committed(id, until) {
                     Parked::Exited => Err("ERR exited\n".to_string()),
-                    Parked::Done(_) => Ok(true),
-                    Parked::Deadline | Parked::HungUp => Ok(false),
+                    // A wait nothing drew in looks again: a starved program that reads nothing
+                    // draws nothing either.
+                    Parked::Done(_) | Parked::Deadline => Ok(true),
+                    Parked::HungUp => Ok(false),
                 }
             };
             match composer_key_once_shown(look, wait) {
@@ -2873,8 +3003,8 @@ fn turn_attempt(
         let by_claim = auto_mode && by_screen && proven_codex_alab(ctx);
         for press_no in 0..presses {
             // A re-press is for an Enter the program read and swallowed; one still unread would
-            // only queue another behind it (`input_stall::repress_would_queue`).
-            if press_no > 0 && crate::input_stall::repress_would_queue(&ctx.sink) {
+            // only queue another behind it.
+            if press_no > 0 && crate::input_stall::input_unread(&ctx.sink) {
                 break;
             }
             if press_no > 0 && ctx.update_parked.is_parked() {
@@ -2893,7 +3023,7 @@ fn turn_attempt(
             let window = deadline.min(Instant::now() + Duration::from_millis(submit_window_ms));
             let (base_started, typed_row, base_turns, mut id) = {
                 let mut t = term_lock(term);
-                let base = t.started_command_seq();
+                let base = ShellSubmit::capture(&t);
                 let row = by_screen.then(|| t.cursor().row);
                 let turns = by_claim.then(|| claim_base(t.program_state())).flatten();
                 let after = t.content_seq();
@@ -2970,8 +3100,9 @@ fn turn_attempt(
                         disarm_watch(term, id),
                     ) {
                         Parked::Exited => return "ERR exited\n".to_string(),
-                        Parked::Done(PressLook::Started) => {
+                        Parked::Done(PressLook::Started(block)) => {
                             submit_by = Some(SubmitBy::Block);
+                            submit_block = block;
                             break;
                         }
                         Parked::Done(PressLook::Moved) => {
@@ -2994,8 +3125,9 @@ fn turn_attempt(
                             } else if !submit_verify_block {
                                 submit_by = Some(SubmitBy::Screen);
                                 break;
-                            } else if t.started_command_seq() > base_started {
+                            } else if t.started_command_seq() > base_started.started {
                                 submit_by = Some(SubmitBy::Block);
+                                submit_block = base_started.block(&t);
                                 break;
                             }
                             if Instant::now() >= window {
@@ -3017,11 +3149,12 @@ fn turn_attempt(
                                     ComposerAfterPress::Holds => composer_gone = false,
                                     ComposerAfterPress::Unfinished => {}
                                 }
-                            } else if matches!(closed, Parked::HungUp)
-                                && submit_verify_block
-                                && term_lock(term).started_command_seq() > base_started
-                            {
-                                submit_by = Some(SubmitBy::Block);
+                            } else if matches!(closed, Parked::HungUp) && submit_verify_block {
+                                let t = term_lock(term);
+                                if t.started_command_seq() > base_started.started {
+                                    submit_by = Some(SubmitBy::Block);
+                                    submit_block = base_started.block(&t);
+                                }
                             }
                             break;
                         }
@@ -3031,7 +3164,7 @@ fn turn_attempt(
             if submit_by.is_none()
                 && advanced
                 && auto_mode
-                && base_started == 0
+                && base_started.started == 0
                 && composer_key.is_none()
             {
                 submit_by = Some(SubmitBy::Screen);
@@ -3160,6 +3293,11 @@ fn turn_attempt(
     if let Some(by) = submit_by {
         use std::fmt::Write as _;
         let _ = write!(verdict, " submit_by={}", by.as_str());
+        if by == SubmitBy::Block
+            && let Some(block) = submit_block
+        {
+            let _ = write!(verdict, " block={block}");
+        }
     }
     if typed {
         use std::fmt::Write as _;
@@ -3284,6 +3422,48 @@ fn composer_key_once_shown(
         if !wait(after)? {
             return Ok(None);
         }
+    }
+}
+
+/// The wait for a Claude Code composer to show the text a `turn` typed. A text its program has not
+/// read has no echo yet, so the echo's [`EchoWait::CAP`] runs again from each look that finds the
+/// program's input unread and from the first look after it that finds none. The text counts as
+/// unread until a look finds it read, so a read no look saw (one inside the echo's settle, which
+/// looks at nothing) gets the cap from the first look after it. The wait never runs past a minute
+/// after the typing ([`EchoWait::HANG`]), when a program that has not read the text is hung, nor
+/// past the turn's deadline.
+#[derive(Clone, Copy, Debug)]
+struct EchoWait {
+    /// Where the wait ends: the cap from the typing until the first look.
+    until: std::time::Instant,
+    hung_by: std::time::Instant,
+    /// What the last look found, or no look yet.
+    unread: bool,
+}
+
+impl EchoWait {
+    const CAP: std::time::Duration =
+        std::time::Duration::from_millis(aterm_types::control_verbs::TURN_ECHO_CAP_MS);
+    const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The wait for the echo of a text whose typing ended at `typed`, in a turn that ends at
+    /// `deadline`.
+    fn after_typing(typed: std::time::Instant, deadline: std::time::Instant) -> Self {
+        Self {
+            until: deadline.min(typed + Self::CAP),
+            hung_by: deadline.min(typed + Self::HANG),
+            unread: true,
+        }
+    }
+
+    /// Where the wait ends after a look at `now` that finds the program's input `unread`, or
+    /// `None` once that has passed.
+    fn look(&mut self, unread: bool, now: std::time::Instant) -> Option<std::time::Instant> {
+        if self.unread || unread {
+            self.until = self.hung_by.min(now + Self::CAP);
+        }
+        self.unread = unread;
+        (now < self.until).then_some(self.until)
     }
 }
 
@@ -6223,7 +6403,7 @@ mod tests {
         assert!(
             any.contains(
                 " rev=2 state=done agent=- program_state=- attention=- result_bytes=64 \
-                 task_news=1\n"
+                 conclusion=finished task_news=1\n"
             ),
             "{any}"
         );
@@ -6331,7 +6511,7 @@ mod tests {
             one(60_000),
             format!(
                 "OK 1\n@{sid} rev=2 state=done agent=- program_state=blocked:permission \
-                 attention=- result_bytes=0 task_news=1\n"
+                 attention=- result_bytes=0 conclusion=finished task_news=1\n"
             ),
             "the record's own news"
         );
@@ -7405,7 +7585,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("identity-only roster must not wait on terminal, meta or timeline");
         let mut lines = bridge.lines();
-        assert_eq!(lines.next(), Some("OK 2"));
+        assert_eq!(lines.next(), Some("OK 2 roster=2"));
         assert_eq!(lines.map(str::to_string).collect::<Vec<_>>(), expected);
         assert!(!bridge.contains("window=") && !bridge.contains("detail="));
         worker.join().unwrap();
@@ -9290,7 +9470,7 @@ mod composer_verify_tests {
     use aterm_core::terminal::Terminal;
 
     use super::{
-        ComposerAfterPress, ComposerKey, composer_after_press, composer_key_once_shown,
+        ComposerAfterPress, ComposerKey, EchoWait, composer_after_press, composer_key_once_shown,
         composer_verify_key,
     };
 
@@ -9417,6 +9597,61 @@ mod composer_verify_tests {
         assert_eq!(
             script(vec![shows()], vec![]),
             (Ok(Some("edit".to_string())), vec![])
+        );
+    }
+
+    #[test]
+    fn the_echo_cap_runs_from_the_first_look_that_finds_the_text_read() {
+        let t0 = std::time::Instant::now();
+        let s = std::time::Duration::from_secs;
+        let (cap, far) = (EchoWait::CAP, t0 + s(600));
+
+        let mut echo = EchoWait::after_typing(t0, far);
+        assert_eq!(
+            echo.look(false, t0 + cap),
+            Some(t0 + cap + cap),
+            "read before any look: the cap from the first look after it"
+        );
+        assert_eq!(
+            echo.look(false, t0 + cap + s(1)),
+            Some(t0 + cap + cap),
+            "and no later one"
+        );
+        assert_eq!(echo.look(false, t0 + cap + cap), None, "its end passed");
+
+        let mut echo = EchoWait::after_typing(t0, far);
+        assert_eq!(
+            echo.look(true, t0 + s(1)),
+            Some(t0 + s(1) + cap),
+            "unread: the cap from the look"
+        );
+        assert_eq!(echo.look(true, t0 + s(3)), Some(t0 + s(3) + cap));
+        assert_eq!(
+            echo.look(false, t0 + s(4)),
+            Some(t0 + s(4) + cap),
+            "the first look that finds it read"
+        );
+        assert_eq!(echo.look(false, t0 + s(5)), Some(t0 + s(4) + cap));
+        assert_eq!(
+            echo.look(true, t0 + s(6)),
+            Some(t0 + s(6) + cap),
+            "unread again"
+        );
+
+        let mut echo = EchoWait::after_typing(t0, far);
+        let late = t0 + EchoWait::HANG - cap / 2;
+        assert_eq!(
+            echo.look(true, late),
+            Some(t0 + EchoWait::HANG),
+            "never past a minute after the typing"
+        );
+        assert_eq!(echo.look(true, t0 + EchoWait::HANG), None);
+
+        let mut echo = EchoWait::after_typing(t0, t0 + s(2));
+        assert_eq!(
+            echo.look(true, t0 + s(1)),
+            Some(t0 + s(2)),
+            "nor past the deadline"
         );
     }
 }

@@ -10,6 +10,7 @@ pub mod announcement;
 pub mod answered;
 pub mod auto_mode;
 pub mod autocompact;
+pub mod chrome_intro;
 pub mod codex;
 pub mod credits;
 pub mod disk_full;

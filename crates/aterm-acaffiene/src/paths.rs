@@ -3,7 +3,93 @@
 
 //! File paths for `aterm acaffiene`, derived from the three root directories in [`Paths`].
 
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
+
+/// Whether `dir` already exists as an owned real directory (`Ok(true)`), is missing (`Ok(false)`),
+/// or is a symlink, non-directory, or owned by another user (`Err`).
+pub(crate) fn existing_real_dir(dir: &Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if !meta.file_type().is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is not a directory", dir.display()),
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                if meta.uid() != aterm_uds::peer::our_uid() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("{} is not this user's directory", dir.display()),
+                    ));
+                }
+            }
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Ensures `dir` is an owned real directory, refusing symlinked `dir` or an existing symlinked
+/// parent before creating missing directories.
+pub(crate) fn ensure_real_dir(dir: &Path) -> io::Result<()> {
+    if existing_real_dir(dir)? {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = existing_real_dir(parent)?;
+    }
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(dir)
+            .map_err(|err| match err.raw_os_error() {
+                Some(code) if code == libc::ELOOP || code == libc::ENOTDIR => io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is not a directory", dir.display()),
+                ),
+                _ => err,
+            })?;
+        let meta = opened.metadata()?;
+        if !meta.is_dir() || meta.uid() != aterm_uds::peer::our_uid() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is not this user's directory", dir.display()),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        if existing_real_dir(dir)? {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} does not exist", dir.display()),
+            ))
+        }
+    }
+}
+
+/// Whether `path`'s parent directory is an existing, owned real directory (or `path` is bare).
+#[must_use]
+pub(crate) fn parent_is_real_dir(path: &Path) -> bool {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => matches!(existing_real_dir(dir), Ok(true)),
+        _ => true,
+    }
+}
 
 /// The mug's files, under three roots.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +216,114 @@ mod tests {
         assert_eq!(
             paths.startup_off_file("x.y"),
             PathBuf::from("/s/acaffiene/x.y.startup-off")
+        );
+    }
+
+    /// SYMLINKED `state_dir` IS REFUSED ACROSS ALL MUG FILES: `trouble`, `state`, `instance`,
+    /// `launchd`, `code`, and `sweep_*` refuse to read, create, overwrite, or unlink files or
+    /// subdirectories inside an outside directory aliased by a symlinked `state_dir`.
+    /// NEGATIVE CONTROL: a real `state_dir` owned by the current user reads, writes, locks, and
+    /// clears cleanly.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_state_dir_is_refused_across_mug_files() {
+        use crate::model::{Clocks, Mode};
+
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let now = Clocks {
+            since_boot: 100,
+            wall: 1_700_000_000,
+        };
+        let label = "com.aterm.aterm.acaffiene.dev.0123abcd";
+        let program = Path::new("/t/aterm");
+
+        // Negative control: a real state directory works end to end.
+        let real = Paths {
+            state_dir: root.path().join("real-state"),
+            home: root.path().join("home"),
+            logs_dir: root.path().join("logs"),
+        };
+        crate::trouble::note_at(&real, "disk full", 10).expect("note real trouble");
+        assert_eq!(crate::trouble::read(&real).map(|t| t.since), Some(10));
+        crate::trouble::clear(&real);
+        assert_eq!(crate::trouble::read(&real), None);
+        crate::state::save_at(&real.state_file(), Mode::Off, now).expect("save real state");
+        assert_eq!(
+            crate::state::read(&real.state_file(), now).map(|s| s.mode),
+            Some(Mode::Off)
+        );
+        let held = crate::instance::Instance::try_hold(&real.lock_file())
+            .expect("hold real lock")
+            .expect("free");
+        assert_eq!(
+            crate::instance::running_pid(&real.lock_file()),
+            Some(std::process::id())
+        );
+        drop(held);
+
+        // Adversarial case: `state_dir` is a symlink to `outside` holding pre-existing files.
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).expect("outside");
+        std::fs::write(outside.join("acaffiene.trouble"), b"since=7\nwhy=keep\n")
+            .expect("seed outside trouble");
+        std::fs::write(outside.join("acaffiene.state"), b"mode=off\n").expect("seed outside state");
+        std::fs::write(outside.join("acaffiene.lock"), b"99999\n").expect("seed outside lock");
+        std::fs::write(outside.join("caffeine.bridge"), b"4242\n")
+            .expect("seed outside legacy bridge");
+        let aliased_state = root.path().join("aliased-state");
+        std::os::unix::fs::symlink(&outside, &aliased_state).expect("symlink state_dir");
+        let aliased = Paths {
+            state_dir: aliased_state,
+            home: root.path().join("aliased-home"),
+            logs_dir: root.path().join("aliased-logs"),
+        };
+
+        assert_eq!(crate::trouble::read(&aliased), None);
+        assert!(crate::trouble::note_at(&aliased, "spoof", 99).is_err());
+        crate::trouble::clear(&aliased);
+        assert_eq!(
+            std::fs::read(outside.join("acaffiene.trouble")).expect("outside trouble kept"),
+            b"since=7\nwhy=keep\n"
+        );
+
+        assert_eq!(crate::state::read(&aliased.state_file(), now), None);
+        assert!(crate::state::save_at(&aliased.state_file(), Mode::Forever, now).is_err());
+        for (_, res) in crate::state::sweep_temps(&aliased) {
+            assert!(res.is_err());
+        }
+        assert_eq!(
+            std::fs::read(outside.join("acaffiene.state")).expect("outside state kept"),
+            b"mode=off\n"
+        );
+
+        assert!(crate::instance::Instance::try_hold(&aliased.lock_file()).is_err());
+        assert_eq!(crate::instance::running_holder(&aliased.lock_file()), None);
+        assert_eq!(crate::instance::last_holder(&aliased.lock_file()), None);
+        assert_eq!(
+            std::fs::read(outside.join("acaffiene.lock")).expect("outside lock kept"),
+            b"99999\n"
+        );
+
+        assert!(crate::launchd::choose_startup(&aliased, label, program, false).is_err());
+        assert!(crate::launchd::choose_startup(&aliased, label, program, true).is_err());
+        assert!(!crate::launchd::startup_turned_off(&aliased, label));
+        assert!(!outside.join("acaffiene").exists());
+        let plist_swept = crate::launchd::sweep_plist_temps(&aliased);
+        assert_eq!(plist_swept.len(), 2);
+        for (_, res) in plist_swept {
+            assert!(res.is_err());
+        }
+
+        let app = root.path().join("Fake.app").join("Contents").join("MacOS");
+        std::fs::create_dir_all(&app).expect("fake bundle");
+        let exe = app.join("aterm");
+        std::fs::write(&exe, b"bin").expect("fake exe");
+        assert!(crate::code::prepare_copy(&exe, &aliased.code_dir(), label).is_err());
+        assert!(crate::code::discard_copies(&aliased.code_dir()).is_err());
+        assert!(!outside.join("acaffiene-code.noindex").exists());
+        assert_eq!(
+            std::fs::read(outside.join("caffeine.bridge")).expect("outside legacy bridge kept"),
+            b"4242\n"
         );
     }
 }

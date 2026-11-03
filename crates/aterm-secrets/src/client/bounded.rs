@@ -70,7 +70,7 @@ pub(super) fn sync_reader_with_candidates_until(
         let found = PeerDiscovery::selected(&peers);
         // A failed record server may still serve an envelope. Keep the ordinary reader's
         // independent pulls, but every subsequent operation still uses this same deadline.
-        let _ = sync_records_until(paths, None, &[], Some(&found), Some(deadline));
+        let _ = sync_records_until(paths, None, &[], Some(&found), Some(deadline), None);
     }
     network_refresh::run(paths, &config, |refresh| {
         let attempt =
@@ -111,23 +111,12 @@ pub(super) fn sync_reader_with_candidates_until(
             _ => false,
         };
         if !primary_advanced && let Some(pin) = config.signer.as_ref() {
-            let found: Vec<SyncPeerHead> = std::thread::scope(|scope| {
-                let handles: Vec<_> = peers
-                    .iter()
-                    .map(|url| {
-                        let config = &config;
-                        let subscriber = subscriber.as_deref();
-                        scope.spawn(move || {
-                            let left = budget(Some(deadline), PROBE_DEADLINE).ok()?;
-                            probe_sync_peer(paths, url, config, pin, left, subscriber)
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .filter_map(|h| h.join().ok().flatten())
-                    .collect()
-            });
+            let found: Vec<SyncPeerHead> = match budget(Some(deadline), PROBE_DEADLINE) {
+                Ok(left) => {
+                    probe_peers_for_sync(paths, &peers, &config, pin, left, subscriber.as_deref())
+                }
+                Err(_) => Vec::new(),
+            };
             let exact = before.digest.and_then(|digest| {
                 found
                     .iter()
@@ -194,33 +183,8 @@ fn probe_default_until(deadline: Instant) -> crate::Result<ProbeOutcome> {
         Err(error) if refused_by_local_network(&error) => return Err(error),
         Err(_) => Vec::new(),
     };
-    let urls =
-        crate::discover::candidate_urls(crate::ALAB_DEFAULT_URLS, &discovered, crate::ALAB_VAULT);
-    let outcomes: Vec<_> = std::thread::scope(|scope| {
-        let handles: Vec<_> = urls
-            .iter()
-            .map(|url| {
-                scope.spawn(move || {
-                    budget(Some(deadline), PROBE_DEADLINE).and_then(|left| probe(url, &pin, left))
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| Err(Error::new("vault probe thread panicked")))
-            })
-            .collect()
-    });
-    select_probed_outcome(urls.iter().zip(outcomes).map(|(url, outcome)| {
-        let origin = if crate::is_alab_default_url(url) {
-            ProbeOrigin::Default
-        } else {
-            ProbeOrigin::Discovered
-        };
-        (origin, outcome)
-    }))
+    let left = budget(Some(deadline), PROBE_DEADLINE)?;
+    probe_alab(&pin, &discovered, left, transport::look_within)
 }
 
 /// Join over exactly `expected`, sharing `deadline` across discovery, fetch, materialization,

@@ -109,7 +109,7 @@ is until you turn it on, and the sign-outs are left alone. Setup
 starts at once, with no countdown and nothing to confirm, whether or not anyone is at
 the Mac or an aterm window is in front, and after an update too. Only the steps that
 put something in front of you wait for you: the permission pages, the debugger
-question, the Command Line Tools password and the Messages and FaceTime sign-outs start
+question and the Messages and FaceTime sign-outs start
 while System State is in front and you are at the Mac (a key, click or trackpad used
 within the last minute, the screen unlocked), stop waiting when you lock the screen or
 step away, and go on when you come back. Once aterm finds the ALab signal before
@@ -125,7 +125,18 @@ the foot of the page.
 Closing the tab never cancels or holds setup: it goes on behind your tabs.
 System State remains available to rerun setup or to press Restore previous settings.
 Terminal and ssh sessions, -e commands, headless runs, private lab homes and utilities
-never start setup.
+never start setup by themselves. Your own `aterm pkg install` or `aterm pkg update` ends
+once it succeeds with `aterm init --no-wait --no-sign-out --no-profile` (no permission
+walk; the command keeps the package pass's exit status) when its input and its error
+output are both your terminal, it runs as you (not as root) in your own login and home
+(no private state root), and it is none of these: `--help` or `-h`, a Command Line Tools
+install, a program built into aterm, a pass a program waits behind (`--wait-lock`), or
+one that says `--no-init`. Type `--no-init` to skip it; an AI CLI's Install button,
+`aterm ai doctor` and `aterm ai login` pass it, since each installs as one step of its
+own. At this Mac's screen, until macOS has answered whether aterm may use the local
+network, that run leaves the look for the vault to System State or to an `aterm init` you
+type, so it never puts that question on screen; over ssh, where macOS asks nothing, it
+looks at once, as an `aterm init` you type there does.
 
 Setup choices:
   Caps Lock as Control; natural scrolling off; trackpad momentum scrolling on
@@ -169,21 +180,25 @@ are spent. It then stays Failed until something it waits on changes, you press C
 again or Set up now or make a choice, or aterm launches again; switching windows does not
 try it again. One only you can fix (a GitHub token to renew in the vault, Apple's Command
 Line Tools to install) reads Needs you with what to do. Apple's Command Line Tools install
-in a terminal tab titled Command Line Tools, which aterm opens by itself once for your
-account on this Mac and where you type your Mac password once; System State's Go to tab
-brings it to the front. While they install the GitHub repositories row waits calmly, and
-`git`, `cc`, `python3` and their kin in the shells aterm opens say the tools are on their
-way instead of raising Apple's install dialog, in a login shell whose profile reorders PATH
-too, and in a `bash -lc` or a script one of those shells starts (through `BASH_ENV`, after
-your own `BASH_ENV`, which comes back once the install ends) or a `fish -l` a fish tab starts.
-A `zsh -lc`, an interactive `bash -l` or `sh -l`, a fish started from another shell's tab and
-`pwsh -Login` get no such hook: their `git` is Apple's own and raises its dialog. A shell that
-ran one keeps working once they arrive: `git`, `cc` and the rest run through Apple's own
-`/usr/bin/<tool>` then, `xcrun` included, with the SDK it sets. Press Stop, or let the install
-end unfinished, or be on an account that may not install them, and new shells go back to
-Apple's own `git` at once, as does a shell that already had aterm's. The tab ends on one line
-that says they are installed, or why the install did not finish, and the card's Install
-Command Line Tools… opens it again. In Low Data Mode the row waits calmly and the tab opens
+early in the first launch, in a terminal tab titled Command Line Tools, which aterm opens by
+itself, in front, once per build for your account on this Mac (an update retries unfinished
+setup) and where you type your Mac password once; System State's Go to tab brings it to the
+front. Until they exist the GitHub repositories row waits calmly, and `git`, `cc`, `python3`
+and their kin, in the shells aterm opens, say so and exit instead of raising Apple's install
+dialog, whatever you press. For what those shells start with a PATH of its own (an agent's tool
+shell, a `zsh -lc`, a program that runs `/usr/bin/git` by its full path), aterm also names its
+own developer directory in `DEVELOPER_DIR` (never over your own), which Apple's `/usr/bin`
+programs follow; that this keeps their dialog away on a Mac without the tools is not yet
+measured. Apple's dialog can still come from a program with no aterm behind it (an app opened
+from Finder, the Dock or Spotlight, or by `open` in a tab, a login item, a launchd agent,
+another terminal app), one that empties its environment (`env -i`, `sudo`), one running as
+root, and one that sets its own `DEVELOPER_DIR`.
+A shell that ran one keeps working once they arrive: `git`, `cc` and the
+rest run through Apple's own `/usr/bin/<tool>` then, `xcrun` included, with the SDK it sets.
+The tab ends on one line that says they are installed, or why the install did not finish; an
+install that failed asks again at the next launch, one you stopped (a Ctrl-C, a closed tab)
+does not by itself on that build, and the card's Install Command Line Tools…
+opens it at once. In Low Data Mode the row waits calmly and the tab opens
 by itself once the mode is off; an account
 that is not one of the Mac's administrators is told so, with no Install…. When Apple's own
 installer window is open, System State asks you to finish there. `aterm init` asks for your
@@ -520,8 +535,12 @@ shells and agents outlive a crashed, killed or force-quit window. macOS only.
   aterm keeper start | stop | status | serve      (`aterm keeper --help` has the flags)
 
 STATUS & RESTORE
-  Opt in with `[keeper] enabled = true` in `aterm.toml` (read at launch) and start
-  one with `aterm keeper start` (a window never does). The keeper holds each
+  On by default: each window of an aterm.app that stays put starts the keeper if
+  none runs (a transient launchd job until logout, with no Background Items
+  notice); a copy opened inside the disk image or before macOS lets it leave
+  Downloads starts none, since its path goes away. Off is
+  `[keeper] enabled = false` in `aterm.toml` (read at launch), and `aterm keeper
+  stop` ends the one running. The keeper holds each
   terminal's screen, scrollback and turn-ledger journal in memory beside its master
   (never on disk; gone at logout or reboot). When aterm reopens after an unclean
   exit it reattaches the orphaned shells: `restore=exact`, `restore=screen` when
@@ -529,8 +548,8 @@ STATUS & RESTORE
   `restore=meta`, a blank screen, when no region was usable or the restore failed
   (`history_lost=` counts shed scrollback). A clean quit closes its terminals as
   usual; `stop` hangs up the shells only the keeper holds.
-  `serve` from an app bundle reopens the app after a crash, up to 3 times in a row
-  (after 0 s, 10 s, 60 s). A peer must be the same user and, by default, satisfy
+  The installed app's keeper (in /Applications or ~/Applications) reopens it after a crash, up to 3 times in a row
+  (after 0 s, 10 s, 60 s), and never after a quit. A peer must be the same user and, by default, satisfy
   this build's designated requirement; each dev tree has its own socket and label."#,
         ),
     },
@@ -753,8 +772,14 @@ LIMITS
 
 THE DOCTOR
   `aterm ai` prints one row per CLI and a health line (exit 0): what `aterm ai doctor`
-  fixes itself, then a `NEEDS YOU:` line for each sign-in no route of aterm's makes.
-  `aterm ai doctor` makes aterm's own fixes at a terminal or none, under an agent too:
+  tries itself, then a `NEEDS YOU:` line for each sign-in no route of aterm's makes.
+  A CLI nobody asked for here is a note with its `fix:`, never a FAIL, a `NEEDS YOU:`
+  line, an exception or an exit code: asked means the preferred CLI, named by `[ai.<id>]
+  use = true` or an `[ai] reviewers` list, a pinned pool row, or actually used here (a
+  review, a finished sign-in, a launch, a login in its default home). A roster row is
+  no ask, since the account sheet syncs those onto every Mac (`"asked"` in `--json`).
+  `aterm ai doctor` tries aterm's own fixes at a terminal or none, under an agent too,
+  and says why any did not finish:
   it installs a CLI that is not installed and signs in through accounts v2's or a
   CLI's pool's renewal where a row has an email and a route that runs with nobody at
   this Mac (a mailbox, or the row's own browser profile in a headless browser). With
@@ -762,8 +787,8 @@ THE DOCTOR
   waits for the window's upkeep after a failed sign-in or a bot check on record. A
   CLI's own sign-in, approved in a browser, a row no route signs in (its `fix:` names
   the step, e.g. `aterm harness accounts browser <label>` once), and any sign-in while
-  `[harness] logins = "off"`, it runs only for a person at the terminal. It exits 1
-  while one is signed out or not installed (`--read-only` only looks; `--on <host>,…`
+  `[harness] logins = "off"`, it runs only for a person at the terminal. It exits 1 while one someone asked for
+  is signed out or not installed (`--read-only` only looks; `--on <host>,…`
   or `--fleet` runs it on other machines over ssh for a person at a terminal).
   Where Claude Code's sign-in cannot start (accounts.toml refused or listing this
   machine's own login with no email, account records that cannot be read, or
@@ -822,6 +847,57 @@ CONFIGURATION — `[ai]` in `aterm.toml`
         body: None, // generated — see `init_page()`
     },
     Topic {
+        name: "email",
+        tagline: "headless email reads and incoming-mail updates",
+        body: Some(
+            r#"aterm email — read configured mail accounts without a window
+
+    aterm email session ACCOUNT [--folder ID] [--limit 1..100] [--timeout 1..3600]
+    aterm email accounts
+    aterm email connect-gmail ACCOUNT [--client-file FILE] [--timeout 1..300]
+    aterm email folders ACCOUNT
+    aterm email list ACCOUNT [--folder ID] [--limit 1..100]
+    aterm email read ACCOUNT MESSAGE_ID [--folder ID]
+    aterm email watch ACCOUNT [--folder ID] [--limit 1..100] [--timeout 1..3600]
+
+Output is JSON Lines. List and watch return headers; only read includes the body.
+Reading leaves unread flags unchanged. Watch first emits a snapshot, then changed
+snapshots and a final complete event at its deadline. Connection failures produce
+a reconnecting status; authorization refusals end the command. No mail is sent
+or deleted. --timeout bounds connection and mail operations (60 seconds by default).
+Errors include a retryable field; a false value ends automatic retries.
+
+connect-gmail explicitly runs one bounded headless OAuth enrollment. It uses
+aterm's own Google desktop client JSON at ~/.config/aterm/mail/google-client.json
+or --client-file, with private file permissions. It verifies a read-only Gmail
+connection before saving the encrypted offline grant. No token is printed.
+Reading mail never launches enrollment automatically.
+
+Session mode keeps one authenticated connection and accepts one JSON request per
+line on stdin. It returns a ready record, correlated replies, and a completion
+record on EOF or timeout. Its default lifetime is one hour. Example requests:
+
+    {"id":1,"command":"list","limit":10}
+    {"id":2,"command":"read","message_id":"MESSAGE_ID"}
+    {"id":3,"command":"wait","timeout":30}
+    {"id":4,"command":"select","folder":"FOLDER_ID"}
+    {"id":5,"command":"quit"}
+
+Other commands are folders and ping. Requests are bounded to 64 KiB; send/delete
+mail operations are not accepted. Each operation has a maximum 30-second budget;
+a wait also reserves five seconds for completing the notification exchange.
+Wait returns changed headers immediately if they differ from the prior snapshot,
+otherwise waits for a change. A failed connection is renewed on the next request;
+a refused renewal remains refused until a new session is started.
+
+Uses the native Proton transport and configured IMAP accounts, including Gmail
+app passwords and stored Google OAuth grants. Gmail uses IMAP IDLE notifications;
+Proton checks for changes every two seconds. Credentials come from aterm's
+configured mailbox routes and encrypted grants, never command-line passwords.
+"#,
+        ),
+    },
+    Topic {
         name: "secrets",
         tagline: "one credentials file for every machine: the vault, its server and ~/.secrets (status | join | sync | edit | password | approve | serve …)",
         body: Some(
@@ -841,12 +917,13 @@ CONFIGURATION — `[ai]` in `aterm.toml`
 DETAILS
 
   A vault Mac starts with `aterm secrets create http://127.0.0.1:7484/v1/<name> --serve`:
-  its server set up and answering, then the vault. The pinned default ALab vault admits
-  new Macs automatically from the home ALab LAN while open: a network where at least 3
-  fleet members proved themselves to the server's Mac in the last 10 minutes, never a
-  phone hotspot. Elsewhere, and at other vaults, a new Mac takes a member's Allow
-  (`aterm help members`): a person presses Allow and types the phrase it shows, and the
-  admin's subscriber admits that request. `aterm secrets password new` gives a vault a join
+  its server set up and answering, then the vault. A new Mac on the home ALab LAN joins
+  the pinned default ALab vault with nobody's Allow by proving itself to a member there:
+  the member's own network, where at least 3 fleet members proved themselves to that
+  member's Mac in the last 10 minutes, never a phone hotspot. A plain ask, from any
+  network and at any vault, takes a member's Allow (`aterm help members`): a person
+  presses Allow and types the phrase it shows, and the admin's subscriber admits that
+  request. `aterm secrets password new` gives a vault a join
   password, and `password off` leaves each machine to an Allow or an admin's code.
 
 HOW IT WORKS
@@ -877,8 +954,7 @@ VERBS
                   admins, rotate-key
   a server        serve, server on|off|status (`server on` returns once it answers)
   `watch` is the subscriber `agent on` installs; on an admin it also lets in machines
-  a member allowed, that type the join password, or that join the open default ALab
-  vault from the home ALab LAN. `agent off` records that
+  a member allowed or that type the join password. `agent off` records that
   choice, which setup keeps, and every install of the subscriber removes it. A path
   vault has no join queue: approve each key.
 
@@ -888,30 +964,35 @@ FILES
     },
     Topic {
         name: "members",
-        tagline: "Macs joining ALab: ask every member, Allow on any one, type the phrase it shows; any member removes (requests | allow | invite | ignore | join | status | list | remove | undo)",
+        tagline: "Macs joining ALab: a member on the home ALab LAN lets in a Mac that proves itself; elsewhere ask every member, Allow on any one, type the phrase it shows; any member removes (requests | allow | invite | ignore | join | status | list | remove | undo)",
         body: Some(
             r#"members — Macs joining ALab, and the members that let them in (macOS and Linux;
 `aterm members --help` has every verb). No member is a leader: any one lets a Mac in.
 
-  aterm members join                 a new Mac: find ALab on this network and ask every member
+  aterm members join                 a new Mac: find ALab on this network, prove this Mac
+                                     to its members, and ask every one where none let it in
   aterm members join <phrase>        type the phrase the member that allowed this Mac shows
   aterm members requests             on a member: the Macs asking that it hears
   aterm members allow <name>         on a member: show a phrase for that Mac on this screen
   aterm members list                 the members, and the Macs the vault removed
-  aterm members remove <name>        on a member: take that Mac out (--stolen: rotate
-                                     the fleet code and name what to rotate)
+  aterm members remove <name>        on a member: take that Mac out and rotate the
+                                     fleet code (--stolen: also deny-list it and name
+                                     what to rotate)
   aterm members undo [<name>]        on a Mac that member removed: its Undo rows; a
                                      person's press of one in the window signs a share
 
 HOW A MAC JOINS
   1. The new Mac runs `aterm members join` (install.sh runs `members join --no-wait`,
-     which asks, joins the ALab vault and starts this Mac's vault subscriber, which asks
-     again 1, 2, 4 and 8 minutes later and then every 15; the join System State and
-     `aterm init` make at the ALab vault asks the same way). It finds the members by
-     Bonjour on macOS (on Linux, name one:
-     `aterm members join --at <host>`), with no account and no password, and asks each
-     one at once on the fleet port's `ask` ALPN, the one op a caller without the fleet
-     secret reaches.
+     which also joins the ALab vault and starts this Mac's vault subscriber; the join
+     System State and `aterm init` make at the ALab vault does the same). It finds the
+     members by Bonjour on macOS (on Linux, name one: `aterm members join --at <host>`),
+     with no account and no password, on the fleet port's `ask` ALPN, the one op a
+     caller without the fleet secret reaches. It proves itself to them first, one after
+     another: a member on the home ALab LAN lets it in at once, with no row and nobody's
+     Allow, and the steps below never happen (with `[swarm] enabled = false` it proves
+     nothing). Only where none let it in does it ask each member at once. Until it is
+     in, its subscriber proves and asks again about half a minute later, then 1, 2, 4
+     and 8 minutes later and then every 15.
   2. Every member files it as one entry for later in its exceptions list, never an alert
      on screen: "New Mac calling itself <name>", with Allow beside it (from 4 asking
      Macs on, one entry for them all). The entry goes about 30 minutes after the Mac
@@ -941,8 +1022,8 @@ HOW A MAC JOINS
 HOW A MAC LEAVES
   Where the vault holds a membership log, any member removes a Mac, no admin needed:
   `aterm members remove <name>` (or Remove on its row) signs its removal, gives every
-  audience it was in a new key the rest hold, and lists what it could read, to rotate at
-  the provider where it was lost; `--stolen` also rotates the fleet code and prints one
+  audience it was in a new key the rest hold, rotates the fleet code, and lists what it
+  could read, to rotate at the provider where it was lost; `--stolen` also prints one
   NEEDS YOU: line. A removed Mac that asks again shows as "m12 was removed by m7 on
   Oct 30. Allow again?"; Allow again restores it. A Mac one member removed shows
   "m7 removed this Mac and 3 others. Undo m7's removals?": a quorum of the Macs that
@@ -1042,6 +1123,16 @@ WHAT IT IS
     every 6 h.
   * Recovery: retries transient API and overload errors, runs `/compact` on a context
     wall, renews expired logins, and relaunches a crashed agent on its conversation.
+    Under Cruise (the default) and Land (until its work lands), a Claude Code, Muse
+    Code or agy that ended when nobody asked (no person's or driver's keys within the
+    grace, no hold, no stop through `aterm ctl signal`) comes back too, its orderly end
+    on a signal from outside aterm included, once in 10 minutes; so a `kill` or
+    Activity Monitor's Quit is no stop: stop an agent in its tab (`/exit`), with the
+    Overview's Stop or `aterm ctl signal term`, or with Autopilot Off. A stop through
+    `aterm ctl signal` (any signal but `int`, `kill` included) is its asker's, never
+    relaunched whatever the end left behind. An end left that a program asked through
+    `aterm ctl signal`, that came again within 10 minutes, or whose owner could not be
+    read is recorded in Messages, the asker named; the record asks nothing.
   * Human grace: after a person types, clicks or scrolls, it holds off for
     `human_grace_s` (`status human_ms=`), but a permission box nobody has touched
     since it appeared, and a choice dialog that grants and spends nothing (a
@@ -1049,8 +1140,8 @@ WHAT IT IS
     last input, and an untouched box Claude Code will deny on a timer (`⚠ … deny
     this request in M:SS`) only until 15 s before the deny. While a hold stands (`hold=1`) or an external supervisor holds the lease
     (`supervisor=external`), the window only watches. A worker frozen past
-    `stall_term_after_s` (`input=stalled`) is warned about once, or restarted under
-    `stall_term = true`.
+    `stall_term_after_s` (`input=stalled`) is restarted, or warned about once under
+    `stall_term = false`.
   Every decision goes to the session's journal (`aterm drive ledger`) and the approval
   ledger (`aterm harness ledger`). An agent that supervises itself (codex-alab, on its
   proven claim) books each act it records (`meta set harness_act`) in that ledger as its
@@ -1076,7 +1167,7 @@ AUTOPILOT — how far the harness carries a session's work
     not make as it is); then the first again. Timed cruise (`meta set autopilot cruise
     until=+2h`, or `[harness] land_at = "18:00"`; chip: `keeps going until then,
     finding more to do`) switches to `land` at `land_at=`.
-  * land (`⤓ land`; chip: `wrapping up: landing everything on the remote main branch,
+  * land (`⤓`; chip: `wrapping up: landing everything on the remote main branch,
     then stopping`) — continues every turn end until the reply defends in a few lines
     starting `Nothing left:` that all of the work is on the remote main branch, leaving
     nothing open or for later, and `git` in the session's repository finds nothing
@@ -1089,7 +1180,9 @@ AUTOPILOT — how far the harness carries a session's work
     Land's next prompt quotes, asking it to resolve each issue it can; that answer given
     again stands, and Land holds on it, quoted; a `NEEDS YOU:` line alone is a need, and
     Land types nothing more until someone else's turn. `LANDED` over a clean `git` read marks
-    `task=landed` (`✓ landed`) and stops typing until someone else's turn; codex-alab
+    `task=landed` (`✓ landed`) and stops typing until someone else's turn; a worker's own
+    failed conclusion (`Could not finish: <why>`, or the same reply again with no work)
+    reads `task=failed` (`✕ failed`) and stops typing the same way; codex-alab
     lands by its own check. The session's journal says what that check read: under the
     landing's `DONE` note, a
     `RECEIPT` line names `HEAD` (12 hex digits), the remote main it is on, the
@@ -1107,7 +1200,7 @@ AUTOPILOT — how far the harness carries a session's work
             r#", they say so. A switch to `land` is acted on at
     once: within about a second when the agent is at rest, at its next turn end when it
     is mid-turn, never typed into a running turn.
-  * off (`○ off`; chip: `hands off`) — nothing is pressed or typed.
+  * off (`○`; chip: `hands off`) — nothing is pressed or typed.
 
   Task states (`status task=`): `open` (work goes on), `landed` (`LANDED` answered to
   the land check under `land`), `theirs` (`⤓ quiet`: under `land`, a person's own exchange
@@ -1245,8 +1338,9 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   autocompact_offer ["400k"]      answer Claude Code's autocompact offer (`"400k"`|`"off"`)
   relaunch [true]                 relaunch crashed agents on their conversation
   stall_term_after_s [600]        seconds before a frozen worker (`input=stalled`) is
-                                  warned about (0 = never)
-  stall_term [false]              restart a frozen worker at `stall_term_after_s` once
+                                  restarted (0 = never)
+  stall_term [true]               restart a frozen worker at `stall_term_after_s` once
+                                  (false: warn about it once)
   memory_ceiling [auto]           warn (and restart at idle under critical Mac memory
                                   pressure) past this footprint (`auto`, GiB, or `off`)
   upgrade [true]                  move idle sessions onto newer builds/models
@@ -1265,7 +1359,7 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                                   making progress) or for programs of its calls macOS's
                                   program check holds (once until none is held), whole
                                   or not at all, never on an answer (false: none)
-  stuck_break_note [false]        true: at a break of the agent's background work,
+  stuck_break_note [true]         at a break of the agent's background work,
                                   type that fact as one line of aterm's own, as often
                                   (Cruise or Land, with `facts` on)
 
@@ -1299,14 +1393,15 @@ THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
   tap        the status-line usage tap aterm adds to Claude Code relaunches
 
 THE FOOTER
-  A supervised tab's footer bar carries an Autopilot chip (`∞` cruise, `⤓ land`,
-  `✓ landed`, `⤓ quiet`, `○ off`, or `✋ you` while you hold it), context and usage
+  A supervised tab's footer bar carries an Autopilot chip (`∞` cruise, `⤓` land,
+  `✓ landed`, `⤓ quiet`, `○` off, or `✋ you` while you hold it), context and usage
   meters and status lights. `[claude_footer]` keys, each true by default, switch its
   extras: `usage` (the `Σ` working time and tokens), `acts` (what the harness just did,
   beside the chip), `card` (the decorated launch card, its line linking alab.systems,
   and the banners over Claude Code's update notice and startup announcement) and
   `agents` (the agents panel's colours). Clicking the chip moves Autopilot to its next
-  mode (Cruise, Land, Off, round again); a right-click (control-click on a Mac) opens
+  mode (Cruise, Land, Off, round again), its name shown after the glyph for a moment
+  (`⤓ land`); a right-click (control-click on a Mac) opens
   the Autopilot menu (Cruise, Land now, Off, a timed Cruise that then lands, Cancel
   landing while one is armed, and Harness settings…). `aterm ctl chrome` reports the
   chip as drawn (`face=`, `drawn=`, `spoken=`, `description=`; a debug build adds
@@ -1374,6 +1469,14 @@ WHAT IT IS
   vendor anchors.
   The first window launch runs `aterm pkg seed` and `aterm pkg update` by itself, and
   `aterm init` runs the same two (its `base.pkg.toolset` row) on a Mac with no window.
+  On macOS and Linux, an `install` or `update` you type finishes setup once it succeeds,
+  with `aterm init --no-wait --no-sign-out --no-profile`, and exits with the pass's own
+  status, when its input and its error output are both your terminal and it runs as you
+  (not as root) in your own login and home; `--help`, a Command Line Tools install, a
+  program built into aterm, a `--wait-lock` and `--no-init` (type it to skip setup) never
+  do. At a Mac's screen that run looks for the vault only once macOS has answered its
+  Local Network question; over ssh, where macOS asks nothing, it looks at once (see
+  `aterm help setup`).
 
 KEY USAGE (`aterm pkg --help` lists every verb, plumbing included)
   aterm pkg install --default-set
@@ -1465,7 +1568,7 @@ HOW IT WORKS & GOTCHAS
     },
     Topic {
         name: "agh",
-        tagline: "the GitHub client — reads, routed identities, JSON, typed exits",
+        tagline: "the GitHub client — reads and writes, routed identities, JSON, typed exits",
         body: None, // generated — see `agh::cli::help::manual()`
     },
     Topic {
@@ -1777,11 +1880,23 @@ GOTCHAS
 
 WHAT HAPPENS
   An agent's shell tool runs commands with no controlling terminal, so a bare
-  `sudo` there cannot read a password and fails ("a terminal is required").
-  For uncontained sessions launched from a macOS aterm bundle, aterm supplies
-  its askpass helper (`SUDO_ASKPASS`) unless a separate helper is already set.
-  A no-terminal `sudo` can then raise a password sheet on that session's tab.
-  The operator types the password; the helper delivers it to sudo's pipe.
+  `sudo` there cannot read a password. For root in such a shell run
+
+      aterm ctl sudo -- <command> [args...]
+
+  aterm starts `/usr/bin/sudo -k -A` itself on those exact words, with your
+  stdin, stdout, stderr and directory, and raises a password sheet on your tab
+  showing them. The operator types the password; it authorizes that one command.
+  You get the command's output and exit code (128+n for a signal). A program name
+  is found on your PATH. Your environment is not passed: the command gets sudo's
+  own, so name a variable with `/usr/bin/env VAR=value <command>`. For several
+  commands, run a script as the one command.
+
+  A plain `sudo` is refused with no sheet (`ERR askpass refused
+  command-unreadable`): the sheet must show exactly what runs, and macOS withholds
+  the arguments of a sudo aterm did not start (measured on macOS 26.6:
+  KERN_PROCARGS2 answers EINVAL, and `ps` joins the words with spaces, so `a b` and
+  `a` `b` read alike). `aterm ctl sudo` needs no such read, because aterm chose them.
 
 FOR AN AGENT
   * The password is the operator's to type, on the sheet. Never ask for it in
@@ -1792,12 +1907,14 @@ FOR AN AGENT
   * The sheet waits up to 5 minutes, longer than a shell tool's default
     2-minute command timeout. Give a sudo command a longer timeout (300000 ms
     or more), or it is backgrounded before the operator answers.
-  * Cancel on the sheet, not Esc in the agent, stops a pending sudo.
-  * `-A` is not needed, and it skips Touch ID.
+  * Ending the `aterm ctl sudo` call (Esc, a tool timeout) withdraws its sheet
+    and sends the command SIGTERM; a command that ignores SIGTERM runs on as
+    root to its own end. Cancel on the sheet declines the password.
   * The sheet attaches only while the session shows in its window's active
     tab: from a background tab (a spawned worker's), while another sheet is
-    open, or soon after a cancel, sudo is refused at once with no sheet, and
-    aterm never switches tabs to show one.
+    open, or soon after a cancel, sudo is refused at once with no sheet
+    (`not-frontmost` from a background tab), and aterm never switches tabs to
+    show one.
   * `sudo -n` never prompts, so it raises no sheet: it runs only where sudo
     needs no password (a cached credential, a NOPASSWD rule) and fails at once
     elsewhere.
@@ -1807,13 +1924,9 @@ FOR AN AGENT
 
 WHAT IT IS NOT
   `sudo` does not lift a privacy-consent wall (`aterm help permissions`).
-  A direct `sudo lldb` (or `debugserver`, `gdb`, `dtrace`) is refused with no
-  sheet (`ERR askpass refused debugger-as-root`); so is a command whose exact
-  kernel argv cannot be read, or that carries a sudo option aterm does not know
-  (`ERR askpass refused command-unreadable`). macOS may withhold a setuid-root
-  sudo's argv, and then every request is refused this way; the `ps` line is
-  never taken as the command. Only the direct target is judged: a shell or
-  wrapper can run anything.
+  A direct debugger target (`lldb`, `debugserver`, `gdb`, `dtrace`) is refused with
+  no sheet (`ERR sudo refused debugger-as-root`). Only the direct target is judged:
+  a shell or wrapper can run anything, and the sheet says so.
   The owner turns the relay off in Settings ▸ Security (which asks them to
   confirm, and no control verb can answer), or with the marker file
   `askpass-off` in aterm's state dir; every request then answers `ERR askpass
@@ -2119,7 +2232,9 @@ fn overview_page() -> String {
                 "run a command with authenticated per-tab resource ownership"
             }
             crate::Verb::Pkg => "install / update / verify the toolchain",
-            crate::Verb::Agh => "GitHub reads for agents: routed identities, JSON, typed exits",
+            crate::Verb::Agh => {
+                "GitHub for agents: reads and writes as routed identities, JSON, typed exits"
+            }
             crate::Verb::Fleet => {
                 "a LAN fleet's membership (init | join | peers | allow | publish | sync | census \
                  | leave); `ctl --host` drives where allowed"
@@ -2163,17 +2278,21 @@ fn overview_page() -> String {
                  (status | join | sync | edit | password | approve | serve)"
             }
             crate::Verb::Members => {
-                "Macs joining ALab: ask every member, Allow on any one, type its phrase \
-                 (requests | allow | invite | ignore | list | remove | undo | join | status)"
+                "Macs joining ALab: prove to a member on the home ALab LAN, else ask every \
+                 member, Allow on any one, type its phrase (requests | allow | invite | ignore \
+                 | list | remove | undo | join | status)"
             }
             crate::Verb::Db => {
                 "encrypted embedded application databases: offline edits, direct LAN replication, accounts and budget rights"
+            }
+            crate::Verb::Email => {
+                "read email headlessly (accounts | folders | list | read | watch), JSON Lines"
             }
             crate::Verb::Harness => {
                 "Claude Code's spend, limits and accounts, disk, ledger; `upgrade` (the window supervises)"
             }
             crate::Verb::Keeper => {
-                "the PTY keeper: shells that outlive a crashed window (start | stop | status | serve; macOS, opt-in)"
+                "the PTY keeper: shells that outlive a crashed window (start | stop | status | serve; macOS)"
             }
             crate::Verb::Acaffiene => {
                 "the menu-bar keep-awake mug: a click keeps this Mac awake (on | off | status | startup | quit; macOS)"
@@ -2248,7 +2367,7 @@ fn sys_page() -> String {
         );
     }
     s.push_str("AUTHORIZED CPU POLICY DIAGNOSTICS (macOS)\n  aterm ctl @self sys policy status --json reads operation status without prompting. sys policy collect requests one bounded, read-only collection of Game Mode, CarPlay and runaway-mitigation flags through aterm's own password sheet; focus the requesting tab. sys policy cancel requests cancellation. Repeated requests cannot launch another operation until the exact collector and pipe readers have drained. sys report --json includes per-PID generation, per-selector values/errors, actual collector euid, observation window and coverage; a zero-hit census is not an atomic global all-clear or a hardware diagnosis. No automatic reboot or policy change.\n\n");
-    s.push_str("SCHEDULING\n  sys procs reports Darwin nice, target application and requested-background bits, suppression, application role and lifetime CPU nanoseconds by QoS; zero/false are measured values, and refusal, unsupported and OS errors remain distinct. sys cores/procs/why show cluster occupancy and flag runnable wait with idle performance cores only across aligned nominal sampling windows. Unchanged core counters leave current utilization unavailable; a held drawing value is not a new measurement. This is an observation, not proof of which cores a worker used or why it waited. nice=0/background=false do not rule out a QoS ceiling. For a deliberate macOS policy change, taskpolicy -a must wrap the actual worker exec: an outer wrapper's role does not survive fork, and -B only clears Darwin backgrounding. Preserve loader environment and job ownership, and measure counter deltas and the result.\n\n");
+    s.push_str("SCHEDULING\n  sys procs reports Darwin nice, target application and requested-background bits, suppression, application role and lifetime CPU nanoseconds by QoS; zero/false are measured values, and refusal, unsupported and OS errors remain distinct. A process row's cpu_mc covers only its own interval CPU, not its children's work. JSON cpu_accounting keeps exact decimal-string cumulative self and reaped-descendant CPU, counter timestamp, process identity and automatic-reaping flag; sys report retains these with anomaly frames after workers exit. Compare counters only for the same process generation. Do not add reaped-child CPU to the row's rate: it can overlap observed children, and Darwin automatic reaping can charge it twice. QoS counters are lifetime CPU by class, not core residency. sys cores/procs/why show cluster occupancy and flag runnable wait with idle performance cores only across aligned nominal sampling windows. Unchanged core counters leave current utilization unavailable; a held drawing value is not a new measurement. This is an observation, not proof of which cores a worker used or why it waited. nice=0/background=false do not rule out a QoS ceiling. For a deliberate macOS policy change, taskpolicy -a must wrap the actual worker exec: an outer wrapper's role does not survive fork, and -B only clears Darwin backgrounding. Preserve loader environment and job ownership, and measure counter deltas and the result.\n\n");
     s.push_str("THIS MACHINE (read now)\n");
     let clusters: Vec<String> = layout
         .clusters
@@ -2654,19 +2773,21 @@ PROVISION — make this machine able to publish
       An audit that writes nothing: the roster, the Trust toolchain and verifiers,
       rustup, Apple's packaging tools, the Developer ID identity, a live-tested
       notary credential, the channel token, and the layers a release host stands
-      on (the base layer, `targo --unverified verify provision`, the publication
-      engine, the site checkout and its firebase.json, and a readable deployer key
-      for the site, which deploys over Firebase Hosting's REST API with no node or
-      firebase-tools). It names every gap with its fix and exits non-zero while
-      one is open.
+      on (the base layer, `targo --unverified verify provision --release`, the
+      publication engine, the site checkout and its firebase.json, and a readable
+      deployer key for the site, which deploys over Firebase Hosting's REST API
+      with no node or firebase-tools). It names every gap with its fix and exits
+      non-zero while one is open.
   aterm ship provision --id <machine-id>
       The same checks, acquiring what `--check` only reports: it runs `targo
-      --unverified verify provision`, lays rustup's `trust` link, asks before
-      spending one of the five Developer ID slots, and runs `notarytool
-      store-credentials` (it prompts for the app-specific password). Only on a clean
-      pass does it mint the machine's key, asking for the paper master phrase: a
-      roster id is never spent on a machine that cannot release, and keys are never
-      copied between machines.
+      --unverified verify provision --release`, builds this checkout's
+      source-signing helper, lays rustup's `trust` link, asks before spending
+      one of the five Developer ID slots, and runs `notarytool store-credentials`
+      (it prompts for the app-specific password). Once the independent
+      prerequisites pass, it can mint the machine's key, asking for the paper
+      master phrase. Keys are never copied between machines. The final
+      source-signing audit runs after the identity and its signed roster are in
+      place. An existing identity is reused.
 
 CUT — from a clean clone of the dev repo on main, never the shared checkout
   targo --unverified ship release --dry-run --bump --mac-only   the plan and every refusal
@@ -2675,6 +2796,11 @@ CUT — from a clean clone of the dev repo on main, never the shared checkout
       A cut must say --mac-only or --linux-artifacts <dir>. It builds from git
       objects, runs every step itself, asks the owner once for what only they can
       give, and ends in one line.
+  targo --unverified ship release status [--json]
+      Read this release clone's current or latest run without starting a cut.
+      Shows its stage, release and verification logs, latest progress and first
+      reported failure. JSON also carries source and journal binding. Run this
+      in the clone doing the release; a separate clone has its own journal.
   targo --unverified ship release --abandon vX.Y.Z
       withdraws a claimed, unpublished cut (the claim commit stays).
 
@@ -2869,6 +2995,8 @@ KEY USAGE (`aterm ctl help <verb>` has every flag)
   aterm ctl @<sid> task      the task record (`state=`, `rev=`, `from=`, `result_bytes=`)
   aterm ctl @<sid> turn typed=1 settle=submitted '<one line>'
                              a follow-up prompt; it returns `task_rev=<n>` once submitted
+                             (`id=` is the turn/history ID, not a shell block ID; a verified
+                              shell submit's optional `block=` feeds `blocktext`).
                              (`submit_by=` says what showed it: `claim` is a codex-alab's
                              own report), then wait on `await task @<sid>:<n>`
   aterm ctl @<sid> signal term
@@ -2899,8 +3027,13 @@ ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>`, or `--all`, on `<h>
   `m<N>` in it (`m27` of `MacbookAir-m27-…`, never a chip's `M5`). A short name two Macs
   answer to is refused, naming both; a word no peer answers to is refused, except by
   `survey --host`, which looks it up as a host.
-  aterm ctl --host <h> spawn agent=<word> [model=<m>] [cwd=<abs-path>] - < task
-  aterm ctl --host any spawn agent=<claude|codex> [model=<m>] [cwd=<abs-path>] - < task
+  aterm ctl --host <h> spawn agent=<word> [model=<m>] [autopilot=land|cruise]
+                       [cwd=<abs-path>] - < task
+                             the worker's Autopilot is named here alone: a drive serves
+                             no `meta`, so `meta set autopilot` runs on that Mac; each
+                             refusal names the word it refused
+  aterm ctl --host any spawn agent=<claude|codex> [model=<m>] [autopilot=land|cruise]
+                         [cwd=<abs-path>] - < task
                              one survey of every member picks the Mac: of those that let
                              this Mac drive them and have an enrolled, unwalled account of
                              that program, one read working before an unseen one, then the
@@ -2915,7 +3048,8 @@ ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>`, or `--all`, on `<h>
   aterm ctl --host <h> @<w> result | status | text | screen
   aterm ctl --host <h> @<w> turn [settle=submitted] '<line>' | key <k> | send <text>
   aterm ctl --host <h> hold <w> on|off   (<w> bare: no @)
-  aterm ctl --host <h> @<w> close
+  aterm ctl --host <h> @<w> close   (or `close <w>`): its own worker, even after that Mac's
+                             aterm updated, or its own plain shell no person has touched
 
 THE SURVEY & CHANNELS
   aterm ctl survey [--budget <chars> | [--json] [--sid <s>]]
@@ -2943,6 +3077,10 @@ THE SURVEY & CHANNELS
 GOTCHAS
   * Hand over a task with `spawn agent=… -`, never by typing a `turn` into someone
     else's session.
+  * `conclusion=` on `await task` and `task` says how a worker ended: `finished`, or
+    `failed` with `why=` (`could-not-finish`, a reply whose first line starts `Could not
+    finish: <why>`; `exit`, before it finished; `off`, a person; `off-ctl`, a manager or a
+    script; `expired`; `repeated`; a stall, until it moves).
   * `done` means a clean `Nothing left:` defense, a `git` check that found nothing left
     to land where it could read, and `LANDED` answered to the land check (codex-alab runs
     its own; `aterm help harness` names where the check cannot read); `checked=` on
@@ -3287,6 +3425,13 @@ WHAT IT IS
   join and shares its book on every read, so the fleet needs no machine in particular.
 
 MEMBERSHIP
+  Normal ALab setup joins the signed default fleet automatically once its
+  code is available from the vault. Members may read and drive each other
+  by default. Explicit access restrictions, a different manually joined
+  fleet, and a previous `leave` are preserved. Use `aterm fleet peers` or
+  `aterm ctl survey --fleet` to inspect the current state; no per-machine
+  `init` or `join` command is needed for the normal ALab setup.
+
   Default fleet joining chooses this machine's LAN address and reserves a free
   listener port automatically. Its stable temporary name is node-<node-id>.
   `aterm fleet name` shows the name and alias; `aterm fleet name set m62` assigns
@@ -3294,8 +3439,9 @@ MEMBERSHIP
   membership entries. Conflicting primary names refuse ambiguous lookups;
   the permanent node aliases continue to work.
 
-  `aterm fleet init` on the first machine mints the secret, writes the join code (the
-  secret alone) to a 0600 file and prints that file's path (never the code), and sets
+  For a separate, manually configured fleet, `aterm fleet init` on the first
+  machine mints the secret, writes the join code (the secret alone) to a 0600
+  file and prints that file's path (never the code), and sets
   `[fleet]` (port 7100). `aterm fleet join` on each other machine reads the code from
   stdin, `--code-file F` or a hidden prompt, never an argument, and joins through the
   member `--at <host[:port]>` names, the place a vault's code names, a member its book
@@ -3306,14 +3452,15 @@ MEMBERSHIP
   this machine's own listener, writing nothing); `leave` removes the fleet secret, the join code, both
   books and `[fleet]`'s listen, allow and drive_from (the node id and node key stay).
   `aterm fleet sync [--on]` joins the signed default ALab fleet, or its newer code from
-  the default fleet this machine is in, keeping the level set here; its first join lets
+  the default fleet this machine is in (a rotated secret of that fleet it takes in
+  place, book and grants kept), keeping the level set here; its first join lets
   every member drive this machine (`drive_from = ["*"]`, a vault admin's too), and it
   leaves a fleet joined by hand to another code, one minted here, and a key it cannot
   read as they are.
   `aterm fleet publish`, run by an ALab vault admin where the code was minted,
-  publishes its join code to every current and future ALab member. A `leave` in a fleet
-  writes `<state>/fleet-off`, which keeps sync off until `sync --on` or a join here (an
-  init keeps it).
+  publishes its join code to every current and future ALab member. A `leave`, in a fleet
+  or not, writes `<state>/fleet-off`, which keeps sync off until `sync --on` or a join
+  here (an init keeps it).
 
 READING & DRIVING ACROSS THE FLEET
   aterm ctl survey --fleet
@@ -3321,7 +3468,8 @@ READING & DRIVING ACROSS THE FLEET
   aterm ctl survey --host <host|short name|node|address> [--sid <s>]
                        one peer machine (or one session's excerpts)
   Levels (`[fleet] allow`; `--allow` on init and join sets `facts` or `content`):
-  * `facts` (default) — programs, agent states, redacted roles, task records, models.
+  * `facts` (manual init/join default) — programs, agent states, redacted roles,
+    task records, models.
   * `content` — `facts` plus titles, cwds, prompts, recent agent words and shell lines.
   * `drive` — `content`, and the nodes `aterm fleet allow drive --from` names (bound by
     node key), or with `--all` (the `"*"` grant) every member this machine's membership
@@ -3485,10 +3633,9 @@ fn rust_page() -> String {
         rust_toolchain_row(pinned.as_deref(), rustup_env.as_deref())
     );
     let cargo_cfg = cwd.as_ref().map(|d| d.join(".cargo/config.toml"));
-    match cargo_cfg
-        .as_deref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-    {
+    match cargo_cfg.as_deref().and_then(|p| {
+        aterm_uds::atomic_file::read_regular_text(p, aterm_uds::atomic_file::MAX_CONFIG_BYTES).ok()
+    }) {
         Some(cfg) => {
             let live: Vec<&str> = cfg
                 .lines()
@@ -4014,10 +4161,13 @@ fn rustc_movers(
         if !seen.insert(file.clone()) {
             continue;
         }
-        if let Some(value) = std::fs::read_to_string(&file)
-            .ok()
-            .as_deref()
-            .and_then(build_rustc_in)
+        if let Some(value) = aterm_uds::atomic_file::read_regular_text(
+            &file,
+            aterm_uds::atomic_file::MAX_CONFIG_BYTES,
+        )
+        .ok()
+        .as_deref()
+        .and_then(build_rustc_in)
         {
             found.push((format!("build.rustc in {}", file.display()), value));
         }
@@ -4397,10 +4547,9 @@ fn resolve_from(found: PathBuf) -> OnPath {
     let mut shims = Vec::new();
     let mut at = found.clone();
     while shims.len() < MAX_SHIM_HOPS {
-        let small = std::fs::metadata(&at).is_ok_and(|m| m.is_file() && m.len() <= MAX_SHIM_BYTES);
-        let Some(script) = small
-            .then(|| std::fs::read(&at).ok())
-            .flatten()
+        let Some(script) = aterm_uds::atomic_file::read_regular(&at, MAX_SHIM_BYTES)
+            .ok()
+            .map(|(bytes, _)| bytes)
             .filter(|bytes| bytes.starts_with(b"#!"))
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .as_deref()
@@ -4832,7 +4981,9 @@ fn push_macos_walls(s: &mut String) {
          file access may differ from a fresh tab's: open a new tab. Full page: `aterm help\n  \
          permissions`.\n  \
          This Mac's setup (its grants, the vault, the repositories) is `setup=` in `aterm ctl\n  \
-         @self status` (`done`, or `pending:fda,devtools,…`): reading it changes nothing, where a\n  \
+         @self status` (`done`, `done;asking:vault` while a run still asks by itself, or \
+         `pending:fda,devtools,…`; `;offered:…` names macOS grants on offer, which nothing waits \
+         for): reading it changes nothing, where a\n  \
          bare `aterm doctor` repairs and can open System Settings in front of the person.\n",
         protected_folder_names(),
     );
@@ -4945,6 +5096,12 @@ A PERSON — HALT, READ AND ANSWER AS YOURSELF
   aterm fabric inbox --cap-file <cap> [--peek]
   aterm fabric post --cap-file <cap> to=@<sid>@<node> kind=answer re=<off> <text>
   aterm link notify --fleet <F> --broker <ep> --cap-file <cap> --on ask:h-<you> --exec <cmd>
+  A cap is its holder: every `--cap-file` is a regular file of yours at 0600 or tighter
+  (`--out` writes it so; `mint-for` to stdout leaves the file to you). A wider one, a
+  symlink or a FIFO is refused at once, naming the file and the `chmod` where one closes it.
+  Supervised and observer startups use the same rule. A private folder does not exempt the
+  file, and startup does not change its permissions. `aterm fabric on` leaves refused or
+  unreadable rings intact, including in a dry run. `aterm fabric doctor` names the refusal.
 
 IS IT ON HERE? (`aterm fabric help` has every flag)
   aterm fabric                  the status report: config, broker, nodes, bridges,

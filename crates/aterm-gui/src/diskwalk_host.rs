@@ -2273,7 +2273,7 @@ impl crate::App {
                 }
                 tabs.push(TabFacts {
                     key: view.session,
-                    label: format!("Tab {}", i + 1),
+                    label: self.tab_name(tab, i),
                     shell_pid: pid,
                     reported_cwd: self
                         .session_reported_cwd(view.session)

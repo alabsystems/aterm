@@ -223,7 +223,7 @@ pub(crate) trait AppRt {
         toolbar::read_tab_menus(handle)
     }
 
-    /// Show a native modal confirmation for a destructive quit/close gesture and block until the user answers.
+    /// Ask before a menu action changes state, returning `None` when UI is unavailable.
     fn confirm(&self, title: &str, body: &str, proceed_label: &str) -> Option<bool>;
 
     /// [`Self::confirm`] for an owner gesture that ends something, FAIL CLOSED (Stop Worker's sheet): its default button is Cancel and the destructive button takes only a click, so a Return the person was typing elsewhere never says yes.
@@ -231,7 +231,7 @@ pub(crate) trait AppRt {
         None
     }
 
-    /// Register the whole-app quit confirmation for AppKit `terminate:` gestures that bypass the application menu's Quit item: the Dock-icon "Quit", AppleScript `quit`, and logout/restart/shutdown. macOS wires winit's synchronous `applicationShouldTerminate:` to a typed event-loop deferral, where `App` runs the same dialog and document-durability barrier as ⌘Q.
+    /// Register the whole-app quit confirmation for AppKit `terminate:` gestures that bypass the application menu's Quit item: the Dock-icon "Quit", AppleScript `quit`, and logout/restart/shutdown. macOS wires winit's synchronous `applicationShouldTerminate:` to a typed event-loop deferral, where `App` runs the same in-window question and document-durability barrier as ⌘Q.
     fn install_quit_confirm(&self);
 
     /// Query the OS motion preference. macOS reads `NSWorkspace.accessibilityDisplayShouldReduceMotion`.
@@ -709,7 +709,7 @@ impl AppRt for AppRtMacOS {
     }
 
     fn confirm(&self, title: &str, body: &str, proceed_label: &str) -> Option<bool> {
-        Some(menu::confirm(title, body, proceed_label))
+        menu::confirm(title, body, proceed_label)
     }
 
     fn confirm_owner(&self, title: &str, body: &str, proceed_label: &str) -> Option<bool> {

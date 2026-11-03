@@ -78,6 +78,8 @@ pub const RULE_LIMIT_RESET: &str = "limit-reset@v1";
 pub const RULE_AUTOCOMPACT_OFFER: &str = "autocompact-offer@v1";
 /// Claude Code's auto-mode environment offer ([`auto_mode_setup`]).
 pub const RULE_AUTO_MODE_SETUP: &str = "auto-mode-setup@v1";
+/// Claude Code's `Claude in Chrome` intro ([`chrome_intro`]).
+pub const RULE_CHROME_INTRO: &str = "chrome-intro@v1";
 /// A disk-free worker's fence ([`ApprovalCtx::disk_worker`], design
 /// `docs/DESIGN-disk-free-ask-2026-10-24.md` §8.4): a Bash box whose every command is a read or
 /// `aterm harness disk` ([`crate::harness::disk::fence::runs_harness_disk`]) is approved under
@@ -968,8 +970,9 @@ fn claim_action(p: &PromptV2, choice: &Choice) -> Result<(), String> {
 
 /// The tool boxes an agent raises for a call it makes: the boxes a disk-free worker's fence
 /// decides ([`disk_fence`]). A question, the folder-trust dialog, and the dialogs about the
-/// session (a usage limit, a model switch, the autocompact and auto-mode offers, an MCP server,
-/// a held message, one of no kind aterm reads) are left to their own rules.
+/// session (a usage limit, a model switch, the autocompact and auto-mode offers, the Claude in
+/// Chrome intro, an MCP server, a held message, one of no kind aterm reads) are left to their own
+/// rules.
 const fn fenced(kind: PromptKind) -> bool {
     match kind {
         PromptKind::Bash
@@ -998,6 +1001,7 @@ const fn fenced(kind: PromptKind) -> bool {
         | PromptKind::AutocompactOffer
         | PromptKind::McpServer
         | PromptKind::AutoModeSetup
+        | PromptKind::ChromeIntro
         | PromptKind::Other => false,
     }
 }
@@ -1155,6 +1159,19 @@ fn decide_unfenced(
             auto_mode_setup(prompt, rows)
         };
         return decided_at(trace, "auto-mode-setup", decision);
+    }
+    if let Some(prompt) = reading.prompt.as_ref()
+        && prompt.kind == PromptKind::ChromeIntro
+    {
+        let decision = if !draws_claude_boxes(reading.program)
+            || reading.phase != Phase::Prompt
+            || !reading.phase_authoritative
+        {
+            Decision::escalate("no Claude in Chrome intro the reader vouches for")
+        } else {
+            chrome_intro(prompt, rows, ctx)
+        };
+        return decided_at(trace, "chrome-intro", decision);
     }
     if let Some(prompt) = reading.prompt.as_ref()
         && draws_claude_boxes(reading.program)
@@ -5082,6 +5099,39 @@ fn auto_mode_setup(prompt: &PromptV2, rows: &[String]) -> Decision {
         choice: Choice::Digit(n),
         guard: row_guard(title_row),
         subject: format!("{}{SUBJECT_OPTION}{}", prompt.title, later.label),
+        unproven: None,
+    }
+}
+
+/// Claude Code's `Claude in Chrome` intro (2.1.317), confirmed with its footer's Enter at `safe`
+/// and `all`. Claude Code draws it, before its REPL, only in a session started with Claude in
+/// Chrome on (as `--chrome` turns it on), so the person who started it asked for what it
+/// introduces; it offers nothing to choose. Its Esc is no refusal: in 2.1.317 Enter and Esc both
+/// call the dialog's `onDone`, the intro has recorded itself shown when it was drawn, and Chrome
+/// stays on for the session either way, so confirming dismisses it and changes nothing else.
+/// Enter is the answer the dialog names. Under `approve = "none"` the person's configuration keeps
+/// every box theirs, this one included.
+fn chrome_intro(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
+    if ctx.approve == Approve::None {
+        return Decision::escalate(
+            "approve = \"none\": the Claude in Chrome intro is the owner's to confirm",
+        );
+    }
+    let Some(confirm) = prompt.chrome_intro_confirm() else {
+        return Decision::escalate("a Claude in Chrome intro not read whole");
+    };
+    // The title's first row: a narrow pane wraps the title under it.
+    let Some(title_row) = rows.get(prompt.span.0) else {
+        return Decision::escalate("the Claude in Chrome intro's title is not on the screen");
+    };
+    Decision::Approve {
+        rule_id: RULE_CHROME_INTRO,
+        choice: Choice::Focus {
+            steps: 0,
+            label: confirm.label.clone(),
+        },
+        guard: row_guard(title_row),
+        subject: format!("{}{SUBJECT_OPTION}{}", prompt.title, confirm.label),
         unproven: None,
     }
 }

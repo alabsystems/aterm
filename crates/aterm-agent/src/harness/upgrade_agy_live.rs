@@ -590,7 +590,7 @@ fn simple_commands(line: &str) -> Vec<Vec<String>> {
     let mut word = String::new();
     let mut nest: Vec<Nest> = Vec::new();
     let mut escaped = false;
-    let mut chars = line.chars().peekable();
+    let mut chars = line.chars();
     while let Some(ch) = chars.next() {
         if escaped {
             word.push(ch);
@@ -607,19 +607,30 @@ fn simple_commands(line: &str) -> Vec<Vec<String>> {
         }
         let quoted = top == Some(Nest::Double);
         match ch {
-            '\\' => escaped = true,
+            '\\' => {
+                if chars.as_str().starts_with('\n') {
+                    chars.next();
+                    continue;
+                }
+                if chars.as_str().starts_with("\r\n") {
+                    chars.next();
+                    chars.next();
+                    continue;
+                }
+                escaped = true;
+            }
             '"' if quoted => {
                 nest.pop();
             }
             '"' => nest.push(Nest::Double),
             '\'' if !quoted => nest.push(Nest::Single),
-            '$' if chars.peek() == Some(&'(') => {
+            '$' if chars.as_str().starts_with('(') => {
                 word.push(ch);
                 word.extend(chars.next());
                 nest.push(Nest::Paren);
                 continue;
             }
-            '$' if chars.peek() == Some(&'{') => {
+            '$' if chars.as_str().starts_with('{') => {
                 word.push(ch);
                 word.extend(chars.next());
                 nest.push(Nest::Brace);
@@ -658,27 +669,61 @@ fn simple_commands(line: &str) -> Vec<Vec<String>> {
     commands
 }
 
-/// The name a word assigns (`NAME=…`, its name unquoted), or `None`.
-fn assigned_name(word: &str) -> Option<&str> {
-    let (name, _) = word.split_once('=')?;
+fn is_env_name(name: &str) -> bool {
     let mut bytes = name.bytes();
-    let first = bytes.next()?;
-    ((first.is_ascii_alphabetic() || first == b'_')
-        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_'))
-    .then_some(name)
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The name a word assigns (`NAME=…`, with an unquoted `=` and its name unquoted), or `None`.
+fn assigned_name(word: &str) -> Option<String> {
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    let mut eq_at = None;
+    for (idx, ch) in word.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !single => escaped = true,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '$' | '`' if !single => return None,
+            '=' if !single && !double => {
+                eq_at = Some(idx);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let lhs = unquoted(&word[..eq_at?]);
+    is_env_name(&lhs).then_some(lhs)
 }
 
 /// `word` with its quotes and escapes taken off.
 fn unquoted(word: &str) -> String {
     let mut out = String::new();
     let (mut single, mut double, mut escaped) = (false, false, false);
-    for ch in word.chars() {
+    let mut chars = word.chars();
+    while let Some(ch) = chars.next() {
         match ch {
             _ if escaped => {
                 out.push(ch);
                 escaped = false;
             }
-            '\\' if !single => escaped = true,
+            '\\' if !single => {
+                if chars.as_str().starts_with('\n') {
+                    chars.next();
+                } else if chars.as_str().starts_with("\r\n") {
+                    chars.next();
+                    chars.next();
+                } else {
+                    escaped = true;
+                }
+            }
             '\'' if !double => single = !single,
             '"' if !single => double = !double,
             c => out.push(c),
@@ -687,24 +732,33 @@ fn unquoted(word: &str) -> String {
     out
 }
 
-/// Return the first inline `NAME=VALUE` assignment prefixing the `agy` command in `cmdline`.
+/// Return the first inline `NAME=VALUE` assignment prefixing `program` in `cmdline`
+/// whose variable name is not in `carried`.
 #[must_use]
-pub fn inline_env(cmdline: &str) -> Option<String> {
+pub(super) fn inline_env_for(cmdline: &str, program: &str, carried: &[&str]) -> Option<String> {
     for words in simple_commands(cmdline) {
         let mut set: Option<String> = None;
         let mut under_env = false;
         for word in &words {
             let bare = unquoted(word);
-            if let Some(name) =
-                assigned_name(word).or_else(|| under_env.then(|| assigned_name(&bare)).flatten())
-            {
-                if name != super::upgrade_agy::HOME_ENV && set.is_none() {
-                    set = Some(name.to_owned());
+            let name = assigned_name(word).or_else(|| {
+                under_env
+                    .then(|| {
+                        bare.split_once('=')
+                            .map(|(n, _)| n)
+                            .filter(|n| is_env_name(n))
+                            .map(str::to_owned)
+                    })
+                    .flatten()
+            });
+            if let Some(name) = name {
+                if !carried.contains(&name.as_str()) && set.is_none() {
+                    set = Some(name);
                 }
                 continue;
             }
             let base = bare.rsplit('/').next().unwrap_or(&bare);
-            if base == super::upgrade_agy::PROGRAM {
+            if base == program {
                 if set.is_some() {
                     return set;
                 }
@@ -718,6 +772,16 @@ pub fn inline_env(cmdline: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Return the first inline `NAME=VALUE` assignment prefixing the `agy` command in `cmdline`.
+#[must_use]
+pub fn inline_env(cmdline: &str) -> Option<String> {
+    inline_env_for(
+        cmdline,
+        super::upgrade_agy::PROGRAM,
+        &[super::upgrade_agy::HOME_ENV],
+    )
 }
 
 #[cfg(test)]

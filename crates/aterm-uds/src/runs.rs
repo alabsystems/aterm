@@ -11,6 +11,7 @@
 use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::process::{
     Birth, END_GRACE, EndControlLive, EndRefusal, Ended, GroupMembers, HeldNow, Identity, Lineage,
@@ -191,7 +192,7 @@ pub struct Record {
     /// The stage groups made, in order, each marked when a `closed` line released it.
     pub groups: Vec<GroupLine>,
     /// The uniqueid horizon the first reader that found the launcher dead wrote. Two readers may
-    /// race to append it; the first line stands, the lower horizon and the narrower window.
+    /// race to record it; the first persisted observation stands.
     pub dead_seen: Option<u64>,
     /// When that first reader found it dead, unix milliseconds.
     pub dead_seen_ms: Option<u64>,
@@ -524,55 +525,52 @@ pub fn table(kernel: &(impl Kernel + ?Sized), me: i32) -> Option<(Vec<i32>, u64)
 const RECORD_BYTES: u64 = 4 * 1024 * 1024;
 
 fn read_record_text(path: &Path) -> std::io::Result<String> {
-    read_bounded_regular_text(path, RECORD_BYTES)
+    read_bounded_regular_text_with(path, RECORD_BYTES, true)
 }
 
-/// The text of the regular file at `path`, at most `limit` bytes: a link, a FIFO, a device, a
-/// reparse point, a file over the bound or text that is not UTF-8 is refused, and the open never
-/// blocks.
+/// The text of the regular file at `path`, at most `limit` bytes: a final link or reparse point,
+/// a FIFO, a device, a file over the bound or text that is not UTF-8 is refused. Unix opens are
+/// nonblocking; ancestor directories may be links.
 ///
 /// # Errors
 /// The open's or the read's, or [`std::io::ErrorKind::InvalidData`] for what is refused.
 pub fn read_bounded_regular_text(path: &Path, limit: u64) -> std::io::Result<String> {
-    use std::io::Read as _;
+    read_bounded_regular_text_with(path, limit, false)
+}
+
+fn read_bounded_regular_text_with(
+    path: &Path,
+    limit: u64,
+    coherent_record: bool,
+) -> std::io::Result<String> {
+    let (file, _) = crate::regular_file::open(path)?;
+    let _held = if coherent_record {
+        Some(RecordLock::read(&file)?)
+    } else {
+        None
+    };
+    read_open_text(&file, limit)
+}
+
+/// Read the admitted handle while the caller retains any required record lock.
+fn read_open_text(file: &std::fs::File, limit: u64) -> std::io::Result<String> {
+    use std::io::{Read as _, Seek as _};
     let invalid = || {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "not a bounded regular run record",
         )
     };
-    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
-        return Err(invalid());
-    }
-    let mut open = std::fs::OpenOptions::new();
-    open.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        // Open a reparse point itself, never the object it redirects to.
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        open.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = open.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() > limit {
         return Err(invalid());
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(invalid());
-        }
-    }
+    let mut input = file;
+    input.seek(std::io::SeekFrom::Start(0))?;
     let mut bytes = Vec::new();
-    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    input
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
         return Err(invalid());
     }
@@ -580,12 +578,13 @@ pub fn read_bounded_regular_text(path: &Path, limit: u64) -> std::io::Result<Str
         .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidData, why))
 }
 
-/// The record at `path` opened to write: made new (mode 0600, truncated) or, with
-/// `append_existing`, appended to only while it is a regular file. Never through a link, never
-/// blocking, and kept out of every child.
+/// The record at `path` opened to read and append: created new (mode 0600) or, with
+/// `append_existing`, retained only while it is a regular file. Never through a link, never
+/// blocking, and kept out of every child. The retained offset cannot overwrite another writer.
 ///
 /// # Errors
-/// The open's, or [`std::io::ErrorKind::InvalidData`] for what is not a regular file.
+/// The open's (including `AlreadyExists` rather than truncating a prior record), or
+/// [`std::io::ErrorKind::InvalidData`] for what is not a regular file.
 pub fn open_regular_write(path: &Path, append_existing: bool) -> std::io::Result<std::fs::File> {
     let invalid =
         || std::io::Error::new(std::io::ErrorKind::InvalidData, "not a regular run record");
@@ -596,8 +595,10 @@ pub fn open_regular_write(path: &Path, append_existing: bool) -> std::io::Result
     if append_existing {
         open.append(true);
     } else {
-        open.create(true).truncate(true).write(true);
+        open.create_new(true).append(true);
     }
+    // Reading is needed for locked read-or-append transactions, and lets Windows lock the file.
+    open.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -741,7 +742,7 @@ fn cleanup_record(path: &Path, text: &str) -> Option<Record> {
 ///
 /// # Errors
 /// The directory's read, a record's, or [`std::io::ErrorKind::InvalidData`] for a record that is
-/// not a complete supported one.
+/// not a complete supported one. A record being written returns [`std::io::ErrorKind::WouldBlock`].
 pub fn read_records(dir: &Path) -> std::io::Result<Vec<(PathBuf, Record)>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -766,18 +767,176 @@ pub fn read_records(dir: &Path) -> std::io::Result<Vec<(PathBuf, Record)>> {
     Ok(records)
 }
 
-/// Append `line` to the record at `path`, best-effort.
-pub fn append(path: &Path, line: &str) {
-    if let Ok(mut file) = open_regular_write(path, true) {
-        let _ = writeln!(file, "{line}");
+/// Append one complete line to an existing run record.
+///
+/// # Errors
+/// The open's or [`write_line`]'s error.
+pub fn append(path: &Path, line: &str) -> std::io::Result<()> {
+    let file = open_regular_write(path, true)?;
+    write_line(&file, line)
+}
+
+/// The bound on local lock contention for a complete record write, not on the file I/O.
+const RECORD_WRITE_WITHIN: Duration = Duration::from_secs(1);
+
+/// A file's shared read or exclusive write scope, explicitly unlocked before the file closes.
+struct RecordLock<'file>(&'file std::fs::File);
+
+impl<'file> RecordLock<'file> {
+    fn read(file: &'file std::fs::File) -> std::io::Result<Self> {
+        crate::keep_out_of_children(file)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "RecordLock explicitly unlocks the admitted file in Drop"
+        )]
+        match file.try_lock_shared() {
+            Ok(()) => Ok(Self(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "a run-record writer still holds the record",
+            )),
+            Err(std::fs::TryLockError::Error(why)) => Err(why),
+        }
+    }
+
+    fn write(file: &'file std::fs::File, deadline: Instant) -> std::io::Result<Self> {
+        crate::file_lock::lock_exclusive_until(
+            file,
+            deadline,
+            "a run-record reader or writer still holds the record",
+        )?;
+        Ok(Self(file))
     }
 }
 
-/// Append the `dead_seen` line a reader that found the record's launcher dead writes: `horizon`,
-/// the high-water unique id of a table of this uid read after that, at `at_ms`. A record keeps its
-/// first such line ([`Record::parse`]).
-pub fn append_dead_seen(path: &Path, horizon: u64, at_ms: u64) {
-    append(path, &format!("dead_seen uniqueid={horizon} at={at_ms}"));
+impl Drop for RecordLock<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Write a complete run-record block through a file returned by [`open_regular_write`].
+/// Calls sharing that same descriptor must retain their process-local serialization too:
+/// the advisory lock serializes independently opened descriptors, not threads sharing one.
+/// The file lock spans all short writes and is explicitly released on errors and unwinding.
+///
+/// # Errors
+/// The lock's I/O error, `WouldBlock` after one second of contention, or the write's error.
+pub fn write_record_text(file: &std::fs::File, text: &str) -> std::io::Result<()> {
+    write_record_with(
+        file,
+        text.as_bytes(),
+        Instant::now() + RECORD_WRITE_WITHIN,
+        |mut file, bytes| file.write_all(bytes),
+    )
+}
+
+/// Write one run-record line, including its newline, through a retained append writer.
+/// The same descriptor serialization as [`write_record_text`] is required.
+///
+/// # Errors
+/// [`write_record_text`]'s errors.
+pub fn write_line(file: &std::fs::File, line: &str) -> std::io::Result<()> {
+    write_line_with(file, line, |mut file, bytes| file.write_all(bytes))
+}
+
+fn write_line_with(
+    file: &std::fs::File,
+    line: &str,
+    mut write: impl FnMut(&std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut bytes = Vec::with_capacity(line.len() + 1);
+    bytes.extend_from_slice(line.as_bytes());
+    bytes.push(b'\n');
+    write_record_with(
+        file,
+        &bytes,
+        Instant::now() + RECORD_WRITE_WITHIN,
+        &mut write,
+    )
+}
+
+fn write_record_with(
+    file: &std::fs::File,
+    bytes: &[u8],
+    deadline: Instant,
+    mut write: impl FnMut(&std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let _held = RecordLock::write(file, deadline)?;
+    write(file, bytes)
+}
+
+/// The first dead-launcher observation actually retained by a run record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeadSeen {
+    /// The observed table's high-water unique id.
+    pub horizon: u64,
+    /// When the observation was made, unix milliseconds.
+    pub at_ms: u64,
+}
+
+/// Retain the first `dead_seen` observation, or return the one another reader recorded first.
+/// The admitted header and roots must still match `expected`; group and closed lines may grow.
+/// A first observation already present in `expected` must remain unchanged.
+/// Reading, choosing the first observation and appending share one exclusive file-lock scope.
+/// A busy record returns immediately so a later observation can retry it.
+///
+/// # Errors
+/// `WouldBlock` while the record is held, or the open, lock, read or write error; `InvalidData`
+/// for a malformed record, moved header, changed or removed admitted first observation, or an
+/// append exceeding the record's byte limit.
+pub fn append_dead_seen(
+    path: &Path,
+    expected: &Record,
+    horizon: u64,
+    at_ms: u64,
+) -> std::io::Result<DeadSeen> {
+    let file = open_regular_write(path, true)?;
+    let _held = RecordLock::write(&file, Instant::now())?;
+    let text = read_open_text(&file, RECORD_BYTES)?;
+    let record = cleanup_record(path, &text).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "incomplete run record")
+    })?;
+    if record.id != expected.id
+        || record.boot != expected.boot
+        || record.uniqueid != expected.uniqueid
+        || record.start_ms != expected.start_ms
+        || record.sid != expected.sid
+        || record.roots != expected.roots
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the admitted run-record header changed",
+        ));
+    }
+    if expected.dead_seen.is_some()
+        && (record.dead_seen != expected.dead_seen || record.dead_seen_ms != expected.dead_seen_ms)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the admitted first dead-run observation changed",
+        ));
+    }
+    if let Some(horizon) = record.dead_seen {
+        let at_ms = record.dead_seen_ms.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "missing dead_seen time")
+        })?;
+        return Ok(DeadSeen { horizon, at_ms });
+    }
+    let line = format!("dead_seen uniqueid={horizon} at={at_ms}\n");
+    if text
+        .len()
+        .checked_add(line.len())
+        .is_none_or(|bytes| bytes as u64 > RECORD_BYTES)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the dead_seen observation exceeds the run-record limit",
+        ));
+    }
+    let mut output = &file;
+    output.write_all(line.as_bytes())?;
+    Ok(DeadSeen { horizon, at_ms })
 }
 
 /// The directory under `rendezvous` that run records live in: `verify-runs`, and beneath it one
@@ -870,6 +1029,9 @@ pub fn pct_decode(text: &str) -> String {
     }
     String::from_utf8_lossy(&out).into_owned()
 }
+
+#[cfg(test)]
+mod append_tests;
 
 #[cfg(test)]
 mod tests {

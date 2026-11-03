@@ -11,7 +11,7 @@ use aterm_uds::spawnfd::{Child as OwnedChild, Stdio as OwnedStdio};
 
 use super::harness::{
     self, DEADLINE, FIXTURE_GUI_CONFIG, FLEET, SECRET, World, cap_line, connect, connect_within,
-    kv, node_grants, until,
+    kv, node_grants, until, write_cap,
 };
 
 /// One private fabric: the production broker binary (`aterm link broker`, with the default rules
@@ -164,7 +164,7 @@ impl Inst {
         std::fs::write(root.join("link/node"), format!("{node}\n")).expect("the node id");
         let cap = root.join("node.cap");
         let caps: String = node_grants(node).iter().map(|g| cap_line(g)).collect();
-        std::fs::write(&cap, caps).expect("the node's cap file");
+        write_cap(&cap, caps);
         // The bridge command `aterm fabric on` writes (`enable::bridge_command`): this node's own
         // sessions' tasks arrive undemoted.
         let fabric_cmd = format!(
@@ -250,6 +250,7 @@ impl Inst {
                 fake_path_in(&self.root),
             )
             .env("ATERM_DEBUG_SYSTEM_PRESSURE", "none")
+            .env(aterm_types::domain::ENV_DEBUG_HOST_SLEEP, "none")
             .env("ATERM_LOG", "info")
             .env(
                 harness::STALE_HORIZON.0,
@@ -779,11 +780,10 @@ pub(crate) fn cli_command(aterm: &str, root: &Path, args: &[&str]) -> aterm_uds:
     cmd
 }
 
-/// The rows of the tab menu of `sid`, the `tab`th tab, read headless (`tab <n>`, `open
-/// tab-menu`, `controls tab-menu`).
-fn menu(inst: &Inst, sid: &str, tab: usize) -> Vec<String> {
-    let r = inst.verb(&format!("@{sid} tab {tab}"));
-    assert!(r.ok(), "tab {tab}: {}", r.header());
+/// The rows of `sid`'s tab menu, selected by identity before reading it headless.
+fn menu(inst: &Inst, sid: &str) -> Vec<String> {
+    let r = inst.verb(&format!("raise {sid}"));
+    assert!(r.ok(), "raise {sid}: {}", r.header());
     let r = inst.verb("open tab-menu");
     assert!(r.ok(), "open tab-menu: {}", r.header());
     let rows = inst
@@ -932,9 +932,7 @@ fn overview(b: &Inst) -> String {
 
 /// The `now:` row of `sid`'s tab menu, if it has one.
 fn clause(inst: &Inst, sid: &str) -> Option<String> {
-    menu(inst, sid, 1)
-        .into_iter()
-        .find(|r| r.starts_with("now: "))
+    menu(inst, sid).into_iter().find(|r| r.starts_with("now: "))
 }
 
 /// [`until`] on `sid` in `inst` within `budget`: a failure shows the session's log at the host
@@ -1052,10 +1050,7 @@ fn the_owners_ask_over_the_stream() {
         ],
     );
     await_log(&a, &s, "open=turn", &at);
-    let title = menu(&a, &s, 1)
-        .first()
-        .cloned()
-        .expect("the menu's title row");
+    let title = menu(&a, &s).first().cloned().expect("the menu's title row");
     let at = cursor(&a, &s);
     release(&a, "k1", 1);
     let need = await_log(&a, &s, "need", &at);
@@ -1065,7 +1060,7 @@ fn the_owners_ask_over_the_stream() {
     );
 
     // Leg 5: A's clause names the box; the tab's label is its identity title.
-    let menu_box = menu(&a, &s, 1);
+    let menu_box = menu(&a, &s);
     assert_eq!(menu_box.first(), Some(&title), "{menu_box:?}");
     let head_a = clause(&a, &s).expect("a now: row");
     assert!(head_a.starts_with("now: approval \u{b7} bash"), "{head_a}");
@@ -1235,7 +1230,7 @@ fn the_owners_ask_over_the_stream() {
         json.contains("\"need\":\"wall:usage-weekly\",\"detail\":\"in 1m\""),
         "B's need is not A's clause head: {json}"
     );
-    assert_eq!(menu(&a, &s, 1).first(), Some(&title));
+    assert_eq!(menu(&a, &s).first(), Some(&title));
 
     // Leg 5: the harness waits out the reset (`in 1m`, three seconds on its clock), then its grace
     // and jitter, a fraction of a second ([`reset_soon`]), and types its carry-on: the menu shows
@@ -1279,7 +1274,7 @@ fn the_owners_ask_over_the_stream() {
             .any(|l| l.contains(" act word=continue rule=usage-resume.v1 by=harness ")),
         "{log}"
     );
-    assert_eq!(menu(&a, &s, 1).first(), Some(&title));
+    assert_eq!(menu(&a, &s).first(), Some(&title));
 
     // The turn ends; still no word of the mail crossed; a ctl label never shows.
     let at = cursor(&a, &s);
@@ -1737,8 +1732,8 @@ fn two_edges_flooding_one_tab_each_say_their_own_dropped() {
     let e2 = spawn_tab(&a);
     // An edge's token is checked against the active session's edges: D, the window's first
     // tab, is brought to the front.
-    let r = a.verb(&format!("@{d} tab 0"));
-    assert!(r.header().starts_with("OK 0 "), "tab 0: {}", r.header());
+    let r = a.verb(&format!("@{d} tab 1"));
+    assert!(r.header().starts_with("OK 1 "), "tab 1: {}", r.header());
     let floods: Vec<(String, String, u64)> = [(e1, 30u64), (e2, 45)]
         .into_iter()
         .map(|(src, n)| (edge_token(&a, &d, &src), src, n))
@@ -2260,7 +2255,7 @@ fn an_asked_restart_pages_nothing_and_says_who_asked() {
             .then_some(())
     });
     let cap = a.root.join("watch.cap");
-    std::fs::write(&cap, cap_line(&format!("ro:/f/{FLEET}/pub/>"))).expect("the watch's cap");
+    write_cap(&cap, cap_line(&format!("ro:/f/{FLEET}/pub/>")));
     let state = a.root.join("watch");
     std::fs::create_dir_all(&state).expect("the watch's state");
     let fired = a.root.join("fired.log");

@@ -404,6 +404,7 @@ impl Stamped<'_> {
         let asker = crate::session_log::EndAsker {
             timeline: &ctx.timeline,
             by,
+            from: None,
         };
         match term(master, &ctx.sink, pgrp, &stamp.start, asker) {
             Signalled::Gone => {
@@ -1015,6 +1016,7 @@ pub(crate) fn carry(ctx: &Arc<SessionCtx>, state: &std::path::Path, now_s: u64) 
     crate::session_log::EndAsker {
         timeline: &ctx.timeline,
         by: aterm_slog::Actor::Aterm,
+        from: None,
     }
     .stand(pgrp);
     let Some(watch) = watch(state, pgrp, &stamp) else {

@@ -106,6 +106,8 @@ pub(crate) struct Args {
     pub backlog: Option<u32>,
     /// Rows the ask world's asked table is pre-filled to (`--asked-prefill`).
     pub asked_prefill: Option<u32>,
+    /// One-way notes the messaging world posts paced after its burst (`--paced-notes`).
+    pub paced_notes: Option<u32>,
 }
 
 fn positive(flag: &str, raw: &str) -> Result<u32, String> {
@@ -252,6 +254,17 @@ impl Args {
                             })?,
                     );
                 }
+                "--paced-notes" => {
+                    a.paced_notes = Some(
+                        raw.bytes()
+                            .all(|b| b.is_ascii_digit())
+                            .then(|| raw.parse::<u32>().ok())
+                            .flatten()
+                            .ok_or_else(|| {
+                                format!("`{flag}` needs a non-negative integer, got `{raw}`")
+                            })?,
+                    );
+                }
                 "--no-windows" | "--admit" => {}
                 other => {
                     return Err(format!(
@@ -375,6 +388,9 @@ impl Args {
         if let Some(n) = self.asked_prefill {
             words.push(format!("asked_prefill={n}"));
         }
+        if let Some(n) = self.paced_notes {
+            words.push(format!("paced_notes={n}"));
+        }
         words.extend(arm.words());
         words.join(" ")
     }
@@ -427,6 +443,9 @@ impl Args {
         }
         if let Some(n) = self.asked_prefill {
             line.push_str(&format!(" --asked-prefill {n}"));
+        }
+        if let Some(n) = self.paced_notes {
+            line.push_str(&format!(" --paced-notes {n}"));
         }
         line.push_str(&arm.flags());
         line
@@ -509,7 +528,7 @@ fn run_arm(
     )?;
     let read = |name: &str| {
         let path = scratch.path().join(name);
-        std::fs::read_to_string(&path)
+        crate::read_regular_text(&path)
             .map_err(|e| format!("the bench wrote no {}: {e}", path.display()))
     };
     let tables = read("fabric.md")?;
@@ -897,6 +916,48 @@ mod tests {
         ] {
             let mut o = BTreeMap::new();
             o.insert("--asked-prefill", bad.to_string());
+            o.insert("--scenario", scenario.to_string());
+            assert!(Args::from_options(&o).is_err(), "{scenario} {bad}");
+        }
+    }
+
+    /// C13: the messaging world's paced notes reach the bench's words and each entry's Run
+    /// line, and the bench's own refusals reach the flag (past their cap, or on a run that
+    /// measures no messaging).
+    #[test]
+    fn the_paced_notes_reach_the_bench_and_the_ledger() {
+        let shipped = Arm::shipped();
+        for n in ["0", "60"] {
+            let mut o = BTreeMap::new();
+            o.insert("--paced-notes", n.to_string());
+            o.insert("--scenario", "messaging".to_string());
+            let a = Args::from_options(&o).expect("parses");
+            assert_eq!(
+                a.bench_words(Path::new("/s"), shipped),
+                format!(
+                    "out=/s scenario=messaging paced_notes={n} durability=ordered horizon_ms=100"
+                )
+            );
+            assert!(
+                a.command_line(shipped)
+                    .contains(&format!(" --scenario messaging --paced-notes {n} ")),
+                "{}",
+                a.command_line(shipped)
+            );
+        }
+        let a = Args::from_options(&BTreeMap::new()).expect("bare");
+        assert!(
+            !a.bench_words(Path::new("/s"), shipped)
+                .contains("paced_notes")
+        );
+        for (scenario, bad) in [
+            ("messaging", "-1"),
+            ("messaging", "many"),
+            ("messaging", "546"),
+            ("pingpong", "10"),
+        ] {
+            let mut o = BTreeMap::new();
+            o.insert("--paced-notes", bad.to_string());
             o.insert("--scenario", scenario.to_string());
             assert!(Args::from_options(&o).is_err(), "{scenario} {bad}");
         }

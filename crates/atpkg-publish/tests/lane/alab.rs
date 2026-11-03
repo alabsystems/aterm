@@ -1179,3 +1179,167 @@ fn a_key_the_roster_does_not_list_packs_and_signs_nothing() {
     assert!(w.fx.calls("clone ").is_empty(), "refused before any clone");
     ok(w.run(true));
 }
+
+/// Site 5 of finding F2 (plan §15): under agh the signing run asks each owner's writer, the
+/// channel's first, and a dry run asks neither.
+mod under_agh {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use atpkg_publish::ctx::HostChoice;
+    use atpkg_publish::error::Error;
+    use atpkg_publish::host::fake::{FakeFail, FakeHost, FakeOp};
+    use atpkg_publish::host::{HostError, Hosts, Probe, Release, ReleaseHost, Replace, Slug};
+
+    use super::{World, ok};
+
+    /// A `FakeHost` whose `write_preflight` refuses one slug, a program repository's, and
+    /// delegates every other: the run's staging host only, so the role, not the slug, says
+    /// which check asks.
+    struct RefusesOne {
+        inner: Arc<FakeHost>,
+        refused: Slug,
+    }
+
+    impl ReleaseHost for RefusesOne {
+        fn releases(&self, slug: &Slug) -> Result<Vec<Release>, HostError> {
+            self.inner.releases(slug)
+        }
+        fn release(&self, slug: &Slug, tag: &str) -> Result<Release, HostError> {
+            self.inner.release(slug, tag)
+        }
+        fn download(
+            &self,
+            slug: &Slug,
+            tag: &str,
+            assets: &[&str],
+            dir: &Path,
+        ) -> Result<(), HostError> {
+            self.inner.download(slug, tag, assets, dir)
+        }
+        fn create(
+            &self,
+            slug: &Slug,
+            tag: &str,
+            title: &str,
+            notes: &str,
+            files: &[PathBuf],
+        ) -> Result<(), HostError> {
+            self.inner.create(slug, tag, title, notes, files)
+        }
+        fn upload(
+            &self,
+            slug: &Slug,
+            tag: &str,
+            files: &[PathBuf],
+            replace: Replace,
+        ) -> Result<(), HostError> {
+            self.inner.upload(slug, tag, files, replace)
+        }
+        fn publish_draft(&self, slug: &Slug, tag: &str) -> Result<(), HostError> {
+            self.inner.publish_draft(slug, tag)
+        }
+        fn write_preflight(&self, slug: &Slug) -> Result<(), HostError> {
+            if *slug == self.refused {
+                Err(HostError::Refused("this writer is refused".into()))
+            } else {
+                self.inner.write_preflight(slug)
+            }
+        }
+        fn probe_public(&self, slug: &Slug, tag: &str, asset: &str) -> Probe {
+            self.inner.probe_public(slug, tag, asset)
+        }
+        fn fetch_public(
+            &self,
+            slug: &Slug,
+            tag: &str,
+            asset: &str,
+            dest: &Path,
+            cap: u64,
+        ) -> Probe {
+            self.inner.fetch_public(slug, tag, asset, dest, cap)
+        }
+        fn clone_repo(&self, slug: &Slug, dest: &Path) -> Result<(), HostError> {
+            self.inner.clone_repo(slug, dest)
+        }
+        fn fetch_repo(&self, slug: &Slug, dir: &Path) -> Result<(), HostError> {
+            self.inner.fetch_repo(slug, dir)
+        }
+    }
+
+    fn no_write(host: &FakeHost) {
+        let calls = host.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("create")
+                || c.starts_with("upload")
+                || c.starts_with("publish-draft")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_signing_run_asks_both_writers_under_agh() {
+        let w = World::new("alab-writers");
+        std::fs::remove_file(&w.fx.ctx.tokens.channel).expect("rm token");
+        std::fs::remove_file(&w.fx.ctx.tokens.staging).expect("rm token");
+        let mut ctx = w.fx.ctx.clone().with_host_choice(HostChoice::Agh);
+        let channel = ctx.index_slug();
+        let staging = ctx.staging_slug(atpkg::manifest::INDEX_REPO);
+
+        w.fx.host.fail_next(FakeOp::Preflight, FakeFail::Refuse);
+        let e = w.run_as(&ctx, false).0.expect_err("no channel writer");
+        assert!(matches!(e, Error::CannotRun(_)), "{e}");
+        let why = e.to_string();
+        assert!(
+            why.contains(&format!("channel writer unavailable on {channel}")),
+            "{why}"
+        );
+        assert!(why.contains("refused by the test"), "{why}");
+        let calls = w.fx.host.calls();
+        assert!(calls.contains(&format!("preflight {channel}")), "{calls:?}");
+        no_write(&w.fx.host);
+        assert!(w.fx.packer.legs().is_empty(), "a build ran");
+
+        // A tracked program's staging repository is asked too, after the index repository's:
+        // the lane clones and stages it, and under agh push and a grant are per repository.
+        let trust = ctx.staging_slug("trust");
+        ctx.hosts = Hosts {
+            staging: Arc::new(RefusesOne {
+                inner: w.fx.host.clone(),
+                refused: trust.clone(),
+            }),
+            channel: w.fx.host.clone(),
+        };
+        let e = w.run_as(&ctx, false).0.expect_err("no staging writer");
+        assert!(matches!(e, Error::CannotRun(_)), "{e}");
+        let why = e.to_string();
+        assert!(
+            why.contains(&format!("staging writer unavailable on {trust}")),
+            "{why}"
+        );
+        assert!(why.contains("this writer is refused"), "{why}");
+        let calls = w.fx.host.calls();
+        assert!(calls.contains(&format!("preflight {staging}")), "{calls:?}");
+        let public_trust = ctx.public_slug("trust");
+        assert!(
+            calls.contains(&format!("preflight {public_trust}")),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("clone ")),
+            "refused before any clone: {calls:?}"
+        );
+        no_write(&w.fx.host);
+        assert!(w.fx.packer.legs().is_empty(), "a build ran");
+
+        let asked = |host: &FakeHost| {
+            host.calls()
+                .iter()
+                .filter(|c| c.starts_with("preflight "))
+                .count()
+        };
+        let before = asked(&w.fx.host);
+        ok(w.run_as(&ctx, true));
+        assert_eq!(asked(&w.fx.host), before, "a dry run asks no writer");
+    }
+}

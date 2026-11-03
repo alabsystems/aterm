@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
+use crate::host::agh::AghHost;
 use crate::host::rest::RestHost;
 use crate::host::{Hosts, Slug};
 
@@ -100,17 +101,93 @@ impl HostChoice {
     /// `gh`, `agh-staging`, `agh`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
-        // WP12 writes the spellings (plan §16); until then the choice has none.
-        let _ = self;
-        ""
+        match self {
+            HostChoice::Gh => "gh",
+            HostChoice::AghStaging => "agh-staging",
+            HostChoice::Agh => "agh",
+        }
     }
 
     /// The choice `text` names.
     #[must_use]
     pub fn parse(text: &str) -> Option<HostChoice> {
-        // WP12 writes the parse (plan §16); until then no text names a choice.
-        let _ = text;
-        None
+        match text {
+            "gh" => Some(HostChoice::Gh),
+            "agh-staging" => Some(HostChoice::AghStaging),
+            "agh" => Some(HostChoice::Agh),
+            _ => None,
+        }
+    }
+
+    /// A verb's own `--host VALUE` or `--host=VALUE`: the value (`(missing)` when `--host`
+    /// ends the line, taking the next argument from `rest`), or `None` for any other `flag`.
+    pub(crate) fn flag_value<'a>(
+        flag: &'a str,
+        rest: &mut impl Iterator<Item = &'a String>,
+    ) -> Option<&'a str> {
+        if flag == "--host" {
+            return Some(rest.next().map_or("(missing)", String::as_str));
+        }
+        flag.strip_prefix("--host=")
+    }
+}
+
+/// The two config needs `from_home_hosts` raises and clears (design §10.3).
+const CONFIG_NEEDS: [&str; 2] = ["agh.config.missing", "agh.config.invalid"];
+
+/// What `AghHost::production`'s refusal begins with when agh.toml does not validate.
+const INVALID: &str = "agh.toml is invalid: ";
+
+/// What `AghHost::production`'s refusal begins with when agh.toml is missing.
+const MISSING: &str = "agh.toml is missing";
+
+/// What `AghHost::production`'s refusal begins with when agh.toml says `vault = true`.
+const VAULT: &str = "agh.toml says vault = true";
+
+/// Why the lanes refuse an agh.toml that says `vault = true`: the fact alone, because naming
+/// writers beside the line never clears it (`production` refuses the line whatever profiles
+/// the file names), and [`crate::hosts_check::UNVAULT`] is the step that does.
+const VAULT_WHY: &str =
+    "vault adoption is not composed for atpkg-publish, whatever profiles agh.toml names";
+
+/// The need `from_home_hosts` raises for production's refusal `why`, at `at`. Each `then` is a
+/// step that clears that refusal: `agh.config.missing` is agh's own, whose `then` is the step
+/// that provisions agh.toml from token files ([`crate::hosts_check::PROVISION`] is the same
+/// constant), and a file that says `vault = true` is `agh.config.invalid` whose `why` is
+/// [`VAULT_WHY`] and whose `then` is [`crate::hosts_check::UNVAULT`], rather than
+/// `agh policy check`, which accepts the file.
+fn config_need(why: &str, at: u64) -> agh::needs::Need {
+    use crate::hosts_check::UNVAULT;
+    if why.starts_with(MISSING) {
+        agh::needs::Need::config_missing(at)
+    } else if why.starts_with(VAULT) {
+        let mut need = agh::needs::Need::config_invalid(VAULT_WHY, at);
+        need.what = "agh.toml says vault = true on this builder".to_string();
+        need.then = UNVAULT.to_string();
+        need
+    } else {
+        agh::needs::Need::config_invalid(why.strip_prefix(INVALID).unwrap_or(why), at)
+    }
+}
+
+/// `from_home_hosts`' refusal for production's `why`, with `shown` the config file and `h`
+/// the choice. A `vault = true` refusal is spelled from [`VAULT_WHY`] and
+/// [`crate::hosts_check::UNVAULT`], the step that clears it, never from `production`'s own
+/// advice.
+fn config_refusal(why: &str, shown: &str, h: &str) -> String {
+    let why = if why.starts_with(VAULT) {
+        format!("{VAULT}, and {VAULT_WHY}: {}", crate::hosts_check::UNVAULT)
+    } else {
+        why.to_string()
+    };
+    format!("{why}: the lanes route their GitHub identities through it ({shown}, --host {h})")
+}
+
+/// Clear both config needs under `dirs` (best effort, as `from_home_hosts`' success does).
+/// It reads no agh.toml and creates nothing: a missing needs folder stays missing.
+pub(crate) fn clear_config_needs(dirs: &agh::config::Dirs) {
+    for key in CONFIG_NEEDS {
+        let _ = agh::needs::clear(dirs, key);
     }
 }
 
@@ -122,27 +199,7 @@ impl Ctx {
     /// A could-not-run naming `HOME` when it is unset or empty, or when the clock cannot
     /// be read.
     pub fn from_env() -> Result<Self> {
-        let home = non_empty_env("HOME").ok_or_else(|| {
-            Error::cannot_run(
-                "HOME is unset — the machine key, the token files, the state root and the \
-                 atpkg store are all found under it; run with HOME set",
-            )
-        })?;
-        let now = aterm_time::unix_secs()
-            .and_then(|s| i64::try_from(s).ok())
-            .ok_or_else(|| Error::cannot_run("the system clock reads before 1970"))?;
-        let tokens = Tokens::under(&home);
-        let hosts = Hosts {
-            staging: Arc::new(RestHost::new(Some(tokens.staging))),
-            channel: Arc::new(RestHost::new(Some(tokens.channel))),
-        };
-        Ok(Self::new(
-            &home,
-            non_empty_env("XDG_CONFIG_HOME").as_deref(),
-            non_empty_env("XDG_STATE_HOME").as_deref(),
-            now,
-            hosts,
-        ))
+        Self::from_env_hosts(HostChoice::Gh)
     }
 
     /// A context rooted at `home` that speaks to `hosts` with production defaults.
@@ -188,12 +245,27 @@ impl Ctx {
     /// # Errors
     ///
     /// As `from_env`; under `AghStaging` or `Agh`, a could-not-run naming agh.toml when it is
-    /// missing or invalid (design §10.3's text), after raising the need (§4.6.15).
+    /// missing or invalid (design §10.3's text), after raising the need (§4.6.15). Also
+    /// could-not-run when agh's directories cannot be resolved from `HOME`, `XDG_CONFIG_HOME`
+    /// and `XDG_STATE_HOME` (a relative root), when an owner of `accounts` is no valid slug
+    /// owner, and when agh.toml says `vault = true` (its need is `agh.config.invalid`).
     pub fn from_env_hosts(hosts: HostChoice) -> Result<Self> {
-        let _ = hosts;
-        Err(Error::cannot_run(
-            "not yet: Ctx::from_env_hosts lands in WP12",
-        ))
+        let home = non_empty_env("HOME").ok_or_else(|| {
+            Error::cannot_run(
+                "HOME is unset — the machine key, the token files, the state root and the \
+                 atpkg store are all found under it; run with HOME set",
+            )
+        })?;
+        let now = aterm_time::unix_secs()
+            .and_then(|s| i64::try_from(s).ok())
+            .ok_or_else(|| Error::cannot_run("the system clock reads before 1970"))?;
+        Self::from_home_hosts(
+            &home,
+            non_empty_env("XDG_CONFIG_HOME").as_deref(),
+            non_empty_env("XDG_STATE_HOME").as_deref(),
+            now,
+            hosts,
+        )
     }
 
     /// What `from_env_hosts` builds once it has read the environment and the clock: the
@@ -203,7 +275,8 @@ impl Ctx {
     ///
     /// # Errors
     ///
-    /// As `from_env_hosts`.
+    /// As `from_env_hosts`. Its unset-`HOME` and clock refusals are its own: this reads
+    /// neither.
     pub fn from_home_hosts(
         home: &Path,
         xdg_config_home: Option<&Path>,
@@ -211,10 +284,67 @@ impl Ctx {
         now_unix: i64,
         hosts: HostChoice,
     ) -> Result<Self> {
-        let _ = (home, xdg_config_home, xdg_state_home, now_unix, hosts);
-        Err(Error::cannot_run(
-            "not yet: Ctx::from_home_hosts lands in WP12",
-        ))
+        let tokens = Tokens::under(home);
+        let gh = Hosts {
+            staging: Arc::new(RestHost::new(Some(tokens.staging))),
+            channel: Arc::new(RestHost::new(Some(tokens.channel))),
+        };
+        let mut ctx = Self::new(home, xdg_config_home, xdg_state_home, now_unix, gh);
+        ctx.host_choice = hosts;
+        if hosts == HostChoice::Gh {
+            // The default reads no agh.toml (plan §1, rule 16).
+            return Ok(ctx);
+        }
+        let h = hosts.as_str();
+        let dirs =
+            agh::config::Dirs::resolve(home, xdg_config_home, xdg_state_home).ok_or_else(|| {
+                let shown = |dir: Option<&Path>| {
+                    dir.map_or_else(|| "(unset)".to_string(), |d| d.display().to_string())
+                };
+                Error::cannot_run(format!(
+                    "agh's directories cannot be resolved from HOME {}, XDG_CONFIG_HOME {} and \
+                     XDG_STATE_HOME {} (each must be absolute): --host {h} reads agh.toml there",
+                    home.display(),
+                    shown(xdg_config_home),
+                    shown(xdg_state_home)
+                ))
+            })?;
+        let slug = |owner: &str| {
+            agh::Slug::new(owner, atpkg::manifest::INDEX_REPO)
+                .map_err(|e| Error::cannot_run(e.why.clone()))
+        };
+        let (staging_home, public_home) =
+            (slug(&ctx.accounts.staging)?, slug(&ctx.accounts.public)?);
+        let built = AghHost::production(&dirs, staging_home).and_then(|staging| {
+            let channel: crate::host::HostRef = match hosts {
+                HostChoice::Agh => Arc::new(AghHost::production(&dirs, public_home)?),
+                _ => ctx.hosts.channel.clone(),
+            };
+            Ok((staging, channel))
+        });
+        let (staging, channel) = match built {
+            Ok(built) => built,
+            Err(why) => {
+                // Nothing was sent: `production` returns before any client is built. The need
+                // is a fact for later; the refusal below names the file whatever it answers.
+                let need = config_need(&why, u64::try_from(now_unix).unwrap_or(0));
+                let _ = agh::needs::raise(&dirs, &need);
+                for key in CONFIG_NEEDS.iter().filter(|k| **k != need.key) {
+                    let _ = agh::needs::clear(&dirs, key);
+                }
+                return Err(Error::cannot_run(config_refusal(
+                    &why,
+                    &ctx.shown(&dirs.config_file()),
+                    h,
+                )));
+            }
+        };
+        clear_config_needs(&dirs);
+        ctx.hosts = Hosts {
+            staging: Arc::new(staging),
+            channel,
+        };
+        Ok(ctx)
     }
 
     /// The choice this context's hosts were built with.

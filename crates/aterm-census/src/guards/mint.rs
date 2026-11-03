@@ -49,7 +49,7 @@ fn launcher_mint(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         }
     }
     for rel in manifests(&tree.corpus.paths) {
-        let text = match std::fs::read_to_string(tree.root.join(rel)) {
+        let text = match crate::tree::read_to_string(&tree.root.join(rel)) {
             Ok(text) if text.contains(FEATURE) => text,
             Ok(_) => continue,
             Err(e) => {

@@ -302,8 +302,10 @@ impl Tools for HostTools {
                 .bounded(),
             )?;
         }
-        Ok(std::fs::read(&ca).map_err(|e| e.to_string())?
-            == std::fs::read(&cb).map_err(|e| e.to_string())?)
+        Ok(crate::identity::read_regular_bytes(&ca, 512 * 1024 * 1024)
+            .map_err(|e| e.to_string())?
+            == crate::identity::read_regular_bytes(&cb, 512 * 1024 * 1024)
+                .map_err(|e| e.to_string())?)
     }
 
     fn thin(&self, file: &Path, arch: &str, out: &Path) -> Result<(), String> {

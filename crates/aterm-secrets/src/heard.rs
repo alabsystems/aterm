@@ -5,13 +5,14 @@
 //! the ALab vault heard, kept so the next look on the same network is spared. One line,
 //! `<unix seconds> found <network> <url> <signer>` for the vault itself, or
 //! `<unix seconds> elsewhere <network>` for another vault's signed envelope at its address. A
-//! record this build does not understand (an older `absent`, or a line keyed by the subnet alone
-//! before the gateway's hardware address joined the key) is dropped, not read.
+//! record this build does not understand (an older `absent`, or a line keyed by anything but the
+//! network place's strong id) is dropped, not read.
 //!
-//! The network key ([`network_key`]) is the default gateway's hardware address and the subnet,
-//! read with no packet: two routers both numbering a LAN `192.168.1.0/24` have different hardware
-//! addresses, so a fact kept against one never stands on the other. With no gateway neighbour
-//! entry yet the key cannot be formed and nothing is kept.
+//! The network key ([`network_key`]) is the network place's id of the network this Mac's traffic
+//! leaves on (`aterm_netplace`, the one reader of where this Mac is): its default gateway's
+//! hardware address and its subnet, read with no packet. Two routers both numbering a LAN
+//! `192.168.1.0/24` have different hardware addresses, so a fact kept against one never stands on
+//! the other. With no gateway neighbour entry yet the key cannot be formed and nothing is kept.
 //!
 //! A look that heard the vault stands for [`FOUND_FOR`], one that heard another vault's signed
 //! envelope at its address for [`ABSENT_FOR`], each only on the network it was made on. A look
@@ -24,11 +25,6 @@
 
 use crate::client::Paths;
 use std::net::IpAddr;
-
-/// The separator between the gateway's hardware address and the subnet in a [`network_key`]. A
-/// record whose network field lacks it is a pre-SYNC-1 subnet-only line: it cannot be migrated
-/// (no hardware address was recorded), so it is dropped.
-const KEY_SEP: char = '@';
 
 /// The record's file name in [`Paths::dir`].
 pub const FILE: &str = "probe";
@@ -106,9 +102,12 @@ impl Verdict {
             // `absent` (an older build's timeout kept as no vault) and any other word: not read.
             _ => return None,
         };
-        // A record keyed by the subnet alone (pre-SYNC-1) carries no gateway address, so it
-        // cannot be migrated: it is dropped. A valid key always carries the separator.
-        (network.contains(KEY_SEP) && words.next().is_none()).then_some(Self { at, heard, network })
+        // A record keyed by anything but the network place's strong id (a subnet alone, or an
+        // earlier build's hardware address and subnets) names no network this build can tell: it
+        // is dropped.
+        (aterm_netplace::NetworkId::parse(&network).is_some_and(|id| id.is_strong())
+            && words.next().is_none())
+        .then_some(Self { at, heard, network })
     }
 }
 
@@ -121,26 +120,14 @@ pub fn network() -> Option<String> {
     network_of(&crate::network::interfaces().ok()?)
 }
 
-/// The discovery record's network key: the default gateway's hardware address (lowercase hex)
-/// and the subnet fingerprint ([`network`]), joined by [`KEY_SEP`], read with no packet. `None`
-/// where there is no subnet, or the gateway has no neighbour entry yet — the key cannot be
-/// formed, so the caller keeps nothing and looks afresh.
+/// The discovery record's network key: the network place's strong id of the network this Mac's
+/// traffic leaves on (`aterm_netplace::facts::network_now`: the default gateway's hardware
+/// address and the route's subnet), read with no packet. `None` with no IPv4 default route, or
+/// where the gateway has no neighbour entry yet — the key cannot be formed, so the caller keeps
+/// nothing and looks afresh.
 #[must_use]
 pub fn network_key() -> Option<String> {
-    network_key_of(network(), crate::network::default_gateway_hw().as_deref())
-}
-
-/// [`network_key`] from a subnet fingerprint and a gateway hardware address, both required.
-fn network_key_of(subnets: Option<String>, hardware: Option<&[u8]>) -> Option<String> {
-    let (subnets, hardware) = (subnets?, hardware?);
-    let mut key = String::with_capacity(hardware.len() * 2 + 1 + subnets.len());
-    for byte in hardware {
-        use std::fmt::Write as _;
-        let _ = write!(key, "{byte:02x}");
-    }
-    key.push(KEY_SEP);
-    key.push_str(&subnets);
-    Some(key)
+    aterm_netplace::facts::network_now().map(|id| id.as_str().to_owned())
 }
 
 fn network_of(addresses: &[crate::network::InterfaceAddress]) -> Option<String> {
@@ -217,17 +204,52 @@ mod tests {
         );
     }
 
+    /// A route on `subnet`'s `.23` behind a gateway whose hardware address is `hw`.
+    fn route(subnet: [u8; 3], hw: Option<&[u8]>) -> aterm_netplace::RouteFacts {
+        aterm_netplace::RouteFacts {
+            interface: "en0".to_owned(),
+            address: Ipv4Addr::new(subnet[0], subnet[1], subnet[2], 23),
+            prefix: 24,
+            gateway: Some(Ipv4Addr::new(subnet[0], subnet[1], subnet[2], 1)),
+            gateway_hw: hw.map(<[u8]>::to_vec),
+        }
+    }
+
+    /// The network key is the network place's strong id of the route traffic takes, read from the
+    /// one source of where this Mac is: a scripted route gives that route's id, a gateway whose
+    /// hardware address is unread gives none, and no route gives none.
+    /// NEGATIVE CONTROL: keying by the place's weak id where the strong one cannot be formed
+    /// (`.or_else(|| routes_now().0.as_ref().map(NetworkId::weak))` in `network_now`) gives a key
+    /// before the gateway is read, and "no key before ARP" fails.
     #[test]
-    fn a_network_key_needs_the_gateway_and_the_subnet() {
+    fn a_network_key_is_the_network_places_strong_id() {
         let hardware = [0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33];
+        let script = |route: Option<aterm_netplace::RouteFacts>| aterm_netplace::facts::Script {
+            facts: aterm_netplace::Facts {
+                route,
+                ..aterm_netplace::Facts::default()
+            },
+            via: Vec::new(),
+        };
+        let home = route([192, 168, 4], Some(&hardware));
+        let key = aterm_netplace::facts::script_here(script(Some(home.clone())), network_key);
         assert_eq!(
-            network_key_of(Some("192.168.4.0/24".into()), Some(&hardware)).as_deref(),
-            Some("aabbcc112233@192.168.4.0/24")
+            key,
+            aterm_netplace::NetworkId::of(&home).map(|id| id.as_str().to_owned())
         );
-        // No gateway neighbour entry yet: the key cannot be formed, so the caller keeps nothing.
-        assert_eq!(network_key_of(Some("192.168.4.0/24".into()), None), None);
-        // No subnet: no key.
-        assert_eq!(network_key_of(None, Some(&hardware)), None);
+        assert!(key.is_some());
+        assert_eq!(
+            aterm_netplace::facts::script_here(
+                script(Some(route([192, 168, 4], None))),
+                network_key
+            ),
+            None,
+            "no key before ARP"
+        );
+        assert_eq!(
+            aterm_netplace::facts::script_here(script(None), network_key),
+            None
+        );
     }
 
     #[test]
@@ -235,7 +257,7 @@ mod tests {
         let root = aterm_tempfile::tempdir().unwrap();
         let paths = Paths::for_home(root.path());
         assert_eq!(read(&paths), None);
-        let here = "aabbcc112233@192.168.4.0/24";
+        let here = "n00112233445566aa";
         let absent = Verdict {
             at: 1_000,
             heard: Heard::Absent,
@@ -274,10 +296,14 @@ mod tests {
 
     #[test]
     fn an_absent_stands_on_its_gateway_not_on_a_twin_subnet() {
-        let subnet = "192.168.1.0/24";
-        let here = network_key_of(Some(subnet.into()), Some(&[0xaa, 0xbb, 0xcc, 0, 0, 1])).unwrap();
-        let twin =
-            network_key_of(Some(subnet.into()), Some(&[0xde, 0xad, 0xbe, 0xef, 0, 2])).unwrap();
+        let key = |hw: &[u8]| {
+            aterm_netplace::NetworkId::of(&route([192, 168, 1], Some(hw)))
+                .unwrap()
+                .as_str()
+                .to_owned()
+        };
+        let here = key(&[0xaa, 0xbb, 0xcc, 0, 0, 1]);
+        let twin = key(&[0xde, 0xad, 0xbe, 0xef, 0, 2]);
         assert_ne!(
             here, twin,
             "two gateways numbering one subnet are two networks"
@@ -288,8 +314,8 @@ mod tests {
             network: here.clone(),
         };
         assert_eq!(absent.standing(&here, 1_001), Some(&Heard::Absent));
-        // The negative control is the pre-SYNC-1 key (subnet alone): there the stale Absent would
-        // stand on the new network and block the vault. With the gateway in the key it does not.
+        // The negative control is a key of the subnet alone: there the stale Absent would stand on
+        // the new network and block the vault. With the gateway in the key it does not.
         assert_eq!(absent.standing(&twin, 1_001), None);
     }
 
@@ -297,7 +323,7 @@ mod tests {
     fn a_local_network_grant_forgets_the_kept_look() {
         let root = aterm_tempfile::tempdir().unwrap();
         let paths = Paths::for_home(root.path());
-        let here = "aabbcc112233@192.168.4.0/24";
+        let here = "n00112233445566aa";
         write(
             &paths,
             &Verdict {
@@ -320,11 +346,13 @@ mod tests {
         let file = paths.dir.join(FILE);
         crate::fsx::ensure_private_dir(&paths.dir).unwrap();
         for line in [
-            "1000 maybe aabbcc@192.168.4.0/24\n",  // an unknown word
-            "1000 absent aabbcc@192.168.4.0/24\n", // an older build's failed look
-            "1000 elsewhere 192.168.4.0/24\n",     // pre-SYNC-1 subnet-only key: dropped
-            "1000 found aabbcc@192.168.4.0/24\n",  // Found missing its url and signer
-            "1000 found aabbcc@192.168.4.0/24 https://v\n", // Found missing its signer
+            "1000 maybe n00112233445566aa\n",               // an unknown word
+            "1000 absent n00112233445566aa\n",              // an older build's failed look
+            "1000 elsewhere 192.168.4.0/24\n",              // a subnet-only key: dropped
+            "1000 elsewhere aabbcc112233@192.168.4.0/24\n", // an earlier build's key: dropped
+            "1000 elsewhere w00112233445566aa\n",           // a weak id (no gateway read): dropped
+            "1000 found n00112233445566aa\n",               // Found missing its url and signer
+            "1000 found n00112233445566aa https://v\n",     // Found missing its signer
         ] {
             std::fs::write(&file, line).unwrap();
             assert_eq!(read(&paths), None, "{line:?}");

@@ -20,7 +20,7 @@ pub const MIN_FREE_DISK_GIB: u64 = 10;
 pub fn trust_stage2_bin() -> Result<PathBuf> {
     let pinned = pin_first_success(&PINNED, resolve_trust_stage2_bin)?;
     if LEASE_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
-        hold_toolchain_lease(&pinned);
+        lease_toolchain_checked(&pinned).map_err(Error::new)?;
     }
     Ok(pinned)
 }
@@ -30,9 +30,15 @@ static PINNED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 /// Pin `dir` as this process's Trust toolchain before anything resolves one.
 ///
 /// # Errors
-/// This process already pinned another toolchain.
+/// The directory cannot be resolved, or this process already pinned another toolchain.
 pub fn pin_trust_stage2_bin(dir: &Path) -> Result<()> {
-    pin_into(&PINNED, dir)
+    let dir = canonical_toolchain(dir)?;
+    pin_into(&PINNED, &dir)
+}
+
+fn canonical_toolchain(dir: &Path) -> Result<PathBuf> {
+    dir.canonicalize()
+        .map_err(|e| Error::new(format!("resolve toolchain {}: {e}", dir.display())))
 }
 
 fn pin_into(cell: &std::sync::OnceLock<PathBuf>, dir: &Path) -> Result<()> {
@@ -50,27 +56,56 @@ fn pin_into(cell: &std::sync::OnceLock<PathBuf>, dir: &Path) -> Result<()> {
 
 static LEASE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Arm [`hold_toolchain_lease`].
+/// Arm [`lease_toolchain_checked`] for every subsequent toolchain resolution.
 pub fn arm_toolchain_lease() {
     LEASE_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// [`hold_toolchain_lease`] on `dir`, for `ship release`.
-pub fn lease_toolchain(dir: &Path) {
-    hold_toolchain_lease(dir);
+/// Hold the selected compiler before inspecting it; refuse a store lease failure.
+/// # Errors
+/// The directory cannot be resolved, or the store entry's lease cannot be acquired.
+pub fn lease_toolchain_checked(dir: &Path) -> std::result::Result<(), String> {
+    static LEASES: std::sync::Mutex<std::collections::BTreeMap<PathBuf, atpkg::lease::Lease>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let dir = dir
+        .canonicalize()
+        .map_err(|e| format!("resolve toolchain {} before leasing: {e}", dir.display()))?;
+    let mut leases = LEASES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if leases.contains_key(&dir) {
+        return Ok(());
+    }
+    let home = aterm_types::dirs::home_dir();
+    let configured = atpkg::config::load().prefix_path(home.as_deref());
+    let Some(layout) = atpkg::store::resolve(configured.as_deref()) else {
+        return Ok(());
+    };
+    retain_cut_lease(&mut leases, &layout.prefix, &dir)
 }
 
-fn hold_toolchain_lease(dir: &Path) {
-    static LEASE: std::sync::OnceLock<Option<atpkg::lease::Lease>> = std::sync::OnceLock::new();
-    LEASE.get_or_init(|| {
-        let home = aterm_types::dirs::home_dir();
-        let configured = atpkg::config::load().prefix_path(home.as_deref());
-        let layout = atpkg::store::resolve(configured.as_deref())?;
-        take_cut_lease(&layout.prefix, dir)
-    });
+fn retain_cut_lease(
+    leases: &mut std::collections::BTreeMap<PathBuf, atpkg::lease::Lease>,
+    prefix: &Path,
+    dir: &Path,
+) -> std::result::Result<(), String> {
+    if let std::collections::btree_map::Entry::Vacant(entry) = leases.entry(dir.to_path_buf())
+        && let Some(lease) = take_cut_lease_checked(prefix, dir)?
+    {
+        entry.insert(lease);
+    }
+    Ok(())
 }
 
+#[cfg(test)]
 fn take_cut_lease(prefix: &Path, dir: &Path) -> Option<atpkg::lease::Lease> {
+    take_cut_lease_checked(prefix, dir).unwrap()
+}
+
+fn take_cut_lease_checked(
+    prefix: &Path,
+    dir: &Path,
+) -> std::result::Result<Option<atpkg::lease::Lease>, String> {
     let who = format!(
         "aterm-release (pid {}) \u{2014} a release cut",
         std::process::id()
@@ -81,17 +116,13 @@ fn take_cut_lease(prefix: &Path, dir: &Path) -> Option<atpkg::lease::Lease> {
                 "release: {} held for this cut; an unattended trust update waits for it",
                 lease.subject().describe()
             );
-            Some(lease)
+            Ok(Some(lease))
         }
-        Ok(None) => None,
-        Err(e) => {
-            eprintln!(
-                "release: warn \u{2014} toolchain not held ({e}); an update during this cut can \
-                 replace {}",
-                dir.display()
-            );
-            None
-        }
+        Ok(None) => Ok(None),
+        Err(e) => Err(format!(
+            "toolchain lease refused for {}: {e}",
+            dir.display()
+        )),
     }
 }
 
@@ -110,14 +141,23 @@ fn resolve_trust_stage2_bin() -> Result<PathBuf> {
     let explicit = env::var_os("TRUST_STAGE2_BIN").map(PathBuf::from);
     let home = aterm_types::dirs::home_dir().unwrap_or_default();
     let path = env::var_os("PATH").unwrap_or_default();
-    let found = atpkg::toolchain::Toolchain::discover(
+    let mut before_probe = |dir: &Path| {
+        if LEASE_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
+            lease_toolchain_checked(dir)
+        } else {
+            Ok(())
+        }
+    };
+    let found = atpkg::toolchain::Toolchain::discover_guarded(
         explicit.as_deref(),
         &home,
         &path,
         Some(atpkg::seam::DEFAULT_SEAM),
-    );
+        &mut before_probe,
+    )
+    .map_err(Error::new)?;
     if found.have_targo() && found.stage2_dir.join("trustc").is_file() {
-        return Ok(found.stage2_dir);
+        return canonical_toolchain(&found.stage2_dir);
     }
     let looked = found
         .refused
@@ -1000,6 +1040,8 @@ pub struct VerifiedRecord {
     pub commit: String,
     /// SHA-256 of the executable it judged (`aterm.app/Contents/MacOS/aterm`).
     pub executable: String,
+    /// Compiler, standard-library and SDK content identity during the checks.
+    pub inputs: String,
 }
 
 fn verified_path(git: &dyn GitRunner, commit: &str) -> Result<(PathBuf, String)> {
@@ -1015,11 +1057,17 @@ fn verified_path(git: &dyn GitRunner, commit: &str) -> Result<(PathBuf, String)>
 ///
 /// # Errors
 /// git cannot name the tree or the common dir; any write.
-pub fn record_verified(git: &dyn GitRunner, commit: &str, macho_sha256: &str) -> Result<PathBuf> {
+pub fn record_verified(
+    git: &dyn GitRunner,
+    commit: &str,
+    macho_sha256: &str,
+    inputs: &str,
+) -> Result<PathBuf> {
     let (path, _) = verified_path(git, commit)?;
     let record = VerifiedRecord {
         commit: commit.to_string(),
         executable: macho_sha256.to_string(),
+        inputs: inputs.to_string(),
     };
     let text = aterm_toml::to_string(&record)
         .map_err(|e| Error::new(format!("serialize the verified record: {e}")))?;
@@ -1033,6 +1081,15 @@ pub fn record_verified(git: &dyn GitRunner, commit: &str, macho_sha256: &str) ->
 /// # Errors
 /// git cannot name the tree, or the record cannot be read at all: no answer either way.
 pub fn verified(git: &dyn GitRunner, commit: &str, macho_sha256: &str) -> Result<(bool, String)> {
+    verified_with_inputs(git, commit, macho_sha256, crate::build_inputs::current)
+}
+
+pub(crate) fn verified_with_inputs(
+    git: &dyn GitRunner,
+    commit: &str,
+    macho_sha256: &str,
+    inputs: impl FnOnce() -> std::result::Result<String, String>,
+) -> Result<(bool, String)> {
     if let Some(accepted) =
         crate::accepted_measure::accepted(git, commit, macho_sha256).map_err(Error::new)?
     {
@@ -1070,6 +1127,12 @@ pub fn verified(git: &dyn GitRunner, commit: &str, macho_sha256: &str) -> Result
             ),
         ));
     }
+    if record.inputs != inputs().map_err(Error::new)? {
+        return Ok((
+            false,
+            "compiler or SDK bytes changed since release verification".into(),
+        ));
+    }
     Ok((
         true,
         format!(
@@ -1087,6 +1150,14 @@ pub fn verified(git: &dyn GitRunner, commit: &str, macho_sha256: &str) -> Result
 /// # Errors
 /// Not verified, or not built yet, with the remedy; and a record or journal that cannot be read.
 pub fn verify_gate_at(git: &dyn GitRunner, commit: &str) -> Result<String> {
+    verify_gate_at_with_inputs(git, commit, crate::build_inputs::current)
+}
+
+fn verify_gate_at_with_inputs(
+    git: &dyn GitRunner,
+    commit: &str,
+    inputs: impl FnOnce() -> std::result::Result<String, String>,
+) -> Result<String> {
     let journal = crate::release::Journal::load(
         &crate::release::release_dir(git)
             .map_err(Error::new)?
@@ -1105,7 +1176,7 @@ pub fn verify_gate_at(git: &dyn GitRunner, commit: &str) -> Result<String> {
             crate::release::RELEASE_COMMAND
         )));
     };
-    match verified(git, commit, &artifact.macho_sha256)? {
+    match verified_with_inputs(git, commit, &artifact.macho_sha256, inputs)? {
         (true, line) => Ok(line),
         (false, why) => Err(Error::new(format!(
             "the bundle of {} (build {}) has not passed `verify release` ({why}) — `{}` runs \
@@ -1295,6 +1366,15 @@ fn precheck_with(
     rev: &str,
     stamp: std::result::Result<&str, &crate::cutter::NotOwn>,
 ) -> Result<Precheck> {
+    precheck_with_judge(git, rev, stamp, |commit| verify_gate_at(git, commit))
+}
+
+fn precheck_with_judge(
+    git: &dyn GitRunner,
+    rev: &str,
+    stamp: std::result::Result<&str, &crate::cutter::NotOwn>,
+    verify: impl FnOnce(&str) -> Result<String>,
+) -> Result<Precheck> {
     let mut found = Precheck::of(git, rev)?;
     let (commit, version) = (found.commit.clone(), found.version.clone());
     let identity = match own_cutter_of(git, stamp, &commit) {
@@ -1362,7 +1442,7 @@ fn precheck_with(
         },
         PrecheckGate {
             name: "verify release",
-            outcome: answer(verify_gate_at(git, &commit)),
+            outcome: answer(verify(&commit)),
         },
     ];
     Ok(found)
@@ -2400,8 +2480,8 @@ pub(crate) fn release_at_least(release: &str, floor: &str) -> Result<bool> {
     }
 }
 
-/// The release's fixture generator's own target directory in the tree it runs in.
-pub const HANDOFF_FIXTURE_GUARD_TARGET: &str = "target-fixture-guard";
+/// The release's retained fixture-generator target, outside filesystem indexing.
+pub const HANDOFF_FIXTURE_GUARD_TARGET: &str = "target/.ubd/fixture-guard.noindex";
 
 /// `targo --unverified test -p aterm-gui --lib --target-dir <target> -- <args>` in `tree`, with the build's steering variables (`RUSTFLAGS`, `RUSTC`, …) removed, as for the release build.
 pub(crate) fn aterm_gui_lib_test(
@@ -2829,6 +2909,35 @@ mod cut_lease_tests {
     use super::*;
 
     #[test]
+    fn a_store_lease_io_failure_is_not_reported_as_an_unmanaged_compiler() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let bin = root.path().join("store/trust/9192/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(root.path().join(atpkg::lease::DIR), "blocked").unwrap();
+        let mut held = std::collections::BTreeMap::new();
+        assert!(
+            retain_cut_lease(&mut held, root.path(), &bin)
+                .unwrap_err()
+                .contains("lease refused")
+        );
+        assert!(held.is_empty(), "a transient refusal is not retained");
+        assert!(
+            take_cut_lease_checked(root.path(), &root.path().join("external"))
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_file(root.path().join(atpkg::lease::DIR)).unwrap();
+        retain_cut_lease(&mut held, root.path(), &bin).unwrap();
+        retain_cut_lease(&mut held, root.path(), &bin).unwrap();
+        assert_eq!(held.len(), 1, "the acquired lease is retained once");
+        let subject = atpkg::lease::Subject::build("trust", 9192).unwrap();
+        let atpkg::lease::Holders::Held(who) = atpkg::lease::holders(root.path(), &subject) else {
+            panic!("the successful retry holds the compiler");
+        };
+        assert_eq!(who.len(), 1);
+    }
+
+    #[test]
     fn a_cut_leases_the_toolchain_it_pinned_and_nothing_else_does() {
         assert!(
             !LEASE_ARMED.load(std::sync::atomic::Ordering::Relaxed),
@@ -3172,6 +3281,24 @@ mod toolchain_pin_tests {
 
     use super::*;
     use std::sync::OnceLock;
+
+    #[cfg(unix)]
+    #[test]
+    fn toolchain_aliases_share_a_pin_but_different_builds_do_not() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let real = root.path().join("store/1/bin");
+        let other = root.path().join("store/2/bin");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let alias = root.path().join("current");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let cell = OnceLock::new();
+        pin_into(&cell, &canonical_toolchain(&real).unwrap()).unwrap();
+        pin_into(&cell, &canonical_toolchain(&alias).unwrap()).unwrap();
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&other, &alias).unwrap();
+        assert!(pin_into(&cell, &canonical_toolchain(&alias).unwrap()).is_err());
+    }
 
     #[test]
     fn the_first_resolution_is_the_one_the_whole_process_gets() {
@@ -4327,7 +4454,10 @@ mod published_commit_tests {
         let git = repo.git();
         let check = |rev: &str| {
             let own = repo.run(&["rev-parse", rev]);
-            precheck_with(&git, rev, Ok(&own)).expect("a releasable commit")
+            precheck_with_judge(&git, rev, Ok(&own), |commit| {
+                verify_gate_at_with_inputs(&git, commit, || Ok("inputs".into()))
+            })
+            .expect("a releasable commit")
         };
 
         let found = check(&candidate);
@@ -4357,14 +4487,14 @@ mod published_commit_tests {
                 .join(crate::release::JOURNAL_FILE),
         )
         .unwrap();
-        record_verified(&git, &candidate, &macho).unwrap();
+        record_verified(&git, &candidate, &macho, "inputs").unwrap();
         let found = check(&candidate);
         assert!(found.refused().is_empty(), "{}", found.transcript());
 
         let head = check("HEAD");
         assert_eq!(head.commit, later);
         assert_eq!(head.refused(), ["handoff fixtures", "verify release"]);
-        record_verified(&git, &candidate, &"ef".repeat(32)).unwrap();
+        record_verified(&git, &candidate, &"ef".repeat(32), "inputs").unwrap();
         let found = check(&candidate);
         assert_eq!(
             found.refused(),

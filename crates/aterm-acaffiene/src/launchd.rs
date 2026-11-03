@@ -227,10 +227,25 @@ fn bundle_id_of(program: &Path) -> Option<String> {
     crate::code::own_bundle(program).and_then(|b| crate::code::bundle_identifier(&b))
 }
 
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
+fn validate_label(label: &str) -> io::Result<()> {
+    if crate::code::plain_name(label) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label:?} is not a plain launchd label"),
+        ))
+    }
+}
+
 /// Whether Enable at Startup is on for `label` ([`startup`]).
 #[must_use]
 pub fn startup_enabled(paths: &Paths, label: &str) -> bool {
-    paths.startup_plist(label).is_file()
+    crate::code::plain_name(label) && is_regular_file(&paths.startup_plist(label))
 }
 
 /// What Enable at Startup does at the next login.
@@ -275,8 +290,11 @@ impl Startup {
 /// Startup state ([`Startup::Off`], [`Startup::Disabled`], [`Startup::Blocked`], [`Startup::On`]).
 #[must_use]
 pub fn startup(paths: &Paths, label: &str, doors: &StartupDoors) -> Startup {
+    if !crate::code::plain_name(label) {
+        return Startup::Off;
+    }
     let plist = paths.startup_plist(label);
-    if !plist.is_file() {
+    if !is_regular_file(&plist) {
         Startup::Off
     } else if (doors.disabled)(label) {
         Startup::Disabled
@@ -289,9 +307,11 @@ pub fn startup(paths: &Paths, label: &str, doors: &StartupDoors) -> Startup {
 
 /// Toggle Enable at Startup for `label` and `program` ([`prune_orphans`]).
 /// # Errors
-/// The plist cannot be written or removed, or `program` is not a UTF-8 path.
+/// `label` is not a plain name, the plist cannot be written or removed, or `program` is not a
+/// UTF-8 path.
 #[cfg(unix)]
 pub fn set_startup(paths: &Paths, label: &str, program: &Path, on: bool) -> io::Result<()> {
+    validate_label(label)?;
     let plist = paths.startup_plist(label);
     if !on {
         let removed = match std::fs::remove_file(&plist) {
@@ -312,30 +332,67 @@ pub fn set_startup(paths: &Paths, label: &str, program: &Path, on: bool) -> io::
     aterm_uds::atomic_file::write(&plist, text.as_bytes(), 0o644)
 }
 
+fn check_existing_session_dir(dir: &Path) -> io::Result<bool> {
+    if let Some(parent) = dir.parent()
+        && !parent.as_os_str().is_empty()
+        && !crate::paths::existing_real_dir(parent)?
+    {
+        return Ok(false);
+    }
+    crate::paths::existing_real_dir(dir)
+}
+
 /// The person's own Enable at Startup for `label`: [`set_startup`], and a record of an off
 /// ([`Paths::startup_off_file`]) that no launch overrides ([`startup_turned_off`]); an on
 /// removes it.
 /// # Errors
 /// As [`set_startup`], or the record cannot be written or removed.
 pub fn choose_startup(paths: &Paths, label: &str, program: &Path, on: bool) -> io::Result<()> {
-    set_startup(paths, label, program, on)?;
+    validate_label(label)?;
     let record = paths.startup_off_file(label);
     if on {
+        let session_exists = match record.parent() {
+            Some(dir) => check_existing_session_dir(dir)?,
+            None => true,
+        };
+        set_startup(paths, label, program, true)?;
+        if !session_exists {
+            return Ok(());
+        }
         return match std::fs::remove_file(&record) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         };
     }
-    if let Some(dir) = record.parent() {
-        std::fs::create_dir_all(dir)?;
+    const RECORD_TEXT: &[u8] = b"Enable at Startup turned off by the person\n";
+    #[cfg(unix)]
+    {
+        if let Some(dir) = record.parent() {
+            ensure_session_dir(dir)?;
+        }
+        set_startup(paths, label, program, false)?;
+        aterm_uds::atomic_file::write(&record, RECORD_TEXT, 0o600)
     }
-    std::fs::write(&record, b"Enable at Startup turned off by the person\n")
+    #[cfg(not(unix))]
+    {
+        if let Some(dir) = record.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            crate::paths::ensure_real_dir(dir)?;
+        }
+        set_startup(paths, label, program, false)?;
+        std::fs::write(&record, RECORD_TEXT)
+    }
 }
 
 /// Whether the person turned Enable at Startup off for `label` ([`choose_startup`]).
 #[must_use]
 pub fn startup_turned_off(paths: &Paths, label: &str) -> bool {
-    paths.startup_off_file(label).is_file()
+    let record = paths.startup_off_file(label);
+    crate::code::plain_name(label)
+        && crate::paths::parent_is_real_dir(&paths.session_dir())
+        && crate::paths::parent_is_real_dir(&record)
+        && is_regular_file(&record)
 }
 
 /// Enable at Startup.
@@ -434,12 +491,23 @@ pub(crate) fn program_gone(program: &Path) -> bool {
 #[must_use]
 pub fn sweep_plist_temps(paths: &Paths) -> Vec<(std::path::PathBuf, io::Result<usize>)> {
     let mut swept = Vec::new();
-    for dir in [
-        paths.session_dir(),
-        crate::legacy::session_dir(paths),
-        paths.launch_agents(),
+    for (dir, private_state) in [
+        (paths.session_dir(), true),
+        (crate::legacy::session_dir(paths), true),
+        (paths.launch_agents(), false),
     ] {
-        match plists_with_temps(&dir) {
+        let listed = if private_state {
+            check_existing_session_dir(&dir).and_then(|exists| {
+                if exists {
+                    plists_with_temps(&dir)
+                } else {
+                    Ok(Vec::new())
+                }
+            })
+        } else {
+            plists_with_temps(&dir)
+        };
+        match listed {
             Ok(plists) => swept.extend(plists.into_iter().map(|plist| {
                 let after = aterm_uds::atomic_file::ABANDONED_AFTER;
                 let gone = aterm_uds::atomic_file::sweep_temps_beside(&plist, after);
@@ -754,6 +822,35 @@ pub fn disabled(label: &str) -> bool {
     })
 }
 
+#[cfg(unix)]
+fn ensure_session_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{
+        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    };
+    if let Some(parent) = dir.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = crate::paths::existing_real_dir(parent)?;
+    }
+    let _ = crate::paths::existing_real_dir(dir)?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_DIRECTORY)
+        .open(dir)?;
+    let meta = directory.metadata()?;
+    if !meta.is_dir() || meta.uid() != aterm_uds::peer::our_uid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not this user's directory", dir.display()),
+        ));
+    }
+    directory.set_permissions(std::fs::Permissions::from_mode(0o700))
+}
+
 /// Write the session plist at `plist` (`0644` in a `0700` directory).
 #[cfg(unix)]
 fn write_session_plist(
@@ -763,27 +860,10 @@ fn write_session_plist(
     program: &Path,
     bundle_id: Option<&str>,
 ) -> io::Result<()> {
-    use std::os::unix::fs::{
-        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
-    };
+    validate_label(label)?;
     utf8(program)?;
     if let Some(dir) = plist.parent() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-        let directory = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_DIRECTORY)
-            .open(dir)?;
-        let meta = directory.metadata()?;
-        if !meta.is_dir() || meta.uid() != aterm_uds::peer::our_uid() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("{} is not this user's directory", dir.display()),
-            ));
-        }
-        directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        ensure_session_dir(dir)?;
     }
     let text = plist_text(label, program, &paths.log_file(), bundle_id);
     aterm_uds::atomic_file::write(plist, text.as_bytes(), 0o644)
@@ -1381,5 +1461,99 @@ mod tests {
         assert_eq!(print_pid("\tpid = 42\n"), Some(42));
         assert_eq!(print_pid("\tpid = +42\n"), None);
         assert_eq!(print_pid("\tpid = -1\n"), None);
+    }
+
+    /// STARTUP-OFF AND LOGIN PLIST CHECKS REFUSE DIRECTORY AND FILE SYMLINKS: `choose_startup`
+    /// writes `.startup-off` atomically (`0600`) inside a validated `0700` session directory
+    /// without following symlinks, and `startup_enabled`, `startup`, and `startup_turned_off`
+    /// inspect `symlink_metadata` rather than following symlinks.
+    /// NEGATIVE CONTROL: a regular `.startup-off` and regular login plist round-trip cleanly.
+    #[cfg(unix)]
+    #[test]
+    fn choose_startup_and_startup_readers_refuse_symlinks() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = Paths {
+            state_dir: root.path().join("state"),
+            home: root.path().join("home"),
+            logs_dir: root.path().join("logs"),
+        };
+        let label = "com.aterm.aterm.acaffiene.dev.0123abcd";
+        let program = Path::new("/t/aterm");
+        let doors = StartupDoors {
+            blocks: |_| false,
+            disabled: |_| false,
+            enable: |_| Ok(()),
+        };
+
+        choose_startup(&paths, label, program, false).expect("record off");
+        assert!(startup_turned_off(&paths, label));
+        let record = paths.startup_off_file(label);
+        let mode = |p: &Path| {
+            std::fs::symlink_metadata(p)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(record.parent().expect("session dir")), 0o700);
+        assert_eq!(mode(&record), 0o600);
+
+        let keep = root.path().join("keep");
+        std::fs::write(&keep, b"preserve").expect("seed keep");
+        std::fs::remove_file(&record).expect("remove regular record");
+        std::os::unix::fs::symlink(&keep, &record).expect("symlink record");
+        assert!(
+            !startup_turned_off(&paths, label),
+            "symlinked startup-off record must not count as regular"
+        );
+        choose_startup(&paths, label, program, false).expect("atomic replace over symlink");
+        assert_eq!(std::fs::read(&keep).expect("keep intact"), b"preserve");
+        assert!(startup_turned_off(&paths, label));
+
+        choose_startup(&paths, label, program, true).expect("record on");
+        assert!(!startup_turned_off(&paths, label));
+        assert!(startup_enabled(&paths, label));
+        assert_eq!(startup(&paths, label, &doors), Startup::On);
+
+        let plist = paths.startup_plist(label);
+        let fake_plist = root.path().join("fake.plist");
+        std::fs::write(&fake_plist, b"<plist/>").expect("fake plist");
+        std::fs::remove_file(&plist).expect("remove regular plist");
+        std::os::unix::fs::symlink(&fake_plist, &plist).expect("symlink plist");
+        assert!(!startup_enabled(&paths, label));
+        assert_eq!(startup(&paths, label, &doors), Startup::Off);
+
+        let aliased = Paths {
+            state_dir: root.path().join("alias-state"),
+            ..paths.clone()
+        };
+        std::fs::create_dir_all(&aliased.state_dir).expect("alias state");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, aliased.session_dir()).expect("symlink session dir");
+        let outside_record = outside.join(format!("{label}.startup-off"));
+        std::fs::write(&outside_record, b"do-not-delete").expect("seed outside record");
+        assert!(
+            choose_startup(&aliased, label, program, false).is_err(),
+            "choose_startup(off) must refuse symlinked session_dir"
+        );
+        assert!(
+            choose_startup(&aliased, label, program, true).is_err(),
+            "choose_startup(on) must refuse symlinked session_dir without unlinking outside record"
+        );
+        assert!(
+            outside_record.exists(),
+            "outside record must remain untouched"
+        );
+
+        for bad_label in ["", ".", "..", "../escape", "a/b", "a\\b", "x.partial"] {
+            assert!(set_startup(&paths, bad_label, program, true).is_err());
+            assert!(choose_startup(&paths, bad_label, program, true).is_err());
+            assert!(choose_startup(&paths, bad_label, program, false).is_err());
+            assert!(!startup_enabled(&paths, bad_label));
+            assert!(!startup_turned_off(&paths, bad_label));
+            assert_eq!(startup(&paths, bad_label, &doors), Startup::Off);
+        }
     }
 }

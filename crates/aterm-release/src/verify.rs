@@ -577,8 +577,8 @@ pub fn post_publish(
     if let Some(local) = local_manifest
         && local.is_file()
     {
-        let local_bytes =
-            fs::read(local).map_err(|e| Error::new(format!("read {}: {e}", local.display())))?;
+        let local_bytes = crate::durable::read_file(local)
+            .map_err(|e| Error::new(format!("read {}: {e}", local.display())))?;
         match Manifest::parse(&String::from_utf8_lossy(&local_bytes)) {
             Ok(lm) if lm.build_number == best.build => {
                 if local_bytes != best.text.as_bytes() {
@@ -602,7 +602,7 @@ pub fn post_publish(
     }
 
     let local_signature = match signature.local_signature {
-        Some(path) if path.is_file() => Some(fs::read(path).map_err(|error| {
+        Some(path) if path.is_file() => Some(crate::durable::read_file(path).map_err(|error| {
             Error::new(format!("read local signature {}: {error}", path.display()))
         })?),
         _ => None,
@@ -828,7 +828,7 @@ pub fn run_status(repo: &Path) -> Result<()> {
     println!("aterm-release · status ({slug})");
     step("signing", signing_requirement());
 
-    let cargo_text = fs::read_to_string(repo.join("Cargo.toml"))
+    let cargo_text = crate::durable::read_text(&repo.join("Cargo.toml"))
         .map_err(|e| Error::new(format!("read Cargo.toml: {e}")))?;
     let full = publish::workspace_version(&cargo_text)?;
     let release_version = publish::release_version_from_workspace(&full)?;
@@ -837,7 +837,7 @@ pub fn run_status(repo: &Path) -> Result<()> {
         &format!("{full} (Cargo.toml [workspace.package] MAJOR.MINOR.0 — the ONE version)"),
     );
 
-    let ledger_text = fs::read_to_string(repo.join(ledger::LEDGER_FILE))
+    let ledger_text = crate::durable::read_text(&repo.join(ledger::LEDGER_FILE))
         .map_err(|e| Error::new(format!("read {}: {e}", ledger::LEDGER_FILE)))?;
     let records = ledger::parse(&ledger_text)?;
     let tail = ledger::tail(&ledger_text)?;
@@ -1474,7 +1474,7 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
 }
 
 fn origin_slug_of(repo: &Path) -> Result<String> {
-    let cargo_text = fs::read_to_string(repo.join("Cargo.toml"))
+    let cargo_text = crate::durable::read_text(&repo.join("Cargo.toml"))
         .map_err(|e| Error::new(format!("read Cargo.toml: {e}")))?;
     publish::repo_slug(&cargo_text).ok_or_else(|| {
         Error::new(

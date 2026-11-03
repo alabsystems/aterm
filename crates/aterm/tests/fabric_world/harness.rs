@@ -460,6 +460,13 @@ pub fn cap_line(grant: &str) -> String {
     format!("{} {hex}\n", cap.filter)
 }
 
+/// Write a cap file as every aterm that mints one does: owner-only, what its readers require.
+pub fn write_cap(path: &std::path::Path, ring: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::write(path, ring).expect("write a cap file");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod a cap");
+}
+
 /// Returns the capability grant ring for `node` ([`aterm_link::enable::node_grants`]).
 pub fn node_grants(node: &str) -> Vec<String> {
     aterm_link::enable::node_grants(FLEET, node)
@@ -477,11 +484,19 @@ pub fn prepare_gui_environment(cmd: &mut Command) {
     for (name, wait) in TEST_WAITS {
         cmd.env(name, wait.as_millis().to_string());
     }
+    cmd.env(HOST_SLEEP.0, HOST_SLEEP.1);
 }
 
 /// The bounds every child of a test has in place of the product's ([`prepare_gui_environment`],
 /// [`scratch_spawnfd`]).
 const TEST_WAITS: [(&str, Duration); 4] = [STALE_HORIZON, ACK_WAIT, LIVE_WAIT, FABRIC_IO_WAIT];
+
+/// The sleep every instance a test starts reads in its hosted harness loops
+/// ([`aterm_types::domain::ENV_DEBUG_HOST_SLEEP`]), set where [`TEST_WAITS`] are: none, a host
+/// that never sleeps, so a Mac with its lid closed, in and out of dark wake every few seconds,
+/// puts no wake to settle into what a test waits on; `owner_ask`'s instances, which build their
+/// own environment, set it beside its other seams.
+const HOST_SLEEP: (&str, &str) = (aterm_types::domain::ENV_DEBUG_HOST_SLEEP, "none");
 
 /// Owed-answer horizon (`ATERM_FABRIC_STALE_AFTER_MS`) set by [`prepare_gui_environment`].
 pub const STALE_HORIZON: (&str, Duration) = ("ATERM_FABRIC_STALE_AFTER_MS", VERB_DEADLINE);
@@ -1192,7 +1207,7 @@ impl World {
         let cap_path = tmp.join("node.cap");
         let grants = grants.map_or_else(|| node_grants(&node), |f| f(&node));
         let caps: String = grants.iter().map(|g| cap_line(g)).collect();
-        std::fs::write(&cap_path, caps).expect("write the node cap file");
+        write_cap(&cap_path, caps);
 
         let mut fabric_cmd = format!(
             "{} link serve --fleet {FLEET} --broker {broker_sock} --cap-file {} --state {}",
@@ -2059,7 +2074,8 @@ pub fn scratch_spawnfd<'a>(
     for (name, wait) in TEST_WAITS {
         cmd.env(name, wait.as_millis().to_string());
     }
-    cmd.envs(scratch_cli_env(tmp))
+    cmd.env(HOST_SLEEP.0, HOST_SLEEP.1)
+        .envs(scratch_cli_env(tmp))
 }
 
 fn scratch_cli_env(tmp: &Path) -> [(&'static str, PathBuf); 3] {
@@ -2176,7 +2192,7 @@ impl Fleet {
     pub fn cap_file(&self, name: &str, grants: &[String]) -> PathBuf {
         let path = self.tmp.join(format!("{name}.cap"));
         let caps: String = grants.iter().map(|g| cap_line(g)).collect();
-        std::fs::write(&path, caps).expect("write a cap file");
+        write_cap(&path, caps);
         path
     }
 
@@ -2270,7 +2286,7 @@ impl Node {
 
         let cap_file = tmp.join("node.cap");
         let caps: String = node_grants(&node).iter().map(|g| cap_line(g)).collect();
-        std::fs::write(&cap_file, caps).expect("write the node cap file");
+        write_cap(&cap_file, caps);
 
         let mut fabric_cmd = format!(
             "{} link serve --fleet {FLEET} --broker {} --cap-file {} --state {}",

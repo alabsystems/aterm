@@ -92,6 +92,15 @@ impl App {
         tab: TabId,
         field: MetaField,
     ) -> bool {
+        // A press on the Workers chip means the worker it shows, whose name it reads.
+        let tab = self
+            .windows
+            .get(&window)
+            .and_then(|ws| {
+                let shown = ws.tab_set.active().filter(|active| active.parked)?;
+                (ws.tab_set.home() == Some(tab)).then_some(shown.id)
+            })
+            .unwrap_or(tab);
         let Some(index) = self.tab_index_for_id(window, tab) else {
             aterm_log::info!("rename dropped: tab {tab} no longer exists in its window");
             return false;
@@ -130,10 +139,16 @@ impl App {
                 .unwrap_or_default(),
             _ => field.wire_name().to_string(),
         };
+        // A worker's editor stands over the chip that stands for it.
+        let chip = self
+            .windows
+            .get(&window)
+            .and_then(|ws| ws.tab_set.chip_of(tab))
+            .unwrap_or(tab);
         let native = match self._toolbars.get(&window) {
             Some(handle) => self
                 .apprt
-                .begin_tab_rename(handle, tab, session, &seed, &placeholder),
+                .begin_tab_rename(handle, chip, session, &seed, &placeholder),
             None => false,
         };
         let surface = if native {

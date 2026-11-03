@@ -73,6 +73,7 @@ fn the_logs_task_words_mirror_the_task_record() {
             TaskState::Done => "done",
             TaskState::Exited => "exited",
             TaskState::Stalled => "stalled",
+            TaskState::Failed => "failed",
         };
         assert_eq!(state.as_str(), word);
         assert_eq!(lookup(STATE_WORDS, word), Some(word), "{state:?}");
@@ -292,6 +293,7 @@ fn a_carried_record_keeps_only_the_time_it_was_awake() {
         why: Some("held"),
         checked: None,
         exit: None,
+        finished: false,
         result_bytes: 0,
         result_path: None,
         attention: false,
@@ -300,6 +302,7 @@ fn a_carried_record_keeps_only_the_time_it_was_awake() {
         started_unix_ms: 4_000,
         started: t0,
         entered: 3,
+        carried_entered: None,
         agent: None,
         trusted_cwd: None,
         fact: None,
@@ -350,6 +353,7 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         why: Some("exit"),
         checked: None,
         exit: Some(-2),
+        finished: false,
         result_bytes: 9,
         result_path: Some(tasks().join("r 1.txt")),
         attention: true,
@@ -358,6 +362,7 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         started_unix_ms: 10_000,
         started: t0,
         entered: 7,
+        carried_entered: None,
         agent: Some(aterm_phase::Program::Agy),
         trusted_cwd: Some(folder("w/my proj")),
         fact: None,
@@ -509,6 +514,7 @@ fn the_reply_event_and_status_spellings() {
         why: Some("landed"),
         checked: None,
         exit: None,
+        finished: false,
         result_bytes: 120,
         result_path: None,
         attention: false,
@@ -517,6 +523,7 @@ fn the_reply_event_and_status_spellings() {
         started_unix_ms: 0,
         started: Instant::now(),
         entered: 3,
+        carried_entered: None,
         agent: Some(aterm_phase::Program::Agy),
         trusted_cwd: Some(folder("w")),
         fact: None,
@@ -527,12 +534,18 @@ fn the_reply_event_and_status_spellings() {
         fields.starts_with("rev=3 state=done from=ctl since_ms="),
         "{fields}"
     );
-    assert!(fields.ends_with(" result_bytes=120 why=landed"), "{fields}");
+    assert!(
+        fields.ends_with(" result_bytes=120 conclusion=finished why=landed"),
+        "{fields}"
+    );
     assert_eq!(status_tokens(Some(&record)), "task_state=done task_rev=3");
     assert_eq!(status_tokens(None), "task_state=- task_rev=0");
     assert_eq!(
         await_row(SID, Some(&record), "idle", "-", "-", false),
-        format!("@{SID} rev=3 state=done agent=idle program_state=- attention=- result_bytes=120")
+        format!(
+            "@{SID} rev=3 state=done agent=idle program_state=- attention=- result_bytes=120 \
+             conclusion=finished why=landed"
+        )
     );
     assert_eq!(
         await_row(
@@ -920,7 +933,8 @@ fn the_task_verb_reads_marks_and_refuses_an_edge_the_mark() {
     assert!(read.starts_with("OK task rev=2 state=done from="), "{read}");
     assert!(
         read.ends_with(
-            " result_bytes=7 why=landed agent=- program_state=- attention=stuck%20on%20CI\n"
+            " result_bytes=7 conclusion=finished why=landed agent=- program_state=- \
+             attention=stuck%20on%20CI\n"
         ),
         "{read}"
     );
@@ -1601,6 +1615,7 @@ fn the_carry_holds_the_fact_word_and_its_rev_and_reads_them_leniently() {
         why: None,
         checked: None,
         exit: None,
+        finished: false,
         result_bytes: 0,
         result_path: None,
         attention: false,
@@ -1609,6 +1624,7 @@ fn the_carry_holds_the_fact_word_and_its_rev_and_reads_them_leniently() {
         started_unix_ms: 10_000,
         started: t0,
         entered: 1,
+        carried_entered: None,
         agent: None,
         trusted_cwd: None,
         fact: hold_room(2),
@@ -2190,4 +2206,512 @@ fn unicode_receipts_mark_done_and_roundtrip_through_records_and_result_sidecars(
             sidecar
         );
     }
+}
+
+/// A CONCLUSION STANDS EXACTLY WHERE A TASK IS TERMINAL, over every state and every `why=`, so what
+/// wakes a waiter is what can be read; and each state reads as the record says it ended.
+#[test]
+fn a_conclusion_stands_exactly_where_a_task_is_terminal() {
+    for state in TaskState::ALL {
+        for why in &[false, true] {
+            assert_eq!(
+                state.is_terminal(),
+                state.conclusion(*why).is_some(),
+                "{state:?} finished={why}"
+            );
+        }
+    }
+    for (state, why, conclusion) in [
+        (TaskState::Working, None, None),
+        (TaskState::Done, Some("landed"), Some(Conclusion::Finished)),
+        (TaskState::Done, None, Some(Conclusion::Finished)),
+        (TaskState::Exited, Some("exit"), Some(Conclusion::Failed)),
+        (TaskState::Exited, None, Some(Conclusion::Failed)),
+        (
+            TaskState::Stalled,
+            Some("startup"),
+            Some(Conclusion::Failed),
+        ),
+        (
+            TaskState::Failed,
+            Some(WHY_COULD_NOT_FINISH),
+            Some(Conclusion::Failed),
+        ),
+    ] {
+        let record = TaskMark {
+            why,
+            ..TaskMark::new(state)
+        }
+        .apply(None, false, Instant::now(), 1_000)
+        .0;
+        assert_eq!(record.conclusion(), conclusion, "{state:?} why={why:?}");
+    }
+    assert_eq!(Conclusion::Finished.word(), "finished");
+    assert_eq!(Conclusion::Failed.word(), "failed");
+}
+
+/// `conclusion=` AND `why=` ARE ON THE STATUS FIELDS AND THE `await task` ROW once the task ended,
+/// and on no carry row, which holds what it is worked out from. A tab closed on a task with no
+/// conclusion reads failed. NEGATIVE CONTROL: a working record prints none.
+#[test]
+fn the_wire_says_how_a_task_ended() {
+    let t0 = Instant::now();
+    let working = TaskMark::new(TaskState::Working)
+        .apply(None, false, t0, 1_000)
+        .0;
+    assert!(!working.wire_fields().contains("conclusion="));
+    let row = |record: &TaskRecord, closed: bool| {
+        await_row(SID, Some(record), "claude", "-", "-", closed)
+    };
+    assert!(!row(&working, false).contains("conclusion="));
+    assert!(row(&working, true).contains(" conclusion=failed"), "closed");
+
+    let failed = TaskMark {
+        why: Some(WHY_COULD_NOT_FINISH),
+        ..TaskMark::new(TaskState::Failed)
+    }
+    .apply(Some(&working), false, t0, 2_000)
+    .0;
+    let fields = failed.wire_fields();
+    assert!(fields.contains("state=failed"), "{fields}");
+    assert!(fields.contains(" conclusion=failed"), "{fields}");
+    assert!(fields.contains(" why=could-not-finish"), "{fields}");
+    let row_words = row(&failed, false);
+    assert!(row_words.contains(" conclusion=failed"), "{row_words}");
+    assert!(row_words.contains(" why=could-not-finish"), "{row_words}");
+    let carried = failed.carry_row(t0);
+    assert!(!carried.contains("conclusion="), "{carried}");
+    assert!(carried.contains("failed"), "{carried}");
+
+    let landed = TaskMark {
+        why: Some(WHY_LANDED),
+        ..TaskMark::new(TaskState::Done)
+    }
+    .apply(Some(&working), false, t0, 2_000)
+    .0;
+    assert!(row(&landed, false).contains(" conclusion=finished"));
+    assert!(
+        row(&landed, true).contains(" conclusion=finished"),
+        "closed after"
+    );
+    assert_eq!(
+        parse(" failed why=could-not-finish").map(|m| m.state),
+        Ok(TaskState::Failed)
+    );
+    for word in [
+        WHY_COULD_NOT_FINISH,
+        WHY_OFF,
+        WHY_OFF_CTL,
+        WHY_EXPIRED,
+        WHY_REPEATED,
+        WHY_EXIT,
+    ] {
+        assert!(TASK_WHY.contains(&word), "{word}");
+        assert!(parse(&format!(" failed why={word}")).is_ok(), "{word}");
+    }
+}
+
+/// AN EXIT DOES NOT REWRITE HOW THE TASK ENDED: a landing's `why=` and `checked=` and a failure's
+/// `why=` outlive it, and a look at them stays a look. NEGATIVE CONTROL: an agent that exits while
+/// its task works reads failed, its own `why=exit` kept.
+#[test]
+fn an_exit_keeps_how_the_task_ended() {
+    let t0 = Instant::now();
+    let working = TaskMark::new(TaskState::Working)
+        .apply(None, false, t0, 1_000)
+        .0;
+    let exit = TaskMark {
+        why: Some(WHY_EXIT),
+        exit: Some(0),
+        ..TaskMark::new(TaskState::Exited)
+    };
+
+    let landed = TaskMark {
+        why: Some(WHY_LANDED),
+        checked: Some("abc@origin/main".to_string()),
+        ..TaskMark::new(TaskState::Done)
+    }
+    .apply(Some(&working), false, t0, 2_000)
+    .0;
+    let (gone, moved) = exit.apply(Some(&landed), false, t0, 3_000);
+    assert!(moved);
+    assert_eq!(gone.why, Some(WHY_LANDED));
+    assert_eq!(gone.checked.as_deref(), Some("abc@origin/main"));
+    assert_eq!(gone.entered, landed.entered, "a look stays a look");
+    assert_eq!(gone.conclusion(), Some(Conclusion::Finished));
+    assert!(gone.finished);
+
+    // WHATEVER WORD FINISHED IT: a hand's bare `done` and a marker's stand as a landing does, and
+    // a carry row keeps the fact across a restart.
+    for why in [None, Some("marker")] {
+        let finished = TaskMark {
+            why,
+            ..TaskMark::new(TaskState::Done)
+        }
+        .apply(Some(&working), false, t0, 2_000)
+        .0;
+        let (gone, _) = exit.apply(Some(&finished), false, t0, 3_000);
+        assert_eq!((gone.state, gone.why), (TaskState::Exited, why), "{why:?}");
+        assert_eq!(gone.conclusion(), Some(Conclusion::Finished), "{why:?}");
+        assert_eq!(gone.entered, finished.entered, "{why:?}");
+        let row = gone.carry_row(t0);
+        assert!(row.contains(" finished=1"), "{row}");
+        let back = TaskRecord::from_carry_row(&row, None, t0, 3_000).expect("reads");
+        assert_eq!(back.conclusion(), Some(Conclusion::Finished), "{row}");
+        assert_eq!(back.carry_row(t0), row);
+    }
+
+    let failed = TaskMark {
+        why: Some(WHY_COULD_NOT_FINISH),
+        ..TaskMark::new(TaskState::Failed)
+    }
+    .apply(Some(&working), false, t0, 2_000)
+    .0;
+    let (gone, _) = exit.apply(Some(&failed), false, t0, 3_000);
+    assert_eq!(gone.state, TaskState::Exited);
+    assert_eq!(gone.why, Some(WHY_COULD_NOT_FINISH));
+    assert_eq!(gone.entered, failed.entered);
+    assert_eq!(gone.conclusion(), Some(Conclusion::Failed));
+
+    let (gone, _) = exit.apply(Some(&working), false, t0, 3_000);
+    assert_eq!(gone.why, Some(WHY_EXIT));
+    assert_eq!(gone.conclusion(), Some(Conclusion::Failed));
+    assert!(!gone.finished);
+    assert!(!gone.carry_row(t0).contains("finished="));
+    assert_ne!(gone.entered, working.entered);
+
+    // A turn after the landing opens it again: an exit then reads as it stands.
+    let open = TaskMark::new(TaskState::Working)
+        .apply(Some(&landed), false, t0, 3_500)
+        .0;
+    let (gone, _) = exit.apply(Some(&open), false, t0, 4_000);
+    assert_eq!(gone.conclusion(), Some(Conclusion::Failed));
+}
+
+/// A HAND'S `task mark failed` IS REFUSED WHILE A LOOP CARRIES THE SESSION: it would read as ended
+/// while the loop types on, and the refusal says what stops it. NEGATIVE CONTROLS: Autopilot Off, no
+/// claim, a lapsed claim, and aterm's own loop.
+#[test]
+fn a_hands_failed_mark_is_refused_while_a_loop_carries_the_session() {
+    use crate::control::{Principal, Scope, ServingPrincipal};
+    let h = crate::session_store::test_handle(9_401);
+    let mark = |h: &crate::session_store::SessionHandle| {
+        cmd_task(
+            &h.ctx,
+            h.local_id,
+            Scope::Owner,
+            "mark failed why=could-not-finish",
+        )
+    };
+    let now = crate::metrics::now_us();
+    crate::session_timeline::claim_supervisor(&h.ctx, "sup-a", None, Some(now + 60_000_000), now)
+        .expect("claimed");
+    h.ctx
+        .meta
+        .lock()
+        .unwrap()
+        .set_autopilot(Some("land".to_owned()), None);
+    assert_eq!(mark(&h), FAILED_UNDER_A_LOOP);
+    assert!(
+        h.ctx.timeline.lock().unwrap().task().is_none(),
+        "no record moved"
+    );
+    assert!(FAILED_UNDER_A_LOOP.contains("Autopilot off"));
+    {
+        let _harness = ServingPrincipal::enter(Principal::Harness);
+        assert!(mark(&h).starts_with("OK task "), "aterm's own loop");
+    }
+
+    let h = crate::session_store::test_handle(9_402);
+    assert!(mark(&h).starts_with("OK task "), "no claim");
+
+    let h = crate::session_store::test_handle(9_403);
+    let now = crate::metrics::now_us();
+    crate::session_timeline::claim_supervisor(&h.ctx, "sup-a", None, Some(now + 60_000_000), now)
+        .expect("claimed");
+    h.ctx
+        .meta
+        .lock()
+        .unwrap()
+        .set_autopilot(Some("off".to_owned()), None);
+    assert!(
+        mark(&h).starts_with("OK task "),
+        "Autopilot Off types nothing"
+    );
+
+    let h = crate::session_store::test_handle(9_404);
+    let now = crate::metrics::now_us();
+    crate::session_timeline::claim_supervisor(&h.ctx, "sup-a", None, Some(now + 1), now)
+        .expect("claimed");
+    h.ctx
+        .meta
+        .lock()
+        .unwrap()
+        .set_autopilot(Some("land".to_owned()), None);
+    std::thread::sleep(Duration::from_millis(1));
+    assert!(mark(&h).starts_with("OK task "), "a lapsed claim");
+}
+
+/// WHO HAS THEIR OWN REPORT OF THEIR END: a credit claim's worker and the disk worker, each by its
+/// folder. NEGATIVE CONTROL: any other folder, and none.
+#[test]
+fn a_worker_with_its_own_report_is_told_by_its_folder() {
+    use aterm_agent::harness::{credit_offers, disk};
+    let under = |name: &str| format!("/state/aterm/{}/{name}", aterm_agent::harness::cli::HARNESS);
+    assert!(reports_its_own_end(Some(&under(
+        disk::fence::WORKER_FOLDER
+    ))));
+    assert!(reports_its_own_end(Some(&under(
+        credit_offers::CLAIM_FOLDER
+    ))));
+    assert!(!reports_its_own_end(Some(&under("elsewhere"))));
+    assert!(!reports_its_own_end(Some("/work/disk-worker")));
+    assert!(!reports_its_own_end(None));
+}
+
+/// A PERSON'S AUTOPILOT OFF ENDS A WORKING TASK AND THEIR SWITCH BACK OPENS IT. aterm's own Off is
+/// the expiry's, a word set before the record began is no move on it, and a failure of the worker's
+/// own is not the word's to open. NEGATIVE CONTROL: Land over a working record moves nothing.
+#[test]
+fn autopilot_off_fails_a_working_task_and_the_switch_back_opens_it() {
+    use crate::session_timeline::AutopilotSetBy;
+    const LATER: u64 = 60_000;
+    use aterm_agent::supervise::Autopilot;
+    let t0 = Instant::now();
+    let by = |actor, since_ms| AutopilotSetBy {
+        actor,
+        surface: None,
+        since_ms,
+    };
+    let person = aterm_slog::Actor::Human;
+    let working = TaskMark::new(TaskState::Working)
+        .apply(None, false, t0, 1_000)
+        .0;
+
+    let off = autopilot_mark(
+        &working,
+        Some(Autopilot::Off),
+        Some(&by(person, 2_000)),
+        LATER,
+    )
+    .expect("a mark");
+    assert_eq!((off.state, off.why), (TaskState::Failed, Some(WHY_OFF)));
+    assert_eq!(
+        autopilot_mark(
+            &working,
+            Some(Autopilot::Off),
+            Some(&by(person, 500)),
+            LATER
+        ),
+        None,
+        "set before this task began"
+    );
+    assert_eq!(
+        autopilot_mark(
+            &working,
+            Some(Autopilot::Off),
+            Some(&by(aterm_slog::Actor::Aterm, 2_000)),
+            LATER
+        ),
+        None,
+        "aterm's own"
+    );
+    for hand in [aterm_slog::Actor::Ctl, aterm_slog::Actor::Bridge] {
+        let off = autopilot_mark(
+            &working,
+            Some(Autopilot::Off),
+            Some(&by(hand, 2_000)),
+            LATER,
+        )
+        .expect("a mark");
+        assert_eq!(
+            (off.state, off.why),
+            (TaskState::Failed, Some(WHY_OFF_CTL)),
+            "only a Human reads as a person: {hand:?}"
+        );
+    }
+    assert!(failed_words(TaskState::Failed, Some(WHY_OFF)).contains("person"));
+    assert!(!failed_words(TaskState::Failed, Some(WHY_OFF_CTL)).contains("person"));
+    assert_eq!(
+        autopilot_mark(&working, Some(Autopilot::Off), None, LATER),
+        None
+    );
+    assert_eq!(
+        autopilot_mark(
+            &working,
+            Some(Autopilot::Land),
+            Some(&by(person, 2_000)),
+            LATER
+        ),
+        None
+    );
+
+    let failed_by = |why| {
+        TaskMark {
+            why: Some(why),
+            ..TaskMark::new(TaskState::Failed)
+        }
+        .apply(Some(&working), false, t0, 2_000)
+        .0
+    };
+    for why in [WHY_OFF, WHY_OFF_CTL, WHY_EXPIRED] {
+        for word in [Autopilot::Land, Autopilot::Cruise] {
+            let back = autopilot_mark(&failed_by(why), Some(word), Some(&by(person, 3_000)), LATER)
+                .expect("opened");
+            assert_eq!(back.state, TaskState::Working, "{why}");
+        }
+    }
+    assert_eq!(
+        autopilot_mark(
+            &failed_by(WHY_COULD_NOT_FINISH),
+            Some(Autopilot::Land),
+            Some(&by(person, 3_000)),
+            LATER
+        ),
+        None,
+        "the worker's own word stands until a turn runs"
+    );
+    // Cruise never rests: set after any failure, it opens the task, the worker's own word too.
+    for why in [WHY_COULD_NOT_FINISH, WHY_REPEATED] {
+        let back = autopilot_mark(
+            &failed_by(why),
+            Some(Autopilot::Cruise),
+            Some(&by(aterm_slog::Actor::Ctl, 3_000)),
+            LATER,
+        )
+        .expect("opened");
+        assert_eq!((back.state, back.why), (TaskState::Working, Some("turn")));
+        assert_eq!(
+            autopilot_mark(
+                &failed_by(why),
+                Some(Autopilot::Cruise),
+                Some(&by(person, 1_500)),
+                LATER
+            ),
+            None,
+            "a Cruise set before it failed is not the move that opens it"
+        );
+    }
+}
+
+/// AN OFF FAILS THE TASK ONLY ONCE IT HAS STOOD: a click from Land through Off to Cruise tells a
+/// waiter nothing, and the look owed when it settles fails it. NEGATIVE CONTROL: an Off stood
+/// [`OFF_SETTLES_MS`] fails it, and nothing waits to settle once it has.
+#[test]
+fn an_off_fails_a_task_only_once_it_has_stood() {
+    use crate::session_timeline::AutopilotSetBy;
+    use aterm_agent::supervise::Autopilot;
+    let set = AutopilotSetBy {
+        actor: aterm_slog::Actor::Human,
+        surface: None,
+        since_ms: 2_000,
+    };
+    let working = TaskMark::new(TaskState::Working)
+        .apply(None, false, Instant::now(), 1_000)
+        .0;
+    let at = |now| autopilot_mark(&working, Some(Autopilot::Off), Some(&set), now);
+    assert_eq!(at(2_000), None, "a click passing through");
+    assert_eq!(at(2_000 + OFF_SETTLES_MS - 1), None);
+    assert_eq!(
+        off_settles_in(&working, Some(Autopilot::Off), Some(&set), 2_500),
+        Some(Duration::from_millis(OFF_SETTLES_MS - 500)),
+        "a look is owed when it settles"
+    );
+    let off = at(2_000 + OFF_SETTLES_MS).expect("stood");
+    assert_eq!((off.state, off.why), (TaskState::Failed, Some(WHY_OFF)));
+    assert_eq!(
+        off_settles_in(
+            &working,
+            Some(Autopilot::Off),
+            Some(&set),
+            2_000 + OFF_SETTLES_MS
+        ),
+        None
+    );
+    assert_eq!(
+        off_settles_in(&working, Some(Autopilot::Cruise), Some(&set), 2_500),
+        None,
+        "it moved on: nothing to settle"
+    );
+}
+
+/// A CLICK THAT PASSES THROUGH OFF ON ITS WAY TO CRUISE LEAVES A WORKING TASK WORKING, and the look
+/// the window owes the Off finds nothing to fail once the word moved on.
+#[test]
+fn a_click_through_off_leaves_a_working_task_working() {
+    use aterm_agent::supervise::Autopilot;
+    let mut app = crate::App::headless_for_test();
+    let local = app
+        .focused_session_id(crate::WindowId(0))
+        .expect("a session");
+    let ctx = app.pool.get(local).expect("its session").ctx.clone();
+    mark_session_task(&ctx, local, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    let set = |word: Autopilot| {
+        let now_ms = i64::try_from(unix_ms_now()).expect("in range");
+        let mut meta = ctx.meta.lock().unwrap();
+        meta.autopilot = Some(word.word().to_owned());
+        meta.autopilot_set_by = Some(crate::session_timeline::AutopilotSetBy {
+            actor: aterm_slog::Actor::Human,
+            surface: None,
+            since_ms: now_ms,
+        });
+    };
+    set(Autopilot::Off);
+    app.hold_task_to_autopilot(local);
+    let state = || ctx.timeline.lock().unwrap().task().map(|r| r.state);
+    assert_eq!(state(), Some(TaskState::Working), "not yet stood");
+    assert!(app.autopilot_off_wake().is_some(), "a look is owed");
+    set(Autopilot::Cruise);
+    app.tick_autopilot_offs(Instant::now() + Duration::from_millis(OFF_SETTLES_MS + 1));
+    assert_eq!(state(), Some(TaskState::Working));
+    assert_eq!(app.autopilot_off_wake(), None, "nothing left to settle");
+}
+
+/// A FAILED TASK'S RESULT READS AND A TURN INTO IT OPENS IT AGAIN, as a done task's does, and the
+/// harness's own turn does not.
+#[test]
+fn a_failed_task_reads_its_result_and_a_turn_opens_it() {
+    let handle = crate::session_store::test_handle(12);
+    let ctx = &handle.ctx;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-task-failed-")
+        .tempdir()
+        .expect("scratch");
+    let transcript = dir.path().join("t.jsonl");
+    let row = r#"{"type":"assistant","isSidechain":false,"uuid":"a-1","sessionId":"0b22","message":{"id":"msg_1","model":"claude-sonnet-5-5","content":[{"type":"text","text":"Could not finish: no grammar."}]}}"#;
+    let snap = aterm_agent::harness::result::snapshot(
+        &dir.path().join("tasks"),
+        "s-12-1",
+        Some((&transcript, &format!("{row}\n"))),
+        aterm_agent::harness::result::DoneBy::Failed,
+    )
+    .expect("written");
+    mark_session_task(ctx, 12, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    let failed = TaskMark {
+        why: Some(WHY_COULD_NOT_FINISH),
+        result_bytes: snap.bytes,
+        result_path: Some(snap.path.clone()),
+        ..TaskMark::new(TaskState::Failed)
+    };
+    mark_session_task(ctx, 12, &failed).expect("unfenced");
+    assert!(
+        cmd_result(ctx, 12, "").contains("Could not finish: no grammar."),
+        "{}",
+        cmd_result(ctx, 12, "")
+    );
+    let state = || {
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .task()
+            .map(|r| (r.state, r.why))
+    };
+    let found = || ctx.timeline.lock().unwrap().task().map(|r| r.entered);
+    reopen_at_turn(ctx, 12, &TurnBy::Harness, found());
+    assert_eq!(
+        state(),
+        Some((TaskState::Failed, Some(WHY_COULD_NOT_FINISH)))
+    );
+    reopen_at_turn(ctx, 12, &TurnBy::Ctl, found());
+    assert_eq!(state(), Some((TaskState::Working, Some("turn"))));
 }

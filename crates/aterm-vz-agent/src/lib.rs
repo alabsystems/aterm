@@ -52,12 +52,83 @@ pub const COMMAND_PORT: u32 = 1024;
 /// The vsock port of the host's listener the agent dials for its watch connection.
 pub const WATCH_PORT: u32 = 1025;
 
+#[cfg(target_os = "macos")]
+const NONBLOCK_OPEN_FLAG: i32 = 0x0004;
+#[cfg(all(unix, not(target_os = "macos")))]
+const NONBLOCK_OPEN_FLAG: i32 = 0o4000;
+
+pub(crate) fn open_nonblock(path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(NONBLOCK_OPEN_FLAG)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::open(path)
+    }
+}
+
+pub(crate) fn open_regular_nonblock(path: &Path) -> io::Result<std::fs::File> {
+    let f = open_nonblock(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(f)
+}
+
+pub(crate) fn read_bounded_regular(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is a symbolic link",
+        ));
+    }
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let f = open_regular_nonblock(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let opened = f.metadata()?;
+        if opened.dev() != meta.dev() || opened.ino() != meta.ino() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file changed while opening",
+            ));
+        }
+    }
+    let cap = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    let read = f.take(cap).read_to_end(&mut bytes)?;
+    if read > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes}-byte limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// The SHA-256 of the file at `path`, read in pieces.
 ///
 /// # Errors
 /// It could not be read.
 pub fn sha256_of(path: &Path) -> io::Result<[u8; 32]> {
-    let mut f = std::fs::File::open(path)?;
+    let mut f = open_regular_nonblock(path)?;
     let mut h = aterm_digest::Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {

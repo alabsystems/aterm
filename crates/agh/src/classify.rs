@@ -39,18 +39,22 @@ fn secondary(error: Error, headers: &[(String, String)]) -> Error {
     }
 }
 
+/// The scopes a comma-separated scope header lists, trimmed, empty entries dropped.
 #[inline]
-fn scopes(text: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn scopes(text: &str) -> impl Iterator<Item = &str> {
     text.split(',').map(str::trim).filter(|s| !s.is_empty())
 }
 
-/// The first scope `x-accepted-oauth-scopes` names that `x-oauth-scopes` lacks.
+/// The scope to name when `x-oauth-scopes` holds none of `x-accepted-oauth-scopes`: the first
+/// accepted one. The accepted list is any-of (GitHub lists every scope that would do), so a
+/// token that holds one of them lacks no scope, and the refusal is something else.
 pub(crate) fn missing_scope(headers: &[(String, String)]) -> Option<String> {
     let held = header(headers, "x-oauth-scopes")?;
     let accepted = header(headers, "x-accepted-oauth-scopes")?;
-    scopes(accepted)
-        .find(|want| !scopes(held).any(|have| have == *want))
-        .map(str::to_string)
+    if scopes(accepted).any(|want| scopes(held).any(|have| have == want)) {
+        return None;
+    }
+    scopes(accepted).next().map(str::to_string)
 }
 
 /// The `next` that names a missing OAuth scope.

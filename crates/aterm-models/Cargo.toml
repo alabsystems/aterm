@@ -24,6 +24,7 @@ aterm-spec.workspace = true
 aterm-models-agh.workspace = true
 aterm-models-aos.workspace = true
 aterm-models-atpkg.workspace = true
+aterm-models-capacity.workspace = true
 aterm-models-core.workspace = true
 aterm-models-db.workspace = true
 aterm-models-effects.workspace = true
@@ -46,6 +47,7 @@ aterm-models-update.workspace = true
 # to any of them.
 agh.workspace = true
 aterm-agent.workspace = true
+aterm-capacity.workspace = true
 aterm-cli = { path = "../aterm-cli" }
 aterm-core.workspace = true
 aterm-db.workspace = true

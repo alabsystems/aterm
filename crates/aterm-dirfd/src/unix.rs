@@ -220,6 +220,10 @@ impl RenameFlags {
     /// Fail with `EEXIST` if the destination already exists, instead of replacing it.
     pub const NOREPLACE: Self = Self(1);
 
+    /// Atomically exchange two existing entries, including a file and a nonempty directory.
+    /// Cannot be combined with [`Self::NOREPLACE`]; the kernel refuses that combination.
+    pub const EXCHANGE: Self = Self(2);
+
     /// No flags — equivalent to a plain [`renameat`].
     #[inline]
     #[must_use]
@@ -507,6 +511,9 @@ pub fn renameat_with<F1: AsFd, F2: AsFd, P: Arg, Q: Arg>(
                 if flags.contains(RenameFlags::NOREPLACE) {
                     raw |= RENAME_NOREPLACE;
                 }
+                if flags.contains(RenameFlags::EXCHANGE) {
+                    raw |= libc::RENAME_EXCHANGE;
+                }
                 // SAFETY: raw syscall form because not every libc has a
                 // `renameat2` wrapper; the argument list is the kernel's and all
                 // four inputs are live.
@@ -527,6 +534,9 @@ pub fn renameat_with<F1: AsFd, F2: AsFd, P: Arg, Q: Arg>(
                 let mut raw: libc::c_uint = 0;
                 if flags.contains(RenameFlags::NOREPLACE) {
                     raw |= libc::RENAME_EXCL;
+                }
+                if flags.contains(RenameFlags::EXCHANGE) {
+                    raw |= libc::RENAME_SWAP;
                 }
                 // SAFETY: both descriptors are live and both names are NUL-terminated for the duration of the call.
                 check(unsafe {

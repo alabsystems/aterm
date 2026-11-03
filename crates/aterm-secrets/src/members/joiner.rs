@@ -353,9 +353,10 @@ pub type SignNode<'a> = &'a (dyn Fn(&[u8]) -> [u8; 64] + Sync);
 /// Prove this Mac to the member that sent `greeting` (`prove`), with nobody's Allow: sign the
 /// greeting's fresh challenge with the request's writer key and the fleet node key
 /// (`sign_node`), answer the possession challenge, and open the bundle the member sealed to this
-/// Mac's age identity. `sent` turns true once the possession answer went: the member may have
-/// signed this Mac's records by then, so the caller tries no other member at once (two members
-/// removing one old seat at one cutoff would make a quorum `Remove`).
+/// Mac's age identity. `sent` turns true before the possession answer's write: a failed write or
+/// flush may still have delivered it, letting the member sign this Mac's records. The caller
+/// tries no other member at once (two members removing one old seat at one cutoff would make a
+/// quorum `Remove`).
 ///
 /// # Errors
 /// The member refused (why, from its `NO` line), the stream failed, or the bundle does not open,
@@ -389,11 +390,9 @@ pub fn prove<S: Read + Write + ?Sized>(
     let line = wire::read_line(stream)?;
     let challenge = wire::answer(&line)?.b64("challenge")?;
     let response = joining.device.answer(&request, &challenge)?;
-    wire::write_line(
-        stream,
-        &format!("possess response={}", wire::b64(&response)),
-    )?;
+    let possession = format!("possess response={}", wire::b64(&response));
     *sent = true;
+    wire::write_line(stream, &possession)?;
     let line = wire::read_line(stream)?;
     let size: usize = Some(wire::answer(&line)?.get("bundle")?)
         .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))

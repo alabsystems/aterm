@@ -83,7 +83,7 @@ pub(crate) fn gate_deck(record: bool) -> LaneRun {
     };
     let tsv = match bench(scratch.path()) {
         Ok(tsv) => tsv,
-        Err(e) => return LaneRun::fail(format!("could not measure: {e}")),
+        Err(e) => return e.verdict(),
     };
     let values = match report_of(&tsv) {
         Ok(v) => v,
@@ -109,7 +109,7 @@ pub(crate) fn gate_deck(record: bool) -> LaneRun {
 }
 
 /// Run `deck_frame_cost` optimized and alone, its table written into `dir`.
-fn bench(dir: &Path) -> Result<String, String> {
+fn bench(dir: &Path) -> Result<String, super::floors::MeasureError> {
     let driver = super::driver::cargo_driver()?;
     let out = dir.join("deck_frame_cost.tsv");
     let args = [
@@ -119,33 +119,60 @@ fn bench(dir: &Path) -> Result<String, String> {
         "--profile",
         "opt-test",
         "--lib",
-        "--",
-        "--ignored",
-        "deck_frame_cost",
-        "--nocapture",
-        "--test-threads",
-        "1",
+        "--no-run",
+        "--message-format=json-render-diagnostics",
     ];
     eprintln!(
         "  $ ATERM_DECK_COST={} {}",
         out.display(),
         driver.display_workspace("test", &args)
     );
-    let ran = driver
+    let built = driver
         .workspace_command("test")
         .args(args)
         .env("ATERM_DECK_COST", &out)
         .current_dir(workspace_root())
         .output()
-        .map_err(|e| format!("could not spawn the bench: {e}"))?;
+        .map_err(|e| format!("could not build the bench: {e}"))?;
+    if !built.status.success() {
+        return Err(format!(
+            "deck bench build failed: {}",
+            String::from_utf8_lossy(&built.stderr)
+        )
+        .into());
+    }
+    let executable = super::bench_build::built_executable(
+        &String::from_utf8_lossy(&built.stdout),
+        "aterm_gui",
+        "lib",
+    )?;
+    let mut run = aterm_uds::spawnfd::command(&executable);
+    run.args([
+        "--ignored",
+        "deck_frame_cost",
+        "--nocapture",
+        "--test-threads",
+        "1",
+    ])
+    .env("ATERM_DECK_COST", &out)
+    .current_dir(workspace_root());
+    let _entry = super::measurement_entry().map_err(super::floors::MeasureError::Timing)?;
+    let ran = run
+        .output()
+        .map_err(|e| format!("could not execute deck bench: {e}"))?;
+    _entry
+        .timing_admission()
+        .map_err(|why| super::floors::MeasureError::Timing(why.to_string()))?;
     if !ran.status.success() {
         return Err(format!(
             "the bench exited {:?}\n{}",
             ran.status.code(),
             String::from_utf8_lossy(&ran.stderr)
-        ));
+        )
+        .into());
     }
-    std::fs::read_to_string(&out).map_err(|e| format!("the bench wrote no table: {e}"))
+    crate::read_regular_text(&out)
+        .map_err(|e| super::floors::MeasureError::Failed(format!("the bench wrote no table: {e}")))
 }
 
 /// Build aterm release with its dev seams, then take `deck-motion idle` of it; its summary.
@@ -200,7 +227,7 @@ fn idle_take(dir: &Path) -> Result<String, String> {
                 .unwrap_or("")
         ));
     }
-    std::fs::read_to_string(out.join("deck-motion.txt"))
+    crate::read_regular_text(out.join("deck-motion.txt"))
         .map_err(|e| format!("deck-motion wrote no summary: {e}"))
 }
 

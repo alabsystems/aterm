@@ -28,6 +28,11 @@ pub(super) const HARNESS_CONFIG_TOGGLE: &str = "harness/config/toggle";
 /// DECIDED FOR YOU's disclosure (§10.4.1).
 pub(super) const HARNESS_DECIDED_ALL: &str = "harness/decided/all";
 
+/// Every action of the Owner rules card starts with this (`docs/DESIGN-harness-occupancy-2026-10-20.md`
+/// §3.3): its Confirm is the owner's yes to a rule's text, so `act` presses none of them
+/// (`app_control`'s person-only list). No action carries it yet.
+pub(crate) const OWNER_RULES_PREFIX: &str = "harness/owner-rules/";
+
 /// How many of today's choices DECIDED FOR YOU shows, its disclosure closed.
 const DECIDED_SHOWN: usize = 3;
 

@@ -46,8 +46,11 @@ pub struct Plan {
     pub mgr: String,
     /// The manager's prompt (one line, holding the token).
     pub prompt: String,
-    /// The three workers.
+    /// The three workers that land.
     pub workers: Vec<Worker>,
+    /// The worker that cannot finish: its `report` is the one reply it ends on, and it has no
+    /// answer to a LAND instruction, because none is ever typed.
+    pub failing: Worker,
     /// The text the manager ends its first turn with.
     pub waiting: String,
     /// The manager's summary, the last thing it says.
@@ -94,12 +97,23 @@ impl Plan {
         ];
         Plan {
             prompt: format!(
-                "{mgr}: start three workers, wait for them in the background, then read each one's result and summarise."
+                "{mgr}: start four workers, wait for them in the background, then read each one's result and summarise."
             ),
             mgr,
             workers,
-            waiting: "Started three workers; waiting for them in the background.".into(),
-            summary: "Summary: all three workers finished and reported (LABSUM).".into(),
+            failing: Worker {
+                token: tok(4),
+                task: format!(
+                    "{}: rebuild the grammar this parser needs, then write w4.out.",
+                    tok(4)
+                ),
+                file: "w4.out".into(),
+                report: "Could not finish: the grammar this parser needs was deleted upstream."
+                    .into(),
+                defense: String::new(),
+            },
+            waiting: "Started four workers; waiting for them in the background.".into(),
+            summary: "Summary: three workers landed and one could not finish (LABSUM).".into(),
         }
     }
 
@@ -112,10 +126,15 @@ impl Plan {
         )
     }
 
+    /// Every worker the manager starts, in the order it starts them.
+    pub fn started(&self) -> impl Iterator<Item = &Worker> {
+        self.workers.iter().chain(std::iter::once(&self.failing))
+    }
+
     /// The manager's background wait over the workers its spawns printed.
     #[must_use]
     pub fn await_command(&self) -> String {
-        let sel: Vec<String> = (1..=self.workers.len())
+        let sel: Vec<String> = (1..=self.started().count())
             .map(|k| format!("@@SID:{k}@"))
             .collect();
         format!("aterm ctl await task {} all since=0", sel.join(","))
@@ -137,7 +156,7 @@ impl Plan {
         };
         let say = |when: &str, text: &str| J::obj([("when", J::s(when)), ("text", J::s(text))]);
         let mut steps = Vec::new();
-        for (k, w) in self.workers.iter().enumerate() {
+        for (k, w) in self.started().enumerate() {
             steps.push(bash(
                 &self.mgr,
                 Self::spawn_command(w),
@@ -152,7 +171,7 @@ impl Plan {
             true,
         ));
         steps.push(say(&self.mgr, &self.waiting));
-        for k in 1..=self.workers.len() {
+        for k in 1..=self.started().count() {
             steps.push(bash(
                 &self.mgr,
                 format!("aterm ctl @@SID:{k}@ result"),
@@ -161,7 +180,7 @@ impl Plan {
             ));
         }
         steps.push(say(&self.mgr, &self.summary));
-        for w in &self.workers {
+        for w in self.started() {
             steps.push(bash(
                 &w.token,
                 format!(
@@ -172,7 +191,14 @@ impl Plan {
                 false,
             ));
             steps.push(say(&w.token, &w.report));
+            if *w == self.failing {
+                continue;
+            }
             steps.push(say(&w.token, &w.defense));
+            steps.push(say(
+                &w.token,
+                aterm_agent::supervise::policy::land_check::LANDED,
+            ));
         }
         J::Arr(steps)
     }
@@ -577,6 +603,23 @@ fn wall_ms(w: f64) -> i64 {
     ms
 }
 
+/// The permission mode the manager runs under, which each worker's line must carry.
+const PARENT_MODE: [&str; 2] = ["--permission-mode", "acceptEdits"];
+
+/// The foreground program's pid in a session's `sys procs` reply.
+fn foreground_pid(procs: &str) -> Option<u32> {
+    procs
+        .lines()
+        .find(|line| line.split_whitespace().any(|field| field == "label=fg"))
+        .and_then(|line| kv(line, "pid"))
+        .and_then(|pid| pid.parse().ok())
+}
+
+/// Whether a process's argv names [`PARENT_MODE`].
+fn rides_parent_mode(argv: &[String]) -> bool {
+    argv.windows(2).any(|pair| pair == PARENT_MODE)
+}
+
 /// The sids of the manager's spawn results, in order (`OK <sid>`), each tool result once.
 fn spawned(mgr: &[Row]) -> Vec<String> {
     let mut seen: Vec<&str> = Vec::new();
@@ -771,6 +814,71 @@ fn upgrade_drill(
     Ok(())
 }
 
+/// How long the failing worker is watched for anything typed into it. Land types its instruction as
+/// soon as a turn ends, so a typing loop shows long before this.
+const FAILING_WATCH: Duration = Duration::from_secs(20);
+
+/// THE WORKER THAT REPLIES `Could not finish: …`: its record says so, its result reads back, and
+/// nothing more is typed into it over [`FAILING_WATCH`].
+fn check_failing(
+    run: &Run,
+    door: &Door<'_>,
+    w: &Worker,
+    sid: &str,
+    c: &mut Checks,
+) -> Result<(), Fail> {
+    let at = format!("@{sid}");
+    println!("  failing   {sid}");
+    let task = door.out(&[at.as_str(), "task"]);
+    c.check(
+        kv(&task, "state") == Some("failed")
+            && kv(&task, "conclusion") == Some("failed")
+            && kv(&task, "why") == Some("could-not-finish"),
+        &format!(
+            "failing: task state=failed conclusion=failed why=could-not-finish ({})",
+            task.trim().chars().take(160).collect::<String>()
+        ),
+    );
+    let res = door.ctl(&[at.as_str(), "result"])?;
+    let want = format!("{}\n", w.report);
+    c.check(
+        res.code == 0 && res.stdout == want,
+        &format!(
+            "failing: result reads back the reply that said so, byte for byte (got {:?})",
+            res.stdout
+        ),
+    );
+    let _ = wait_for(FAILING_WATCH, || false)?;
+    let later = door.out(&[at.as_str(), "task"]);
+    c.check(
+        kv(&later, "rev") == kv(&task, "rev") && kv(&later, "state") == Some("failed"),
+        &format!(
+            "failing: its record stood for {} s ({})",
+            FAILING_WATCH.as_secs(),
+            later.trim().chars().take(160).collect::<String>()
+        ),
+    );
+    let all = transcripts(run);
+    let rows = transcript_of(&all, &w.token).unwrap_or_default();
+    let typed: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.kind == "user" && r.result.is_none() && !r.text.is_empty())
+        .collect();
+    let last = rows
+        .iter()
+        .rev()
+        .find(|r| r.kind == "assistant" && !r.text.is_empty());
+    c.check(
+        typed.len() == 1 && last.is_some_and(|r| r.text == w.report),
+        &format!(
+            "failing: nothing was typed after its task, and its last words are the reply ({} user rows, last {:?})",
+            typed.len(),
+            last.map(|r| r.text.chars().take(80).collect::<String>())
+        ),
+    );
+    Ok(())
+}
+
 /// One proof on the lab `tag`, which [`cmd_workers`] brought up; with
 /// `upgrade`, the live-upgrade drill after it ([`upgrade_drill`]).
 #[allow(clippy::too_many_lines)]
@@ -813,11 +921,11 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         &Launch {
             envs: vec![format!("CLAUDE_CODE_TMPDIR={}", tmp_root.display())],
             no_wait: true,
-            args: if early {
-                vec![plan.prompt.clone()]
-            } else {
-                Vec::new()
-            },
+            args: PARENT_MODE
+                .iter()
+                .map(|flag| flag.to_string())
+                .chain(early.then(|| plan.prompt.clone()))
+                .collect(),
             ..Launch::default()
         },
     )
@@ -857,6 +965,7 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
     );
 
     let n = plan.workers.len();
+    let spawns = plan.started().count();
     let settled = |p: &Pushed| {
         let workers: Vec<&String> = p
             .created
@@ -864,14 +973,17 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
             .map(|(s, _)| s)
             .filter(|s| **s != mgr_sid)
             .collect();
-        workers.len() >= n
+        workers.len() >= spawns
             && workers.iter().all(|s| {
                 p.tasks
                     .iter()
                     .rev()
                     .find(|(t, _, _)| t == *s)
                     .is_some_and(|(_, _, pl)| {
-                        matches!(kv(pl, "state"), Some("done" | "stalled" | "exited"))
+                        matches!(
+                            kv(pl, "state"),
+                            Some("done" | "stalled" | "exited" | "failed")
+                        )
                     })
             })
     };
@@ -910,11 +1022,11 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         "the manager drew its summary: its scripted turns ran end to end",
     );
     c.check(
-        sids.len() == n
-            && created.len() == n
+        sids.len() == spawns
+            && created.len() == spawns
             && sids.iter().all(|s| created.iter().any(|(c, _)| c == s)),
         &format!(
-            "the manager's {n} spawns printed OK <sid> for the {n} sessions the instance created (spawned {sids:?}, created {:?})",
+            "the manager's {spawns} spawns printed OK <sid> for the {spawns} sessions the instance created (spawned {sids:?}, created {:?})",
             created.iter().map(|(s, _)| s).collect::<Vec<_>>()
         ),
     );
@@ -963,6 +1075,13 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
                 kv(pl, "state").unwrap_or("?")
             )
         };
+        let argv = foreground_pid(&door.out(&[at.as_str(), "sys", "procs"]))
+            .and_then(atpkg::caller_shell::process_args)
+            .map(|args| args.argv);
+        c.check(
+            argv.as_ref().is_some_and(|line| rides_parent_mode(line)),
+            &format!("{label}: its line carries its manager's permission mode ({argv:?})"),
+        );
         let timeline = door.out(&[at.as_str(), "timeline"]);
         let recorded = task_moves(&timeline);
         let pushed_states: Vec<String> = moves.iter().map(|(_, _, pl)| rev_state(pl)).collect();
@@ -1055,6 +1174,17 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         }
     }
 
+    let failing_sid = sids.get(n).map(String::as_str);
+    match failing_sid {
+        Some(sid) => check_failing(&run, &door, &plan.failing, sid, &mut c)?,
+        None => {
+            c.check(
+                false,
+                "the failing worker: the manager's spawn printed no sid",
+            );
+        }
+    }
+
     let bg = mgr.iter().position(|r| {
         r.tool_use.as_ref().is_some_and(|(name, input)| {
             name == "Bash"
@@ -1111,14 +1241,28 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
     c.check(
         done_rows == n,
         &format!(
-            "the await's output has {n} rows state=done, one per worker ({done_rows}: {:?}){unread}",
+            "the await's output has {n} rows state=done, one per landing worker ({done_rows}: {:?}){unread}",
             out.trim().chars().take(400).collect::<String>()
+        ),
+    );
+    let failed_row = failing_sid.and_then(|s| {
+        out.lines()
+            .find(|l| l.starts_with(&format!("@{s} ")))
+            .map(str::to_string)
+    });
+    c.check(
+        failed_row.as_deref().is_some_and(|l| {
+            kv(l, "state") == Some("failed")
+                && kv(l, "conclusion") == Some("failed")
+                && kv(l, "why") == Some("could-not-finish")
+        }),
+        &format!(
+            "the await's row for the failing worker says state=failed conclusion=failed why=could-not-finish ({failed_row:?})"
         ),
     );
     let after: Vec<&Row> = wake.map_or_else(Vec::new, |(i, _)| mgr[i + 1..].iter().collect());
     let read_back = plan
-        .workers
-        .iter()
+        .started()
         .filter(|w| {
             after
                 .iter()
@@ -1131,9 +1275,9 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         .find(|r| r.kind == "assistant" && !r.text.is_empty())
         .is_some_and(|r| r.text == plan.summary);
     c.check(
-        read_back == n && summary_said,
+        read_back == spawns && summary_said,
         &format!(
-            "in that turn the manager read the {n} reports ({read_back} found in its tool results) and ended with its summary"
+            "in that turn the manager read the {spawns} reports ({read_back} found in its tool results) and ended with its summary"
         ),
     );
 
@@ -1160,8 +1304,18 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
     )];
     for (k, w) in plan.workers.iter().enumerate() {
         if let Some(s) = sids.get(k) {
-            asked_said.push((s.clone(), w.token.clone(), head(&w.report), end(&w.report)));
+            let landed = aterm_agent::supervise::policy::land_check::LANDED;
+            asked_said.push((s.clone(), w.token.clone(), head(landed), end(landed)));
         }
+    }
+    if let Some(s) = failing_sid {
+        let said = &plan.failing.report;
+        asked_said.push((
+            s.to_string(),
+            plan.failing.token.clone(),
+            head(said),
+            end(said),
+        ));
     }
     let mut survey = door.ctl(&["survey"])?;
     let survey_settled = wait_for(Duration::from_secs(60), || {
@@ -1188,8 +1342,9 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
             && long == 0
             && text.chars().count() <= 24_000,
         &format!(
-            "survey: {} session lines, {shown} of the 4 Claude Code sessions with what each was asked and last said ({}), {} chars (budget 24000), {long} session lines past 110",
+            "survey: {} session lines, {shown} of the {} Claude Code sessions with what each was asked and last said ({}), {} chars (budget 24000), {long} session lines past 110",
             session_lines.len(),
+            all_sids.len(),
             if survey_settled {
                 format!("all shown by a read {survey_wait:.1} s after the summary was drawn")
             } else {
@@ -1197,6 +1352,14 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
             },
             text.chars().count()
         ),
+    );
+    let header = text
+        .lines()
+        .find(|l| l.starts_with("== "))
+        .unwrap_or_default();
+    c.check(
+        header.contains("(1 failed, 4 done)"),
+        &format!("survey: its header counts the failing worker as failed, never done ({header})"),
     );
     if c.bad > 0 || shown != all_sids.len() {
         for l in text.lines() {
@@ -1236,7 +1399,8 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
     c.check(
         json.code == 0 && json_ok == all_sids.len(),
         &format!(
-            "survey --json: {json_ok} of the 4 records are claude with their prompt and last words ({} records)",
+            "survey --json: {json_ok} of the {} records are claude with their prompt and last words ({} records)",
+            all_sids.len(),
             sessions.len()
         ),
     );
@@ -1388,6 +1552,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_workers_line_is_read_from_its_foreground_program() {
+        let procs = "procs  tab 1 · 2 live\n\
+            proc pid=7 exe=trustc label=job pgid=7 cpu_mc=1\n\
+            proc pid=88 exe=claude label=fg pgid=88 cpu_mc=2\n";
+        assert_eq!(foreground_pid(procs), Some(88));
+        assert_eq!(foreground_pid("proc pid=7 exe=zsh label=job\n"), None);
+        let line = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert!(rides_parent_mode(&line(&[
+            "claude",
+            "--permission-mode",
+            "acceptEdits",
+            "--model",
+            "x",
+        ])));
+        assert!(!rides_parent_mode(&line(&[
+            "claude",
+            "--permission-mode",
+            "default",
+        ])));
+        assert!(!rides_parent_mode(&line(&["claude"])));
+    }
+
+    #[test]
     fn an_iso_stamp_is_read_as_unix_milliseconds() {
         assert_eq!(iso_ms("1970-01-01T00:00:00.000Z"), Some(0));
         assert_eq!(iso_ms("2026-10-16T10:24:42.738Z"), Some(1_792_146_282_738));
@@ -1418,13 +1605,16 @@ mod tests {
         let req =
             |msgs: &[J]| J::obj([("messages", J::Arr(msgs.to_vec()))]).dump(crate::pyjson::COMPACT);
         let user = |t: &str| J::obj([("role", J::s("user")), ("content", J::s(t))]);
-        let used = J::obj([
-            ("role", J::s("assistant")),
-            (
-                "content",
-                J::Arr(vec![J::obj([("type", J::s("tool_use"))])]),
-            ),
-        ]);
+        let used_call = || {
+            J::obj([
+                ("role", J::s("assistant")),
+                (
+                    "content",
+                    J::Arr(vec![J::obj([("type", J::s("tool_use"))])]),
+                ),
+            ])
+        };
+        let used = used_call();
         let result = |t: &str| {
             J::obj([
                 ("role", J::s("user")),
@@ -1439,7 +1629,7 @@ mod tests {
         };
         let said = |t: &str| J::obj([("role", J::s("assistant")), ("content", J::s(t))]);
         let mut m = vec![user(&plan.prompt)];
-        for (k, w) in plan.workers.iter().enumerate() {
+        for (k, w) in plan.started().enumerate() {
             match tool_turn(req(&m).as_bytes(), &script) {
                 Some(ToolTurn::Call(name, input, step)) => {
                     assert_eq!((name.as_str(), step), ("Bash", k));
@@ -1454,10 +1644,10 @@ mod tests {
             m.push(result(&format!("OK s-{k}{k}{k}a")));
         }
         match tool_turn(req(&m).as_bytes(), &script) {
-            Some(ToolTurn::Call(_, input, 3)) => {
+            Some(ToolTurn::Call(_, input, 4)) => {
                 assert_eq!(
                     input.get("command").and_then(J::as_str),
-                    Some("aterm ctl await task @s-000a,@s-111a,@s-222a all since=0")
+                    Some("aterm ctl await task @s-000a,@s-111a,@s-222a,@s-333a all since=0")
                 );
                 assert!(input.get("run_in_background").is_some_and(J::truthy));
             }
@@ -1467,26 +1657,26 @@ mod tests {
         m.push(result("Command running in background with ID: b1"));
         assert_eq!(
             tool_turn(req(&m).as_bytes(), &script),
-            Some(ToolTurn::Say(plan.waiting.clone(), 4))
+            Some(ToolTurn::Say(plan.waiting.clone(), 5))
         );
         m.push(said(&plan.waiting));
         m.push(user(
             "<task-notification><status>completed</status></task-notification>",
         ));
         match tool_turn(req(&m).as_bytes(), &script) {
-            Some(ToolTurn::Call(_, input, 5)) => assert_eq!(
+            Some(ToolTurn::Call(_, input, 6)) => assert_eq!(
                 input.get("command").and_then(J::as_str),
                 Some("aterm ctl @s-000a result")
             ),
             other => panic!("result: {other:?}"),
         }
-        for k in 0..3 {
+        for w in plan.started() {
             m.push(used.clone());
-            m.push(result(&plan.workers[k].report));
+            m.push(result(&w.report));
         }
         assert_eq!(
             tool_turn(req(&m).as_bytes(), &script),
-            Some(ToolTurn::Say(plan.summary.clone(), 8))
+            Some(ToolTurn::Say(plan.summary.clone(), 10))
         );
         let w = &plan.workers[1];
         let task_row = user(&format!("{}\n\n(Started by `s-m` …)", w.task));
@@ -1509,21 +1699,27 @@ mod tests {
             ),
             Some(ToolTurn::Say(w.defense.clone(), 2))
         );
+        let failing = user(&format!("{}\n\n(Started by `s-m` …)", plan.failing.task));
+        assert_eq!(
+            tool_turn(
+                req(&[failing, used_call(), result("2 w4.out")]).as_bytes(),
+                &script
+            ),
+            Some(ToolTurn::Say(plan.failing.report.clone(), 1))
+        );
+        assert_eq!(
+            aterm_agent::supervise::policy::needs::could_not_finish(&plan.failing.report),
+            plan.failing.report.strip_prefix("Could not finish: ")
+        );
         for w in &plan.workers {
             assert!(clean_defense(Some(&w.defense)), "{}", w.defense);
             assert!(!clean_defense(Some(&w.report)), "{}", w.report);
             assert!(!w.result().contains("ATERM-TASK-DONE"));
             assert_eq!(w.result(), format!("{}\n\n{}\n", w.report, w.defense));
         }
-        for w in &plan.workers {
+        for w in plan.started() {
             assert!(!w.task.contains(&plan.mgr));
-            assert!(
-                plan.workers
-                    .iter()
-                    .filter(|o| w.task.contains(&o.token))
-                    .count()
-                    == 1
-            );
+            assert!(plan.started().filter(|o| w.task.contains(&o.token)).count() == 1);
             assert!(!w.task.lines().any(|l| l == "EOF"));
             assert_eq!(w.report.trim(), w.report, "the result reader trims");
         }

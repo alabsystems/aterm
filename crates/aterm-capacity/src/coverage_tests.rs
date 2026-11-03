@@ -14,11 +14,13 @@ const GIB: u64 = 1 << 30;
 
 fn record(pid: u32, need: Need, held: bool) -> Record {
     Record {
+        accounting: crate::Accounting::Holder,
         pid,
         start_ms: 1,
         seq: 0,
         checkout: "/ck".to_owned(),
         need,
+        timing: crate::TimingEvidence::default(),
         held: held.then_some(Held {
             admitted_ms: 1,
             cores: 0,
@@ -76,6 +78,24 @@ fn a_held_covering_claim_covers_its_holders_line_and_nothing_else() {
     assert!(!covered(&elsewhere, 300), "another line's claim");
     assert!(covered_memory(100, &[&stage], None));
     assert!(!covered_memory(300, &[&stage], None), "no ancestry read");
+}
+
+#[test]
+fn retained_custody_never_covers_or_skips_a_reused_holders_line() {
+    let procs = line();
+    let mut retained = record(
+        100,
+        Need::new("retained compiler").mem(18 * GIB).covers(),
+        true,
+    );
+    retained.accounting = crate::Accounting::Whole;
+    retained.credit = vec![300];
+    assert!(!covered_memory(300, &[&retained], Some(&procs)));
+    assert!(!covered_memory(100, &[&retained], Some(&procs)));
+    assert_eq!(
+        crate::admit::counted(vec![&retained], 300, Some(&procs)).len(),
+        1
+    );
 }
 
 /// CREDIT IS KINSHIP: a held covering claim that credits a process (what the build it was kept

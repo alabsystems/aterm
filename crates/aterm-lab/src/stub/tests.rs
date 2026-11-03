@@ -2968,8 +2968,17 @@ fn an_anthropic_rate_limit_names_its_wait_in_its_header_alone() {
     let (st, head, body) = post_as(&port.to_string(), "/v1/messages", None, turn);
     assert_eq!(st, 429, "rate-limited");
     assert!(head.contains("retry-after: 150"), "{head}");
+    // The error's own words, not the whole body: its random request id can hold "150".
+    let error = J::parse(&body).unwrap();
+    let error = error.get("error").unwrap();
+    let message = error.get("message").and_then(J::as_str).unwrap();
+    assert_eq!(
+        error.get("type").and_then(J::as_str),
+        Some("rate_limit_error"),
+        "{body}"
+    );
     assert!(
-        body.contains("rate_limit_error") && !body.contains("150") && !body.contains("try again"),
+        !message.contains("150") && !message.contains("try again"),
         "{body}"
     );
     let (st, body, _) = responses_error("rate-limit:150", "5").unwrap();

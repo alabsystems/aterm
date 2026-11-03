@@ -43,7 +43,7 @@ use super::LaneRun;
 use super::arena::cat::{CORPUS_MB, Corpus, corpus_file, inner_argv};
 use super::arena::vte::{benchmark_dirs, pinned_checkout, trimmed_benchmarks};
 use super::arena::{Halt, Scratch, arena_dir, pins};
-use super::floors::{FloorLane, judge_keyed, measure_example_with, number};
+use super::floors::{FloorLane, judge_keyed, measure_cycle_example_with, number};
 
 /// The grid the payloads are captured at and replayed into: the `vte` lane's default.
 const ROWS: u16 = 40;
@@ -112,6 +112,9 @@ pub(crate) fn run(record: bool) -> LaneRun {
             None => judge_keyed(&LANE, &json, record),
         },
         Err(Halt::Skip { why, fix }) => LaneRun::skip(why, fix),
+        Err(Halt::Timing(why)) => {
+            LaneRun::could_not_run(why, "obtain fresh measured timing admission")
+        }
         Err(Halt::Fail(e)) => LaneRun::fail(e),
     }
 }
@@ -156,7 +159,7 @@ fn measure() -> Result<aterm_json::Value, Halt> {
     match vtebench {
         Some(bin) => {
             let stream_path = part.join(STREAM);
-            let stream = std::fs::read(&stream_path)
+            let stream = crate::read_regular(&stream_path)
                 .map_err(|e| format!("{}: {e}", stream_path.display()))?;
             cross_check(&stream, &read_payloads(&part, &names)?)?;
             std::fs::remove_file(&stream_path)
@@ -200,7 +203,7 @@ fn measure() -> Result<aterm_json::Value, Halt> {
          MiB are"
     );
     let from = aterm_capacity::Live.read(None);
-    let json = measure_example_with(LANE.example, &[], &args)?;
+    let json = measure_cycle_example_with(LANE.example, &[], &args)?;
     let to = aterm_capacity::Live.read(None);
     eprintln!(
         "  machine across the build and the replay: {}",
@@ -333,7 +336,7 @@ fn read_payloads(dir: &Path, names: &[String]) -> Result<Vec<Payload>, String> {
         .map(|name| {
             let read = |ext: &str| {
                 let p = dir.join(format!("{name}.{ext}"));
-                std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))
+                crate::read_regular(&p).map_err(|e| format!("{}: {e}", p.display()))
             };
             Ok(Payload {
                 name: name.clone(),

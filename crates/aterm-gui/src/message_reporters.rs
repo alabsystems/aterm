@@ -1709,6 +1709,13 @@ pub(crate) fn stop_worker_nothing(session: u64, label: &str, detail: &str) -> Me
     .key(&stop_worker_key(session))
 }
 
+/// The notice when a person's close of the Workers tab is refused, with the refusal's words.
+pub(crate) fn workers_tab_stays(why: &str) -> Message {
+    Message::new(tags::WINDOW, Severity::Info, "Workers tab stays open")
+        .line(why)
+        .notice(NoticeKind::Answer)
+}
+
 /// Builds the error message when an Agents menu or palette command fails.
 pub(crate) fn fabric_failure(verb: &str, title: &str, lines: &[&str]) -> Message {
     gesture_failure_lines(
@@ -2445,10 +2452,14 @@ pub(crate) fn file_access_granted() -> Message {
 }
 
 /// Builds the log record when macOS presents a TCC consent dialog outside the consent card.
-pub(crate) fn consent_dialog_record(short: &str, what: &str, tab: Option<usize>) -> Message {
+pub(crate) fn consent_dialog_record(
+    short: &str,
+    what: &str,
+    tab: Option<crate::consent_card::TabPlace>,
+) -> Message {
     let asker = tab.map_or_else(
         || "a program in aterm".to_owned(),
-        |n| format!("a program in tab {n}"),
+        |tab| format!("a program {}", tab.words()),
     );
     Message::new(tags::PRIVACY, Severity::Info, format!("Asked for {what}"))
         .line(format!("macOS asked you, for {asker}"))
@@ -3457,6 +3468,141 @@ pub(crate) fn supervisor_failing_entry(sid: &str, spot: &UpgradeSpot, why: &str)
         entry = entry.show(nav.clone());
     }
     entry
+}
+
+/// The record in Messages of a worker that ended unfinished, `words` saying how
+/// ([`crate::task_record::failed_words`]): beside `harness.landing.<sid>`, which says the other way a
+/// worker ends. No alert: a concluded worker needs nobody now.
+pub(crate) fn worker_failed_record(sid: &str, place: &str, words: &str) -> Message {
+    Message::new(
+        tags::HARNESS,
+        Severity::Warn,
+        fitted_title("Worker did not finish", place),
+    )
+    .line(atpkg::progress::sanitize_for_tty(
+        words,
+        aterm_messages::DETAIL_LINE_CAP,
+    ))
+    .record()
+    .key(&host_record_key("worker-failed", sid))
+}
+
+/// Builds the exceptions digest entry of a worker that ended unfinished with nobody waiting on it:
+/// a fact for the owner's later look, gone once its task opens again.
+pub(crate) fn worker_failed_entry(sid: &str, spot: &UpgradeSpot, words: &str) -> Entry {
+    let mut entry = Entry::new(
+        Family::Supervisor,
+        sid,
+        "worker-failed",
+        &fitted_title("Worker did not finish", &spot.place),
+        Why::OnlyYou(Reason::new(
+            "nobody waits on this worker, and nothing carries its work on",
+        )),
+        Then::step("Read what it said in its tab"),
+    )
+    .severity(Severity::Warn)
+    .resurface(Resurface::WAIT)
+    .more(atpkg::progress::sanitize_for_tty(words, 160))
+    .log_line(format!("worker-failed sid={sid}: {words}"));
+    if let Some(nav) = &spot.nav {
+        entry = entry.show(nav.clone());
+    }
+    entry
+}
+
+/// Digest key for [`worker_failed_entry`].
+pub(crate) fn worker_failed_key(sid: &str) -> String {
+    digest_key(Family::Supervisor, sid, "worker-failed")
+}
+
+/// The record in Messages of a credit claim worker's end, either way (`failed`: how it did not
+/// finish, [`crate::task_record::failed_words`]): the claim's one report of how its worker ended,
+/// beside which no generic one goes ([`crate::task_record::reports_its_own_end`]). Whether the
+/// credit was claimed is the worker's own reply's to say, so a landing's `said` (its receipt's
+/// words, [`aterm_agent::supervise::mode_words::said_within`]) is the record's line: the record
+/// outlives the tab and its reply.
+pub(crate) fn credit_claim_worker_record(
+    sid: &str,
+    place: &str,
+    failed: Option<&str>,
+    said: Option<&str>,
+) -> Message {
+    let (severity, head, line) = match failed {
+        None => (
+            Severity::Info,
+            "Credit claim worker finished",
+            said.map_or_else(
+                || "Its last reply says whether the credit was claimed".to_owned(),
+                capitalized_first,
+            ),
+        ),
+        Some(words) => (
+            Severity::Warn,
+            "Credit claim worker did not finish",
+            capitalized_first(words),
+        ),
+    };
+    Message::new(tags::HARNESS, severity, fitted_title(head, place))
+        .line(atpkg::progress::sanitize_for_tty(
+            &line,
+            aterm_messages::DETAIL_LINE_CAP,
+        ))
+        .record()
+        .key(&host_record_key("claim-worker", sid))
+}
+
+/// How a disk worker ended, as the record in Messages says it ([`disk_worker_over_record`]).
+pub(crate) struct DiskWorkerEnd<'a> {
+    /// Its end word ([`aterm_agent::harness::disk::ask::WorkerState::Over`]).
+    pub(crate) why: &'a str,
+    /// The rise in free space while it ran, whoever freed it.
+    pub(crate) rose: u64,
+    /// Whether the volume reached the free space it was told to reach, where that is known.
+    pub(crate) target_met: Option<bool>,
+    /// The bytes its own `aterm harness disk free` removals released, by the disk ledger.
+    pub(crate) removed: u64,
+    /// The `disk-free filling:` and `disk-free owner-only:` lines of its report.
+    pub(crate) report: &'a [String],
+}
+
+/// The record in Messages of a disk worker's end, either way: how it ended, what it removed itself
+/// and how far free space rose (two figures that differ, since anything on the volume moves the
+/// second), whether the volume reached its target, and what its report named.
+pub(crate) fn disk_worker_over_record(sid: &str, place: &str, end: &DiskWorkerEnd<'_>) -> Message {
+    use aterm_agent::harness::disk::{ask, human_bytes};
+    let (finished, words) = ask::worker_end_words(end.why);
+    let (severity, head) = if finished {
+        (Severity::Info, "Disk worker finished")
+    } else {
+        (Severity::Warn, "Disk worker did not finish")
+    };
+    let line =
+        |text: &str| atpkg::progress::sanitize_for_tty(text, aterm_messages::DETAIL_LINE_CAP);
+    let target = match end.target_met {
+        Some(true) => "; the volume reached its target",
+        Some(false) => "; the volume did not reach its target",
+        None => "",
+    };
+    let mut message = Message::new(tags::HARNESS, severity, fitted_title(head, place))
+        .line(line(&capitalized_first(&words)))
+        .line(line(&format!(
+            "It removed {}; free space rose {} while it ran, whoever freed it{target}",
+            human_bytes(end.removed),
+            human_bytes(end.rose)
+        )));
+    for said in end.report {
+        message = message.line(line(said));
+    }
+    message.record().key(&host_record_key("disk-worker", sid))
+}
+
+/// `text` with its first letter capitalized.
+fn capitalized_first(text: &str) -> String {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 fn digest_key(family: Family, sid: &str, cause: &str) -> String {
@@ -5099,26 +5245,29 @@ pub(crate) const ACCOUNTS_CREDITS_KEY: &str = "harness.accounts.credits";
 
 /// The fact for later when the harness starts a worker to claim a free credit Claude Code offers
 /// (`[harness] claim_credits`, [`crate::harness_host::credit_claim`]): the offer, its link and
-/// the worker's tab.
+/// the worker's place, `spot` (`in Workers ▸ <label>`, a parked worker having no tab number), and
+/// a way there.
 pub(crate) fn credit_claim_started_entry(
     offer: &aterm_agent::harness::credit_offers::Offer,
     sid: &str,
+    spot: &UpgradeSpot,
 ) -> Entry {
-    Entry::new(
+    let place = &spot.place;
+    let mut entry = Entry::new(
         Family::Accounts,
         offer.id.word(),
         "claim-started",
         "Claiming a free Claude credit",
         Why::Spent {
             tried: Reason::new(format!(
-                "started a worker in tab @{sid} to claim it in your own Chrome"
+                "started a worker {place} to claim it in your own Chrome"
             )),
             reason: Reason::new("Claude Code's cached offer says this account can claim it"),
         },
         Then::step(format!(
-            "Read tab @{sid} for the worker's last reply: it ends by itself about 30 minutes \
-             after it started or you last typed in it, and its tab closes about 30 minutes after \
-             that unless it is its window's last tab"
+            "Read the worker's last reply {place}: it ends by itself about 30 minutes after it \
+             started or you last typed in it, and its tab closes about 30 minutes after that \
+             unless it is its window's last tab"
         )),
     )
     .severity(Severity::Info)
@@ -5128,7 +5277,11 @@ pub(crate) fn credit_claim_started_entry(
     .log_line(format!(
         "credit-claim started offer={} tab=@{sid}",
         offer.id.word()
-    ))
+    ));
+    if let Some(nav) = &spot.nav {
+        entry = entry.show(nav.clone());
+    }
+    entry
 }
 
 /// [`credit_claim_started_entry`] where no worker started: why, and the link to claim it by hand.
@@ -5545,6 +5698,88 @@ pub(crate) fn accounts_logins_unread_entry() -> Entry {
     .severity(Severity::Info)
     .resurface(Resurface::WAIT)
     .log_line("accounts need=logins-unread")
+}
+
+pub(crate) const ACCOUNTS_CLOCK_OFF_KEY: &str = "harness.accounts.clock-off";
+
+pub(crate) const ACCOUNTS_CLOCK_SPLIT_KEY: &str = "harness.accounts.clock-split";
+
+/// The step of the clock warnings: a clock macOS sets itself agrees with its peers'.
+const ACCOUNTS_CLOCK_STEP: &str = "Turn on automatic date and time in System Settings";
+
+/// THE WARNING THAT THIS MAC'S PEERS DISAGREE WITH ITS CLOCK
+/// (docs/DESIGN-fluid-swarm-2026-10-28.md F22), from the accounts store's record of its last
+/// claims read (`accounts::State::clock_at`, as [`crate::harness_host::ClockSaid`] carries it).
+/// Off: a strict majority of the Macs it hears reads its clock off by more than the tolerance (10
+/// minutes), one way, so it writes no account claim and uses its home accounts only; the line says
+/// how far off, at least. Split: no majority agrees with it, so it claims its home accounts only,
+/// and the Macs whose clocks disagree with this one's are named, so a person whose own clock is
+/// right knows which to check. Not an alert: the Mac keeps working on its home accounts. Withdrawn
+/// when the record clears.
+pub(crate) fn accounts_clock_entry(clock: &crate::harness_host::ClockSaid) -> Entry {
+    let (cause, what, reason, ahead) = match clock.standing {
+        aterm_agent::harness::accounts::ClockStanding::Off { ahead } => (
+            "clock-off",
+            "This Mac's clock is off",
+            format!(
+                "{} of the {} Macs it hears read it at least {} {}",
+                clock.against,
+                clock.of,
+                clock_span_words(clock.by_s),
+                if ahead { "ahead" } else { "behind" }
+            ),
+            Some(ahead),
+        ),
+        aterm_agent::harness::accounts::ClockStanding::Split => (
+            "clock-split",
+            "Macs disagree with this Mac's clock",
+            format!(
+                "{} of the {} Macs it hears disagree with this Mac's clock",
+                clock.against, clock.of
+            ),
+            None,
+        ),
+    };
+    let mut entry = Entry::new(
+        Family::Accounts,
+        "",
+        cause,
+        what,
+        Why::Spent {
+            tried: Reason::new("keeps to its home accounts while the clocks disagree"),
+            reason: Reason::new(reason),
+        },
+        Then::step(ACCOUNTS_CLOCK_STEP),
+    )
+    .severity(Severity::Warn)
+    .resurface(Resurface::WAIT);
+    if !clock.peers.is_empty() {
+        for line in labels_lines(
+            "Disagreeing Macs: ",
+            &clock.peers,
+            aterm_messages::exceptions::MORE_LINES,
+        ) {
+            entry = entry.more(line);
+        }
+    }
+    let ahead = ahead.map_or(String::new(), |ahead| format!(" ahead={}", u8::from(ahead)));
+    entry.log_line(format!(
+        "accounts need={cause}{ahead} by_s={} against={} of={}",
+        clock.by_s, clock.against, clock.of
+    ))
+}
+
+/// `secs` in days and hours, or hours and minutes under a day ("2 d 3 h", "45 min").
+fn clock_span_words(secs: i64) -> String {
+    let minutes = secs.max(0) / 60;
+    let (d, h, m) = (minutes / 1440, minutes / 60 % 24, minutes % 60);
+    match (d, h, m) {
+        (0, 0, m) => format!("{m} min"),
+        (0, h, 0) => format!("{h} h"),
+        (0, h, m) => format!("{h} h {m} min"),
+        (d, 0, _) => format!("{d} d"),
+        (d, h, _) => format!("{d} d {h} h"),
+    }
 }
 
 pub(crate) const USAGE_TAP_SILENT_KEY: &str = "harness.accounts.no-tap";
@@ -6372,6 +6607,15 @@ fn strip_place(line: &str) -> Option<&str> {
 }
 
 /// Formats a 1-based tab position (`in tab 2` or `in window 1, tab 2`).
+/// [`tab_place`] for a worker's tab, which has no chip for a number to name: its `name`
+/// (`Workers ▸ bench`).
+pub(crate) fn worker_place(window: Option<usize>, name: &str) -> String {
+    match window {
+        Some(window) => format!("in window {window}, {name}"),
+        None => format!("in {name}"),
+    }
+}
+
 pub(crate) fn tab_place(window: Option<usize>, tab: usize) -> String {
     match window {
         Some(window) => format!("in window {window}, tab {tab}"),

@@ -133,8 +133,10 @@ pub const PROBE_CONNECT: Duration = Duration::from_secs(1);
 /// join change gap, which a key's changed request (its join password typed again) waits for.
 /// The server's other `429`s, its caps on the queue, carry none.
 const JOIN_RETRY_MOST: Duration = Duration::from_secs(10);
-/// The deadline of a publish (up to 16 MiB on a LAN) and of the join exchanges.
-const EXCHANGE: Duration = Duration::from_secs(120);
+/// The deadline of a publish (up to 16 MiB on a LAN), of a records post and of the join
+/// exchanges. Every exchange of one fan-out to many servers shares one such deadline
+/// (`client::fan_out`).
+pub(crate) const EXCHANGE: Duration = Duration::from_secs(120);
 /// The deadline of a join verdict's one-line exchange ([`post_verdict`], [`list_verdicts`]):
 /// a waiting subscriber reads it before each long-poll, and the approver posts it within its
 /// pass, so neither waits out a [`EXCHANGE`] on a vault that does not answer.
@@ -710,12 +712,16 @@ pub(crate) fn observe_after_nowait(
     }
 }
 
-/// What [`observe_after_nowait_within`] heard.
+/// What a read of at most some bytes of a vault server's answer heard
+/// ([`observe_after_nowait_within`], [`get_within_as`], [`look_within`],
+/// [`fetch_records_within`]).
 #[cfg(any(unix, test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Pulled {
-    /// What [`observe_after_nowait`] returns for it.
-    Fetched(Fetched),
+pub(crate) enum Pulled<A = Fetched> {
+    /// The answer, read whole: what [`observe_after_nowait`] returns for it, for [`look_within`]
+    /// what [`get_within`] does, or for [`fetch_records_within`] what [`fetch_records_sync`]
+    /// does.
+    Fetched(A),
     /// An answer, of any status, whose body is longer than the limit given: no more of it than
     /// that was read (none, when the answer declares its length).
     Larger,
@@ -733,17 +739,52 @@ pub(crate) fn observe_after_nowait_within(
     total: Duration,
     limit: usize,
 ) -> crate::Result<Pulled> {
-    let sent = get_request(
-        &client(total),
+    pulled(
+        get_request(
+            &client(total),
+            url,
+            after,
+            Some(PROBE_CONNECT.min(total)),
+            None,
+            true,
+            true,
+        ),
         url,
         after,
-        Some(PROBE_CONNECT.min(total)),
         None,
-        true,
-        true,
+        limit,
     )
-    .limit(limit.min(MAX_ENVELOPE))
-    .send_phased(&[]);
+}
+
+/// `request`, a GET of the vault at `url` (asking after `after`, for `subscriber`), sent reading
+/// a body of at most `limit` bytes and never more than [`MAX_ENVELOPE`]: a longer one is
+/// [`Pulled::Larger`], and an answer no vault server gives is an error.
+#[cfg(any(unix, test))]
+fn pulled(
+    request: aterm_http::RequestBuilder<'_>,
+    url: &str,
+    after: Option<u64>,
+    subscriber: Option<&str>,
+    limit: usize,
+) -> crate::Result<Pulled> {
+    match pulled_answer(request, url, after, subscriber, limit)? {
+        Pulled::Fetched(Answer::Fetched(fetched)) => Ok(Pulled::Fetched(fetched)),
+        Pulled::Fetched(Answer::Foreign(why)) => Err(Error::new(why)),
+        Pulled::Larger => Ok(Pulled::Larger),
+    }
+}
+
+/// [`pulled`], keeping an answer no vault server gives as the [`Answer::Foreign`] [`get`] makes of
+/// it.
+#[cfg(any(unix, test))]
+fn pulled_answer(
+    request: aterm_http::RequestBuilder<'_>,
+    url: &str,
+    after: Option<u64>,
+    subscriber: Option<&str>,
+    limit: usize,
+) -> crate::Result<Pulled<Answer>> {
+    let sent = request.limit(limit.min(MAX_ENVELOPE)).send_phased(&[]);
     if let Err(aterm_http::SendError {
         error: aterm_http::Error::TooLarge { .. },
         ..
@@ -751,13 +792,9 @@ pub(crate) fn observe_after_nowait_within(
     {
         return Ok(Pulled::Larger);
     }
-    match classify_get_response(sent, url, after, None)
-        .map(|observed| observed.answer)
-        .map_err(|unheard| unheard.why)?
-    {
-        Answer::Fetched(fetched) => Ok(Pulled::Fetched(fetched)),
-        Answer::Foreign(why) => Err(Error::new(why)),
-    }
+    classify_get_response(sent, url, after, subscriber)
+        .map(|observed| Pulled::Fetched(observed.answer))
+        .map_err(|unheard| unheard.why)
 }
 
 /// [`fetch_within`] as a non-consuming probe ([`OBSERVER_HEADER`]): the server answers it as any
@@ -855,21 +892,70 @@ pub fn get_within(url: &str, total: Duration) -> crate::Result<Answer> {
     .map_err(|unheard| unheard.why)
 }
 
-/// [`get_within`] for an identified consumer, preserving the same connect and total budgets.
+/// [`get_within`], reading a body of at most `limit` bytes (and never more than
+/// [`MAX_ENVELOPE`]): a longer one is [`Pulled::Larger`], where [`get_within`] takes it for an
+/// answer no vault server gives ([`Answer::Foreign`], saying [`past_any_envelope`] of one past
+/// [`MAX_ENVELOPE`]). A join's probe of many servers at once reads each so, under a small limit
+/// first (`crate::client`'s `probes_within`).
+#[cfg(unix)]
+pub(crate) fn look_within(
+    url: &str,
+    total: Duration,
+    limit: usize,
+) -> crate::Result<Pulled<Answer>> {
+    pulled_answer(
+        get_request(
+            &client(total),
+            url,
+            None,
+            Some(PROBE_CONNECT.min(total)),
+            None,
+            false,
+            true,
+        ),
+        url,
+        None,
+        None,
+        limit,
+    )
+}
+
+/// What [`get_within`] says of `url`'s answer when its body is longer than [`MAX_ENVELOPE`]
+/// ([`Answer::Foreign`]): an answer a read of at most that much ([`look_within`]) takes for
+/// [`Pulled::Larger`].
+#[cfg(unix)]
+pub(crate) fn past_any_envelope(url: &str) -> String {
+    transport_error(
+        "fetching",
+        url,
+        &aterm_http::Error::TooLarge {
+            limit: MAX_ENVELOPE,
+        },
+    )
+    .0
+}
+
+/// One GET of the vault at `url` for an identified consumer (its `age1…` recipient in
+/// [`SUBSCRIBER_HEADER`] when `Some`), never a look: all of it within `total`, its lookup and
+/// connect within `connect` where given, reading a body of at most `limit` bytes (and never more
+/// than [`MAX_ENVELOPE`]). A longer one is [`Pulled::Larger`], and an answer no vault server
+/// gives is an error. A client reading many servers' envelopes at once reads each so, under a
+/// small limit first (`crate::client`'s `fan_out::envelopes_within`).
 #[cfg(unix)]
 pub(crate) fn get_within_as(
     url: &str,
     total: Duration,
+    connect: Option<Duration>,
     subscriber: Option<&str>,
-) -> crate::Result<Answer> {
-    get_via(
-        &client(total),
+    limit: usize,
+) -> crate::Result<Pulled> {
+    pulled(
+        get_request(&client(total), url, None, connect, subscriber, false, false),
         url,
         None,
-        Some(PROBE_CONNECT.min(total)),
         subscriber,
+        limit,
     )
-    .map_err(|unheard| unheard.why)
 }
 
 /// [`get_bounded`] through `client` (its timeout is the request's deadline).
@@ -1157,31 +1243,97 @@ pub(crate) fn fetch_records_sync(
         Some(w) => w.saturating_add(FETCH_MARGIN).max(total),
         None => total,
     };
-    let target = records_have_url(url, have);
     let http = client(deadline);
+    let request = records_request(
+        &http,
+        url,
+        have,
+        wait,
+        total,
+        subscriber,
+        crate::membership_log::MAX_RECORDS_STREAM,
+    );
+    match request.send_phased(&[]) {
+        Ok(response) => records_answer(response, url),
+        Err(failed) if wait.is_some() && held_past_deadline(&failed) => Ok(RecordsAnswer::none()),
+        Err(aterm_http::SendError { error, .. }) => {
+            Err(transport_error("fetching records from", url, &error))
+        }
+    }
+}
+
+/// [`fetch_records_sync`] of a server that does not wait ([`NO_WAIT_HEADER`]), reading a body of at
+/// most `limit` bytes (and never more than [`crate::membership_log::MAX_RECORDS_STREAM`]): a longer
+/// one is [`Pulled::Larger`] (past [`crate::membership_log::MAX_RECORDS_STREAM`], where
+/// [`fetch_records_sync`] fails as [`past_any_records_stream`] says). A records pass reads its
+/// peers so, all at once under a small limit first (`crate::client`'s `fan_out::RECORDS`).
+#[cfg(unix)]
+pub(crate) fn fetch_records_within(
+    url: &str,
+    have: &[crate::membership_log::RecordId],
+    total: Duration,
+    subscriber: Option<&str>,
+    limit: usize,
+) -> crate::Result<Pulled<RecordsAnswer>> {
+    let http = client(total);
+    let request = records_request(&http, url, have, None, total, subscriber, limit);
+    match request.send_phased(&[]) {
+        Ok(response) => records_answer(response, url).map(Pulled::Fetched),
+        Err(aterm_http::SendError {
+            error: aterm_http::Error::TooLarge { .. },
+            ..
+        }) => Ok(Pulled::Larger),
+        Err(aterm_http::SendError { error, .. }) => {
+            Err(transport_error("fetching records from", url, &error))
+        }
+    }
+}
+
+/// How [`fetch_records_sync`] fails at `url` when the records it answers are longer than
+/// [`crate::membership_log::MAX_RECORDS_STREAM`], which [`fetch_records_within`] takes for
+/// [`Pulled::Larger`].
+#[cfg(unix)]
+pub(crate) fn past_any_records_stream(url: &str) -> Error {
+    transport_error(
+        "fetching records from",
+        url,
+        &aterm_http::Error::TooLarge {
+            limit: crate::membership_log::MAX_RECORDS_STREAM,
+        },
+    )
+}
+
+/// A records GET of `url` naming `have` (`GET <url>/records?have=…`) on `http`, for `subscriber`
+/// where given, reading a body of at most `limit` bytes (never more than
+/// [`crate::membership_log::MAX_RECORDS_STREAM`]). With no `wait`, it asks the server not to
+/// ([`NO_WAIT_HEADER`]) and dials within [`PROBE_CONNECT`] (or `total`, where shorter).
+fn records_request<'a>(
+    http: &'a Client,
+    url: &str,
+    have: &[crate::membership_log::RecordId],
+    wait: Option<Duration>,
+    total: Duration,
+    subscriber: Option<&str>,
+    limit: usize,
+) -> aterm_http::RequestBuilder<'a> {
     let request = http
-        .get(&target)
-        .limit(crate::membership_log::MAX_RECORDS_STREAM);
+        .get(&records_have_url(url, have))
+        .limit(limit.min(crate::membership_log::MAX_RECORDS_STREAM));
     let request = match subscriber {
         Some(sub) => request.header(SUBSCRIBER_HEADER, sub),
         None => request,
     };
-    let request = if wait.is_none() {
+    if wait.is_none() {
         request
             .header(NO_WAIT_HEADER, "1")
             .connect_within(PROBE_CONNECT.min(total))
     } else {
         request
-    };
-    let response = match request.send_phased(&[]) {
-        Ok(response) => response,
-        Err(failed) if wait.is_some() && held_past_deadline(&failed) => {
-            return Ok(RecordsAnswer::none());
-        }
-        Err(aterm_http::SendError { error, .. }) => {
-            return Err(transport_error("fetching records from", url, &error));
-        }
-    };
+    }
+}
+
+/// What `response`, `url`'s to a records GET ([`records_request`]), says.
+fn records_answer(response: aterm_http::Response, url: &str) -> crate::Result<RecordsAnswer> {
     let needs = response.header(RECORDS_NEED_HEADER) == Some("1");
     let boot = response
         .header(RECORDS_BOOT_HEADER)
@@ -1189,7 +1341,7 @@ pub(crate) fn fetch_records_sync(
         .map(str::to_owned);
     match response.status() {
         200 => Ok(RecordsAnswer {
-            bytes: response.body().to_vec(),
+            bytes: response.into_body(),
             needs,
             boot,
         }),
@@ -1351,14 +1503,45 @@ pub fn post_records(url: &str, records: &[u8]) -> crate::Result<()> {
 /// `records` exceeds [`crate::membership_log::MAX_RECORDS_STREAM`], transport fails, or the server
 /// answers `408`, `429` or a `5xx` other than `507`.
 pub(crate) fn post_records_answered(url: &str, records: &[u8]) -> crate::Result<crate::Result<()>> {
+    post_records_answered_until(url, records, None)
+}
+
+/// [`post_records_answered`], the whole exchange ending by `deadline` where one is given (at most
+/// [`EXCHANGE`] from now): a post that starts once `deadline` has passed dials nothing and
+/// answers [`ErrorKind::TimedOut`], so the posts of one fan-out that share a deadline end by it
+/// however many servers take a post and never answer.
+///
+/// # Errors
+/// As [`post_records_answered`], and [`ErrorKind::TimedOut`] once `deadline` has passed.
+pub(crate) fn post_records_answered_until(
+    url: &str,
+    records: &[u8],
+    deadline: Option<std::time::Instant>,
+) -> crate::Result<crate::Result<()>> {
     let max = crate::membership_log::MAX_RECORDS_STREAM;
     if records.len() > max {
         return Err(Error::new(format!(
             "the record batch is larger than {max} bytes"
         )));
     }
+    let within = match deadline {
+        Some(deadline) => deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| {
+                Error::of_kind(
+                    ErrorKind::TimedOut,
+                    format!(
+                        "posting records to {}: the deadline passed before it began",
+                        describe(url)
+                    ),
+                )
+            })?
+            .min(EXCHANGE),
+        None => EXCHANGE,
+    };
     let target = records_url(url);
-    let response = client(EXCHANGE)
+    let response = client(within)
         .post(&target)
         .header("Content-Type", "application/octet-stream")
         .limit(REASON_BODY)
@@ -1851,8 +2034,9 @@ pub fn wait_joins(url: &str, after: Option<u64>, wait: Duration) -> crate::Resul
     wait_joins_from(url, after, wait).map(|(joins, _)| joins)
 }
 
-/// [`wait_joins`], and the address of the server that answered (`None`: not known), which an
-/// approver needs to judge the listing's `home=` words ([`crate::home_lan::Place::serving`]).
+/// [`wait_joins`], and the address of the server that answered (`None`: not known): an approver
+/// continues a queue's long-poll only from the server that answered it, and names that server in
+/// `aterm secrets requests --json`.
 pub fn wait_joins_from(
     url: &str,
     after: Option<u64>,
@@ -1998,7 +2182,7 @@ pub fn parse_verdict_line(line: &str) -> Option<(String, String)> {
 }
 
 /// One join request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct JoinRequest {
     /// The machine's `age1…` recipient, as sent.
     pub recipient: String,
@@ -2008,18 +2192,23 @@ pub struct JoinRequest {
     pub code: String,
     /// Unix seconds when the server queued it (listings only).
     pub time: Option<u64>,
-    /// An older server's marker that it observed this request from any private address
-    /// (listings only). A server since the home ALab LAN rule never lists it, and no approver
-    /// admits by it: a phone hotspot or a café numbers its hosts privately too.
-    pub lan: bool,
-    /// The home ALab LAN the serving vault observed this request on, while that server is still
-    /// on it (listings only, [`crate::home_lan`]).
-    #[cfg(unix)]
-    pub home: Option<crate::home_lan::HomeTag>,
     /// A member's signed Allow of it (`crate::members::Allowed`), padded base64.
     pub allowed: Option<String>,
     /// The join-password proof it carried (`crate::join`), padded base64.
     pub proof: Option<String>,
+}
+
+impl std::fmt::Debug for JoinRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinRequest")
+            .field("recipient", &self.recipient)
+            .field("host", &self.host)
+            .field("code", &self.code)
+            .field("time", &self.time)
+            .field("member_allow_present", &self.allowed.is_some())
+            .field("password_proof_present", &self.proof.is_some())
+            .finish()
+    }
 }
 
 impl JoinRequest {
@@ -2037,9 +2226,8 @@ impl JoinRequest {
         line
     }
 
-    /// The line a server lists: `age1… <host> <code> <time>`, then ` home=<tag>`,
-    /// ` allowed=<b64>` and ` proof=<b64>`. An older parser reads ` home=` as a fifth field and
-    /// skips the line, so an older approver never admits such a request automatically.
+    /// The line a server lists: `age1… <host> <code> <time>`, then ` allowed=<b64>` and
+    /// ` proof=<b64>`.
     pub fn listed(&self) -> String {
         let mut line = format!(
             "{} {} {} {}",
@@ -2048,14 +2236,6 @@ impl JoinRequest {
             self.code,
             self.time.unwrap_or(0)
         );
-        if self.lan {
-            line.push_str(" lan=1");
-        }
-        #[cfg(unix)]
-        if let Some(home) = &self.home {
-            line.push_str(" home=");
-            line.push_str(home.as_str());
-        }
         if let Some(allowed) = &self.allowed {
             line.push_str(" allowed=");
             line.push_str(allowed);
@@ -2097,13 +2277,18 @@ pub fn parse_join_line(line: &str) -> crate::Result<JoinRequest> {
         }
         None => (line, None),
     };
-    #[cfg(unix)]
+    // An aterm 0.148 or 0.149 server lists ` home=<16 lowercase hex>` on a request it observed
+    // on its home ALab LAN, and one before 0.148 ` lan=1` on one from a private address. Nothing
+    // admits by either any longer (a Mac on the home ALab LAN is let in by a member when it
+    // proves itself): each is read past, so a newer admin still sees and can approve the request.
     let (line, home) = match line.rsplit_once(" home=") {
-        Some((rest, tag)) => match crate::home_lan::HomeTag::parse(tag) {
-            Some(tag) => (rest, Some(tag)),
-            None => return Err(Error::new("a join request's home LAN marker is invalid")),
-        },
-        None => (line, None),
+        Some((rest, tag))
+            if tag.len() == 16 && tag.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+        {
+            (rest, true)
+        }
+        Some(_) => return Err(Error::new("a join request's home LAN marker is invalid")),
+        None => (line, false),
     };
     let (line, lan) = match line.rsplit_once(" lan=") {
         Some((rest, "1")) => (rest, true),
@@ -2142,11 +2327,7 @@ pub fn parse_join_line(line: &str) -> crate::Result<JoinRequest> {
                 .ok_or_else(|| Error::new("a join request's time is not unix seconds"))?,
         ),
     };
-    #[cfg(unix)]
-    let marked = lan || home.is_some();
-    #[cfg(not(unix))]
-    let marked = lan;
-    if marked && time.is_none() {
+    if (lan || home) && time.is_none() {
         return Err(Error::new("only a server listing carries a LAN marker"));
     }
     Ok(JoinRequest {
@@ -2154,9 +2335,6 @@ pub fn parse_join_line(line: &str) -> crate::Result<JoinRequest> {
         host: host.to_owned(),
         code: code.to_owned(),
         time,
-        lan,
-        #[cfg(unix)]
-        home,
         allowed,
         proof,
     })
@@ -3163,13 +3341,11 @@ mod tests {
         assert_eq!(request.host, "m22");
         assert_eq!(request.code, "abcd-ef23-ghij-k234");
         assert_eq!(request.time, None);
-        assert!(!request.lan);
         assert_eq!(request.proof, None);
         assert_eq!(request.line(), line);
         let listed = parse_join_line(&format!("{line} 1792530000")).expect("listed");
         assert_eq!(listed.time, Some(1_792_530_000));
         assert_eq!(listed.listed(), format!("{line} 1792530000"));
-        assert!(!listed.lan, "old server listings carry no LAN assertion");
         let proof = crate::b64::encode_padded(&[7u8; 32]);
         let proved = parse_join_line(&format!("{line} proof={proof}")).expect("proved");
         assert_eq!(proved.proof.as_deref(), Some(proof.as_str()));
@@ -3177,17 +3353,37 @@ mod tests {
         let listed = parse_join_line(&format!("{line} 1792530000 proof={proof}")).expect("listed");
         assert_eq!(listed.time, Some(1_792_530_000));
         assert_eq!(listed.proof.as_deref(), Some(proof.as_str()));
-        let lan_line = format!("{line} 1792530000 lan=1 proof={proof}");
-        let lan = parse_join_line(&lan_line).expect("server LAN listing");
-        assert!(lan.lan);
-        assert_eq!(lan.listed(), lan_line);
-        assert_eq!(
-            lan.line(),
-            proved.line(),
-            "a client cannot send server fields"
-        );
+        // An older server's LAN markers (` lan=1` before 0.148, ` home=<tag>` from 0.148 and
+        // 0.149) parse and are read past: the request stays listed, and nothing of the marker
+        // survives into what this Mac lists or posts.
+        let tag = "0123456789abcdef";
+        for (old, without) in [
+            (
+                format!("{line} 1792530000 lan=1 proof={proof}"),
+                format!("{line} 1792530000 proof={proof}"),
+            ),
+            (
+                format!("{line} 1792530000 home={tag}"),
+                format!("{line} 1792530000"),
+            ),
+            (
+                format!("{line} 1792530000 lan=1 home={tag} proof={proof}"),
+                format!("{line} 1792530000 proof={proof}"),
+            ),
+        ] {
+            let marked = parse_join_line(&old).expect("an older server's listing");
+            assert_eq!(marked.listed(), without, "{old}");
+            assert_eq!(marked.line(), parse_join_line(&without).unwrap().line());
+            assert_eq!(marked.host, "m22", "{old}");
+        }
         for bad in [
             format!("{line} lan=1"),
+            format!("{line} home={tag}"),
+            format!("{line} lan=1 home={tag}"),
+            format!("{line} 1792530000 home=0123456789ABCDEF"),
+            format!("{line} 1792530000 home=0123456789abcde"),
+            format!("{line} 1792530000 home="),
+            format!("{line} 1792530000 home={tag} home={tag}"),
             format!("{line} 1792530000 lan=0"),
             format!("{line} 1792530000 lan=1 lan=1"),
             format!("{line} 1792530000 lan=true"),

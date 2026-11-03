@@ -601,6 +601,7 @@ fn execution_work_read(
     elapsed: bool,
 ) -> progress::ProgressRead {
     if matches!(case, 20 | 21) {
+        let activity_roster = a.roster();
         host.account_progress_read_with_activity(
             sid,
             std::process::id().try_into().unwrap(),
@@ -614,10 +615,14 @@ fn execution_work_read(
                     ["work-2", "unlisted-account"]
                         .map(|label| aterm_agent::harness::accounts_sync::LoginActivity {
                             label: label.into(),
+                            identity: activity_roster
+                                .row(label)
+                                .map(aterm_agent::harness::accounts_sync::LoginIdentity::for_test),
                             route: Some("fixture-browser".into()),
                             active: true,
                             observed_at: now,
                             next_at: Some(now + 1),
+                            diagnostic: None,
                         })
                         .to_vec()
                 })
@@ -1221,6 +1226,7 @@ fn a_repaired_execution_hold_becomes_history_at_its_monotonic_deadline() {
     }
     // Once the gate is historical, a current sign-in owns its own future event time.
     let next_activity = retained.next_at.unwrap() + 60;
+    let activity_row = a.roster().row("work-2").unwrap().clone();
     for wall in [None, Some(retained.observed_at - 86_400)] {
         let read = host
             .account_progress_read_with_activity(
@@ -1232,10 +1238,16 @@ fn a_repaired_execution_hold_becomes_history_at_its_monotonic_deadline() {
                 |_, _, _| {
                     Some(vec![aterm_agent::harness::accounts_sync::LoginActivity {
                         label: "work-2".into(),
+                        identity: Some(
+                            aterm_agent::harness::accounts_sync::LoginIdentity::for_test(
+                                &activity_row,
+                            ),
+                        ),
                         route: None,
                         active: true,
                         observed_at: retained.observed_at,
                         next_at: Some(next_activity),
+                        diagnostic: None,
                     }])
                 },
             )

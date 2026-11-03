@@ -163,7 +163,7 @@ pub enum Verb {
     ResourceRun,
     /// `aterm pkg` — the toolchain package manager.
     Pkg,
-    /// `aterm agh` — the GitHub client: reads as the routed identity, JSON out, typed exits.
+    /// `aterm agh` — the GitHub client: reads and writes as the routed identity, JSON out, typed exits.
     Agh,
     /// `aterm fleet` — fleet membership (`init`, `join`, `peers`, `allow`, `leave`).
     Fleet,
@@ -199,6 +199,8 @@ pub enum Verb {
     Members,
     /// `aterm db` — embedded replicated application databases, offline and LAN.
     Db,
+    /// `aterm email` — read configured mail accounts without opening a window.
+    Email,
     /// `aterm harness` — Claude Code harness read views, accounts roster, and live upgrade.
     Harness,
     /// `aterm keeper` — the PTY keeper (`start | stop | status | serve`).
@@ -240,6 +242,7 @@ impl Verb {
         Verb::Secrets,
         Verb::Members,
         Verb::Db,
+        Verb::Email,
         Verb::Harness,
         Verb::Keeper,
         Verb::Acaffiene,
@@ -273,6 +276,7 @@ impl Verb {
             Verb::Secrets => "secrets",
             Verb::Members => "members",
             Verb::Db => "db",
+            Verb::Email => "email",
             Verb::Harness => "harness",
             Verb::Keeper => "keeper",
             Verb::Acaffiene => "acaffiene",
@@ -310,6 +314,7 @@ impl Verb {
             | Verb::Secrets
             | Verb::Members
             | Verb::Db
+            | Verb::Email
             | Verb::Harness
             | Verb::Keeper
             | Verb::Acaffiene
@@ -343,6 +348,7 @@ impl Verb {
             Verb::Secrets => "aterm secrets [<cmd>]",
             Verb::Members => "aterm members <cmd>",
             Verb::Db => "aterm db <cmd> --dir <database>",
+            Verb::Email => "aterm email <cmd>",
             Verb::Harness => "aterm harness <cmd>",
             Verb::Keeper => "aterm keeper <cmd>",
             Verb::Acaffiene => "aterm acaffiene [<cmd>]",
@@ -372,8 +378,8 @@ impl Verb {
             ],
             Verb::Pkg => &["Install, update and verify the toolchain."],
             Verb::Agh => &[
-                "GitHub reads as the routed identity: JSON out,",
-                "typed exits (`aterm agh help`).",
+                "GitHub reads and writes as the routed identity:",
+                "JSON out, typed exits (`aterm agh help`).",
             ],
             Verb::Fleet => &[
                 "This machine's membership in a fleet, the aterms",
@@ -443,6 +449,10 @@ impl Verb {
                 "`--develop`: fast-forward recorded checkouts and",
                 "provision their test tools, no settings.",
             ],
+            Verb::Email => &[
+                "Read mail without a window (accounts | folders |",
+                "list | read | watch); JSON Lines output.",
+            ],
             Verb::Secrets => &[
                 "One credentials file for every machine: the",
                 "vault, its server and ~/.secrets (status | join |",
@@ -471,7 +481,7 @@ impl Verb {
             Verb::Keeper => &[
                 "The PTY keeper holds every terminal's master, so",
                 "a crashed window's shells live on (start | stop |",
-                "status | serve). macOS only, opt-in.",
+                "status | serve). On by default; macOS only.",
             ],
             Verb::Acaffiene => &[
                 "The menu-bar keep-awake mug: a click keeps this",
@@ -1005,12 +1015,18 @@ fn exceptions_log_path() -> Option<std::path::PathBuf> {
 
 fn read_log_tail(path: &std::path::Path, tail: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
-    let meta = std::fs::symlink_metadata(path).ok()?;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    opts.custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS);
+    let mut file = opts.open(path).ok()?;
+    let meta = file.metadata().ok()?;
     if !meta.file_type().is_file() {
         return None;
     }
     let len = meta.len();
-    let mut file = std::fs::File::open(path).ok()?;
     let cut = len > tail;
     if cut {
         file.seek(SeekFrom::Start(len - tail)).ok()?;

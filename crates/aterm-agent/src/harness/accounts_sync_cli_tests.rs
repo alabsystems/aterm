@@ -608,10 +608,10 @@ fn a_look_at_the_sheet_asks_the_host_its_name_once() {
     );
     let sheet = bed.secrets().join(ACCOUNTS_CSV_FILE);
     let config = bed.aterm_toml();
-    let _ = sheet_names_this_machine(&bed.home, Some(&config), &sheet);
+    let _ = sheet_names_this_machine(Some(&config), &sheet);
     let asked = HOST_ASKED.with(std::cell::Cell::get);
     for _ in 0..3 {
-        let _ = sheet_names_this_machine(&bed.home, Some(&config), &sheet);
+        let _ = sheet_names_this_machine(Some(&config), &sheet);
     }
     assert_eq!(HOST_ASKED.with(std::cell::Cell::get), asked);
 }
@@ -842,18 +842,6 @@ fn the_source_table_includes_pending_rows_without_a_sync_or_machine_id() {
         Ok(Vec::new())
     );
     assert!(cli_pools_due(&pool_bed.aterm_toml(), &pool_bed.state, &pool_bed.home, NOW).is_empty());
-}
-
-#[test]
-fn the_signed_machine_record_supplies_the_account_machine_id() {
-    let root = aterm_tempfile::tempdir().expect("machine record root");
-    fs::create_dir(root.path().join(".aterm")).unwrap();
-    fs::write(
-        root.path().join(".aterm/machine.toml"),
-        "id = \"m22\"\npubkey = \"record-key\"\n",
-    )
-    .unwrap();
-    assert_eq!(machine_record_id(root.path()), Some("m22".into()));
 }
 
 #[test]
@@ -1548,7 +1536,6 @@ fn with_logged_effects<R>(
     let fx = UpkeepEffects {
         fetch,
         spawn_renewal: spawn,
-        quota_refresh: &|_, _, _, _| {},
         sync_cooldown: &cooldown,
         rediscovery,
         renew_guard: &guard,
@@ -2404,10 +2391,10 @@ fn a_grok_rows_background_renewal_hands_off_nothing_and_a_kimi_rows_still_starts
     assert_eq!(*handed.lock().unwrap(), 1);
     assert_eq!(
         renew(Cli::Kimi, &kimi, "kimi-2"),
-        RenewalDispatch::Failed,
-        "CONTROL: no email"
+        RenewalDispatch::Started,
+        "an email-less Kimi device flow starts too"
     );
-    assert_eq!(*handed.lock().unwrap(), 1);
+    assert_eq!(*handed.lock().unwrap(), 2);
 
     // A saved selection of each, as a menu click leaves it, served by the window's upkeep.
     let bed = Bed::new("grok-selection");
@@ -2705,7 +2692,6 @@ region = \"global\"
     let fx = UpkeepEffects {
         fetch: &fetch,
         spawn_renewal: &spawn,
-        quota_refresh: &|_, _, _, _| {},
         sync_cooldown: &cooldown,
         rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &fresh_guard,
@@ -2785,7 +2771,6 @@ region = \"global\"
         let fx = UpkeepEffects {
             fetch: &fetch,
             spawn_renewal: &spawn,
-            quota_refresh: &|_, _, _, _| {},
             sync_cooldown: &cooldown,
             rediscovery: &Mutex::new(Rediscovery::default()),
             renew_guard: &guard,
@@ -2832,7 +2817,6 @@ fn kimi_pool_upkeep(bed: &Bed, guard: &Arc<Mutex<AutoRenewGuard>>, now: i64) -> 
     let fx = UpkeepEffects {
         fetch: &fetch,
         spawn_renewal: &spawn,
-        quota_refresh: &|_, _, _, _| {},
         sync_cooldown: &cooldown,
         rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: guard,
@@ -3287,7 +3271,6 @@ region = \"global\"
     let fx = UpkeepEffects {
         fetch: &fetch,
         spawn_renewal: &spawn,
-        quota_refresh: &|_, _, _, _| {},
         sync_cooldown: &cooldown,
         rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &pool_guard,
@@ -3486,7 +3469,6 @@ region = \"global\"
     let idle_fx = UpkeepEffects {
         fetch: &fetch,
         spawn_renewal: &spawn,
-        quota_refresh: &|_, _, _, _| {},
         sync_cooldown: &cooldown,
         rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &idle_guard,
@@ -3558,7 +3540,6 @@ region = \"global\"
     let wall_fx = UpkeepEffects {
         fetch: &fetch,
         spawn_renewal: &spawn,
-        quota_refresh: &|_, _, _, _| {},
         sync_cooldown: &cooldown,
         rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &wall_guard,
@@ -3803,7 +3784,6 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
     let fx = UpkeepEffects {
         fetch: &fetch,
         spawn_renewal: &noop_spawn,
-        quota_refresh: &|_, _, _, _| {},
         sync_cooldown: &cooldown,
         rediscovery: &Mutex::new(Rediscovery::default()),
         renew_guard: &guard,
@@ -3882,7 +3862,6 @@ fn harness_accounts_off_stops_window_upkeep_sign_ins_as_well_as_sync() {
         let fx = UpkeepEffects {
             fetch: &fetch,
             spawn_renewal: &spawn,
-            quota_refresh: &|_, _, _, _| {},
             sync_cooldown: &cooldown,
             rediscovery: &Mutex::new(Rediscovery::default()),
             renew_guard: &guard,

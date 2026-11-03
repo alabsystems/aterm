@@ -10,7 +10,10 @@ use aterm_session::SessionId;
 pub(crate) use aterm_gui_fabric::*;
 
 /// One worker observes atomic mailbox replacements, including writes by a handoff peer
-/// after this process adopted the session. GUI readers only use the cached metadata.
+/// after this process adopted the session. GUI readers only use the cached metadata, and a
+/// parked `await inbox` is woken only by a refresh that changed it: nothing else rechecks.
+/// Only the active owner's mailbox is observed. An uncommitted successor waits for Commit;
+/// unknown legacy mailboxes may still belong to older readers and are left untouched.
 #[cfg(all(unix, not(test)))]
 pub(crate) fn watch_direct_mail(ctx: &Arc<crate::SessionCtx>) {
     use std::sync::{Mutex, Weak, mpsc};
@@ -27,7 +30,6 @@ pub(crate) fn watch_direct_mail(ctx: &Arc<crate::SessionCtx>) {
     if std::thread::Builder::new()
         .name("fleet-mail-watch".to_owned())
         .spawn(move || {
-            use std::os::unix::fs::MetadataExt;
             let mut sessions = Vec::new();
             loop {
                 match rx.recv_timeout(std::time::Duration::from_secs(1)) {
@@ -39,10 +41,12 @@ pub(crate) fn watch_direct_mail(ctx: &Arc<crate::SessionCtx>) {
                     let Some(ctx) = weak.upgrade() else {
                         return false;
                     };
+                    if !ctx.fleet_mail_ready() {
+                        return true;
+                    }
                     let stamp = ctx
                         .fleet_mail_path()
-                        .and_then(|path| std::fs::symlink_metadata(path).ok())
-                        .map(|m| (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec()));
+                        .and_then(|path| crate::fabric::fleet_mail::stamp(&path).ok());
                     if stamp != *seen && crate::fabric::fleet_mail::restore(&*ctx) {
                         *seen = stamp;
                     }
@@ -104,6 +108,10 @@ impl FabricSession for crate::SessionCtx {
             None
         }
     }
+
+    fn fleet_mail_ready(&self) -> bool {
+        !aterm_update::is_uncommitted_handoff_candidate()
+    }
 }
 
 impl Registry for crate::session_store::SessionStore {
@@ -118,6 +126,10 @@ impl Registry for crate::session_store::SessionStore {
     fn session(&self, sid: &SessionId) -> Option<Arc<dyn FabricSession>> {
         self.by_sid(sid)
             .map(|h| Arc::clone(&h.ctx) as Arc<dyn FabricSession>)
+    }
+
+    fn roster_seq(&self) -> u64 {
+        crate::session_store::SessionStore::roster_seq(self)
     }
 
     fn bridge_lost_advised(&self, sessions: usize) {

@@ -11,8 +11,8 @@ use aterm_core::render::{BandIcon, ChromeIcon};
 use aterm_window::event::{ElementState, MouseButton};
 
 use super::gesture_tests::{
-    BYPASS, Hosted, PGID, WHOLE_FACTS, app, autopilot, draw_claude, feed, footer_fp, footer_row,
-    frame, hit, host, pty, publish_facts, px_of, row_text,
+    BYPASS, Hosted, PGID, WHOLE_FACTS, a_minute_ago, app, autopilot, draw_claude, feed, footer_fp,
+    footer_row, frame, hit, host, interval, pty, publish_facts, px_of, row_text,
 };
 use super::{BorderSwitch, Chip};
 use crate::autopilot::{AutopilotView, HarnessSwitch, SwitchOff};
@@ -81,22 +81,6 @@ fn click_at_when(app: &mut App, wid: WindowId, cell: (usize, usize), when: Insta
     app.on_mouse_input_at(wid, ElementState::Released, MouseButton::Left, when);
 }
 
-/// A double click's interval, whose last instant still continues a run of presses.
-fn interval() -> Duration {
-    Duration::from_millis(
-        u64::try_from(crate::multi_click_ms()).expect("a double click's interval"),
-    )
-}
-
-/// Where a test's stated presses start: a minute ago, far enough from the clock that a press or
-/// a stamp that read the clock instead of its stated time lands on the wrong side of a double
-/// click's interval.
-fn a_minute_ago() -> Instant {
-    Instant::now()
-        .checked_sub(Duration::from_secs(60))
-        .expect("a minute of uptime")
-}
-
 /// The middle of the switch's face, where a person presses it.
 fn on_switch(app: &App, wid: WindowId) -> (usize, usize) {
     let b = switch(app, wid).expect("a switch");
@@ -112,9 +96,7 @@ fn settings_open(app: &App) -> bool {
 /// (`SessionLights::switch_pressed`), as a person's next, separate click
 /// would: the press is stamped that long ago.
 pub(super) fn later(app: &mut App, wid: WindowId, session: u64) {
-    let interval = Duration::from_millis(
-        u64::try_from(crate::multi_click_ms()).expect("a double click's interval") + 1,
-    );
+    let apart = interval() + Duration::from_millis(1);
     if let Some(s) = app
         .windows
         .get_mut(&wid)
@@ -123,7 +105,7 @@ pub(super) fn later(app: &mut App, wid: WindowId, session: u64) {
         .sessions
         .get_mut(&session)
     {
-        s.switch_pressed = s.switch_pressed.and_then(|at| at.checked_sub(interval));
+        s.switch_pressed = s.switch_pressed.and_then(|at| at.checked_sub(apart));
     }
 }
 
@@ -362,7 +344,9 @@ fn a_switch_turning_off_says_so_and_takes_no_click() {
 
 /// Each press states when it happened, so how long the read-back and the frame between two
 /// presses take never moves the second across a double click's interval. A press anywhere on the
-/// off face the read-back drew is the switch's own within the interval too, and turns nothing.
+/// off face the read-back drew is the switch's own within the interval too, and turns nothing; so
+/// is a slow triple click's third press, within the interval of the second though past the
+/// first's: a run of presses each within the interval of the one before is one gesture.
 #[test]
 fn a_double_click_on_on_leaves_the_harness_on() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
@@ -393,27 +377,28 @@ fn a_double_click_on_on_leaves_the_harness_on() {
          back on: {said:?}"
     );
     let at = on_switch(&app, wid);
-    click_at_when(&mut app, wid, at, first + interval());
+    click_at_when(&mut app, wid, at, first + interval() * 2);
     let said = not_saved(&app, "harness.enabled").expect("the off-write's record");
     assert!(
         said.contains("harness.enabled = false"),
-        "nor did a press on the off face's middle at the interval's last instant: {said:?}"
+        "nor did a slow triple click's third press, on the off face's middle at the last instant \
+         of the interval after the second: {said:?}"
     );
     assert_eq!(
         super::SWITCHES_LET_GO.with(std::cell::Cell::get),
         1,
-        "one write for a double click"
+        "one write for a run of clicks"
     );
     click_at_when(
         &mut app,
         wid,
         at,
-        first + interval() + Duration::from_millis(1),
+        first + interval() * 3 + Duration::from_millis(1),
     );
     let said = not_saved(&app, "harness.enabled").expect("a later click's write");
     assert!(
         said.contains("harness.enabled = true"),
-        "a click a millisecond after the interval: {said:?}"
+        "a click a millisecond after the interval of the run's last press: {said:?}"
     );
     assert_eq!(autopilot(&app, session), (None, AutopilotView::MasterOff));
 
@@ -448,12 +433,12 @@ fn a_double_click_on_on_leaves_the_harness_on() {
             "readback did not turn the double click's second press, at the interval's last \
              instant, into land"
         );
-        let past = first + interval() + Duration::from_millis(1);
+        let past = first + interval() * 2 + Duration::from_millis(1);
         click_at_when(&mut app, wid, at, past);
         assert_eq!(
             autopilot(&app, session).1,
             AutopilotView::Land,
-            "a click a millisecond after the interval steps the word"
+            "a click a millisecond after the interval of the run's last press steps the word"
         );
         frame(&mut app, wid);
         let at = super::gesture_tests::hit(&app, wid, super::Chip::Autopilot);

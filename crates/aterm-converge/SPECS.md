@@ -54,7 +54,7 @@ CV-TIMING	contract	ItemReport::elapsed_ms, Report::phases, Laps::{start, lap, ph
 FJ-BEFORE	contract	FileJournal::{before_change, failed}	When an item's apply starts, journal.ndjson already holds its before_change line {time > 0, id, from, to, revert}; one before_change line per change, in run order. A failed apply keeps its before_change line and appends a companion failure line {time > 0, id, failed}.	J::the_line_is_on_disk_before_the_apply_runs_and_a_failed_apply_keeps_it	fs, serde, the clock	1,8,9
 FJ-LAZY	contract	FileJournal::under, run	Nothing under <state>/converge exists before the first change: an item already as wanted and a plan create no folder and no file.	J::an_item_already_as_wanted_and_a_plan_write_nothing	fs	1,8
 FJ-BOUND	invariant	FileJournal::append	After every append journal.ndjson and journal.1.ndjson each hold at most the bound; a line that would carry a non-empty journal past it first renames the journal over journal.1.ndjson, so the rotation's last line directly precedes the journal's first; a line longer than the bound is refused and its change not made; the folder holds only the journal, its rotation and its lock.	J::the_journal_rotates_within_its_bound_and_keeps_one_rotation; J::a_line_over_the_bound_is_refused_and_its_change_not_made	u64 arithmetic, fs metadata and rename	1,8
-FJ-REGULAR	contract	FileJournal::append	A journal path that is not a regular file refuses every line ("not a regular file"), and so the change it would record is not made.	J::a_journal_that_is_not_a_regular_file_refuses_and_nothing_is_applied	fs metadata	1,8
+FJ-REGULAR	contract	FileJournal::append, make_dir, Held::take	A journal, rotated journal, or lock path that is not a regular file ("not a regular file"), or a journal directory or parent `state_dir` that is not a real directory ("not a directory"), refuses every line before creating or overwriting symlink targets, and so the change it would record is not made.	J::a_journal_that_is_not_a_regular_file_refuses_and_nothing_is_applied	fs metadata	1,8
 FJ-DURABLE	contract	FileJournal::append	Each line's data is flushed durable (aterm_durable::durable_data) before before_change returns; the folder is flushed too whenever the line starts a file (the first line, and the first after a rotation), and only then.	J::each_line_is_flushed_durable_before_its_change_and_a_new_entry_with_its_folder	fs, a recording seam	1,8
 FJ-LOCK	invariant	Held::take, FileJournal::append	Appends are serialized by journal.lock (flock): a writer waits at most `wait` for another holder, then refuses ("another run held the journal for more than …s") and its change is not made; once released the next line takes it. Writers that cross the bound together each rotate only a journal one more line would carry past the bound: no line is torn or lost and none is refused.	J::a_line_waits_for_another_writers_lock_and_a_hold_past_the_wait_refuses_its_change; J::writers_that_cross_the_bound_together_rotate_once_and_none_is_refused	flock, threads	1,8,13
 ```
@@ -128,26 +128,15 @@ J	writers_that_cross_the_bound_together_rotate_once_and_none_is_refused	FJ-LOCK	
 
 ## 5. Gaps and disagreements
 
-- No row states activations (`Item::activation`, the `Activation` trait, `settle` in `E`), and their
-  tests are not in §2:
-  `items_sharing_an_activation_are_applied_before_it_runs_once_and_read_back_after_it`,
-  the three `an_activation_*` tests,
-  `an_item_waiting_on_an_activated_item_runs_after_its_whole_activation` and
-  `a_selected_item_keeps_its_activation`. Three rows leave them out: CV-ORDER (an item whose edge
-  names an item of another activation also runs after every item of that activation), CV-READBACK
-  (an activated item is read back after its activation runs, and is Failed "applied, but not
-  activated: …" when the activation fails for it) and CV-JOURNAL-FIRST (an activation with something
-  pending journals its own line before it activates).
-- No row states `Readiness::of`, whose tests are not in §2:
-  `M::readiness_is_stricter_than_the_failure_policy_and_requires_evidence`,
-  `M::optional_readiness_round_trips_without_changing_older_reports` and
-  `M::changed_settings_await_login_or_restart_without_inventing_pending_work_for_ok_rows`.
-  `E::a_successful_read_back_reports_the_current_value_instead_of_the_old_target` is not in §2
-  either: it holds that a Changed row's `to` is the read-back value, which CV-READBACK does not say.
-- CV-WAITS blocks an item behind any prerequisite that is not ok?, so a prerequisite that is
-  `NotApplicable` on this host blocks its dependants in every apply, although `NotApplicable` never
-  fails a surface (CV-FAILS-SURFACE). An edge to such an item needs the rule to admit
-  `NotApplicable`.
+- **Resolved — `CV-ACTIVATION-CHECK`, `CV-READINESS`, and `CV-READBACK` read-back `to` value.**
+  `CV-ACTIVATION-CHECK`, `CV-READINESS`, `CV-ORDER`'s shared-activation edge widening,
+  `CV-READBACK`'s observed read-back `to = now`, and `CV-JOURNAL-FIRST`'s failure-line recording
+  are all stated in §1, and all 61 unit tests across `M`, `S`, `E`, and `J` are mapped in §2.
+- **`CV-WAITS` and `NotApplicable` prerequisites (`left_as_is` vs `left_to_another`).**
+  `CV-WAITS` (`unmet_prerequisite`) requires prerequisites in an apply to be `ok?` (`Ok | Changed`).
+  That keeps `left_as_is` (`NotApplicable`, `after` retained) blocking dependants whose unapplied
+  prerequisite did not land, whereas `left_to_another` (`NotApplicable`, `after` cleared) lets
+  items handed to another run proceed without waiting (`S::an_item_another_run_lays_waits_on_nothing`).
 
 ## 6. Proof order (easiest, high value first)
 

@@ -27,6 +27,7 @@ struct World {
     now: u64,
     out: Vec<String>,
     calls: Vec<String>,
+    observations: Vec<&'static str>,
     pid: u32,
     started: String,
     alive: BTreeMap<u32, String>,
@@ -127,6 +128,7 @@ struct World {
     landing_fails: bool,
     /// The prover the world resolves (TRUST_STAGE2_BIN, the journal's, the store's).
     prover: Prover,
+    lease_error: Option<String>,
     /// The engine's code now, and the engine that staged the attestation in publish/.out.
     engine: String,
     staged_by: Option<String>,
@@ -155,6 +157,7 @@ impl World {
             now: 1_000_000,
             out: Vec::new(),
             calls: Vec::new(),
+            observations: Vec::new(),
             pid: 4242,
             started: "Thu Oct  9 02:00:00 2026".into(),
             alive: BTreeMap::new(),
@@ -216,6 +219,7 @@ impl World {
             generator_refuses: false,
             landing_fails: false,
             prover: prover(),
+            lease_error: None,
             engine: "e7e7e7e7e7".into(),
             staged_by: None,
             running_at_prepared: None,
@@ -301,6 +305,9 @@ fn ran(code: i32) -> Ran {
 }
 
 impl Backend for World {
+    fn observe_operational(&mut self) {
+        self.observations.push("observe-operational");
+    }
     fn now(&mut self) -> u64 {
         self.now += 1;
         self.now
@@ -368,18 +375,22 @@ impl Backend for World {
         ));
     }
     fn prover(&mut self, _journaled: Option<&str>) -> Result<Prover, String> {
+        self.observations.push("prover");
         Ok(self.prover.clone())
     }
-    fn lease(&mut self, _prover: &Prover) {
+    fn lease(&mut self, _prover: &Prover) -> Result<(), String> {
         self.calls.push("lease".into());
+        self.lease_error.clone().map_or(Ok(()), Err)
     }
     fn cleared_env(&mut self) -> Vec<String> {
         Vec::new()
     }
     fn machine(&mut self, _creds: &Path, _explicit: bool) -> (String, Vec<Refusal>) {
+        self.observations.push("machine");
         ("m3".into(), self.machine_refusals.clone())
     }
     fn fetch(&mut self) -> Result<String, Refusal> {
+        self.observations.push("fetch");
         Ok(self.tip())
     }
     fn head(&mut self) -> String {
@@ -467,6 +478,7 @@ impl Backend for World {
         Ok(made.into())
     }
     fn validation_tools(&mut self) -> Result<String, Refusal> {
+        self.observations.push("validation-tools");
         self.calls.push("validation-tools".into());
         self.validation_tools.clone()
     }
@@ -844,6 +856,33 @@ fn lease_held() -> Refusal {
         "release lease — the release lock is held by claim abcdef; nothing was claimed",
         "on the machine that cut it: targo --unverified ship release",
     )
+}
+
+#[test]
+fn a_toolchain_lease_failure_stops_before_any_release_work() {
+    let mut world = World::new();
+    world.lease_error = Some("lease IO refused".into());
+    let (code, last) = world.run(bump());
+    assert_ne!(code, 0);
+    assert!(last.contains("lease IO refused"), "{last}");
+    assert_eq!(world.calls, ["lease"]);
+    assert_eq!(world.observations, ["observe-operational", "prover"]);
+}
+
+#[test]
+fn operational_observation_precedes_prover_network_and_provisioning() {
+    let mut world = World::new();
+    let (code, _) = world.run(bump());
+    assert_eq!(code, 0);
+    let observed = world
+        .observations
+        .iter()
+        .position(|&c| c == "observe-operational")
+        .unwrap();
+    for call in ["prover", "machine", "fetch", "validation-tools"] {
+        let position = world.observations.iter().position(|&c| c == call).unwrap();
+        assert!(observed < position, "{call} ran before observation");
+    }
 }
 
 #[test]
@@ -2445,7 +2484,15 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_only_a_pass
         bump_from: None,
     };
     let mut real = Real::new(&repo, None, true, false).expect("a backend");
-    let record = |r: &str| crate::gates::verified(&git, r, &"ab".repeat(32)).unwrap().0;
+    real.build_inputs = || Ok("fixture inputs".into());
+    let record =
+        |r: &str| {
+            crate::gates::verified_with_inputs(&git, r, &"ab".repeat(32), || {
+                Ok("fixture inputs".into())
+            })
+            .unwrap()
+            .0
+        };
     let set = |code: &str, how: &str| {
         std::fs::write(dir.path().join("code"), code).unwrap();
         std::fs::write(&mode, how).unwrap();
@@ -2487,6 +2534,22 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_only_a_pass
     assert!(!said.exists(), "nothing ran");
     assert!(!record(&r));
     std::fs::remove_file(repo.join("stray.txt")).unwrap();
+
+    fn changing_inputs() -> Result<String, String> {
+        static READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        Ok(READS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_string())
+    }
+    real.build_inputs = changing_inputs;
+    let refused =
+        Backend::verify(&mut real, &cand, &prover, &artifact).expect_err("inputs changed");
+    assert!(refused.why.contains("compiler or SDK bytes changed"));
+    assert!(
+        !record(&r),
+        "changed inputs cannot produce a verification receipt"
+    );
+    real.build_inputs = || Ok("fixture inputs".into());
 
     let ran = Backend::verify(&mut real, &cand, &prover, &artifact).expect("it ran");
     assert_eq!(ran.code, 0);

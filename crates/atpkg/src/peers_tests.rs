@@ -365,9 +365,9 @@ fn loopback() -> Vec<IpAddr> {
     vec![IpAddr::from([127, 0, 0, 1])]
 }
 
-/// Bind `share` for `layout` on a loopback port, admitting the addresses `members` names (read
-/// at most every `refresh`), on a thread of its own: the address it listens on, its stop flag,
-/// its notes and the thread.
+/// Run `share` for `layout` on a kernel-assigned loopback port, admitting the addresses
+/// `members` names (read at most every `refresh`), on a thread of its own: the address of its
+/// bound listener, its stop flag, its notes and the thread.
 fn sharing_on(
     layout: &Layout,
     members: Members,
@@ -378,14 +378,10 @@ fn sharing_on(
     mpsc::Receiver<String>,
     std::thread::JoinHandle<()>,
 ) {
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let listen = SocketAddr::from(([127, 0, 0, 1], port));
+    let listen = SocketAddr::from(([127, 0, 0, 1], 0));
     let running = Arc::new(AtomicBool::new(true));
     let (said, notes) = mpsc::channel();
+    let (bound, ready) = mpsc::channel();
     let thread = std::thread::spawn({
         let (layout, running) = ((*layout).clone(), Arc::clone(&running));
         move || {
@@ -397,13 +393,19 @@ fn sharing_on(
                     members: &*members,
                     refresh,
                     note: &|line| {
+                        if let Some(at) = serving(&layout) {
+                            let _ = bound.send(at);
+                        }
                         let _ = said.send(line.to_owned());
                     },
                 },
             );
         }
     });
-    (listen.to_string(), running, notes, thread)
+    let at = ready
+        .recv_timeout(HANG)
+        .expect("the sharing store bound its listener");
+    (at.to_string(), running, notes, thread)
 }
 
 /// The note `notes` hears next that contains `word`, within the hang detector.
@@ -491,28 +493,30 @@ fn a_sharing_store_serves_a_kept_unit_by_default_and_lists_nothing() {
 
     running.store(false, Ordering::Release);
     thread.join().unwrap();
+    // Observe this listener's owner and record: its released port may already belong to
+    // another parallel test, so a new connection cannot prove whether this owner closed it.
     assert_eq!(serving(&layout), None, "a stopped server's record goes");
-    assert!(
-        TcpStream::connect(&addr).is_err(),
-        "and its listener is closed"
-    );
 }
 
 #[test]
 fn the_persons_off_closes_a_sharing_store_and_on_opens_it_again() {
     let layout = crate::testdir::layout("atpkg-peers-share-off-");
-    let (addr, running, notes, thread) = sharing_on(&layout, Arc::new(loopback), HANG);
+    let (_, running, notes, thread) = sharing_on(&layout, Arc::new(loopback), HANG);
     heard(&notes, "serving");
     turn_off(&layout).unwrap();
     heard(&notes, "off");
-    assert!(
-        TcpStream::connect(&addr).is_err(),
-        "the off closed its listener"
+    assert_eq!(
+        serving(&layout),
+        None,
+        "the off removes its listener's record"
     );
-    assert_eq!(serving(&layout), None, "and its record");
     turn_on(&layout).unwrap();
     heard(&notes, "serving");
-    assert!(TcpStream::connect(&addr).is_ok(), "--on opened it again");
+    let at = serving(&layout).expect("the resumed store records its listener");
+    assert!(
+        TcpStream::connect(at).is_ok(),
+        "--on opened its recorded listener"
+    );
     running.store(false, Ordering::Release);
     thread.join().unwrap();
 }
@@ -863,4 +867,36 @@ fn an_oversized_or_incomplete_request_head_is_refused_without_answering() {
 
     running.store(false, Ordering::Release);
     thread.join().unwrap();
+}
+
+/// NEGATIVE CONTROL: `turn_off` never follows symlinked `store` or `store/<program>` directories
+/// and never unlinks a symlinked `*.unit`, while unlinking real `<build>.unit` files in place.
+#[cfg(unix)]
+#[test]
+fn turn_off_never_follows_symlinked_store_programs_or_units() {
+    let layout = crate::testdir::layout("atpkg-peers-turn-off-symlink-");
+    let outside = layout.prefix.parent().unwrap().join(format!(
+        "atpkg-peers-outside-{}",
+        layout.prefix.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(outside.join("victim")).unwrap();
+    std::fs::write(outside.join("victim/1.unit"), b"keep").unwrap();
+
+    let store = layout.prefix.join("store");
+    std::fs::create_dir_all(store.join("real")).unwrap();
+    std::fs::write(store.join("real/1.unit"), b"drop").unwrap();
+    std::os::unix::fs::symlink(outside.join("victim/1.unit"), store.join("real/2.unit")).unwrap();
+    std::os::unix::fs::symlink(outside.join("victim"), store.join("linked")).unwrap();
+
+    turn_off(&layout).unwrap();
+    assert!(!store.join("real/1.unit").exists(), "real unit removed");
+    assert!(
+        std::fs::symlink_metadata(store.join("real/2.unit")).is_ok(),
+        "symlinked unit entry left untouched"
+    );
+    assert!(
+        outside.join("victim/1.unit").exists(),
+        "outside target untouched"
+    );
+    let _ = std::fs::remove_dir_all(&outside);
 }

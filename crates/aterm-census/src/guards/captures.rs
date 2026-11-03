@@ -371,7 +371,7 @@ fn baseline_path() -> Option<PathBuf> {
 pub(super) fn baseline() -> Result<(String, String), String> {
     let path = baseline_path().ok_or("neither PUBLICATION_ENGINE nor HOME names the engine")?;
     let shown = path.display().to_string();
-    std::fs::read_to_string(&path)
+    crate::tree::read_to_string(&path)
         .map(|text| (shown.clone(), text))
         .map_err(|e| format!("{shown}: {e}"))
 }
@@ -408,7 +408,7 @@ fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mu
     if captures.is_empty() {
         return;
     }
-    let extra = match std::fs::read_to_string(tree.root.join(EXTRA)) {
+    let extra = match crate::tree::read_to_string(&tree.root.join(EXTRA)) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
@@ -433,7 +433,7 @@ fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mu
     }
     rows.extend(capture_rows());
     for rel in captures {
-        match std::fs::read(tree.root.join(rel)) {
+        match crate::tree::read_bytes(&tree.root.join(rel)) {
             Ok(bytes) => judge(rel, &String::from_utf8_lossy(&bytes), &rows, out),
             Err(e) => out.push(Finding {
                 rule: CAPTURE_PRIVACY.id,

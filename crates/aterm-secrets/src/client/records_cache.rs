@@ -5,10 +5,16 @@
 
 use super::{Paths, fsx, sha256};
 use crate::{
-    SecretBytes,
+    Error, SecretBytes,
     membership_log::{MAX_RECORDS_STREAM, Store},
 };
-use std::{collections::VecDeque, sync::Mutex};
+use aterm_digest::Sha256;
+use std::{
+    collections::VecDeque,
+    io::{Read, Seek, SeekFrom},
+    sync::Mutex,
+};
+use zeroize::Zeroizing;
 
 const MAX_ENTRIES: usize = 16;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -42,35 +48,72 @@ impl Cache {
     }
 
     fn read(&self, paths: &Paths, vault: String, store: Store) -> crate::Result<Store> {
-        let Some(bytes) = fsx::read_owned_head(&paths.records_file(), MAX_RECORDS_STREAM)? else {
+        self.read_then(paths, vault, store, || {})
+    }
+
+    fn read_then(
+        &self,
+        paths: &Paths,
+        vault: String,
+        store: Store,
+        after_observation: impl FnOnce(),
+    ) -> crate::Result<Store> {
+        let Some(mut reader) = fsx::open_owned_reader(&paths.records_file())? else {
             return Ok(store);
         };
+        let observed = observe(&mut reader)?;
+        reader.check_unchanged()?;
+        after_observation();
         let keys = store.keys().map(<[[u8; 32]]>::to_vec);
         let same_context = |entry: &Entry| entry.vault == vault && entry.keys == keys;
         // A recovered store roots another genesis under different admitted
         // keys. Reuse only after reading the current bytes and key context.
-        if let Ok(entries) = self.entries.lock()
+        if let Observed::Small(bytes) = &observed
+            && let Ok(entries) = self.entries.lock()
             && let Some(entry) = entries.iter().find(|entry| {
                 same_context(entry)
                     && entry
                         .bytes
                         .as_ref()
-                        .is_some_and(|saved| saved.as_slice() == bytes)
+                        .is_some_and(|saved| saved.as_slice() == bytes.as_slice())
             })
         {
+            reader.check_unchanged()?;
             return Ok(entry.store.clone());
         }
         #[cfg(test)]
         self.hashes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let digest = sha256(&bytes);
+        let digest = match &observed {
+            Observed::Small(bytes) => sha256(bytes.as_slice()),
+            Observed::Large(digest) => *digest,
+        };
         let same = |entry: &Entry| same_context(entry) && entry.digest == digest;
         if let Ok(entries) = self.entries.lock()
             && let Some(entry) = entries.iter().find(|entry| same(entry))
         {
+            reader.check_unchanged()?;
             return Ok(entry.store.clone());
         }
-        let store = store.recovering(&bytes);
+        let (store, bytes) = match observed {
+            Observed::Small(bytes) => (store.recovering(bytes.as_slice()), Some(bytes)),
+            Observed::Large(_) => {
+                reader
+                    .file()
+                    .seek(SeekFrom::Start(0))
+                    .map_err(|e| Error::new(format!("membership record seek failed: {e}")))?;
+                let recovered = recover_observation(
+                    store,
+                    reader.file().take(MAX_RECORDS_STREAM as u64),
+                    digest,
+                )?;
+                #[cfg(test)]
+                self.hashes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (recovered, None)
+            }
+        };
+        reader.check_unchanged()?;
         if let Ok(mut entries) = self.entries.lock() {
             entries.retain(|entry| !same(entry));
             if entries.len() >= MAX_ENTRIES {
@@ -80,11 +123,80 @@ impl Cache {
                 vault,
                 keys,
                 digest,
-                bytes: (bytes.len() <= MAX_INPUT_BYTES).then(|| SecretBytes::new(bytes)),
+                bytes,
                 store: store.clone(),
             });
         }
         Ok(store)
+    }
+}
+
+enum Observed {
+    Small(SecretBytes),
+    Large([u8; 32]),
+}
+
+fn recover_observation(store: Store, input: impl Read, expected: [u8; 32]) -> crate::Result<Store> {
+    let mut input = Hashed::new(input);
+    let recovered = store.recovering_read(&mut input)?;
+    if input.finish() != expected {
+        return Err(Error::new("membership records changed between reads"));
+    }
+    Ok(recovered)
+}
+
+fn observe(reader: &mut fsx::OwnedReader) -> crate::Result<Observed> {
+    let mut small = (reader.len() <= MAX_INPUT_BYTES as u64)
+        .then(|| Zeroizing::new(Vec::with_capacity(reader.len() as usize + 1)));
+    let mut digest = Sha256::new();
+    let mut buffer = Zeroizing::new([0; 16 * 1024]);
+    let mut input = reader.file().take(MAX_RECORDS_STREAM as u64);
+    loop {
+        let n = match input.read(&mut *buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(Error::new(format!("membership record read failed: {e}"))),
+        };
+        if let Some(bytes) = &mut small {
+            if bytes.len() + n <= MAX_INPUT_BYTES {
+                bytes.extend_from_slice(&buffer[..n]);
+                continue;
+            }
+            digest.update(bytes.as_slice());
+            small = None;
+        }
+        digest.update(&buffer[..n]);
+    }
+    Ok(match small {
+        Some(mut bytes) => Observed::Small(SecretBytes::new(std::mem::take(&mut *bytes))),
+        None => Observed::Large(digest.finalize()),
+    })
+}
+
+struct Hashed<R> {
+    reader: R,
+    digest: Sha256,
+}
+
+impl<R> Hashed<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            digest: Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> [u8; 32] {
+        self.digest.finalize()
+    }
+}
+
+impl<R: Read> Read for Hashed<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.reader.read(bytes)?;
+        self.digest.update(&bytes[..n]);
+        Ok(n)
     }
 }
 
@@ -226,6 +338,164 @@ mod tests {
                     .is_none()
             );
         }
-        assert_eq!(cache.hashes.load(Ordering::Relaxed), 2);
+        // First observation and its cold decode, then the second warm observation.
+        assert_eq!(cache.hashes.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn changed_files_cannot_return_warm_small_or_large_records() {
+        for large in [false, true] {
+            let home = aterm_tempfile::tempdir().unwrap();
+            let paths = Paths::for_home(home.path());
+            fsx::ensure_private_dir(&paths.dir).unwrap();
+            let mut wire = signed(&SIGNER, 1);
+            if large {
+                wire.resize(MAX_INPUT_BYTES + 64, 0);
+            }
+            fsx::write_atomic(&paths.records_file(), &wire, 0o600).unwrap();
+            let cache = Cache::new();
+            let expected = cache
+                .read(&paths, "fixture".into(), base(&SIGNER))
+                .unwrap()
+                .encode();
+            let prior_digest = cache.entries.lock().unwrap()[0].digest;
+            let changed = cache.read_then(&paths, "fixture".into(), base(&SIGNER), || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(paths.records_file())
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+            });
+            assert!(changed.is_err());
+            {
+                let entries = cache.entries.lock().unwrap();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].digest, prior_digest);
+            }
+            fsx::write_atomic(&paths.records_file(), &wire, 0o600).unwrap();
+            assert_eq!(
+                cache
+                    .read(&paths, "fixture".into(), base(&SIGNER))
+                    .unwrap()
+                    .encode(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn changed_large_decode_never_installs_its_partial_store() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(home.path());
+        fsx::ensure_private_dir(&paths.dir).unwrap();
+        let mut wire = signed(&SIGNER, 1);
+        wire.resize(MAX_INPUT_BYTES + 64, 0);
+        fsx::write_atomic(&paths.records_file(), &wire, 0o600).unwrap();
+        let cache = Cache::new();
+        let changed = cache.read_then(&paths, "fixture".into(), base(&SIGNER), || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(paths.records_file())
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+        });
+        assert!(changed.is_err());
+        assert!(cache.entries.lock().unwrap().is_empty());
+        fsx::write_atomic(&paths.records_file(), &wire, 0o600).unwrap();
+        assert!(
+            cache
+                .read(&paths, "fixture".into(), base(&SIGNER))
+                .unwrap()
+                .log()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_failed_observation_preserves_the_previous_cache_and_can_recover() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(home.path());
+        fsx::ensure_private_dir(&paths.dir).unwrap();
+        let wire = signed(&SIGNER, 1);
+        fsx::write_atomic(&paths.records_file(), &wire, 0o600).unwrap();
+        let cache = Cache::new();
+        cache.read(&paths, "fixture".into(), base(&SIGNER)).unwrap();
+        let digest = cache.entries.lock().unwrap()[0].digest;
+        fsx::fail_reads(&paths.records_file(), 1);
+        assert!(cache.read(&paths, "fixture".into(), base(&SIGNER)).is_err());
+        assert_eq!(cache.entries.lock().unwrap()[0].digest, digest);
+        assert_eq!(
+            cache
+                .read(&paths, "fixture".into(), base(&SIGNER))
+                .unwrap()
+                .encode(),
+            wire
+        );
+    }
+
+    #[test]
+    fn the_decoding_digest_includes_the_entire_ignored_tail() {
+        let mut wire = signed(&SIGNER, 1);
+        wire.resize(MAX_INPUT_BYTES + 64, 0);
+        let mut reader = Hashed::new(std::io::Cursor::new(&wire));
+        let recovered = base(&SIGNER).recovering_read(&mut reader).unwrap();
+        assert!(recovered.log().is_some());
+        assert_eq!(reader.finish(), sha256(&wire));
+    }
+
+    #[test]
+    fn reversion_after_decoder_reads_cannot_authenticate_different_bytes() {
+        use std::os::unix::fs::FileExt;
+
+        struct Reverting<'a> {
+            file: std::fs::File,
+            original: &'a [u8],
+            replacement: &'a [u8],
+            read: usize,
+            changed: bool,
+            restored: bool,
+        }
+        impl Read for Reverting<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if !self.changed {
+                    self.file.write_all_at(self.replacement, 0)?;
+                    self.changed = true;
+                }
+                let n = self.file.read(out)?;
+                self.read += n;
+                if self.read == self.original.len() && !self.restored {
+                    self.file.write_all_at(self.original, 0)?;
+                    self.restored = true;
+                }
+                Ok(n)
+            }
+        }
+
+        let home = aterm_tempfile::tempdir().unwrap();
+        let path = home.path().join("records");
+        let mut original = signed(&SIGNER, 1);
+        let mut replacement = signed(&SIGNER, 2);
+        original.resize(MAX_INPUT_BYTES + 64, 0);
+        replacement.resize(original.len(), 0);
+        assert!(base(&SIGNER).recovering(&replacement).log().is_some());
+        fsx::write_atomic(&path, &original, 0o600).unwrap();
+        let mut reader = Reverting {
+            file: std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+            original: &original,
+            replacement: &replacement,
+            read: 0,
+            changed: false,
+            restored: false,
+        };
+        let outcome = recover_observation(base(&SIGNER), &mut reader, sha256(&original));
+        assert!(reader.changed && reader.restored);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(outcome.is_err());
     }
 }

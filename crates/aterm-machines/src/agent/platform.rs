@@ -3,34 +3,15 @@
 
 //! Host `IOPlatformUUID` lookup via `ioreg`.
 
-use crate::port::{Cmd, System};
+use crate::{
+    hardware::{ioreg_value, uuid_shaped},
+    port::{Cmd, System},
+};
 
 /// `ioreg -rd1 -c IOPlatformExpertDevice`: the platform's identity record.
 #[must_use]
 pub fn ioreg_cmd() -> Cmd {
     Cmd::new("/usr/sbin/ioreg").args(["-rd1", "-c", "IOPlatformExpertDevice"])
-}
-
-/// Extracts the string value of `"<key>" = "<value>"` in `ioreg` output.
-#[must_use]
-pub fn ioreg_value(text: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\" = \"");
-    text.lines().find_map(|line| {
-        let rest = line.trim_start().strip_prefix(&needle)?;
-        let value = rest.strip_suffix('"')?;
-        (!value.is_empty() && !value.contains('"')).then(|| value.to_owned())
-    })
-}
-
-/// Whether `s` has an IOPlatformUUID's shape: `8-4-4-4-12` hex digits.
-#[must_use]
-pub fn uuid_shaped(s: &str) -> bool {
-    let groups: Vec<&str> = s.split('-').collect();
-    groups.len() == 5
-        && groups
-            .iter()
-            .zip([8, 4, 4, 4, 12])
-            .all(|(g, n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// This Mac's IOPlatformUUID.

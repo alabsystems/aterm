@@ -197,6 +197,22 @@ pub(crate) fn progress_facts_at(
             .enumerate()
             .map(|(n, detail)| (format!("Finding {}", n + 1), detail.clone())),
     );
+    for diagnostic in &progress.login_diagnostics {
+        if now.is_some_and(|now| {
+            (1..=253_402_300_799).contains(&now)
+                && (1..=253_402_300_799).contains(&diagnostic.completed_at)
+                && diagnostic.completed_at <= now
+        }) {
+            facts.push((
+                "Last local sign-in".into(),
+                format!("{}: {}", diagnostic.label(), diagnostic.words()),
+            ));
+            facts.push((
+                "Sign-in finished".into(),
+                observed_seconds(diagnostic.completed_at),
+            ));
+        }
+    }
     facts.push(("Scope".into(), "This session's supervisor observations; activity on other processes or machines may be unobserved".into()));
     facts
 }

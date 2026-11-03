@@ -323,8 +323,13 @@ pub(crate) fn parse_machine_id(raw: &str) -> Option<&str> {
 
 pub(crate) fn machine_id_from_files(paths: &[&std::path::Path]) -> Option<String> {
     use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     for path in paths {
-        let Ok(file) = std::fs::File::open(path) else {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+        else {
             continue;
         };
         if !file.metadata().is_ok_and(|m| m.is_file()) {

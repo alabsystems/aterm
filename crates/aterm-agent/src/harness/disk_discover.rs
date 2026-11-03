@@ -1062,15 +1062,35 @@ fn worktrees(repo: &Path, homes: &[&Path]) -> Vec<PathBuf> {
     out
 }
 
-fn small_bytes(p: &Path) -> Option<Vec<u8>> {
-    let meta = std::fs::symlink_metadata(p).ok()?;
+pub(crate) fn small_bytes(p: &Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(p)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let meta = std::fs::symlink_metadata(p).ok()?;
+        if !meta.is_file() || meta.len() > 4096 {
+            return None;
+        }
+        std::fs::File::open(p).ok()?
+    };
+    let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.len() > 4096 {
         return None;
     }
-    std::fs::read(p).ok()
+    let mut buf = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    file.take(4097).read_to_end(&mut buf).ok()?;
+    (buf.len() <= 4096).then_some(buf)
 }
 
-fn small_text(p: &Path) -> Option<String> {
+pub(crate) fn small_text(p: &Path) -> Option<String> {
     String::from_utf8(small_bytes(p)?).ok()
 }
 

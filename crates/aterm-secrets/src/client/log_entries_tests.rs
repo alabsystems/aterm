@@ -11,6 +11,9 @@ use crate::membership_log::{
 use crate::server::Options as ServerOptions;
 use std::collections::VecDeque;
 
+#[path = "coalesce_tests.rs"]
+mod coalesce;
+
 pub(super) fn join_host(paths: &Paths, source: &str, host: &str) {
     join(
         paths,
@@ -3931,6 +3934,24 @@ fn a_wrap_gap_after_a_concurrent_epoch_is_closed_by_one_holder() {
     let (m40, gap, first, second) = admitted_beside_a_concurrent_epoch(&macs);
     let (first, second) = (&first, &second);
 
+    {
+        let _writer = StateLock::take(first).unwrap();
+        assert!(log_entries::close_wrap_gaps(first, gap.opened_ms).is_err());
+    }
+    struct FailedReads(PathBuf);
+    impl Drop for FailedReads {
+        fn drop(&mut self) {
+            fsx::fail_reads(&self.0, 0);
+        }
+    }
+    for path in [first.cache_file(), first.dir.join("commons/device.age")] {
+        let fault = FailedReads(path);
+        fsx::fail_reads(&fault.0, usize::MAX);
+        let unreadable = log_entries::close_wrap_gaps(first, gap.opened_ms);
+        drop(fault);
+        assert!(unreadable.is_err());
+    }
+
     assert!(
         log_entries::close_wrap_gaps(second, gap.opened_ms)
             .unwrap()
@@ -4850,8 +4871,11 @@ fn second_member_remove_after_sync_forms_quorum_and_voids_post_cutoff_records() 
     //    out even if it asks under a new device writer seed with the same age recipient.
     let rec_m40 = request.binding().recipient();
     let trust = Bootstrap::required(m22).unwrap().trust();
-    log_entries::retire_recipients_in_log_local(m22, &[], &BTreeSet::from([rec_m40]))
-        .expect("rotate epochs excluding m40");
+    {
+        let lock = StateLock::take(m22).unwrap();
+        log_entries::retire_recipients_in_log_local(m22, &lock, &[], &BTreeSet::from([rec_m40]))
+            .expect("rotate epochs excluding m40");
+    }
     assert!(
         reconcile_commons_log(m22, true).unwrap().is_empty(),
         "reconcile_commons_log must not re-wrap epochs to a left-out member"
@@ -5083,6 +5107,31 @@ fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_
         std::fs::read(m7.home.join(".secrets/shared")).unwrap(),
         b"everyone-v2"
     );
+    let records_before = std::fs::read(m7.records_file()).unwrap();
+    let crate::commons::Observation::Unavailable(reason) = crate::commons::observe(m7).unwrap()
+    else {
+        panic!("the excluded member must not observe Commons control");
+    };
+    assert_eq!(reason.code(), "control-excluded");
+    assert!(matches!(
+        status(m7).unwrap().membership,
+        Membership::In { .. }
+    ));
+    assert_eq!(std::fs::read(m7.records_file()).unwrap(), records_before);
+    let original_state = load_state(m7).unwrap();
+    let retained_cache = m7.cache_file().with_extension("retained-envelope");
+    std::fs::rename(m7.cache_file(), &retained_cache).unwrap();
+    let mut log_only_state = original_state.clone();
+    log_only_state.digest = None;
+    save_state(m7, &log_only_state).unwrap();
+    let log_only_observation = crate::commons::observe(m7);
+    save_state(m7, &original_state).unwrap();
+    std::fs::rename(retained_cache, m7.cache_file()).unwrap();
+    assert!(matches!(
+        log_only_observation.unwrap(),
+        crate::commons::Observation::Unavailable(crate::commons::Unavailable::ControlExcluded)
+    ));
+    assert_eq!(std::fs::read(m7.records_file()).unwrap(), records_before);
     assert!(matches!(
         admit::admit_by_phrase(m22, &m7_req, [0u8; 32], "m7", 700).unwrap(),
         admit::ByLog::Admitted(_)
@@ -5309,6 +5358,7 @@ fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_
             node_key: None,
             aliases: Vec::new(),
             hint: None,
+            hw_hint: None,
             admitted_ms: 1,
             claimed_label: None,
             claimed_at_ms: None,
@@ -5944,7 +5994,11 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
     //    `Observation::Unavailable(Unavailable::Revoked)` rather than falling back to decrypting
     //    the cached envelope's locker.
     let m7_rec = read_identity(m7).unwrap().unwrap().recipient();
-    log_entries::retire_recipients_in_log_local(m22, &[], &BTreeSet::from([m7_rec])).unwrap();
+    {
+        let lock = StateLock::take(m22).unwrap();
+        log_entries::retire_recipients_in_log_local(m22, &lock, &[], &BTreeSet::from([m7_rec]))
+            .unwrap();
+    }
     save_records(m7, &load_records(m22).unwrap().encode()).unwrap();
     let obs = observe_commons(m7).unwrap();
     assert!(
@@ -6342,4 +6396,34 @@ fn pending_request_members_are_verified_without_admin_credentials() {
     assert!(!members.contains(&stranger));
     let empty = Paths::for_home(&macs.root.path().join("untrusted-reader"));
     assert!(request_members(&empty, &config, None).unwrap().is_none());
+}
+
+#[test]
+fn an_admins_approved_recipient_is_not_pending_while_enrollment_is_unfinished() {
+    let macs = two_macs(&[]);
+    let admin = admin_open(&macs.m22).unwrap();
+    let recipient = Identity::from_secret_bytes([79; 32])
+        .recipient()
+        .to_bech32();
+    let mut doc = admin.doc.clone();
+    doc.add_machine("awaiting-enrollment", &recipient).unwrap();
+    let membership = request_members(&macs.m22, &admin.config, None)
+        .unwrap()
+        .expect("the administrator already has authenticated membership");
+    assert!(!membership.contains(&recipient));
+    let approved = request_members(&macs.m22, &admin.config, Some(&doc))
+        .unwrap()
+        .unwrap();
+    assert!(
+        approved.contains(&recipient),
+        "an existing log must not hide the administrator's approval"
+    );
+    assert!(membership.iter().all(|member| approved.contains(member)));
+    assert!(
+        !request_members(&macs.m22, &admin.config, None)
+            .unwrap()
+            .unwrap()
+            .contains(&recipient),
+        "filtering a request must not enroll its recipient"
+    );
 }

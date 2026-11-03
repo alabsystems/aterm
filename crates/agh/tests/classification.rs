@@ -244,12 +244,25 @@ fn a_missing_oauth_scope_is_named_in_next() {
     let error = classify(
         403,
         &[
-            ("x-oauth-scopes", "repo"),
-            ("x-accepted-oauth-scopes", "repo, admin:public_key"),
+            ("x-oauth-scopes", "read:org"),
+            (
+                "x-accepted-oauth-scopes",
+                "admin:public_key, write:public_key",
+            ),
         ],
         "",
     );
     assert!(error.next.contains("admin:public_key"), "{}", error.next);
+    // The accepted list is any-of: a token that holds one of its scopes lacks none.
+    let error = classify(
+        403,
+        &[
+            ("x-oauth-scopes", "repo"),
+            ("x-accepted-oauth-scopes", "admin:public_key, repo"),
+        ],
+        "",
+    );
+    assert_eq!(error.next, Kind::Forbidden.next_action());
     let error = classify(
         404,
         &[

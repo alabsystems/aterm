@@ -183,12 +183,18 @@ pub struct ClaimVersion {
     pub text: String,
 }
 
+/// The longest `version=` value.
+const VERSION_MAX: usize = 128;
+
 impl ClaimVersion {
     /// The three-part parse: `MAJOR.MINOR.0`, each part canonical decimal, then optionally `+`
     /// and dot-separated alphanumeric identifiers. A non-zero patch, a pre-release (`-…`) and
     /// anything else is refused.
     #[must_use]
     pub fn parse(text: &str) -> Option<ClaimVersion> {
+        if text.len() > VERSION_MAX {
+            return None;
+        }
         let (core, meta) = match text.split_once('+') {
             Some((core, meta)) => (core, Some(meta)),
             None => (text, None),
@@ -225,7 +231,8 @@ const VENDOR_MAX: usize = 64;
 
 /// Whether `v` is a vendor version a claim may announce: 1 to [`VENDOR_MAX`] bytes of ASCII
 /// alphanumerics and `.`, `-`, `+`, `_`.
-fn vendor_ok(v: &str) -> bool {
+#[must_use]
+pub(super) fn vendor_ok(v: &str) -> bool {
     !v.is_empty()
         && v.len() <= VENDOR_MAX
         && v.bytes()

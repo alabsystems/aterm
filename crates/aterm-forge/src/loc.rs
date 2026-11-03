@@ -40,7 +40,7 @@ fn patch_targets(root: &Path) -> &'static MemberIndex {
         return hit;
     }
     let mut table: MemberIndex = BTreeMap::new();
-    let doc = std::fs::read_to_string(root.join("Cargo.toml"))
+    let doc = crate::read_regular_text(root.join("Cargo.toml"))
         .ok()
         .and_then(|text| text.parse::<aterm_toml::edit::DocumentMut>().ok());
     if let Some(rows) = doc
@@ -68,7 +68,7 @@ fn patch_targets(root: &Path) -> &'static MemberIndex {
 
 /// `[package] version` from a manifest directory, if it reads.
 pub(crate) fn manifest_version(dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+    let text = crate::read_regular_text(dir.join("Cargo.toml")).ok()?;
     package_version(&text)
 }
 
@@ -86,7 +86,7 @@ fn workspace_members(root: &Path) -> &'static MemberIndex {
     {
         return hit;
     }
-    let workspace_version = std::fs::read_to_string(root.join("Cargo.toml"))
+    let workspace_version = crate::read_regular_text(root.join("Cargo.toml"))
         .ok()
         .and_then(|text| {
             text.parse::<aterm_toml::edit::DocumentMut>()
@@ -104,7 +104,7 @@ fn workspace_members(root: &Path) -> &'static MemberIndex {
     if let Ok(entries) = std::fs::read_dir(root.join("crates")) {
         for entry in entries.flatten() {
             let dir = entry.path();
-            let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
+            let Ok(text) = crate::read_regular_text(dir.join("Cargo.toml")) else {
                 continue;
             };
             let name = package_name(&text);
@@ -204,18 +204,24 @@ pub fn measure(root: &Path, id: &PkgId, printed: Option<&Path>) -> PkgFacts {
             ..PkgFacts::default()
         };
     };
+    measure_directory(root, dir)
+}
+
+/// Measure the directory the resolver actually named, without falling back to
+/// a same-named registry or workspace package from a different source.
+fn measure_directory(root: &Path, dir: PathBuf) -> PkgFacts {
     let mut files = Vec::new();
     collect_rs(&dir, &mut files);
     let mut loc = 0u64;
     let mut unsafe_tokens = 0u64;
     for file in &files {
-        let Ok(bytes) = std::fs::read(file) else {
+        let Ok(bytes) = crate::read_regular(file) else {
             continue;
         };
         loc += physical_lines(&bytes);
         unsafe_tokens += count_unsafe(&bytes);
     }
-    let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap_or_default();
+    let manifest = crate::read_regular_text(dir.join("Cargo.toml")).unwrap_or_default();
     let (license, is_proc_macro) = manifest_facts(&manifest);
     PkgFacts {
         loc,
@@ -266,8 +272,43 @@ pub fn survey_cell_logged(
     cell: &Cell,
     log: &mut String,
 ) -> Result<CellSurvey, String> {
-    let (graph, paths) = resolve::graph_and_paths(cargo, root, cell, log)?;
-    let facts = facts_with_paths(root, &graph, &paths);
+    let (graph, mut paths) = resolve::graph_and_paths(cargo, root, cell, log)?;
+    let mut resolved_git = Vec::new();
+    if paths
+        .values()
+        .any(|path| path.to_string_lossy().contains("://"))
+    {
+        let packages = resolve::git_packages(cargo, root)?;
+        for (id, path) in &mut paths {
+            if !path.to_string_lossy().contains("://") {
+                continue;
+            }
+            let package = packages
+                .get(id)
+                .ok_or_else(|| format!("Git package {id} has no resolved source directory"))?;
+            if !resolve::matching_git_annotation(path, &package.source) {
+                return Err(format!(
+                    "Git package {id} source disagrees with its tree annotation"
+                ));
+            }
+            if !package.directory.join("Cargo.toml").is_file() {
+                return Err(format!("Git package {id} has no unpacked source manifest"));
+            }
+            resolved_git.push((id.clone(), package.clone()));
+            *path = package.directory.clone();
+        }
+    }
+    let mut facts = facts_with_paths(root, &graph, &paths);
+    for (id, package) in resolved_git {
+        let mut fact = measure_directory(root, package.directory);
+        if crate::provenance::is_first_party_git(root, &package.source) {
+            fact.is_third_party = false;
+            log.push_str(&format!(
+                "    {id}: first-party Git source, same repository owner and full pinned commit\n"
+            ));
+        }
+        facts.insert(id, fact);
+    }
     Ok(CellSurvey {
         cell: cell.clone(),
         graph,
@@ -357,6 +398,80 @@ fn manifest_facts(text: &str) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_git_dependency_is_measured_from_its_resolved_checkout() {
+        use aterm_uds::output::CommandOutput as _;
+        use aterm_uds::spawnfd::command;
+
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let repo = scratch.path().join("source");
+        let project = scratch.path().join("consumer");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"leaf\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n").unwrap();
+        std::fs::write(repo.join("lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+        let git = |args: &[&str]| {
+            let out = command("git")
+                .current_dir(&repo)
+                .args(args)
+                .output_owned()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ]);
+        let revision = git(&["rev-parse", "HEAD"]);
+        std::fs::write(project.join("Cargo.toml"), format!(
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[workspace]\n[lib]\npath = \"lib.rs\"\n[dependencies]\nleaf = {{ git = \"file://{}\", rev = \"{}\" }}\n",
+            repo.display(), revision.trim(),
+        )).unwrap();
+        std::fs::write(
+            project.join("lib.rs"),
+            "pub fn answer() -> u32 { leaf::answer() }\n",
+        )
+        .unwrap();
+        let cargo = resolve::Cargo::from_env();
+        let fetched = cargo.command("fetch", &project).output_owned().unwrap();
+        assert!(
+            fetched.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fetched.stderr)
+        );
+        let cell = Cell {
+            name: "fixture".to_owned(),
+            triple: "x86_64-unknown-linux-gnu".to_owned(),
+            package: "consumer".to_owned(),
+        };
+        let survey = survey_cell(&cargo, &project, &cell).unwrap();
+        let facts = &survey.facts[&PkgId::new("leaf", "0.1.0")];
+        assert_eq!(facts.loc, 1);
+        assert!(
+            facts.is_third_party,
+            "a local file URL is not same-owner GitHub provenance"
+        );
+        let resolved = facts.root_dir.as_ref().unwrap();
+        assert_ne!(resolved, &repo, "measure the resolver's immutable checkout");
+        assert_eq!(
+            std::fs::read_to_string(resolved.join("lib.rs")).unwrap(),
+            "pub fn answer() -> u32 { 42 }\n"
+        );
+    }
 
     #[test]
     fn manifest_facts_read_licence_and_the_proc_macro_flag() {

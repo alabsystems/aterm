@@ -421,23 +421,120 @@ fn loopback_round(
 /// nothing: a time is never a pass condition.
 #[test]
 fn a_round_that_moves_nothing_reports_its_cpu() {
-    const WARM: usize = 2;
-    const MEASURED: u32 = 8;
-    let pair = log_pair();
-    let a = pair.endpoint(0, true);
-    let b = pair.endpoint(1, true);
+    quiet_rounds(8, false);
+}
+
+/// The same quiet pair kept busy long enough to sample its current-source process. This
+/// runs alone when requested by `verify perf commons-quiet --sustained`.
+#[test]
+#[ignore = "sustained isolated CPU measurement; run with verify perf commons-quiet --sustained"]
+fn a_sustained_quiet_pair_reports_its_cpu() {
+    quiet_rounds(256, false);
+}
+
+/// Ordinary catalog discovery and subscription are part of this workload;
+/// neither side receives an explicit application table list.
+#[test]
+fn a_quiet_catalog_pair_reports_its_cpu() {
+    quiet_rounds(8, true);
+}
+
+#[test]
+#[ignore = "sustained isolated CPU measurement; run with verify perf commons-quiet --catalog --sustained"]
+fn a_sustained_quiet_catalog_pair_reports_its_cpu() {
+    quiet_rounds(256, true);
+}
+
+fn catalog_pair() -> Pair {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    seed_log(&lab);
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let directory = crate::catalog::Directory::new(&lab.paths[0], bootstrap.trust());
+    let scope = directory
+        .open_application(&session, "quiet-catalog", "rows", 1)
+        .unwrap();
+    directory
+        .open_store(&session, scope)
+        .unwrap()
+        .commit_catalog(&session, b"quiet catalog fixture")
+        .unwrap();
+    let peer = crate::catalog::Directory::new(&lab.paths[1], bootstrap.trust());
+    let paths = [directory.path(scope).unwrap(), peer.path(scope).unwrap()];
+    assert!(!paths[1].exists(), "the receiver must discover the table");
+    drop(session);
+    Pair { lab, scope, paths }
+}
+
+fn catalog_inventories(pair: &Pair) -> [BTreeMap<Digest, BTreeSet<Digest>>; 2] {
+    std::array::from_fn(|n| {
+        let bootstrap = pair.lab.bootstrap(n);
+        let session = Session::observe(&bootstrap).unwrap();
+        let directory = crate::catalog::Directory::new(&pair.lab.paths[n], bootstrap.trust());
+        [directory.catalog_scope(), pair.scope]
+            .into_iter()
+            .map(|scope| {
+                let store = directory.observe_table(&session, scope).unwrap();
+                (
+                    scope.digest(),
+                    store.inventory(&session).unwrap().copied().collect(),
+                )
+            })
+            .collect()
+    })
+}
+
+fn quiet_rounds(measured: u32, catalog: bool) {
+    let warm = if catalog { 8 } else { 2 };
+    let pair = if catalog { catalog_pair() } else { log_pair() };
+    let endpoint = |n| {
+        if catalog {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            Endpoint::from_bootstrap_until(&pair.lab.bootstrap(n), deadline)
+                .unwrap()
+                .unwrap()
+                .with_commons_until(
+                    pair.lab.paths[n].clone(),
+                    pair.lab.paths[n].home.join("config.toml"),
+                    deadline,
+                )
+                .unwrap()
+        } else {
+            pair.endpoint(n, true)
+        }
+    };
+    let a = endpoint(0);
+    let b = endpoint(1);
     let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    for _ in 0..WARM {
+    for _ in 0..warm {
         loopback_round(&listener, (&a, &b), (&mut ra, &mut rb));
+    }
+    let inventories = catalog.then(|| catalog_inventories(&pair));
+    if let Some([left, right]) = &inventories {
+        assert_eq!(left, right, "catalog warm-up must converge operation IDs");
+        assert_eq!(left[&pair.scope.digest()].len(), 1);
+        assert!(left.values().all(|records| !records.is_empty()));
+    }
+    let mut visited = BTreeSet::new();
+    if measured > 8 {
+        eprintln!(
+            "\nCOMMONS-QUIET-READY {}",
+            aterm_json::json!({"pid": std::process::id(), "rounds": measured})
+        );
     }
     let reading = process_cpu();
     let start = process_cpu();
     let reading = start - reading;
-    for _ in 0..MEASURED {
+    for _ in 0..measured {
         loopback_round(&listener, (&a, &b), (&mut ra, &mut rb));
         for repair in [&ra, &rb] {
             let application = repair.application().expect("a completed application round");
+            if catalog {
+                assert!(repair.application_error().is_none());
+                assert_eq!(application.deferred, 0, "a measured round deferred repair");
+                visited.insert(application.table.expect("a catalog workload table"));
+            }
             assert_eq!(
                 application.sent
                     + application.received
@@ -453,22 +550,29 @@ fn a_round_that_moves_nothing_reports_its_cpu() {
         }
     }
     let spent = process_cpu() - start;
+    if let Some(before) = &inventories {
+        let [left, _] = before;
+        assert_eq!(visited, left.keys().copied().collect());
+        assert_eq!(&catalog_inventories(&pair), before);
+    }
     eprintln!(
         "COMMONS-QUIET {}",
         aterm_json::json!({
             "schema": 1,
-            "warmup_rounds": WARM,
-            "rounds": MEASURED,
+            "workload": if catalog { "catalog" } else { "explicit" },
+            "tables": if catalog { 2 } else { 1 },
+            "warmup_rounds": warm,
+            "rounds": measured,
             "process_cpu_ns": u64::try_from(spent.as_nanos()).unwrap(),
-            "per_round_cpu_ns": u64::try_from((spent / MEASURED).as_nanos()).unwrap(),
+            "per_round_cpu_ns": u64::try_from((spent / measured).as_nanos()).unwrap(),
             "clock_read_cpu_ns": u64::try_from(reading.as_nanos()).unwrap(),
             "moved_records": 0,
         })
     );
     eprintln!(
-        "COMMONS-NOOP-ROUND process CPU, both sides, per round over {MEASURED} rounds: {:?} \
+        "COMMONS-NOOP-ROUND process CPU, both sides, per round over {measured} rounds: {:?} \
          (one CPU reading costs {reading:?})",
-        spent / MEASURED,
+        spent / measured,
     );
     // What a round paid for its peer's witness when it was not held: before the cache held one
     // log per roster peer, every round with more than 16 peers round-robin paid it.

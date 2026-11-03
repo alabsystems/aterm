@@ -49,7 +49,7 @@ impl Row {
 
 /// Read `<root>/tools/forge-budget.tsv` ([`run`]).
 pub fn load(root: &Path) -> Result<Vec<Row>, String> {
-    match std::fs::read_to_string(root.join(BUDGET_PATH)) {
+    match crate::read_regular_text(root.join(BUDGET_PATH)) {
         Ok(text) => parse(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!(

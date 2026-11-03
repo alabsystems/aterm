@@ -1765,6 +1765,156 @@ mod dead_pty_spawns {
         assert_dead_pty_error(result, "its slave failed fstat", &forked);
         assert!(forked.is_empty(), "nothing was forked: {forked:?}");
     }
+
+    fn assert_session_leader_holds_live_pty() {
+        use std::os::fd::AsRawFd as _;
+        let (master, slave, mut child) = spawn_session_leader_on_pty(|slave| {
+            let tty = || slave.try_clone().map(std::process::Stdio::from);
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", "printf 'READY\\n'; exec sleep 30"])
+                .stdout(tty()?)
+                .stderr(tty()?);
+            Ok(cmd)
+        })
+        .expect("session leader spawns onto a live pty");
+        drop(slave);
+        set_nonblocking(master.as_raw_fd(), true).expect("nonblocking master");
+        let deadline = std::time::Instant::now() + HANG_DETECTOR;
+        let mut seen = Vec::new();
+        while !String::from_utf8_lossy(&seen).contains("READY") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session leader never wrote READY to its pty: {:?}",
+                String::from_utf8_lossy(&seen)
+            );
+            let mut buf = [0u8; 64];
+            let n = read(master.as_raw_fd(), &mut buf);
+            if n > 0 {
+                seen.extend_from_slice(&buf[..n as usize]);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let pid = libc::pid_t::try_from(child.id()).expect("pid");
+        // SAFETY: `getsid`, `getpgid` and `tcgetpgrp` read kernel process/tty ids with no memory aliasing.
+        let (sid, pgid, tpgid) = unsafe {
+            (
+                libc::getsid(pid),
+                libc::getpgid(pid),
+                libc::tcgetpgrp(master.as_raw_fd()),
+            )
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(sid, pid, "child leads its own session");
+        assert_eq!(pgid, pid, "child leads its own process group");
+        assert_eq!(
+            tpgid, pid,
+            "child holds the pty's foreground controlling terminal"
+        );
+    }
+
+    /// `spawn_session_leader_on_pty` checks `dead_pty` before forking: a first fresh pty whose
+    /// slave was revoked (`in_fresh`) or whose `/dev` node is gone (`gone_by_name`) is replaced
+    /// while held open and never forked onto, and the child runs with a live controlling terminal.
+    #[test]
+    fn session_leader_replaces_dead_or_gone_fresh_pty_before_fork_and_holds_terminal() {
+        let _pool = OwnPool::new();
+        pty_race::in_fresh(1);
+        assert_session_leader_holds_live_pty();
+        let forked = spawn_trace::take();
+        let struck = pty_race::take_struck_fresh();
+        assert_eq!(struck.len(), 1, "first fresh pty revoked: {struck:?}");
+        assert_eq!(forked.len(), 1, "one fork onto replacement pty: {forked:?}");
+        assert_ne!(
+            forked[0], struck[0],
+            "dead first pty held open so replacement got a distinct minor"
+        );
+
+        pty_race::gone_by_name(1);
+        assert_session_leader_holds_live_pty();
+        let forked = spawn_trace::take();
+        assert_eq!(
+            forked.len(),
+            1,
+            "gone-by-name pty replaced before fork: {forked:?}"
+        );
+    }
+
+    /// `spawn_session_leader_on_pty` replaces a pty that dies in the child right before
+    /// `TIOCSCTTY` (`in_children`) or right after `TIOCSCTTY` (`after_login_tty`), holding the
+    /// dead pty open while opening the fresh one so the child lands on a distinct live minor.
+    #[test]
+    fn session_leader_replaces_pty_dying_before_or_after_tiocsctty_once() {
+        let _pool = OwnPool::new();
+        pty_race::in_children(1);
+        assert_session_leader_holds_live_pty();
+        let forked = spawn_trace::take();
+        assert_eq!(forked.len(), 2, "struck fork then replacement: {forked:?}");
+        assert_ne!(forked[0], forked[1], "replacement pty has a distinct minor");
+
+        pty_race::after_login_tty(1);
+        assert_session_leader_holds_live_pty();
+        let forked = spawn_trace::take();
+        assert_eq!(
+            forked.len(),
+            2,
+            "post-TIOCSCTTY death then replacement: {forked:?}"
+        );
+        assert_ne!(forked[0], forked[1], "replacement pty has a distinct minor");
+    }
+
+    /// Two consecutive dead ptys in `spawn_session_leader_on_pty` fail closed naming both causes
+    /// and `ATERM-KI-1028-4` after two forks; a non-pty `exec` failure (`NotFound`) on a live pty
+    /// returns immediately after one fork with zero pty replacement (negative control).
+    #[test]
+    fn session_leader_second_dead_pty_errors_and_non_pty_failure_does_not_replace() {
+        let _pool = OwnPool::new();
+        pty_race::in_children(2);
+        let dead_res = spawn_session_leader_on_pty(|_slave| {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", "exec sleep 30"]);
+            Ok(cmd)
+        });
+        let forked = spawn_trace::take();
+        let err = match dead_res {
+            Ok((_m, _s, mut child)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("two dead ptys must error, not return a child ({forked:?})");
+            }
+            Err(err) => err,
+        };
+        let text = err.to_string();
+        assert!(
+            text.starts_with("every pty opened for this shell died")
+                && text.ends_with("(ATERM-KI-1028-4)")
+                && text.matches("TIOCSCTTY failed").count() == 2,
+            "error must name both TIOCSCTTY failures and ATERM-KI-1028-4: {text}"
+        );
+        assert_eq!(forked.len(), 2, "two forks, then error: {forked:?}");
+
+        let missing = spawn_session_leader_on_pty(|_slave| {
+            Ok(std::process::Command::new(
+                "/nonexistent/aterm-pty-no-such-session-leader",
+            ))
+        });
+        let forked = spawn_trace::take();
+        let missing_err = match missing {
+            Ok((_m, _s, mut child)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("missing binary must fail");
+            }
+            Err(err) => err,
+        };
+        assert_eq!(missing_err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            forked.len(),
+            1,
+            "negative control: non-pty exec error never replaces the pty: {forked:?}"
+        );
+    }
 }
 
 /// Where [`spawn_probe_checks_the_child`] passes its pipe's read end, a byte already in the pipe.
@@ -2636,14 +2786,31 @@ fn wrapped_spawn_enforces_network_deny_via_seatbelt() {
     let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
     let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    listener
+        .set_nonblocking(true)
+        .expect("a listener whose accept never waits");
     let port = listener.local_addr().expect("bound").port().to_string();
-    let nc: Vec<std::ffi::OsString> = ["/usr/bin/nc", "-G", "1", "-w", "1", "-z", "127.0.0.1"]
-        .into_iter()
-        .chain([port.as_str()])
-        .map(std::ffi::OsString::from)
-        .collect();
+    // The control's connect must happen, so nc's connect and idle timeouts are the hang detector,
+    // not a one-second budget a loaded host can miss; the denied connect fails at once.
+    let wait = HANG_DETECTOR.as_secs().to_string();
+    let nc: Vec<std::ffi::OsString> = [
+        "/usr/bin/nc",
+        "-G",
+        &wait,
+        "-w",
+        &wait,
+        "-z",
+        "127.0.0.1",
+        &port,
+    ]
+    .into_iter()
+    .map(std::ffi::OsString::from)
+    .collect();
+    // nc's exit and whether the listener holds its connection, read once nc is reaped. Its printed
+    // "succeeded" is no witness: nc prints nothing for a connect that failed, so an empty screen
+    // cannot tell a failed connect from output the pty never delivered.
     let run = |sandbox_wrap: Option<&str>| {
-        let master = spawn_shell(
+        let sh = spawn_shell_with_pid_cell_px(
             24,
             80,
             &spawn_cap,
@@ -2655,30 +2822,41 @@ fn wrapped_spawn_enforces_network_deny_via_seatbelt() {
             Some(&nc),
             None,
             sandbox_wrap,
+            aterm_sandbox::Limits::inherit(),
+            None,
+            None,
         )
         .expect("-e nc must spawn");
-        let mut out = Vec::new();
         let mut buf = [0u8; 256];
-        loop {
-            let n = read(master, &mut buf);
-            if n <= 0 {
-                break;
+        while read(sh.master, &mut buf) > 0 {}
+        let deadline = std::time::Instant::now() + HANG_DETECTOR;
+        let exit = loop {
+            if let Some(exit) = collect_exit_status(sh.pid) {
+                break exit;
             }
-            out.extend_from_slice(&buf[..n as usize]);
-        }
-        close_fd(master);
-        String::from_utf8_lossy(&out).into_owned()
+            assert!(std::time::Instant::now() < deadline, "nc never exited");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        close_fd(sh.master);
+        let reached = match listener.accept() {
+            Ok(_) => true,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => false,
+            Err(e) => panic!("the listener's accept: {e}"),
+        };
+        (exit, reached)
     };
     let open = run(None);
     let denied = run(Some(aterm_containment::BASE_PROFILE));
-    drop(listener);
-    assert!(
-        open.contains("succeeded"),
-        "control: unwrapped nc connects: {open:?}"
+    assert_eq!(
+        open,
+        (crate::ChildExit::Code(0), true),
+        "control: unwrapped nc connects"
     );
-    assert!(
-        !denied.contains("succeeded"),
-        "DENY FAILED: wrapped nc connected under (deny network*): {denied:?}"
+    // nc's own exit 1 (its connect refused), not sandbox-exec's 65 for a profile it rejected.
+    assert_eq!(
+        denied,
+        (crate::ChildExit::Code(1), false),
+        "DENY FAILED: wrapped nc under (deny network*)"
     );
 }
 

@@ -8,6 +8,22 @@ mod pins;
 mod quad;
 mod triple;
 
+/// TOML's basic-string escape of `path`, for an agh.toml a test writes.
+pub fn toml_path(path: &std::path::Path) -> String {
+    path.display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+/// Write `text` as agh.toml under `dirs`, 0600 in a 0700 directory, replacing any there.
+pub fn write_config(dirs: &agh::config::Dirs, text: &str) {
+    std::fs::create_dir_all(dirs.config.parent().expect("a parent")).expect("the config parent");
+    aterm_uds::private_file::create_private_dir(&dirs.config).expect("the config directory");
+    aterm_uds::private_file::write_private(&dirs.config, "agh.toml", text.as_bytes())
+        .expect("agh.toml");
+}
+
 /// A scratch directory removed on drop.
 pub fn scratch(label: &str) -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()

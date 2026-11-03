@@ -86,6 +86,161 @@ fn the_program_is_the_script_or_the_image_that_is_claude() {
     );
 }
 
+/// THE EXIT AN AUTOPILOT CARRIES ([`carried`]): tab 1's exit of 2026-10-27, a Cruise session's
+/// Claude Code ended in order by a `SIGTERM` nobody in aterm sent, its own background work's
+/// occupancy hold open, nobody typing, read off the `status` the tab answers once it publishes
+/// no agent (`autopilot=-`, `task=-`); under Cruise, and Land until its work landed, such an
+/// exit comes back, and every owner `on_exit` or the session names keeps it theirs. An exit
+/// whose owner cannot be read is unread, never carried.
+#[test]
+fn an_exit_nobody_owns_is_carried_under_cruise_and_land_and_never_over_an_owner() {
+    use crate::supervise::Autopilot;
+    let at_exit = "OK schema=1 phase=idle hold=0 hand=- human_ms=- typed_by=aterm typed_ms=176000 \
+                   occupancy=prompt occupancy_hold=undeclared supervisor=- autopilot=- task=-";
+    let decision = on_exit(true, Some(at_exit), 120, false, false);
+    assert_eq!(
+        decision,
+        OnExit::Relaunch,
+        "the agent's own background work holds nobody's exit"
+    );
+    let cruise = |status: Option<&str>, driven_ms: Option<u64>| {
+        carried(decision, Autopilot::Cruise, status, driven_ms, false, 120)
+    };
+    for (autopilot, landed, said) in [
+        (Autopilot::Cruise, false, Carried::Yes),
+        (Autopilot::Cruise, true, Carried::Yes),
+        (Autopilot::Land, false, Carried::Yes),
+        (Autopilot::Land, true, Carried::No),
+        (Autopilot::Off, false, Carried::No),
+    ] {
+        assert_eq!(
+            carried(decision, autopilot, Some(at_exit), None, landed, 120),
+            said,
+            "{autopilot:?} landed={landed}: Cruise carries the session past a landing, Land \
+             only until its work landed"
+        );
+    }
+    assert_eq!(
+        carried(decision, Autopilot::Land, None, None, true, 120),
+        Carried::No,
+        "Land's work landed: not the Autopilot's, read or not"
+    );
+    for owned in [
+        OnExit::PersonAsked,
+        OnExit::Held,
+        OnExit::Limited,
+        OnExit::Asked,
+        OnExit::Restarted,
+    ] {
+        assert_eq!(
+            carried(owned, Autopilot::Cruise, Some(at_exit), None, false, 120),
+            Carried::No,
+            "{owned:?}"
+        );
+    }
+    assert_eq!(
+        cruise(None, None),
+        Carried::Unread,
+        "an unreadable status shows neither a person's keys nor a hand: whose it is is unread"
+    );
+    assert_eq!(
+        cruise(Some("ERR busy"), None),
+        Carried::Unread,
+        "a refused status reads nothing either"
+    );
+    for (driven_ms, said) in [
+        (Some(4_000), Carried::No),
+        (Some(119_999), Carried::No),
+        (Some(120_000), Carried::Yes),
+        (None, Carried::Yes),
+    ] {
+        assert_eq!(
+            cruise(Some(at_exit), driven_ms),
+            said,
+            "{driven_ms:?}: a driver's `/exit` is the driver's; aterm's own lines ask no end"
+        );
+    }
+}
+
+/// THE AUTOPILOT CARRIES AN EXIT ONCE A HEALTHY RUN ([`Relaunches::carry`]): an agent whose carried
+/// relaunch landed and that ends again by nobody's word within [`HEALTHY`] (a person's `kill`
+/// from outside aterm, an agent that ends itself after each start) is not brought back again;
+/// one that ran [`HEALTHY`] since that landing is. An attach starts no new clock (the host reads
+/// its own relaunch's attach as running too), save one read back while a carried relaunch is
+/// still due, which is that relaunch's landing: its agent registered after the attempt's own
+/// wait gave up.
+#[test]
+fn an_exit_is_carried_once_a_healthy_run() {
+    let t0 = Instant::now();
+    let soon = t0 + Duration::from_secs(5);
+    let landed_at = |at: Instant| {
+        let mut r = Relaunches::default();
+        assert!(r.exited(OnExit::Relaunch, at).is_ok());
+        assert!(r.carry(at), "the first unowned end comes back");
+        assert_eq!(r.attempted(&Outcome::Relaunched, at), Say::Nothing);
+        r
+    };
+    let mut r = landed_at(t0);
+    assert!(r.exited(OnExit::Relaunch, soon).is_ok());
+    assert!(!r.carry(soon), "ended again 5 s after it came back");
+    assert_eq!(
+        r.attempted(&Outcome::Relaunched, soon),
+        Say::Nothing,
+        "a crash then, relaunched on the back-off: no carried exit's landing"
+    );
+    let before = t0 + HEALTHY - Duration::from_secs(1);
+    assert!(r.exited(OnExit::Relaunch, before).is_ok());
+    assert!(
+        !r.carry(before),
+        "the clock is the carried exit's landing's, not the crash's"
+    );
+    assert!(r.exited(OnExit::Relaunch, t0 + HEALTHY).is_ok());
+    assert!(r.carry(t0 + HEALTHY), "it ran a healthy run since");
+    let mut r = landed_at(t0);
+    let _ = r.running(soon);
+    assert!(r.exited(OnExit::Relaunch, soon).is_ok());
+    assert!(
+        !r.carry(soon),
+        "the host reads its own relaunch's attach as running: no new clock"
+    );
+    let mut r = Relaunches::default();
+    assert!(r.exited(OnExit::Relaunch, t0).is_ok());
+    assert!(r.carry(t0));
+    assert!(r.exited(OnExit::Relaunch, soon).is_ok());
+    assert!(
+        r.carry(soon),
+        "a carried relaunch that never landed starts no clock"
+    );
+    let mut r = Relaunches::default();
+    assert!(r.exited(OnExit::Relaunch, t0).is_ok());
+    assert!(r.carry(t0));
+    assert_eq!(
+        r.attempted(&Outcome::NotYet("wait:resume".to_string()), t0),
+        Say::Nothing
+    );
+    let _ = r.running(t0 + Duration::from_secs(2));
+    let again = t0 + Duration::from_secs(7);
+    assert!(r.exited(OnExit::Relaunch, again).is_ok());
+    assert!(
+        !r.carry(again),
+        "its line's agent registered after the attempt's wait gave up: read back attached while \
+         the carried relaunch was due, that is its landing"
+    );
+    let mut r = Relaunches::default();
+    assert!(r.exited(OnExit::Relaunch, t0).is_ok());
+    assert!(r.carry(t0));
+    assert_eq!(
+        r.attempted(&Outcome::Cannot("no-conversation".to_string()), t0),
+        Say::Cannot
+    );
+    let _ = r.running(t0 + Duration::from_secs(2));
+    assert!(r.exited(OnExit::Relaunch, again).is_ok());
+    assert!(
+        r.carry(again),
+        "no carried relaunch due: a person's own start later on starts no clock"
+    );
+}
+
 #[test]
 fn an_exit_is_relaunched_unless_someone_owns_it_or_it_is_limited() {
     let st = |tail: &str| format!("OK schema=1 {tail}");
@@ -1293,6 +1448,7 @@ fn the_resumed_prompt_is_one_line_and_keeps_going() {
     for cause in [
         CAUSE_EXIT,
         CAUSE_MEMORY,
+        CAUSE_INPUT_LOST,
         "model:opus",
         "model-back:fable",
         "model-back:",
@@ -2096,6 +2252,52 @@ fn an_account_moves_record_is_a_relaunch_that_ended_its_own_agent() {
         !ends_its_agent(CAUSE_EXIT),
         "an exit's relaunch ended nothing"
     );
+}
+
+/// A RESTART IN PLACE FOR A LINE THE WORKER READ AND DREW NONE OF ([`Restart::InputLost`]) IS A
+/// RELAUNCH THAT ENDED ITS OWN AGENT, carried as a memory restart's is: its own cause
+/// ([`CAUSE_INPUT_LOST`]), the model the agent rode (or the hand's) kept, and a fallback it rode
+/// carried; the relaunch is no exit, and its resumed prompt says why in words of its own.
+#[test]
+fn a_restart_for_a_lost_line_ends_its_agent_and_keeps_its_model() {
+    let fell = St {
+        cause: "model:claude-sonnet-5-5".to_string(),
+        fallback_from: Some("claude-fable-5-1".to_string()),
+        ..St::default()
+    };
+    let at = |why: &Restart, riding: Option<&str>, hand: Option<&str>| {
+        model_restart(
+            why,
+            Some(&fell),
+            "claude-sonnet-5-5".to_string(),
+            riding.map(str::to_string),
+            hand.map(str::to_string),
+        )
+    };
+    for (riding, hand) in [
+        (None, None),
+        (Some("claude-opus-5-5"), None),
+        (None, Some("claude-fable-5-2")),
+        (Some("claude-opus-5-5"), Some("claude-fable-5-2")),
+    ] {
+        let lost = at(&Restart::InputLost, riding, hand);
+        let memory = at(&Restart::Memory, riding, hand);
+        assert_eq!(lost.cause, CAUSE_INPUT_LOST, "{riding:?} {hand:?}");
+        assert_eq!(
+            ModelRestart {
+                cause: CAUSE_MEMORY.to_string(),
+                ..lost
+            },
+            memory,
+            "carried as a memory restart's: {riding:?} {hand:?}"
+        );
+    }
+    assert!(relaunch_cause(CAUSE_INPUT_LOST));
+    assert!(ends_its_agent(CAUSE_INPUT_LOST) && ends_at_once(CAUSE_INPUT_LOST));
+    assert!(!starts_afresh(CAUSE_INPUT_LOST));
+    let said = resumed_prompt("2.1.300", CAUSE_INPUT_LOST);
+    assert!(said.contains("drew none of it"), "{said}");
+    assert_ne!(said, resumed_prompt("2.1.300", CAUSE_MEMORY));
 }
 
 #[test]
@@ -4419,6 +4621,7 @@ fn every_lanes_carry_on_ends_on_the_continuation_and_its_needs_sentence() {
     let causes = [
         CAUSE_EXIT,
         CAUSE_MEMORY,
+        CAUSE_INPUT_LOST,
         CAUSE_STALL,
         CAUSE_ASKED,
         CAUSE_HOST,

@@ -289,7 +289,7 @@ impl RetryPlan {
     /// The plan for a try at `at_unix` in a zone `offset` seconds from UTC.
     pub(crate) fn with_offset(at_unix: i64, offset: Option<i64>) -> Self {
         let clock = offset.map(|offset| {
-            let local = (at_unix + offset).rem_euclid(86_400);
+            let local = (at_unix.rem_euclid(86_400) + offset.rem_euclid(86_400)).rem_euclid(86_400);
             format!("{:02}:{:02}", local / 3600, (local % 3600) / 60)
         });
         Self { at_unix, clock }
@@ -307,7 +307,6 @@ pub(crate) fn with_retry_plan(
         return agent;
     };
     let mut agent = agent?;
-    let ahead = plan.at_unix - now_unix;
     let AgentPhase::Wall {
         kind,
         reset: None,
@@ -316,10 +315,10 @@ pub(crate) fn with_retry_plan(
     else {
         return Some(agent);
     };
-    if ahead <= 0 || !Native::wall_retries(*kind) {
+    if plan.at_unix <= now_unix || !Native::wall_retries(*kind) {
         return Some(agent);
     }
-    *until = now.checked_add(Duration::from_secs(ahead.unsigned_abs()));
+    *until = now.checked_add(Duration::from_secs(plan.at_unix.abs_diff(now_unix)));
     if let AgentPhase::Wall { reset, .. } = &mut agent.phase {
         reset.clone_from(&plan.clock);
     }
@@ -683,10 +682,7 @@ fn countdown_in(
     local_zone: Option<&str>,
 ) -> Option<Duration> {
     let at = place_in(reset, now, offset_at, local_zone)?;
-    u64::try_from(at - now)
-        .ok()
-        .filter(|&s| s > 0)
-        .map(Duration::from_secs)
+    (at > now).then(|| Duration::from_secs(at.abs_diff(now)))
 }
 
 /// Where `reset` falls on this machine's clock (unix seconds), placed as of `printed`.
@@ -1692,6 +1688,46 @@ mod tests {
     }
 
     #[test]
+    fn retry_plan_clock_handles_the_entire_timestamp_range() {
+        for (at, offset, expected) in [
+            (i64::MAX, 3600, "16:30"),
+            (i64::MIN, -3600, "07:29"),
+            (i64::MAX, i64::MAX, "07:00"),
+            (i64::MIN, i64::MAX, "23:59"),
+        ] {
+            let plan = RetryPlan::with_offset(at, Some(offset));
+            assert_eq!(plan.at_unix, at);
+            assert_eq!(plan.clock.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn retry_plan_ordering_survives_extreme_timestamp_differences() {
+        let agent = AgentReading {
+            phase: AgentPhase::Wall {
+                kind: aterm_phase::WallKind::Overloaded,
+                reset: None,
+                until: None,
+            },
+            context_pct: Some(40),
+        };
+        let now = t0();
+        let past = RetryPlan::with_offset(i64::MIN, Some(0));
+        assert_eq!(
+            with_retry_plan(Some(agent.clone()), Some(&past), i64::MAX, now),
+            Some(agent.clone())
+        );
+        let future = RetryPlan::with_offset(i64::MAX, Some(0));
+        let got = with_retry_plan(Some(agent), Some(&future), i64::MIN, now).unwrap();
+        let AgentPhase::Wall { reset, until, .. } = got.phase else {
+            panic!("still a wall");
+        };
+        assert_eq!(reset, future.clock);
+        assert!(until.is_none(), "the monotonic deadline is unrepresentable");
+        assert_eq!(got.context_pct, Some(40));
+    }
+
+    #[test]
     fn a_retry_plan_is_laid_on_an_api_wall_and_nothing_else() {
         use aterm_phase::{ApiCause, WallKind};
         const NOW_UNIX: i64 = 1_789_660_500;
@@ -1882,6 +1918,24 @@ mod tests {
     }
 
     #[test]
+    fn relative_reset_countdown_keeps_extreme_timestamp_distances() {
+        assert_eq!(
+            countdown_at("in 18446744073709551615s", i64::MIN, 0, None),
+            Some(Duration::from_secs(u64::MAX))
+        );
+        assert_eq!(
+            countdown_at("in 9223372036854775808s", i64::MIN, 0, None),
+            Some(Duration::from_secs(1u64 << 63))
+        );
+        assert_eq!(
+            countdown_at("in 18446744073709551615s", i64::MAX, 0, None),
+            None,
+            "a reset saturated at the current instant has no countdown"
+        );
+        assert_eq!(countdown_at("in 0s", i64::MIN, 0, None), None);
+    }
+
+    #[test]
     fn the_countdown_is_to_the_reset_on_this_clock() {
         let now = 1_789_812_000_i64;
         let off = -7 * 3600;
@@ -1903,18 +1957,25 @@ mod tests {
         );
         assert_eq!(at("5am (Etc/UTC)"), None, "another zone");
         assert_eq!(at("soon"), None);
-        if let Some(offset) = local_offset_s()
-            && local_offset_at(limit::unix_now() + 2 * 3600) == Some(offset)
-        {
-            let local = limit::unix_now() + offset + 2 * 3600;
-            let tod = local.rem_euclid(86_400);
+        // On this machine's clock: a reset named by the wall clock two hours on. A clock change
+        // between moves how far ahead that wall clock falls, never what it reads there.
+        let now = limit::unix_now();
+        let then = now + 2 * 3600;
+        if let Some(offset) = local_offset_at(then) {
+            let tod = (then + offset).rem_euclid(86_400);
             let text = format!("{}:{:02}", tod / 3600, (tod % 3600) / 60);
             let ahead = countdown_to_reset(&text).expect("placeable");
+            let after = limit::unix_now();
+            assert!(ahead <= Duration::from_secs(2 * 3600), "{text}: {ahead:?}");
+            let placed = place_reset(&text, now).expect("placeable");
+            let reads = placed + local_offset_at(placed).expect("the zone reads");
+            assert_eq!(reads.rem_euclid(86_400), tod - tod % 60, "{text}");
+            // The countdown runs to that placement from the clock it read, which reads
+            // between `now` and `after`; the placement two hours on is the same from either.
+            let ahead = i64::try_from(ahead.as_secs()).expect("seconds fit");
             assert!(
-                (Duration::from_secs(2 * 3600 - 60) - aterm_spec::wait::MUST_HAPPEN
-                    ..=Duration::from_secs(2 * 3600))
-                    .contains(&ahead),
-                "{text}: {ahead:?}"
+                (placed - after..=placed - now).contains(&ahead),
+                "{text}: {ahead}s to {placed}, the clock read in [{now}, {after}]"
             );
         }
         assert_eq!(countdown_to_reset("soon"), None);
@@ -2266,7 +2327,9 @@ mod tests {
 
     /// The band's countdown places a reset with the offset that holds at the
     /// reset, not one process-wide offset: a dated reset on the far side of a
-    /// daylight-saving change counts down to the real instant.
+    /// daylight-saving change counts down to the real instant, read from a fixed
+    /// September morning in New York to noon that December. CONTROL: the morning's
+    /// offset held flat lands an hour early.
     #[cfg(unix)]
     #[test]
     fn r44_hb5_the_reset_countdown_places_a_reset_with_the_offset_that_holds_then() {
@@ -2274,52 +2337,26 @@ mod tests {
             crate::test_alone::run_alone_with(&[("TZ", std::ffi::OsStr::new("America/New_York"))]);
             return;
         }
-        const MONTHS: [&str; 12] = [
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-        ];
-        fn month_day(days: i64) -> (usize, i64) {
-            let z = days + 719_468;
-            let era = z.div_euclid(146_097);
-            let doe = z - era * 146_097;
-            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-            let mp = (5 * doy + 2) / 153;
-            let d = doy - (153 * mp + 2) / 5 + 1;
-            let m = if mp < 10 { mp + 3 } else { mp - 9 };
-            (usize::try_from(m).unwrap(), d)
+        const NOW: i64 = 1_789_812_000; // 2026-09-19 06:00 EDT
+        const NOON: i64 = 1_796_144_400; // 2026-12-01 12:00 EST (17:00Z)
+        const RESET: &str = "Dec 1 at 12pm";
+        let (edt, est) = (local_offset_at(NOW), local_offset_at(NOON));
+        if edt != Some(-4 * 3600) || est != Some(-5 * 3600) {
+            aterm_spec::host::could_not_run(format!(
+                "America/New_York reads {edt:?} and {est:?} here: no zone database to read it from"
+            ));
         }
-        let Some(now_offset) = local_offset_s() else {
-            aterm_spec::host::could_not_run("no local offset reads here");
-        };
-        let now = limit::unix_now();
-        let Some((probe, then_offset)) = [90i64, 120, 150, 180, 210, 240]
-            .into_iter()
-            .map(|days| now + days * 86_400)
-            .find_map(|t| {
-                local_offset_at(t)
-                    .filter(|o| *o != now_offset)
-                    .map(|o| (t, o))
-            })
-        else {
-            aterm_spec::host::could_not_run(
-                "America/New_York keeps one offset here: no zone database to read it from",
-            );
-        };
-        let (m, d) = month_day((probe + then_offset).div_euclid(86_400));
-        let reset = format!("{} {d} at 12pm", MONTHS[m - 1]);
-        let got = countdown_to_reset(&reset).expect("a figure");
-        let spec = limit::parse_reset(&reset).expect("the grammar reads it");
-        let now = limit::unix_now();
-        let at = limit::reset_in_zone(&spec, now, limit::SESSION_AHEAD_MAX, &|t| {
-            local_offset_at(t)
-        })
-        .expect("placed");
-        let want = u64::try_from(at - now).expect("ahead");
-        let off_by = got.as_secs().abs_diff(want);
-        assert!(
-            off_by <= 5,
-            "`{reset}` counted down {got:?}, the reset is {want} s away: {off_by} s off \
-             (offset now {now_offset}, then {then_offset})"
+        assert_eq!(place_reset(RESET, NOW), Some(NOON));
+        assert_eq!(
+            countdown_in(RESET, NOW, &local_offset_at, local_zone().as_deref()),
+            Some(Duration::from_secs(u64::try_from(NOON - NOW).unwrap()))
+        );
+        assert_eq!(
+            countdown_at(RESET, NOW, -4 * 3600, None),
+            Some(Duration::from_secs(
+                u64::try_from(NOON - 3600 - NOW).unwrap()
+            )),
+            "CONTROL: one offset for the whole span"
         );
     }
 }

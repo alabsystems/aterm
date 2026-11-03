@@ -643,5 +643,5 @@ fn a_startup_join_over_an_unreadable_vault_is_admitted_at_once_without_the_join(
     assert_eq!((host.tries, host.failures.len()), (1, 0));
     assert!(host.not_joined, "the page says the vault was not joined");
     let snapshot = setup.snapshot().unwrap();
-    assert!(snapshot.permissions_allowed && !snapshot.finished);
+    assert!(snapshot.run_allowed && !snapshot.finished);
 }

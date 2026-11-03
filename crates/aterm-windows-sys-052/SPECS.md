@@ -44,7 +44,7 @@ WSYS052-PF-VALUE	table-property	windows_sys::Win32::System::Threading::PF_ARM_V8
 file	test	primary	also
 ```
 
-## 5. Open finding
+## 3. Coverage
 
 - 0 runtime `#[test]` fns remain (1 original test converted to CTFE; 0 non-spec samples).
 - All four recorded declarations, including `WSYS052-PF-VALUE`, are checked by the compiler on

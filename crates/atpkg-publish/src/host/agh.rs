@@ -2,20 +2,36 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! [`AghHost`]: the release host over agh (docs/DESIGN-agh-2026-10-19.md §10.3).
+//! [`AghHost`]: the release host over agh (docs/DESIGN-agh-2026-10-19.md §10.3, §11.2).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use agh::download::{Expect, Sink};
+use agh::git::GitRun;
 use agh::github::TagObjects;
+use agh::github::releases::{
+    DraftRequest, MakeLatest, PublishGuard, PublishPatch, Replace as AghReplace, UploadFile,
+};
 use agh::model::ReleaseObject;
 use agh::page::ListOpts;
-use agh::policy::{Presence, RefusalCode};
+use agh::policy::{Access, Named, Presence, RefusalCode, RouteRequest, RouteTarget, Tier};
 use agh::retry::RetryPolicy;
-use agh::{How, Kind, Sub};
+use agh::{How, Kind, Outcome, Permit, Sub};
 
 use super::{HostError, Probe, Release, ReleaseHost, Replace, Slug};
+
+/// The `[[writers]]` caller atpkg-publish's release-tier writes are granted to (design §10.2),
+/// which every lane write and helper grant names.
+pub(crate) const CALLER: &str = "atpkg-publish";
+
+/// How long a lane's clone or fetch through agh's isolated git may take: four hours, the
+/// Linux unit's `TimeoutStartSec`, in place of agh's ten-minute `GIT_BUDGET`. A lane clone of a
+/// large repository over a slow link outlasts ten minutes, and `RestHost`'s git has no limit;
+/// a release-tier grant still lives at most `GRANT_MAX`.
+pub const LANE_GIT_BUDGET: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// A release host over one agh client.
 pub struct AghHost {
@@ -40,15 +56,28 @@ impl AghHost {
     }
 
     /// The production host serving `home` (design §10.3): `Router::from_validated` of
-    /// `config::load_for_host(&dirs)`, the journal, the caller `atpkg-publish`, and
+    /// agh.toml as `load_config` reads it (`config::load_for_host_faults`), the journal, the caller `atpkg-publish`, and
     /// `RetryPolicy::STANDARD`.
     ///
     /// # Errors
     ///
-    /// `Err(why)` when agh.toml is missing (`None`) or invalid, for `Ctx::from_env_hosts`.
+    /// `Err(why)` when agh.toml is missing (`None`) or invalid, for `Ctx::from_env_hosts`,
+    /// and when it says `vault = true`: vault adoption's rows are not composed here, so such a
+    /// file would build a host whose every write is refused as a missing writer.
     pub fn production(dirs: &agh::config::Dirs, home: agh::Slug) -> Result<AghHost, String> {
-        let _ = (dirs, home);
-        Err("not yet: AghHost::production lands in WP11".to_string())
+        let validated = load_config(dirs).map_err(|refusal| refusal.detail("agh.toml"))?;
+        let env = Arc::new(agh::identity::ProcessEnv);
+        let github = agh::GithubBuilder::new(agh::policy::Router::from_validated(validated))
+            .transport(Arc::new(agh::wire::http::HttpTransport::new(env.clone())))
+            .endpoints(agh::wire::Endpoints::github_com())
+            .env(env)
+            .fx(Arc::new(agh::Fx::live()))
+            .retry(RetryPolicy::STANDARD)
+            .caller(CALLER)
+            .journal(dirs.clone())
+            .rate_book(agh::rate::RateBook::at(dirs.rate()))
+            .build();
+        Ok(AghHost::new(github, home))
     }
 
     /// Tests: another pause (the contract uses zero).
@@ -112,6 +141,39 @@ impl AghHost {
         }
     }
 
+    /// The error map of a write (design §10.3's table): `host_error`, with an open intent named
+    /// as such, and the next step kept where it is the one that unblocks a lane (a guard that
+    /// failed, a grant that is missing). A missing writer refuses the write by its owner.
+    fn write_error(&self, e: &agh::Error) -> HostError {
+        match &e.sub {
+            Sub::IntentOpen { intent } => {
+                return HostError::Unreachable(Self::outcome_unknown(intent));
+            }
+            Sub::GuardFailed { .. } | Sub::Policy(RefusalCode::NotGranted) => {
+                // A guard that set no next of its own carries its kind's generic one, which
+                // names agh's JSON fields; only a step of the error's own is worth the line.
+                if e.next == e.kind.next_action() {
+                    return HostError::Refused(self.redacted(&e.why));
+                }
+                return HostError::Refused(self.redacted(&format!("{}; next: {}", e.why, e.next)));
+            }
+            Sub::Policy(RefusalCode::WriterAbsent) => {
+                return HostError::Refused(self.redacted(&format!(
+                    "a write needs the writer identity for {}, which is absent: {}",
+                    self.home.owner(),
+                    e.why
+                )));
+            }
+            _ => {}
+        }
+        self.host_error(e)
+    }
+
+    /// `Unreachable`'s why for an open intent.
+    fn outcome_unknown(intent: &dyn std::fmt::Display) -> String {
+        format!("outcome unknown; intent {intent} open")
+    }
+
     fn own(&self, slug: &Slug) -> Result<agh::Slug, String> {
         let s = agh::Slug::new(&slug.owner, &slug.repo).map_err(|e| self.redacted(&e.why))?;
         if s.owner().eq_ignore_ascii_case(self.home.owner()) {
@@ -128,16 +190,54 @@ impl AghHost {
         self.own(slug).map_err(HostError::Refused)
     }
 
-    fn resolve(&self, s: &agh::Slug, tag: &str, how: How) -> Result<ReleaseObject, HostError> {
-        let releases = self.github.releases(s).how(how);
-        let found = releases
-            .objects_for_tag(tag)
-            .map_err(|e| self.host_error(&e))?;
+    /// How a write names `s` (design §10.2): a release-tier repository by the `[[writers]]`
+    /// grant of atpkg-publish, which the router refuses `not_granted` without; any other by
+    /// the library's default.
+    fn named(&self, s: &agh::Slug) -> Result<Named, HostError> {
+        let router = self.github.router();
+        if router.tier_of(s.owner()) != Tier::Release {
+            return Ok(Named::Default);
+        }
+        router
+            .grant(CALLER, s)
+            .map(Named::Literal)
+            .map_err(|e| self.write_error(&e))
+    }
+
+    /// The one-owner check, then a write permit for `slug`, named as `named` says.
+    fn permit(&self, slug: &Slug) -> Result<(agh::Slug, Permit), HostError> {
+        let s = self.own_or_refuse(slug)?;
+        let named = self.named(&s)?;
+        let req = RouteRequest::write(RouteTarget::Repo(s.clone())).with_named(named);
+        let permit = self.github.permit(&req).map_err(|e| self.write_error(&e))?;
+        Ok((s, permit))
+    }
+
+    /// What a WriterRead of `tag` sees, in a bounded number of requests whatever the repository
+    /// holds (`recent_objects_for_tag`, so a draft is seen: finding F11).
+    fn tag_objects(&self, s: &agh::Slug, tag: &str, how: How) -> Result<TagObjects, HostError> {
+        self.github
+            .releases(s)
+            .how(how)
+            .recent_objects_for_tag(tag)
+            .map_err(|e| self.host_error(&e))
+    }
+
+    /// M1's resolution of what `tag_objects` saw: each object read by id, the published
+    /// release first, drafts beside it a warning.
+    fn pick(
+        &self,
+        s: &agh::Slug,
+        tag: &str,
+        how: How,
+        found: TagObjects,
+    ) -> Result<ReleaseObject, HostError> {
         let objects = match found {
             TagObjects::None => return Err(HostError::NotFound),
             TagObjects::One(release) => return Ok(*release),
             TagObjects::Many(objects) => objects,
         };
+        let releases = self.github.releases(s).how(how);
         let mut read = Vec::with_capacity(objects.len());
         for object in &objects {
             match releases.get(object.id) {
@@ -169,6 +269,122 @@ impl AghHost {
         }
     }
 
+    fn resolve(&self, s: &agh::Slug, tag: &str, how: How) -> Result<ReleaseObject, HostError> {
+        let found = self.tag_objects(s, tag, how.clone())?;
+        self.pick(s, tag, how, found)
+    }
+
+    /// Each of `files` opened and hashed before anything is sent.
+    fn open_files(&self, files: &[PathBuf]) -> Result<Vec<UploadFile>, HostError> {
+        files
+            .iter()
+            .map(|path| {
+                UploadFile::open(path, None).map_err(|e| HostError::Refused(self.redacted(&e.why)))
+            })
+            .collect()
+    }
+
+    /// Closes an open create intent for `tag` from what `release` just read (finding F4). An
+    /// error is one warning line, never a `HostError`; a client with no journal has none open.
+    fn observe(&self, s: &agh::Slug, tag: &str, seen: &TagObjects) {
+        if self.github.dirs().is_none() {
+            return;
+        }
+        let observed = self.github.journal(s).and_then(|journal| {
+            self.github
+                .releases(s)
+                .observe_open(tag, seen, Access::WriterRead, &journal)
+        });
+        if let Err(e) = observed {
+            self.warn(format!(
+                "atpkg-publish: {s} tag {tag}: an open intent could not be observed: {}",
+                e.why
+            ));
+        }
+    }
+
+    /// Body 2's published-`Done` rule: the release a lost answer's publish left holds every
+    /// file with its sha256 as its digest, and nothing else, or `create` is refused by name.
+    fn converged_published(
+        &self,
+        s: &agh::Slug,
+        tag: &str,
+        release: &ReleaseObject,
+        files: &[UploadFile],
+    ) -> Result<(), HostError> {
+        let want: agh::github::releases::AssetSet = files
+            .iter()
+            .map(|file| (file.name.clone(), Some(file.sha256)))
+            .collect();
+        // An asset not yet uploaded, or whose digest is malformed, holds no file's bytes
+        // (`AssetObject::holds`), so it is seen with no digest: changed, or added.
+        let seen: agh::github::releases::AssetSet = release
+            .assets
+            .iter()
+            .map(|asset| {
+                let digest = asset.sha256().ok().flatten();
+                (asset.name.clone(), digest.filter(|_| asset.is_uploaded()))
+            })
+            .collect();
+        let change = agh::github::releases::asset_change(&want, &seen);
+        if change.is_empty() {
+            // The trait's create leaves a prerelease, and agh's publish guard converges only a
+            // release published as its patch would leave it, so `publish_draft` refuses one
+            // made a full release since; `create` refuses it too.
+            if !release.prerelease {
+                return Err(HostError::Refused(self.redacted(&format!(
+                    "{tag} on {s} is published as a full release, not a prerelease"
+                ))));
+            }
+            return Ok(());
+        }
+        let list = |names: &[String]| {
+            if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(", ")
+            }
+        };
+        Err(HostError::Refused(self.redacted(&format!(
+            "{tag} on {s} is published with other files: added {}; missing {}; changed {}",
+            list(&change.added),
+            list(&change.missing),
+            list(&change.changed)
+        ))))
+    }
+
+    /// Before a clobber of `files`: every temporary asset an earlier clobber of the same name
+    /// left with other bytes (`{name}.agh-{8 hex}` not of this file's digest, which agh's
+    /// clobber neither renames nor deletes) is deleted, and so is the staged copy a cut
+    /// `RestHost` replace of the same name left (`{name}.atpkg-staged`), as `RestHost` drops
+    /// both before every clobber: during the swap both hosts write the same staging releases.
+    /// A temporary of this file's own bytes is the clobber's to finish, and a release holding
+    /// none sends nothing here. Left behind, either would be an asset the mirror refuses to
+    /// republish.
+    fn drop_stale_temporaries(
+        &self,
+        releases: &agh::github::releases::Releases<'_>,
+        permit: &Permit,
+        release: &ReleaseObject,
+        files: &[UploadFile],
+    ) -> Result<(), HostError> {
+        for file in files {
+            let ours = agh::github::releases::clobber_temporary(&file.name, &file.sha256);
+            let staged = format!("{}{}", file.name, crate::host::rest::STAGED);
+            let stale = release.assets.iter().filter(|asset| {
+                asset.name == staged
+                    || (asset.name != ours
+                        && agh::github::releases::is_clobber_temporary_of(&asset.name, &file.name))
+            });
+            for asset in stale {
+                releases
+                    .delete_asset(permit, release, &asset.name)
+                    .map_err(|e| self.write_error(&e))?;
+            }
+        }
+        Ok(())
+    }
+
     fn fetch_public_own(
         &self,
         s: &agh::Slug,
@@ -190,6 +406,56 @@ impl AghHost {
     }
 }
 
+/// Why agh.toml builds no host for the lanes (design §10.3): what `AghHost::production` and
+/// `hosts check` both read it as.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigRefusal {
+    /// There is no agh.toml.
+    Missing,
+    /// agh.toml is refused: its first fault, `{rule} {what}` whole, or the refusal of the
+    /// file itself (its mode, its owner, its bytes), which names no rule; shaped.
+    Invalid(String),
+    /// agh.toml says `vault = true`: vault adoption's rows are not composed here, so such a
+    /// file would build a host whose every write is refused as a missing writer.
+    Vault,
+}
+
+impl ConfigRefusal {
+    /// The refusal of the agh.toml written `file` (`agh.toml`, or its shown path).
+    pub(crate) fn detail(&self, file: &str) -> String {
+        match self {
+            ConfigRefusal::Missing => format!("{file} is missing"),
+            ConfigRefusal::Invalid(fault) => format!("{file} is invalid: {fault}"),
+            ConfigRefusal::Vault => format!(
+                "{file} says vault = true, and vault adoption is not composed for atpkg-publish: \
+                 {}",
+                crate::hosts_check::UNVAULT
+            ),
+        }
+    }
+}
+
+/// agh.toml under `dirs` as the lanes read it: `config::load_for_host_faults`, its first
+/// fault taken as data, and a file that says `vault = true` refused.
+pub(crate) fn load_config(
+    dirs: &agh::config::Dirs,
+) -> Result<agh::config::Validated, ConfigRefusal> {
+    match agh::config::load_for_host_faults(dirs) {
+        Ok(Some(validated)) if validated.joins_vault() => Err(ConfigRefusal::Vault),
+        Ok(Some(validated)) => Ok(validated),
+        Ok(None) => Err(ConfigRefusal::Missing),
+        Err(refusal) => {
+            let fault = match refusal.first {
+                Some(first) => format!("{} {}", first.rule, first.what),
+                None => refusal.error.why.clone(),
+            };
+            Err(ConfigRefusal::Invalid(agh::redact::Redactor::shapes(
+                &fault,
+            )))
+        }
+    }
+}
+
 fn release_of(object: &ReleaseObject) -> Release {
     Release {
         tag: object.tag_name.clone(),
@@ -198,6 +464,12 @@ fn release_of(object: &ReleaseObject) -> Release {
         assets: object.assets.iter().map(|a| a.name.clone()).collect(),
     }
 }
+
+/// What every publish of atpkg-publish leaves: a prerelease, never `latest`.
+const PRERELEASE: PublishPatch = PublishPatch {
+    prerelease: true,
+    make_latest: MakeLatest::False,
+};
 
 impl ReleaseHost for AghHost {
     fn releases(&self, slug: &Slug) -> Result<Vec<Release>, HostError> {
@@ -214,7 +486,9 @@ impl ReleaseHost for AghHost {
 
     fn release(&self, slug: &Slug, tag: &str) -> Result<Release, HostError> {
         let s = self.own_or_refuse(slug)?;
-        Ok(release_of(&self.resolve(&s, tag, How::writer())?))
+        let seen = self.tag_objects(&s, tag, How::writer())?;
+        self.observe(&s, tag, &seen);
+        Ok(release_of(&self.pick(&s, tag, How::writer(), seen)?))
     }
 
     fn download(
@@ -265,29 +539,100 @@ impl ReleaseHost for AghHost {
     fn create(
         &self,
         slug: &Slug,
-        _tag: &str,
-        _title: &str,
-        _notes: &str,
-        _files: &[PathBuf],
+        tag: &str,
+        title: &str,
+        notes: &str,
+        files: &[PathBuf],
     ) -> Result<(), HostError> {
-        self.own_or_refuse(slug)?;
-        Err(HostError::Refused("agh writes arrive in M2".into()))
+        let (s, permit) = self.permit(slug)?;
+        let journal = self.github.journal(&s).map_err(|e| self.write_error(&e))?;
+        let files = self.open_files(files)?;
+        let req = DraftRequest {
+            tag_name: tag.to_string(),
+            target_commitish: None,
+            name: title.to_string(),
+            body: notes.to_string(),
+            prerelease: true,
+            make_latest: Some(MakeLatest::False),
+        };
+        let releases = self.github.releases(&s);
+        let release = match releases.create(&permit, &req, &journal) {
+            Ok(Outcome::Done(ensured)) => ensured.object,
+            Ok(Outcome::NeverSent(e)) => return Err(self.write_error(&e)),
+            // A rate limit settles as a refusal (nothing was created, so a rerun POSTs once
+            // more), but it is `Unreachable` as on every other write (design §10.3, F14).
+            Ok(Outcome::Refused(e)) if e.kind == Kind::RateLimited => {
+                return Err(HostError::Unreachable(self.redacted(&e.why)));
+            }
+            Ok(Outcome::Refused(e)) => return Err(HostError::Refused(self.redacted(&e.why))),
+            Ok(Outcome::Unknown { intent, .. }) => {
+                return Err(HostError::Unreachable(Self::outcome_unknown(&intent)));
+            }
+            Err(e) => return Err(self.write_error(&e)),
+        };
+        if !release.draft {
+            // The created-intent rule found the release this journal's draft was published
+            // as: an earlier run's publish landed and its answer was lost. Nothing is uploaded
+            // and no PATCH is sent: `ensure` runs its publish step here, whose guard converges
+            // without one on a release published with the same files as a prerelease, and
+            // refuses any other. So an immutable release converges, and one made a full
+            // release since is refused.
+            return self.converged_published(&s, tag, &release, &files);
+        }
+        for file in &files {
+            releases
+                .upload(&permit, &release, file, AghReplace::Never)
+                .map_err(|e| self.write_error(&e))?;
+        }
+        let expected: BTreeMap<String, agh::model::Sha256Digest> = files
+            .iter()
+            .map(|file| (file.name.clone(), file.sha256))
+            .collect();
+        releases
+            .publish(
+                &permit,
+                release.id,
+                &PublishGuard::expecting(expected),
+                &PRERELEASE,
+            )
+            .map_err(|e| self.write_error(&e))?;
+        Ok(())
     }
 
     fn upload(
         &self,
         slug: &Slug,
-        _tag: &str,
-        _files: &[PathBuf],
-        _replace: Replace,
+        tag: &str,
+        files: &[PathBuf],
+        replace: Replace,
     ) -> Result<(), HostError> {
-        self.own_or_refuse(slug)?;
-        Err(HostError::Refused("agh writes arrive in M2".into()))
+        let (s, permit) = self.permit(slug)?;
+        let release = self.resolve(&s, tag, How::writer())?;
+        let files = self.open_files(files)?;
+        let replace = match replace {
+            Replace::Never => AghReplace::Never,
+            Replace::Clobber => AghReplace::Clobber,
+        };
+        let releases = self.github.releases(&s);
+        if replace == AghReplace::Clobber {
+            self.drop_stale_temporaries(&releases, &permit, &release, &files)?;
+        }
+        for file in &files {
+            releases
+                .upload(&permit, &release, file, replace)
+                .map_err(|e| self.write_error(&e))?;
+        }
+        Ok(())
     }
 
-    fn publish_draft(&self, slug: &Slug, _tag: &str) -> Result<(), HostError> {
-        self.own_or_refuse(slug)?;
-        Err(HostError::Refused("agh writes arrive in M2".into()))
+    fn publish_draft(&self, slug: &Slug, tag: &str) -> Result<(), HostError> {
+        let (s, permit) = self.permit(slug)?;
+        let release = self.resolve(&s, tag, How::writer())?;
+        self.github
+            .releases(&s)
+            .publish(&permit, release.id, &PublishGuard::default(), &PRERELEASE)
+            .map_err(|e| self.write_error(&e))?;
+        Ok(())
     }
 
     fn probe_public(&self, slug: &Slug, tag: &str, asset: &str) -> Probe {
@@ -313,9 +658,27 @@ impl ReleaseHost for AghHost {
         answer
     }
 
-    fn clone_repo(&self, slug: &Slug, _dest: &Path) -> Result<(), HostError> {
-        self.own_or_refuse(slug)?;
-        Err(HostError::Refused("git through agh arrives in M2".into()))
+    fn clone_repo(&self, slug: &Slug, dest: &Path) -> Result<(), HostError> {
+        let s = self.own_or_refuse(slug)?;
+        let named = self.named(&s)?;
+        // A clone killed at its budget leaves a half-made `dest/.git`, which every later run
+        // would take for a clone and fetch into; so a `dest` this clone made goes with it.
+        let fresh = matches!(
+            std::fs::symlink_metadata(dest),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        );
+        let cloned = self.github.run_git(
+            &GitRun::new_clone(&s, dest)
+                .with_named(named)
+                .with_budget(LANE_GIT_BUDGET),
+        );
+        if let Err(e) = cloned {
+            if fresh {
+                let _ = std::fs::remove_dir_all(dest);
+            }
+            return Err(self.write_error(&e));
+        }
+        Ok(())
     }
 
     fn retry_pause(&self) -> Duration {
@@ -329,8 +692,194 @@ impl ReleaseHost for AghHost {
             .is_none_or(|profile| self.github.presence(profile) != Presence::Present)
     }
 
-    fn fetch_repo(&self, slug: &Slug, _dir: &Path) -> Result<(), HostError> {
-        self.own_or_refuse(slug)?;
-        Err(HostError::Refused("git through agh arrives in M2".into()))
+    /// `GET /repos/{o}/{r}` through the read chain, then anonymously: `Ok(false)` only when
+    /// both answer 404 (agh's `not_found` or `not_visible` for the repository itself), as
+    /// `RestHost` asks it, so the D50 arm stages a pack the public owner cannot be listed for.
+    fn repo_seen(&self, slug: &Slug) -> Result<bool, HostError> {
+        let s = self.own_or_refuse(slug)?;
+        let unseen = |e: &agh::Error| {
+            matches!(e.kind, Kind::NotFound | Kind::NotVisible)
+                && !matches!(e.sub, Sub::Moved { .. })
+        };
+        for how in [How::read(), How::read().anonymous(true)] {
+            match self.github.repos().how(how).get(&s) {
+                Ok(_) => return Ok(true),
+                Err(e) if unseen(&e) => {}
+                Err(e) => return Err(self.host_error(&e)),
+            }
+        }
+        Ok(false)
+    }
+
+    fn fetch_repo(&self, slug: &Slug, dir: &Path) -> Result<(), HostError> {
+        let s = self.own_or_refuse(slug)?;
+        let named = self.named(&s)?;
+        self.github
+            .run_git(
+                &GitRun::fetch(&s, dir)
+                    .with_named(named)
+                    .with_budget(LANE_GIT_BUDGET),
+            )
+            .map_err(|e| self.write_error(&e))?;
+        Ok(())
+    }
+
+    /// `GET /repos/{o}/{r}/git/ref/heads/main` for main's sha, then agh's isolated
+    /// `GitOp::FetchMain` of `+refs/heads/main:{into}` into `dir`, then `into` held to that sha
+    /// (`rev-parse --verify`), as `RestHost` does: on a mismatch `into` is deleted and the fetch
+    /// is `Unreachable`, so only the API names the main of record.
+    fn fetch_main(&self, slug: &Slug, dir: &Path, into: &str) -> Result<(), HostError> {
+        let s = self.own_or_refuse(slug)?;
+        let named = self.named(&s)?;
+        let main = self.github.refs(&s).get("refs/heads/main").map_err(|e| {
+            HostError::Unreachable(
+                self.redacted(&format!("read {s}'s main from the host API: {}", e.why)),
+            )
+        })?;
+        let expected = main.object.sha;
+        self.github
+            .run_git(
+                &GitRun::fetch_main(&s, dir, into)
+                    .with_named(named)
+                    .with_budget(LANE_GIT_BUDGET),
+            )
+            .map_err(|e| match self.write_error(&e) {
+                HostError::Unreachable(why) => {
+                    HostError::Unreachable(format!("fetch of {s}'s main: {why}"))
+                }
+                other => other,
+            })?;
+        let fetched = crate::git::run(dir, &["rev-parse", "--verify", into]);
+        let checked = match fetched {
+            Ok(actual) if actual.trim() == expected => return Ok(()),
+            Ok(actual) => format!(
+                "fetched {s}'s main ({}) differs from the host API ({expected}); main moved or \
+                 git transported another main",
+                actual.trim()
+            ),
+            Err(e) => format!("{into} cannot be read after the fetch: {e}"),
+        };
+        let dropped = crate::git::run(dir, &["update-ref", "-d", into]);
+        Err(HostError::Unreachable(self.redacted(&match dropped {
+            Ok(_) => format!("could not bind {s}'s main of record: {checked}"),
+            Err(drop) => format!(
+                "could not bind {s}'s main of record: {checked}; removing {into} failed: {drop}"
+            ),
+        })))
+    }
+
+    fn published_releases(&self, slug: &Slug) -> Result<Vec<Release>, HostError> {
+        let s = self.own_or_refuse(slug)?;
+        let listing = self
+            .github
+            .releases(&s)
+            .how(How::read())
+            .list(&ListOpts::CAS)
+            .and_then(agh::page::Listing::complete)
+            .map_err(|e| self.host_error(&e))?;
+        Ok(listing
+            .items
+            .iter()
+            .filter(|release| !release.draft)
+            .map(release_of)
+            .collect())
+    }
+
+    fn published_by_tag(&self, slug: &Slug, tag: &str) -> Result<Release, HostError> {
+        let s = self.own_or_refuse(slug)?;
+        let release = self
+            .github
+            .releases(&s)
+            .how(How::read())
+            .published_by_tag(tag)
+            .map_err(|e| self.host_error(&e))?;
+        if release.draft {
+            return Err(HostError::NotFound);
+        }
+        Ok(release_of(&release))
+    }
+
+    fn write_preflight(&self, slug: &Slug) -> Result<(), HostError> {
+        let (s, permit) = self.permit(slug)?;
+        // The write journal is the first local thing `create` needs: a state directory
+        // `Journal::open` refuses is named here, before a build, not at the create after it.
+        // It sends nothing; it makes or checks `<state>/journal/<owner>`.
+        self.github.journal(&s).map_err(|e| self.write_error(&e))?;
+        let (_, permissions) = self
+            .github
+            .repos()
+            .permissions(&s, Access::WriterRead)
+            .map_err(|e| self.write_error(&e))?;
+        if permissions.push {
+            return Ok(());
+        }
+        let writer = self
+            .github
+            .router()
+            .profile(permit.profile())
+            .and_then(|profile| profile.login.clone())
+            .unwrap_or_else(|| permit.profile().to_string());
+        Err(HostError::Refused(
+            self.redacted(&format!("{writer} has no push on {s}")),
+        ))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::AghHost;
+
+    fn home() -> agh::Slug {
+        agh::Slug::new("fixture-dev", "packs").expect("the home slug")
+    }
+
+    /// `dirs` under a fresh scratch root, with `text` as its agh.toml when one is given.
+    fn production(text: Option<&str>) -> Result<AghHost, String> {
+        let root = aterm_tempfile::Builder::new()
+            .prefix("atpkg-publish-agh-production-")
+            .tempdir()
+            .expect("scratch dir");
+        let dirs = agh::config::Dirs::under(root.path());
+        if let Some(text) = text {
+            std::fs::create_dir_all(dirs.config.parent().expect("a parent"))
+                .expect("the config parent");
+            aterm_uds::private_file::create_private_dir(&dirs.config)
+                .expect("the config directory");
+            aterm_uds::private_file::write_private(&dirs.config, "agh.toml", text.as_bytes())
+                .expect("agh.toml");
+        }
+        AghHost::production(&dirs, home())
+    }
+
+    fn refusal(text: Option<&str>) -> String {
+        match production(text) {
+            Ok(_) => panic!("{text:?} built a host"),
+            Err(why) => why,
+        }
+    }
+
+    #[test]
+    fn production_refuses_a_missing_an_invalid_and_a_vault_agh_toml_apart() {
+        let missing = refusal(None);
+        assert!(missing.contains("agh.toml"), "{missing}");
+        let invalid = refusal(Some("[profiles.x]\ntier = \"dev\"\nbogus = true\n"));
+        assert!(invalid.contains("L1 "), "{invalid}");
+        assert!(invalid.contains("bogus"), "{invalid}");
+        assert!(!invalid.contains("rule(s)"), "{invalid}");
+        let vault = refusal(Some("vault = true\n"));
+        assert!(vault.contains("vault = true"), "{vault}");
+        assert_ne!(missing, vault);
+        assert_ne!(missing, invalid);
+        assert!(!invalid.contains("vault"), "{invalid}");
+    }
+
+    #[test]
+    fn production_builds_over_a_file_that_names_its_writers() {
+        let text = "[profiles.dev]\ntoken_file = \"/nonexistent/dev.token\"\ntier = \"dev\"\n\
+                    login = \"fixture-dev-bot\"\n\n[[owners]]\nname = \"fixture-dev\"\n\
+                    tier = \"dev\"\nread = [\"dev\"]\nwrite = \"dev\"\n";
+        if let Err(why) = production(Some(text)) {
+            panic!("{why}");
+        }
     }
 }

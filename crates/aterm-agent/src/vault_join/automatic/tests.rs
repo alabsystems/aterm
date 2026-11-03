@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 const HANG: Duration = Duration::from_secs(60);
+
+mod recovery;
+mod recovery_invalidation;
+mod request_policy;
 const TRUST: Trust = Trust {
     network: [1; 16],
     authority: [2; 32],
@@ -52,16 +56,16 @@ struct Place {
 struct Fake {
     root: std::path::PathBuf,
     advance: Mutex<Duration>,
+    frozen: Mutex<Option<Instant>>,
     place: Mutex<Option<Place>>,
     read_gate: Mutex<Option<Gate>>,
-    post_gate: Mutex<Option<Gate>>,
+    refusal_gate: Mutex<Option<Gate>>,
     fail_read: AtomicBool,
-    fail_post: AtomicBool,
-    posts: Sender<String>,
     waiting: Sender<Instant>,
-    posted: AtomicUsize,
     reads: AtomicUsize,
-    post_reads: Mutex<Vec<usize>>,
+    /// Each proof this member decided, by whether it came from its home ALab LAN.
+    proved: Mutex<Vec<bool>>,
+    refusals: AtomicUsize,
 }
 
 fn device(root: &std::path::Path, name: &str) -> Device {
@@ -94,34 +98,22 @@ impl Backend for Fake {
         }))
     }
 
-    fn forward(
-        &self,
-        desk: &Mutex<Desk>,
-        now: Instant,
-        current: &dyn Fn() -> bool,
-    ) -> Result<usize> {
-        desk::forward_automatic_with(desk, now, |request| {
-            if !current() {
-                return Ok(());
-            }
-            self.posted.fetch_add(1, Ordering::SeqCst);
-            self.post_reads
-                .lock_or_recover()
-                .push(self.reads.load(Ordering::SeqCst));
-            self.posts.send(request.host.clone()).unwrap();
-            if let Some(gate) = self.post_gate.lock_or_recover().take() {
-                gate.wait();
-            }
-            if self.fail_post.swap(false, Ordering::SeqCst) {
-                Err(Error::new("vault unreachable"))
-            } else {
-                Ok(())
-            }
-        })
+    fn now(&self) -> Instant {
+        let frozen = *self.frozen.lock_or_recover();
+        frozen.unwrap_or_else(Instant::now) + *self.advance.lock_or_recover()
     }
 
-    fn now(&self) -> Instant {
-        Instant::now() + *self.advance.lock_or_recover()
+    fn prove(&self, proving: &desk::Proving<'_>, _peer: IpAddr) -> Result<SecretBytes> {
+        self.proved.lock_or_recover().push(proving.lan);
+        Err(Error::new("decided by the test's member"))
+    }
+
+    fn refuses(&self, _proving: &desk::Proving<'_>, _peer: IpAddr) -> Option<String> {
+        self.refusals.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = self.refusal_gate.lock_or_recover().take() {
+            gate.wait();
+        }
+        None
     }
 
     fn waiting(&self, until: Instant) {
@@ -132,7 +124,6 @@ impl Backend for Fake {
 struct Fixture {
     service: Option<AutomaticJoins>,
     fake: Arc<Fake>,
-    posts: Receiver<String>,
     waits: Receiver<Instant>,
     _root: aterm_tempfile::TempDir,
 }
@@ -140,29 +131,26 @@ struct Fixture {
 impl Fixture {
     fn new(place: Option<Place>) -> Self {
         let root = aterm_tempfile::tempdir().unwrap();
-        let (posts, posted) = mpsc::channel();
         let (waiting, waits) = mpsc::channel();
         let fake = Arc::new(Fake {
             root: root.path().to_owned(),
             advance: Mutex::new(Duration::ZERO),
+            frozen: Mutex::new(None),
             place: Mutex::new(place),
             read_gate: Mutex::new(None),
-            post_gate: Mutex::new(None),
+            refusal_gate: Mutex::new(None),
             fail_read: AtomicBool::new(false),
-            fail_post: AtomicBool::new(false),
-            posts,
             waiting,
-            posted: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
-            post_reads: Mutex::new(Vec::new()),
+            proved: Mutex::new(Vec::new()),
+            refusals: AtomicUsize::new(0),
         });
         let service = AutomaticJoins::with_backend(fake.clone()).unwrap();
-        // This observes completion of the initial read and empty post, without a sleep.
+        // This observes completion of the initial read, without a sleep.
         waits.recv_timeout(HANG).unwrap();
         Self {
             service: Some(service),
             fake,
-            posts: posted,
             waits,
             _root: root,
         }
@@ -197,7 +185,11 @@ impl Fixture {
     }
 
     fn ask(&self, name: &str, wrong_member: bool) {
-        let (mut stream, ended, worker) = self.connection();
+        self.ask_from(name, wrong_member, "192.168.1.40", !wrong_member);
+    }
+
+    fn ask_from(&self, name: &str, wrong_member: bool, peer: &str, accepted: bool) {
+        let (mut stream, ended, worker) = self.connection_from(peer);
         let mut greeting = joiner::greeting(&mut stream).unwrap();
         if wrong_member {
             greeting.key[0] ^= 1;
@@ -211,25 +203,30 @@ impl Fixture {
         };
         assert_eq!(
             joiner::ask(&mut stream, &greeting, &joining).is_ok(),
-            !wrong_member
+            accepted
         );
         assert_eq!(
             ended.recv_timeout(HANG).expect("ask handler finished"),
-            !wrong_member
+            accepted
         );
         worker.join().unwrap();
     }
 
     fn connection(&self) -> (TcpStream, Receiver<bool>, JoinHandle<()>) {
+        self.connection_from("192.168.1.40")
+    }
+
+    fn connection_from(&self, peer: &str) -> (TcpStream, Receiver<bool>, JoinHandle<()>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = self.handle();
+        let peer = peer.parse().unwrap();
         let (ended, end) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream.set_read_timeout(Some(HANG)).unwrap();
             stream.set_write_timeout(Some(HANG)).unwrap();
-            let result = handle.serve(&mut stream, "192.168.1.40".parse().unwrap());
+            let result = handle.serve(&mut stream, peer);
             ended.send(result.is_ok()).unwrap();
         });
         let stream = TcpStream::connect_timeout(&addr, HANG).unwrap();
@@ -247,114 +244,212 @@ fn refused(handle: &AutomaticJoinHandle, peer: &str) {
     assert!(!reply.contains("ALAB member=1"), "{reply}");
 }
 
-/// Both connection threads finish while the sole submission worker is deliberately blocked.
-/// No latency budget is involved: the vault cannot progress until this test releases it.
+/// A Mac on this member's home ALab LAN that proves itself on the node's anonymous channel reaches
+/// the member's decision marked `lan`, with no window open: a windowless member lets new Macs in
+/// as a window's desk does (`aterm_secrets::client::readmit`).
+///
+/// NEGATIVE CONTROL: `AutomaticJoinHandle::serve` back on `desk::serve` (no `Proof`): the desk
+/// refuses the `prove` line, no decision runs, and the assert fails.
 #[test]
-fn a_slow_vault_does_not_hold_an_ask_connection_or_spawn_another_worker() {
+fn a_windowless_member_decides_a_proof_from_its_home_lan() {
     let f = Fixture::home();
-    let (gate, entered, release) = Gate::pair();
-    *f.fake.post_gate.lock_or_recover() = Some(gate);
-    f.ask("first", false);
-    entered.recv_timeout(HANG).unwrap();
-    f.ask("second", false);
-    assert_eq!(f.fake.posted.load(Ordering::SeqCst), 1);
-    release.send(()).unwrap();
-    assert_eq!(f.posts.recv_timeout(HANG).unwrap(), "first");
-    assert_eq!(f.posts.recv_timeout(HANG).unwrap(), "second");
+    let (mut stream, ended, worker) = f.connection();
+    let greeting = joiner::greeting(&mut stream).unwrap();
+    attempt_proof(stream, greeting, &f.fake.root);
+    ended
+        .recv_timeout(HANG)
+        .expect("the proof's handler finished");
+    worker.join().unwrap();
+    assert_eq!(*f.fake.proved.lock_or_recover(), vec![true]);
 }
 
-#[test]
-fn each_waiting_machine_gets_a_fresh_policy_read_before_its_submission() {
-    let f = Fixture::home();
-    let (gate, entered, release) = Gate::pair();
-    *f.fake.read_gate.lock_or_recover() = Some(gate);
-    f.ask("first", false);
-    entered.recv_timeout(HANG).unwrap();
-    // Both asks are already queued when the worker's policy read finishes.
-    f.ask("second", false);
-    release.send(()).unwrap();
-    assert_eq!(f.posts.recv_timeout(HANG).unwrap(), "first");
-    assert_eq!(f.posts.recv_timeout(HANG).unwrap(), "second");
-    let reads = f.fake.post_reads.lock_or_recover();
-    assert_eq!(reads.len(), 2);
-    assert!(
-        reads[1] > reads[0],
-        "one policy read covered both posts: {reads:?}"
-    );
+fn attempt_proof(mut stream: TcpStream, greeting: joiner::Greeting, root: &std::path::Path) {
+    use ring::signature::KeyPair as _;
+    let device = device(root, "newcomer");
+    let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[0x44; 32]).unwrap();
+    let node: [u8; 32] = pair.public_key().as_ref().try_into().unwrap();
+    let joining = Joining {
+        device: &device,
+        node,
+        name: "newcomer".to_owned(),
+        model: "Mac".to_owned(),
+    };
+    let prefix = format!("aterm-fleet/v3 record {}\0", desk::PROVE_RECORD);
+    let sign_node = |message: &[u8]| -> [u8; 64] {
+        pair.sign(&[prefix.as_bytes(), message].concat())
+            .as_ref()
+            .try_into()
+            .unwrap()
+    };
+    let refused = joiner::prove(&mut stream, &greeting, &joining, &sign_node, &mut false);
+    assert!(refused.is_err(), "this backend never admits a proof");
 }
 
-#[test]
-fn a_failed_post_retries_at_its_deadline_without_another_ask() {
-    let f = Fixture::home();
-    f.fake.fail_post.store(true, Ordering::SeqCst);
-    f.ask("retry", false);
-    assert_eq!(f.posts.recv_timeout(HANG).unwrap(), "retry");
-    f.waits.recv_timeout(HANG).unwrap();
-    assert_eq!(f.fake.posted.load(Ordering::SeqCst), 1);
-    *f.fake.advance.lock_or_recover() += Duration::from_secs(30);
-    // Wake the condvar as if its timer expired; no ask or refresh revision changes.
-    f.handle().shared.changed.notify_all();
-    assert_eq!(f.posts.recv_timeout(HANG).unwrap(), "retry");
-    assert_eq!(f.fake.posted.load(Ordering::SeqCst), 2);
+#[derive(Clone, Copy, Debug)]
+enum PolicyChange {
+    Refreshed,
+    Moved,
+    Unavailable,
+    Expired,
+    Stopped,
+    PeriodicMove,
+    PeriodicHomeLoss,
 }
 
-#[test]
-fn a_failed_membership_read_retries_only_requests_that_are_still_live() {
-    for (elapsed, retry) in [(REFRESH_EVERY, true), (desk::STILL_ASKING, false)] {
-        let f = Fixture::home();
-        f.fake.fail_post.store(true, Ordering::SeqCst);
-        f.ask("retry-after-read", false);
-        assert_eq!(f.posts.recv_timeout(HANG).unwrap(), "retry-after-read");
-        f.waits.recv_timeout(HANG).unwrap();
+const POLICY_CHANGES: [PolicyChange; 7] = [
+    PolicyChange::Refreshed,
+    PolicyChange::Moved,
+    PolicyChange::Unavailable,
+    PolicyChange::Expired,
+    PolicyChange::Stopped,
+    PolicyChange::PeriodicMove,
+    PolicyChange::PeriodicHomeLoss,
+];
 
-        let desk = f.ready_on("home-a");
-        f.fake.fail_read.store(true, Ordering::SeqCst);
-        f.handle().refresh();
-        f.waits.recv_timeout(HANG).unwrap();
-        refused(&f.handle(), "192.168.1.40");
-        assert_eq!(desk.lock_or_recover().rows(f.fake.now()).len(), 1);
-        assert_eq!(f.fake.posted.load(Ordering::SeqCst), 1);
-
-        *f.fake.advance.lock_or_recover() += elapsed;
-        f.handle().shared.changed.notify_all();
-        f.waits.recv_timeout(HANG).unwrap();
-        assert!(Arc::ptr_eq(&desk, &f.ready_on("home-a")));
-        if retry {
-            assert_eq!(f.posts.recv_timeout(HANG).unwrap(), "retry-after-read");
-            assert_eq!(f.fake.posted.load(Ordering::SeqCst), 2);
-        } else {
-            assert!(f.posts.try_recv().is_err(), "expired request was posted");
-            assert_eq!(f.fake.posted.load(Ordering::SeqCst), 1);
-            let desk = desk.lock_or_recover();
-            assert!(desk.rows(f.fake.now()).is_empty());
-            assert!(desk.next_automatic_request(f.fake.now()).is_none());
+impl PolicyChange {
+    fn apply(self, f: &mut Fixture) {
+        match self {
+            Self::Refreshed => {
+                f.handle().refresh();
+                f.ready_on("home-a");
+            }
+            Self::Moved => {
+                *f.fake.place.lock_or_recover() = Some(Place {
+                    network: "home-b",
+                    home: true,
+                });
+                f.handle().refresh();
+                f.ready_on("home-b");
+            }
+            Self::Unavailable => {
+                f.fake.fail_read.store(true, Ordering::SeqCst);
+                f.handle().refresh();
+                f.waits.recv_timeout(HANG).unwrap();
+            }
+            Self::Expired => *f.fake.advance.lock_or_recover() += REFRESH_EVERY,
+            Self::Stopped => drop(f.service.take()),
+            Self::PeriodicMove | Self::PeriodicHomeLoss => {
+                *f.fake.place.lock_or_recover() = Some(Place {
+                    network: if matches!(self, Self::PeriodicMove) {
+                        "home-b"
+                    } else {
+                        "home-a"
+                    },
+                    home: matches!(self, Self::PeriodicMove),
+                });
+                *f.fake.advance.lock_or_recover() += REFRESH_EVERY;
+                f.handle().shared.changed.notify_all();
+                f.waits.recv_timeout(HANG).unwrap();
+            }
         }
     }
 }
 
+/// The greeting does not reserve policy: even a freshly republished desk cannot revive a
+/// connection whose generation was invalidated. Periodic reads can replace its desk or policy
+/// without a watcher notification, and an expired snapshot cannot authorize a proof either.
 #[test]
-fn a_wrong_signature_and_a_peer_outside_home_never_reach_the_queue() {
-    let f = Fixture::home();
-    f.ask("forged", true);
-    refused(&f.handle(), "172.20.10.40");
-    let desk = f.ready_on("home-a");
-    assert!(desk.lock_or_recover().rows(f.fake.now()).is_empty());
-    assert_eq!(f.fake.posted.load(Ordering::SeqCst), 0);
+fn an_invalidated_proof_does_not_start_the_vault_preflight() {
+    for change in POLICY_CHANGES {
+        let mut f = Fixture::home();
+        let now = f.fake.now();
+        *f.fake.frozen.lock_or_recover() = Some(now);
+        let (mut stream, ended, worker) = f.connection();
+        let greeting = joiner::greeting(&mut stream).unwrap();
+        change.apply(&mut f);
+        attempt_proof(stream, greeting, &f.fake.root);
+        assert!(!ended.recv_timeout(HANG).unwrap());
+        worker.join().unwrap();
+        assert_eq!(f.fake.refusals.load(Ordering::SeqCst), 0, "{change:?}");
+        assert!(f.fake.proved.lock_or_recover().is_empty(), "{change:?}");
+    }
+}
+
+/// The preflight starts on valid policy. Hold it until that policy is invalidated, then let
+/// the real client complete possession: the stale connection must never enter the signer.
+#[test]
+fn an_invalidated_proof_does_not_reach_the_admission_decision() {
+    for change in POLICY_CHANGES {
+        let mut f = Fixture::home();
+        let now = f.fake.now();
+        *f.fake.frozen.lock_or_recover() = Some(now);
+        let (gate, entered, release) = Gate::pair();
+        *f.fake.refusal_gate.lock_or_recover() = Some(gate);
+        let (mut stream, ended, worker) = f.connection();
+        let greeting = joiner::greeting(&mut stream).unwrap();
+        let root = f.fake.root.clone();
+        let client = std::thread::spawn(move || attempt_proof(stream, greeting, &root));
+        entered.recv_timeout(HANG).unwrap();
+        change.apply(&mut f);
+        release.send(()).unwrap();
+        client.join().unwrap();
+        assert!(!ended.recv_timeout(HANG).unwrap());
+        worker.join().unwrap();
+        assert_eq!(f.fake.refusals.load(Ordering::SeqCst), 1, "{change:?}");
+        assert!(f.fake.proved.lock_or_recover().is_empty(), "{change:?}");
+    }
 }
 
 #[test]
-fn an_unconfigured_or_nonhome_node_refuses_before_the_greeting() {
-    for place in [
-        None,
-        Some(Place {
-            network: "elsewhere",
-            home: false,
-        }),
-    ] {
-        let f = Fixture::new(place);
-        refused(&f.handle(), "192.168.1.40");
-        assert_eq!(f.fake.posted.load(Ordering::SeqCst), 0);
-    }
+fn a_wrong_signature_and_a_peer_outside_home_never_reach_the_desk() {
+    let f = Fixture::home();
+    f.ask("forged", true);
+    f.ask_from("away", false, "172.20.10.40", false);
+    let desk = f.ready_on("home-a");
+    assert!(desk.lock_or_recover().rows(f.fake.now()).is_empty());
+}
+
+#[test]
+fn an_unconfigured_node_refuses_before_the_greeting_and_a_nonhome_node_refuses_asks() {
+    let f = Fixture::new(None);
+    refused(&f.handle(), "192.168.1.40");
+    let f = Fixture::new(Some(Place {
+        network: "elsewhere",
+        home: false,
+    }));
+    f.ask_from("away", false, "192.168.1.40", false);
+    assert!(
+        f.ready_on("elsewhere")
+            .lock_or_recover()
+            .rows(f.fake.now())
+            .is_empty()
+    );
+}
+
+#[test]
+fn membership_arrival_and_policy_replacement_wake_without_a_network_move() {
+    let f = Fixture::new(None);
+    // The periodic refresh can never become due: only an input-change wake can make progress.
+    let now = f.fake.now();
+    *f.fake.frozen.lock_or_recover() = Some(now);
+    let handle = f.handle();
+    refused(&handle, "192.168.1.40");
+    *f.fake.place.lock_or_recover() = Some(Place {
+        network: "home-a",
+        home: true,
+    });
+    let keys = Arc::new(aterm_net::fleet_member::MemberKeys::default());
+    handle.observe_membership(Some(&keys));
+    f.ready_on("home-a");
+    f.waits.recv_timeout(HANG).unwrap();
+
+    // Ordinary watcher ticks reuse the cached allocation and must not invalidate admission.
+    let epoch = handle.shared.state.lock_or_recover().epoch;
+    handle.observe_membership(Some(&keys));
+    assert_eq!(handle.shared.state.lock_or_recover().epoch, epoch);
+
+    // LocalLog can re-evaluate changed vault inputs to the same keys. That still needs a read.
+    let replacement = Arc::new(aterm_net::fleet_member::MemberKeys::default());
+    let reads = f.fake.reads.load(Ordering::SeqCst);
+    handle.observe_membership(Some(&replacement));
+    f.ready_on("home-a");
+    assert!(f.fake.reads.load(Ordering::SeqCst) > reads);
+
+    *f.fake.place.lock_or_recover() = None;
+    handle.observe_membership(None);
+    refused(&handle, "192.168.1.40");
+    assert!(handle.shared.state.lock_or_recover().valid_until.is_none());
+    assert_eq!(*f.fake.advance.lock_or_recover(), Duration::ZERO);
 }
 
 #[test]
@@ -384,65 +479,18 @@ fn a_refresh_during_a_read_cannot_publish_its_stale_network() {
     );
     next_release.send(()).unwrap();
     f.ready_on("home-b");
-    assert_eq!(f.fake.posted.load(Ordering::SeqCst), 0);
 }
 
+/// Dropping the worker refuses new connections at once and joins the worker, which may be in a
+/// state read: the drop returns only once that read is let go.
 #[test]
-fn a_home_policy_change_during_a_post_prevents_the_waiting_request() {
-    let f = Fixture::home();
-    let (gate, entered, release) = Gate::pair();
-    *f.fake.post_gate.lock_or_recover() = Some(gate);
-    f.ask("first", false);
-    entered.recv_timeout(HANG).unwrap();
-    f.ask("waiting", false);
-    *f.fake.place.lock_or_recover() = Some(Place {
-        network: "home-a",
-        home: false,
-    });
-    f.handle().refresh();
-    release.send(()).unwrap();
-    f.waits.recv_timeout(HANG).unwrap();
-    refused(&f.handle(), "192.168.1.40");
-    assert_eq!(f.fake.posted.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn a_connection_that_read_the_old_network_cannot_queue_on_the_new_one() {
-    let f = Fixture::home();
-    let old = f.ready_on("home-a");
-    let (mut stream, ended, worker) = f.connection();
-    let greeting = joiner::greeting(&mut stream).unwrap();
-    *f.fake.place.lock_or_recover() = Some(Place {
-        network: "home-b",
-        home: true,
-    });
-    f.handle().refresh();
-    let new = f.ready_on("home-b");
-    assert!(!Arc::ptr_eq(&old, &new));
-    let device = device(&f.fake.root, "moved");
-    let joining = Joining {
-        device: &device,
-        node: [7; 32],
-        name: "moved".to_owned(),
-        model: "Mac".to_owned(),
-    };
-    joiner::ask(&mut stream, &greeting, &joining).unwrap();
-    assert!(ended.recv_timeout(HANG).unwrap());
-    worker.join().unwrap();
-    assert_eq!(old.lock_or_recover().rows(f.fake.now()).len(), 1);
-    assert!(new.lock_or_recover().rows(f.fake.now()).is_empty());
-    assert_eq!(f.fake.posted.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn stopping_refuses_new_connections_and_joins_the_in_flight_submission() {
+fn stopping_refuses_new_connections_and_joins_the_worker() {
     let mut f = Fixture::home();
     let handle = f.handle();
     let (gate, entered, release) = Gate::pair();
-    *f.fake.post_gate.lock_or_recover() = Some(gate);
-    f.ask("last", false);
+    *f.fake.read_gate.lock_or_recover() = Some(gate);
+    handle.refresh();
     entered.recv_timeout(HANG).unwrap();
-    f.ask("waiting", false);
     let service = f.service.take().unwrap();
     let (done, finished) = mpsc::channel();
     let stopping = std::thread::spawn(move || {
@@ -458,8 +506,11 @@ fn stopping_refuses_new_connections_and_joins_the_in_flight_submission() {
     }
     drop(state);
     refused(&handle, "192.168.1.40");
+    assert!(
+        finished.try_recv().is_err(),
+        "the drop returned before its worker's read ended"
+    );
     release.send(()).unwrap();
     finished.recv_timeout(HANG).expect("worker joined");
     stopping.join().unwrap();
-    assert_eq!(f.fake.posted.load(Ordering::SeqCst), 1);
 }

@@ -143,9 +143,11 @@ impl AccountsHost for Host {
         else {
             panic!("automatic sign-in must use the headless opener");
         };
+        // The opener links to the resolved executable (`opener_link` canonicalizes it), so a test
+        // binary reached through a symlinked target directory compares by its resolved path.
         assert_eq!(
             fs::read_link(opener).unwrap(),
-            std::env::current_exe().unwrap()
+            fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
         );
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(

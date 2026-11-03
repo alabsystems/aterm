@@ -444,11 +444,11 @@ fn a_pick_held_after_its_election_is_waited_for_and_elected_again_once_past() {
         owner_line(&e, round + 20 * 60_000)
     );
     assert!(
-        why_lines(&lease, &[], round)
+        why_lines(&lease, &[], &[], round)
             .iter()
             .any(|l| l.contains("back in the episode") && l.contains("@s-a")),
         "{:#?}",
-        why_lines(&lease, &[], round)
+        why_lines(&lease, &[], &[], round)
     );
     one.held.clear();
     one.seats = vec![seat("s-a", 30, false)];
@@ -523,11 +523,11 @@ fn the_record_of_held_sessions_goes_with_its_episode() {
     let e = lease.entry(KEY).expect("entry").clone();
     assert!(e.held.is_empty(), "{:?}", e.held);
     assert!(
-        !why_lines(&lease, &[], T0 + 3_600_000)
+        !why_lines(&lease, &[], &[], T0 + 3_600_000)
             .iter()
             .any(|l| l.contains("usage limit")),
         "{:#?}",
-        why_lines(&lease, &[], T0 + 3_600_000)
+        why_lines(&lease, &[], &[], T0 + 3_600_000)
     );
     // A day on the volume falls short again; host 1 opens with no seat of its own, before host 2
     // (whose session is long past its wall) looks.
@@ -599,10 +599,10 @@ fn a_round_whose_sessions_are_all_held_waits_and_elects_the_first_past() {
         owner_line(&e, at + 3_600_000)
     );
     assert!(
-        why_lines(&lease, &[], at).iter().any(|l| l
+        why_lines(&lease, &[], &[], at).iter().any(|l| l
             .contains("@s-a (host pid 1) at a usage limit, @s-c (host pid 2) at a usage limit")),
         "{:#?}",
-        why_lines(&lease, &[], at)
+        why_lines(&lease, &[], &[], at)
     );
     assert_eq!(
         Lease::decode(&lease.encode()),
@@ -2090,11 +2090,11 @@ fn another_hosts_look_leaves_an_ended_hosts_pick_owed_until_its_successor_adopts
         Said::Owed { .. }
     ));
     assert!(
-        why_lines(&lease, &[], ended)
+        why_lines(&lease, &[], &[], ended)
             .iter()
             .any(|l| l.contains("read ended")),
         "{:?}",
-        why_lines(&lease, &[], ended)
+        why_lines(&lease, &[], &[], ended)
     );
     let mut successor = At::short(&h3, vec![seat("s-a", 12, true)]);
     successor.dead = vec![1];
@@ -3466,11 +3466,8 @@ fn rows_say_each_decision_and_the_reader_explains_the_lease() {
     assert_eq!(v.get("sid").and_then(Value::as_str), Some("s-a"));
     assert_eq!(v.get("rule").and_then(Value::as_str), Some(RULE_DISK_FREE));
     let s = step_row(T0 / 1000, "s-a", KEY, "wait:busy", &h1);
-    let lines = why_lines(
-        &lease,
-        &[r.clone(), s, "{\"kind\":\"pass\"}".to_owned()],
-        T0,
-    );
+    let rows = [r.clone(), s, "{\"kind\":\"pass\"}".to_owned()];
+    let lines = why_lines(&lease, &rows, &rows, T0);
     let all = lines.join("\n");
     assert!(all.contains("owed @s-a (host pid 1)"), "{all}");
     assert!(all.contains("lines 0/2; picked @s-a; no line yet"), "{all}");
@@ -3485,7 +3482,7 @@ fn rows_say_each_decision_and_the_reader_explains_the_lease() {
     );
     assert_eq!(row_line(&r).map(|l| l.starts_with("2026-")), Some(true));
     assert!(
-        why_lines(&Lease::default(), &[], T0)
+        why_lines(&Lease::default(), &[], &[], T0)
             .join("\n")
             .contains("the lease is empty")
     );
@@ -3715,7 +3712,7 @@ fn a_round_that_waits_on_a_hold_or_a_draft_says_what_holds_it_and_what_ends_the_
             )
         );
         let text = said.describe();
-        let why = why_lines(&lease, &[], round).join("\n");
+        let why = why_lines(&lease, &[], &[], round).join("\n");
         assert!(text.contains(hold.at(false)), "{text}");
         assert!(
             why.contains(&format!("@s-a (host pid 1) {}", hold.at(false))),

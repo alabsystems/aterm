@@ -5,8 +5,10 @@
 //! QUIET-ADMIT). A windowed instance ([`crate::instance::Instance::start`]) and the Linux lane's
 //! GUI rows each hold a quiet claim in the per-user capacity ledger while they run: alone among
 //! quiet claims, admitted once the 1-minute load is low, saying once a minute what it waits for.
-//! That is admission, not a retry. `--admit now`, given to any verb, starts them at once; a
-//! starved run then shows as starved. The same flag is the run's for every claim it makes: the
+//! That is admission, not a retry. Requested Timing work also requires an actual sampled CPU
+//! interval; unavailable, forced and `--admit now` admission cannot qualify it and start no
+//! window. This is admission evidence, not continuous quiet or a postcompile performance
+//! qualification. The same flag is the run's for every claim it makes: the
 //! Linux and Windows lanes' boots take it for their disk claims ([`mode`]).
 
 use std::sync::OnceLock;
@@ -58,11 +60,11 @@ pub(crate) fn strip(args: &mut Vec<String>) -> Result<Admit, Fail> {
     Ok(mode)
 }
 
-/// A quiet claim for `what`, part of this run's verb, as [`take`] admits it. A ledger that cannot
-/// be used is said, and the work runs unadmitted (`None`).
+/// A measured Timing claim for `what`, part of this run's verb, as [`take`] admits it.
+/// An unavailable ledger or unqualified admission starts no work.
 /// # Errors
 /// NOT RUN when an interrupt ended the wait, or came before it ([`quiet_in`]).
-pub fn quiet(what: &str) -> Result<Option<Claim>, Fail> {
+pub fn quiet(what: &str) -> Result<Claim, Fail> {
     let (mode, verb) = RUN
         .get()
         .cloned()
@@ -79,8 +81,8 @@ pub fn quiet(what: &str) -> Result<Option<Claim>, Fail> {
 }
 
 /// [`quiet`]'s admission of `need` for `what` in `ledger` on `machine`, at `pace`, its wait
-/// lines said through `say`. No ledger, or one that cannot be used, is said, and the work runs
-/// unadmitted (`None`).
+/// lines said through `say`. Missing/failed ledger or unknown/forced admission is NOT RUN,
+/// before any work or window starts.
 /// # Errors
 /// NOT RUN, carrying the signal, when an interrupt ended the wait: `what` started nothing, and
 /// the interrupt is the run's ([`crate::stop::note`]), so it ends what it started its own way and
@@ -95,7 +97,7 @@ pub(crate) fn quiet_in(
     mode: Admit,
     pace: Pace,
     say: &mut dyn FnMut(&str),
-) -> Result<Option<Claim>, Fail> {
+) -> Result<Claim, Fail> {
     let stopped = |e: &dyn std::fmt::Display, signal: Option<i32>| Fail {
         stopped: signal
             .inspect(|sig| crate::stop::note(*sig))
@@ -108,18 +110,22 @@ pub(crate) fn quiet_in(
         return Err(stopped(&"not asked for: the run was interrupted", None));
     }
     let Some(ledger) = ledger else {
-        eprintln!("aterm-lab: no home to keep the capacity ledger under; {what} runs unadmitted");
-        return Ok(None);
+        return Err(stopped(
+            &"unavailable: no home to keep the capacity ledger under",
+            None,
+        ));
     };
     match aterm_capacity::admit_until(ledger, machine, need, mode, pace, say, &|| {
         crate::stop::check().is_err()
     }) {
-        Ok(claim) => Ok(Some(claim)),
-        Err(e @ aterm_capacity::Error::Stopped { signal, .. }) => Err(stopped(&e, signal)),
-        Err(e) => {
-            eprintln!("aterm-lab: {e}; {what} runs unadmitted");
-            Ok(None)
+        Ok(claim) => {
+            claim
+                .timing_admission()
+                .map_err(|why| stopped(&why, None))?;
+            Ok(claim)
         }
+        Err(e @ aterm_capacity::Error::Stopped { signal, .. }) => Err(stopped(&e, signal)),
+        Err(e) => Err(stopped(&e, None)),
     }
 }
 
@@ -139,13 +145,84 @@ mod tests {
 
     /// The machine both sides read: idle, so only the quiet claim the test holds keeps the
     /// stand-in waiting.
-    fn machine() -> Fixed {
-        Fixed::new(Reading::of_gib(48, 40, 14))
+    struct Measured {
+        fixed: Fixed,
+        origin: Instant,
+        points: std::cell::Cell<u64>,
+    }
+    impl Machine for Measured {
+        fn read(&self, path: Option<&std::path::Path>) -> Reading {
+            self.fixed.read(path)
+        }
+        fn procs(&self) -> Option<aterm_capacity::Procs> {
+            self.fixed.procs()
+        }
+        fn cpu_point(&self) -> Option<aterm_capacity::CpuPoint> {
+            let n = self.points.get() + 1;
+            self.points.set(n);
+            Some(aterm_capacity::CpuPoint {
+                at: self.origin + std::time::Duration::from_secs(n),
+                unix_ms: aterm_time::unix_millis()?,
+                ticks: vec![aterm_sysprobe::CoreTicks {
+                    user: n,
+                    idle: n * 99,
+                    ..Default::default()
+                }],
+            })
+        }
+    }
+    fn machine() -> Measured {
+        Measured {
+            fixed: Fixed::new(Reading::of_gib(48, 40, 14)),
+            origin: Instant::now(),
+            points: std::cell::Cell::new(0),
+        }
+    }
+
+    #[test]
+    fn requested_timing_refuses_unknown_now_and_missing_ledger_before_work() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(scratch.path().join("ledger"));
+        let fixed = Fixed::new(Reading::of_gib(48, 40, 14));
+        for (ledger, mode) in [
+            (Some(&ledger), Admit::Wait),
+            (Some(&ledger), Admit::Now),
+            (None, Admit::Wait),
+        ] {
+            let refused = quiet_in(
+                ledger,
+                &fixed,
+                Need::timing("refusal control"),
+                "refusal control",
+                mode,
+                Pace::default(),
+                &mut |_| {},
+            )
+            .unwrap_err();
+            assert_eq!(refused.code, 3);
+            assert!(refused.msg.unwrap().contains("started nothing"));
+        }
+        let claim = quiet_in(
+            Some(&ledger),
+            &machine(),
+            Need::timing("positive measured fixture"),
+            "positive measured fixture",
+            Admit::Wait,
+            Pace {
+                poll: std::time::Duration::ZERO,
+                ..Pace::default()
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(claim.timing_admission().is_ok());
+        // The positive fixture remains explicit; Fixed itself still supplies no CPU proof.
+        assert!(fixed.cpu_point().is_none());
     }
 
     /// The stand-in's quiet claim for the x86_64 GUI rows, looking every two minutes (twice the
     /// parent's hang detector, so only an interrupt ends the wait in time).
-    fn gui_rows(dir: &std::path::Path, say: &mut dyn FnMut(&str)) -> Result<Option<Claim>, Fail> {
+    fn gui_rows(dir: &std::path::Path, say: &mut dyn FnMut(&str)) -> Result<Claim, Fail> {
         quiet_in(
             Some(&Ledger::at(dir.join("ledger"))),
             &machine(),

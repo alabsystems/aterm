@@ -109,7 +109,7 @@ fn platform_uuid() -> Option<String> {
             .map(str::to_string);
     }
     for p in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
-        if let Ok(s) = std::fs::read_to_string(p) {
+        if let Ok(s) = crate::read_regular_text(p) {
             let t = s.trim().to_string();
             if !t.is_empty() {
                 return Some(t);
@@ -143,12 +143,14 @@ fn machine_shape() -> String {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|s| !s.is_empty())
     } else {
-        std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("model name"))
-                .and_then(|l| l.split_once(':'))
-                .map(|(_, v)| v.trim().to_string())
-        })
+        crate::read_regular_text("/proc/cpuinfo")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("model name"))
+                    .and_then(|l| l.split_once(':'))
+                    .map(|(_, v)| v.trim().to_string())
+            })
     };
     let chip = chip.unwrap_or_else(|| std::env::consts::ARCH.to_string());
     let cores = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
@@ -256,7 +258,7 @@ pub(crate) fn default_box_key(identities: &[String]) -> String {
 
 /// This machine, resolved against the committed alias table.
 pub(crate) fn machine_id() -> MachineId {
-    let aliases = std::fs::read_to_string(boxes_path()).unwrap_or_default();
+    let aliases = crate::read_regular_text(boxes_path()).unwrap_or_default();
     let mut identities = Vec::new();
     if let Some(fp) = platform_fingerprint() {
         identities.push(format!("fp:{fp}"));
@@ -676,8 +678,8 @@ pub(crate) fn gate_trend(
 ) -> LaneRun {
     let path = trend_path();
     let me = machine_id();
-    let aliases = std::fs::read_to_string(boxes_path()).unwrap_or_default();
-    let ledger = std::fs::read_to_string(&path).unwrap_or_default();
+    let aliases = crate::read_regular_text(boxes_path()).unwrap_or_default();
+    let ledger = crate::read_regular_text(&path).unwrap_or_default();
     let judgment = judge_trend(&ledger, &aliases, &me, samples);
     let append = may_append(lanes_ok, &judgment, recorded);
     let TrendJudgment {

@@ -170,6 +170,8 @@ pub enum When {
     Linux,
     /// Only to re-record a golden (`--record`).
     Record,
+    /// Only to prepare a release host (`--release`).
+    Release,
 }
 
 impl When {
@@ -180,6 +182,7 @@ impl When {
             Self::Always => None,
             Self::Linux => Some("--linux"),
             Self::Record => Some("--record"),
+            Self::Release => Some("--release"),
         }
     }
 
@@ -776,8 +779,11 @@ pub fn sh_held_any(fds: &[std::os::fd::RawFd]) -> String {
         .collect();
     if !high.is_empty() {
         let numbers = high.iter().map(ToString::to_string).collect::<Vec<_>>();
+        // Reserve a free low number for the directory walk. Without this,
+        // its own handle can impersonate a missing high descriptor in a dense
+        // table. The subshell leaves the caller's descriptor 3 untouched.
         held.push(format!(
-            "{{ h=; for f in /dev/fd/*; do case ${{f#/dev/fd/}} in {}) h=1;; esac; done; [ -n \"$h\" ]; }}",
+            "( exec 3<&-; h=; for f in /dev/fd/*; do case ${{f#/dev/fd/}} in {}) h=1;; esac; done; [ -n \"$h\" ] )",
             numbers.join("|")
         ));
     }

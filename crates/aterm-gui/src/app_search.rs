@@ -774,7 +774,8 @@ impl App {
                     crate::native_app::AppKind::Markdown
                     | crate::native_app::AppKind::About
                     | crate::native_app::AppKind::SystemState
-                    | crate::native_app::AppKind::Recovery => None,
+                    | crate::native_app::AppKind::Recovery
+                    | crate::native_app::AppKind::Workers => None,
                 });
             if let Some(action) = action {
                 let _ = self.dispatch_native_event(

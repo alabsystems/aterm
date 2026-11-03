@@ -516,10 +516,7 @@ pub(crate) fn no_profile(name: &str, next: &str) -> crate::error::Error {
 /// 12 lowercase hex characters: a fingerprint (`identity::fingerprint`).
 #[inline]
 pub(crate) fn is_fingerprint(text: &str) -> bool {
-    text.len() == 12
-        && text
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    aterm_codec::hex::is_lower(text, 12)
 }
 
 /// Whether `owner` is on the release floor, ASCII case-insensitively.
@@ -1194,7 +1191,7 @@ pub fn expand(path: &str, home: &Path) -> Option<PathBuf> {
 pub fn load(dirs: &Dirs) -> Result<Option<Validated>> {
     #[cfg(unix)]
     {
-        load_private(dirs, false)
+        load_private(dirs, false).map_err(|refusal| refusal.error)
     }
     #[cfg(not(unix))]
     {
@@ -1211,6 +1208,29 @@ pub fn load(dirs: &Dirs) -> Result<Option<Validated>> {
 ///
 /// As [`load`].
 pub fn load_for_host(dirs: &Dirs) -> Result<Option<Validated>> {
+    load_for_host_faults(dirs).map_err(|refusal| refusal.error)
+}
+
+/// agh.toml refused for AghHost (`load_for_host_faults`): the error [`load_for_host`] returns,
+/// and the first fault it lists, as data, so a caller writes `{rule} {what}` whole whatever
+/// `what` holds. `first` is `None` for a refusal of the file itself (its mode, its owner, its
+/// bytes), which names no rule.
+#[derive(Clone, Debug)]
+pub struct HostConfigRefusal {
+    /// The refusal.
+    pub error: crate::error::Error,
+    /// The first fault it lists.
+    pub first: Option<ConfigFault>,
+}
+
+/// [`load_for_host`], its refusal carrying the first fault as data.
+///
+/// # Errors
+///
+/// As [`load`], with the first fault beside the error.
+pub fn load_for_host_faults(
+    dirs: &Dirs,
+) -> std::result::Result<Option<Validated>, HostConfigRefusal> {
     #[cfg(unix)]
     {
         load_private(dirs, true)
@@ -1302,6 +1322,7 @@ fn make_private_level(dir: &Path) -> std::io::Result<()> {
 /// and when that `repos` holds an entry that is not a string (which the edit would otherwise
 /// drop). Refused, with nothing edited, when an inline row with no `repos` would gain one, or
 /// when the edited text does not read back as that one edit (a layout the edit cannot follow).
+#[cfg(unix)]
 pub(crate) fn edit_writers(text: &str, caller: &str, repo: &Slug, add: bool) -> Result<String> {
     use crate::error::{Error, Kind};
     use aterm_toml::edit::{ArrayOfTables, DocumentMut, Item, Table, TableLike, Value};
@@ -1415,9 +1436,11 @@ pub(crate) fn edit_writers(text: &str, caller: &str, repo: &Slug, add: bool) -> 
 
 /// One `writers` row as `edit_writers` compares it: its `caller`, and its `repos` with each
 /// entry that is no string as `None` (`None` for a `repos` that is missing or no array).
+#[cfg(unix)]
 type WriterSummary = (Option<String>, Option<Vec<Option<String>>>);
 
 /// A document's `writers` rows, in either form; `None` when `writers` is neither.
+#[cfg(unix)]
 fn writer_rows(doc: &aterm_toml::edit::DocumentMut) -> Option<Vec<WriterSummary>> {
     use aterm_toml::edit::{Item, TableLike};
     let summary = |row: &dyn TableLike| -> WriterSummary {
@@ -1447,6 +1470,7 @@ fn writer_rows(doc: &aterm_toml::edit::DocumentMut) -> Option<Vec<WriterSummary>
 
 /// `rows` with `wanted` added to `caller`'s row (a new row when it has none), or removed from
 /// it (the row with its last entry): what `edit_writers`'s text must read back as.
+#[cfg(unix)]
 fn with_edit(
     mut rows: Vec<WriterSummary>,
     caller: &str,
@@ -1486,12 +1510,14 @@ fn with_edit(
 }
 
 /// A new row's `repos`: `[wanted]`.
+#[cfg(unix)]
 fn new_repos(wanted: &str) -> aterm_toml::edit::Value {
     use aterm_toml::edit::{Array, Value};
     Value::from(std::iter::once(wanted).collect::<Array>())
 }
 
 /// `text` with a first `[[writers]]` row for `caller` appended at its end, after a blank line.
+#[cfg(unix)]
 fn append_writers_row(text: &str, caller: &str, wanted: &str) -> String {
     use aterm_toml::edit::Value;
     let mut appended = text.to_string();
@@ -1513,6 +1539,7 @@ fn append_writers_row(text: &str, caller: &str, wanted: &str) -> String {
 /// lines an edit wrote follow the file's; `edited` as it is otherwise (a file of LF lines, of
 /// mixed lines, or of one line). Every bare LF of such an `edited` is one the edit wrote, since
 /// `original` holds none; the rows it writes hold no multi-line string.
+#[cfg(unix)]
 fn follow_crlf(original: &str, edited: String) -> String {
     let bytes = original.as_bytes();
     let mut ends = original.match_indices('\n').map(|(at, _)| at).peekable();
@@ -1534,6 +1561,7 @@ fn follow_crlf(original: &str, edited: String) -> String {
 }
 
 /// What `edit_repos` made of a row's `repos`.
+#[cfg(unix)]
 enum Repos {
     /// The edit changes nothing.
     Unchanged,
@@ -1546,6 +1574,7 @@ enum Repos {
 }
 
 /// The edit of one row's `repos` in `text`, which the row was parsed from.
+#[cfg(unix)]
 fn edit_repos(
     text: &str,
     row: &dyn aterm_toml::edit::TableLike,
@@ -1597,6 +1626,7 @@ fn edit_repos(
 
 /// The whitespace before the value that starts at `start`, when nothing else precedes it on
 /// its line; two spaces otherwise.
+#[cfg(unix)]
 fn indent_before(text: &str, start: usize) -> &str {
     let line = text[..start].rfind('\n').map_or(0, |at| at + 1);
     let lead = &text[line..start];
@@ -1608,6 +1638,7 @@ fn indent_before(text: &str, start: usize) -> &str {
 }
 
 /// Whether the trivia between an array's last value and its `]` holds the trailing comma.
+#[cfg(unix)]
 fn trivia_has_comma(trivia: &str) -> bool {
     let mut in_comment = false;
     for c in trivia.chars() {
@@ -1625,6 +1656,7 @@ fn trivia_has_comma(trivia: &str) -> bool {
 /// `text` with `entry` (one value's TOML) as the last element of `array`, which was parsed
 /// from `text` (see `edit_writers` for the layout). `None` when `array` carries no source
 /// spans.
+#[cfg(unix)]
 fn splice_push(text: &str, array: &aterm_toml::edit::Array, entry: &str) -> Option<String> {
     let span = array.span()?;
     let close = span.end.checked_sub(1)?;
@@ -1667,6 +1699,7 @@ fn splice_push(text: &str, array: &aterm_toml::edit::Array, entry: &str) -> Opti
 /// only value on that line, and otherwise the element and the comma beside it. `array` was
 /// parsed from `text`, or from a text that differs from it only after that element. `None`
 /// when `array` carries no source spans.
+#[cfg(unix)]
 fn splice_remove(text: &str, array: &aterm_toml::edit::Array, at: usize) -> Option<String> {
     let span = array.get(at)?.span()?;
     let blank = |b: u8| b == b' ' || b == b'\t';
@@ -1712,18 +1745,25 @@ fn splice_remove(text: &str, array: &aterm_toml::edit::Array, at: usize) -> Opti
 /// (`load_for_host`), each profile row's `legacy_loose` is copied onto its profile; without it
 /// (`load`), every profile's is false whatever the row says.
 #[cfg(unix)]
-fn load_private(dirs: &Dirs, honour_loose: bool) -> Result<Option<Validated>> {
+fn load_private(
+    dirs: &Dirs,
+    honour_loose: bool,
+) -> std::result::Result<Option<Validated>, HostConfigRefusal> {
+    let whole = |error| HostConfigRefusal { error, first: None };
     let text = match read_config_in(&dirs.config, CONFIG_FILE, &dirs.home, Some(&dirs.config)) {
         ConfigText::Missing => return Ok(None),
         ConfigText::Refused { error, remedy } => {
             let next = remedy.unwrap_or_else(|| POLICY_CHECK.to_string());
-            return Err(invalid(format!("agh.toml: {error}"), next));
+            return Err(whole(invalid(format!("agh.toml: {error}"), next)));
         }
         ConfigText::Io(error) => {
-            return Err(invalid(format!("agh.toml: {error}"), POLICY_CHECK));
+            return Err(whole(invalid(format!("agh.toml: {error}"), POLICY_CHECK)));
         }
         ConfigText::NotUtf8 => {
-            return Err(invalid("agh.toml is not UTF-8".to_string(), POLICY_CHECK));
+            return Err(whole(invalid(
+                "agh.toml is not UTF-8".to_string(),
+                POLICY_CHECK,
+            )));
         }
         ConfigText::Text(text) => text,
     };
@@ -1740,14 +1780,17 @@ fn load_private(dirs: &Dirs, honour_loose: bool) -> Result<Option<Validated>> {
             }
             Ok(Some(validated))
         }
-        Err(faults) => Err(invalid(
-            format!(
-                "agh.toml breaks {} rule(s): {}",
-                faults.len(),
-                ConfigFault::list(&faults)
+        Err(faults) => Err(HostConfigRefusal {
+            error: invalid(
+                format!(
+                    "agh.toml breaks {} rule(s): {}",
+                    faults.len(),
+                    ConfigFault::list(&faults)
+                ),
+                POLICY_CHECK,
             ),
-            POLICY_CHECK,
-        )),
+            first: faults.into_iter().next(),
+        }),
     }
 }
 

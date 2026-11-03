@@ -87,29 +87,44 @@ pub(crate) fn note_if_changed(layout: &Layout, before: &[Option<PathBuf>]) {
 
 fn publish(layout: &Layout, marker: &str) -> std::io::Result<()> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if crate::store::ToolName::new(marker).is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid activation marker name",
+        ));
+    }
+    if std::fs::symlink_metadata(&layout.prefix).is_ok_and(|m| !m.file_type().is_dir()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "prefix is not a real directory",
+        ));
+    }
     let dir = layout.prefix.join(NOTICE_DIR);
+    if std::fs::symlink_metadata(&dir).is_ok_and(|m| !m.file_type().is_dir()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "activation notice directory is not a real directory",
+        ));
+    }
     layout.ensure_dir(&dir)?;
-    let tmp = dir.join(format!(
-        "{marker}.tmp-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    let staged = file.write_all(b"1\n");
+    if !std::fs::symlink_metadata(&dir)?.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "activation notice directory is not a real directory",
+        ));
+    }
+    let dest = dir.join(marker);
+    let (tmp, mut file) = crate::platform::create_temp_beside(&dest, 0o600)?;
+    let staged = file
+        .write_all(b"1\n")
+        .and_then(|()| crate::platform::sync_durable(&file));
     drop(file);
     if let Err(error) = staged {
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }
-    std::fs::rename(&tmp, dir.join(marker)).inspect_err(|_| {
+    std::fs::rename(&tmp, &dest).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
 }
@@ -326,6 +341,32 @@ mod tests {
             !marker_path(&layout).exists() && !marker_path_of(&layout, "muse").exists(),
             "an agy landing replaces neither the first marker nor Muse Code's"
         );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// NEGATIVE CONTROL: `publish` refuses invalid marker names and symlinked notice directories
+    /// without writing into the symlink target, while publishing `0600` markers into a real folder.
+    #[test]
+    fn publish_refuses_bad_marker_names_and_symlinked_notice_dirs() {
+        let prefix = crate::testdir::dir("atpkg-activation-notice-symlink-");
+        let layout = Layout {
+            prefix: prefix.clone(),
+        };
+        prepare(&layout);
+        assert!(publish(&layout, "../escape").is_err());
+        assert!(publish(&layout, "sh").is_err());
+
+        let outside = prefix.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let notice = prefix.join(NOTICE_DIR);
+        std::fs::remove_dir(&notice).unwrap();
+        std::os::unix::fs::symlink(&outside, &notice).unwrap();
+        assert!(publish(&layout, "claude").is_err());
+        assert!(!outside.join("claude").exists());
+
+        std::fs::remove_file(&notice).unwrap();
+        assert!(publish(&layout, "claude").is_ok());
+        assert!(marker_path_of(&layout, "claude").exists());
         let _ = std::fs::remove_dir_all(&prefix);
     }
 

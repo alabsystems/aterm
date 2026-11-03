@@ -78,8 +78,10 @@ impl Instance {
 
     /// The open, the private-file check and the take of [`Instance::try_hold`].
     fn take_at(path: &Path) -> io::Result<Option<Self>> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            crate::paths::ensure_real_dir(parent)?;
         }
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
@@ -185,7 +187,7 @@ fn private_lock_file(meta: &std::fs::Metadata) -> bool {
 fn adopt_fd(fd: i32, path: &Path) -> Option<Instance> {
     use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
     use std::os::unix::fs::MetadataExt as _;
-    if fd < 0 {
+    if fd < 0 || !crate::paths::parent_is_real_dir(path) {
         return None;
     }
     // SAFETY: `F_GETFD` reads one descriptor's flags and touches no memory; a number that is not open answers -1.
@@ -275,7 +277,9 @@ impl Holder {
 /// Who holds the lock at `path`, if anyone does, as its file says (the pid unchecked: a mug killed outright leaves its pid behind, which a probe holding the lock for an instant then reads as live; [`running_mug`] checks it).
 #[must_use]
 pub fn running_holder(path: &Path) -> Option<Holder> {
-    if aterm_uds::ownerlock::probe(path) != aterm_uds::ownerlock::Owner::Live {
+    if !crate::paths::parent_is_real_dir(path)
+        || aterm_uds::ownerlock::probe(path) != aterm_uds::ownerlock::Owner::Live
+    {
         return None;
     }
     last_holder(path)
@@ -285,6 +289,9 @@ pub fn running_holder(path: &Path) -> Option<Holder> {
 #[must_use]
 pub fn last_holder(path: &Path) -> Option<Holder> {
     use std::io::Read as _;
+    if !crate::paths::parent_is_real_dir(path) {
+        return None;
+    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]

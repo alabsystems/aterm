@@ -9,7 +9,6 @@ use crate::Outcome;
 use aterm_census::seal;
 use aterm_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 /// The checked-in input, independent of the generated Rust output.
@@ -274,16 +273,15 @@ fn read(path: &Path) -> Result<Vec<u8>, String> {
             path.display()
         ));
     }
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .map_err(|e| e.to_string())?
-        .take(MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err("capture grew beyond the size limit".into());
-    }
-    Ok(bytes)
+    aterm_uds::atomic_file::read_regular(path, MAX_BYTES)
+        .map(|(bytes, _)| bytes)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                "capture grew beyond the size limit".into()
+            } else {
+                e.to_string()
+            }
+        })
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -474,7 +472,8 @@ fn run_with(
     std::fs::write(&candidate, render(&capture, &generator, &digest(&bytes)))
         .map_err(|e| e.to_string())?;
     formatter(root, &candidate)?;
-    let formatted = std::fs::read_to_string(&candidate).map_err(|e| e.to_string())?;
+    let formatted = aterm_uds::atomic_file::read_regular_text(&candidate, MAX_BYTES)
+        .map_err(|e| e.to_string())?;
     if legacy::tables(&formatted)? != capture.tables {
         return Err("formatting changed captured help values".into());
     }

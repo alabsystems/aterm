@@ -246,7 +246,7 @@ impl Reference {
             )));
         }
         let path = compiler.doc_json(cell, &self.target);
-        std::fs::read_to_string(&path).map_err(io("reading", &path))
+        crate::read_regular_text(&path).map_err(io("reading", &path))
     }
 
     /// Compile `probe` for `cell` and read each fact off the compiler's errors.
@@ -347,7 +347,7 @@ fn parse_doc(text: &str, cell: &Cell) -> Result<Doc, Stop> {
 
 fn read_doc(path: &Path, cell: &Cell) -> Result<Doc, Stop> {
     parse_doc(
-        &std::fs::read_to_string(path).map_err(io("reading", path))?,
+        &crate::read_regular_text(path).map_err(io("reading", path))?,
         cell,
     )
 }
@@ -458,7 +458,7 @@ fn format(trust: &Trust, files: &[PathBuf]) -> Result<(), Stop> {
 /// Stamp each written module's seal over its final, formatted text.
 fn seal(files: &[PathBuf]) -> Result<(), Stop> {
     for path in files {
-        let text = std::fs::read_to_string(path).map_err(io("reading", path))?;
+        let text = crate::read_regular_text(path).map_err(io("reading", path))?;
         let sealed = aterm_census::seal::stamp(&text)
             .map_err(|e| Stop::Failed(format!("{}: {e}", path.display())))?;
         std::fs::write(path, sealed).map_err(io("writing", path))?;

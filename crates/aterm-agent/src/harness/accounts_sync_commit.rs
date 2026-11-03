@@ -316,7 +316,7 @@ impl Store {
             state.machine = id;
         }
         let before = state.clone();
-        let events = edit(&mut state)?;
+        let mut events = edit(&mut state)?;
         let old_state = read(&self.state_file(), MAX_STATE_BYTES)?;
         let new_state = if state != before || (!events.is_empty() && old_state.is_none()) {
             drop_stale_sessions(&mut state, now);
@@ -324,6 +324,9 @@ impl Store {
         } else {
             old_state.clone()
         };
+        // The ledger rows gain their account's lab key before the ledger image is made; the
+        // notes go out once the transaction is durable (design §8, the journal's hooks).
+        let notes = super::super::journal::observe(self.cli, &before, &state, &mut events, now);
         let plan = Plan {
             local_logins: false,
             roster_path: None,
@@ -338,6 +341,7 @@ impl Store {
             wake: Some(events.iter().any(Event::wakes)),
         };
         self.publish_plan(held, None, plan, &events, || Ok(()))?;
+        super::super::journal::publish(&notes);
         Ok(events)
     }
 
@@ -450,6 +454,7 @@ impl Store {
         let text = read(&target, MAX_ROSTER_BYTES)?
             .ok_or_else(|| format!("{}: account roster is missing", roster.display()))?;
         let raw = Roster::parse_for(self.cli, &text)?;
+        let cli = self.cli;
         self.transact_images_held(
             held,
             now,
@@ -463,7 +468,11 @@ impl Store {
                 }),
                 wake,
             },
-            |state, logins| edit(&raw, state, logins),
+            |state, logins| {
+                let events = edit(&raw, state, logins)?;
+                super::super::journal::learn(cli, &raw, state);
+                Ok(events)
+            },
             || Ok(()),
         )
     }
@@ -543,6 +552,7 @@ impl Store {
             .map(|text| Roster::parse_for(self.cli, text))
             .transpose()?
             .unwrap_or_default();
+        let cli = self.cli;
         self.transact_images_held(
             &held,
             now,
@@ -556,7 +566,11 @@ impl Store {
                 }),
                 wake: WakeRule::Events,
             },
-            |state, logins| edit(&raw, state, logins),
+            |state, logins| {
+                let events = edit(&raw, state, logins)?;
+                super::super::journal::learn(cli, &raw, state);
+                Ok(events)
+            },
             || Ok(()),
         )
     }
@@ -825,7 +839,7 @@ impl Store {
             state.machine = id;
         }
         let before = (state.clone(), logins.clone());
-        let events = edit(&mut state, &mut logins)?;
+        let mut events = edit(&mut state, &mut logins)?;
         advance_renewal_generations(&before.1, &mut logins, &events)?;
         advance_sign_in_receipts(&before.1, &mut logins, &state, &events)?;
         let old_state = read(&self.state_file(), MAX_STATE_BYTES)?;
@@ -836,6 +850,7 @@ impl Store {
         } else {
             old_state.clone()
         };
+        let notes = super::super::journal::observe(self.cli, &before.0, &state, &mut events, now);
         let new_logins = if logins != before.1 {
             Some(logins.to_json() + "\n")
         } else {
@@ -878,6 +893,7 @@ impl Store {
             },
         };
         self.publish_plan(held, roster.as_deref(), plan, &events, auxiliary)?;
+        super::super::journal::publish(&notes);
         Ok(events)
     }
 
@@ -952,9 +968,26 @@ impl Store {
         self.retain_witness(&self.dir.join(WITNESS))
             .map_err(|why| why.to_string())?;
         self.save_receipt(&receipt)?;
-        self.recover_sync_at(held, roster, &mut |_| Ok(()))?;
+        #[cfg(test)]
+        let cut = CUT.with(std::cell::Cell::take);
+        #[cfg(not(test))]
+        let cut: Option<usize> = None;
+        self.recover_sync_at(held, roster, &mut |step| {
+            if cut == Some(step) {
+                Err("injected interruption".to_owned())
+            } else {
+                Ok(())
+            }
+        })?;
         Ok(())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's crash: the next commit on this thread stops before replay step `n`, its receipt
+    /// pending, as a process killed there would leave it.
+    pub(in crate::harness) static CUT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg_attr(

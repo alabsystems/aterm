@@ -285,6 +285,7 @@ mod tests {
             claim_ended: false,
             not_claim_worker: false,
             claim_worker: None,
+            task: None,
         })
     }
 
@@ -296,6 +297,7 @@ mod tests {
                 root: RestoredSplitTree::leaf(terminal(label)),
                 focused_path: Vec::new(),
                 zoomed: false,
+                parked: false,
             },
         }
     }

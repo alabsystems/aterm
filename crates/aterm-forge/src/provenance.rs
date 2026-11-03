@@ -61,6 +61,62 @@ pub fn is_first_party(root: &Path, dir: &Path) -> bool {
     dir.starts_with(root.join("crates")) || is_first_party_vendored(root, dir)
 }
 
+/// A resolved Git source from this workspace's repository owner, pinned to its
+/// full commit. Directory names and a dependency's self-reported author are not
+/// provenance. The source is supplied by the locked resolver, not the checkout.
+pub(crate) fn is_first_party_git(root: &Path, source: &str) -> bool {
+    let Some(repository) = crate::read_regular_text(root.join("Cargo.toml"))
+        .ok()
+        .and_then(|text| text.parse::<aterm_toml::edit::DocumentMut>().ok())
+        .and_then(|doc| {
+            doc.get("workspace")?
+                .get("package")?
+                .get("repository")?
+                .as_str()
+                .map(str::to_owned)
+        })
+    else {
+        return false;
+    };
+    pinned_git_same_owner(&repository, source)
+}
+
+fn pinned_git_same_owner(repository: &str, source: &str) -> bool {
+    fn owner(repository: &str) -> Option<&str> {
+        let path = repository.strip_prefix("https://github.com/")?;
+        let (owner, project) = path.split_once('/')?;
+        let valid = |part: &str| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        };
+        (valid(owner) && valid(project) && project != "." && project != "..").then_some(owner)
+    }
+    let Some((url, query)) = source
+        .strip_prefix("git+")
+        .and_then(|value| value.split_once('?'))
+    else {
+        return false;
+    };
+    let Some((revision, resolved)) = query
+        .strip_prefix("rev=")
+        .and_then(|value| value.split_once('#'))
+    else {
+        return false;
+    };
+    if revision.len() != 40
+        || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || revision != resolved
+    {
+        return false;
+    }
+    match (owner(repository), owner(url)) {
+        (Some(workspace), Some(dependency)) => workspace.eq_ignore_ascii_case(dependency),
+        _ => false,
+    }
+}
+
 /// Does the roster describe this root?
 #[must_use]
 pub fn applies_to(root: &Path) -> bool {
@@ -98,7 +154,7 @@ pub fn path_dependants(root: &Path, rel_root: &str) -> Vec<String> {
     for entry in entries.flatten() {
         let member = entry.path();
         let manifest = member.join("Cargo.toml");
-        let Ok(text) = std::fs::read_to_string(&manifest) else {
+        let Ok(text) = crate::read_regular_text(&manifest) else {
             continue;
         };
         if !path_deps(&text)
@@ -162,6 +218,37 @@ fn normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_ownership_requires_the_same_account_and_an_immutable_resolved_pin() {
+        let repository = "https://github.com/our-account/aterm";
+        let hash = "1234567890123456789012345678901234567890";
+        let source = |owner: &str, query: &str, resolved: &str| {
+            format!("git+https://github.com/{owner}/core.git?{query}#{resolved}")
+        };
+        assert!(pinned_git_same_owner(
+            repository,
+            &source("our-account", &format!("rev={hash}"), hash)
+        ));
+        for candidate in [
+            source("other-account", &format!("rev={hash}"), hash),
+            source("our-account-copy", &format!("rev={hash}"), hash),
+            source("our-account", "branch=main", hash),
+            source("our-account", "rev=1234567", hash),
+            source(
+                "our-account",
+                &format!("rev={hash}"),
+                "9876543210987654321098765432109876543210",
+            ),
+            format!("git+https://github.com.evil/our-account/core?rev={hash}#{hash}"),
+            format!("git+https://our-account@github.com/other/core?rev={hash}#{hash}"),
+        ] {
+            assert!(
+                !pinned_git_same_owner(repository, &candidate),
+                "accepted {candidate}"
+            );
+        }
+    }
 
     #[test]
     fn path_values_are_read_out_of_a_manifest_and_relative_parts_resolve() {

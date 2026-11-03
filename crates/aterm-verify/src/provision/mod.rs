@@ -6,6 +6,7 @@
 
 mod bash;
 mod fish;
+mod openssl;
 mod place;
 mod rows;
 pub mod stable;
@@ -217,6 +218,8 @@ pub struct Options {
     pub linux: bool,
     /// `--record`: add the rows that re-record goldens.
     pub record: bool,
+    /// `--release`: add native source-signing tools.
+    pub release: bool,
     /// `--check`: read only.
     pub check: bool,
     /// `-h`/`--help`.
@@ -228,7 +231,7 @@ pub struct Options {
 pub fn usage() -> String {
     let names: Vec<&str> = ROWS.iter().map(|r| r.name).collect();
     format!(
-        "targo --unverified verify provision [ROW...] [--linux] [--record] [--check]
+        "targo --unverified verify provision [ROW...] [--linux] [--record] [--release] [--check]
 
 Fetch or build the tools this checkout pins into this user's cache, each placed whole
 or not at all beside a stamp.json; each download is held to a pinned sha256 (pwsh's
@@ -242,6 +245,7 @@ off first in a home it never ran in). It reads the network.
   --linux     and the Linux lane's VM: lima, Ubuntu's pinned image for its own VM, and
               stable's aarch64-unknown-linux-musl std, which its guest agent is built against
   --record    and wasm-bindgen, to re-record the wasm-glue goldens
+  --release   and native source-signing tools for a release host
   --check     say what is missing; fetch and change nothing
   ROW...      just these: {}
 
@@ -263,6 +267,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         match arg.as_str() {
             "--linux" => opts.linux = true,
             "--record" => opts.record = true,
+            "--release" => opts.release = true,
             "--check" => opts.check = true,
             "-h" | "--help" => opts.help = true,
             flag if flag.starts_with('-') => {
@@ -295,6 +300,7 @@ pub fn select(opts: &Options) -> Vec<&'static Row> {
                     When::Always => true,
                     When::Linux => opts.linux,
                     When::Record => opts.record,
+                    When::Release => opts.release,
                 }
             } else {
                 opts.rows.iter().any(|n| n == r.name)
@@ -336,6 +342,7 @@ fn target(row: &Row, machine: &Machine) -> Option<Target> {
         Install::Unpack { .. }
         | Install::Build { .. }
         | Install::Configure { .. }
+        | Install::OpenSsl { .. }
         | Install::Cargo
         | Install::Files { .. }
         | Install::Rustup { .. } => {
@@ -570,6 +577,9 @@ pub fn provide_for(
         }
         Install::Configure { source, patches } => {
             bash::build(&source, patches, &t, machine, host, say).map_err(Refused::from)
+        }
+        Install::OpenSsl { source } => {
+            openssl::build(&source, &t, machine, host, say).map_err(Refused::from)
         }
         Install::Cargo => return cargo_row(row, &t, machine, host, say),
         Install::Browser(engine) => return browser_row(engine, &t, machine, host, say),

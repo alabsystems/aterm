@@ -40390,7 +40390,7 @@ fn a_short_choices_default_reads_as_its_segment() {
 fn session_controls_save_reset_and_disclose_observed_runtime() {
     use crate::session_log_journal::{Attention, Cause, Phase, Status};
     for (key, default) in [
-        (prefs::EDIT_KEEPER_ENABLED, false),
+        (prefs::EDIT_KEEPER_ENABLED, crate::keeper_link::DEFAULT_ON),
         (prefs::EDIT_SESSION_LOG_JOURNAL, true),
         (prefs::EDIT_SESSION_LOG_CLAUSE, true),
     ] {

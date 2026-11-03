@@ -344,7 +344,7 @@ fn rollback_reason(root: &Path, merge_base: &str) -> Option<String> {
 
 fn exclude(root: &Path) -> Result<Vec<String>, String> {
     let path = root.join("Cargo.toml");
-    let doc: DocumentMut = std::fs::read_to_string(&path)
+    let doc: DocumentMut = crate::read_regular_text(&path)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .parse()
         .map_err(|e| format!("{}: {e}", path.display()))?;

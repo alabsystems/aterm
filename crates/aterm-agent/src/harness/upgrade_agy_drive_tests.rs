@@ -326,12 +326,22 @@ impl AgyKernel for Script {
 
     fn args(&self, pid: u32) -> Option<atpkg::caller_shell::ProcArgs> {
         let shell = if self.knobs.fish { "fish" } else { "zsh" };
-        (pid == SHELL || (pid == 0 && self.knobs.zero_reads_as_zsh)).then(|| {
-            atpkg::caller_shell::ProcArgs {
+        if pid == SHELL || (pid == 0 && self.knobs.zero_reads_as_zsh) {
+            return Some(atpkg::caller_shell::ProcArgs {
                 exec_path: format!("/bin/{shell}"),
                 argv: vec![format!("-{shell}")],
                 env: Vec::new(),
-            }
+            });
+        }
+        (pid == TUI && !self.knobs.noappear).then(|| atpkg::caller_shell::ProcArgs {
+            exec_path: self.exe.to_string_lossy().into_owned(),
+            argv: self.knobs.new_argv.clone().unwrap_or_else(|| {
+                vec![
+                    self.exe.to_string_lossy().into_owned(),
+                    format!("--conversation={C1}"),
+                ]
+            }),
+            env: vec![format!("ATERM_PARENT_SESSION_ID={TAB}")],
         })
     }
 
@@ -840,6 +850,29 @@ fn a_graceful_exit_a_refused_start_and_an_unwitnessed_end_are_never_relaunched()
         crate::harness::relaunch::launch_ended(&snap, &rig.look(&snap)),
         Some("refused-start")
     );
+}
+
+/// An exit an Autopilot carries ([`ExitCause::Carried`]) comes back however it ended, its own
+/// exit's or an unwitnessed one; a start agy refused is a refusal the owner hears, never
+/// relaunched.
+#[test]
+fn an_exit_an_autopilot_carries_comes_back_unless_its_start_was_refused() {
+    for (status, crash_left, want) in [
+        (0, false, "continued"),
+        (137, false, "continued"),
+        (1, false, "continued"),
+        (137, true, "continued"),
+        (2, false, "refused:refused-start"),
+    ] {
+        let rig = Rig::new("carried", status, true, false, crash_left);
+        let snap = rig.snap(Some(C1));
+        let left = rig.look(&snap);
+        let r = rig.attempt(&snap, &left, ExitCause::Carried);
+        assert_eq!(r.step, want, "{status} {crash_left}: {left:?} {r:?}");
+        if want.starts_with("refused:") {
+            assert!(rig.typed().is_empty(), "{status}: {:#?}", rig.typed());
+        }
+    }
 }
 
 #[test]
@@ -2670,4 +2703,45 @@ fn a_relaunch_under_land_into_a_defense_leaves_it_to_the_land_check() {
     let r = carry_adopted(&going, CAUSE_EXIT, true);
     assert_eq!(r.step, "continued", "{r:?}");
     assert_eq!(going.continuations(), 1);
+}
+
+#[test]
+fn holders_in_reports_live_tui_and_ignores_non_tui_commands() {
+    let mut rig = Rig::new("holders-tui", 0, true, false, false);
+    let session = key(TAB);
+    let sessions = BTreeSet::from([session.clone()]);
+    let pids = [TUI];
+    let live_tabs = vec![LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(i64::from(TUI)),
+    }];
+
+    let found = holders_in(&sessions, Some(&live_tabs), &pids, &rig.kernel);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].pid, TUI);
+    assert_eq!(found[0].session, session);
+    assert_eq!(found[0].version, VERSION);
+    assert_eq!(found[0].tab.as_deref(), Some(TAB));
+
+    let found_env = holders_in(&sessions, None, &pids, &rig.kernel);
+    assert_eq!(found_env.len(), 1);
+    assert_eq!(found_env[0].pid, TUI);
+    assert_eq!(found_env[0].version, VERSION);
+
+    for argv in [
+        vec!["agy", "-p", "hi"],
+        vec!["agy", "--version"],
+        vec!["agy", "--help"],
+        vec!["agy", "auth", "status"],
+    ] {
+        rig.kernel.knobs.new_argv = Some(argv.iter().map(|s| (*s).to_string()).collect());
+        assert!(
+            holders_in(&sessions, Some(&live_tabs), &pids, &rig.kernel).is_empty(),
+            "non-TUI argv {argv:?} must not count as a live TUI holder"
+        );
+        assert!(
+            holders_in(&sessions, None, &pids, &rig.kernel).is_empty(),
+            "non-TUI argv {argv:?} must not count as a live TUI holder without live_tabs"
+        );
+    }
 }

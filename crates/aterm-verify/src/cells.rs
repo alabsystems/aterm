@@ -17,6 +17,9 @@ use std::time::Instant;
 use aterm_forge::model::{Cell, Graph, PkgId};
 
 use crate::Ctx;
+
+#[path = "cells_units.rs"]
+mod units;
 use crate::exec::{self, Cmd};
 use crate::ladder::{Outcome, Report, Severity};
 use crate::plan::{Lane, lane_dir};
@@ -115,33 +118,21 @@ pub fn narrows(triple: &str, scope: &crate::scope::Scope, pulled: bool) -> bool 
         }
 }
 
-/// The roots of a depth-prefixed `targo tree` forest ([`test_tree`]) that reach any of `seeds`, the
+/// The roots of the target unit graph that reach any of `seeds`, the
 /// seeds' own included: a member's dependents on this cell's triple, dev edges included. The change
 /// cone is closed over this machine's edges, so it cannot hold a dependent only another OS has
 /// (`aterm-gui` on `aterm-x11`, the Windows crates on `aterm-win32`), which only this graph names.
 ///
-/// # Errors
-/// A line forge cannot read.
-pub fn dependents_in_forest(
-    text: &str,
+#[must_use]
+pub fn dependents_in_graph(
+    dependencies: &BTreeMap<String, BTreeSet<PkgId>>,
     seeds: &BTreeSet<String>,
-) -> Result<BTreeSet<String>, String> {
-    let mut found = BTreeSet::new();
-    let mut root = None;
-    for raw in text.lines() {
-        let Some(line) = aterm_forge::resolve::parse_line(raw)? else {
-            continue;
-        };
-        if line.depth == 0 {
-            root = Some(line.id.name.clone());
-        }
-        if seeds.contains(&line.id.name)
-            && let Some(root) = &root
-        {
-            found.insert(root.clone());
-        }
-    }
-    Ok(found)
+) -> BTreeSet<String> {
+    dependencies
+        .iter()
+        .filter(|(_, nodes)| nodes.iter().any(|id| seeds.contains(&id.name)))
+        .map(|(root, _)| root.clone())
+        .collect()
 }
 
 /// The crates a [`narrows`] lint names: of `own`, the `wanted` members this cell compiles for its
@@ -324,7 +315,7 @@ pub enum CellOutcome {
 /// The `cells` check's stage: one row per selected cell, the windows-sys oracles when a
 /// Windows cell is selected, then the `cshim` rows nothing could use.
 pub fn run(ctx: &Ctx, r: &mut Report) {
-    let policy = match std::fs::read_to_string(ctx.root.join(POLICY))
+    let policy = match crate::read_regular_text(ctx.root.join(POLICY))
         .map_err(|e| format!("cannot read {POLICY}: {e}"))
         .and_then(|t| parse_policy(&t))
     {
@@ -676,13 +667,13 @@ pub struct TestGraph {
     pub nodes: BTreeSet<PkgId>,
     pub selected: Vec<String>,
     pub excluded: Vec<String>,
-    /// The forest itself, for a selection's dependents ([`dependents_in_forest`]).
-    pub forest: String,
+    /// Each root's target dependencies, for [`dependents_in_graph`].
+    pub dependencies: BTreeMap<String, BTreeSet<PkgId>>,
 }
 
 /// The test-target pass's graph for `cell`: the selection
 /// [`test_selection`] makes from `members` and the cell's `normal` package
-/// names, resolved by `targo tree` for exactly that selection.
+/// names, resolved by `targo check --unit-graph` for exactly that selection.
 fn test_graph(
     ctx: &Ctx,
     cell: &Cell,
@@ -706,23 +697,26 @@ fn test_graph(
     );
     let out = exec::bounded(ctx.child_ceiling, {
         let excluded = excluded.clone();
-        move || test_tree(&targo, &path, &root, &triple, &excluded)
+        move || test_units(&targo, &path, &root, &triple, &excluded)
     })
-    .unwrap_or_else(|why| Err(format!("`targo tree` {}", why.sentence())))?;
+    .unwrap_or_else(|why| Err(format!("`targo check --unit-graph` {}", why.sentence())))?;
     let excluded_set: BTreeSet<String> = excluded.iter().cloned().collect();
     let roots: BTreeSet<String> = members.difference(&excluded_set).cloned().collect();
+    let dependencies = units::read(&out, &cell.triple, &roots)?;
     Ok(TestGraph {
-        nodes: parse_test_forest(&out, &roots)?,
+        nodes: dependencies
+            .values()
+            .flat_map(|nodes| nodes.iter().cloned())
+            .collect(),
         selected,
         excluded,
-        forest: out,
+        dependencies,
     })
 }
 
-/// `targo tree` over the workspace less `excluded`, for `triple`, with normal
-/// and dev edges and no proc-macro or build subtrees (host code a target
-/// override cannot help): the depth-prefixed forest, one root per member.
-fn test_tree(
+/// Resolve all target kinds over the workspace less `excluded`, without compiling or running
+/// build scripts. The compact unit graph retains host/target and feature distinctions.
+fn test_units(
     targo: &Path,
     path: &std::ffi::OsStr,
     root: &Path,
@@ -732,125 +726,25 @@ fn test_tree(
     let mut cmd = aterm_uds::spawnfd::command(targo);
     cmd.env("PATH", path)
         .current_dir(root)
-        .arg("tree")
+        .args(["--unverified", "check"])
         .arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
-        .args(["--workspace", "--edges", "normal,dev,no-proc-macro"])
-        .args(["--prefix", "depth", "--no-dedupe", "--locked", "--offline"])
+        .args(["--all-targets", "--workspace", "--locked", "--offline"])
+        .args(crate::stages::UNIT_GRAPH)
         .args(["--target", triple]);
     for name in excluded {
         cmd.arg("--exclude").arg(name);
     }
     let out = cmd
         .output_owned()
-        .map_err(|e| format!("could not run {} tree: {e}", targo.display()))?;
+        .map_err(|e| format!("could not run {} check --unit-graph: {e}", targo.display()))?;
     if !out.status.success() {
         return Err(format!(
-            "`targo tree` for {triple}'s test targets failed: {}",
+            "`targo check --unit-graph` for {triple}'s test targets failed: {}",
             String::from_utf8_lossy(&out.stderr).trim_end()
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// The packages of a depth-prefixed `targo tree` forest whose roots must be exactly `roots`.
-///
-/// # Errors
-/// A line forge cannot read, or a forest that is not the one asked for.
-pub fn parse_test_forest(text: &str, roots: &BTreeSet<String>) -> Result<BTreeSet<PkgId>, String> {
-    /// One depth-0 tree: whether its root is a proc macro, and every line from
-    /// the root down, as (depth, package).
-    struct RootTree {
-        proc_macro: bool,
-        lines: Vec<(usize, PkgId)>,
-    }
-    let mut trees: Vec<RootTree> = Vec::new();
-    let mut ancestors = 0;
-    for raw in text.lines() {
-        let Some(line) = aterm_forge::resolve::parse_line(raw)? else {
-            continue;
-        };
-        if line.depth > ancestors {
-            return Err(format!("the test dependency tree jumps a depth at `{raw}`"));
-        }
-        if line.depth == 0 {
-            trees.push(RootTree {
-                proc_macro: line.is_proc_macro,
-                lines: Vec::new(),
-            });
-        }
-        let Some(tree) = trees.last_mut() else {
-            return Err(format!(
-                "the test dependency tree starts below a root at `{raw}`"
-            ));
-        };
-        tree.lines.push((line.depth, line.id));
-        ancestors = line.depth + 1;
-    }
-    let subtree = |lines: &[(usize, PkgId)], at: usize| -> BTreeSet<PkgId> {
-        let depth = lines[at].0;
-        let mut nodes = BTreeSet::from([lines[at].1.clone()]);
-        for (d, id) in &lines[at + 1..] {
-            if *d <= depth {
-                break;
-            }
-            nodes.insert(id.clone());
-        }
-        nodes
-    };
-    let mut host: BTreeMap<String, Vec<BTreeSet<PkgId>>> = BTreeMap::new();
-    for tree in trees.iter().filter(|tree| tree.proc_macro) {
-        for at in 1..tree.lines.len() {
-            host.entry(tree.lines[at].1.name.clone())
-                .or_default()
-                .push(subtree(&tree.lines, at));
-        }
-    }
-    let mut by_root: BTreeMap<String, Vec<(bool, BTreeSet<PkgId>)>> = BTreeMap::new();
-    for tree in &trees {
-        by_root
-            .entry(tree.lines[0].1.name.clone())
-            .or_default()
-            .push((tree.proc_macro, subtree(&tree.lines, 0)));
-    }
-    let seen: BTreeSet<String> = by_root.keys().cloned().collect();
-    let mut nodes = BTreeSet::new();
-    for (name, mut copies) in by_root {
-        if copies.len() > 1 {
-            let Some(host_copies) = host.get(&name) else {
-                return Err(format!(
-                    "the test dependency tree repeats root `{name}`, and no proc macro in \
-                     the forest reaches it (so neither copy is known to be the host's)"
-                ));
-            };
-            let mut extra = copies.len() - 1;
-            copies.retain(|(_, set)| {
-                if extra > 0 && host_copies.contains(set) {
-                    extra -= 1;
-                    false
-                } else {
-                    true
-                }
-            });
-            if copies.len() != 1 {
-                return Err(format!(
-                    "the test dependency tree repeats root `{name}`, and its copies do not \
-                     reduce to one target copy beside the host's its proc macro prints"
-                ));
-            }
-        }
-        let (proc_macro, set) = copies.remove(0);
-        if !proc_macro {
-            nodes.extend(set);
-        }
-    }
-    if seen != *roots {
-        return Err(format!(
-            "the test dependency tree's roots {seen:?} are not the pass's selected members \
-             {roots:?}"
-        ));
-    }
-    Ok(nodes)
 }
 
 /// The cell's packages compiled for the host ([`host_side`]). A third-party
@@ -1005,10 +899,8 @@ fn check_cell(
     if matches!(ctx.scope, crate::scope::Scope::Changed(_))
         && let Some(tests) = &tests
     {
-        match dependents_in_forest(&tests.forest, &wanted) {
-            Ok(dependents) => wanted.extend(dependents),
-            Err(e) => return could_not("NO-TEST-GRAPH", vec![e]),
-        }
+        let dependents = dependents_in_graph(&tests.dependencies, &wanted);
+        wanted.extend(dependents);
     }
     // A patched crate's name can stand for two packages (the windows-sys facades), so neither `-p`
     // nor a read by name could say which was compiled: that selection takes the whole graph.
@@ -1567,7 +1459,7 @@ pub fn test_selection(
 /// The manifest could not be read ("could not look" is not "there are none").
 pub fn patched_crates(root: &Path) -> Result<BTreeSet<String>, String> {
     let manifest = root.join("Cargo.toml");
-    let text = std::fs::read_to_string(&manifest)
+    let text = crate::read_regular_text(&manifest)
         .map_err(|e| format!("could not read {} ({e})", manifest.display()))?;
     let mut out = BTreeSet::new();
     let mut inside = false;
@@ -1843,7 +1735,7 @@ fn path_is_inside(dir: &Path, root: &Path) -> bool {
 
 /// Does the manifest in `dir` declare `proc-macro = true` under `[lib]`?
 fn is_proc_macro(dir: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
+    let Ok(text) = crate::read_regular_text(dir.join("Cargo.toml")) else {
         return false;
     };
     let mut in_lib = false;
@@ -1975,26 +1867,34 @@ mod tests {
         assert!(!narrows("wasm32-unknown-unknown", &cone, true));
     }
 
-    /// A dependent only this cell's OS has is found in its own forest, dev edges included: the root
+    /// A dependent only this cell's OS has is found in its own graph, dev edges included: the root
     /// `aterm-gui` reaches `aterm-x11` here though this machine's cone could not say so. NEGATIVE
     /// CONTROL: a member that does not reach it is left out.
     #[test]
-    fn a_seeds_dependents_come_from_the_cells_own_forest() {
-        let forest = "0aterm-gui v0.1.0\n1aterm-window v0.1.0\n2aterm-x11 v0.1.0\n\
-                      0aterm-x11 v0.1.0\n0aterm-grid v0.1.0\n1aterm-types v0.1.0\n";
+    fn a_seeds_dependents_come_from_the_cells_own_graph() {
+        let ids = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| PkgId::new(*name, "0.1.0"))
+                .collect()
+        };
+        let graph = BTreeMap::from([
+            (
+                "aterm-gui".into(),
+                ids(&["aterm-gui", "aterm-window", "aterm-x11"]),
+            ),
+            ("aterm-x11".into(), ids(&["aterm-x11"])),
+            ("aterm-grid".into(), ids(&["aterm-grid", "aterm-types"])),
+        ]);
         assert_eq!(
-            dependents_in_forest(forest, &names(&["aterm-x11"])).expect("the forest"),
+            dependents_in_graph(&graph, &names(&["aterm-x11"])),
             names(&["aterm-gui", "aterm-x11"])
         );
         assert_eq!(
-            dependents_in_forest(forest, &names(&["aterm-window"])).expect("the forest"),
+            dependents_in_graph(&graph, &names(&["aterm-window"])),
             names(&["aterm-gui"])
         );
-        assert!(
-            dependents_in_forest(forest, &names(&["nothing"]))
-                .expect("the forest")
-                .is_empty()
-        );
+        assert!(dependents_in_graph(&graph, &names(&["nothing"])).is_empty());
     }
 
     /// A `-p` no member answers to is an error, not a green over nothing, spec spellings included.
@@ -2194,11 +2094,11 @@ mod tests {
         }
     }
 
-    /// A real workspace's test-target forest (resolved, never compiled) holds only the selected
+    /// A real workspace's test-target unit graph (resolved, never compiled) holds only the selected
     /// members and their dev and target dependencies: no build-only or proc-macro subtree, no
     /// excluded member's oracle.
     #[test]
-    fn the_test_target_forest_has_only_selected_members_dev_and_target_dependencies() {
+    fn the_test_target_graph_has_only_selected_members_dev_and_target_dependencies() {
         let dir = aterm_tempfile::tempdir().expect("private resolver fixture");
         let root = dir.path();
         let packages = [
@@ -2267,20 +2167,30 @@ mod tests {
         let (selected, excluded) = test_selection(&members, &normal, &BTreeSet::new());
         assert_eq!(selected, ["app", "decoder", "pm"]);
         assert_eq!(excluded, ["build-only", "ignored", "ignored-sys", "oracle"]);
+        std::fs::write(
+            root.join("app/build.rs"),
+            "fn main() { panic!(\"graph query executed a build script\"); }",
+        )
+        .expect("build script that must never run during resolution");
         let targo = PathBuf::from(env!("CARGO"));
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let forest = test_tree(&targo, &path, root, "x86_64-pc-windows-msvc", &excluded)
+        let graph = test_units(&targo, &path, root, "x86_64-pc-windows-msvc", &excluded)
             .expect("resolve the actual test member selection without compiling");
         let roots: BTreeSet<String> = members
             .difference(&excluded.iter().cloned().collect())
             .cloned()
             .collect();
-        let nodes = parse_test_forest(&forest, &roots).expect("the selected members' forest");
+        let dependencies = units::read(&graph, "x86_64-pc-windows-msvc", &roots)
+            .expect("the selected members' graph");
+        let nodes: BTreeSet<PkgId> = dependencies
+            .values()
+            .flat_map(|nodes| nodes.iter().cloned())
+            .collect();
         let names: Vec<_> = nodes.iter().map(|id| id.name.as_str()).collect();
         assert_eq!(names, ["app", "decoder", "oracle"]);
         let one: BTreeSet<String> = ["app".to_string()].into_iter().collect();
-        assert!(parse_test_forest("", &one).is_err());
-        assert!(parse_test_forest("0other v1.0.0\n", &one).is_err());
+        assert!(units::read("", "x86_64-pc-windows-msvc", &one).is_err());
+        assert!(units::read(&graph, "x86_64-pc-windows-msvc", &one).is_err());
     }
 
     /// A member a selected proc macro depends on prints as both a target and a host node.
@@ -2336,19 +2246,16 @@ mod tests {
         .expect("locked local dependency graph");
         let targo = PathBuf::from(env!("CARGO"));
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let forest = test_tree(&targo, &path, root, "x86_64-pc-windows-msvc", &[])
+        let graph = test_units(&targo, &path, root, "x86_64-pc-windows-msvc", &[])
             .expect("resolve the fixture without compiling");
-        let nodes = parse_test_forest(&forest, &members)
+        let dependencies = units::read(&graph, "x86_64-pc-windows-msvc", &members)
             .expect("a member's host copy is not a second target root");
+        let nodes: BTreeSet<PkgId> = dependencies
+            .values()
+            .flat_map(|nodes| nodes.iter().cloned())
+            .collect();
         let found: Vec<_> = nodes.iter().map(|id| id.name.as_str()).collect();
         assert_eq!(found, ["app", "shared", "win-only"]);
-
-        let err = parse_test_forest(
-            "0shared v1.0.0\n1win-only v1.0.0\n0shared v1.0.0\n1unix-only v1.0.0\n",
-            &names(&["shared"]),
-        )
-        .expect_err("an unexplained repeat");
-        assert!(err.contains("no proc macro"), "{err}");
     }
 
     #[test]

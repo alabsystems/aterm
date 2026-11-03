@@ -7,6 +7,50 @@
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd};
 
+/// Run an operation with nonblocking status set on a descriptor, then restore its flags.
+/// Duplicated descriptors share these flags; the caller must own their read/write use
+/// during this scope. Restoration is also attempted during unwinding.
+///
+/// # Errors
+/// Reading, setting or restoring descriptor flags fails, or the operation fails.
+pub fn with_nonblocking<T>(
+    fd: BorrowedFd<'_>,
+    work: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    struct Restore<'a> {
+        fd: BorrowedFd<'a>,
+        flags: i32,
+    }
+    impl Restore<'_> {
+        fn apply(&self) -> io::Result<()> {
+            // SAFETY: the borrowed descriptor remains open; F_SETFL takes this integer flag word.
+            if unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, self.flags) } < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = self.apply();
+        }
+    }
+    // SAFETY: F_GETFL reads the flags of the live borrowed descriptor.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let restore = Restore { fd, flags };
+    // SAFETY: F_SETFL updates the status flags of that same open descriptor.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = work();
+    let restored = restore.apply();
+    result.and_then(|value| restored.map(|()| value))
+}
+
 /// What [`either`] found ready: at least one is `true`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ready {
@@ -145,6 +189,23 @@ pub fn until(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scoped_nonblocking_restores_flags_after_an_operation_error() {
+        use std::io::Read as _;
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let (mut reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let observer = reader.try_clone().unwrap();
+        // SAFETY: the stream retains its live descriptor throughout the test.
+        let before = unsafe { libc::fcntl(observer.as_raw_fd(), libc::F_GETFL) };
+        assert!(before >= 0);
+        let error = super::with_nonblocking(observer.as_fd(), || reader.read(&mut [0]).map(|_| ()))
+            .expect_err("an empty open stream would block");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        // SAFETY: the same observer still retains the open descriptor.
+        let after = unsafe { libc::fcntl(observer.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(after, before);
+    }
+
     use super::{Ready, either, one};
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsFd as _;

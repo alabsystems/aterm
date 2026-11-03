@@ -10,11 +10,21 @@ use std::time::{Duration, Instant};
 
 use crate::headless_boot;
 
+use aterm_types::control_verbs::TURN_ECHO_CAP_MS;
 use headless_boot::{Instance, boot_session, ctl, ctl_ok, field, status, type_line};
 
 const HANG: Duration = Duration::from_secs(60);
 const HANG_MS: &str = "timeout=60000";
+/// Longer than a `turn` gives the echo of a text its program has read.
+const PAST_THE_ECHO_CAP: Duration = Duration::from_millis(TURN_ECHO_CAP_MS + 1_000);
+/// Shorter than the cap by less than a `late` stand-in's draw comes after its read, so a line
+/// read this long after its typing is drawn past the cap.
+const INSIDE_THE_ECHO_CAP: Duration = Duration::from_millis(TURN_ECHO_CAP_MS - 1_000);
 
+/// Claude Code's frame around a composer, a logo that repaints whatever the input loop does, and
+/// that loop, which reads nothing while `$0.hold` stands. Its second word is `still` for a logo
+/// that stands still while the hold does, as a starved Claude Code, one process, draws nothing
+/// while it reads nothing, or `late` for a loop that draws what it read 1.5 s after the read.
 const COMPOSER: &str = r#"#!/bin/sh
 mode="$1"
 stty raw -echo 2>/dev/null
@@ -29,7 +39,8 @@ printf '%s[21;1H❯ ' "$esc"
   c=1
   while :; do
     c=$((c % 6 + 1))
-    printf '%s7%s[1;1H%s[3%dm▐▛███▜▌%s[0m%s8' "$esc" "$esc" "$esc" "$c" "$esc" "$esc"
+    [ "$2" = still ] && [ -e "$0.hold" ] ||
+      printf '%s7%s[1;1H%s[3%dm▐▛███▜▌%s[0m%s8' "$esc" "$esc" "$esc" "$c" "$esc" "$esc"
     sleep 0.1
   done
 ) &
@@ -38,10 +49,12 @@ trap 'kill $painter 2>/dev/null' EXIT
 cr=$(printf '\r')
 draft=
 out=3
+while [ -e "$0.hold" ]; do sleep 0.1; done
 while :; do
   chunk=$(dd bs=256 count=1 2>/dev/null; printf x)
   chunk=${chunk%x}
   [ -z "$chunk" ] && exit 0
+  [ "$2" = late ] && sleep 1.5
   case $chunk in
     *"$cr"*)
       draft="$draft${chunk%%"$cr"*}"
@@ -126,6 +139,19 @@ fn start(inst: &Instance, sid: &str, script: &std::path::Path, claude: bool, mod
     }
 }
 
+fn boot(prefix: &str) -> (Instance, std::path::PathBuf) {
+    let inst = headless_boot::boot_with(
+        prefix,
+        |_, cmd| {
+            cmd.args(["--lines", "24", "--columns", "80"]);
+        },
+        |_| true,
+    );
+    let script = inst.tmp.join("composer.sh");
+    std::fs::write(&script, COMPOSER).expect("write the stand-in");
+    (inst, script)
+}
+
 fn composer(inst: &Instance, sid: &str) -> String {
     let screen = ctl_ok(inst, &[&format!("@{sid}"), "text"]);
     screen
@@ -133,6 +159,19 @@ fn composer(inst: &Instance, sid: &str) -> String {
         .nth(20)
         .unwrap_or_else(|| panic!("no row 21: {screen}"))
         .to_string()
+}
+
+/// Once the session holds the follow-up's line, unread.
+fn typed(inst: &Instance, sid: &str) {
+    let deadline = Instant::now() + HANG;
+    loop {
+        let s = status(inst, sid);
+        if field(&s, "input_bytes") == Some("8") {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the line was never typed: {s}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// The composer row once it reads `want`, or what it last read when the one-minute hang
@@ -151,15 +190,7 @@ fn composer_settles(inst: &Instance, sid: &str, want: &str) -> String {
 
 #[test]
 fn a_follow_up_into_claude_code_is_submitted_only_when_its_composer_takes_it() {
-    let inst = headless_boot::boot_with(
-        "atts",
-        |_, cmd| {
-            cmd.args(["--lines", "24", "--columns", "80"]);
-        },
-        |_| true,
-    );
-    let script = inst.tmp.join("composer.sh");
-    std::fs::write(&script, COMPOSER).expect("write the stand-in");
+    let (inst, script) = boot("atts");
     let (_, ignores) = boot_session(&inst);
     let takes = spawn(&inst);
     let plain = spawn(&inst);
@@ -213,5 +244,74 @@ fn a_follow_up_into_claude_code_is_submitted_only_when_its_composer_takes_it() {
             run.join()
                 .unwrap_or_else(|why| std::panic::resume_unwind(why));
         }
+    });
+}
+
+/// A starved Claude Code's echo comes later than any cap on it. While the line stands unread the
+/// Enter waits for it, so a repaint verifies nothing, and the composer alone judges the Enter: the
+/// stand-in that ignores it, its logo still while it reads nothing, answers `submitted=0` and the
+/// one that takes it, its logo repainting all along, `submit_by=composer`.
+#[test]
+fn a_line_claude_code_has_not_read_is_pressed_once_its_composer_shows_it() {
+    let (inst, script) = boot("attu");
+    let hold = inst.tmp.join("composer.sh.hold");
+    std::fs::write(&hold, "").expect("hold the stand-ins");
+    let (_, ignores) = boot_session(&inst);
+    let takes = spawn(&inst);
+    start(&inst, &ignores, &script, true, "ignores still");
+    start(&inst, &takes, &script, true, "takes");
+
+    std::thread::scope(|scope| {
+        let ignored = scope.spawn(|| follow_up(&inst, &ignores, 1, 2_000));
+        let taken = scope.spawn(|| follow_up(&inst, &takes, 1, 60_000));
+        for sid in [&ignores, &takes] {
+            typed(&inst, sid);
+        }
+        std::thread::sleep(PAST_THE_ECHO_CAP);
+        std::fs::remove_file(&hold).expect("feed the stand-ins");
+
+        let verdict = ignored.join().expect("the ignored turn");
+        assert!(
+            verdict.contains("submitted=0 status=timeout"),
+            "{verdict}\n{}",
+            ctl_ok(&inst, &[&format!("@{ignores}"), "text"])
+        );
+        assert_eq!(composer(&inst, &ignores), "❯ carry on");
+        let verdict = taken.join().expect("the taken turn");
+        assert!(
+            verdict.contains("submitted=1 status=submitted")
+                && verdict.contains(" submit_by=composer"),
+            "{verdict}\n{}",
+            ctl_ok(&inst, &[&format!("@{takes}"), "text"])
+        );
+        assert_eq!(composer(&inst, &takes), "❯");
+    });
+}
+
+/// A starved Claude Code can read the line while its echo settles, before `turn` first looks at
+/// the composer, and draw it only past the cap the typing started. The first look that finds the
+/// line read gives the echo its cap again, so a repaint verifies nothing and the composer that
+/// keeps the line answers `submitted=0`.
+#[test]
+fn a_line_read_before_any_look_is_pressed_once_its_composer_shows_it() {
+    let (inst, script) = boot("attl");
+    let hold = inst.tmp.join("composer.sh.hold");
+    std::fs::write(&hold, "").expect("hold the stand-in");
+    let (_, late) = boot_session(&inst);
+    start(&inst, &late, &script, true, "ignores late");
+
+    std::thread::scope(|scope| {
+        let ignored = scope.spawn(|| follow_up(&inst, &late, 1, 2_000));
+        typed(&inst, &late);
+        std::thread::sleep(INSIDE_THE_ECHO_CAP);
+        std::fs::remove_file(&hold).expect("feed the stand-in");
+
+        let verdict = ignored.join().expect("the turn");
+        assert!(
+            verdict.contains("submitted=0 status=timeout"),
+            "{verdict}\n{}",
+            ctl_ok(&inst, &[&format!("@{late}"), "text"])
+        );
+        assert_eq!(composer_settles(&inst, &late, "❯ carry on"), "❯ carry on");
     });
 }

@@ -27,8 +27,8 @@ use aterm_spec::derive::Model;
 ///   worker cooldown;
 /// - `wk`: the lease's worker record: none (0), claimed (1), running (2), over (3); `ws`, apart
 ///   from it, the worker's session: none started (0), working under Autopilot (1), stopped (2):
-///   its task ended or stalled, its host ended with no successor, or its host turned its
-///   Autopilot Off at `expired`. A host that ended and whose successor runs the session moves
+///   its task ended (a stall is no end: it may move on, so it is working), its host ended with no
+///   successor, or its host turned its Autopilot Off at `expired`. A host that ended and whose successor runs the session moves
 ///   the record to it, which is no step here;
 /// - `nW`: the workers claimed this episode (with none open, since the last one closed);
 /// - `late`: the fill reaches the emergency line before the step in hand (a line owed or out,

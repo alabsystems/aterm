@@ -443,8 +443,11 @@ fn lay_commands_off_path(
     let tools = match crate::store::recorded_exposes(&build_dir) {
         Some(tools) => tools,
         None => match signed_exposes(fetcher, index, repo, program, build) {
-            Ok(tools) => {
+            Ok((tools, version)) => {
                 let _ = crate::store::write_exposes(&build_dir, &tools);
+                if crate::store::recorded_version(&build_dir).is_none() {
+                    let _ = crate::store::write_version(&build_dir, &version);
+                }
                 tools
             }
             Err(_) if crate::installed_exposes(layout, program).is_some() => {
@@ -489,15 +492,15 @@ fn lay_commands_off_path(
     Ok(off.iter().map(|tool| tool.as_str().to_string()).collect())
 }
 
-/// The admitted `exposes` of `program`'s signed manifest for `build`, read and verified as an
-/// install reads it.
+/// The admitted `exposes` and `version` of `program`'s signed manifest for `build`, read and
+/// verified as an install reads it.
 fn signed_exposes(
     fetcher: &dyn Fetcher,
     index: &TrustedIndex,
     repo: &str,
     program: &str,
     build: u64,
-) -> Result<Vec<ToolName>, FlowError> {
+) -> Result<(Vec<ToolName>, String), FlowError> {
     let (raw, sig) = fetcher
         .pkg_manifest(repo, program, build)
         .map_err(FlowError::PkgFetch)?;
@@ -508,7 +511,7 @@ fn signed_exposes(
     if !pkg.is_for(program) || pkg.build_number != build {
         return Err(FlowError::Mismatch);
     }
-    Ok(crate::store::split_exposed(&pkg.exposes).0)
+    Ok((crate::store::split_exposed(&pkg.exposes).0, pkg.version))
 }
 
 /// The [`FlowError`] a signed manifest that verified but did not parse is refused with.
@@ -554,6 +557,34 @@ pub fn install_collecting_assets(
     now_unix: i64,
     resolved_assets: &mut BTreeMap<String, String>,
 ) -> Result<InstallReport, FlowError> {
+    install_collecting_assets_with_index(
+        fetcher,
+        layout,
+        anchor,
+        req,
+        floor,
+        now_unix,
+        None,
+        resolved_assets,
+    )
+}
+
+/// [`install_collecting_assets`], reusing `pre_resolved` when the caller already verified the
+/// signed index to decide the lane.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "install_collecting_assets plus the optional pre-verified index from the caller"
+)]
+pub(crate) fn install_collecting_assets_with_index(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    anchor: &Anchor,
+    req: &InstallRequest,
+    floor: BuildFloor,
+    now_unix: i64,
+    pre_resolved: Option<TrustedIndex>,
+    resolved_assets: &mut BTreeMap<String, String>,
+) -> Result<InstallReport, FlowError> {
     let mut seen = BTreeMap::new();
     install_inner(
         fetcher,
@@ -562,6 +593,7 @@ pub fn install_collecting_assets(
         req,
         floor,
         now_unix,
+        pre_resolved,
         &mut seen,
         resolved_assets,
     )
@@ -582,6 +614,7 @@ fn install_inner(
     req: &InstallRequest,
     floor: BuildFloor,
     now_unix: i64,
+    pre_resolved: Option<TrustedIndex>,
     seen: &mut BTreeMap<String, Option<DepResult>>,
     resolved_assets: &mut BTreeMap<String, String>,
 ) -> Result<InstallReport, FlowError> {
@@ -590,13 +623,19 @@ fn install_inner(
     if crate::linkmode::is_linked(layout, program) {
         return Err(FlowError::Linked(program.to_string()));
     }
-    if let Some(spec) = crate::vendor_direct::spec(program)
+    let mut resolved_index = pre_resolved;
+    if resolved_index.is_none()
+        && let Some(spec) = crate::vendor_direct::spec(program)
         && !crate::alab::agent(program).is_some_and(|agent| {
             agent.serves(triple)
                 && resolve_verified_index(fetcher, layout, anchor, floor, now_unix)
                     .ok()
                     .is_some_and(|index| {
-                        crate::alab::index_owns(layout, program, triple, Some(&index))
+                        let owns = crate::alab::index_owns(layout, program, triple, Some(&index));
+                        if owns {
+                            resolved_index = Some(index);
+                        }
+                        owns
                     })
         })
     {
@@ -613,7 +652,10 @@ fn install_inner(
         .into_install(layout);
     }
     seen.insert(program.to_string(), None);
-    let index = resolve_verified_index(fetcher, layout, anchor, floor, now_unix)?;
+    let index = match resolved_index {
+        Some(index) => index,
+        None => resolve_verified_index(fetcher, layout, anchor, floor, now_unix)?,
+    };
     let row = index
         .program(program)
         .ok_or_else(|| FlowError::NotReachable(program.to_string(), index_roster(&index)))?;
@@ -733,6 +775,7 @@ fn install_inner(
             &dep_req,
             floor,
             now_unix,
+            None,
             seen,
             resolved_assets,
         ) {
@@ -2794,6 +2837,27 @@ pub fn rollback(
     floor: BuildFloor,
     now_unix: i64,
 ) -> Result<RollbackReport, FlowError> {
+    rollback_returning_index(
+        fetcher, layout, anchor, channel, program, excluded, floor, now_unix,
+    )
+    .map(|(report, _)| report)
+}
+
+/// [`rollback`] returning the verified [`TrustedIndex`] alongside the [`RollbackReport`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "rollback_returning_index takes the same irreducible inputs as rollback"
+)]
+pub fn rollback_returning_index(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    anchor: &Anchor,
+    channel: &str,
+    program: &str,
+    excluded: &[String],
+    floor: BuildFloor,
+    now_unix: i64,
+) -> Result<(RollbackReport, TrustedIndex), FlowError> {
     let current = *crate::ops::active_builds(layout)
         .get(program)
         .ok_or_else(|| {
@@ -2861,16 +2925,19 @@ pub fn rollback(
     } else {
         members.into_iter().filter(|m| pins.contains(m)).collect()
     };
-    Ok(RollbackReport {
-        program: program.to_string(),
-        from_build: current,
-        to_build: target,
-        index_build: index.index_build,
-        roster_seq: index.roster_seq(),
-        coherence_group,
-        held_by,
-        revoked_member,
-    })
+    Ok((
+        RollbackReport {
+            program: program.to_string(),
+            from_build: current,
+            to_build: target,
+            index_build: index.index_build,
+            roster_seq: index.roster_seq(),
+            coherence_group,
+            held_by,
+            revoked_member,
+        },
+        index,
+    ))
 }
 
 /// The transactional `update <grouped-member>` path.
@@ -2892,8 +2959,36 @@ pub fn apply_program(
     floor: BuildFloor,
     now_unix: i64,
 ) -> Result<ChannelApplyReport, FlowError> {
+    apply_program_with_index(
+        fetcher, layout, anchor, channel, triple, program, installed, excluded, floor, now_unix,
+        None,
+    )
+}
+
+/// [`apply_program`] reusing an already-verified `pre_resolved` index when the caller has one.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "apply_program_with_index threads the optional pre-verified index alongside \
+              apply_program's irreducible inputs"
+)]
+pub fn apply_program_with_index(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    anchor: &Anchor,
+    channel: &str,
+    triple: &str,
+    program: &str,
+    installed: &BTreeMap<String, u64>,
+    excluded: &[String],
+    floor: BuildFloor,
+    now_unix: i64,
+    pre_resolved: Option<TrustedIndex>,
+) -> Result<ChannelApplyReport, FlowError> {
     refuse_vendor_program(program, triple)?;
-    let index = verify_select_fresh(fetcher, layout, anchor, floor, now_unix)?;
+    let index = match pre_resolved {
+        Some(index) => index,
+        None => verify_select_fresh(fetcher, layout, anchor, floor, now_unix)?,
+    };
     let ch = index
         .channel_for(channel, triple)
         .ok_or_else(|| FlowError::NoChannel(channel.to_string()))?;
@@ -2934,8 +3029,45 @@ pub fn plan_update(
     floor: BuildFloor,
     now_unix: i64,
 ) -> Result<UpdatePlan, FlowError> {
+    plan_update_with_index(
+        fetcher,
+        layout,
+        anchor,
+        channel,
+        triple,
+        program,
+        installed_build,
+        floor,
+        now_unix,
+        None,
+    )
+    .map(|(plan, _)| plan)
+}
+
+/// [`plan_update`] reusing an already-verified `pre_resolved` index when the caller has one, and
+/// returning the verified index alongside the [`UpdatePlan`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "plan_update_with_index threads the optional pre-verified index alongside \
+              plan_update's irreducible inputs"
+)]
+pub fn plan_update_with_index(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    anchor: &Anchor,
+    channel: &str,
+    triple: &str,
+    program: &str,
+    installed_build: Option<u64>,
+    floor: BuildFloor,
+    now_unix: i64,
+    pre_resolved: Option<TrustedIndex>,
+) -> Result<(UpdatePlan, TrustedIndex), FlowError> {
     refuse_vendor_program(program, triple)?;
-    let index = verify_select_fresh(fetcher, layout, anchor, floor, now_unix)?;
+    let index = match pre_resolved {
+        Some(index) => index,
+        None => verify_select_fresh(fetcher, layout, anchor, floor, now_unix)?,
+    };
     let ch = index
         .channel_for(channel, triple)
         .ok_or_else(|| FlowError::NoChannel(channel.to_string()))?;
@@ -2943,12 +3075,15 @@ pub fn plan_update(
     let p = index
         .program(program)
         .ok_or_else(|| FlowError::NotReachable(program.to_string(), index_roster(&index)))?;
-    Ok(UpdatePlan {
-        group: p.coherence_group.clone(),
-        decision: decide(&ch, program, installed_build),
-        current_build_ok: crate::gate::current_build_ok(&ch, program, installed_build),
-        channel: ch,
-    })
+    Ok((
+        UpdatePlan {
+            group: p.coherence_group.clone(),
+            decision: decide(&ch, program, installed_build),
+            current_build_ok: crate::gate::current_build_ok(&ch, program, installed_build),
+            channel: ch,
+        },
+        index,
+    ))
 }
 
 fn refuse_vendor_program(program: &str, triple: &str) -> Result<(), FlowError> {

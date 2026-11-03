@@ -410,7 +410,7 @@ impl Scratch<'_> {
         then: impl FnOnce(&Workspace<'_>) -> io::Result<T>,
     ) -> Result<Result<T, ControlFailure>, CouldNotRun> {
         let path = self.src.join(file);
-        let original = std::fs::read_to_string(&path).map_err(io_failure("reading the copy"))?;
+        let original = crate::read_regular_text(&path).map_err(io_failure("reading the copy"))?;
         let mutated = match apply(file, &original, edits) {
             Ok(mutated) => mutated,
             Err(failure) => return Ok(Err(failure)),
@@ -443,7 +443,7 @@ impl Scratch<'_> {
         let documented = self.planted(self.cell.source, edits, |ws| {
             let (outcome, path) = ws.rustdoc(DocTarget::Shim)?;
             Ok(if outcome.success {
-                Ok(std::fs::read_to_string(path)?)
+                Ok(crate::read_regular_text(&path)?)
             } else {
                 Err(outcome)
             })

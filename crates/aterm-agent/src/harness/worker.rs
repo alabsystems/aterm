@@ -85,7 +85,14 @@ pub struct ModeFlag {
 /// Claude Code's `--permission-mode` and the modes a worker's line may name.
 pub const CLAUDE_PERMISSION_MODE: ModeFlag = ModeFlag {
     flag: "--permission-mode",
-    modes: &["default", "acceptEdits", "plan", "bypassPermissions"],
+    modes: &[
+        "default",
+        "acceptEdits",
+        "plan",
+        "auto",
+        "dontAsk",
+        "bypassPermissions",
+    ],
 };
 
 /// Claude Code's `--chrome` (2.1.311: "Enable Claude in Chrome integration"): the run drives the
@@ -96,15 +103,67 @@ pub const CLAUDE_CHROME_FLAG: &str = "--chrome";
 /// not start: a CLI's sign-in floor ([`grok::signed_out`]).
 type LoginGate = fn(&[(String, String)], Option<&Path>) -> Option<String>;
 
-/// No flag of a starter's rides: Claude Code (whose relaunch reads none).
-const fn no_flags(_: &[String]) -> Result<Vec<String>, String> {
-    Ok(Vec::new())
+/// Claude Code's plan mode, as `--permission-mode` and the pill's flag spell it.
+const CLAUDE_PLAN: &str = "plan";
+
+/// The permission flags of a Claude Code starter's argv, for its worker: a worker runs with its
+/// parent's permissions (owner ruling 2026-11-02). The last of `--dangerously-skip-permissions`
+/// and `--permission-mode` wins, as Claude Code reads them; [`claude_mode_flags`] spells a mode
+/// the starter moved to since it started. Plan mode never rides: it says what the starter is doing
+/// now, not what it may do, and a worker in it could do no work.
+fn claude_permission_flags(argv: &[String]) -> Result<Vec<String>, String> {
+    let mut mode = None;
+    let mut tokens = argv.iter().skip(1);
+    while let Some(tok) = tokens.next() {
+        match tok.as_str() {
+            "--" => break,
+            "--dangerously-skip-permissions" => mode = Some("bypassPermissions".to_string()),
+            "--permission-mode" => {
+                mode = tokens
+                    .next()
+                    .filter(|m| *m != CLAUDE_PLAN)
+                    .cloned()
+                    .or(mode);
+            }
+            other => {
+                if let Some(value) = other.strip_prefix("--permission-mode=")
+                    && value != CLAUDE_PLAN
+                {
+                    mode = Some(value.to_string());
+                }
+            }
+        }
+    }
+    Ok(mode.map_or_else(Vec::new, |mode| claude_mode_flags(&mode)))
 }
 
-/// The flags of a Codex starter's argv that move its config or say how it
-/// reaches its provider; its model, folders and approval posture stay its own,
-/// set by flag or by a `-c` of [`CODEX_OWN_KEYS`] ([`codex_flag_rides`]). A
-/// `--profile` rides whole, whatever it sets.
+/// The flags that start a Claude Code worker in `mode`, as the permission pill or a
+/// `--permission-mode` spells it.
+fn claude_mode_flags(mode: &str) -> Vec<String> {
+    match mode {
+        "bypassPermissions" => vec!["--dangerously-skip-permissions".to_string()],
+        "manual" => vec![
+            CLAUDE_PERMISSION_MODE.flag.to_string(),
+            "default".to_string(),
+        ],
+        mode => vec![CLAUDE_PERMISSION_MODE.flag.to_string(), mode.to_string()],
+    }
+}
+
+/// `starter` as its Claude Code shows itself on `rows`, its tab's screen: the mode on the pill is
+/// the one it runs in now, which a shift+tab may have moved from its argv's. A screen showing no
+/// pill (a box covers it), or plan mode's, leaves the argv's ([`claude_permission_flags`]).
+#[must_use]
+pub fn with_shown_mode(mut starter: Starter, rows: &[String]) -> Starter {
+    if let Some(mode) = super::relaunch::screen_mode(rows).filter(|m| m != CLAUDE_PLAN) {
+        starter.args = Ok(claude_mode_flags(&mode));
+    }
+    starter
+}
+
+/// The flags of a Codex starter's argv that move its config, say how it reaches its provider or
+/// say what it may do unasked; its model and folders stay its own, set by flag or by a `-c` of
+/// [`CODEX_OWN_KEYS`] ([`codex_flag_rides`]). A `--profile` rides whole, whatever it sets.
 const CODEX_CONFIG_FLAGS: &[&str] = &[
     "-c",
     "--config",
@@ -115,21 +174,19 @@ const CODEX_CONFIG_FLAGS: &[&str] = &[
     "--strict-config",
     "--oss",
     "--local-provider",
+    "-a",
+    "--ask-for-approval",
+    "--approve-for-me",
+    "-s",
+    "--sandbox",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--yolo",
+    "--not-so-yolo",
 ];
 
 /// The config keys a Codex starter's `-c`/`--config` sets that stay its own: its
-/// model (the worker's is `model=`'s), and its approval and sandbox posture (the
-/// legacy keys and the permission profiles that select a sandbox alike).
-const CODEX_OWN_KEYS: &[&str] = &[
-    "model",
-    "approval_policy",
-    "approvals_reviewer",
-    "sandbox_mode",
-    "sandbox_workspace_write",
-    "sandbox_permissions",
-    "default_permissions",
-    "permissions",
-];
+/// model (the worker's is `model=`'s).
+const CODEX_OWN_KEYS: &[&str] = &["model"];
 
 /// Whether a Codex starter's flag `name`, as `tokens` spell it, rides onto its
 /// worker's line ([`CODEX_CONFIG_FLAGS`]).
@@ -196,7 +253,7 @@ pub static WORKERS: [WorkerCli; 5] = [
         dirs: &[super::accounts::HOME_ENV, super::accounts::HOMEDIR_ENV],
         launches: Launches::Claude,
         homes: |_, _| Vec::new(),
-        flags: no_flags,
+        flags: claude_permission_flags,
         login: None,
     },
     WorkerCli {
@@ -241,7 +298,7 @@ pub static WORKERS: [WorkerCli; 5] = [
             store_build: super::upgrade_agy::store_build,
         },
         homes: |args, home| super::upgrade_agy::relaunch_env(|n| args.env_var(n), home),
-        flags: |argv| Ok(super::upgrade_agy::config_flags(argv)),
+        flags: |argv| Ok(super::upgrade_agy::worker_flags(argv)),
         login: None,
     },
     WorkerCli {
@@ -265,7 +322,7 @@ pub static WORKERS: [WorkerCli; 5] = [
         },
         homes: |args, home| super::upgrade_muse::relaunch_env(|n| args.env_var(n), home),
         flags: |argv| {
-            super::upgrade_muse::provider_flags(argv).map_err(|refusal| match refusal {
+            super::upgrade_muse::worker_flags(argv).map_err(|refusal| match refusal {
                 upgrade::ArgvRefusal::UnknownFlag(flag)
                 | upgrade::ArgvRefusal::NotResumable(flag) => flag,
             })
@@ -585,6 +642,7 @@ pub fn admit(
 pub fn starter(cli: &WorkerCli, pid: u32, home: &Path) -> Option<Starter> {
     if let Launches::Claude = cli.launches {
         let c = super::relaunch::caller_claude(pid, home)?;
+        let argv = atpkg::caller_shell::process_args(pid)?.argv;
         let env = super::relaunch::required_env(
             c.home.as_deref(),
             c.homedir.as_deref(),
@@ -596,7 +654,7 @@ pub fn starter(cli: &WorkerCli, pid: u32, home: &Path) -> Option<Starter> {
         return Some(Starter {
             exe: c.exe,
             env,
-            args: Ok(Vec::new()),
+            args: (cli.flags)(&argv),
             unset: Vec::new(),
         });
     }

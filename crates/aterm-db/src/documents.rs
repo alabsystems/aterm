@@ -18,6 +18,38 @@ pub(crate) type Cells = BTreeMap<(String, String), Cell>;
 
 /// A stop survives all later edits; a compensating absence remains a candidate
 /// so that an unseen concurrent value cannot disappear when it arrives later.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "WriteA1",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "WriteA2",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "WriteB1",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "WriteB2",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
 pub(crate) fn apply(
     index: &Index,
     cells: &mut Cells,

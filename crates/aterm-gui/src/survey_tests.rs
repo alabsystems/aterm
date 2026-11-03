@@ -766,6 +766,7 @@ fn each_level_emits_exactly_its_fields() {
         "task_rev",
         "task_from",
         "task_ms",
+        "task_conclusion",
         "model",
         "effort",
         "ctx_left_pct",

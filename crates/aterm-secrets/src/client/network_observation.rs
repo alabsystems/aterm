@@ -344,6 +344,7 @@ pub(super) fn configuration_binding(config: &Config) -> [u8; 32] {
 )]
 pub(super) fn record(
     paths: &Paths,
+    lock: &StateLock,
     requested: &Config,
     config: &Config,
     state: &mut State,
@@ -375,7 +376,7 @@ pub(super) fn record(
             .flatten()
             .map(|key| key.recipient().0)
             != Some(body.attempt.recipient)
-        || steward::local_recipient_denied_in_roster(paths)
+        || steward::local_recipient_denied_in_roster_held(paths, lock)
         || !files_intact(paths, state)
     {
         return false;

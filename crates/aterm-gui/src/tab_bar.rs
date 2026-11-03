@@ -117,6 +117,15 @@ impl TabStripMetadata {
         }
     }
 
+    /// Whether this tab shows an application rather than a terminal ([`TabIconKind::surface`]).
+    #[must_use]
+    pub(crate) const fn is_app_tab(self) -> bool {
+        matches!(
+            self.icon,
+            Some(kind) if matches!(kind.surface(), crate::tab_model::TabSurface::App)
+        )
+    }
+
     #[must_use]
     pub(crate) const fn has_status(self) -> bool {
         self.dirty || self.busy || matches!(self.attention, ChipLevel::Yours) || self.conn.is_some()
@@ -270,6 +279,24 @@ const SETTINGS_ICON: &[TabIconPrimitive] = &[
     },
 ];
 
+const SYSTEM_STATE_ICON: &[TabIconPrimitive] = &[
+    TabIconPrimitive::Line {
+        from: [3.0, 13.0],
+        to: [3.0, 9.5],
+        width: 2.25,
+    },
+    TabIconPrimitive::Line {
+        from: [8.0, 13.0],
+        to: [8.0, 6.0],
+        width: 2.25,
+    },
+    TabIconPrimitive::Line {
+        from: [13.0, 13.0],
+        to: [13.0, 3.0],
+        width: 2.25,
+    },
+];
+
 const MARKDOWN_ICON: &[TabIconPrimitive] = &[
     TabIconPrimitive::RoundedRect {
         rect: [1.5, 2.25, 13.0, 11.5],
@@ -381,6 +408,36 @@ const CODEX_ICON: &[TabIconPrimitive] = &[
     },
 ];
 
+const WORKERS_ICON: &[TabIconPrimitive] = &[
+    TabIconPrimitive::Dot {
+        center: [3.0, 4.0],
+        radius: 1.25,
+    },
+    TabIconPrimitive::Line {
+        from: [6.5, 4.0],
+        to: [14.0, 4.0],
+        width: 1.25,
+    },
+    TabIconPrimitive::Dot {
+        center: [3.0, 8.0],
+        radius: 1.25,
+    },
+    TabIconPrimitive::Line {
+        from: [6.5, 8.0],
+        to: [14.0, 8.0],
+        width: 1.25,
+    },
+    TabIconPrimitive::Dot {
+        center: [3.0, 12.0],
+        radius: 1.25,
+    },
+    TabIconPrimitive::Line {
+        from: [6.5, 12.0],
+        to: [14.0, 12.0],
+        width: 1.25,
+    },
+];
+
 const RECOVERY_ICON: &[TabIconPrimitive] = &[
     TabIconPrimitive::RoundedRect {
         rect: [2.0, 1.5, 12.0, 13.0],
@@ -421,9 +478,11 @@ pub(crate) const fn tab_icon_primitives(kind: TabIconKind) -> &'static [TabIconP
         TabIconKind::Codex => CODEX_ICON,
         TabIconKind::About => ABOUT_ICON,
         TabIconKind::Settings => SETTINGS_ICON,
+        TabIconKind::SystemState => SYSTEM_STATE_ICON,
         TabIconKind::Markdown => MARKDOWN_ICON,
         TabIconKind::Editor => EDITOR_ICON,
         TabIconKind::Recovery => RECOVERY_ICON,
+        TabIconKind::Workers => WORKERS_ICON,
     }
 }
 
@@ -1447,6 +1506,99 @@ struct StripColors {
     update_rule: [u8; 3],
     seam: Option<[u8; 3]>,
     active_rim: Option<[u8; 3]>,
+    app_active: AppTile,
+    app_quiet: AppTile,
+    app_hover: AppTile,
+    app_solo: AppTile,
+}
+
+/// The tile under an application tab's glyph: what says "application" while the chip's own marks go on saying "selected" (`docs/DESIGN-app-tabs-2026-11-02.md`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct AppTile {
+    pub(crate) fill: [u8; 3],
+    pub(crate) glyph: [u8; 3],
+}
+
+/// The tiles a macOS strip paints, which has no [`StripColors`] of its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct AppTileInks {
+    pub(crate) active: AppTile,
+    pub(crate) solo: AppTile,
+    pub(crate) quiet: AppTile,
+}
+
+/// How far the tile's source leans from the foreground toward the theme's hue.
+pub(crate) const APP_TILE_HUE: f32 = 0.35;
+/// A tile against the chip it sits on, and its glyph against the tile (WCAG 1.4.11).
+pub(crate) const APP_TILE_FLOOR: f64 = 3.0;
+/// A quiet tile against its ground: visible as a shape, without competing with a selected chip.
+pub(crate) const APP_TILE_QUIET_FLOOR: f64 = 1.30;
+/// The tile's side as a share of what it stands on: a glyph takes this much of the tile.
+pub(crate) const APP_TILE_GLYPH_SHARE: f32 = 0.70;
+/// The tile's corner radius as a share of its side.
+pub(crate) const APP_TILE_RADIUS_SHARE: f32 = 0.25;
+/// The leading mark's width and height (points) on a chip too narrow for a tile.
+pub(crate) const APP_SPINE_W_PT: f32 = 2.0;
+pub(crate) const APP_SPINE_H_PT: f32 = 12.0;
+
+const QUIET_TILE_STEPS: std::ops::RangeInclusive<u8> = 11..=25;
+
+/// The theme's near-neutral tile colour on `ground`.
+fn app_tile_source(fg: [u8; 3], tint: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
+    crate::chrome_band::ensure_contrast(
+        crate::chrome_band::mix3(fg, tint, APP_TILE_HUE),
+        ground,
+        APP_TILE_FLOOR,
+    )
+}
+
+/// A selected or solo tile: filled, its glyph cut in the ground's own tone.
+pub(crate) fn app_tile_solid(fg: [u8; 3], tint: [u8; 3], ground: [u8; 3]) -> AppTile {
+    let fill = app_tile_source(fg, tint, ground);
+    AppTile {
+        fill,
+        glyph: crate::chrome_band::ensure_contrast(ground, fill, APP_TILE_FLOOR),
+    }
+}
+
+/// An unselected tile: a quiet wash of the same colour, its glyph in that colour.
+pub(crate) fn app_tile_tonal(fg: [u8; 3], tint: [u8; 3], ground: [u8; 3]) -> AppTile {
+    use crate::chrome_band::{contrast, ensure_contrast, mix3};
+    let source = app_tile_source(fg, tint, ground);
+    let at = |step: u8| mix3(ground, source, f32::from(step) * 0.02);
+    let fill = QUIET_TILE_STEPS
+        .map(at)
+        .find(|fill| contrast(*fill, ground) >= APP_TILE_QUIET_FLOOR)
+        .unwrap_or_else(|| at(*QUIET_TILE_STEPS.end()));
+    AppTile {
+        fill,
+        glyph: ensure_contrast(source, fill, APP_TILE_FLOOR),
+    }
+}
+
+/// A tile under an OS-forced palette: system colours only, ink on `ground`.
+fn forced_app_tile(hc: crate::chrome_band::ForcedChrome, ground: [u8; 3]) -> AppTile {
+    let fill = crate::chrome_band::forced_ink(hc.window_text, ground);
+    AppTile {
+        fill,
+        glyph: ground,
+    }
+}
+
+/// The inks of the macOS strip for `palette`, with `active_ground` under a selected chip.
+pub(crate) fn native_app_tiles(
+    palette: impl Into<ChromePalette>,
+    active_ground: [u8; 3],
+) -> AppTileInks {
+    let palette = palette.into();
+    let tokens = palette.tokens();
+    let (fg, tint) = (tokens.fg, tokens.theme_tint);
+    let bg = tokens.bg;
+    AppTileInks {
+        active: app_tile_solid(fg, tint, active_ground),
+        solo: app_tile_solid(fg, tint, bg),
+        quiet: app_tile_tonal(fg, tint, bg),
+    }
 }
 
 const TAB_RIM_BELOW: f64 = 1.15;
@@ -1487,6 +1639,10 @@ fn forced_strip_colors(hc: crate::chrome_band::ForcedChrome, foot: [u8; 3]) -> S
         update_rule: plain_fg,
         seam: Some(ink(hc.window_text, hc.btn_face)),
         active_rim: None,
+        app_active: forced_app_tile(hc, hc.highlight),
+        app_quiet: forced_app_tile(hc, hc.btn_face),
+        app_hover: forced_app_tile(hc, hc.window),
+        app_solo: forced_app_tile(hc, hc.btn_face),
     }
 }
 
@@ -1628,6 +1784,10 @@ fn strip_colors_on(p: impl Into<ChromePalette>, floor: StripFloor) -> StripColor
         update_rule,
         seam,
         active_rim: selected_tab_rim(active_bg, band_bg, seam),
+        app_active: app_tile_solid(fg, tokens.theme_tint, active_bg),
+        app_quiet: app_tile_tonal(fg, tokens.theme_tint, chip_bg),
+        app_hover: app_tile_tonal(fg, tokens.theme_tint, hover_bg),
+        app_solo: app_tile_solid(fg, tokens.theme_tint, band_bg),
     }
 }
 
@@ -1705,6 +1865,7 @@ fn strip_colors_for(p: impl Into<ChromePalette>) -> StripColors {
 fn strip_colors_for_on(p: impl Into<ChromePalette>, floor: StripFloor) -> StripColors {
     let p = p.into();
     let active_override = p.authored.active_tab;
+    let tokens = p.tokens();
     let mut colors = strip_colors_on(p, floor);
     if crate::chrome_band::forced_chrome().is_some() {
         return colors;
@@ -1720,6 +1881,7 @@ fn strip_colors_for_on(p: impl Into<ChromePalette>, floor: StripFloor) -> StripC
         colors.active_rim = selected_tab_rim(active_bg, colors.band_bg, colors.seam);
         colors.update_bg = active_bg;
         colors.update_fg = active_fg;
+        colors.app_active = app_tile_solid(tokens.fg, tokens.theme_tint, active_bg);
     }
     colors
 }
@@ -1937,6 +2099,42 @@ pub(crate) fn strip_seam_rail(
         rings: Vec::new(),
         icons: Vec::new(),
     })
+}
+
+impl StripColors {
+    /// The tile a chip wears in this state.
+    /// A narrow chip's spine: it stands in the gutter beside the chip, so on the band.
+    fn app_spine(&self, active: bool, hovered: bool) -> [u8; 3] {
+        crate::chrome_band::ensure_contrast(
+            app_spine_color(self.app_tile(active, hovered), active),
+            self.band_bg,
+            APP_TILE_FLOOR,
+        )
+    }
+
+    const fn app_tile(&self, active: bool, hovered: bool) -> AppTile {
+        if active {
+            self.app_active
+        } else if hovered {
+            self.app_hover
+        } else {
+            self.app_quiet
+        }
+    }
+}
+
+/// What stands for the tile on a chip too narrow to hold one: a tile's fill is too faint at that size when quiet, so its glyph's colour.
+#[must_use]
+pub(crate) const fn app_spine_color(tile: AppTile, active: bool) -> [u8; 3] {
+    if active { tile.fill } else { tile.glyph }
+}
+
+/// Set an app tab's title bold across the cells `from..to`, in every selection state.
+fn embolden_title(row: &mut [RenderCell], from: u16, to: u16) {
+    let end = usize::from(to).min(row.len());
+    for cell in row.get_mut(usize::from(from)..end).unwrap_or_default() {
+        cell.bold = true;
+    }
 }
 
 /// Build the [`RenderCell`] for a strip cell from [`StripColors`] and [`StripRole`].
@@ -2301,13 +2499,19 @@ fn paint_strip_impl(
                         .map_or(0, |s| SOLO_GAP_COLS + strip_display_cells(s));
                 let start = seg.start_col + (span.saturating_sub(width as u16)) / 2;
                 let mut col = put_text(row, start, seg.end_col, &title, title_role);
+                let item = metadata.and_then(|items| items.get(i)).copied();
+                if item.is_some_and(TabStripMetadata::is_app_tab) {
+                    embolden_title(row, start, col);
+                }
                 if let Some(subtitle) = subtitle {
                     col = col.saturating_add(SOLO_GAP_COLS as u16);
                     put_text(row, col, seg.end_col, &subtitle, band_role);
                 }
-                let item = metadata.and_then(|items| items.get(i)).copied();
                 if let (Some(kind), true) = (item.and_then(|item| item.icon), span > 4) {
-                    append_icon_images(&mut images, seg.start_col + 1, kind, colors.fg);
+                    let tile = item
+                        .is_some_and(TabStripMetadata::is_app_tab)
+                        .then_some(colors.app_solo);
+                    append_icon_images(&mut images, seg.start_col + 1, kind, colors.fg, tile);
                 }
                 if let (Some(item), true) = (item.filter(|it| it.has_status()), span > 6) {
                     append_status_image(
@@ -2351,7 +2555,15 @@ fn paint_strip_impl(
                     } else {
                         colors.inactive_fg
                     };
-                    append_icon_images(&mut images, icon_start, kind, color);
+                    let tile = item
+                        .is_some_and(TabStripMetadata::is_app_tab)
+                        .then_some(colors.app_tile(is_active, is_hovered));
+                    append_icon_images(&mut images, icon_start, kind, color, tile);
+                } else if let Some(col) = item
+                    .filter(|item| item.is_app_tab() && layout.icon_start.is_none())
+                    .and_then(|_| layout.title_start.checked_sub(1))
+                {
+                    append_spine_image(&mut images, col, colors.app_spine(is_active, is_hovered));
                 }
                 if let (Some(item), Some(col)) = (item, layout.status_col) {
                     let ink = if is_active {
@@ -2379,7 +2591,11 @@ fn paint_strip_impl(
                         let avail = layout.title_end.saturating_sub(layout.title_start);
                         chip_cut(raw, avail as usize)
                     });
-                    put_text(row, layout.title_start, layout.title_end, &label, tab_role);
+                    let drawn_to =
+                        put_text(row, layout.title_start, layout.title_end, &label, tab_role);
+                    if item.is_some_and(TabStripMetadata::is_app_tab) {
+                        embolden_title(row, layout.title_start, drawn_to);
+                    }
                 }
                 if let Some(cx) = seg.close_col
                     && (paint.hovered == Some(i) || (STRIP_CHIP_CARDS && is_active))
@@ -2647,12 +2863,28 @@ fn status_primitives(metadata: TabStripMetadata) -> Vec<TabIconPrimitive> {
 
 /// Rasterize one icon ir to transparent straight-alpha RGBA.
 fn rasterize_icon(primitives: &[TabIconPrimitive], color: [u8; 3]) -> Vec<u8> {
+    rasterize_glyph(primitives, color, None)
+}
+
+/// The glyph's design coordinate for a tile's: the glyph shrinks about the centre, by [`APP_TILE_GLYPH_SHARE`].
+fn into_tile(design: f32) -> f32 {
+    let centre = TAB_ICON_DESIGN_SIZE * 0.5;
+    (design - centre) / APP_TILE_GLYPH_SHARE + centre
+}
+
+/// `primitives` in `color`, on `tile`'s fill where one is given.
+fn rasterize_glyph(
+    primitives: &[TabIconPrimitive],
+    color: [u8; 3],
+    tile: Option<[u8; 3]>,
+) -> Vec<u8> {
     let side = usize::from(ICON_RASTER_SIZE);
     let samples = u32::from(ICON_SUPERSAMPLE).pow(2);
     let mut rgba = vec![0u8; side * side * 4];
     for py in 0..side {
         for px in 0..side {
             let mut covered = 0u32;
+            let mut filled = 0u32;
             for sy in 0..ICON_SUPERSAMPLE {
                 for sx in 0..ICON_SUPERSAMPLE {
                     let fx = (px as f32 + (f32::from(sx) + 0.5) / f32::from(ICON_SUPERSAMPLE))
@@ -2661,16 +2893,37 @@ fn rasterize_icon(primitives: &[TabIconPrimitive], color: [u8; 3]) -> Vec<u8> {
                     let fy = (py as f32 + (f32::from(sy) + 0.5) / f32::from(ICON_SUPERSAMPLE))
                         * TAB_ICON_DESIGN_SIZE
                         / f32::from(ICON_RASTER_SIZE);
+                    let (gx, gy) = if tile.is_some() {
+                        (into_tile(fx), into_tile(fy))
+                    } else {
+                        (fx, fy)
+                    };
                     covered += u32::from(
                         primitives
                             .iter()
-                            .any(|primitive| primitive_covers(*primitive, fx, fy)),
+                            .any(|primitive| primitive_covers(*primitive, gx, gy)),
+                    );
+                    filled += u32::from(
+                        rounded_rect_signed_distance(
+                            fx,
+                            fy,
+                            [0.0, 0.0, TAB_ICON_DESIGN_SIZE, TAB_ICON_DESIGN_SIZE],
+                            TAB_ICON_DESIGN_SIZE * APP_TILE_RADIUS_SHARE,
+                        ) <= 0.0,
                     );
                 }
             }
-            let alpha = ((covered * 255 + samples / 2) / samples) as u8;
             let offset = (py * side + px) * 4;
-            rgba[offset..offset + 4].copy_from_slice(&[color[0], color[1], color[2], alpha]);
+            let ink = f32::from(((covered * 255 + samples / 2) / samples) as u8) / 255.0;
+            let pixel = match tile {
+                None => [color[0], color[1], color[2], (ink * 255.0).round() as u8],
+                Some(fill) => {
+                    let over = crate::chrome_band::mix3(fill, color, ink);
+                    let alpha = ((filled * 255 + samples / 2) / samples) as u8;
+                    [over[0], over[1], over[2], alpha]
+                }
+            };
+            rgba[offset..offset + 4].copy_from_slice(&pixel);
         }
     }
     rgba
@@ -2723,8 +2976,12 @@ fn rounded_rect_signed_distance(px: f32, py: f32, rect: [f32; 4], radius: f32) -
 }
 
 fn image_data(primitives: &[TabIconPrimitive], color: [u8; 3], cols: u16) -> Arc<ImageData> {
+    bytes_image(rasterize_icon(primitives, color), cols)
+}
+
+fn bytes_image(bytes: Vec<u8>, cols: u16) -> Arc<ImageData> {
     Arc::new(ImageData {
-        bytes: rasterize_icon(primitives, color),
+        bytes,
         format: ImageFormat::RawRgba8 {
             width: ICON_RASTER_SIZE,
             height: ICON_RASTER_SIZE,
@@ -2743,6 +3000,8 @@ fn image_data(primitives: &[TabIconPrimitive], color: [u8; 3], cols: u16) -> Arc
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum IconKey {
     Icon(TabIconKind, [u8; 3]),
+    AppTile(TabIconKind, AppTile),
+    Spine([u8; 3]),
     Status {
         dirty: bool,
         busy: bool,
@@ -2751,7 +3010,7 @@ enum IconKey {
     },
 }
 
-const ICON_MEMO_CAP: usize = 16;
+const ICON_MEMO_CAP: usize = 64;
 
 thread_local! {
     static ICON_MEMO: RefCell<Vec<(IconKey, Arc<ImageData>)>> = const { RefCell::new(Vec::new()) };
@@ -2778,10 +3037,19 @@ fn append_icon_images(
     start_col: u16,
     kind: TabIconKind,
     color: [u8; 3],
+    tile: Option<AppTile>,
 ) {
-    let image = memoized_image(IconKey::Icon(kind, color), || {
-        image_data(tab_icon_primitives(kind), color, ICON_COLS)
-    });
+    let image = match tile {
+        None => memoized_image(IconKey::Icon(kind, color), || {
+            image_data(tab_icon_primitives(kind), color, ICON_COLS)
+        }),
+        Some(tile) => memoized_image(IconKey::AppTile(kind, tile), || {
+            bytes_image(
+                rasterize_glyph(tab_icon_primitives(kind), tile.glyph, Some(tile.fill)),
+                ICON_COLS,
+            )
+        }),
+    };
     for cell_col in 0..ICON_COLS {
         images.push((
             usize::from(start_col + cell_col),
@@ -2793,6 +3061,24 @@ fn append_icon_images(
             },
         ));
     }
+}
+
+fn append_spine_image(images: &mut Vec<(usize, ImageRef)>, col: u16, color: [u8; 3]) {
+    const SPINE: &[TabIconPrimitive] = &[TabIconPrimitive::Line {
+        from: [12.0, 3.0],
+        to: [12.0, 13.0],
+        width: 3.0,
+    }];
+    let image = memoized_image(IconKey::Spine(color), || image_data(SPINE, color, 1));
+    images.push((
+        usize::from(col),
+        ImageRef {
+            image,
+            cell_row: 0,
+            cell_col: 0,
+            kitty: None,
+        },
+    ));
 }
 
 fn append_status_image(
@@ -3852,7 +4138,8 @@ pub(crate) mod pixel_band {
                     let avail = layout.title_end.saturating_sub(layout.title_start);
                     let label: String =
                         labels.get_mut(i).and_then(Option::take).unwrap_or_default();
-                    let label_face = if is_active && design.active_semibold {
+                    let label_bold = is_active || item.is_some_and(TabStripMetadata::is_app_tab);
+                    let label_face = if label_bold && design.active_semibold {
                         TextFace::UiBold
                     } else {
                         TextFace::Ui
@@ -3989,17 +4276,47 @@ pub(crate) mod pixel_band {
                         };
                         (ink, label_face)
                     };
+                    let tile = item
+                        .filter(|it| it.is_app_tab())
+                        .map(|_| colors.app_tile(is_active, is_hovered));
                     if let (Some(icon_start), Some(kind)) =
                         (layout.icon_start, item.and_then(|it| it.icon))
                     {
+                        let centre = (f32::from(icon_start) + f32::from(ICON_COLS) * 0.5) * cw;
+                        let side = ((2.0 * cw).min(band_h) * 0.85).max(6.0);
+                        let (glyph_side, glyph_ink) = match tile {
+                            Some(tile) => {
+                                prims.push(DrawPrim::Panel {
+                                    x: centre - side * 0.5,
+                                    y: cy - side * 0.5,
+                                    w: side,
+                                    h: side,
+                                    radius: side * APP_TILE_RADIUS_SHARE,
+                                    fill: rgba(tile.fill, 255),
+                                });
+                                (side * APP_TILE_GLYPH_SHARE, tile.glyph)
+                            }
+                            None => (side, ink),
+                        };
                         draw_icon_prims(
                             &mut prims,
                             tab_icon_primitives(kind),
-                            (f32::from(icon_start) + f32::from(ICON_COLS) * 0.5) * cw,
+                            centre,
                             cy,
-                            ((2.0 * cw).min(band_h) * 0.85).max(6.0),
-                            ink,
+                            glyph_side,
+                            glyph_ink,
                         );
+                    } else if tile.is_some() {
+                        let h = APP_SPINE_H_PT * scale;
+                        let w = (APP_SPINE_W_PT * scale).max(1.0);
+                        prims.push(DrawPrim::Panel {
+                            x: (f32::from(layout.title_start) * cw - w - 2.0 * scale).round(),
+                            y: (cy - h * 0.5).round(),
+                            w,
+                            h,
+                            radius: w * 0.5,
+                            fill: rgba(colors.app_spine(is_active, is_hovered), 255),
+                        });
                     }
                     if let (Some(item), Some(col)) = (item, layout.status_col) {
                         let color = status_mark_ink(item, &colors, input.palette, ink);
@@ -4019,6 +4336,15 @@ pub(crate) mod pixel_band {
                     }
                     let x0 = f32::from(layout.title_start) * cw;
                     let span_px = f32::from(avail) * cw - 1.0;
+                    let label_ground = if is_active {
+                        colors.active_bg
+                    } else if is_hovered {
+                        colors.hover_bg
+                    } else if design.quiet_cards {
+                        colors.chip_bg
+                    } else {
+                        colors.band_bg
+                    };
                     if let Some(pieces) = pieces {
                         if span_px > 1.0 {
                             draw_emoji_label(
@@ -4036,13 +4362,13 @@ pub(crate) mod pixel_band {
                                 face,
                                 variable_pen
                                     .as_ref()
-                                    .filter(|_| is_active && wants_semibold),
+                                    .filter(|_| label_bold && wants_semibold),
                                 ink,
-                                colors.active_bg,
+                                label_ground,
                             );
                         }
                     } else if span_px > 1.0 && !label.trim().is_empty() {
-                        let varied = if is_active && wants_semibold {
+                        let varied = if label_bold && wants_semibold {
                             variable_pen.as_ref().and_then(|pen| {
                                 let mut run = pen.shape(&label, label_px)?;
                                 if run.width > span_px && cut_keeps_its_end(&label) {
@@ -4063,7 +4389,7 @@ pub(crate) mod pixel_band {
                                     img_h,
                                     span_px,
                                     ink,
-                                    colors.active_bg,
+                                    label_ground,
                                 ))
                             })
                         } else {
@@ -4658,7 +4984,7 @@ pub(crate) mod pixel_band {
         quiet_cards: bool,
         /// Whether the `+` sits on a quiet chip square rather than a bare glyph.
         quiet_button: bool,
-        /// Whether the active label is semibold.
+        /// Whether the selected label and every app tab's label are semibold.
         active_semibold: bool,
     }
 
@@ -4755,7 +5081,11 @@ pub(crate) mod pixel_band {
         wants_semibold: bool,
     ) -> Vec<Option<String>> {
         let face_of = |tab: usize| {
-            if tab == active && wants_semibold {
+            let app = input
+                .metadata
+                .get(tab)
+                .is_some_and(|item| item.is_app_tab());
+            if (tab == active || app) && wants_semibold {
                 TextFace::UiBold
             } else {
                 TextFace::Ui
@@ -8427,20 +8757,219 @@ mod tests {
         );
     }
 
+    /// Every built-in theme, then palettes with nothing to borrow.
+    fn app_tile_palettes() -> Vec<(String, ChromePalette)> {
+        let mut out: Vec<(String, ChromePalette)> = aterm_types::scheme::builtin_names()
+            .iter()
+            .map(|name| {
+                let scheme = aterm_types::scheme::builtin(name).expect("listed scheme exists");
+                (
+                    (*name).to_string(),
+                    ChromePalette::from(Theme::from(&scheme)),
+                )
+            })
+            .collect();
+        let base = out[0].1;
+        for (name, bg, fg, cursor) in [
+            ("mono dark", 0x16_1616, 0xc8_c8c8, 0xa0_a0a0),
+            ("mono light", 0xf4_f4f4, 0x33_3333, 0x66_6666),
+            ("low cursor", 0x20_242c, 0xb8_c0cc, 0x26_2c3a),
+            ("mid grey", 0x77_7777, 0x88_8888, 0x80_8080),
+        ] {
+            let mut palette = base;
+            palette.theme.bg = bg;
+            palette.theme.fg = fg;
+            palette.theme.cursor = cursor;
+            palette.ansi = None;
+            out.push((name.to_string(), palette));
+        }
+        for (name, tab) in [
+            ("active mid", [0x80, 0x70, 0x60]),
+            ("active red", [0xc0, 0x20, 0x20]),
+        ] {
+            let mut palette = base;
+            palette.authored.active_tab = Some(tab);
+            out.push((name.to_string(), palette));
+        }
+        out
+    }
+
+    #[test]
+    fn app_tiles_hold_their_floors_in_every_theme_and_state() {
+        use crate::chrome_band::contrast;
+        for (name, palette) in app_tile_palettes() {
+            let c = strip_colors_for(palette);
+            for (state, tile, ground) in [
+                ("active", c.app_active, c.active_bg),
+                ("solo", c.app_solo, c.band_bg),
+            ] {
+                assert!(
+                    contrast(tile.fill, ground) >= APP_TILE_FLOOR,
+                    "{name} {state} tile"
+                );
+                assert!(
+                    contrast(tile.glyph, tile.fill) >= APP_TILE_FLOOR,
+                    "{name} {state} glyph"
+                );
+            }
+            for (state, tile, ground) in [
+                ("quiet", c.app_quiet, c.chip_bg),
+                ("hover", c.app_hover, c.hover_bg),
+            ] {
+                assert!(
+                    contrast(tile.fill, ground) >= APP_TILE_QUIET_FLOOR,
+                    "{name} {state} tile"
+                );
+                assert!(
+                    contrast(tile.glyph, tile.fill) >= APP_TILE_FLOOR,
+                    "{name} {state} glyph"
+                );
+            }
+            assert!(
+                contrast(c.app_quiet.glyph, c.chip_bg) >= APP_TILE_FLOOR,
+                "{name}: the narrow chip's spine takes the quiet glyph's ink"
+            );
+            assert_ne!(c.app_active.fill, c.app_quiet.fill, "{name}: states differ");
+            for (active, hovered) in [(true, false), (false, true), (false, false)] {
+                assert!(
+                    contrast(c.app_spine(active, hovered), c.band_bg) >= APP_TILE_FLOOR,
+                    "{name}: a spine stands on the band"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_macos_inks_come_from_the_theme_not_the_system_accent() {
+        for (name, palette) in app_tile_palettes() {
+            let tokens = palette.tokens();
+            let inks = native_app_tiles(palette, tokens.bg);
+            assert_eq!(
+                inks.quiet,
+                app_tile_tonal(tokens.fg, tokens.theme_tint, tokens.bg),
+                "{name}"
+            );
+            assert_eq!(
+                inks.solo,
+                app_tile_solid(tokens.fg, tokens.theme_tint, tokens.bg),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_app_tabs_title_is_bold_whether_or_not_it_is_selected() {
+        let theme = Theme::default();
+        let app = TabStripMetadata {
+            icon: Some(TabIconKind::SystemState),
+            ..PLAIN_TAB
+        };
+        let metadata = [PLAIN_TAB, PLAIN_TAB, app];
+        let titles = ["zero", "one", "two"].map(str::to_string);
+        for active in 0..metadata.len() {
+            let segments = layout_segments_with_metadata(90, 3, &metadata, active, false);
+            let mut row = vec![blank_cell(theme); 90];
+            paint_strip_with_metadata(
+                &mut row,
+                &segments,
+                &titles,
+                &metadata,
+                StripPaint {
+                    hovered: None,
+                    new_tab_hovered: false,
+                    version_hovered: false,
+                    caption_hovered: None,
+                    subtitle: None,
+                    rename: None,
+                },
+                active,
+                theme,
+                None,
+            );
+            for (tab, title) in titles.iter().enumerate() {
+                let segment = segments
+                    .iter()
+                    .find(|segment| matches!(segment.kind, TabHit::Select(i) if i == tab))
+                    .expect("every tab has a chip");
+                let span = usize::from(segment.start_col)..usize::from(segment.end_col);
+                let letters: Vec<&RenderCell> = row[span]
+                    .iter()
+                    .filter(|cell| title.contains(cell.ch))
+                    .collect();
+                assert_eq!(letters.len(), title.len(), "{title} with {active} selected");
+                let want = tab == active || metadata[tab].is_app_tab();
+                assert!(
+                    letters.iter().all(|cell| cell.bold == want),
+                    "{title} with {active} selected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_tab_is_an_app_by_its_kinds_surface_not_by_wearing_an_icon() {
+        let with = |icon| TabStripMetadata { icon, ..PLAIN_TAB };
+        assert!(!with(None).is_app_tab());
+        assert!(
+            !with(Some(TabIconKind::Codex)).is_app_tab(),
+            "a program in a terminal"
+        );
+        for kind in TabIconKind::ALL
+            .into_iter()
+            .filter(|k| *k != TabIconKind::Codex)
+        {
+            assert!(with(Some(kind)).is_app_tab(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn every_icon_kind_rasters_its_own_glyph() {
+        let rasters: Vec<_> = TabIconKind::ALL
+            .iter()
+            .map(|kind| rasterize_icon(tab_icon_primitives(*kind), [255, 255, 255]))
+            .collect();
+        for (i, a) in rasters.iter().enumerate() {
+            for b in &rasters[i + 1..] {
+                assert_ne!(a, b, "two icon kinds draw alike");
+            }
+        }
+    }
+
+    #[test]
+    fn a_tile_paints_its_fill_and_glyph_and_leaves_its_corners_clear() {
+        let tile = AppTile {
+            fill: [10, 20, 30],
+            glyph: [200, 210, 220],
+        };
+        let mut images = Vec::new();
+        append_icon_images(
+            &mut images,
+            0,
+            TabIconKind::SystemState,
+            tile.glyph,
+            Some(tile),
+        );
+        let bytes = &images[0].1.image.bytes;
+        let side = usize::from(ICON_RASTER_SIZE);
+        let at = |x: usize, y: usize| &bytes[(y * side + x) * 4..(y * side + x) * 4 + 4];
+        assert_eq!(at(0, 0)[3], 0, "the rounded corner shows the chip");
+        assert_eq!(at(side / 8, side / 2), &[10, 20, 30, 255][..], "the fill");
+        assert!(
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[..3] == tile.glyph),
+            "the glyph stands on the fill"
+        );
+    }
+
     #[test]
     fn memoized_strip_glyphs_match_a_fresh_raster_for_every_key() {
-        let kinds = [
-            TabIconKind::Codex,
-            TabIconKind::About,
-            TabIconKind::Settings,
-            TabIconKind::Markdown,
-            TabIconKind::Editor,
-            TabIconKind::Recovery,
-        ];
         for color in [[213u8, 219, 255], [255, 180, 64]] {
-            for kind in kinds {
+            for kind in TabIconKind::ALL {
                 let mut images = Vec::new();
-                append_icon_images(&mut images, 0, kind, color);
+                append_icon_images(&mut images, 0, kind, color, None);
                 let expected = rasterize_icon(tab_icon_primitives(kind), color);
                 assert_eq!(images.len(), usize::from(ICON_COLS));
                 for (_, placed) in &images {

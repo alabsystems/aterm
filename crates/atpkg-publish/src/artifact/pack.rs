@@ -276,14 +276,16 @@ pub fn held_to_harness(program: &str, h: Harness, mut meta: Metadata) -> Result<
 /// A harness pack's version: the release line `own` with the dev build's `+g<sha>`, where
 /// `sha` is `git rev-parse --short=9` of the commit built.
 /// # Errors
-/// A refusal when `own` is not a release line or `sha` is not at least 9 lowercase hex.
+/// A refusal when `own` is not a release line or `sha` is not 9..=40 lowercase hex.
 pub fn dev_version(own: &str, sha: &str) -> Result<String> {
     if !is_release_line(own) {
         return Err(Error::refused(format!("`{own}` is not MAJOR.MINOR.0")));
     }
-    if sha.len() < 9 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+    if !(9..=40).contains(&sha.len())
+        || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
         return Err(Error::refused(format!(
-            "`{sha}` is not a short commit sha (9 or more lowercase hex)"
+            "`{sha}` is not a short commit sha (9 to 40 lowercase hex)"
         )));
     }
     Ok(format!("{own}+g{sha}"))
@@ -370,6 +372,11 @@ pub fn harness_identity(
         )));
     }
     let sha = crate::git::run(checkout, &["rev-parse", "--short=9", "HEAD"])?;
+    if !head.starts_with(&sha) {
+        return Err(Error::refused(
+            "the harness source changed during the build; refusing its artifact",
+        ));
+    }
     let identity = HarnessIdentity {
         source: head,
         build_number: count,
@@ -377,19 +384,6 @@ pub fn harness_identity(
     };
     identity.recheck(checkout)?;
     Ok((meta, identity))
-}
-
-fn mint_harness(
-    host: &dyn ReleaseHost,
-    program: &str,
-    h: Harness,
-    meta: Metadata,
-    checkout: &Path,
-    build: Build,
-    source: (&str, &str),
-) -> Result<(Metadata, String)> {
-    let (meta, identity) = harness_identity(host, program, h, meta, checkout, Some(build), source)?;
-    Ok((meta, identity.version))
 }
 
 /// The workspace members' freshly built bin executables, from a `--message-format=json` stream: sorted, each once.
@@ -405,12 +399,18 @@ pub fn built_executables(stream: &[u8], meta: &Metadata) -> Vec<PathBuf> {
             .and_then(|t| t.get("kind"))
             .and_then(aterm_json::Value::as_array)
             .is_some_and(|k| k.iter().any(|s| s.as_str() == Some("bin")));
+        let not_test = v
+            .get("profile")
+            .and_then(|p| p.get("test"))
+            .and_then(aterm_json::Value::as_bool)
+            != Some(true);
         let member = v
             .get("manifest_path")
             .and_then(aterm_json::Value::as_str)
             .is_some_and(|m| meta.manifests.contains(m));
         if v.get("reason").and_then(aterm_json::Value::as_str) == Some("compiler-artifact")
             && is_bin
+            && not_test
             && member
             && let Some(exe) = v.get("executable").and_then(aterm_json::Value::as_str)
         {
@@ -829,7 +829,10 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
     let base = request
         .merge_from
         .as_ref()
-        .map(|p| std::fs::read(p).map_err(|e| Error::io(format!("read {}", ctx.shown(p)), &e)))
+        .map(|p| {
+            crate::identity::read_regular_bytes(p, crate::identity::MAX_META_BYTES)
+                .map_err(|e| Error::io(format!("read {}", ctx.shown(p)), &e))
+        })
         .transpose()?;
 
     let tc = toolchain::resolve(ctx, request.toolchain.as_deref())?;
@@ -876,24 +879,31 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
              updating user's PATH. Use `atpkg-publish pack-bundle {program}`"
         )));
     }
-    let (meta, version) = match def.harness() {
-        Some(h) => mint_harness(
-            ctx.hosts.staging.as_ref(),
-            program,
-            h,
-            meta,
-            &request.checkout,
-            build_number,
-            (&ctx.accounts.staging, def.repo),
-        )?,
+    let (meta, version, harness_id) = match def.harness() {
+        Some(h) => {
+            let (meta, identity) = harness_identity(
+                ctx.hosts.staging.as_ref(),
+                program,
+                h,
+                meta,
+                &request.checkout,
+                Some(build_number),
+                (&ctx.accounts.staging, def.repo),
+            )?;
+            let version = identity.version.clone();
+            (meta, version, Some(identity))
+        }
         None => {
             let version = meta.version.clone();
-            (meta, version)
+            (meta, version, None)
         }
     };
     pkgdoc::check_exposes(program, &meta.expose)?;
-    let harness_version = def.harness().map(|_| version.as_str());
+    let harness_version = harness_id.as_ref().map(|id| id.version.as_str());
     let exes = build(tools, &tc, request, &meta, &stage_dir, harness_version)?;
+    if let Some(identity) = &harness_id {
+        identity.recheck(&request.checkout)?;
+    }
     let gated = arch::gate(request.triple, &exes)?;
     eprintln!(
         "atpkg-publish: arch gate OK — {gated} binary(ies) are {} as claimed ({})",
@@ -937,6 +947,9 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
         Some(bytes) => pkgdoc::merge(bytes, &header, &row)?,
         None => pkgdoc::fresh(&header, &row)?,
     };
+    if let Some(identity) = &harness_id {
+        identity.recheck(&request.checkout)?;
+    }
     let pkg = stage_dir.join(pkgdoc::manifest_name(program, build_number));
     let signature = write_manifest(ctx, &doc, &header, &row, &pkg, signer.as_ref())?;
 
@@ -981,7 +994,7 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let request = parse_args(&mut ctx, args, &HostTools)?;
     let ctx = &ctx;
     if request.upload {
-        super::upload::token_preflight(ctx)?;
+        super::upload::program_preflight(ctx, &request.program)?;
     }
     let outcome = Pack.pack(ctx, &request)?;
     println!(

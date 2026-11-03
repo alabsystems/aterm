@@ -285,6 +285,13 @@ pub trait ScreenReader: Sync {
     fn background_rest(&self, _rows: &[String]) -> Option<Phase> {
         None
     }
+    /// The agent's own background work this screen names with its turn over, in
+    /// [`Self::background_wait`]'s words: the stall canary then holds the agent's words to it, and
+    /// on `None` only the agent's title can say it rests. Claude Code's wait reaches further than
+    /// this ([`crate::phase::work_left`]).
+    fn work_left(&self, rows: &[String]) -> Option<&'static str> {
+        self.background_wait(rows)
+    }
     /// Whether the last turn's end is hidden off-screen while the session rests idle.
     fn end_hidden(&self, _rows: &[String]) -> bool {
         false
@@ -565,6 +572,9 @@ impl ScreenReader for ClaudeReader {
     }
     fn background_rest(&self, rows: &[String]) -> Option<Phase> {
         crate::phase::background_rest(rows)
+    }
+    fn work_left(&self, rows: &[String]) -> Option<&'static str> {
+        crate::phase::work_left(rows)
     }
     fn context(&self, rows: &[String]) -> Option<u8> {
         context_left(rows)

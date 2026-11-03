@@ -26,7 +26,7 @@ fn win_resources(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     if tree.corpus.get(BUILD_RS).is_none() && !tree.root.join(CARGO_TOML).is_file() {
         return;
     }
-    match std::fs::read_to_string(tree.root.join(MANIFEST)) {
+    match crate::tree::read_to_string(&tree.root.join(MANIFEST)) {
         Ok(raw) => check_manifest(&raw, out),
         Err(e) => out.push(finding(
             MANIFEST,
@@ -34,7 +34,7 @@ fn win_resources(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             format!("cannot read embedded Win32 manifest ({e})"),
         )),
     }
-    match std::fs::read(tree.root.join(ICON)) {
+    match crate::tree::read_bytes(&tree.root.join(ICON)) {
         Ok(bytes) => check_icon(&bytes, out),
         Err(e) => out.push(finding(
             ICON,

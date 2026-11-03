@@ -68,7 +68,7 @@ impl Scratch {
             astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
         })
         .collect();
-        std::fs::write(dir.path().join("node.cap"), cap).expect("cap file");
+        harness::write_cap(&dir.path().join("node.cap"), cap);
         Self { dir }
     }
 
@@ -1173,8 +1173,17 @@ struct Tail {
 
 impl Tail {
     fn spawn(s: &Scratch, args: &[&str]) -> Self {
+        Self::spawn_in(s, args, None)
+    }
+
+    /// [`Self::spawn`] with `TZ` set to `zone`, when one is named.
+    fn spawn_in(s: &Scratch, args: &[&str], zone: Option<&str>) -> Self {
         use aterm_uds::spawnfd::InheritNothing as _;
-        let mut child = fabric_cmd(s, Some(&s.command(&s.sock(), false)), args)
+        let mut cmd = fabric_cmd(s, Some(&s.command(&s.sock(), false)), args);
+        if let Some(zone) = zone {
+            cmd.env("TZ", zone);
+        }
+        let mut child = cmd
             .inherit_nothing()
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1252,6 +1261,132 @@ fn tail_replays_from_an_offset_hides_bodies_and_follows_live() {
     let rows = tail_rows(&live, 1);
     assert!(rows[0].starts_with(&format!("@{}", new[0])), "{rows:#?}");
     assert!(rows[0].contains(" report "), "{rows:#?}");
+}
+
+/// EVERY VIEW OF THE BUS NAMES A ROW'S OWN OFFSET ACROSS A CLOCK CHANGE: `tail`, `status`'s TRAFFIC
+/// and a person's `inbox`, off a real broker through the OS timezone reader, show each row at
+/// its own offset. A private TZif file changes from -02:00 to -03:00 at a fixed 2019 instant
+/// and stays there, independent of future timezone-policy updates. Both rows read 23:30 on the
+/// 16th. CONTROL: under UTC the two rows are an hour apart and neither is named.
+#[test]
+fn every_view_names_a_rows_own_offset_across_a_clock_change() {
+    const CHANGE_MS: u64 = 1_550_368_800_000; // 2019-02-17T02:00:00Z
+    const PERSON: &str = "h-review";
+    let s = Scratch::new("zones");
+    // TZif v2: one transition, two standard offsets, and a fixed final POSIX rule.
+    // Supply both widths for OS readers; the wide block and footer also cover dates past 2038.
+    let mut tzif = Vec::new();
+    for wide in [false, true] {
+        tzif.extend_from_slice(b"TZif2");
+        tzif.extend_from_slice(&[0; 15]);
+        for count in [0u32, 0, 0, 1, 2, 4] {
+            tzif.extend_from_slice(&count.to_be_bytes());
+        }
+        let transition = CHANGE_MS / 1000;
+        if wide {
+            tzif.extend_from_slice(&i64::try_from(transition).unwrap().to_be_bytes());
+        } else {
+            tzif.extend_from_slice(&i32::try_from(transition).unwrap().to_be_bytes());
+        }
+        tzif.push(1);
+        for offset in [-7200i32, -10800] {
+            tzif.extend_from_slice(&offset.to_be_bytes());
+            tzif.extend_from_slice(&[0, 0]);
+        }
+        tzif.extend_from_slice(b"FIX\0");
+    }
+    tzif.extend_from_slice(b"\nFIX3\n");
+    let zone_file = s.path("fixed.tzif");
+    std::fs::write(&zone_file, tzif).expect("fixed timezone");
+    let fixed_zone = format!(":{zone_file}");
+    let _broker = Broker::spawn(&s);
+    let cap: String = aterm_link::enable::person_grants("t1", PERSON)
+        .iter()
+        .map(|g| {
+            let c = astream_cap::mint(SECRET, g).expect("mint");
+            astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
+        })
+        .collect();
+    let cap_file = s.path("person.cap");
+    std::fs::write(&cap_file, cap).expect("cap file");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cap_file, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 600");
+    }
+    let (before, after) = (CHANGE_MS - 1_800_000, CHANGE_MS + 1_800_000);
+    let row = |t: u64, text: &str| {
+        (
+            format!("/f/t1/in/p/{PERSON}/n-00000000000000aa/note"),
+            format!("v=1 t={t} text={text}"),
+        )
+    };
+    let offs = publish(&s.sock(), &[row(before, "before"), row(after, "after")]);
+    let command = s.command(&s.sock(), false);
+    // What a row says between its offset and its kind.
+    let time = |rows: &[String], off: u64| -> String {
+        let at = format!("@{off}");
+        let row = rows
+            .iter()
+            .find(|r| r.split_whitespace().next() == Some(at.as_str()))
+            .unwrap_or_else(|| panic!("no {at} in {rows:#?}"));
+        row.split_whitespace()
+            .skip(1)
+            .take_while(|w| *w != "note")
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let lines = |text: &str| -> Vec<String> { text.lines().map(str::to_owned).collect() };
+    for (zone, header, pre, post) in [
+        (
+            fixed_zone.as_str(),
+            "times UTC-03:00",
+            "02-16T23:30 UTC-02:00",
+            "02-16T23:30",
+        ),
+        ("UTC", "times UTC+00:00", "02-17T01:30", "02-17T02:30"),
+    ] {
+        let tail = Tail::spawn_in(&s, &["tail", "--from", "0"], Some(zone));
+        let rows = tail_rows(&tail, 2);
+        assert_eq!(time(&rows, offs[0]), pre, "tail under {zone}: {rows:#?}");
+        assert_eq!(time(&rows, offs[1]), post, "tail under {zone}: {rows:#?}");
+
+        let Output { stdout, .. } = harness::output_within(
+            fabric_cmd(&s, Some(&command), &["status"]).env("TZ", zone),
+            "aterm fabric status",
+        );
+        let status = String::from_utf8_lossy(&stdout).into_owned();
+        assert!(status.contains(header), "status under {zone}:\n{status}");
+        let rows = lines(&status);
+        assert_eq!(time(&rows, offs[0]), pre, "status under {zone}:\n{status}");
+        assert_eq!(time(&rows, offs[1]), post, "status under {zone}:\n{status}");
+
+        let Output { stdout, stderr, .. } = harness::output_within(
+            fabric_cmd(
+                &s,
+                Some(&command),
+                &["inbox", "--peek", "--cap-file", &cap_file],
+            )
+            .env("TZ", zone),
+            "aterm fabric inbox",
+        );
+        let (inbox, said) = (
+            String::from_utf8_lossy(&stdout).into_owned(),
+            String::from_utf8_lossy(&stderr).into_owned(),
+        );
+        assert!(said.contains(header), "inbox under {zone}:\n{said}");
+        let rows = lines(&inbox);
+        assert_eq!(
+            time(&rows, offs[0]),
+            pre,
+            "inbox under {zone}:\n{inbox}\n{said}"
+        );
+        assert_eq!(
+            time(&rows, offs[1]),
+            post,
+            "inbox under {zone}:\n{inbox}\n{said}"
+        );
+    }
 }
 
 /// A RECORD WITH NO `text=` TAILS AS ITS FIELDS (fix unit E5, E2E-10): a session's presence

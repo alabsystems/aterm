@@ -1483,6 +1483,35 @@ fn is_idle_notice(said: &str) -> bool {
         && words.next().is_none_or(|w| w == "·")
 }
 
+/// Claude Code's row for a task the compaction restored, `line` its rows rejoined: `⏺ Task "…" `
+/// and the task's status, in the words its renderer gives it and in no others (read in the 2.1.310,
+/// 2.1.312, 2.1.314 and 2.1.316 binaries: `running` is `still running in background`, `completed`
+/// is `completed in background`, `killed` is `stopped`, and any other status is drawn as its own
+/// word, `failed` or `pending`). A reply that opens `Task "…"` goes on in words of its own.
+fn is_task_status(line: &str) -> bool {
+    let drawn = |status: &str| {
+        [
+            const { crate::anchor!("turn.task_running") },
+            const { crate::anchor!("turn.task_completed") },
+            const { crate::anchor!("turn.task_stopped") },
+        ]
+        .contains(&status)
+            || (!status.is_empty() && status.bytes().all(|b| b.is_ascii_lowercase()))
+    };
+    line.strip_prefix(['⏺', '●'])
+        .map(str::trim_start)
+        .and_then(|row| row.strip_prefix(const { crate::anchor!("turn.task_status") }))
+        .and_then(|rest| rest.rsplit_once("\" "))
+        .is_some_and(|(task, status)| !task.is_empty() && drawn(status))
+}
+
+/// The row `line` (its rows rejoined) is an idle compaction's notice: a compaction an earlier one
+/// left as the conversation's last words is no turn either.
+fn is_idle_notice_row(line: &str) -> bool {
+    line.strip_prefix(['⏺', '●'])
+        .is_some_and(|said| is_idle_notice(said.trim_start()))
+}
+
 fn before_idle_compaction(rows: &[String], head: usize) -> usize {
     let recap = const { crate::anchor!("turn.recap") };
     let mut k = head;
@@ -1511,7 +1540,9 @@ fn before_idle_compaction(rows: &[String], head: usize) -> usize {
             Some(i)
                 if rows[i]
                     .strip_prefix('※')
-                    .is_some_and(|rest| rest.trim_start().starts_with(recap)) =>
+                    .is_some_and(|rest| rest.trim_start().starts_with(recap))
+                    || is_task_status(&crate::wrap::rejoined(&rows[i..k]))
+                    || is_idle_notice_row(&crate::wrap::rejoined(&rows[i..k])) =>
             {
                 k = i;
             }
@@ -1521,12 +1552,16 @@ fn before_idle_compaction(rows: &[String], head: usize) -> usize {
     k
 }
 
+/// Where the rows Claude Code's idle compaction drew begin, its notice being the last thing said.
+pub(crate) fn idle_compaction_from(rows: &[String]) -> Option<usize> {
+    let (head, said) = message_at(rows, last_said_index(rows)?)?;
+    is_idle_notice(&said).then(|| before_idle_compaction(rows, head))
+}
+
 /// Returns whether the last turn ended on Claude Code's idle context-compaction notice.
 #[must_use]
 pub fn idle_compacted(rows: &[String]) -> bool {
-    last_said_index(rows)
-        .and_then(|last| message_at(rows, last))
-        .is_some_and(|(_, said)| is_idle_notice(&said))
+    idle_compaction_from(rows).is_some()
 }
 
 /// Returns whether the last turn was interrupted by the user (`⎿  Interrupted`).
@@ -2650,6 +2685,80 @@ mod tests {
         );
         assert!(idle_compacted(&alone));
         assert_eq!(said_tail(&alone), None);
+    }
+
+    /// A TASK'S ROW UNDER AN IDLE COMPACTION IS CLAUDE CODE'S, NEVER THE WORKER'S LAST WORDS (the
+    /// tab of 2026-10-27, whose last words read `Task "…" still running in background`). The
+    /// control: a message of the worker's that has not that row's shape stays its last words, one
+    /// that opens `Task "…"` and goes on in words the renderer never gives a status included.
+    #[test]
+    fn a_task_row_under_an_idle_compaction_is_no_last_word() {
+        use crate::prompt::fixtures::IDLE_COMPACTED_OVER_A_SHELL_2_1_312;
+        let measured = screen(IDLE_COMPACTED_OVER_A_SHELL_2_1_312);
+        assert!(idle_compacted(&measured));
+        assert!(
+            said_tail(&measured).is_some_and(|said| said.starts_with("Lint and the cross-OS")),
+            "{:?}",
+            said_tail(&measured)
+        );
+        let foot = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        let compacted = |task: &[&str]| {
+            let mut body = vec![
+                "⏺ Merged the fix.",
+                "",
+                "✻ Worked for 57s · done 4:28 PM · 1 shell still running",
+                "  ⎿  Read ../.claude/projects/-Users-user00-aterm/memory/notes.md (33 lines)",
+                "",
+            ];
+            body.extend(task);
+            body.extend([
+                "  ⎿  Skills restored (workflow-authoring)",
+                "",
+                "⏺ Compacted while idle, before the prompt cache expired",
+                "",
+            ]);
+            framed(&body, foot)
+        };
+        for task in [
+            &["⏺ Task \"Lint the tree\" still running in background"][..],
+            &["● Task \"Lint the tree\" still running in background"],
+            &["⏺ Task \"Lint the tree\" completed in background"],
+            &["⏺ Task \"Lint the tree\" stopped"],
+            &["⏺ Task \"Lint the tree\" failed"],
+            &["⏺ Task \"Lint the \"landed\" tree\" still running in background"],
+            &[
+                "⏺ Task \"Lint the tree and the cross cells on it\" still running in",
+                "  background",
+            ],
+            &[
+                "⏺ Task \"Lint the tree and the cross cells on the tree",
+                "  that landed\" still running in background",
+            ],
+            &[
+                "⏺ Task \"Lint the tree\" still running in background",
+                "",
+                "⏺ Task \"Soak the tree\" still running in background",
+            ],
+        ] {
+            let rows = compacted(task);
+            assert_eq!(
+                said_tail(&rows).as_deref(),
+                Some("Merged the fix."),
+                "{task:?}"
+            );
+        }
+        for (mine, said) in [
+            ("⏺ Task list is done.", "Task list is done."),
+            ("⏺ Task \"Lint the tree\"", "Task \"Lint the tree\""),
+            ("⏺ Task \"\" stopped", "Task \"\" stopped"),
+            (
+                "⏺ Task \"lint\" is what I ran; it landed clean.",
+                "Task \"lint\" is what I ran; it landed clean.",
+            ),
+            ("⏺ Task \"lint\" Failed", "Task \"lint\" Failed"),
+        ] {
+            assert_eq!(said_tail(&compacted(&[mine])).as_deref(), Some(said));
+        }
     }
 
     #[test]

@@ -16,8 +16,9 @@ pub const USAGE: &str = "aterm-release — the `targo --unverified ship` release
 
 USAGE
   targo --unverified ship release status [--json]
-      Read this clone's current or latest release, first reported failure, log
-      paths and validation timing without starting, resuming or building it.
+      Read this clone's current or latest release, unfinished verification stages,
+      first reported failure, log paths and validation timing without starting,
+      resuming or building it. Older logs leave stage activity unobserved.
 
   targo --unverified ship accept-measure-failure REPORT REASON
       Only on the owner's explicit instruction to ship the known measurement defect:
@@ -69,6 +70,13 @@ USAGE
                            vX.Y.Z (its draft or uploads, its origin tag, its
                            journal; the claim commit stays). Only the claim's
                            own cutter can abandon its cut
+
+  targo --unverified ship stage-local --assets DIRECTORY --host-pid PID
+                 --expect-build N --expect-commit SEALEDSTAMP [--stage]
+      Check canonical private-cut assets through the ordinary pinned-roster updater
+      and full bundle verifier in scratch. --stage atomically publishes only the
+      verified updater stage, eligible for existing host automation. The tool never
+      invokes apply or publishes a release.
 
   targo --unverified ship build
       The one build of a release bundle: both slices at once from a snapshot of
@@ -170,6 +178,12 @@ USAGE
                            macOS guards (~/Downloads) raises a dialog
         --check            audit only: nothing provisioned, minted or written;
                            exits non-zero while anything is open
+
+  targo --unverified ship provision --id <existing-id> --roster-only --roster <public-pair-path> [--check]
+        --roster-only      restore only the canonical public roster pair for an existing
+                           signer; verify the newest of dist/, kept and --roster under
+                           pinned masters and require current cut authority. No keys,
+                           credentials or services are acquired. --check writes nothing.
 
   targo --unverified ship status        what a cut signs with · version · next cut ·
                            ledger tail · journaled cut · newest published build ·
@@ -332,6 +346,12 @@ USAGE
                            commit, push, deploy and check it live. The release's
                            after-cut step runs it as --latest. Flags and exit
                            codes: `ship site --help`
+  targo --unverified ship site --check-key [--site-dir DIR]
+                           authenticate the configured service-account key with
+                           Google without building or deploying the website
+  targo --unverified ship site --check-access [--site-dir DIR]
+                           read the Hosting site and test its update permission
+                           without changing a site or IAM policy
   targo --unverified ship hook pre-promote | post-promote | transforms
                            the publication engine's hooks, run by
                            publish/pre-promote, publish/post-promote and
@@ -386,11 +406,13 @@ pub enum Cmd {
     Provision {
         id: String,
         check: bool,
+        roster: Option<std::path::PathBuf>,
         /// `--cert-dir`: the visible folder the browser errand may use.
         cert_dir: Option<std::path::PathBuf>,
     },
     /// `release`: the one release command ([`crate::release`]).
     Release(crate::release::ReleaseOptions),
+    StageLocal(Vec<String>),
     Status,
     ReleaseStatus {
         json: bool,
@@ -603,6 +625,8 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
         "provision" => {
             let mut id: Option<String> = None;
             let mut check = false;
+            let mut roster_only = false;
+            let mut roster = None;
             let mut cert_dir: Option<std::path::PathBuf> = None;
             while let Some(flag) = it.next() {
                 match flag {
@@ -617,6 +641,17 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                         );
                     }
                     "--check" => check = true,
+                    "--roster-only" => roster_only = true,
+                    "--roster" => {
+                        if roster.is_some() {
+                            return Err("--roster given twice".into());
+                        }
+                        let path = it
+                            .next()
+                            .filter(|p| !p.is_empty())
+                            .ok_or("--roster needs a public roster path")?;
+                        roster = Some(std::path::PathBuf::from(path));
+                    }
                     "--cert-dir" => {
                         if cert_dir.is_some() {
                             return Err("--cert-dir given twice".to_string());
@@ -638,12 +673,20 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                 "provision needs --id <machine-id> — the roster name this machine signs \
                  under (e.g. targo --unverified ship provision --id m2)",
             )?;
+            if roster_only != roster.is_some() {
+                return Err("--roster-only requires --roster <public roster path>; --roster requires --roster-only".into());
+            }
+            if roster_only && cert_dir.is_some() {
+                return Err("--roster-only cannot acquire certificates (--cert-dir)".into());
+            }
             Ok(Cmd::Provision {
                 id,
                 check,
+                roster,
                 cert_dir,
             })
         }
+        "stage-local" => Ok(Cmd::StageLocal(it.map(str::to_string).collect())),
         "status" => {
             if let Some(extra) = it.next() {
                 return Err(format!("status takes no arguments (got {extra:?})"));
@@ -1091,6 +1134,7 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             );
             Ok(())
         }
+        Cmd::StageLocal(args) => crate::stage_local::run(&args),
         Cmd::Build => crate::artifact::run_build(&repo_root()?),
         Cmd::AcceptMeasure { report, reason } => {
             crate::accepted_measure::record(&repo_root()?, &report, &reason).map_err(Error::new)
@@ -1102,8 +1146,12 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
         Cmd::Provision {
             id,
             check,
+            roster,
             cert_dir,
-        } => crate::provision::run_provision(&repo_root()?, &id, check, cert_dir.as_deref()),
+        } => match roster {
+            Some(path) => crate::provision::run_roster_only(&repo_root()?, &id, check, &path),
+            None => crate::provision::run_provision(&repo_root()?, &id, check, cert_dir.as_deref()),
+        },
         Cmd::Release(opts) => match &opts.abandon {
             Some(version) => verify::run_abandon(&repo_root()?, version),
             None => match crate::release_steps::run(&repo_root()?, &opts) {
@@ -1187,4 +1235,43 @@ fn repo_root() -> ledger::Result<std::path::PathBuf> {
     }
     let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
     Ok(std::path::PathBuf::from(root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roster_only_requires_an_explicit_pair_and_cannot_acquire_certificates() {
+        let parse_flags = |flags: &[&str]| {
+            let args: Vec<String> = ["provision", "--id", "m3"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .map(str::to_string)
+                .collect();
+            parse(&args)
+        };
+        for flags in [
+            vec!["--roster-only"],
+            vec!["--roster", "/public/pair"],
+            vec![
+                "--roster-only",
+                "--roster",
+                "/public/pair",
+                "--cert-dir",
+                "/cert",
+            ],
+        ] {
+            assert!(parse_flags(&flags).is_err());
+        }
+        assert!(
+            matches!(parse_flags(&["--roster-only", "--roster", "/public/pair", "--check"]).unwrap(),
+            Cmd::Provision { check: true, roster: Some(path), cert_dir: None, .. }
+                if path == std::path::Path::new("/public/pair"))
+        );
+        assert!(matches!(
+            parse_flags(&[]).unwrap(),
+            Cmd::Provision { roster: None, .. }
+        ));
+    }
 }

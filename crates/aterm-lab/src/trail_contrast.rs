@@ -21,6 +21,9 @@ pub const CORE_SHARE: f64 = 0.70;
 pub use aterm_effects::rainbow_kitty::prism_glass::colour::{BLANK_BELOW, RING_REACH, SOLID_SHARE};
 /// The legibility bar the local measure counts pixels under (WCAG AA for text).
 pub const LEGIBLE: f64 = 4.5;
+/// The share of its own clean reading a glyph may lose before `--lowered-min` counts it as the
+/// effects' doing: the share the letter guard keeps a letter of (`letter_guard::OWN_SHARE`).
+pub const LOWERED_SHARE: f64 = 0.97;
 /// A pixel the effects changed: a channel off by more than this.
 pub const DIFF_DELTA: u8 = 12;
 /// A caret pixel: at least this ratio against the page.
@@ -31,7 +34,8 @@ const MAX_SIDE: u32 = 1 << 14;
 /// The verb's own help (`trail-contrast --help`).
 pub const HELP: &str = "\
 usage: targo --unverified lab trail-contrast <png> [--find TEXT]... [--cells ROW:COL[-COL]]... [--row N]...
-         [--newest N] [--min X] [--newest-min X] [--caret-min X] [--dims FILE | --origin X,Y --cell WxH]
+         [--newest N] [--min X] [--newest-min X] [--caret-min X] [--lowered-min X]
+         [--dims FILE | --origin X,Y --cell WxH]
          [--text FILE] [--clean PNG | --no-clean] [--cursor FILE | --caret ROW,COL] [--page RRGGBB]
 
 The WCAG contrast of the cells of an aterm capture, as JSON: the grid (from the frame's own <stem>.<frame>.dims.txt or its <stem>.dims.txt sidecar, --dims,
@@ -46,11 +50,14 @@ them) and names the worst pixel row of the glyph (each row's lower median), so a
 counts where the whole cell's median ground would hide it; local_min is its worst pixel and local_under the pixels under
 4.5:1. min_contrast and the --min and --newest-min thresholds judge local_contrast, what a reader sees round each stroke
 (the letter guard keeps the same reading), or contrast for a glyph with no ground that near. Without a twin (--no-clean)
-the coarser `extreme` method is used.
+the coarser `extreme` method is used. clean_local_contrast is local_contrast read on the twin itself: the glyph's own
+reading, low where the page draws it low (a coloured prompt segment). --lowered-min judges only what the effects did:
+a glyph under X that also reads under 97% of its own clean reading, so a page's own dim text is not the trail's.
 The sidecars trail-gallery writes (.text.txt, .cursor.txt, .clean.png, .dims.txt) are read when present.
 
 exit: 0; 1 a threshold failed (--min: a selected cell, --newest-min: a glyph left of the caret, --caret-min: the caret's
-ink against its ground; each named in `failures`); 2 a usage, file or decoding error
+ink against its ground, --lowered-min: a selected cell the effects took under it; each named in `failures`); 2 a usage,
+file or decoding error (--lowered-min with no clean twin)
 ";
 
 /// An sRGB colour.
@@ -567,6 +574,13 @@ fn measure_cell(
             ("local_px", J::Int(l.judged)),
         ]));
     }
+    if let Some(l) = solid_ink_ratios(clean, clean, b, clean_ground, extreme).map(|r| Local::of(&r))
+    {
+        out.push((
+            "clean_local_contrast".to_string(),
+            J::Float(round_to(l.worst_row, 2)),
+        ));
+    }
     out
 }
 
@@ -706,6 +720,22 @@ fn judged(cell: &J) -> Option<f64> {
     cell.get("local_contrast")
         .and_then(J::as_f64)
         .or_else(|| cell.get("contrast").and_then(J::as_f64))
+}
+
+/// What [`judged`] reads on the cell's clean twin: the glyph's own reading, with no effect drawn.
+fn clean_judged(cell: &J) -> Option<f64> {
+    cell.get("clean_local_contrast")
+        .and_then(J::as_f64)
+        .or_else(|| cell.get("clean_contrast").and_then(J::as_f64))
+}
+
+/// Whether the effects took `cell` under `bar`: it reads under it, and under [`LOWERED_SHARE`] of
+/// its own clean reading ([`clean_judged`]).
+fn lowered_under(cell: &J, bar: f64) -> bool {
+    match (judged(cell), clean_judged(cell)) {
+        (Some(now), Some(own)) => now < bar && now < own * LOWERED_SHARE,
+        _ => false,
+    }
 }
 
 /// The least share of the caret's cell its ink must cover to be read as the caret: under it (a speck,
@@ -1108,6 +1138,7 @@ pub struct Args {
     pub min: Option<f64>,
     pub newest_min: Option<f64>,
     pub caret_min: Option<f64>,
+    pub lowered_min: Option<f64>,
 }
 
 fn number<T: std::str::FromStr>(flag: &str, v: &str, kind: &str) -> Result<T, Fail> {
@@ -1152,6 +1183,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
         min: float(&mut a, "--min")?,
         newest_min: float(&mut a, "--newest-min")?,
         caret_min: float(&mut a, "--caret-min")?,
+        lowered_min: float(&mut a, "--lowered-min")?,
         png: String::new(),
     };
     if let Some(flag) = a.iter().find(|x| x.starts_with('-') && x.len() > 1) {
@@ -1306,6 +1338,12 @@ pub fn report(a: &Args) -> Result<J, String> {
             .or_else(|| sidecar(&png, ".clean.png", true));
         path.map(|p| clean_twin(&frame, &p)).transpose()?
     };
+    if a.lowered_min.is_some() && clean.is_none() {
+        return Err(
+            "--lowered-min judges what the effects did against the frame's clean twin, and there is none (--clean PNG)"
+                .to_string(),
+        );
+    }
 
     let text_path = a
         .text
@@ -1483,6 +1521,9 @@ pub fn report(a: &Args) -> Result<J, String> {
     let low_cells = a
         .min
         .map_or(0, |m| measured.iter().filter(|&&c| c < m).count());
+    let lowered_cells = a
+        .lowered_min
+        .map_or(0, |m| cells.iter().filter(|c| lowered_under(c, m)).count());
     out.set("cells", J::Arr(cells));
     out.set("min_contrast", min_contrast.map_or(J::Null, J::Float));
 
@@ -1551,12 +1592,25 @@ pub fn report(a: &Args) -> Result<J, String> {
             "{low_cells} measured glyph cell(s) under {m:.2}:1"
         )));
     }
+    if let Some(m) = a.lowered_min
+        && lowered_cells > 0
+    {
+        failures.push(J::s(format!(
+            "{lowered_cells} glyph cell(s) the effects took under {m:.2}:1"
+        )));
+    }
     if let Some(m) = a.newest_min {
         let low = newest_contrasts
             .iter()
             .filter(|c| c.unwrap_or(0.0) < m)
             .count();
-        if newest_contrasts.is_empty() || low > 0 {
+        // No glyph left of the caret is no evidence, and fails as a missing caret does under
+        // --caret-min; named as such, not as a count of glyphs under the bar.
+        if newest_contrasts.is_empty() {
+            failures.push(J::s(format!(
+                "no glyph left of the caret to judge against {m:.2}:1"
+            )));
+        } else if low > 0 {
             failures.push(J::s(format!(
                 "{low} of {} newest glyph cell(s) under {m:.2}:1",
                 newest_contrasts.len()

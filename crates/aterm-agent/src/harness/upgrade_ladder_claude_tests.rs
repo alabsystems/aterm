@@ -610,6 +610,43 @@ fn the_agents_own_work_holds_the_restart_under_any_footer_rule() {
     }
 }
 
+/// THE WORK A DONE ROW NAMES ABOVE AN IDLE COMPACTION HOLDS THE RESTART: Claude Code 2.1.312
+/// compacted an idle conversation under the done row of a turn that left work running (the tab of
+/// 2026-10-27), and its notice, a row of the transcript, is drawn between that row and the
+/// composer. A done row there that names background agents still running names work of Claude
+/// Code's own process, which no process row names and a restart would end, so the restart waits
+/// for it at every rung and its signal does not go.
+/// NEGATIVE CONTROL: the captured screen, whose done row names a shell alone (the process table's
+/// to name), holds nothing by its words.
+#[test]
+fn the_work_a_done_row_names_above_an_idle_compaction_holds_the_restart() {
+    use aterm_phase::prompt::fixtures::{IDLE_COMPACTED_OVER_A_SHELL_2_1_312, screen};
+    let captured = screen(IDLE_COMPACTED_OVER_A_SHELL_2_1_312);
+    let f = rest_look(&captured, upgrade::RUNG_LAND_S);
+    assert!(f.background.is_empty(), "{f:?}");
+    let done = captured
+        .iter()
+        .position(|r| r.starts_with("✻ Worked for 23s"))
+        .expect("the done row");
+    let mut agents = captured.clone();
+    agents[done] = "✻ Worked for 23s · done 4:57 PM · 1 shell, 2 agents still running".to_string();
+    for behind in [60, upgrade::RUNG_LAND_S] {
+        let f = rest_look(&agents, behind);
+        assert_eq!(
+            f.background,
+            ["screen:background-work-still-running"],
+            "behind {behind}s: {f:?}"
+        );
+        assert_eq!(
+            upgrade::next_step(&Phase::Pending, &f, false, NOW),
+            upgrade::Step::Wait("background"),
+            "behind {behind}s: {f:?}"
+        );
+    }
+    let signal = read(agents, 7, HumanInput::Ago(600_000));
+    assert!(!turn_over_shown(&signal, false), "the signal waits");
+}
+
 /// A Claude Code screen under a command status line (aterm's usage tap is one), CONSTRUCTED in the
 /// shape of 2.1.311's tapped mid-reply capture: the reply's rows drawn so far and no spinner or
 /// `esc to interrupt` anywhere, `status` the line the status line prints under the composer.

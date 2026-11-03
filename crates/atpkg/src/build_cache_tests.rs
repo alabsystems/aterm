@@ -3539,7 +3539,7 @@ fn the_root_the_cache_moved_from_goes_once_nothing_builds_there() {
 fn a_target_nothing_builds_in_goes_whole_and_a_held_one_stays() {
     let f = Fixture::new("build-cache-unbuilt");
     let old = f.dir("target/verify/cells.noindex");
-    let deep = old.join("win/x86_64-pc-windows-msvc/debug");
+    let deep = old.join("verify/.ubd/side-lanes/cells/win/x86_64-pc-windows-msvc/debug");
     std::fs::create_dir_all(deep.join("deps")).unwrap();
     std::fs::write(deep.join(".cargo-lock"), b"").unwrap();
     std::fs::write(deep.join("deps/x.rmeta"), b"x").unwrap();

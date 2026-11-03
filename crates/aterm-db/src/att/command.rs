@@ -107,16 +107,33 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
         match word.as_str() {
             "--show-addresses" => args.reveal = true,
             "--json" => args.json = true,
-            "--publish" => args.publish = true,
-            "--tsv" if verb == "export" => args.file = Some(value("--tsv")?),
-            "--tsv" => args.tsv = true,
-            "--request" => args.request = Some(value("--request")?),
-            "--where" => args.filters.push(Where::parse(&value("--where")?)?),
+            "--publish" if verb == "schema" => args.publish = true,
+            "--tsv" if verb == "export" => {
+                if args.file.is_some() {
+                    return Err(Error::new("export takes one --tsv <file>"));
+                }
+                args.file = Some(value("--tsv")?);
+            }
+            "--tsv" if verb == "scan" => args.tsv = true,
+            "--request" if verb == "revert" => {
+                if args.request.is_some() {
+                    return Err(Error::new("revert takes one --request <hex>"));
+                }
+                args.request = Some(value("--request")?);
+            }
+            "--where" if matches!(verb, "scan" | "export" | "edit") => {
+                args.filters.push(Where::parse(&value("--where")?)?);
+            }
             flag if flag.starts_with("--") => {
-                return Err(Error::new(&format!("{verb}: unknown option {flag}")));
+                return Err(Error::new(&format!(
+                    "{verb}: unknown option (see `aterm db table --help`)"
+                )));
             }
             operand => args.operands.push(operand.to_owned()),
         }
+    }
+    if args.tsv && args.json {
+        return Err(Error::new("scan takes either --tsv or --json"));
     }
     Ok(args)
 }
@@ -152,6 +169,22 @@ pub fn run(
         .first()
         .map(String::as_str)
         .ok_or_else(|| Error::new("missing table verb"))?;
+    if !matches!(
+        verb,
+        "ls" | "schema"
+            | "get"
+            | "scan"
+            | "history"
+            | "check"
+            | "revert"
+            | "export"
+            | "apply"
+            | "edit"
+    ) {
+        return Err(Error::new(
+            "unknown table verb (see `aterm db table --help`)",
+        ));
+    }
     let args = parse(verb, &words[1..])?;
     let handle = |name: &str| Ok::<_, Error>(Handle::at(paths.clone(), find(name)?));
     match verb {
@@ -302,9 +335,17 @@ pub fn run(
                 "abandoned": edited.abandoned,
             })))
         }
-        other => Err(Error::new(&format!(
-            "unknown table verb {other} (see `aterm db table --help`)"
-        ))),
+        _ => Err(Error::new(
+            "unknown table verb (see `aterm db table --help`)",
+        )),
+    }
+}
+
+pub(crate) fn safe_key(key: &str) -> &str {
+    if crate::typed::guard::credential_shaped(key) {
+        grid::REFUSED
+    } else {
+        key
     }
 }
 
@@ -320,12 +361,30 @@ fn field_json(column: Option<&crate::typed::Column>, field: &Field, reveal: bool
         Field::Conflict { candidates, .. } => {
             json!({"conflict": candidates.iter().map(|c| one(&c.value.x)).collect::<Vec<_>>()})
         }
-        Field::Set(_) => json!(field.members().into_iter().collect::<Vec<_>>()),
+        Field::Set(_) => {
+            let inner = column.and_then(|c| match c.ty {
+                Ty::Set(inner) => Some(inner),
+                _ => None,
+            });
+            json!(
+                field
+                    .members()
+                    .into_iter()
+                    .map(|elem| match inner {
+                        Some(inner) => grid_value(inner, &Value::String(elem.to_owned()), reveal),
+                        None => grid::raw_masked(&Value::String(elem.to_owned()), reveal),
+                    })
+                    .collect::<Vec<_>>()
+            )
+        }
     }
 }
 
 /// A typed value with its addresses masked unless `reveal`.
 fn grid_value(ty: &Ty, x: &Value, reveal: bool) -> Value {
+    if !crate::typed::cell::admissible(ty, x) {
+        return grid::raw_masked(x, reveal);
+    }
     match ty {
         Ty::Email => match x.as_str() {
             Some(address) if !reveal => Value::String(grid::mask(address)),
@@ -343,14 +402,14 @@ fn row_json(
     reveal: bool,
 ) -> Value {
     let mut object = Map::new();
-    object.insert("pk".into(), Value::String(pk.to_owned()));
+    object.insert("pk".into(), Value::String(safe_key(pk).to_owned()));
     for (name, field) in &row.fields {
         let column = collection.column(name).filter(|_| !row.raw.contains(name));
         let value = match column {
             Some(column) => field_json(Some(column), field, reveal),
             None => field_json(None, field, reveal),
         };
-        object.insert(name.clone(), value);
+        object.insert(safe_key(name).to_owned(), value);
     }
     Value::Object(object)
 }
@@ -372,28 +431,28 @@ fn get(view: &View, collection: &'static Collection, pk: &str, reveal: bool) -> 
             .owned
             .get(collection.name)
             .and_then(|read| read.rows.get(pk))
-            .ok_or_else(|| Error::new(&format!("{}: no row {pk}", collection.name)))?;
-        return Ok(json!({"collection": collection.name, "pk": pk,
+            .ok_or_else(|| Error::new(&format!("{}: no row with that key", collection.name)))?;
+        return Ok(json!({"collection": collection.name, "pk": safe_key(pk),
             "machine": keys::uuid32(&row.machine), "row": grid::raw_masked(&row.value, reveal)}));
     }
     let projection = view.project(collection);
     let row = projection
         .rows
         .get(pk)
-        .ok_or_else(|| Error::new(&format!("{}: no row {pk}", collection.name)))?;
-    let conflicts: Vec<&String> = row
+        .ok_or_else(|| Error::new(&format!("{}: no row with that key", collection.name)))?;
+    let conflicts: Vec<&str> = row
         .fields
         .iter()
         .filter(|(_, f)| match f {
             Field::Set(elements) => elements.values().any(Field::conflicted),
             other => other.conflicted(),
         })
-        .map(|(name, _)| name)
+        .map(|(name, _)| safe_key(name))
         .collect();
     Ok(
         json!({"collection": collection.name, "row": row_json(collection, pk, row, reveal),
         "lifecycle": row.lifecycle().unwrap_or("live"), "conflicts": conflicts,
-        "raw": row.raw.iter().collect::<Vec<_>>()}),
+        "raw": row.raw.iter().map(|name| safe_key(name)).collect::<Vec<_>>()}),
     )
 }
 
@@ -405,6 +464,12 @@ fn scan(
 ) -> Result<Value> {
     owned_only(collection)?;
     if collection.kind == Kind::Owned {
+        if !filters.is_empty() {
+            return Err(Error::new(&format!(
+                "{}: --where filters cells collections only",
+                collection.name
+            )));
+        }
         let rows: Vec<Value> = view
             .owned
             .get(collection.name)
@@ -412,7 +477,7 @@ fn scan(
                 read.rows
                     .iter()
                     .map(|(pk, row)| {
-                        json!({"pk": pk, "machine": keys::uuid32(&row.machine),
+                        json!({"pk": safe_key(pk), "machine": keys::uuid32(&row.machine),
                         "row": grid::raw_masked(&row.value, reveal)})
                     })
                     .collect()
@@ -510,30 +575,50 @@ fn ls(handle: &Handle) -> Value {
     })
 }
 
-fn finding_json(finding: &Finding) -> Value {
+pub(crate) fn finding_json(finding: &Finding) -> Value {
     match finding {
         Finding::Conflict {
             collection,
             pk,
             column,
-        } => json!({"finding": "conflict", "collection": collection, "pk": pk, "column": column}),
+        } => json!({
+            "finding": "conflict",
+            "collection": safe_key(collection),
+            "pk": safe_key(pk),
+            "column": safe_key(column),
+        }),
         Finding::Dangling {
             collection,
             pk,
             column,
             target,
-        } => json!({"finding": "dangling", "collection": collection, "pk": pk,
-            "column": column, "target": target}),
+        } => json!({
+            "finding": "dangling",
+            "collection": safe_key(collection),
+            "pk": safe_key(pk),
+            "column": safe_key(column),
+            "target": safe_key(target),
+        }),
         Finding::Unique {
             collection,
             columns,
             pks,
-        } => json!({"finding": "unique", "collection": collection, "columns": columns, "pks": pks}),
+        } => json!({
+            "finding": "unique",
+            "collection": safe_key(collection),
+            "columns": columns.iter().map(|c| safe_key(c)).collect::<Vec<_>>(),
+            "pks": pks.iter().map(|pk| safe_key(pk)).collect::<Vec<_>>(),
+        }),
         Finding::Raw {
             collection,
             pk,
             column,
-        } => json!({"finding": "raw", "collection": collection, "pk": pk, "column": column}),
+        } => json!({
+            "finding": "raw",
+            "collection": safe_key(collection),
+            "pk": safe_key(pk),
+            "column": safe_key(column),
+        }),
     }
 }
 
@@ -544,11 +629,23 @@ pub(crate) fn capacity_json(table: &Table, found: &Capacity, me: &Actor) -> Valu
             "finding": "quota-spent", "writer": hex::encode_lower(writer), "mine": writer == me,
             "spent": spent, "of": table.self_quota,
         }),
-        Capacity::Roll(reason) => json!({"finding": "roll", "reason": match reason {
-            Roll::Quota => "quota",
-            Roll::Records => "records",
-            Roll::Bytes => "bytes",
-        }}),
+        Capacity::Roll(reason) => {
+            let mut found = json!({"finding": "roll", "reason": match reason {
+                Roll::Quota => "quota",
+                Roll::Records => "records",
+                Roll::Bytes => "bytes",
+            }});
+            // The registry's roll is its own verb (design §3.8); a table with no later
+            // generation compiled names none.
+            if crate::att::TABLES.iter().any(|compiled| {
+                (compiled.table.application, compiled.table.role) == (table.application, table.role)
+                    && compiled.successor.is_some()
+            }) && let Some(object) = found.as_object_mut()
+            {
+                object.insert("verb".to_owned(), json!("aterm db alab roll --apply"));
+            }
+            found
+        }
     }
 }
 
@@ -593,10 +690,10 @@ fn check(handle: &Handle, view: &View, usage: &Usage) -> Value {
 fn change_json(handle: &Handle, change: &crate::database::Change, reveal: bool) -> Value {
     let value = change.value.as_ref();
     let shown = if change.collection == SCHEMA {
-        value
-            .and_then(|v| v.get("r"))
-            .cloned()
-            .map_or(Value::Null, |r| json!({"schema": r}))
+        value.and_then(|v| v.get("r")).map_or(
+            Value::Null,
+            |r| json!({"schema": grid::raw_masked(r, reveal)}),
+        )
     } else {
         let collection = handle.compiled().table.collection(&change.collection);
         match (collection, value) {
@@ -606,7 +703,13 @@ fn change_json(handle: &Handle, change: &crate::database::Change, reveal: bool) 
                     .ok()
                     .and_then(|key| collection.column(key.col).map(|c| (key, c)));
                 match (typed, CellValue::decode(value)) {
-                    (Some((key, _)), Ok(cell)) if key.elem.is_some() => cell.x,
+                    (Some((key, column)), Ok(cell))
+                        if key.elem.is_some()
+                            && matches!(column.ty, Ty::Set(_))
+                            && cell.x.as_bool().is_some() =>
+                    {
+                        cell.x
+                    }
                     (Some((_, column)), Ok(cell)) => {
                         Value::String(grid::show(&column.ty, &cell.x, reveal))
                     }
@@ -616,7 +719,11 @@ fn change_json(handle: &Handle, change: &crate::database::Change, reveal: bool) 
             (_, Some(value)) => grid::raw_masked(value, reveal),
         }
     };
-    json!({"collection": change.collection, "key": change.key, "value": shown})
+    json!({
+        "collection": safe_key(&change.collection),
+        "key": safe_key(&change.key),
+        "value": shown,
+    })
 }
 
 fn history(
@@ -659,25 +766,31 @@ pub fn baseline(file: &Path) -> String {
     format!("{}.att.json", file.display())
 }
 
+fn baseline_path(file: &Path) -> std::path::PathBuf {
+    let mut os = file.as_os_str().to_os_string();
+    os.push(".att.json");
+    std::path::PathBuf::from(os)
+}
+
 /// Write an export's TSV and its baseline, each owner-only (`0600`).
 fn save(file: &Path, text: &str, base: &Base) -> Result<()> {
     let base_json = aterm_json::to_vec(&base.to_json())
         .map_err(|_| Error::new("the grid baseline could not be encoded"))?;
     aterm_uds::atomic_file::write(file, text.as_bytes(), 0o600)
         .map_err(|_| Error::new("the grid file could not be written"))?;
-    aterm_uds::atomic_file::write(Path::new(&baseline(file)), &base_json, 0o600)
+    aterm_uds::atomic_file::write(&baseline_path(file), &base_json, 0o600)
         .map_err(|_| Error::new("the grid baseline could not be written"))?;
     Ok(())
 }
 
 fn read_capped(path: &Path, what: &str) -> Result<String> {
-    let unreadable = || Error::new(&format!("the {what} could not be read"));
-    let size = std::fs::metadata(path).map_err(|_| unreadable())?.len();
-    if size > grid::MAX_BYTES as u64 * 4 {
-        return Err(Error::new(&format!("the {what} is too large")));
-    }
-    String::from_utf8(std::fs::read(path).map_err(|_| unreadable())?)
-        .map_err(|_| Error::new(&format!("the {what} is not UTF-8")))
+    super::read_regular_utf8(
+        path,
+        grid::MAX_BYTES * 4,
+        &format!("the {what} could not be read"),
+        &format!("the {what} is too large"),
+        &format!("the {what} is not UTF-8"),
+    )
 }
 
 /// `apply <file>`: read an exported file against its baseline and write its changed cells. On
@@ -685,7 +798,7 @@ fn read_capped(path: &Path, what: &str) -> Result<String> {
 /// now, with any cell that changed meanwhile showing `⚠ mine ‖ theirs`.
 fn apply(paths: &Paths, file: &Path) -> Result<Output> {
     let base = Base::from_json(
-        &aterm_json::from_str::<Value>(&read_capped(Path::new(&baseline(file)), "grid baseline")?)
+        &aterm_json::from_str::<Value>(&read_capped(&baseline_path(file), "grid baseline")?)
             .map_err(|_| Error::new("the grid baseline is not JSON"))?,
     )?;
     let handle = Handle::at(paths.clone(), find(&base.table)?);
@@ -720,8 +833,9 @@ fn apply(paths: &Paths, file: &Path) -> Result<Output> {
     save(file, &grid::render(&kept), &kept)?;
     Ok(Output::Json(json!({
         "written": applied.records, "cells": applied.cells, "unchanged": applied.unchanged,
-        "born": plan.born, "retired": plan.retired,
-        "stale": applied.stale.iter().map(|s| json!({"pk": s.pk, "column": s.column}))
+        "born": applied.born.iter().map(|pk| safe_key(pk)).collect::<Vec<_>>(),
+        "retired": applied.retired.iter().map(|pk| safe_key(pk)).collect::<Vec<_>>(),
+        "stale": applied.stale.iter().map(|s| json!({"pk": safe_key(&s.pk), "column": safe_key(&s.column)}))
             .collect::<Vec<_>>(),
     })))
 }

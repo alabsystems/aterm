@@ -138,6 +138,19 @@ contract_fn! {
     }
 }
 
+contract_fn! {
+    /// Verified predicate for retaining a `(producer_id, producer_seq) -> Offset`
+    /// deduplication entry across a retention cut to `cut_min`: every record at or above
+    /// `cut_min` stays in the kept suffix, and every record below `cut_min` was dropped.
+    #[cfg(feature = "retention")]
+    #[must_use]
+    pub(crate) const fn dedup_retains_from_cut(record_off: u64, cut_min: u64) -> bool
+    clauses [ensures result == (cut_min <= record_off)]
+    {
+        cut_min <= record_off
+    }
+}
+
 fn raw_wall_unix_ms() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
@@ -644,7 +657,7 @@ impl Told {
 pub type ToldPage = (Vec<Arc<BrokerRecord>>, u64, Option<crate::proto::Gap>);
 
 struct RebuiltIndices {
-    records: Vec<Arc<BrokerRecord>>,
+    records: Vec<BrokerRecord>,
     dedup: HashMap<(u64, u64), Offset>,
     last: BTreeMap<String, Offset>,
     subject_charges: HashMap<String, u64>,
@@ -3369,6 +3382,13 @@ impl OpenOptions {
         self
     }
 
+    /// Builder helper setting [`Self::resident_budget`].
+    #[must_use]
+    pub const fn with_resident_budget(mut self, budget: usize) -> Self {
+        self.resident_budget = Some(budget);
+        self
+    }
+
     pub(crate) const fn at_rest_key_opt(&self) -> Option<[u8; 32]> {
         #[cfg(feature = "at-rest")]
         {
@@ -4485,7 +4505,8 @@ impl BrokerLog {
         Ok(())
     }
 
-    fn prepare_nothing() -> io::Result<Prepared> {
+    /// No-op embedder sidecar preparation callback for [`Self::open_opts`].
+    pub fn prepare_nothing() -> io::Result<Prepared> {
         Ok(Prepared::Nothing)
     }
 
@@ -4846,7 +4867,8 @@ impl BrokerLog {
                 rebuilt.records,
                 record_bts,
                 record_at,
-                crate::tier::Tier::RESIDENT_ALL,
+                opts.resident_budget
+                    .unwrap_or(crate::tier::Tier::RESIDENT_ALL),
             ),
             base,
             next,
@@ -4917,9 +4939,6 @@ impl BrokerLog {
         // recovered from the bytes, so a broker restart cannot hand a producer back a
         // budget its registered wills already hold.
         log.reserve_pending_will_subjects();
-        if let Some(budget) = opts.resident_budget {
-            log.set_resident_budget(budget);
-        }
         Ok((log, dropped))
     }
 
@@ -5203,14 +5222,8 @@ impl BrokerLog {
                 *e = crate::proto::group_commit_monotone(*e, c.upto);
             }
         }
-        // Wrap the recovered records in Arc for the shared egress read path (the dedup +
-        // group_commits above were already rebuilt from the borrowed records).
-        let mut shared_records = Vec::new();
-        for rec in records {
-            shared_records.push(Arc::new(rec));
-        }
         RebuiltIndices {
-            records: shared_records,
+            records,
             dedup,
             last,
             subject_charges,
@@ -6077,7 +6090,10 @@ impl BrokerLog {
                     "truncate_replica_to: in-memory record count mismatch or unreadable record",
                 ));
             };
-            kept_records_vec.push((*arc_rec).clone());
+            kept_records_vec.push(match Arc::try_unwrap(arc_rec) {
+                Ok(rec) => rec,
+                Err(arc) => (*arc).clone(),
+            });
             kept_bts_vec.push(self.tier.bt(r_idx));
             kept_at_vec.push(at);
             r_idx = r_idx.saturating_add(1);
@@ -8614,10 +8630,7 @@ impl BrokerLog {
                 visited = visited.saturating_add(1);
                 let matched = off.0 < visible && filter.matches_str(subject);
                 if matched {
-                    let rec = match self.record_at(off.0) {
-                        Some(r) => Some(r),
-                        None => self.carried_last.get(subject).cloned(),
-                    };
+                    let rec = self.last_indexed_record(subject, off.0)?;
                     if let Some(rec) = rec {
                         out.push(rec);
                     }
@@ -8682,10 +8695,7 @@ impl BrokerLog {
                 }
             } else if let Some(off) = last_off {
                 if off.0 < visible && filter.matches_str(subject) {
-                    let rec = match self.record_at(off.0) {
-                        Some(r) => Some(r),
-                        None => self.carried_last.get(subject).cloned(),
-                    };
+                    let rec = self.last_indexed_record(subject, off.0)?;
                     if let Some(rec) = rec {
                         out.push(rec);
                     }
@@ -8697,6 +8707,22 @@ impl BrokerLog {
         }
         // The range ran out: the answer is complete, so there is nothing to resume.
         Ok(LastStep::Page(out, None))
+    }
+
+    /// A retained last-value record must actually be readable. Only a known pruned
+    /// offset can use carried state; unreadable cold bytes never prove absence or make
+    /// an older carried value current again.
+    fn last_indexed_record(
+        &self,
+        subject: &str,
+        off: u64,
+    ) -> Result<Option<Arc<BrokerRecord>>, LastViewError> {
+        if off < self.base.0 {
+            return Ok(self.carried_last.get(subject).cloned());
+        }
+        self.record_at(off)
+            .map(Some)
+            .ok_or(LastViewError::UnreadableRetained { offset: off })
     }
 
     /// BOUNDED READ: at most `max` records matching `filter` with offset >= `from`,
@@ -9200,6 +9226,11 @@ impl BrokerLog {
     #[cfg(all(test, unix))]
     pub(crate) fn frame_at_for_test(&self, idx: usize) -> Option<u64> {
         self.tier.at(idx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hot_capacity_for_test(&self) -> usize {
+        self.tier.hot_capacity()
     }
 
     /// Bound the decoded records this log keeps resident to about `budget` bytes of
@@ -9750,24 +9781,6 @@ impl BrokerLog {
             self.compact_abandon(c);
             return Err(e);
         }
-        // The records the cut drops, read while the old file is still the log: after the
-        // switch their frames are gone, and their still-theirs dedup keys go in step 5.
-        let drain_len = usize::try_from(c.drop_count)
-            .unwrap_or(self.tier.len())
-            .min(self.tier.len());
-        let mut dropped_keys: Vec<(u64, u64, Offset)> = Vec::new();
-        for i in 0..drain_len {
-            let Some(rec) = self.record_arc(i) else {
-                self.compact_abandon(c);
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "retention: a record the cut drops could not be read back",
-                ));
-            };
-            if rec.subject != COMMIT_SUBJECT {
-                dropped_keys.push((rec.producer_id, rec.producer_seq, rec.seq));
-            }
-        }
         // 4) The switch. A failed rename leaves the log as it was.
         if let Err(e) = rename_path(c.copy.kept(), &self.path) {
             self.compact_abandon(c);
@@ -9785,13 +9798,18 @@ impl BrokerLog {
             );
             return Err(e);
         }
-        // 5) In memory (infallible): re-base, drop the pruned records and their
-        //    still-theirs dedup keys, take the carried state and the new identity.
-        for (pid, pseq, seq) in dropped_keys {
-            if self.dedup.get(&(pid, pseq)) == Some(&seq) {
-                self.dedup.remove(&(pid, pseq));
-            }
+        // 5) In memory (infallible): re-base, drop the pruned records and every dedup
+        //    entry whose retained offset lies below `c.min` without decoding dropped
+        //    cold frames from disk, then take the carried state and the new identity.
+        self.dedup
+            .retain(|_, off| dedup_retains_from_cut(off.0, c.min));
+        if self.dedup.capacity() > 64 && self.dedup.len() <= self.dedup.capacity() / 4 {
+            self.dedup
+                .shrink_to(self.dedup.len().saturating_mul(2).max(16));
         }
+        let drain_len = usize::try_from(c.drop_count)
+            .unwrap_or(self.tier.len())
+            .min(self.tier.len());
         // The kept suffix's frames moved down by exactly the bytes cut.
         self.tier.drain_front(drain_len, cut);
         if let Some((carried_wills, carried_last, carried_last_bt, carried_charges)) = carried {
@@ -10835,6 +10853,83 @@ mod tests {
         let (_file, created) = open_log_file(&path, counting, || {}).unwrap();
         assert!(!created);
         assert_eq!(SYNCS.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(all(unix, feature = "retention"))]
+    #[test]
+    fn an_unreadable_retained_last_value_never_uses_a_stale_carried_entry() {
+        use std::os::unix::fs::FileExt as _;
+
+        let root = crate::test_scratch::Scratch::new("last-stale-carried");
+        eprintln!("Last stale-carried fault world={}", root.path().display());
+        let path = root.path().join("log");
+        let subject = "/f/tier/quiet";
+        let mut log = BrokerLog::open_with(&path, Durability::Strict).unwrap();
+        log.set_resident_budget(0);
+        log.publish(7, 0, subject.into(), b"old carried value".to_vec())
+            .unwrap();
+        log.publish(7, 1, "/f/tier/newest".into(), b"newest".to_vec())
+            .unwrap();
+        log.retain_before_carrying_state(Offset(1)).unwrap();
+        let stale = log.carried_last.get(subject).unwrap().clone();
+        assert_eq!(stale.seq, Offset(0));
+        log.publish(7, 2, subject.into(), b"new retained value".to_vec())
+            .unwrap();
+        log.publish(
+            7,
+            3,
+            "/f/tier/newest".into(),
+            b"make the retained value cold".to_vec(),
+        )
+        .unwrap();
+        assert!(
+            !log.carried_last.contains_key(subject),
+            "ordinary publication removes superseded carried state"
+        );
+        // Explicit derived-index fault, not a claim that normal publication leaves this
+        // stale entry: retained unreadability must refuse even when an older Arc exists.
+        log.carried_last.insert(subject.into(), stale);
+        let head = log.head().0;
+        drop(log.publish_last_visible(head).unwrap());
+        let mut view = log.last_view_at(head).unwrap();
+        let filter = Filter::new(subject).unwrap();
+        let expected = log
+            .last_matching(&filter, "", 8, 100, &mut view)
+            .unwrap()
+            .into_page()
+            .unwrap();
+        assert_eq!(expected.0.len(), 1);
+        assert_eq!(expected.0[0].seq, Offset(2));
+
+        let at = log.frame_at_for_test(1).unwrap() + 16;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut original = [0; 4];
+        file.read_exact_at(&mut original, at).unwrap();
+        file.write_all_at(&original.map(|byte| byte ^ 0xff), at)
+            .unwrap();
+        file.sync_all().unwrap();
+        assert!(matches!(
+            log.last_matching(&filter, "", 8, 100, &mut view),
+            Err(LastViewError::UnreadableRetained { offset: 2 })
+        ));
+        assert_eq!(
+            log.carried_last.get(subject).unwrap().seq,
+            Offset(0),
+            "the stale alternative was present at refusal"
+        );
+        file.write_all_at(&original, at).unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(
+            log.last_matching(&filter, "", 8, 100, &mut view)
+                .unwrap()
+                .into_page()
+                .unwrap(),
+            expected
+        );
     }
 
     #[test]

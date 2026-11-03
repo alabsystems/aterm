@@ -507,7 +507,7 @@ fn the_loopback_guard_refuses_a_lan_dial_listen_and_join_and_keeps_the_loopback(
                 (
                     "dial",
                     Connection::connect(
-                        (documentation, 7100).into(),
+                        (documentation, 7101).into(),
                         Scope::Lan,
                         Duration::from_secs(60),
                     )

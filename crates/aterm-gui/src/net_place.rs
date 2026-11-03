@@ -52,6 +52,20 @@ pub(crate) fn hold(place: Option<Place>) {
     HELD.with(|held| *held.borrow_mut() = place);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread asked for the place in the way that starts a read once the
+    /// last is stale ([`latest`]); [`cached`] never counts.
+    static ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread called [`latest`], each a read it may start: what a test of a
+/// render-thread path holds at zero.
+#[cfg(test)]
+pub(crate) fn reads_asked() -> usize {
+    ASKED.with(std::cell::Cell::get)
+}
+
 /// Restore a test thread's prior place, including when its fixture unwinds.
 #[cfg(all(test, unix))]
 pub(crate) struct HeldPlace(Option<Place>);
@@ -194,6 +208,7 @@ impl crate::App {
 pub(crate) fn latest() -> Option<Place> {
     #[cfg(test)]
     {
+        ASKED.with(|asked| asked.set(asked.get() + 1));
         HELD.with(|held| held.borrow().clone())
     }
     #[cfg(all(unix, not(test)))]
@@ -232,7 +247,8 @@ pub(crate) fn latest() -> Option<Place> {
 /// The place as last read, starting no read: what paint takes, which runs on the render thread
 /// and so never spawns a read of its own ([`latest`] does once its read is stale). The follow
 /// lane's read every `FOLLOW_EVERY`, and every other caller's [`latest`], keep it current; `None`
-/// until the first read lands, or off Unix. A unit test sees the place it held.
+/// until the first read lands, or off Unix. A unit test sees the place it held, and its call is
+/// no read asked ([`reads_asked`]).
 pub(crate) fn cached() -> Option<Place> {
     #[cfg(test)]
     {
@@ -292,35 +308,26 @@ pub(crate) fn sys_view() -> Option<aterm_vitals::PlaceView> {
     latest().map(|place| sys_view_of(&place, &Words::now()))
 }
 
-/// The menu bar's Network row: the place's summary ([`words::summary`]) and whether being
-/// elsewhere (on another network or offline) explains members that do not answer, so no Local
-/// Network privacy setting is blamed ([`words::elsewhere_explains`]).
+/// The menu bar's Network row: the place's summary ([`words::summary`]). Whether a fleet read's
+/// no-route is this Mac's Local Network privacy is the read's own verdict, judged by each dial's
+/// address against this network ([`words::on_link`], the survey's note the fleet glance reads),
+/// so the row blames nothing and excuses nothing by where this Mac is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MenuLine {
     /// `Network — <summary>`.
     pub label: String,
-    /// On another network or offline ([`words::elsewhere_explains`]).
-    pub away: bool,
 }
 
 /// [`MenuLine`] for `place` at `words`.
 pub(crate) fn menu_line_of(place: &Place, words: &Words<'_>) -> MenuLine {
     MenuLine {
         label: format!("Network \u{2014} {}", words::summary(place, words)),
-        away: away(place),
     }
 }
 
 /// The menu bar's Network row now; `None` until a place was read.
 pub(crate) fn menu_line() -> Option<MenuLine> {
     latest().map(|place| menu_line_of(&place, &Words::now()))
-}
-
-/// Whether being elsewhere explains members that do not answer ([`words::elsewhere_explains`]):
-/// on another network or offline, but not on a remembered network that fell silent, which may be
-/// home with Local Network turned off.
-pub(crate) fn away(place: &Place) -> bool {
-    words::elsewhere_explains(place)
 }
 
 #[cfg(all(test, unix))]

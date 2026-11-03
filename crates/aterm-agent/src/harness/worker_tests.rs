@@ -336,7 +336,7 @@ fn a_permission_mode_is_claude_codes_own_flag() {
     }
     let plain = line(claude, Dialect::Zsh, &claude.plain(), &fresh(None)).expect("a line");
     assert!(!plain.contains("--permission-mode"), "{plain}");
-    for bad in ["auto", "Default", "--dangerously-skip-permissions", ""] {
+    for bad in ["manual", "Default", "--dangerously-skip-permissions", ""] {
         let err = line(claude, Dialect::Zsh, &claude.plain(), &fresh(Some(bad)))
             .expect_err("a mode Claude Code does not take");
         assert!(err.contains("none of Claude Code's"), "{bad}: {err}");
@@ -406,7 +406,8 @@ fn a_starters_config_and_provider_flags_ride_its_workers_line() {
         [
             "--gemini_dir=/Users//u/agy-work",
             "--app_data_dir",
-            "alt-cli"
+            "alt-cli",
+            "--dangerously-skip-permissions"
         ]
     );
     let typed = line(agy, Dialect::Zsh, &s, &Fresh::default()).expect("a line");
@@ -416,7 +417,10 @@ fn a_starters_config_and_provider_flags_ride_its_workers_line() {
         ),
         "{typed}"
     );
-    assert!(!typed.contains("dangerously"), "{typed}");
+    assert!(
+        typed.contains("'--dangerously-skip-permissions'"),
+        "{typed}"
+    );
     let muse = row(Program::Muse);
     let argv = [
         "/opt/bin/muse",
@@ -445,6 +449,7 @@ fn a_starters_config_and_provider_flags_ride_its_workers_line() {
     assert_eq!(
         s.args.clone().expect("Muse Code's flags read"),
         [
+            "--yolo",
             "--provider",
             "openai",
             "--base-url=https://proxy.internal/v1",
@@ -600,12 +605,109 @@ fn a_starters_program_rides_only_where_it_runs_the_same_cli() {
     }
 }
 
+/// A WORKER RUNS WITH ITS PARENT'S PERMISSIONS (owner ruling 2026-11-02): a Claude Code starter's
+/// mode rides, by argv until its screen shows another, and a claim worker's named mode is the
+/// caller's choice beside it.
+#[test]
+fn a_claude_starters_permissions_ride_its_workers_line() {
+    let cli = row(Program::Claude);
+    let flags = |argv: &[&str]| {
+        (cli.flags)(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).expect("read")
+    };
+    assert_eq!(
+        flags(&[
+            "claude",
+            "--settings",
+            "{}",
+            "--dangerously-skip-permissions"
+        ]),
+        ["--dangerously-skip-permissions"]
+    );
+    assert_eq!(
+        flags(&["claude", "--permission-mode", "acceptEdits"]),
+        ["--permission-mode", "acceptEdits"]
+    );
+    assert_eq!(
+        flags(&["claude", "--permission-mode=bypassPermissions"]),
+        ["--dangerously-skip-permissions"]
+    );
+    assert_eq!(
+        flags(&[
+            "claude",
+            "--dangerously-skip-permissions",
+            "--permission-mode",
+            "plan"
+        ]),
+        ["--dangerously-skip-permissions"],
+        "plan mode says what it is doing, not what it may do"
+    );
+    assert!(flags(&["claude", "--permission-mode", "plan"]).is_empty());
+    assert!(flags(&["claude", "--permission-mode=plan"]).is_empty());
+    assert_eq!(
+        flags(&[
+            "claude",
+            "--dangerously-skip-permissions",
+            "--permission-mode",
+            "acceptEdits"
+        ]),
+        ["--permission-mode", "acceptEdits"],
+        "the last wins"
+    );
+    assert_eq!(
+        flags(&["claude", "--", "--dangerously-skip-permissions"]),
+        Vec::<String>::new(),
+        "a task's words are no flag"
+    );
+    assert_eq!(flags(&["claude"]), Vec::<String>::new());
+
+    let rule = "\u{2500}".repeat(38);
+    let started_bypassed = Starter {
+        args: Ok(vec!["--dangerously-skip-permissions".to_string()]),
+        ..cli.plain()
+    };
+    let shown = with_shown_mode(
+        started_bypassed.clone(),
+        &[
+            rule.clone(),
+            "\u{276F} ".to_string(),
+            rule.clone(),
+            "  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle)".to_string(),
+        ],
+    );
+    assert_eq!(
+        shown.args,
+        Ok(vec!["--permission-mode".to_string(), "auto".to_string()]),
+        "the pill is the mode it runs in now"
+    );
+    assert_eq!(
+        with_shown_mode(started_bypassed.clone(), &["no pill here".to_string()]).args,
+        started_bypassed.args,
+        "CONTROL: a screen with no pill leaves the argv's"
+    );
+    assert_eq!(
+        with_shown_mode(
+            started_bypassed.clone(),
+            &[
+                rule.clone(),
+                "\u{276F} ".to_string(),
+                rule.clone(),
+                "  \u{23F8} plan mode on (shift+tab to cycle)".to_string(),
+            ],
+        )
+        .args,
+        started_bypassed.args,
+        "a parent planning lends what it may do, not what it is doing"
+    );
+    let typed = line(cli, Dialect::Zsh, &started_bypassed, &Fresh::default()).expect("a line");
+    assert!(typed.contains("--dangerously-skip-permissions"), "{typed}");
+}
+
 /// A CODEX STARTER IS codex-alab, its package's ALab bytes ([`super::super::codex_alab::alab_bytes`]):
 /// its worker types atpkg's managed twin where that twin execs ALab bytes too, else the
 /// starter's own image; it carries the starter's `CODEX_HOME` (an empty one is unset, a
 /// relative one refused; with none, another `HOME`'s `.codex`) and the flags that move its
-/// config or say how it reaches its provider, never its model, folders or approval posture
-/// (by flag, hidden alias or `-c`); a vendor Codex image of the same name, which never
+/// config, say how it reaches its provider or say what it may do unasked (its parent's permissions,
+/// owner ruling 2026-11-02), never its model or folders (by flag or `-c`); a vendor Codex image of the same name, which never
 /// carries itself, is no starter (the line is then the managed twin's, else the word's);
 /// a starter no relaunch could resume (`exec`, `--remote`) lends no flags, and one whose
 /// argv holds a flag no table knows starts no worker.
@@ -710,27 +812,30 @@ fn a_codex_starter_is_codex_alab_and_carries_its_config() {
     assert_eq!(
         s.args.clone().expect("its flags read"),
         [
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--yolo",
             "-c",
             "model_reasoning_effort=high",
+            "-c",
+            "approval_policy=\"never\"",
+            "--config=sandbox_mode=danger-full-access",
+            "--config",
+            "sandbox_workspace_write.network_access=true",
+            "-c",
+            "default_permissions=\":danger-full-access\"",
+            "-c",
+            "permissions.dev.filesystem=\"write\"",
+            "-c",
+            "sandbox_workspace_write . network_access = true",
             "--profile",
             "work",
+            "-s",
+            "workspace-write",
             "--oss"
         ]
     );
     let typed = line(cli, Dialect::Zsh, &s, &Fresh::default()).expect("a line");
-    for gone in [
-        "dangerously",
-        "yolo",
-        "gpt-x",
-        "gpt-y",
-        "approval_policy",
-        "sandbox_mode",
-        "network_access",
-        "permissions",
-        "/elsewhere",
-        "/x'",
-        "workspace-write",
-    ] {
+    for gone in ["gpt-x", "gpt-y", "gpt-z", "/elsewhere", "/x'"] {
         assert!(!typed.contains(gone), "{gone}: {typed}");
     }
     let s = starter_of(cli, Some(&alab), &proc_args(&argv, &env), user, || {

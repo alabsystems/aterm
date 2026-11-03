@@ -102,11 +102,13 @@ aterm ctl subscribe "@$SID" log          # every new record, live
 ```sh
 aterm ctl "@$SID" key enter
 aterm ctl "@$SID" key if=Do.you.want.to.proceed 1                # only if a visible row matches
-printf 'line one\nline two\n' | aterm ctl "@$SID" send --stdin   # exact bytes
+printf 'line one\nline two\n' | aterm ctl "@$SID" send --stdin   # last newline is Enter
+printf 'line one\n' | aterm ctl "@$SID" feed-bin                 # exact bytes
 cat script.py | aterm ctl "@$SID" paste --stdin                  # with paste semantics
 ```
 
-- Inline `send` rejects newlines: use `--stdin`. `send` writes raw bytes.
+- Inline `send` rejects newlines: use `--stdin`. A trailing newline or `\n` (backslash, n) is
+  Enter, inline and on stdin; `feed-bin` writes raw bytes.
 - `key if=<re>` checks and presses under one lock (`if-gen=<gen>` and `if-fp=<hash>` from
   `status` fence it to your read). `OK skipped` (exit 0): the guard failed and nothing was
   written; re-read.

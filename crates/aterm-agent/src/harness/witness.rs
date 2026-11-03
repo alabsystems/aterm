@@ -66,7 +66,8 @@ impl Target {
     }
 
     /// The endpoint a base URL names: `http://` or `https://`, a host (a bracketed IPv6 literal
-    /// taken without its brackets), an optional port (else the scheme's), and any path after it,
+    /// taken without its brackets and canonicalized), an optional port (else the scheme's), and
+    /// any path after it,
     /// which a probe does not need. URL userinfo, query strings and fragments are unsupported:
     /// dropping them could merge distinct routes or disclose endpoint credentials. `None` also
     /// for an oversized URL, whitespace, another scheme, no host, or an invalid port or literal.
@@ -90,18 +91,20 @@ impl Target {
         }
         let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
             let (host, after) = v6.split_once(']')?;
-            host.parse::<std::net::Ipv6Addr>().ok()?;
+            let ip = host.parse::<std::net::Ipv6Addr>().ok()?;
             let port = if after.is_empty() {
                 None
             } else {
                 Some(after.strip_prefix(':')?)
             };
-            (host, port)
+            (ip.to_string(), port)
         } else {
             match authority.rsplit_once(':') {
-                Some((host, port)) if !host.contains(':') => (host, Some(port)),
+                Some((host, port)) if !host.contains(':') => {
+                    (host.to_ascii_lowercase(), Some(port))
+                }
                 Some(_) => return None,
-                None => (authority, None),
+                None => (authority.to_ascii_lowercase(), None),
             }
         };
         if host.is_empty() {
@@ -112,11 +115,7 @@ impl Target {
             None if tls => 443,
             None => 80,
         };
-        Some(Self {
-            host: host.to_ascii_lowercase(),
-            port,
-            tls,
-        })
+        Some(Self { host, port, tls })
     }
 
     /// The endpoint as a log line names it: `https://api.anthropic.com:443`.
@@ -293,17 +292,55 @@ pub fn no_proxy_names(no_proxy: &str, target: &Target) -> bool {
         if entry == "*" {
             return true;
         }
+        if let Some(v6) = entry.strip_prefix('[') {
+            let Some((host, after)) = v6.split_once(']') else {
+                return false;
+            };
+            let Ok(ip) = host.parse::<std::net::Ipv6Addr>() else {
+                return false;
+            };
+            let port = if after.is_empty() {
+                None
+            } else {
+                let Some(port) = after
+                    .strip_prefix(':')
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .filter(|p| *p > 0)
+                else {
+                    return false;
+                };
+                Some(port)
+            };
+            return port.is_none_or(|p| p == target.port) && target.host == ip.to_string();
+        }
         let (host, port) = match entry.rsplit_once(':') {
-            Some((h, p)) if !h.contains(':') && p.bytes().all(|b| b.is_ascii_digit()) => {
-                (h, p.parse::<u16>().ok())
+            Some((h, p)) if !h.contains(':') => {
+                let Some(port) = (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| p.parse::<u16>().ok().filter(|p| *p > 0))
+                    .flatten()
+                else {
+                    return false;
+                };
+                (h, Some(port))
             }
-            _ => (entry, None),
+            Some(_) => {
+                return entry
+                    .parse::<std::net::Ipv6Addr>()
+                    .is_ok_and(|ip| target.host == ip.to_string());
+            }
+            None => (entry, None),
         };
-        let host = host.trim_start_matches('*').to_ascii_lowercase();
-        if host.is_empty() || port.is_some_and(|p| p != target.port) {
+        if port.is_some_and(|p| p != target.port) {
             return false;
         }
-        let bare = host.trim_start_matches('.');
+        let host = host.strip_prefix("*.").unwrap_or(host);
+        if host.contains('*') {
+            return false;
+        }
+        let bare = host.strip_prefix('.').unwrap_or(host).to_ascii_lowercase();
+        if bare.is_empty() || bare.starts_with('.') {
+            return false;
+        }
         target.host == bare || target.host.ends_with(&format!(".{bare}"))
     })
 }
@@ -321,10 +358,9 @@ fn named(base: &str, what: &str, env: &[String]) -> Endpoint {
         HTTP_PROXY_KEYS
     };
     if let Some(key) = keys.iter().find(|k| var(env, k).is_some()) {
-        let spared = NO_PROXY_KEYS
-            .iter()
-            .filter_map(|k| var(env, k))
-            .any(|list| no_proxy_names(list, target));
+        let lists: Vec<&str> = NO_PROXY_KEYS.iter().filter_map(|k| var(env, k)).collect();
+        let spared =
+            !lists.is_empty() && lists.into_iter().all(|list| no_proxy_names(list, target));
         if !spared {
             return Endpoint::Gap(format!("{key} carries {what}"));
         }

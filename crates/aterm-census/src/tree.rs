@@ -6,13 +6,123 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Upper bound on any single file read by the census (64 MiB).
+pub(crate) const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "riscv64",
+        target_arch = "aarch64",
+        target_arch = "arm",
+    ),
+))]
+const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0800;
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0004;
+
+/// Open `path` without blocking on FIFOs and verify the descriptor is a regular file within
+/// [`MAX_FILE_BYTES`], preserving `IsADirectory` on directories.
+pub(crate) fn open_regular(path: &Path) -> io::Result<(std::fs::File, usize)> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(any(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "riscv64",
+                target_arch = "aarch64",
+                target_arch = "arm",
+            ),
+        ),
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(NONBLOCK_OPEN_FLAG);
+    }
+    let file = opts.open(path)?;
+    let meta = file.metadata()?;
+    if meta.is_dir() {
+        return Err(io::ErrorKind::IsADirectory.into());
+    }
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} exceeds {} byte census cap ({} bytes)",
+                path.display(),
+                MAX_FILE_BYTES,
+                meta.len()
+            ),
+        ));
+    }
+    Ok((file, usize::try_from(meta.len()).unwrap_or(0)))
+}
+
+/// The regular file at `path`, bounded by [`MAX_FILE_BYTES`].
+pub(crate) fn read_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let (file, cap) = open_regular(path)?;
+    let mut out = Vec::with_capacity(cap.min(64 * 1024));
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut out)?;
+    if out.len() as u64 > MAX_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} grew past {} byte census cap",
+                path.display(),
+                MAX_FILE_BYTES
+            ),
+        ));
+    }
+    Ok(out)
+}
+
 /// The file at `path`, as UTF-8 (`std::fs::read_to_string`).
 pub(crate) fn read_to_string(path: &Path) -> io::Result<String> {
     #[cfg(test)]
     if let Some(answer) = memory::answer(path, memory::Files::read) {
         return answer;
     }
-    std::fs::read_to_string(path)
+    use std::io::Read as _;
+    let (file, cap) = open_regular(path)?;
+    let mut out = String::with_capacity(cap.min(64 * 1024));
+    file.take(MAX_FILE_BYTES + 1).read_to_string(&mut out)?;
+    if out.len() as u64 > MAX_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} grew past {} byte census cap",
+                path.display(),
+                MAX_FILE_BYTES
+            ),
+        ));
+    }
+    Ok(out)
 }
 
 /// Whether `path` is a directory (`Path::is_dir`).

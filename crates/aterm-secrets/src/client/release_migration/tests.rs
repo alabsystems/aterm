@@ -92,6 +92,13 @@ impl Fixture {
         }
     }
 
+    fn identity_only(&self) -> Document {
+        match migrate_identity(&self.doc, &[&self.anchor], 5, 1_000) {
+            Migration::Ready(doc) => *doc,
+            _ => panic!("fixture should authorize the original three-file migration"),
+        }
+    }
+
     fn replace_legacy(&mut self, index: usize, bytes: &[u8]) {
         self.doc
             .set_entry_with(
@@ -117,6 +124,24 @@ fn empty_canonical_bundle_copies_exact_values_and_is_idempotent() {
         assert!(copied.if_absent);
         assert_eq!(copied.anchor.as_deref(), Some(CANONICAL[(index + 1) % 3]));
     }
+    for (index, name) in CANONICAL_ROSTER.iter().enumerate() {
+        let copied = next.entry(&Audience::Everyone, name).unwrap();
+        let source = if index == 0 {
+            LEGACY_ROSTER.to_owned()
+        } else {
+            format!("{LEGACY_ROSTER}.sig")
+        };
+        assert_eq!(
+            copied.value,
+            fixture
+                .doc
+                .entry(&Audience::Everyone, &source)
+                .unwrap()
+                .value
+        );
+        assert!(copied.if_absent);
+        assert_eq!(copied.anchor.as_deref(), Some(CANONICAL_ROSTER[1 - index]));
+    }
     assert!(matches!(
         migrate(&next, &[&fixture.anchor], 5, 1_000),
         Migration::Unchanged
@@ -125,7 +150,7 @@ fn empty_canonical_bundle_copies_exact_values_and_is_idempotent() {
 
 #[test]
 fn any_existing_target_even_host_specific_prevents_partial_replacement() {
-    for name in CANONICAL {
+    for name in CANONICAL.into_iter().chain(CANONICAL_ROSTER) {
         for audience in [Audience::Everyone, Audience::Hosts(vec!["admin".into()])] {
             let mut fixture = Fixture::new();
             fixture
@@ -190,8 +215,8 @@ fn a_personal_legacy_profile_stays_while_the_modern_bundle_materializes() {
         crate::release_ring::authorize_with(
             read(CANONICAL[2]).as_slice(),
             read(CANONICAL[0]).as_slice(),
-            read(LEGACY_ROSTER).as_slice().to_vec(),
-            read(&format!("{LEGACY_ROSTER}.sig")).as_slice(),
+            read(CANONICAL_ROSTER[0]).as_slice().to_vec(),
+            read(CANONICAL_ROSTER[1]).as_slice(),
             &[&fixture.anchor],
             0,
             1_000,
@@ -232,6 +257,175 @@ fn mismatched_key_profile_machine_record_and_signature_are_refused() {
         )
         .unwrap();
     assert!(matches!(fixture.migrate(), Migration::Refused(_)));
+}
+
+#[test]
+fn an_existing_three_file_bundle_gets_its_roster_without_rewriting_credentials() {
+    let mut fixture = Fixture::new();
+    fixture.doc = fixture.identity_only();
+    let unrelated = Fixture::new();
+    fixture.replace_legacy(
+        0,
+        unrelated
+            .doc
+            .entry(&Audience::Everyone, LEGACY[0])
+            .unwrap()
+            .value
+            .as_slice(),
+    );
+    assert!(
+        fixture
+            .doc
+            .entry(&Audience::Everyone, CANONICAL_ROSTER[0])
+            .is_none()
+    );
+    let next = fixture.ready();
+    for name in CANONICAL {
+        assert_eq!(
+            next.entry(&Audience::Everyone, name),
+            fixture.doc.entry(&Audience::Everyone, name)
+        );
+    }
+    assert!(
+        next.entry(&Audience::Everyone, CANONICAL_ROSTER[0])
+            .is_some()
+    );
+    assert!(
+        next.entry(&Audience::Everyone, CANONICAL_ROSTER[1])
+            .is_some()
+    );
+}
+
+#[test]
+fn a_profile_naming_the_canonical_roster_can_bootstrap_from_the_signed_legacy_pair() {
+    let mut fixture = Fixture::new();
+    let profile = fixture
+        .doc
+        .entry(&Audience::Everyone, LEGACY[2])
+        .unwrap()
+        .value
+        .as_str()
+        .unwrap()
+        .replace(LEGACY_ROSTER, CANONICAL_ROSTER[0]);
+    fixture.replace_legacy(2, profile.as_bytes());
+    let next = fixture.ready();
+    assert_eq!(
+        next.entry(&Audience::Everyone, CANONICAL[2])
+            .unwrap()
+            .value
+            .as_slice(),
+        profile.as_bytes()
+    );
+    assert!(
+        next.entry(&Audience::Everyone, CANONICAL_ROSTER[0])
+            .is_some()
+    );
+    assert!(
+        next.entry(&Audience::Everyone, CANONICAL_ROSTER[1])
+            .is_some()
+    );
+}
+
+#[test]
+fn vault_owned_roster_pairs_advance_and_newer_canonical_pairs_never_roll_back() {
+    let mut fixture = Fixture::new();
+    let first = fixture.ready();
+    let home = aterm_tempfile::tempdir().unwrap();
+    let (manifest, report) =
+        materialize::apply(home.path(), &first.entries(), &Manifest::default(), 1).unwrap();
+    assert!(report.failed.is_empty());
+    fixture.doc = first.clone();
+    fixture.roster.roster_seq = 6;
+    fixture.sign_roster();
+    let next = fixture.ready();
+    let (_, report) = materialize::apply(home.path(), &next.entries(), &manifest, 2).unwrap();
+    assert!(report.failed.is_empty());
+    for name in CANONICAL_ROSTER {
+        let actual =
+            fsx::read_private(&materialize::target_path(home.path(), name).unwrap(), 65536)
+                .unwrap()
+                .unwrap();
+        assert_eq!(actual, next.entry(&Audience::Everyone, name).unwrap().value);
+    }
+    for name in CANONICAL {
+        assert_eq!(
+            first.entry(&Audience::Everyone, name),
+            next.entry(&Audience::Everyone, name)
+        );
+    }
+    fixture.doc = next;
+    for name in [LEGACY_ROSTER.to_owned(), format!("{LEGACY_ROSTER}.sig")] {
+        let old = first.entry(&Audience::Everyone, &name).unwrap();
+        fixture
+            .doc
+            .set_entry(&Audience::Everyone, &name, old.value.as_slice())
+            .unwrap();
+    }
+    assert!(matches!(fixture.migrate(), Migration::Unchanged));
+}
+
+#[test]
+fn personal_canonical_roster_files_are_preserved() {
+    let next = Fixture::new().ready();
+    let home = aterm_tempfile::tempdir().unwrap();
+    for name in CANONICAL_ROSTER {
+        let path = materialize::target_path(home.path(), name).unwrap();
+        fsx::ensure_private_dir(path.parent().unwrap()).unwrap();
+        fsx::write_atomic(&path, b"personal roster file", 0o600).unwrap();
+    }
+    let (_, report) =
+        materialize::apply(home.path(), &next.entries(), &Manifest::default(), 1).unwrap();
+    assert!(report.failed.is_empty());
+    for name in CANONICAL_ROSTER {
+        assert_eq!(
+            fsx::read_private(&materialize::target_path(home.path(), name).unwrap(), 65536)
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"personal roster file"
+        );
+    }
+}
+
+#[test]
+fn newer_revocations_and_same_generation_forks_do_not_fall_back_to_old_authority() {
+    let mut revoked = Fixture::new();
+    revoked.doc = revoked.ready();
+    revoked.roster.roster_seq = 6;
+    revoked.roster.revoked.push("shared".into());
+    revoked.sign_roster();
+    assert!(matches!(revoked.migrate(), Migration::Refused(_)));
+
+    let mut fork = Fixture::new();
+    fork.doc = fork.ready();
+    fork.roster.valid_until = "9998-12-31T00:00:00Z".into();
+    fork.sign_roster();
+    assert!(matches!(fork.migrate(), Migration::Refused(_)));
+}
+
+#[test]
+fn identical_roster_bytes_signed_by_two_trusted_masters_are_not_a_fork() {
+    let mut fixture = Fixture::new();
+    fixture.doc = fixture.ready();
+    let other = Fixture::new();
+    let raw = fixture
+        .doc
+        .entry(&Audience::Everyone, LEGACY_ROSTER)
+        .unwrap()
+        .value
+        .clone();
+    fixture
+        .doc
+        .set_entry(
+            &Audience::Everyone,
+            &format!("{LEGACY_ROSTER}.sig"),
+            other.master.sign(raw.as_slice()).as_ref(),
+        )
+        .unwrap();
+    assert!(matches!(
+        migrate(&fixture.doc, &[&fixture.anchor, &other.anchor], 5, 1_000),
+        Migration::Unchanged
+    ));
 }
 
 #[test]
@@ -362,4 +556,29 @@ fn a_changed_floor_invalidates_the_current_inspection() {
         1,
         "changed floor requires a fresh authenticated admin read"
     );
+}
+
+/// NEGATIVE CONTROL: `field(&profile, "machine_roster").unwrap_or(LEGACY_ROSTER)` silently
+/// defaulted empty or non-string `machine_roster` fields to the legacy path instead of refusing.
+#[test]
+fn empty_or_non_string_machine_roster_in_legacy_profile_is_refused() {
+    for replacement in ["machine_roster = \"\"", "machine_roster = 42"] {
+        let mut fixture = Fixture::new();
+        let profile = fixture
+            .doc
+            .entry(&Audience::Everyone, LEGACY[2])
+            .unwrap()
+            .value
+            .as_str()
+            .unwrap()
+            .replace(
+                &format!("machine_roster = \"{LEGACY_ROSTER}\""),
+                replacement,
+            );
+        fixture.replace_legacy(2, profile.as_bytes());
+        assert!(
+            matches!(fixture.migrate(), Migration::Refused(_)),
+            "{replacement}"
+        );
+    }
 }

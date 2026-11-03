@@ -14,13 +14,18 @@ use super::driver::cargo_driver;
 use super::{LaneRun, workspace_root};
 
 const TEST: &str = "replica::tests::compatibility::a_round_that_moves_nothing_reports_its_cpu";
+const SUSTAINED_TEST: &str =
+    "replica::tests::compatibility::a_sustained_quiet_pair_reports_its_cpu";
+const CATALOG_TEST: &str = "replica::tests::compatibility::a_quiet_catalog_pair_reports_its_cpu";
+const SUSTAINED_CATALOG_TEST: &str =
+    "replica::tests::compatibility::a_sustained_quiet_catalog_pair_reports_its_cpu";
 const PREFIX: &str = "COMMONS-QUIET ";
 
-pub(crate) fn run(json_out: Option<&Path>) -> LaneRun {
-    outcome(measure(json_out))
+pub(crate) fn run(json_out: Option<&Path>, sustained: bool, catalog: bool) -> LaneRun {
+    outcome(measure(json_out, sustained, catalog))
 }
 
-fn measure(json_out: Option<&Path>) -> Result<String, Halt> {
+fn measure(json_out: Option<&Path>, sustained: bool, catalog: bool) -> Result<String, Halt> {
     let driver = cargo_driver()
         .map_err(|why| Halt::skip(why, "run it with the pinned toolchain's targo"))?;
     let root = workspace_root();
@@ -39,28 +44,53 @@ fn measure(json_out: Option<&Path>) -> Result<String, Halt> {
     )) {
         return Err(Halt::Fail(why));
     }
-    let args = [
+    let args = vec![
         "--profile",
         "opt-test",
         "-p",
         "aterm-db",
         "--lib",
-        TEST,
-        "--",
-        "--exact",
-        "--nocapture",
-        "--test-threads=1",
+        "--no-run",
+        "--message-format=json-render-diagnostics",
     ];
     let build = targo.display("test", &args);
     eprintln!("  {}", plan.summary());
     eprintln!("  $ {build}");
-    let before = load_average();
-    let output = targo
+    let built = targo
         .command("test")
         .args(args)
         .current_dir(&root)
         .output()
+        .map_err(|error| format!("could not build Commons measurement: {error}"))?;
+    if !built.status.success() {
+        return Err(Halt::Fail(format!(
+            "Commons measurement build failed: {}",
+            String::from_utf8_lossy(&built.stderr)
+        )));
+    }
+    let executable =
+        bench_build::built_executable(&String::from_utf8_lossy(&built.stdout), "aterm_db", "lib")?;
+    let test = match (catalog, sustained) {
+        (false, false) => TEST,
+        (false, true) => SUSTAINED_TEST,
+        (true, false) => CATALOG_TEST,
+        (true, true) => SUSTAINED_CATALOG_TEST,
+    };
+    let mut run = command(executable);
+    targo.environment(&mut run);
+    run.current_dir(&root)
+        .args([test, "--exact", "--nocapture", "--test-threads=1"]);
+    if sustained {
+        run.arg("--ignored");
+    }
+    let entry = super::measurement_entry().map_err(Halt::Timing)?;
+    let before = load_average();
+    let output = run
+        .output()
         .map_err(|error| format!("could not run Commons measurement: {error}"))?;
+    entry
+        .timing_admission()
+        .map_err(|why| Halt::Timing(why.to_string()))?;
     let after = load_average();
     let text = format!(
         "{}\n{}",
@@ -75,12 +105,13 @@ fn measure(json_out: Option<&Path>) -> Result<String, Halt> {
             lines.into_iter().rev().collect::<Vec<_>>().join("\n")
         )));
     }
-    let measurement = parse_report(&text)?;
+    let workload = if catalog { "catalog" } else { "explicit" };
+    let measurement = parse_report(&text, workload)?;
     let cpu_ns = measurement["per_round_cpu_ns"]
         .as_u64()
         .expect("validated CPU");
     let summary = format!(
-        "{:.3} ms mean process CPU per quiet round, both peers, over {} rounds (opt-test)",
+        "{:.3} ms mean process CPU per {workload} quiet round, both peers, over {} rounds (opt-test)",
         cpu_ns as f64 / 1_000_000.0,
         measurement["rounds"].as_u64().expect("validated rounds")
     );
@@ -92,6 +123,8 @@ fn measure(json_out: Option<&Path>) -> Result<String, Halt> {
         "commit": head,
         "dirty_paths": dirty.lines().count(),
         "profile": "opt-test",
+        "sustained": sustained,
+        "workload": workload,
         "build": build,
         "build_plan": plan.summary(),
         "rustflags": bench_build::flags::describe(&flags),
@@ -126,7 +159,7 @@ fn git(args: &[&str]) -> Result<String, Halt> {
     })
 }
 
-fn parse_report(text: &str) -> Result<Value, String> {
+fn parse_report(text: &str, workload: &str) -> Result<Value, String> {
     let mut reports = text.lines().filter_map(|line| line.strip_prefix(PREFIX));
     let raw = reports
         .next()
@@ -143,6 +176,11 @@ fn parse_report(text: &str) -> Result<Value, String> {
     };
     if number("schema")? != 1 || number("moved_records")? != 0 {
         return Err("Commons measurement is not a quiet-round schema 1 report".into());
+    }
+    if report.get("workload").and_then(Value::as_str) != Some(workload)
+        || number("tables")? != if workload == "catalog" { 2 } else { 1 }
+    {
+        return Err("Commons measurement has another workload or table count".into());
     }
     let rounds = number("rounds")?;
     let total = number("process_cpu_ns")?;
@@ -161,20 +199,23 @@ mod tests {
 
     fn report() -> Value {
         json!({"schema":1,"warmup_rounds":2,"rounds":8,"process_cpu_ns":800,
-            "per_round_cpu_ns":100,"clock_read_cpu_ns":1,"moved_records":0})
+            "per_round_cpu_ns":100,"clock_read_cpu_ns":1,"moved_records":0,
+            "workload":"explicit","tables":1})
     }
 
     #[test]
     fn measurement_requires_one_complete_consistent_quiet_report() {
         let valid = format!("{PREFIX}{}", report());
-        assert!(parse_report(&valid).is_ok());
-        assert!(parse_report("running 0 tests").is_err());
-        assert!(parse_report(&format!("{valid}\n{valid}")).is_err());
+        assert!(parse_report(&valid, "explicit").is_ok());
+        assert!(parse_report(&valid, "catalog").is_err());
+        assert!(parse_report("running 0 tests", "explicit").is_err());
+        assert!(parse_report(&format!("{valid}\n{valid}"), "explicit").is_err());
         for (key, value) in [
             ("schema", 2),
             ("rounds", 0),
             ("per_round_cpu_ns", 99),
             ("moved_records", 1),
+            ("tables", 2),
         ] {
             let mut invalid = report();
             invalid
@@ -182,12 +223,18 @@ mod tests {
                 .unwrap()
                 .insert(key.into(), json!(value));
             assert!(
-                parse_report(&format!("{PREFIX}{invalid}")).is_err(),
+                parse_report(&format!("{PREFIX}{invalid}"), "explicit").is_err(),
                 "{key}"
             );
         }
         let mut missing = report();
         missing.as_object_mut().unwrap().remove("clock_read_cpu_ns");
-        assert!(parse_report(&format!("{PREFIX}{missing}")).is_err());
+        assert!(parse_report(&format!("{PREFIX}{missing}"), "explicit").is_err());
+        let mut catalog = report();
+        let fields = catalog.as_object_mut().unwrap();
+        fields.insert("workload".into(), json!("catalog"));
+        fields.insert("tables".into(), json!(2));
+        assert!(parse_report(&format!("{PREFIX}{catalog}"), "catalog").is_ok());
+        assert!(parse_report(&format!("{PREFIX}{catalog}"), "explicit").is_err());
     }
 }

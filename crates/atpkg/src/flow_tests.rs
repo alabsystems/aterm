@@ -2031,7 +2031,11 @@ fn an_up_to_date_install_puts_back_every_command_its_build_exposes() {
     );
 
     fake.pkg.insert(key, signed);
+    let version_record =
+        crate::store::sidecar_path(&build_dir, crate::store::VERSION_SUFFIX).unwrap();
+    let expected_version = crate::store::recorded_version(&build_dir).expect("recorded version");
     std::fs::remove_file(&record).unwrap();
+    std::fs::remove_file(&version_record).unwrap();
     lose_the_linked_commands(&layout);
     lays_both_back(
         &fake,
@@ -2040,6 +2044,11 @@ fn an_up_to_date_install_puts_back_every_command_its_build_exposes() {
     assert!(
         record.is_file(),
         "the signed manifest's commands are recorded beside the build"
+    );
+    assert_eq!(
+        crate::store::recorded_version(&build_dir).as_deref(),
+        Some(expected_version.as_str()),
+        "the signed manifest's version is recorded beside the build when missing"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4487,7 +4496,7 @@ fn mark_linked(layout: &Layout, program: &str) {
     std::fs::create_dir_all(layout.links_dir()).unwrap();
     std::fs::write(
         layout.link_marker(program),
-        format!("schema = 2\nprogram = \"{program}\"\ncheckout = \"/nonexistent\"\nbins = []\n"),
+        format!("schema = 1\nprogram = \"{program}\"\ncheckout = \"/nonexistent\"\nbins = []\n"),
     )
     .unwrap();
 }

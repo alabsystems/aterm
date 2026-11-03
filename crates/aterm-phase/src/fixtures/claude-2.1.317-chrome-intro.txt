@@ -1,0 +1,18 @@
+# claude-code 2.1.317 · MEASURED 2026-11-02, the live screen of a harness-started worker's tab (124x46, aterm 0.149.0) running the real Claude Code, launched as `claude --chrome --permission-mode default -- <task>` in a config folder Claude in Chrome was never introduced in · the Claude in Chrome intro in the inline renderer, before the REPL, over the shell's launch line (the user and host anonymised to user00@host00; rows 1-17 of 46, the blank rows under the footer cut), with the `Requires the Chrome extension…` paragraph the bundle draws until its extension check finds the extension
+user00@host00 credit-claim %  CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 'claude' '--chrome' '--permission-mode' 'de
+fault' -- "$(command cat -- "$ATERM_TASK_FILE")"
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Claude in Chrome
+
+  Claude in Chrome works with the Chrome extension to let you control your browser directly from Claude Code. You can
+  navigate websites, fill forms, capture screenshots, record GIFs, and debug with console logs and network requests.
+
+  Requires the Chrome extension. Get started at https://claude.ai/chrome
+
+  Site-level permissions are inherited from the Chrome extension. Manage permissions in the Chrome extension settings to
+  control which sites Claude can browse, click, and type on.
+
+  For more info, use /chrome or visit https://code.claude.com/docs/en/chrome
+
+  Enter to confirm · Esc to cancel

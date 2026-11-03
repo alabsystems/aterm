@@ -2947,6 +2947,17 @@ impl MessageCenter {
             .is_some()
     }
 
+    /// Whether the exception under exactly `key` is open, or its latest filing still awaits
+    /// an observation that its cause ended. A resolved or withdrawn record is not unresolved.
+    #[must_use]
+    pub fn has_unresolved_exception(&self, key: &str) -> bool {
+        self.digest.find_key(key).is_some()
+            || self
+                .log
+                .last_word(key, true)
+                .is_some_and(LogRecord::filed_exception)
+    }
+
     /// The entry under exactly `key` ends with no outcome to claim (`Withdrawn`): its
     /// reporter stops saying it (a kind this build no longer reports, or a fact another
     /// surface now carries) without having read its cause end.

@@ -169,11 +169,24 @@ struct LinkMarker {
 
 fn safe_component(name: &str) -> bool {
     !(name.is_empty()
-        || name == "."
-        || name == ".."
+        || name.starts_with('.')
+        || name.starts_with('-')
         || name.contains('/')
         || name.contains('\\')
         || name.contains('\0'))
+}
+
+fn relative_bin_path(rel: &Path) -> bool {
+    !rel.as_os_str().is_empty()
+        && !rel.to_string_lossy().contains('\0')
+        && rel
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+}
+
+fn next_temp_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether `program` is currently dev-linked (its `0600` link marker exists).
@@ -245,7 +258,11 @@ fn rollback_tmp(shim: &Path) -> std::io::Result<PathBuf> {
             "shim path has no file name",
         )
     })?;
-    Ok(shim.with_file_name(format!(".{name}.atpkg-rollback-{}", std::process::id())))
+    Ok(shim.with_file_name(format!(
+        ".{name}.atpkg-rollback-{}-{}",
+        std::process::id(),
+        next_temp_seq()
+    )))
 }
 
 fn restore_file(shim: &Path, bytes: &[u8], mode: &fs::Permissions) -> std::io::Result<()> {
@@ -326,6 +343,12 @@ fn requested_marker(
             bins.len()
         )));
     }
+    if let Some(rel) = bins.iter().find(|rel| !relative_bin_path(rel)) {
+        return Err(LinkError::Io(format!(
+            "bin path {} is not a checkout-relative path",
+            rel.display()
+        )));
+    }
     let marker = LinkMarker {
         schema: 1,
         program: program.to_string(),
@@ -351,6 +374,9 @@ enum LinkBin {
 }
 
 fn link_bin(checkout: &Path, rel: &Path) -> LinkBin {
+    if !relative_bin_path(rel) {
+        return LinkBin::Unnamed;
+    }
     let Some(name) = bin_tool_name(rel) else {
         return LinkBin::Unnamed;
     };
@@ -745,10 +771,22 @@ fn read_marker(path: &Path) -> std::io::Result<LinkMarker> {
             format!("link marker is invalid: {error}"),
         )
     })?;
+    if marker.schema != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("link marker schema {} is unsupported", marker.schema),
+        ));
+    }
     if !safe_component(&marker.program) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "link marker contains an unsafe program name",
+        ));
+    }
+    if !Path::new(&marker.checkout).is_absolute() || marker.checkout.contains('\0') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "link marker checkout is not an absolute path",
         ));
     }
     if marker.bins.len() > MAX_LINK_MARKER_BINS {
@@ -758,6 +796,16 @@ fn read_marker(path: &Path) -> std::io::Result<LinkMarker> {
                 "link marker has {} bins; limit is {MAX_LINK_MARKER_BINS}",
                 marker.bins.len()
             ),
+        ));
+    }
+    if marker
+        .bins
+        .iter()
+        .any(|rel| !relative_bin_path(Path::new(rel)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "link marker contains a non-relative bin path",
         ));
     }
     Ok(marker)
@@ -793,7 +841,11 @@ fn write_marker(dest: &Path, marker: &LinkMarker) -> std::io::Result<()> {
             "link marker has no parent",
         )
     })?;
-    let tmp = parent.join(format!(".link.tmp-{}", std::process::id()));
+    let tmp = parent.join(format!(
+        ".link.tmp-{}-{}",
+        std::process::id(),
+        next_temp_seq()
+    ));
     let _ = fs::remove_file(&tmp);
     let staged = crate::platform::create_private_new(&tmp)
         .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
@@ -885,6 +937,8 @@ mod tests {
                 serialize_marker(&invalid).unwrap()
             };
             fs::write(layout.link_marker("ay"), bytes.as_bytes()).unwrap();
+            assert!(!is_linked(&layout, "ay"), "{kind}");
+            assert!(linked_checkout_checked(&layout, "ay").is_err(), "{kind}");
             assert!(
                 link_if_checkout(
                     &mut guard,
@@ -1421,5 +1475,42 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         let _ = fs::remove_dir_all(&l.prefix);
         let _ = fs::remove_dir_all(&foreign.prefix);
+    }
+
+    #[test]
+    fn link_rejects_dot_or_dash_programs_and_non_relative_bins() {
+        let l = layout("dot-dash-and-rel-bins");
+        let co = checkout("dot-dash-co", &["ay"]);
+        for bad_prog in [".link.tmp-123", ".hidden", "-flag", ""] {
+            assert!(matches!(
+                link(&l, bad_prog, &co, &[PathBuf::from("target/release/ay")]),
+                Err(LinkError::BadName(_))
+            ));
+            assert!(!is_linked(&l, bad_prog));
+        }
+        for bad_bin in [
+            PathBuf::from("../outside/ay"),
+            PathBuf::from("/abs/path/ay"),
+            PathBuf::from(""),
+        ] {
+            assert!(
+                link(&l, "ay", &co, std::slice::from_ref(&bad_bin)).is_err(),
+                "non-relative bin {} must be rejected",
+                bad_bin.display()
+            );
+        }
+
+        link(&l, "ay", &co, &[PathBuf::from("target/release/ay")]).unwrap();
+        fs::write(l.links_dir().join(".link.tmp-999-0"), b"partial").unwrap();
+        fs::write(l.links_dir().join(".DS_Store"), b"junk").unwrap();
+        assert_eq!(linked_programs_checked(&l).unwrap(), vec!["ay".to_string()]);
+
+        let mut invalid = read_marker_for_program(&l, "ay").unwrap();
+        invalid.bins = vec!["../outside/ay".to_string()];
+        write_marker(&l.link_marker("ay"), &invalid).unwrap();
+        assert!(!is_linked(&l, "ay"));
+
+        let _ = fs::remove_dir_all(&l.prefix);
+        let _ = fs::remove_dir_all(&co);
     }
 }

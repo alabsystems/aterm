@@ -370,8 +370,9 @@ impl Layers {
         seed: &str,
         say: &mut dyn FnMut(&str),
     ) -> Result<Prepared, Error> {
+        ensure_real_dir(&self.root)?;
         for dir in [self.baked_dir(), self.live_dir()] {
-            std::fs::create_dir_all(&dir).map_err(|e| io("create", &dir, &e))?;
+            ensure_real_dir(&dir)?;
         }
         #[cfg(any(test, debug_assertions))]
         if let Some(planted) = self.planted(host, base, seed)? {
@@ -560,11 +561,14 @@ impl Layers {
     /// # Errors
     /// [`Error::Io`]: the files or the ISO could not be made or placed.
     pub fn seed_iso(&self, host: &dyn Host, seed: &Seed) -> Result<PathBuf, Error> {
+        ensure_real_dir(&self.root)?;
         let dir = self.seed_dir();
-        std::fs::create_dir_all(&dir).map_err(|e| io("create", &dir, &e))?;
+        ensure_real_dir(&dir)?;
         let name = format!("{}.iso", seed.fingerprint());
         let iso = dir.join(&name);
-        if !crate::is_regular_file(&iso) {
+        let ready =
+            std::fs::symlink_metadata(&iso).is_ok_and(|m| m.file_type().is_file() && m.len() > 0);
+        if !ready {
             let scratch = aterm_tempfile::Builder::new()
                 .prefix(".partial-")
                 .tempdir_in(&dir)
@@ -575,7 +579,28 @@ impl Layers {
                 .map_err(|e| io("write the seed in", &files, &e))?;
             let made = scratch.path().join("seed.iso");
             host.make_iso(&files, &made).map_err(Error::Io)?;
+            let made_meta = std::fs::symlink_metadata(&made).map_err(|e| io("read", &made, &e))?;
+            if !made_meta.file_type().is_file() || made_meta.len() == 0 {
+                return Err(Error::Io(format!(
+                    "could not make {}: not a non-empty regular file",
+                    made.display()
+                )));
+            }
+            #[cfg(unix)]
+            let made_file = {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                    .open(&made)
+            };
+            #[cfg(not(unix))]
+            let made_file = std::fs::File::open(&made);
+            let made_file = made_file.map_err(|e| io("open", &made, &e))?;
+            aterm_durable::durable(&made_file).map_err(|e| io("flush", &made, &e))?;
+            drop(made_file);
             std::fs::rename(&made, &iso).map_err(|e| io("place", &iso, &e))?;
+            aterm_durable::durable_dir(&dir).map_err(|e| io("flush", &dir, &e))?;
         }
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             if entry.file_name() != name.as_str() {
@@ -589,6 +614,31 @@ impl Layers {
         }
         Ok(iso)
     }
+}
+
+/// Create `dir` and its missing parents if absent, refusing when `dir` is a symlink or
+/// non-directory.
+fn ensure_real_dir(dir: &Path) -> Result<(), Error> {
+    if let Ok(meta) = std::fs::symlink_metadata(dir)
+        && !meta.file_type().is_dir()
+    {
+        return Err(Error::Io(format!(
+            "could not create {}: not a real directory",
+            dir.display()
+        )));
+    }
+    std::fs::create_dir_all(dir).map_err(|e| io("create", dir, &e))?;
+    if !std::fs::symlink_metadata(dir)
+        .map_err(|e| io("read", dir, &e))?
+        .file_type()
+        .is_dir()
+    {
+        return Err(Error::Io(format!(
+            "could not create {}: not a real directory",
+            dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Write `text` to the new file `path`, flushed to stable media.

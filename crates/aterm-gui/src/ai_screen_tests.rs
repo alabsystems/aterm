@@ -19,6 +19,7 @@ fn cli(id: &'static str, state: State, mark: Mark, fact: &str) -> AiCli {
         product: row.product,
         claude: row.is_claude(),
         wanted: true,
+        asked: true,
         state,
         mark,
         fact: fact.to_string(),
@@ -390,6 +391,7 @@ fn a_codex_row_that_offers_no_fix_asks_nothing_of_anyone() {
                 rows: vec![aterm_agent::ai::state::Row {
                     connector: codex,
                     wanted: true,
+                    asked: true,
                     state,
                     mark: Mark::Fail,
                     fact: "what the look saw".to_string(),
@@ -565,6 +567,22 @@ fn a_claude_row_whose_sign_in_starts_nothing_offers_no_sign_in() {
             row.detail
         );
     }
+}
+
+/// The Install tab's `aterm pkg install` runs on a terminal, so without its word `aterm pkg`
+/// would finish this Mac's setup after it ([`atpkg::cli::pass_finishes_setup`]); the word keeps
+/// the tab to the install. CONTROL: the same words without it are followed by setup.
+#[test]
+fn the_install_tab_runs_no_setup_after_its_install() {
+    let words =
+        |words: &[&str]| -> Vec<std::ffi::OsString> { words[1..].iter().map(Into::into).collect() };
+    let install = AiAct::Install.words("codex");
+    assert_eq!(
+        install,
+        ["pkg", "install", "codex", atpkg::cli::NO_INIT_FLAG]
+    );
+    assert!(!atpkg::cli::pass_finishes_setup(&words(&install)));
+    assert!(atpkg::cli::pass_finishes_setup(&words(&install[..3])));
 }
 
 /// Shell launch lines quote the executable path and refuse control characters or unsafe expansions.
@@ -844,4 +862,20 @@ fn a_reading_names_the_whole_path_its_fact_says() {
         ),
         None
     );
+}
+
+/// A signed-out or missing CLI nobody asked for is no exception, on the new Mac's five rows; the
+/// page's row still offers its act, on demand. CONTROL: the same row, asked for, is one.
+#[test]
+fn a_cli_nobody_asked_for_is_no_exception_but_stays_on_its_page() {
+    for state in [State::SignedOut, State::NotInstalled] {
+        let mut asked = cli("codex", state, Mark::Fail, "fact");
+        let mut r = reading();
+        r.clis[1] = asked.clone();
+        assert_eq!(keys(&ai_entries(&r, false)).len(), 1, "{state:?}");
+        asked.asked = false;
+        r.clis[1] = asked.clone();
+        assert!(ai_entries(&r, false).is_empty(), "{state:?}");
+        assert!(asked.act().is_some(), "{state:?}: the page still offers it");
+    }
 }

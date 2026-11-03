@@ -18,10 +18,10 @@ use atpkg_publish::channel::Log;
 use atpkg_publish::channel::group::{
     GroupOutcome, GroupRequest, Mode, Parts, SealProbe, publish_group,
 };
-use atpkg_publish::ctx::{Ctx, STAGING_OWNER};
-use atpkg_publish::error::Result;
-use atpkg_publish::host::fake::FakeHost;
-use atpkg_publish::host::{HostError, Probe as Answer, Release, ReleaseHost, Replace, Slug};
+use atpkg_publish::ctx::{Ctx, HostChoice, STAGING_OWNER};
+use atpkg_publish::error::{Error, Result};
+use atpkg_publish::host::fake::{FakeFail, FakeHost, FakeOp};
+use atpkg_publish::host::{HostError, Hosts, Probe as Answer, Release, ReleaseHost, Replace, Slug};
 use atpkg_publish::programs::TRUST_EXPOSES;
 use atpkg_publish::triple::Triple;
 
@@ -726,4 +726,137 @@ fn upload_needs_the_key_and_the_channel_token_and_a_keyless_stage_signs_nothing(
             .iter()
             .all(|p| p.signing == Signing::Unsigned)
     );
+}
+
+/// A `FakeHost` whose `write_preflight` refuses one slug, a program repository's, and delegates
+/// every other: the run's staging host only, so the role, not the slug, says which check asks.
+struct RefusesOne {
+    inner: Arc<FakeHost>,
+    refused: Slug,
+}
+
+impl ReleaseHost for RefusesOne {
+    fn releases(&self, slug: &Slug) -> std::result::Result<Vec<Release>, HostError> {
+        self.inner.releases(slug)
+    }
+    fn release(&self, slug: &Slug, tag: &str) -> std::result::Result<Release, HostError> {
+        self.inner.release(slug, tag)
+    }
+    fn download(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        assets: &[&str],
+        dir: &Path,
+    ) -> std::result::Result<(), HostError> {
+        self.inner.download(slug, tag, assets, dir)
+    }
+    fn create(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        title: &str,
+        notes: &str,
+        files: &[PathBuf],
+    ) -> std::result::Result<(), HostError> {
+        self.inner.create(slug, tag, title, notes, files)
+    }
+    fn upload(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        files: &[PathBuf],
+        replace: Replace,
+    ) -> std::result::Result<(), HostError> {
+        self.inner.upload(slug, tag, files, replace)
+    }
+    fn publish_draft(&self, slug: &Slug, tag: &str) -> std::result::Result<(), HostError> {
+        self.inner.publish_draft(slug, tag)
+    }
+    fn write_preflight(&self, slug: &Slug) -> std::result::Result<(), HostError> {
+        if *slug == self.refused {
+            Err(HostError::Refused("this writer is refused".into()))
+        } else {
+            self.inner.write_preflight(slug)
+        }
+    }
+    fn probe_public(&self, slug: &Slug, tag: &str, asset: &str) -> Answer {
+        self.inner.probe_public(slug, tag, asset)
+    }
+    fn fetch_public(&self, slug: &Slug, tag: &str, asset: &str, dest: &Path, cap: u64) -> Answer {
+        self.inner.fetch_public(slug, tag, asset, dest, cap)
+    }
+    fn clone_repo(&self, slug: &Slug, dest: &Path) -> std::result::Result<(), HostError> {
+        self.inner.clone_repo(slug, dest)
+    }
+    fn fetch_repo(&self, slug: &Slug, dir: &Path) -> std::result::Result<(), HostError> {
+        self.inner.fetch_repo(slug, dir)
+    }
+}
+
+#[test]
+fn upload_asks_both_writers_under_agh() {
+    let mut c = cut("group-writers", &FLOOR, &[]);
+    std::fs::remove_file(&c.rig.ctx.tokens.channel).expect("rm token");
+    c.rig.ctx = c.rig.ctx.clone().with_host_choice(HostChoice::Agh);
+    let channel = c.rig.ctx.index_slug();
+    let staging = c.rig.ctx.staging_slug(atpkg::manifest::INDEX_REPO);
+    let nothing_ran = |c: &Cut| {
+        let calls = c.rig.host.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|l| l.starts_with("create") || l.starts_with("upload")),
+            "{calls:?}"
+        );
+        assert!(c.packs.packs.borrow().is_empty(), "nothing packs");
+        assert!(c.packs.indexes.borrow().is_empty(), "nothing is indexed");
+    };
+
+    c.rig.host.fail_next(FakeOp::Preflight, FakeFail::Refuse);
+    let (r, _) = run(&c, &request(&c, Mode::Upload));
+    let e = r.expect_err("no channel writer");
+    assert!(matches!(e, Error::Refused(_)), "{e}");
+    let why = e.to_string();
+    assert!(
+        why.contains(&format!("public owner's writer on {channel}")),
+        "{why}"
+    );
+    assert!(why.contains("refused by the test"), "{why}");
+    assert!(!why.contains("staging owner's writer"), "{why}");
+    assert!(
+        c.rig.host.calls().contains(&format!("preflight {channel}")),
+        "{:?}",
+        c.rig.host.calls()
+    );
+    nothing_ran(&c);
+
+    // A program repository's staging writer is asked too, after the index repository's: the
+    // group's packs are uploaded there, and under agh push and a grant are per repository.
+    let trust = c.rig.ctx.staging_slug("trust");
+    c.rig.ctx.hosts = Hosts {
+        staging: Arc::new(RefusesOne {
+            inner: c.rig.host.clone(),
+            refused: trust.clone(),
+        }),
+        channel: c.rig.host.clone(),
+    };
+    let (r, _) = run(&c, &request(&c, Mode::Upload));
+    let e = r.expect_err("no staging writer on a program repository");
+    assert!(matches!(e, Error::Refused(_)), "{e}");
+    let why = e.to_string();
+    assert!(
+        why.contains(&format!("staging owner's writer on {trust}")),
+        "{why}"
+    );
+    assert!(why.contains("this writer is refused"), "{why}");
+    assert!(!why.contains("public owner's writer"), "{why}");
+    let calls = c.rig.host.calls();
+    assert!(calls.contains(&format!("preflight {staging}")), "{calls:?}");
+    let public_trust = c.rig.ctx.public_slug("trust");
+    assert!(
+        calls.contains(&format!("preflight {public_trust}")),
+        "{calls:?}"
+    );
+    nothing_ran(&c);
 }

@@ -24,15 +24,33 @@
 //! tender's pass itself at a clock [`TEND_AHEAD`] gap steps on, so the rank spread does not hold
 //! the lane, round the Macs until none finds a rotation due ([`TEND_ROUNDS`] rounds at most).
 //!
-//! Then F21's split (§4.1 F21): the lab holds a split of its own, carrying records only within
-//! island A (a1, a2, a3) and within island B (b1, b2, b3). On A, a1 removes b3 and a3; on B, b3,
-//! not yet told, removes a3, which mints its epoch, and b1 puts a value under it. Both sides'
-//! acts are kept on their Macs ([`client::test_remove_unposted`], [`client::test_put_everyone`]),
-//! since the Macs' subscribers would carry a post across. Then the lab heals (every Mac takes
-//! every other's records) and runs the tender's pass as before: every member reads b1's value, a
-//! write sealed under an epoch b3 minted past its cutoff; b3's epoch is keyed and covered by a
-//! reseal; and no Mac wraps a newest epoch to b3. b3 plays F21's removed Mac because b2 is out
-//! by F16's quorum by then.
+//! Then F21's split (§4.1 F21): the lab cuts island A (a1, a2, a3) off from island B (b1, b2,
+//! b3) again with the lane's own cut ([`split::Cut`]), which every process of each island
+//! honours on every connect, and carries records only within each island itself. On A, a1
+//! removes b3 and a3; on B, b3, not yet told, removes a3, which mints its epoch, and b1 puts a
+//! value under it. Each removal is signed kept on its Mac ([`client::test_remove_unposted`]),
+//! and then that Mac's own records sync (`aterm secrets sync` in its world) posts its held
+//! records to every server that lacks its frontier: its own island's server must take them, and
+//! the cut refuses the other's. That pass most likely carried a1's removal of b3 to island B
+//! on 2026-11-02, when the vault's `aterm-swarm-policy` listed island B's server and the split
+//! cut nothing (the heal-retry run; not traced, and b3 already held the removal before it
+//! acted), so the split's row sees it held back, not merely idle ([`split::synced`]). b1's put
+//! posts its records to every server it knows ([`client::test_put_everyone`]), all at once on
+//! threads of its own. The lab makes each removal and the put in a process of its Mac's world
+//! ([`act`], [`split::Cut::act`]), which its island's cut covers whole, as that Mac's own
+//! process would be (a cut held on one thread of this process would let the post's other
+//! threads across). The split's ledger ([`split::Ledger`]) reads every Mac and both servers
+//! when the cut falls, again once an exchange in flight then has landed ([`split::LAND`]; each
+//! island then takes in what its own Macs hold, so b3 acts on all its island holds, a1's acts
+//! alone unknown to it), and just before the heal, and [`SPLIT_HELD`] fails where a record or
+//! head either island made, or held alone at that second read, reached the other, naming the
+//! plane, or where a records sync left its own island's server short; [`KEPT`] is not judged
+//! on a split something crossed, or one not read whole or not held, since that run is not shown
+//! to measure a write on the removed Mac's side. Then the lab heals (the cut lifts, and every
+//! Mac takes every other's records) and runs the tender's pass as before: every member reads
+//! b1's value, a write sealed under an epoch b3 minted past its cutoff; b3's epoch is keyed and
+//! covered by a reseal; and no Mac wraps a newest epoch to b3. b3 plays F21's removed Mac
+//! because b2 is out by F16's quorum by then.
 
 use std::time::Instant;
 
@@ -42,6 +60,7 @@ use aterm_secrets::membership_log::{Log, MemberId, RecordId};
 use aterm_secrets::text::Audience;
 
 use super::commons::Mac;
+use super::{Island, split};
 
 /// The hostile Mac.
 pub const REMOVER: &str = "b2";
@@ -163,9 +182,9 @@ pub struct Kept {
     pub removals: Vec<Act>,
     /// b1's put: `Err` with why it failed.
     pub put: Option<Result<(), String>>,
-    /// b1 held a1's removal of b3 before it wrote: the split leaked, and the run measured no
-    /// write on the removed Mac's side.
-    pub leaked: bool,
+    /// The split's ledger: every Mac and server when the cut fell, once what was in flight then
+    /// had landed, and just before the heal.
+    pub ledger: Option<split::Ledger>,
     /// b1's value went under an epoch b3 minted.
     pub under_cut_epoch: bool,
     /// What the tender's passes minted: `<mac> minted <n> records in round <k>`.
@@ -183,6 +202,9 @@ pub const BACK_IN: &str =
     "removals: removed Macs that reach a quorum are back in and read new values";
 /// F21's check (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F21, build step 11).
 pub const KEPT: &str = "removals: a write on the removed Mac's side survives the heal";
+/// F21's split's own check: the lab's split held, so [`KEPT`] judges the product
+/// ([`split::judge`]).
+pub const SPLIT_HELD: &str = "removals: no record or head crossed F21's split";
 
 /// One named check of the plane.
 pub type Check = super::Check;
@@ -303,18 +325,29 @@ pub fn judge(ev: &Evidence) -> Vec<Check> {
             wrong.join("; ")
         },
     });
-    out.push(judge_kept(ev.kept.as_ref()));
+    let ledger = ev.kept.as_ref().and_then(|k| k.ledger.as_ref());
+    let voiding: Vec<split::Shortfall> = split::shortfalls(ledger)
+        .into_iter()
+        .filter(|s| s.voids())
+        .collect();
+    out.push(judge_kept(ev.kept.as_ref(), &voiding));
+    out.push(split::judge(SPLIT_HELD, "F21's split", ledger));
     out
 }
 
 /// [`KEPT`]: b1's write under the epoch b3 minted while a1 removed it is read after the heal by
 /// every member, b3's epoch is keyed and covered once the tender's pass is done, nothing is due,
-/// b3 is out everywhere, and no Mac wraps a newest `[everyone]` epoch to b3.
+/// b3 is out everywhere, and no Mac wraps a newest `[everyone]` epoch to b3. Where the split is
+/// not shown to have held ([`SPLIT_HELD`]; `short`, each way it fell short that voids it,
+/// [`split::Shortfall::voids`]), it is not judged:
+/// what crossed is the lab's leak, and a split not read whole or not held is not shown to have
+/// kept a1's removal from b1, so the run is not shown to measure a write on the removed Mac's
+/// side. Its words say which.
 ///
 /// Its negative controls are the judge tests' (`swarm_partition_removals_tests.rs`). A lane run
 /// with `reseal_ready` answering `false` would leave b3's epoch uncovered and a reseal due; it is
 /// not run, since every Mac's aterm and the lab would need that mutant.
-fn judge_kept(kept: Option<&Kept>) -> Check {
+fn judge_kept(kept: Option<&Kept>, short: &[split::Shortfall]) -> Check {
     let fail = |detail: String| Check {
         name: KEPT,
         pass: false,
@@ -326,6 +359,17 @@ fn judge_kept(kept: Option<&Kept>) -> Check {
     if let Some(why) = &k.skipped {
         return fail(format!("the split did not run: {why}"));
     }
+    if !short.is_empty() {
+        return fail(format!(
+            "not judged: {} ({SPLIT_HELD}), so this run is not shown to measure a write on the \
+             removed Mac's side",
+            short
+                .iter()
+                .map(|s| s.words("F21's split"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
     let mut wrong: Vec<String> = k
         .removals
         .iter()
@@ -336,11 +380,6 @@ fn judge_kept(kept: Option<&Kept>) -> Check {
         None => wrong.push(format!("{WRITER} put no value")),
         Some(Err(why)) => wrong.push(format!("{WRITER} could not put the value: {why}")),
         Some(Ok(())) => {}
-    }
-    if k.leaked {
-        wrong.push(format!(
-            "the split leaked: {WRITER} held a1's removal of {CUT} before it wrote"
-        ));
     }
     if k.put == Some(Ok(())) && !k.under_cut_epoch {
         wrong.push(format!("{WRITER} wrote under an epoch {CUT} did not mint"));
@@ -522,11 +561,11 @@ fn report_kept(out: &mut String, k: &Kept) {
         }
         None => {}
     }
-    if k.leaked {
-        let _ = writeln!(
-            out,
-            "- the split leaked: {WRITER} held a1's removal of {CUT} before it wrote"
-        );
+    if let Some(ledger) = &k.ledger {
+        out.push_str(&split::report("F21's split", ledger));
+        if let Some(why) = &ledger.failed {
+            let _ = writeln!(out, "- F21's split: the lab could not hold it: {why}");
+        }
     }
     for m in &k.minted {
         let _ = writeln!(out, "- after the split's heal, the tender: {m}");
@@ -598,16 +637,25 @@ fn one_line(out: &super::world::Out) -> String {
 }
 
 /// Run the plane on `macs` (the lane's Macs), each act `act(mac, args)` the aterm under test's
-/// CLI in that Mac's world.
-pub fn run(macs: &[Mac], act: &dyn Fn(&str, &[&str]) -> super::world::Out) -> Evidence {
+/// CLI in that Mac's world, F21's split held by `cut`.
+pub fn run(
+    macs: &[Mac],
+    cut: &dyn split::Cut,
+    act: &dyn Fn(&str, &[&str]) -> super::world::Out,
+) -> Evidence {
     let t = Instant::now();
     let mut ev = Evidence::default();
-    drive(macs, act, &mut ev);
+    drive(macs, cut, act, &mut ev);
     ev.ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX);
     ev
 }
 
-fn drive(macs: &[Mac], act: &dyn Fn(&str, &[&str]) -> super::world::Out, ev: &mut Evidence) {
+fn drive(
+    macs: &[Mac],
+    cut: &dyn split::Cut,
+    act: &dyn Fn(&str, &[&str]) -> super::world::Out,
+    ev: &mut Evidence,
+) {
     let mac = |name: &str| macs.iter().find(|m| m.name == name);
     let Some(remover) = mac(REMOVER) else {
         ev.skipped = Some(format!("no {REMOVER}"));
@@ -763,12 +811,65 @@ fn drive(macs: &[Mac], act: &dyn Fn(&str, &[&str]) -> super::world::Out, ev: &mu
             .and_then(|row| row.removed.as_ref())
             .map(client::RemovedNote::title);
     }
-    let kept = keyed_write(macs, ev);
+    let kept = keyed_write(macs, cut, act, ev);
     ev.kept = Some(kept);
 }
 
-/// F21's split on `macs` (see the module doc).
-fn keyed_write(macs: &[Mac], ev: &mut Evidence) -> Kept {
+/// `on`'s own records sync (`aterm secrets sync`, `act` in its world, cut as its island is) under
+/// F21's split, noted in `ledger` ([`split::synced`]): the pass that most likely carried a1's
+/// removal of b3 to island B on 2026-11-02 (not traced), so the split's row sees it held back,
+/// its own island's server taking what `on` made.
+fn sync_under_split(
+    on: &Mac,
+    act: &dyn Fn(&str, &[&str]) -> super::world::Out,
+    watched: &[split::Watched],
+    servers: &[(Island, String)],
+    signers: &split::Signers,
+    ledger: &mut split::Ledger,
+) {
+    let out = act(&on.name, &["secrets", "sync"]);
+    let said = (out.code != 0).then(|| one_line(&out));
+    let island = island_of(&on.name);
+    let (Some(mac), Some((_, server))) = (
+        watched.iter().find(|w| w.name == on.name),
+        servers.iter().find(|(i, _)| *i == island),
+    ) else {
+        ledger.syncs.push(split::Synced {
+            mac: on.name.clone(),
+            island,
+            made: 0,
+            lacking: Vec::new(),
+            unread: Some(format!(
+                "no {} or no island {} server",
+                on.name,
+                island.word()
+            )),
+            said,
+        });
+        return;
+    };
+    let synced = split::synced(ledger, mac, server, signers, said);
+    ledger.syncs.push(synced);
+}
+
+/// The island a lane Mac is on, by its name (`a1` …, `b1` …).
+fn island_of(name: &str) -> Island {
+    if name.starts_with('a') {
+        Island::A
+    } else {
+        Island::B
+    }
+}
+
+/// F21's split on `macs`, held by `lab_cut`, each records sync `act(mac, args)` the aterm under
+/// test's CLI in that Mac's world (see the module doc).
+#[allow(clippy::too_many_lines)]
+fn keyed_write(
+    macs: &[Mac],
+    lab_cut: &dyn split::Cut,
+    act: &dyn Fn(&str, &[&str]) -> super::world::Out,
+    ev: &mut Evidence,
+) -> Kept {
     let mut k = Kept::default();
     let mac = |name: &str| macs.iter().find(|m| m.name == name);
     let (Some(a1), Some(cut), Some(writer)) = (mac("a1"), mac(CUT), mac(WRITER)) else {
@@ -811,12 +912,52 @@ fn keyed_write(macs: &[Mac], ev: &mut Evidence) -> Kept {
         k.skipped = Some(format!("{CUT} is no member of its own log"));
         return k;
     };
-    let island_a: Vec<&Mac> = macs.iter().filter(|m| m.name.starts_with('a')).collect();
-    let island_b: Vec<&Mac> = macs.iter().filter(|m| m.name.starts_with('b')).collect();
+    let island_a: Vec<&Mac> = macs
+        .iter()
+        .filter(|m| island_of(&m.name) == Island::A)
+        .collect();
+    let island_b: Vec<&Mac> = macs
+        .iter()
+        .filter(|m| island_of(&m.name) == Island::B)
+        .collect();
+    let watched: Vec<split::Watched> = macs
+        .iter()
+        .map(|m| split::Watched {
+            name: m.name.clone(),
+            island: island_of(&m.name),
+            paths: m.paths.clone(),
+        })
+        .collect();
+    let servers = lab_cut.servers();
+    let mut signers = split::Signers::new();
+
+    // The split: the lane's cut again, so no process of either island reaches the other's.
+    if let Err(e) = lab_cut.set(true) {
+        k.skipped = Some(format!("the lab could not cut the islands apart: {e}"));
+        return k;
+    }
+    let held_from = Instant::now();
+    let mut ledger = split::Ledger {
+        cut: split::read(&watched, &servers, &mut signers),
+        ..split::Ledger::default()
+    };
+    // Once an exchange that was crossing when the cut fell has landed, each island takes in
+    // what its own Macs hold (so b3 acts on all its island holds, a1's acts alone unknown to
+    // it), and the ledger takes its start read: what either island holds alone from here on, or
+    // makes, must stay there.
+    if split::land(held_from).is_err() {
+        let _ = lab_cut.set(false);
+        k.skipped = Some("interrupted while the split's in-flight exchanges landed".to_owned());
+        return k;
+    }
+    carry_among(&island_a, ev);
+    carry_among(&island_b, ev);
+    ledger.start = split::read(&watched, &servers, &mut signers);
+    ledger.landed_ms = u64::try_from(held_from.elapsed().as_millis()).unwrap_or(u64::MAX);
     let mut remove = |on: &Mac, name: &str, code: &str| {
-        let (ok, said) = match remove_unposted(&on.paths, code) {
+        let (ok, said) = match lab_cut.act(&on.name, &[REMOVE_WORD, code]) {
             Ok(n) => (true, format!("signed {n} records, kept on {}", on.name)),
-            Err(e) => (false, e.to_string()),
+            Err(e) => (false, e),
         };
         k.removals.push(Act {
             on: on.name.clone(),
@@ -826,20 +967,21 @@ fn keyed_write(macs: &[Mac], ev: &mut Evidence) -> Kept {
         });
     };
 
-    // Island A: a1 removes b3 and a3.
+    // Island A: a1 removes b3 and a3, and a1's own records sync posts that to every server that
+    // lacks its frontier: island A's takes it, and the cut refuses island B's.
     remove(a1, CUT, &cut_code);
     remove(a1, ALSO, &also_code);
     carry_among(&island_a, ev);
-    // Island B: b3, not yet told, removes a3 (its epoch), and b1 writes under that epoch.
+    sync_under_split(a1, act, &watched, &servers, &signers, &mut ledger);
+    // Island B: b3, not yet told, removes a3 (its epoch), its records sync puts that on island
+    // B's server, and b1 writes under that epoch.
     remove(cut, ALSO, &also_code);
+    sync_under_split(cut, act, &watched, &servers, &signers, &mut ledger);
     carry_among(&island_b, ev);
-    k.leaked =
-        log_of(&writer.paths).is_some_and(|log| log.membership().removal(&cut_actor).is_some());
-    let put = put_kept(&writer.paths);
-    k.put = Some(match &put {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    });
+    let put = lab_cut
+        .act(WRITER, &[PUT_WORD])
+        .and_then(|epoch| epoch_of(&epoch));
+    k.put = Some(put.as_ref().map(|_| ()).map_err(Clone::clone));
     k.under_cut_epoch = put.as_ref().is_ok_and(|epoch| {
         log_of(&writer.paths)
             .and_then(|log| log.get(epoch).map(|r| *r.actor()))
@@ -847,8 +989,15 @@ fn keyed_write(macs: &[Mac], ev: &mut Evidence) -> Kept {
     });
     let epoch = put.ok();
     carry_among(&island_b, ev);
+    ledger.end = split::read(&watched, &servers, &mut signers);
+    ledger.ms = u64::try_from(held_from.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    // The heal, then the tender's pass, each round further on, until no Mac finds one due.
+    // The heal: the cut lifts, then the tender's pass, each round further on, until no Mac
+    // finds one due.
+    if let Err(e) = lab_cut.set(false) {
+        ledger.failed = Some(format!("the heal: {e}"));
+    }
+    k.ledger = Some(ledger);
     carry(macs, ev);
     let base = aterm_time::unix_millis()
         .unwrap_or(0)
@@ -952,6 +1101,38 @@ fn put_kept(_paths: &Paths) -> aterm_secrets::Result<RecordId> {
     Err(aterm_secrets::Error::new(
         "a release lab has no test seam to put the [everyone] value; run the removals plane from a debug lab",
     ))
+}
+
+/// [`act`]'s word for a removal kept on its Mac, then the removed Mac's join code.
+const REMOVE_WORD: &str = "remove-unposted";
+/// [`act`]'s word for b1's put under the one newest `[everyone]` epoch it holds.
+const PUT_WORD: &str = "put-kept";
+
+/// One of F21's acts on the Mac whose vault paths are `paths`, made in this process: the lab's
+/// `partition-act` verb runs it in a process of that Mac's world ([`split::Cut::act`]), which
+/// its island's cut covers whole. `remove-unposted <code>` says how many records it signed,
+/// `put-kept` the epoch it sealed under, in hex.
+///
+/// # Errors
+/// An act this verb does not know, or the act failed: why.
+pub fn act(paths: &Paths, words: &[String]) -> Result<String, String> {
+    match words {
+        [word, code] if word == REMOVE_WORD => remove_unposted(paths, code)
+            .map(|n| n.to_string())
+            .map_err(|e| e.to_string()),
+        [word] if word == PUT_WORD => put_kept(paths)
+            .map(|epoch| aterm_codec::hex::encode_lower(&epoch))
+            .map_err(|e| e.to_string()),
+        _ => Err(format!("usage: {REMOVE_WORD} <join code> | {PUT_WORD}")),
+    }
+}
+
+/// The epoch `put-kept` printed ([`act`]).
+fn epoch_of(hex: &str) -> Result<RecordId, String> {
+    let mut epoch = [0u8; 32];
+    (hex.len() == 64 && aterm_codec::hex::decode_into(hex.as_bytes(), &mut epoch))
+        .then_some(epoch)
+        .ok_or_else(|| format!("{PUT_WORD} printed no epoch: {hex}"))
 }
 
 /// A removal kept on the Mac at `paths` ([`client::test_remove_unposted`]), a test seam as

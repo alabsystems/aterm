@@ -1991,3 +1991,6 @@ fn check_and_stage_in(
 #[cfg(test)]
 #[path = "github_tests.rs"]
 mod tests;
+
+#[path = "local_stage.rs"]
+pub(crate) mod local_stage;

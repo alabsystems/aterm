@@ -256,8 +256,32 @@ fn start(exec: &Exec, identity: Identity) -> Result<Started, String> {
     let Some((program, args)) = exec.argv.split_first() else {
         return Err("an empty argv".into());
     };
+    if program.is_empty() {
+        return Err("an empty program name".into());
+    }
+    if program.contains(&0) {
+        return Err(format!(
+            "program `{}` holds a NUL byte",
+            String::from_utf8_lossy(program)
+        ));
+    }
+    for (idx, arg) in args.iter().enumerate() {
+        if arg.contains(&0) {
+            return Err(format!(
+                "argument {} (`{}`) holds a NUL byte",
+                idx + 1,
+                String::from_utf8_lossy(arg)
+            ));
+        }
+    }
     if exec.cwd.is_empty() {
         return Err("no cwd".into());
+    }
+    if exec.cwd.contains(&0) {
+        return Err(format!(
+            "cwd `{}` holds a NUL byte",
+            String::from_utf8_lossy(&exec.cwd)
+        ));
     }
     for (k, v) in &exec.env {
         if k.is_empty() || k.contains(&b'=') || k.contains(&0) {

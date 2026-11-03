@@ -6,8 +6,8 @@
 
 use super::*;
 
-/// The window widths the window's least (164pt, a 20-column terminal window) and a 22-, 24-, 30-,
-/// 36- and 42-column terminal window give Settings.
+/// Narrow stress widths and small admitted views; [`least_view`] declares the supported
+/// minimum at each text scale.
 pub(super) const NARROW_WIDTHS: [f32; 6] = [164.0, 178.0, 192.0, 234.0, 276.0, 318.0];
 pub(super) const NARROW_HEIGHTS: [f32; 2] = [348.0, 516.0];
 
@@ -1945,63 +1945,288 @@ fn the_manual_page_s_buttons_keep_their_words() {
 }
 
 #[test]
-fn a_scrolled_page_chooses_its_chrome_again_when_the_text_size_changes() {
-    let chrome_of = |runtime: &NativeRuntime, view: crate::native_app::ViewId| {
-        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
-            unreachable!()
-        };
-        state.page_chrome.get()
-    };
-    let scroll_to = |runtime: &mut NativeRuntime, view: crate::native_app::ViewId, stop| {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-            unreachable!()
-        };
-        state.scroll_page_to(stop);
-    };
-    let set_scale = |scale: f32| {
-        crate::native_appearance::install_preferences(
-            crate::native_appearance::AppearancePreferences {
-                text_scale: scale,
-                ..crate::native_appearance::current_preferences()
-            },
+fn a_text_size_change_remeasures_a_scrolled_caption() {
+    let (width, height) = (318.0, 516.0);
+    for scale in [1.0, 2.0] {
+        let minimum = least_view(scale);
+        assert!(
+            width >= minimum.0 && height >= minimum.1,
+            "admitted regression viewport"
         );
-    };
-    std::thread::Builder::new()
-        .stack_size(8 << 20)
-        .spawn(move || {
-            let mut differs = 0;
-            for route in SettingsRoute::ALL {
-                for (width, height) in NARROW_WIDTHS
-                    .into_iter()
-                    .flat_map(|width| NARROW_HEIGHTS.map(|height| (width, height)))
-                    .chain(WIDE_SIZES)
-                {
-                    let context = format!("{route:?} {width}\u{d7}{height}");
-                    let cx = view_cx_at(width, height);
-                    set_scale(2.0);
-                    let (mut fresh, instance, view) = setup();
-                    go_to_route(&mut fresh, instance, view, route);
-                    scroll_to(&mut fresh, view, 2);
-                    let _ = compile_settings_view(&fresh, instance, view, &cx);
-                    let at_two = chrome_of(&fresh, view);
-                    set_scale(1.0);
-                    let (mut runtime, instance, view) = setup();
-                    go_to_route(&mut runtime, instance, view, route);
-                    let _ = compile_settings_view(&runtime, instance, view, &cx);
-                    scroll_to(&mut runtime, view, 2);
-                    let _ = compile_settings_view(&runtime, instance, view, &cx);
-                    let at_one = chrome_of(&runtime, view);
-                    differs += usize::from(at_one != at_two);
-                    set_scale(2.0);
-                    let _ = compile_settings_view(&runtime, instance, view, &cx);
-                    assert_eq!(chrome_of(&runtime, view), at_two, "{context}");
-                }
+    }
+    at_each_text_scale(&[1.0], "a scrolled caption after text size changes", |_| {
+        let cx = view_cx_at(width, height);
+        let target = UiKey::new(cursor_style_row_key("rainbow kitty underline"));
+        let wrong = UiKey::new(cursor_style_row_key("off"));
+        let caption = "settings/cursor-styles/companions/heading";
+        let set_scale = |scale| {
+            crate::native_appearance::install_preferences(
+                crate::native_appearance::AppearancePreferences {
+                    text_scale: scale,
+                    ..crate::native_appearance::current_preferences()
+                },
+            );
+        };
+        let plan_of = |runtime: &NativeRuntime, view| {
+            let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+                unreachable!()
+            };
+            state.scroll_plan().expect("measured Cursor Styles list")
+        };
+        let inputs_of = |runtime: &NativeRuntime, view| {
+            let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+                unreachable!()
+            };
+            (
+                state.common.last_focus.clone(),
+                state.page_reveal.clone().map(|key| (key, state.reveal_as)),
+                state.page_events,
+            )
+        };
+        let chrome_of = |runtime: &NativeRuntime, view| {
+            let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+                unreachable!()
+            };
+            state.page_chrome.get()
+        };
+        let at_style = |runtime: &NativeRuntime, view, key: &UiKey| {
+            let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+                unreachable!()
+            };
+            let top = state
+                .scroll_record
+                .borrow()
+                .as_ref()
+                .map(|record| record.top());
+            let plan = plan_of(runtime, view);
+            plan.stop_of_identity(key).is_some_and(|stop| {
+                stop <= plan.limit() && top == Some(stop) && plan.shown(stop).contains(&stop)
+            })
+        };
+        let scroll_to_style = |runtime: &mut NativeRuntime, instance, view, key: &UiKey| {
+            let plan = plan_of(runtime, view);
+            let stop = plan
+                .stop_of_identity(key)
+                .expect("declared actual cursor style");
+            assert!(
+                stop <= plan.limit(),
+                "the concrete style admits its own top"
+            );
+            runtime
+                .dispatch(instance, view, AppEvent::ScrollLines(1))
+                .unwrap();
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            state.scroll_page_to(stop);
+        };
+        let whole = |node: &crate::native_ui::PaintNode| {
+            !node.peek
+                && node.rect.width > 0.0
+                && node.rect.height > 0.0
+                && node.rect.intersect(node.clip) == Some(node.rect)
+        };
+        let control = |screen: &crate::native_ui::CompiledUi| {
+            let node = screen
+                .paint
+                .iter()
+                .find(|node| node.key == target && matches!(node.content, UiContent::Button(_)))
+                .expect("actual cursor style control");
+            assert!(
+                whole(node),
+                "the concrete control is whole in its actual clip: {node:?}"
+            );
+            node.rect
+        };
+        let words = |screen: &crate::native_ui::CompiledUi, prefix: &str, expected: &str| {
+            let mut nodes = screen
+                .paint
+                .iter()
+                .filter(|node| {
+                    (node.key.as_str() == prefix
+                        || node.key.as_str().starts_with(&format!("{prefix}/line-")))
+                        && matches!(node.content, UiContent::Text(_))
+                })
+                .collect::<Vec<_>>();
+            if nodes.is_empty() {
+                return None;
             }
-            assert!(differs > 0, "some page's chrome differs at 2\u{d7}");
-        })
-        .expect("a thread")
-        .join()
-        .expect("the chrome is chosen again");
+            assert!(
+                nodes.iter().all(|node| whole(node)),
+                "{prefix}: actual rendered words must be whole"
+            );
+            assert!(
+                cut_words(screen, &[prefix]).is_empty(),
+                "{prefix}: actual painted words fit"
+            );
+            nodes.sort_by(|a, b| {
+                a.rect
+                    .y
+                    .total_cmp(&b.rect.y)
+                    .then_with(|| a.rect.x.total_cmp(&b.rect.x))
+            });
+            let actual = nodes
+                .iter()
+                .filter_map(|node| {
+                    if let UiContent::Text(text) = &node.content {
+                        Some(text.text.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                painted_words(&actual),
+                painted_words(expected),
+                "{prefix}: complete rendered words"
+            );
+            Some(nodes[0].rect)
+        };
+
+        // The only carried input is the real 1x wheel place, not a reference
+        // chosen from the changed 2x output or a copied R4 remapping algorithm.
+        let (mut changed, instance, view) = setup();
+        go_to_route(&mut changed, instance, view, SettingsRoute::CursorStyles);
+        let _ = compile_settings_view(&changed, instance, view, &cx);
+        scroll_to_style(&mut changed, instance, view, &target);
+        let one = compile_settings_view(&changed, instance, view, &cx);
+        assert!(
+            at_style(&changed, view, &target),
+            "1x concrete wheel-place premise"
+        );
+        assert!(
+            plan_of(&changed, view)
+                .stop_of_identity(&target)
+                .expect("style")
+                > 0,
+            "the regression is a scrolled place, not the origin"
+        );
+        let expected_name = {
+            let Some(AppViewState::Settings(state)) = changed.view_state(view) else {
+                unreachable!()
+            };
+            listed_cursor_styles(state)
+                .into_iter()
+                .find(|style| cursor_style_row_key(&style.value) == target.as_str())
+                .expect("declared cursor style")
+                .label()
+        };
+        let expected_caption = CursorStyleGroup::Companions
+            .caption()
+            .expect("group caption")
+            .to_ascii_uppercase();
+        let one_control = control(&one);
+        let one_caption = words(&one, caption, &expected_caption).expect("whole 1x held caption");
+        words(&one, &format!("{}/name", target.as_str()), &expected_name).expect("whole 1x name");
+        let old_inputs = inputs_of(&changed, view);
+        assert!(
+            old_inputs.0.is_none() && old_inputs.1.is_none() && old_inputs.2,
+            "manual wheel with no keyboard/reveal override"
+        );
+        set_scale(2.0);
+        let two = compile_settings_view(&changed, instance, view, &cx);
+
+        // A separate fresh 2x frame establishes FULL feasibility at the SAME
+        // declared style. Its own measured stop is an explicit premise.
+        let (mut fresh, fresh_instance, fresh_view) = setup();
+        go_to_route(
+            &mut fresh,
+            fresh_instance,
+            fresh_view,
+            SettingsRoute::CursorStyles,
+        );
+        let _ = compile_settings_view(&fresh, fresh_instance, fresh_view, &cx);
+        scroll_to_style(&mut fresh, fresh_instance, fresh_view, &target);
+        let feasible = compile_settings_view(&fresh, fresh_instance, fresh_view, &cx);
+        assert!(
+            at_style(&fresh, fresh_view, &target),
+            "independent 2x concrete place premise"
+        );
+        assert_eq!(
+            chrome_of(&fresh, fresh_view),
+            PageChrome::FULL,
+            "independent FULL feasibility"
+        );
+        let fresh_control = control(&feasible);
+        let fresh_caption = words(&feasible, caption, &expected_caption);
+        words(
+            &feasible,
+            &format!("{}/name", target.as_str()),
+            &expected_name,
+        )
+        .expect("whole fresh 2x name");
+        assert_ne!(
+            one_control.height, fresh_control.height,
+            "text size changes actual control geometry"
+        );
+        if let Some(caption) = fresh_caption {
+            assert!(
+                caption.height > one_caption.height,
+                "a painted 2x caption is remeasured"
+            );
+        }
+        assert_eq!(
+            inputs_of(&fresh, fresh_view),
+            old_inputs,
+            "matched semantic event/focus/reveal premises"
+        );
+
+        let (mut other, other_instance, other_view) = setup();
+        go_to_route(
+            &mut other,
+            other_instance,
+            other_view,
+            SettingsRoute::CursorStyles,
+        );
+        let _ = compile_settings_view(&other, other_instance, other_view, &cx);
+        scroll_to_style(&mut other, other_instance, other_view, &wrong);
+        let _ = compile_settings_view(&other, other_instance, other_view, &cx);
+        assert!(
+            at_style(&other, other_view, &wrong),
+            "negative uses an actual different admitted style"
+        );
+        assert!(
+            !at_style(&other, other_view, &target),
+            "wrong actual style cannot establish the premise"
+        );
+        assert!(
+            !at_style(&fresh, fresh_view, &UiKey::new("test/missing-cursor-style")),
+            "missing identity cannot establish the premise"
+        );
+
+        assert!(
+            at_style(&changed, view, &target),
+            "2x retained concrete style premise"
+        );
+        assert_eq!(
+            inputs_of(&changed, view),
+            old_inputs,
+            "text-size change adds no semantic input"
+        );
+        let changed_control = control(&two);
+        assert_ne!(
+            one_control.height, changed_control.height,
+            "retained control uses the new geometry"
+        );
+        // Letting the old caption go is legal; retaining clipped caption ink is not.
+        if let Some(caption) = words(&two, caption, &expected_caption) {
+            assert!(
+                caption.height > one_caption.height,
+                "a retained 2x caption is remeasured"
+            );
+        }
+        words(&two, &format!("{}/name", target.as_str()), &expected_name)
+            .expect("whole changed 2x name");
+        // A stale held caption must not purchase compact chrome when the
+        // independently measured control/name fit FULL at this geometry. A caption
+        // may give way rather than force compact chrome or leave clipped ink.
+        assert_eq!(
+            chrome_of(&changed, view),
+            PageChrome::FULL,
+            "remeasured held-caption geometry must not buy needless compact chrome"
+        );
+    });
 }
 
 #[test]

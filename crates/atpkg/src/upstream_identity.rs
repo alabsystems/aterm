@@ -236,13 +236,29 @@ fn rustup_proxy(target: &Path, canonical: &Path) -> Option<PathBuf> {
     })
 }
 
+fn open_regular_nonblocking(path: &Path) -> Option<std::fs::File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
 fn files_equal_bounded(a: &Path, b: &Path, expected_len: u64) -> bool {
     use std::io::Read as _;
     const MAX_PROXY_BYTES: u64 = 64 * 1024 * 1024;
     if expected_len > MAX_PROXY_BYTES {
         return false;
     }
-    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+    let (Some(mut fa), Some(mut fb)) = (open_regular_nonblocking(a), open_regular_nonblocking(b))
+    else {
         return false;
     };
     let (mut ba, mut bb) = ([0u8; 8192], [0u8; 8192]);

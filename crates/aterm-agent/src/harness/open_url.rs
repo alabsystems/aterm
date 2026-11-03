@@ -44,7 +44,7 @@ pub const DEFAULT_MAILBOX_DIR: &str = "mailbox";
 pub const OUTCOME_ENV: &str = "ATERM_OPEN_URL_OUTCOME";
 
 /// Why a headless sign-in ended without the callback ([`Met`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MetWord {
     /// The headless browser was unavailable or could not be started; no page was observed.
     BrowserStart,
@@ -79,7 +79,7 @@ impl MetWord {
 
 /// Why a headless sign-in ended without the callback, with a page host only when one was
 /// observed, as the opener writes it to [`OUTCOME_ENV`] and a renewal names it ([`Met::words`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Met {
     /// What it met.
     pub word: MetWord,
@@ -3960,6 +3960,9 @@ pub(super) fn poll_mailbox_for_magic_link(
                     if clicked_marker.exists() {
                         return None;
                     }
+                    if !e.file_type().ok()?.is_file() {
+                        return None;
+                    }
                     let meta = e.metadata().ok()?;
                     if !meta.is_file() || meta.len() == 0 {
                         return None;
@@ -3975,7 +3978,7 @@ pub(super) fn poll_mailbox_for_magic_link(
             for (mtime, len, path) in candidates {
                 tried.insert((path.clone(), len, mtime));
                 let mut raw = String::new();
-                let Ok(file) = std::fs::File::open(&path) else {
+                let Some(file) = open_regular_file(&path) else {
                     continue;
                 };
                 if file.take(EMAIL_FILE_MAX).read_to_string(&mut raw).is_err() {
@@ -3985,7 +3988,7 @@ pub(super) fn poll_mailbox_for_magic_link(
                     if let Some(name) = path.file_name() {
                         let marker =
                             mailbox_dir.join(format!("{}.clicked", name.to_string_lossy()));
-                        let _ = std::fs::write(marker, b"1\n");
+                        let _ = super::upgrade_models::write_atomic(&marker, "1\n");
                     }
                     return Ok(magic_url);
                 }
@@ -4478,6 +4481,12 @@ pub fn store_dir_of(
     store_dir.is_dir().then(|| store_dir.to_path_buf())
 }
 
+fn open_regular_file(path: &Path) -> Option<std::fs::File> {
+    aterm_uds::regular_file::open(path)
+        .ok()
+        .map(|(file, _)| file)
+}
+
 fn discover_store_dir() -> Option<PathBuf> {
     let arg0 = std::env::args_os().next().map(PathBuf::from);
     store_dir_of(&|name| std::env::var_os(name), arg0.as_deref())
@@ -4616,8 +4625,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
         use std::io::Read as _;
         let path = local_state_path(home.as_deref()?);
         let mut text = String::new();
-        std::fs::File::open(path)
-            .ok()?
+        open_regular_file(&path)?
             .take(LOCAL_STATE_MAX)
             .read_to_string(&mut text)
             .ok()?;

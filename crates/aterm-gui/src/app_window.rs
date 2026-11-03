@@ -1246,6 +1246,7 @@ impl App {
             crate::toolbar::set_active_tab_color(&handle, authored.active_tab);
             crate::toolbar::set_strip_accent(&handle, strip_accent);
             self._toolbars.insert(wid, handle);
+            self.publish_app_tiles_to(wid);
         }
         let head_pts = self.apprt.titlebar_band_pts(&window);
         let (_, band_memory_pts) = crate::app_config::titlebar_band_decision(
@@ -1821,10 +1822,19 @@ impl App {
         if self.paste_banner.as_ref().is_some_and(|p| p.wid == wid) {
             self.paste_banner = None;
         }
-        if self.close_banner.as_ref().is_some_and(|p| p.wid == wid) {
-            self.close_banner = None;
+        if self.close_banner.as_ref().is_some_and(|p| p.wid == wid)
+            && let Some(pending) = self.close_banner.take()
+        {
+            pending.replay.cancel();
         }
-        self.close_banner_queue.retain(|q| q.wid != wid);
+        self.close_banner_queue.retain(|q| {
+            if q.wid == wid {
+                q.replay.cancel();
+                false
+            } else {
+                true
+            }
+        });
         self.ask_next_queued_close();
         self.winit_to_window.retain(|_, &mut v| v != wid);
         self.focus_order.retain(|w| *w != wid);
@@ -2167,18 +2177,12 @@ impl App {
         let Some(prompt) = self.destructive_prompt(wid, exits_app, busy, replay) else {
             return true;
         };
-        if cfg!(windows) {
-            return self.present_close_banner(wid, prompt, replay);
-        }
-        if let Some(proceed) = self
-            .apprt
-            .confirm(prompt.title, prompt.body, prompt.proceed)
-        {
-            return proceed;
-        }
-        if !busy {
+        if !cfg!(any(target_os = "macos", windows)) && !busy {
             return true;
         }
+        // Keep shutdown in the ordinary event loop. A native NSAlert introduces a nested
+        // modal loop and a separately animated glass window whose teardown can outlive the
+        // answer; the in-window question owns its replay until the shutdown barriers run.
         self.present_close_banner(wid, prompt, replay)
     }
 
@@ -2195,6 +2199,8 @@ impl App {
             crate::close_confirm::CloseReplay::Pane { .. } => Some(true),
             crate::close_confirm::CloseReplay::Window(_)
             | crate::close_confirm::CloseReplay::Quit => None,
+            #[cfg(unix)]
+            crate::close_confirm::CloseReplay::NativeTerminate { .. } => None,
         };
         #[cfg(windows)]
         let prompt = {
@@ -2256,11 +2262,29 @@ impl App {
             }
             return false;
         }
+        if !self.close_question_input_ready(wid) {
+            return false;
+        }
         self.pending_action_refusal = Some(pending.wire_refusal());
         self.stash_deferred_close_attribution(wid);
         self.close_banner = Some(pending);
         self.raise_close_question(wid, by_person);
         false
+    }
+
+    /// As with the former native alert, keys queued before a Mac question appeared cannot
+    /// answer it. Stub and headless windows never enter AppKit.
+    fn close_question_input_ready(&self, wid: WindowId) -> bool {
+        #[cfg(target_os = "macos")]
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|window| window.os_window.is_some())
+        {
+            return crate::appkit::MainThread::new().is_some_and(crate::hwkey::fence_queued_keys);
+        }
+        let _ = wid;
+        true
     }
 
     fn raise_close_question(&mut self, wid: WindowId, focus: bool) {
@@ -2290,6 +2314,7 @@ impl App {
         while self.close_banner.is_none() && !self.close_banner_queue.is_empty() {
             let mut next = self.close_banner_queue.remove(0);
             if !self.windows.contains_key(&next.wid) {
+                next.replay.cancel();
                 continue;
             }
             if let crate::close_confirm::CloseReplay::Window(wid) = next.replay {
@@ -2297,7 +2322,7 @@ impl App {
                 let busy = self.window_has_foreground_job(wid);
                 let asks = self
                     .destructive_prompt(wid, exits_app, busy, next.replay)
-                    .filter(|_| cfg!(windows) || busy);
+                    .filter(|_| cfg!(any(windows, target_os = "macos")) || busy);
                 let Some(prompt) = asks else {
                     if let Some(proxy) = self.proxy.as_ref() {
                         let _ = proxy.send_event(crate::Wake::ConfirmedClose {
@@ -2307,6 +2332,10 @@ impl App {
                     continue;
                 };
                 next.prompt = prompt;
+            }
+            if !self.close_question_input_ready(next.wid) {
+                next.replay.cancel();
+                continue;
             }
             let (wid, focus) = (next.wid, !next.wire_may_answer());
             self.close_banner = Some(next);
@@ -2328,6 +2357,7 @@ impl App {
             w.request_redraw();
         }
         if !proceed {
+            pending.replay.cancel();
             // The attribution `present_close_banner` stashed was for a replay that
             // will not run; a later close must not inherit this gesture's name.
             if let Some(ws) = self.windows.get_mut(&pending.wid) {
@@ -2380,8 +2410,15 @@ impl App {
                 }
             }
             crate::close_confirm::CloseReplay::Quit => {
+                for pending in &self.close_banner_queue {
+                    pending.replay.cancel();
+                }
                 self.close_banner_queue.clear();
                 self.on_quit_requested(el);
+            }
+            #[cfg(unix)]
+            crate::close_confirm::CloseReplay::NativeTerminate { generation } => {
+                self.resume_native_termination(el, generation, true);
             }
             crate::close_confirm::CloseReplay::Tab { .. }
             | crate::close_confirm::CloseReplay::Pane { .. } => {
@@ -2407,6 +2444,8 @@ impl App {
                 .and_then(|ws| ws.pending_close_attribution.take()),
             crate::close_confirm::CloseReplay::Window(_)
             | crate::close_confirm::CloseReplay::Quit => None,
+            #[cfg(unix)]
+            crate::close_confirm::CloseReplay::NativeTerminate { .. } => None,
         };
         let _asked = asker
             .map(|(reason, actor)| crate::session_store::CloseAttribution::enter(reason, actor));
@@ -2419,6 +2458,8 @@ impl App {
             }
             crate::close_confirm::CloseReplay::Window(_)
             | crate::close_confirm::CloseReplay::Quit => None,
+            #[cfg(unix)]
+            crate::close_confirm::CloseReplay::NativeTerminate { .. } => None,
         }
     }
 
@@ -2431,10 +2472,7 @@ impl App {
                 self.close_banner_queue.len()
             )),
             Some(pending) => Some(pending.controls_line()),
-            None if cfg!(not(target_os = "macos")) => {
-                Some(crate::close_confirm::CONTROLS_CLOSED.to_string())
-            }
-            None => None,
+            None => Some(crate::close_confirm::CONTROLS_CLOSED.to_string()),
         }
     }
 
@@ -2586,15 +2624,52 @@ impl App {
     }
 
     /// Stateful counterpart of AppKit's bare `applicationShouldTerminate:` callback.
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     pub(crate) fn on_native_terminate_requested(&mut self, el: &ActiveEventLoop, generation: u64) {
+        self.resume_native_termination(el, generation, false);
+    }
+
+    /// Replay an accepted native request without asking again after an update handoff.
+    #[cfg(unix)]
+    pub(crate) fn resume_native_termination(
+        &mut self,
+        el: &ActiveEventLoop,
+        generation: u64,
+        confirmed: bool,
+    ) {
         if !crate::menu::native_termination_is_current(generation) {
             return;
         }
         if self.defer_pending_update_handoff_teardown(
-            crate::DeferredHandoffTeardown::NativeTerminate { generation },
+            crate::DeferredHandoffTeardown::NativeTerminate {
+                generation,
+                confirmed,
+            },
         ) {
             return;
+        }
+        let policy = self.close_confirm;
+        if confirmed {
+            self.close_confirm = CloseConfirm::Programmatic;
+        }
+        let ready = self.native_termination_ready(generation);
+        self.close_confirm = policy;
+        if !ready {
+            return;
+        }
+        for pending in &self.close_banner_queue {
+            pending.replay.cancel();
+        }
+        self.close_banner_queue.clear();
+        let _ = self.video_abort_app_shutdown();
+        el.exit();
+    }
+
+    /// Keep the native request's identity while its in-window question is outstanding.
+    #[cfg(unix)]
+    fn native_termination_ready(&mut self, generation: u64) -> bool {
+        if !crate::menu::native_termination_is_current(generation) {
+            return false;
         }
         let anchor = self
             .frontmost_window
@@ -2606,26 +2681,32 @@ impl App {
                 window,
                 true,
                 busy,
-                crate::close_confirm::CloseReplay::Quit,
+                crate::close_confirm::CloseReplay::NativeTerminate { generation },
             ) {
-                let _ = crate::menu::cancel_native_termination(generation);
-                return;
+                let waiting = self
+                    .close_banner
+                    .iter()
+                    .chain(self.close_banner_queue.iter())
+                    .any(|pending| {
+                        pending.replay
+                            == crate::close_confirm::CloseReplay::NativeTerminate { generation }
+                    });
+                if !waiting {
+                    let _ = crate::menu::cancel_native_termination(generation);
+                }
+                return false;
             }
         }
 
         match self.quit_barriers() {
             QuitBarrier::Ready => {}
-            QuitBarrier::Saving => return,
+            QuitBarrier::Saving => return false,
             QuitBarrier::Refused => {
                 let _ = crate::menu::cancel_native_termination(generation);
-                return;
+                return false;
             }
         }
-        if !crate::menu::complete_native_termination(generation) {
-            return;
-        }
-        let _ = self.video_abort_app_shutdown();
-        el.exit();
+        crate::menu::complete_native_termination(generation)
     }
 
     /// Re-evaluate document-owned close plans after an asynchronous atomic-save completion.
@@ -3340,6 +3421,7 @@ mod tests {
             native_tabs: Vec::new(),
             tab_order: Vec::new(),
             active_item: None,
+            workers_in_front: false,
             restored_tabs: Vec::new(),
         };
         let quit = PhysicalSize::new(2238, 2168);
@@ -4897,16 +4979,11 @@ mod close_confirm_tests {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let lines = app.read_aux_controls(crate::app_introspect::AuxTarget::Front);
-        if cfg!(not(target_os = "macos")) {
-            assert_eq!(
-                app.close_confirm_controls_line().as_deref(),
-                Some("confirm open=false")
-            );
-            assert_eq!(lines, ["overlay open=false", "confirm open=false"]);
-        } else {
-            assert_eq!(app.close_confirm_controls_line(), None);
-            assert_eq!(lines, ["overlay open=false"]);
-        }
+        assert_eq!(
+            app.close_confirm_controls_line().as_deref(),
+            Some("confirm open=false")
+        );
+        assert_eq!(lines, ["overlay open=false", "confirm open=false"]);
         {
             let _closing = crate::session_store::CloseAttribution::enter(
                 crate::session_store::ExitReason::CtlClose,
@@ -4933,9 +5010,8 @@ mod close_confirm_tests {
         assert!(line.contains("answer=\"-\""), "{line}");
         assert_eq!(app.answer_close_banner(false), None);
         assert_eq!(
-            app.close_confirm_controls_line().is_some(),
-            cfg!(not(target_os = "macos")),
-            "closed again"
+            app.close_confirm_controls_line().as_deref(),
+            Some("confirm open=false")
         );
     }
 
@@ -5101,22 +5177,29 @@ mod close_confirm_tests {
         let mut app = App::headless_for_test();
         app.headless = false;
         let wid = WindowId(0);
-        if cfg!(not(target_os = "macos")) {
-            app.close_confirm = CloseConfirm::Interactive;
-            assert!(!app.confirm_destructive_close(wid, true, true));
-            let pending = app.close_banner.as_ref().expect("the question is parked");
-            assert_eq!(pending.wid, wid);
-            assert_eq!(pending.replay, CloseReplay::Window(wid));
-            assert_eq!(
-                crate::close_confirm::kind(&pending.prompt),
-                "quit",
-                "a last-window close quits the app, and its prompt says so"
-            );
+        app.close_confirm = CloseConfirm::Interactive;
+        assert!(!app.confirm_destructive_close(wid, true, true));
+        let pending = app.close_banner.as_ref().expect("the question is parked");
+        assert_eq!(pending.wid, wid);
+        assert_eq!(pending.replay, CloseReplay::Window(wid));
+        assert_eq!(
+            crate::close_confirm::kind(&pending.prompt),
+            "quit",
+            "a last-window close quits the app, and its prompt says so"
+        );
+        app.close_banner = None;
+        assert!(!app.confirm_destructive_gesture(wid, true, true, CloseReplay::Quit));
+        assert_eq!(
+            app.close_banner.as_ref().map(|p| p.replay),
+            Some(CloseReplay::Quit)
+        );
+        #[cfg(target_os = "macos")]
+        {
             app.close_banner = None;
-            assert!(!app.confirm_destructive_gesture(wid, true, true, CloseReplay::Quit));
-            assert_eq!(
-                app.close_banner.as_ref().map(|p| p.replay),
-                Some(CloseReplay::Quit)
+            assert!(!app.confirm_destructive_gesture(wid, true, false, CloseReplay::Quit));
+            assert!(
+                app.close_banner.is_some(),
+                "an idle Mac quit also asks in the window"
             );
         }
         app.close_banner = None;
@@ -5129,6 +5212,93 @@ mod close_confirm_tests {
         app.close_confirm = CloseConfirm::Interactive;
         assert!(app.confirm_destructive_close(wid, false, false));
         assert!(app.close_banner.is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ask_reopen(app: &mut App) -> u64 {
+        let crate::menu::NativeTerminateDecision::Dispatch(generation) =
+            crate::menu::admit_native_terminate(crate::system_quit::Asker::Reopen)
+        else {
+            panic!("a fresh termination request");
+        };
+        app.headless = false;
+        app.close_confirm = CloseConfirm::Interactive;
+        assert!(!app.native_termination_ready(generation));
+        assert!(crate::menu::native_termination_is_current(generation));
+        assert!(crate::system_quit::reopens());
+        assert_eq!(
+            app.close_banner.as_ref().map(|pending| pending.replay),
+            Some(CloseReplay::NativeTerminate { generation })
+        );
+        assert!(!app.close_banner.as_ref().unwrap().wire_may_answer());
+        generation
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cancelling_reopen_cancels_its_native_request() {
+        let _serial = crate::menu::terminate_test_serial();
+        let mut app = App::headless_for_test();
+        let generation = ask_reopen(&mut app);
+        assert!(!app.native_termination_ready(generation));
+        assert!(
+            app.close_banner_queue.is_empty(),
+            "a repeated request is not another question"
+        );
+        assert_eq!(app.answer_close_banner(false), None);
+        assert!(!crate::menu::native_termination_is_current(generation));
+        assert!(!crate::system_quit::reopens());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn accepting_reopen_keeps_its_identity_until_the_barriers_complete() {
+        let _serial = crate::menu::terminate_test_serial();
+        let mut app = App::headless_for_test();
+        let generation = ask_reopen(&mut app);
+        assert_eq!(
+            app.answer_close_banner(true),
+            Some(CloseReplay::NativeTerminate { generation })
+        );
+        assert!(crate::menu::native_termination_is_current(generation));
+        app.close_confirm = CloseConfirm::Programmatic;
+        assert!(app.native_termination_ready(generation));
+        assert!(!crate::menu::native_termination_is_current(generation));
+        assert!(crate::system_quit::reopens());
+        assert!(
+            !app.native_termination_ready(generation),
+            "a replay cannot terminate twice"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stale_confirmed_reopen_cannot_complete_a_later_request() {
+        let _serial = crate::menu::terminate_test_serial();
+        let mut app = App::headless_for_test();
+        let old = ask_reopen(&mut app);
+        assert_eq!(
+            app.answer_close_banner(true),
+            Some(CloseReplay::NativeTerminate { generation: old })
+        );
+        assert!(crate::menu::cancel_native_termination(old));
+        let new = ask_reopen(&mut app);
+        app.close_confirm = CloseConfirm::Programmatic;
+        assert!(!app.native_termination_ready(old));
+        assert!(crate::menu::native_termination_is_current(new));
+        assert!(crate::system_quit::reopens());
+        app.answer_close_banner(false);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn closing_the_question_window_cancels_the_reopen() {
+        let _serial = crate::menu::terminate_test_serial();
+        let mut app = App::headless_for_test();
+        let generation = ask_reopen(&mut app);
+        app.close_window_logical(WindowId(0));
+        assert!(!crate::menu::native_termination_is_current(generation));
+        assert!(!crate::system_quit::reopens());
     }
 
     #[test]
@@ -5182,7 +5352,7 @@ mod close_confirm_tests {
             "asked after the replay, not before"
         );
         assert_eq!(app.close_window_logical(a), CloseOutcome::Stay);
-        if cfg!(windows) {
+        if cfg!(any(windows, target_os = "macos")) {
             let pending = app
                 .close_banner
                 .as_ref()

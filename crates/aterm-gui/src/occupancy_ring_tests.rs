@@ -116,3 +116,24 @@ fn idle_while_ready_reads_the_last_day_of_the_ring() {
         Some(u64::try_from(looks).expect("looks"))
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn ring_file_rejects_symlinks_on_read_and_append() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let target = tmp.path().join("target.ring");
+    std::fs::write(&target, format!("{}\n", ready_at(T0).line())).expect("write target");
+    let path = ring::ring_path(tmp.path());
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::os::unix::fs::symlink(&target, &path).expect("symlink");
+    let mut file = RingFile::at(path);
+    assert!(file.read().is_empty());
+    assert!(file.append(&ready_at(T0 + MIN)).is_err());
+    assert_eq!(
+        std::fs::read_to_string(&target)
+            .expect("target")
+            .lines()
+            .count(),
+        1
+    );
+}

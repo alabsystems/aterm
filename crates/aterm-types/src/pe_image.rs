@@ -32,7 +32,7 @@ pub fn subsystem(head: &[u8]) -> Option<u16> {
 pub fn file_subsystem(path: &Path) -> Option<u16> {
     use std::io::Read as _;
     let mut head = Vec::new();
-    std::fs::File::open(path)
+    crate::fs_restricted::open_regular_nonblock(path)
         .and_then(|file| file.take(HEAD_BYTES).read_to_end(&mut head))
         .ok()?;
     subsystem(&head)

@@ -549,7 +549,7 @@ fn replan_of(root: &Path, path_env: &OsStr, merge_base: &str, path: &str) -> Rep
             .success()
             .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     };
-    let work = || std::fs::read_to_string(root.join(path)).ok();
+    let work = || crate::read_regular_text(root.join(path)).ok();
     match path {
         "Cargo.toml" => manifest_replan(read().as_deref(), work().as_deref()),
         "Cargo.lock" => lock_replan(read().as_deref(), work().as_deref()),
@@ -593,7 +593,7 @@ fn with_shared_inputs(
             continue;
         };
         let file = root.join(source.as_ref());
-        let text = match std::fs::read_to_string(&file) {
+        let text = match crate::read_regular_text(&file) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(format!("cannot read shared input {}: {e}", file.display())),
@@ -875,7 +875,7 @@ fn read_members(root: &Path, tools: &Toolchain, path_env: &OsStr) -> Members {
         return Members::default();
     };
     let prefix = tree_root_prefix(root);
-    let shared = std::fs::read_to_string(root.join("Cargo.lock"))
+    let shared = crate::read_regular_text(root.join("Cargo.lock"))
         .map(|lock| lock_shared_names(&lock))
         .unwrap_or_default();
     let specs = parse_graph_versions(&out, &prefix)
@@ -893,7 +893,7 @@ fn read_members(root: &Path, tools: &Toolchain, path_env: &OsStr) -> Members {
                 let dir = normalize_manifest_dir(dir);
                 let at = root.join(&dir);
                 let has_lib = at.join("src/lib.rs").is_file()
-                    || std::fs::read_to_string(at.join("Cargo.toml"))
+                    || crate::read_regular_text(at.join("Cargo.toml"))
                         .is_ok_and(|t| declares_lib_target(&t));
                 Member { name, dir, has_lib }
             })
@@ -1009,7 +1009,7 @@ fn manifests_near(root: &Path, paths: &[String]) -> Manifests {
         let mut dir = parent_dir(p);
         while !dir.is_empty() {
             if seen.insert(dir.to_string())
-                && let Ok(text) = std::fs::read_to_string(root.join(dir).join("Cargo.toml"))
+                && let Ok(text) = crate::read_regular_text(root.join(dir).join("Cargo.toml"))
             {
                 m.insert(dir, manifest_package_name(&text));
             }
@@ -1063,7 +1063,7 @@ pub fn declares_lib_target(manifest: &str) -> bool {
 pub fn crate_dir_has_lib(root: &std::path::Path, name: &str) -> bool {
     let name = crate::scope::spec_name(name).unwrap_or(name);
     let dir = root.join("crates").join(name);
-    if let Ok(manifest) = std::fs::read_to_string(dir.join("Cargo.toml"))
+    if let Ok(manifest) = crate::read_regular_text(dir.join("Cargo.toml"))
         && manifest_package_name(&manifest).is_none_or(|pkg| pkg == name)
     {
         return declares_lib_target(&manifest) || dir.join("src/lib.rs").is_file();
@@ -1071,7 +1071,7 @@ pub fn crate_dir_has_lib(root: &std::path::Path, name: &str) -> bool {
     if let Ok(entries) = std::fs::read_dir(root.join("crates")) {
         for entry in entries.flatten() {
             let member_dir = entry.path();
-            if let Ok(manifest) = std::fs::read_to_string(member_dir.join("Cargo.toml"))
+            if let Ok(manifest) = crate::read_regular_text(member_dir.join("Cargo.toml"))
                 && manifest_package_name(&manifest).as_deref() == Some(name)
             {
                 return declares_lib_target(&manifest) || member_dir.join("src/lib.rs").is_file();

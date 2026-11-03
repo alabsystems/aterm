@@ -7,6 +7,8 @@
 //! it misses that wait. A quit System Settings asked for therefore leaves a helper behind that
 //! opens aterm again once this process is gone.
 
+#[cfg(any(target_os = "macos", test))]
+use aterm_uds::process::{Birth, Identity, ProcessPresence};
 use std::ffi::OsString;
 #[cfg(any(target_os = "macos", test))]
 use std::path::{Path, PathBuf};
@@ -27,7 +29,7 @@ const REOPEN_SENDERS: [&str; 2] = [
     "/System/Applications/System Settings.app/Contents/MacOS/System Settings",
 ];
 
-/// The hidden verb `aterm __reopen-after <pid> <bundle>` ([`run_reopen_after`]).
+/// The hidden verb `aterm __reopen-after <process-token> <bundle>` ([`run_reopen_after`]).
 pub const REOPEN_VERB: &str = "__reopen-after";
 
 /// How long the helper waits for the quitting aterm to be gone before it gives up.
@@ -56,12 +58,12 @@ pub(crate) fn sender_reopens(path: &Path) -> bool {
         .any(|sender| path == Path::new(sender))
 }
 
-/// The arguments of the helper that opens `bundle` again once `pid` is gone.
+/// The arguments of the helper that opens `bundle` again once `target` is gone.
 #[cfg(any(target_os = "macos", test))]
-fn reopen_args(pid: u32, bundle: &Path) -> [OsString; 3] {
+fn reopen_args(target: Identity, bundle: &Path) -> [OsString; 3] {
     [
         REOPEN_VERB.into(),
-        pid.to_string().into(),
+        target.token().into(),
         bundle.as_os_str().to_owned(),
     ]
 }
@@ -71,30 +73,24 @@ fn reopen_args(pid: u32, bundle: &Path) -> [OsString; 3] {
 /// would start the helper under that name too, and the router hands a window alias's arguments
 /// to a window, so the verb would never be read.
 #[cfg(any(target_os = "macos", test))]
-fn reopen_command(pid: u32, bundle: &Path) -> aterm_uds::spawnfd::Command {
+fn reopen_command(target: Identity, bundle: &Path) -> aterm_uds::spawnfd::Command {
     let mut command = aterm_uds::spawnfd::command(bundle.join("Contents/MacOS/aterm"));
-    command.args(reopen_args(pid, bundle));
+    command.args(reopen_args(target, bundle));
     command
 }
 
-/// [`reopen_args`] read back past the verb: a pid above 1 and an absolute path to a `.app`.
+/// [`reopen_args`] read back past the verb: a process token and an absolute path to a `.app`.
 #[cfg(any(target_os = "macos", test))]
-fn parse_reopen_args(args: &[OsString]) -> Option<(u32, PathBuf)> {
-    let [pid, bundle] = args else {
+fn parse_reopen_args(args: &[OsString]) -> Option<(Identity, PathBuf)> {
+    let [target, bundle] = args else {
         return None;
     };
-    let pid = pid
-        .to_str()
-        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
-        .parse::<i32>()
-        .ok()
-        .filter(|pid| *pid > 1)
-        .and_then(|pid| u32::try_from(pid).ok())?;
+    let target = Identity::parse(target.to_str()?)?;
     let bundle = PathBuf::from(bundle);
     let app = bundle
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("app"));
-    (bundle.is_absolute() && app).then_some((pid, bundle))
+    (bundle.is_absolute() && app).then_some((target, bundle))
 }
 
 /// What the helper did.
@@ -141,7 +137,14 @@ pub(crate) fn leave_reopen_at_quit() {
     else {
         return;
     };
-    let spawned = reopen_command(std::process::id(), &bundle)
+    let Some(target) = i32::try_from(std::process::id())
+        .ok()
+        .and_then(aterm_uds::process::read_identity)
+    else {
+        aterm_log::warn!("quit & reopen: cannot identify the quitting process");
+        return;
+    };
+    let spawned = reopen_command(target, &bundle)
         .setsid(true)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -160,14 +163,14 @@ pub(crate) fn leave_reopen_at_quit() {
     }
 }
 
-/// [`REOPEN_VERB`]: wait for the aterm at the pid named to be gone, then open the bundle named.
+/// [`REOPEN_VERB`]: wait for the named aterm process to be gone, then open the bundle named.
 #[must_use]
 pub fn run_reopen_after(args: &[OsString]) -> std::process::ExitCode {
     #[cfg(target_os = "macos")]
-    if let Some((pid, bundle)) = parse_reopen_args(args) {
+    if let Some((target, bundle)) = parse_reopen_args(args) {
         let reopened = reopen_once_gone(
-            || wait_gone(pid, GONE_CEILING),
-            || wait_forgotten(pid, FORGOTTEN_CEILING),
+            || wait_gone(target, GONE_CEILING),
+            || wait_forgotten(target.pid.unsigned_abs(), FORGOTTEN_CEILING),
             || open_bundle(&bundle),
         );
         return if reopened == Reopened::Opened {
@@ -177,23 +180,21 @@ pub fn run_reopen_after(args: &[OsString]) -> std::process::ExitCode {
         };
     }
     let _ = args;
-    eprintln!("aterm {REOPEN_VERB}: a pid and an app bundle, on macOS");
+    eprintln!("aterm {REOPEN_VERB}: a process token and an app bundle, on macOS");
     std::process::ExitCode::FAILURE
 }
 
-/// Whether `pid` exited (or was reaped) within `ceiling`, as the kernel reports it.
+/// Whether `target` exited, was reaped or its pid was reused within `ceiling`.
 #[cfg(target_os = "macos")]
-fn wait_gone(pid: u32, ceiling: Duration) -> bool {
-    use aterm_uds::process::{ProcessPresence, process_presence};
-    let Ok(raw) = i32::try_from(pid) else {
-        return false;
-    };
+fn wait_gone(target: Identity, ceiling: Duration) -> bool {
+    use aterm_uds::process::{process_presence, read_birth};
     let end = Instant::now() + ceiling;
-    let mut exit = aterm_uds::deadline::ExitWait::on_pid(pid);
+    let mut exit = aterm_uds::deadline::ExitWait::on_pid(target.pid.unsigned_abs());
     loop {
-        if matches!(
-            process_presence(raw),
-            ProcessPresence::Exited | ProcessPresence::Absent
+        if original_gone(
+            target.birth,
+            process_presence(target.pid),
+            read_birth(target.pid),
         ) {
             return true;
         }
@@ -203,6 +204,13 @@ fn wait_gone(pid: u32, ceiling: Duration) -> bool {
         }
         exit.wait(left);
     }
+}
+
+/// Track process lifetime, not exec: an unreadable birth is not evidence of exit.
+#[cfg(any(target_os = "macos", test))]
+fn original_gone(expected: Birth, presence: ProcessPresence, birth: Option<Birth>) -> bool {
+    matches!(presence, ProcessPresence::Exited | ProcessPresence::Absent)
+        || birth.is_some_and(|birth| birth != expected)
 }
 
 /// Wait, up to `ceiling`, until LaunchServices no longer lists `pid` as a running app.
@@ -252,6 +260,32 @@ fn open_bundle(bundle: &Path) -> bool {
 mod tests {
     use super::*;
 
+    fn target() -> Identity {
+        Identity {
+            pid: 4663,
+            birth: Birth(123),
+            idversion: aterm_uds::process::KEEPS_PID_VERSIONS.then_some(7),
+        }
+    }
+
+    #[test]
+    fn a_reused_pid_is_gone_but_an_unreadable_birth_is_not() {
+        let expected = Birth(123);
+        assert!(original_gone(
+            expected,
+            ProcessPresence::Present,
+            Some(Birth(124))
+        ));
+        assert!(!original_gone(
+            expected,
+            ProcessPresence::Present,
+            Some(expected)
+        ));
+        for presence in [ProcessPresence::Present, ProcessPresence::Unknown] {
+            assert!(!original_gone(expected, presence, None));
+        }
+    }
+
     #[test]
     fn only_system_settings_quit_is_a_quit_and_reopen() {
         for sender in REOPEN_SENDERS {
@@ -288,25 +322,25 @@ mod tests {
     #[test]
     fn the_helper_reads_back_only_what_the_quit_wrote() {
         let bundle = host_bundle();
-        let args = reopen_args(4663, bundle);
+        let target = target();
+        let args = reopen_args(target, bundle);
         assert_eq!(args[0], REOPEN_VERB);
         assert_eq!(
             parse_reopen_args(&args[1..]),
-            Some((4663, bundle.to_path_buf()))
+            Some((target, bundle.to_path_buf()))
         );
         let app = bundle.to_str().expect("a UTF-8 path");
         let exe = bundle.join("Contents/MacOS/aterm");
         let exe = exe.to_str().expect("a UTF-8 path");
-        let refused: [&[&str]; 9] = [
+        let token = target.token();
+        let token = token.as_str();
+        let refused: [&[&str]; 6] = [
             &[],
-            &["4663"],
-            &["4663", app, "more"],
-            &["0", app],
-            &["1", app],
-            &["-4663", app],
-            &["2147483648", app],
-            &["4663", "Applications/aterm.app"],
-            &["4663", exe],
+            &[token],
+            &[token, app, "more"],
+            &["4663", app],
+            &[token, "Applications/aterm.app"],
+            &[token, exe],
         ];
         for words in refused {
             let args: Vec<OsString> = words.iter().map(OsString::from).collect();
@@ -317,12 +351,13 @@ mod tests {
     #[test]
     fn the_helper_runs_the_bundles_front_door_whatever_name_this_aterm_ran_under() {
         let bundle = host_bundle();
-        let command = reopen_command(4663, bundle);
+        let target = target();
+        let command = reopen_command(target, bundle);
         let program = Path::new(command.get_program());
         assert_eq!(program, bundle.join("Contents/MacOS/aterm"));
         assert_eq!(program.file_name(), Some(std::ffi::OsStr::new("aterm")));
         let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
-        let wrote = reopen_args(4663, bundle);
+        let wrote = reopen_args(target, bundle);
         assert_eq!(
             args,
             wrote.iter().map(OsString::as_os_str).collect::<Vec<_>>()
@@ -362,21 +397,24 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_wait_ends_at_the_exit_and_not_before() {
-        let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
-        let mut child = aterm_uds::spawnfd::command(&sleep)
-            .arg("60")
+        let cat = aterm_uds::deadline::stand_in(Path::new("/bin/cat"));
+        let mut child = aterm_uds::spawnfd::command(&cat)
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
             .spawn()
-            .expect("spawn sleep");
-        let pid = child.id();
+            .expect("spawn cat with held input");
+        let target = i32::try_from(child.id())
+            .ok()
+            .and_then(aterm_uds::process::read_identity)
+            .expect("the child's exact identity");
         assert!(
-            !wait_gone(pid, Duration::from_millis(200)),
+            !wait_gone(target, Duration::ZERO),
             "a running process read as gone"
         );
-        child.kill().expect("kill sleep");
+        child.kill().expect("kill cat");
         assert!(
-            wait_gone(pid, Duration::from_secs(60)),
+            wait_gone(target, Duration::from_secs(60)),
             "the exit of an unreaped child was missed"
         );
-        let _ = child.wait();
+        aterm_uds::deadline::kill_within(&mut child, Duration::from_secs(60));
     }
 }

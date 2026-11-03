@@ -15,13 +15,13 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {
         let file = open_sha256_input(path)?;
-        sha256_stream(file)
+        sha256_open_file(file)
     }
 
     #[cfg(all(unix, not(target_os = "linux")))]
     {
         let file = open_sha256_input(path)?;
-        hardware_sha256_stream(file)
+        sha256_open_file(file)
     }
 
     #[cfg(windows)]
@@ -52,6 +52,18 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
             })
             .find(|l| aterm_codec::hex::is_hex(l, 64))
             .ok_or_else(|| "certutil produced no digest".to_string())
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn sha256_open_file(file: std::fs::File) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        sha256_stream(file)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        hardware_sha256_stream(file)
     }
 }
 

@@ -499,9 +499,11 @@ impl Floor {
         match crate::metadata_io::read_bounded_regular_utf8(&self.path, MAX_FLOOR_BYTES) {
             Ok(text) => {
                 let s = text.trim();
-                match (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-                    .then(|| s.parse::<u64>().ok())
-                    .flatten()
+                match (!s.is_empty()
+                    && (s == "0" || !s.starts_with('0'))
+                    && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
                 {
                     Some(value) => (value, false),
                     None => (0, true),
@@ -1191,6 +1193,8 @@ mod tests {
         let oversized = vec![b'9'; MAX_FLOOR_BYTES + 1];
         for garbage in [
             b"garbage-not-a-number".as_slice(),
+            b"00\n".as_slice(),
+            b"07\n".as_slice(),
             &[0xFF, 0xFE, 0x00],
             &oversized,
         ] {

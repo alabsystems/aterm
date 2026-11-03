@@ -1,0 +1,23 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-models-capacity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "aterm's models of durable build-capacity custody (ty_model!), for conformance and spec-check"
+# Registry sweeps live in aterm-models; production conformance lives in aterm-capacity.
+autotests = false
+
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+aterm-spec.workspace = true
+
+[lints]
+workspace = true

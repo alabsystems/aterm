@@ -171,6 +171,7 @@ impl Grid {
         to.tab_stops.clone_from(&from.tab_stops);
         to.tab_defaults_suppressed = from.tab_defaults_suppressed;
         to.pending_wrap = from.pending_wrap;
+        to.follows_glyph = from.follows_glyph;
         to.cursor_template = from.cursor_template;
         to.cursor_template_bg_rgb = from.cursor_template_bg_rgb;
         fork.storage.has_horizontal_margins = storage.has_horizontal_margins;

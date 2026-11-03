@@ -17,6 +17,7 @@ aterm-core = { workspace = true }
 # The paint scanner's PNG decoder and its recording index.json parser.
 aterm-png = { workspace = true }
 aterm-json = { workspace = true }
+aterm-digest = { workspace = true }
 
 # The measuring drivers: a headless instance launched without inherited
 # descriptors and on a lifeline, and the stand-in TUI's raw terminal.

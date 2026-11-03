@@ -279,19 +279,29 @@ pub fn bundle_json(b: &Bundle) -> Jv {
                                 Jv::Arr(
                                     f.workers
                                         .iter()
-                                        .map(|(pid, birth, policy)| {
+                                        .map(|worker| {
                                             Jv::obj([
-                                                ("pid", Jv::u(u64::from(*pid))),
+                                                ("pid", Jv::u(u64::from(worker.pid))),
                                                 (
                                                     "birth_ms",
-                                                    birth.map_or_else(
+                                                    worker.birth_ms.map_or_else(
                                                         || Jv::why("not_sampled"),
                                                         Jv::Int,
                                                     ),
                                                 ),
                                                 (
                                                     "scheduling",
-                                                    super::view::scheduling_json(*policy, "macOS"),
+                                                    super::view::scheduling_json(
+                                                        worker.scheduling,
+                                                        "macOS",
+                                                    ),
+                                                ),
+                                                (
+                                                    "cpu_accounting",
+                                                    super::view::cpu_accounting_json(
+                                                        &worker.cpu_accounting,
+                                                        "macOS",
+                                                    ),
                                                 ),
                                             ])
                                         })
@@ -364,6 +374,10 @@ pub fn current_report_json(s: &Snapshot) -> Jv {
                             (
                                 "scheduling",
                                 super::view::scheduling_json(p.scheduling, "macOS"),
+                            ),
+                            (
+                                "cpu_accounting",
+                                super::view::cpu_accounting_json(&p.cpu_accounting, "macOS"),
                             ),
                         ])
                     })

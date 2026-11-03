@@ -16,6 +16,56 @@ fn main() -> Result<(), String> {
             .ok_or("Pass the private instance home")?;
         return seed_home(&home, std::path::Path::new(&target), &email);
     }
+    if std::env::args().any(|arg| arg == "--auth-poll") {
+        let mut config =
+            aterm_agent::harness::headless_oauth::discover_mailbox_config(Some(&home), None)
+                .ok_or("No mailbox configuration")?;
+        let login = config
+            .webmail_user_for(Some(&email))
+            .ok_or("No mailbox login")?;
+        let password = config
+            .password_for(Some(&email))
+            .ok_or("No mailbox password")?;
+        let mailbox_password = config.mailbox_password_for(Some(&email));
+        let totp_secret = config.totp_secret_for(Some(&email));
+        let shared = aterm_agent::harness::mail_browser::shared_mailbox(
+            &home,
+            aterm_agent::harness::mail_browser::Credentials {
+                email: &email,
+                login: &login,
+                password: &password,
+                mailbox_password: mailbox_password.as_deref(),
+                totp_secret: totp_secret.as_deref(),
+            },
+        )?;
+        let messages = shared
+            .lock()
+            .map_err(|_| "Mail lock failed")?
+            .messages("0", 1)?;
+        if let Some(message) = messages.first() {
+            let (source, _) = shared
+                .lock()
+                .map_err(|_| "Mail lock failed")?
+                .read_source(&message.id)?;
+            if source.text.is_empty() {
+                return Err("No message source".into());
+            }
+        }
+        config.senders = vec!["aterm-native-probe.invalid".into()];
+        let result = aterm_agent::harness::headless_oauth::poll_mailbox_config_for_credential(
+            &config,
+            Some(&email),
+            std::time::Duration::from_secs(3),
+        );
+        match result {
+            Err("timed out waiting for verification email in mailbox") => {
+                println!("Native authentication reader connected and polled successfully");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => return Err("Unexpected credential from excluded sender".into()),
+        }
+    }
     let started = std::time::Instant::now();
     let mailbox = aterm_agent::harness::mail_browser::HeadlessMail::connect_with_progress(
         &home,

@@ -520,6 +520,66 @@ pub fn process_serial(pid: i32) -> Option<u64> {
     }
 }
 
+/// This OS machine's stable identity, independent of a boot, HOME and copied state directories.
+/// Apple uses gethostuuid; Linux requires a root-owned, non-writable regular /etc/machine-id.
+/// Missing, malformed or unsupported identity stays unknown. OS clones must have distinct
+/// provisioned machine identities; this is no remote attestation or physical hardware proof.
+#[must_use]
+pub fn host_id() -> Option<String> {
+    static HOST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOST.get_or_init(read_host_id).clone()
+}
+
+#[cfg(target_vendor = "apple")]
+fn read_host_id() -> Option<String> {
+    unsafe extern "C" {
+        fn gethostuuid(id: *mut u8, wait: *const libc::timespec) -> libc::c_int;
+    }
+    let mut id = [0u8; 16];
+    let wait = libc::timespec {
+        tv_sec: 1,
+        tv_nsec: 0,
+    };
+    // SAFETY: id has exactly uuid_t's 16 writable bytes. wait is a valid, live timespec;
+    // neither pointer is retained by gethostuuid.
+    if unsafe { gethostuuid(id.as_mut_ptr(), &raw const wait) } != 0 || id == [0; 16] {
+        return None;
+    }
+    use std::fmt::Write as _;
+    let mut text = String::from("darwin:");
+    for byte in id {
+        let _ = write!(text, "{byte:02x}");
+    }
+    Some(text)
+}
+
+#[cfg(target_os = "linux")]
+fn read_host_id() -> Option<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open("/etc/machine-id")
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(65).read_to_string(&mut text).ok()?;
+    let text = text.trim();
+    (text.len() == 32
+        && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && text.bytes().any(|byte| byte != b'0'))
+    .then(|| format!("linux:{}", text.to_ascii_lowercase()))
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn read_host_id() -> Option<String> {
+    None
+}
+
 /// This boot's id, which a record kept for one boot names ([`astream_sys::boot_session`]).
 #[cfg(unix)]
 #[must_use]

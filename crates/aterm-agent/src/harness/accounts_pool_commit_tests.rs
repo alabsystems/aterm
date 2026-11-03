@@ -55,14 +55,13 @@ fn run_operation(world: &World, cli: Cli, operation: i64, mut arm: impl FnMut())
         .is_some(),
         2..=4 => {
             let before = super::super::pool_snapshot(&world.seat(), cli).unwrap();
-            let enrolled = accounts::enrolled_for(cli, &before.roster);
             let home_path = world.home.join(cli.accounts().default_home);
             arm();
             super::super::poll_usage(
                 &world.seat(),
                 cli,
                 &before,
-                &enrolled,
+                before.roster.row_for_login(None).expect("the default row"),
                 &|_: Cli, home: &Path, _: Option<&str>, _: i64| {
                     (home == home_path).then(|| Usage {
                         sample: near_wall(),

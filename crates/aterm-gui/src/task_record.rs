@@ -23,11 +23,22 @@ pub(crate) enum TaskState {
     Exited,
     /// Worker stalled before showing its composer or is held without progress.
     Stalled,
+    /// The work ended unfinished while its agent may still stand in the tab: it said it could not
+    /// finish, a person or a manager took Autopilot Off, its budget ran out or its replies repeated
+    /// with no work ([`WHY_COULD_NOT_FINISH`], [`WHY_OFF`], [`WHY_OFF_CTL`], [`WHY_EXPIRED`],
+    /// [`WHY_REPEATED`]).
+    Failed,
 }
 
 impl TaskState {
     /// All states in usage-line order.
-    pub(crate) const ALL: [Self; 4] = [Self::Working, Self::Done, Self::Exited, Self::Stalled];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Working,
+        Self::Done,
+        Self::Exited,
+        Self::Stalled,
+        Self::Failed,
+    ];
 
     /// Wire word for this state.
     #[must_use]
@@ -37,6 +48,7 @@ impl TaskState {
             Self::Done => "done",
             Self::Exited => "exited",
             Self::Stalled => "stalled",
+            Self::Failed => "failed",
         }
     }
 
@@ -51,10 +63,82 @@ impl TaskState {
     pub(crate) const fn is_terminal(self) -> bool {
         !matches!(self, Self::Working)
     }
+
+    /// HOW A TASK IN THIS STATE ENDED: `done` finished, `failed` failed, `exited` finished only if
+    /// its task had (`finished`, [`TaskRecord::finished`]: that end outlives the exit,
+    /// [`TaskMark::apply`]) and failed otherwise, `stalled` failed for as long as it stands (a stall
+    /// that moves on goes back to `working` and takes this back), and `working` has none. It is
+    /// `Some` exactly where [`Self::is_terminal`] holds, so what wakes a waiter is what can be read.
+    #[must_use]
+    pub(crate) const fn conclusion(self, finished: bool) -> Option<Conclusion> {
+        match self {
+            Self::Working => None,
+            Self::Done => Some(Conclusion::Finished),
+            Self::Exited if finished => Some(Conclusion::Finished),
+            Self::Exited | Self::Stalled | Self::Failed => Some(Conclusion::Failed),
+        }
+    }
+
+    /// Whether a task in this state has an end for a person to read once: every conclusion but a
+    /// stall's, which keeps its need. What a look marks seen, where [`Self::marks_its_tab`] says
+    /// which of them also leave the tab its `•`.
+    #[must_use]
+    pub(crate) const fn has_an_end_to_read(self) -> bool {
+        matches!(self, Self::Done | Self::Failed | Self::Exited)
+    }
+
+    /// Whether a task in this state leaves its tab a `•` until someone looks: it finished, or it
+    /// failed with nobody to say so but the record. A stall has a need's own mark, and an exit
+    /// has its tab's.
+    #[must_use]
+    pub(crate) const fn marks_its_tab(self) -> bool {
+        matches!(self, Self::Done | Self::Failed)
+    }
+}
+
+/// How a worker's task ended, whichever way it got there ([`TaskRecord::conclusion`]): the one
+/// question a manager, a person or a surface asks of a record that stopped moving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Conclusion {
+    /// The work finished: landed, or marked done.
+    Finished,
+    /// The work did not finish, and `why=` says how it ended.
+    Failed,
+}
+
+impl Conclusion {
+    /// The `conclusion=` word.
+    #[must_use]
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Self::Finished => "finished",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// `why=` value written when Autopilot Land lands the work.
 pub(crate) const WHY_LANDED: &str = "landed";
+
+/// `why=` of a worker whose reply said `Could not finish: <why>`
+/// (`aterm_agent::supervise::COULD_NOT_FINISH_WHY`).
+pub(crate) const WHY_COULD_NOT_FINISH: &str = aterm_agent::supervise::COULD_NOT_FINISH_WHY;
+
+/// `why=` of a worker a person took off Autopilot before it landed: nothing will carry it on.
+pub(crate) const WHY_OFF: &str = "off";
+
+/// `why=` of a worker a manager or a script, no person, took off Autopilot before it landed.
+pub(crate) const WHY_OFF_CTL: &str = "off-ctl";
+
+/// `why=` of a worker its time budget ran out on (the disk worker's alone today).
+pub(crate) const WHY_EXPIRED: &str = "expired";
+
+/// `why=` of a worker Land stopped typing to because the same reply came back with no work
+/// (`aterm_agent::supervise::REPEATED_WHY`).
+pub(crate) const WHY_REPEATED: &str = aterm_agent::supervise::REPEATED_WHY;
+
+/// `why=` of an agent that left its tab with nothing to bring it back.
+pub(crate) const WHY_EXIT: &str = "exit";
 
 /// `why=` of a worker its launcher refused because its CLI is signed out, which only a person
 /// can fix (`task_launch::refused_why`).
@@ -64,9 +148,9 @@ pub(crate) const WHY_SIGNIN: &str = "signin";
 /// (`task_launch::refused_why`).
 pub(crate) const WHY_INSTALL: &str = "install";
 
-/// `why=` of a claim worker's record a restore other than a seamless update makes anew
-/// (`harness_host::credit_claim::note_restored_worker`): its worker started before the restore,
-/// so no startup or held deadline reads it as one just spawned.
+/// `why=` of a running worker's record after a restore other than a seamless update
+/// (`harness_host::credit_claim::note_restored_worker`, [`seed_restored`]): its worker started
+/// before the restore, so no startup or held deadline reads it as one just spawned.
 pub(crate) const WHY_RESTORED: &str = "restored";
 
 /// Closed `why=` vocabulary for task state transitions.
@@ -74,7 +158,7 @@ pub(crate) const TASK_WHY: &[&str] = &[
     WHY_LANDED,
     "marker",
     "done-check",
-    "exit",
+    WHY_EXIT,
     "shell",
     "startup",
     "held",
@@ -83,7 +167,38 @@ pub(crate) const TASK_WHY: &[&str] = &[
     WHY_SIGNIN,
     WHY_INSTALL,
     WHY_RESTORED,
+    WHY_COULD_NOT_FINISH,
+    WHY_OFF,
+    WHY_OFF_CTL,
+    WHY_EXPIRED,
+    WHY_REPEATED,
 ];
+
+/// A failed conclusion's words for a person, by its `why=` (the Workers row, Done for you and the
+/// fact the menu bar keeps), a stalled record's by [`stall_words`].
+#[must_use]
+pub(crate) fn failed_words(state: TaskState, why: Option<&str>) -> String {
+    match (state, why) {
+        (TaskState::Stalled, why) => stall_words(why),
+        // A task that ended where it stalled ends for the stall's reason.
+        (_, Some(why)) if is_stall_why(why) => stall_words(Some(why)),
+        (_, Some(WHY_COULD_NOT_FINISH)) => "it said it could not finish".to_string(),
+        (_, Some(WHY_OFF)) => "a person turned Autopilot off".to_string(),
+        (_, Some(WHY_OFF_CTL)) => "a manager or a script turned Autopilot off".to_string(),
+        (_, Some(WHY_EXPIRED)) => "its time ran out".to_string(),
+        (_, Some(WHY_REPEATED)) => "it kept repeating the same reply".to_string(),
+        (_, Some(WHY_EXIT)) | (TaskState::Exited, None) => {
+            "its agent exited before landing".to_string()
+        }
+        (_, Some(why)) => format!("ended unfinished ({why})"),
+        (_, None) => "ended unfinished".to_string(),
+    }
+}
+
+/// Whether `why` is a stall's own reason ([`stall_words`] words each).
+fn is_stall_why(why: &str) -> bool {
+    matches!(why, "held" | "startup" | "shell") || why == WHY_SIGNIN || why == WHY_INSTALL
+}
 
 /// A stalled task's words for a person, by its `why=` (the need's `what` and the menu bar's
 /// row). A worker refused as signed out says that a person must sign in, the one step nobody
@@ -98,6 +213,20 @@ pub(crate) fn stall_words(why: Option<&str>) -> String {
         Some(why) => format!("stalled ({why})"),
         None => "stalled".to_string(),
     }
+}
+
+/// Whether a worker trusted to folder `trusted_cwd` has its own report of how it ended, so no
+/// generic one goes beside it (no landing record, no failed record or fact, no Done for you row):
+/// a credit claim's worker (its claim-worker record in Messages,
+/// `App::note_worker_conclusion`) and aterm's disk worker (its disk-worker record, from the disk
+/// watch), each an automatic report and never an item to look at.
+#[must_use]
+pub(crate) fn reports_its_own_end(trusted_cwd: Option<&str>) -> bool {
+    trusted_cwd.is_some_and(|folder| {
+        let folder = Path::new(folder);
+        aterm_agent::harness::credit_offers::is_claim_folder(folder)
+            || aterm_agent::harness::disk::fence::is_worker_folder(folder)
+    })
 }
 
 /// Default `from=` value when a task is started by `ctl` without a caller session ID.
@@ -150,6 +279,10 @@ pub(crate) struct TaskRecord {
     pub(crate) checked: Option<String>,
     /// Agent exit code for an `exited` task, if known.
     pub(crate) exit: Option<i32>,
+    /// An `exited` task that had finished before its agent left, whatever word finished it: an exit
+    /// never rewrites that ([`TaskMark::apply`], [`TaskState::conclusion`]). Worked out from nothing
+    /// else, so a carry row holds it (`finished=1`).
+    pub(crate) finished: bool,
     /// Size in bytes of the worker's result file (`0` when absent).
     pub(crate) result_bytes: u64,
     /// Path to the result file under [`tasks_dir`], if any.
@@ -167,6 +300,9 @@ pub(crate) struct TaskRecord {
     pub(crate) started: Instant,
     /// Revision at which the current state was entered.
     pub(crate) entered: u64,
+    /// The `entered` this record arrived with from an earlier process ([`seed_carried`]), never
+    /// carried on: a conclusion entered before it was told there.
+    pub(crate) carried_entered: Option<u64>,
     /// Agent program started by `spawn agent=<word>`, if spawned as a worker.
     pub(crate) agent: Option<aterm_phase::Program>,
     /// Canonical `cwd` trusted by the starter when spawning the worker.
@@ -187,6 +323,12 @@ impl TaskRecord {
         u64::try_from(self.since.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
+    /// HOW THE TASK ENDED, the one reading of a record's outcome ([`TaskState::conclusion`]).
+    #[must_use]
+    pub(crate) fn conclusion(&self) -> Option<Conclusion> {
+        self.state.conclusion(self.finished)
+    }
+
     /// Whether a waiter has news (a terminal state or a standing ask, [`Self::attention`]).
     #[must_use]
     pub(crate) const fn has_news(&self) -> bool {
@@ -204,6 +346,7 @@ impl TaskRecord {
             self.since_ms(),
             self.result_bytes
         );
+        self.push_conclusion(&mut out);
         self.push_optional(&mut out);
         self.push_fact(&mut out);
         out
@@ -217,6 +360,15 @@ impl TaskRecord {
         }
         let word = self.fact.map_or_else(|| "-".to_string(), FactWord::word);
         out.push_str(&format!(" fact={word} fact_rev={}", self.fact_rev));
+    }
+
+    /// ` conclusion=<word>` once the task has ended ([`Self::conclusion`]). It is worked out from
+    /// the state and [`Self::finished`], so a carry row does not hold it.
+    fn push_conclusion(&self, out: &mut String) {
+        if let Some(conclusion) = self.conclusion() {
+            out.push_str(" conclusion=");
+            out.push_str(conclusion.word());
+        }
     }
 
     /// ` why= checked= exit= result_path=`, each only when set.
@@ -244,7 +396,6 @@ impl TaskRecord {
     /// `ran_ms=`), which a Mac asleep does not advance, so the successor's clocks go on from the
     /// time this one measured ([`Self::from_carry_row`]).
     #[must_use]
-    #[cfg(any(unix, test))]
     pub(crate) fn carry_row(&self, now: Instant) -> String {
         let mut out = format!(
             "rev={} state={} from={} since={} result_bytes={} attention={}",
@@ -256,6 +407,9 @@ impl TaskRecord {
             u8::from(self.attention)
         );
         self.push_optional(&mut out);
+        if self.finished {
+            out.push_str(" finished=1");
+        }
         let ms = |stood: std::time::Duration| u64::try_from(stood.as_millis()).unwrap_or(u64::MAX);
         if self.started_unix_ms != self.since_unix_ms {
             out.push_str(&format!(" started={}", self.started_unix_ms));
@@ -293,7 +447,6 @@ impl TaskRecord {
     /// but its ages (`age_ms=`, `ran_ms=`), which grow while the record stands still. A mark
     /// still moves the face, by its `rev=` at least.
     #[must_use]
-    #[cfg(unix)]
     pub(crate) fn carry_face(row: &str) -> String {
         row.split_whitespace()
             .filter(|word| {
@@ -369,6 +522,7 @@ impl TaskRecord {
                 Some(code) => Some(parse_exit_i32(code)?),
                 None => None,
             },
+            finished: field("finished") == Some("1"),
             result_bytes: parse_u64(field("result_bytes")?)?,
             result_path: match field("result_path") {
                 Some(path) => Some(result_path(path, tasks)?),
@@ -384,6 +538,7 @@ impl TaskRecord {
             started_unix_ms,
             started: now.checked_sub(ran).unwrap_or(now),
             entered: rev,
+            carried_entered: None,
             agent: field("agent").and_then(worker_agent),
             trusted_cwd: field("trusted_cwd").and_then(trusted_folder),
             fact: field("fact")
@@ -434,6 +589,19 @@ pub(crate) fn checked_word(value: &str) -> Option<String> {
 pub(crate) const CHECKED_BY_HAND: &str =
     concat!("ERR task mark: ", aterm_types::checked_by_hand!(), "\n");
 
+/// THE REFUSAL OF A HAND'S `task mark failed` WHILE A LOOP CARRIES THE SESSION: `failed` means
+/// nothing more is typed, and the mark would not reach the loop that types. Autopilot Off stops it,
+/// and that fails the task itself.
+pub(crate) const FAILED_UNDER_A_LOOP: &str = "ERR task mark: Autopilot carries this session, so a \
+     mark of failed would not stop its typing: set its Autopilot off, which fails the task\n";
+
+/// Whether a loop carries the session now: a live claim on it, under an Autopilot word that types.
+fn loop_carries(ctx: &SessionCtx) -> bool {
+    let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    meta.live_supervisor(crate::metrics::now_us()).is_some()
+        && meta.autopilot_word() != Some(aterm_agent::supervise::Autopilot::Off)
+}
+
 /// The [`TASK_WHY`] word `value` is, as its `'static` spelling.
 fn why_word(value: &str) -> Option<&'static str> {
     TASK_WHY.iter().copied().find(|w| *w == value)
@@ -469,7 +637,7 @@ pub(crate) struct TaskMark {
 }
 
 /// Usage error line for `task`.
-pub(crate) const TASK_USAGE: &str = "ERR usage: task [mark <working|done|exited|stalled> \
+pub(crate) const TASK_USAGE: &str = "ERR usage: task [mark <working|done|exited|stalled|failed> \
      [from=<s-…|ctl>] [why=<word>] [checked=<word>] [exit=<n>] [result_bytes=<n>] \
      [result_path=<pct>]]\n";
 
@@ -562,6 +730,7 @@ impl TaskMark {
                 why: self.why,
                 checked: self.checked.clone(),
                 exit: self.exit,
+                finished: false,
                 result_bytes: self.result_bytes,
                 result_path: self.result_path.clone(),
                 attention,
@@ -570,6 +739,7 @@ impl TaskMark {
                 started_unix_ms: now_unix_ms,
                 started: now,
                 entered: 1,
+                carried_entered: None,
                 agent: None,
                 trusted_cwd: None,
                 fact: None,
@@ -577,11 +747,25 @@ impl TaskMark {
             };
             return (record, true);
         };
+        // AN EXIT DOES NOT REWRITE HOW THE TASK ENDED: an agent that leaves after its task finished,
+        // whatever word finished it, or after a failed conclusion, keeps that end's `why=` and
+        // `checked=`, and the fact that it finished stays on the record ([`TaskRecord::finished`]).
+        let finished =
+            self.state == TaskState::Exited && current.conclusion() == Some(Conclusion::Finished);
+        let ended_before =
+            finished || (self.state == TaskState::Exited && current.state == TaskState::Failed);
+        let why = if ended_before { current.why } else { self.why };
+        let checked = if ended_before {
+            current.checked.clone()
+        } else {
+            self.checked.clone()
+        };
         let same = current.state == self.state
             && current.from == from
-            && current.why == self.why
-            && current.checked == self.checked
+            && current.why == why
+            && current.checked == checked
             && current.exit == self.exit
+            && current.finished == finished
             && current.result_bytes == self.result_bytes
             && current.result_path == self.result_path
             && current.attention == attention;
@@ -593,13 +777,17 @@ impl TaskMark {
         if next.state != self.state {
             next.since = now;
             next.since_unix_ms = now_unix_ms;
-            next.entered = next.rev;
+            // A look at how the task ended stays a look when its agent leaves after.
+            if !ended_before {
+                next.entered = next.rev;
+            }
         }
         next.state = self.state;
         next.from = from;
-        next.why = self.why;
-        next.checked.clone_from(&self.checked);
+        next.why = why;
+        next.checked = checked;
         next.exit = self.exit;
+        next.finished = finished;
         next.result_bytes = self.result_bytes;
         next.result_path.clone_from(&self.result_path);
         next.attention = attention;
@@ -925,10 +1113,12 @@ pub(crate) fn fact_edit(
     (outcome, Some(next))
 }
 
-/// Reopens a finished worker's task to `working` when a new turn is sent to it.
+/// Reopens a finished or failed worker's task to `working` when a new turn is sent to it.
 pub(crate) fn reopen_at_turn(ctx: &SessionCtx, local_id: u64, by: &TurnBy, found: Option<u64>) {
     let is_done = |r: Option<&TaskRecord>| {
-        r.is_some_and(|r| r.state == TaskState::Done && Some(r.entered) == found)
+        r.is_some_and(|r| {
+            matches!(r.state, TaskState::Done | TaskState::Failed) && Some(r.entered) == found
+        })
     };
     if *by == TurnBy::Harness
         || !is_done(
@@ -948,6 +1138,111 @@ pub(crate) fn reopen_at_turn(ctx: &SessionCtx, local_id: u64, by: &TurnBy, found
             "task: a turn into a finished worker was not marked working: an update is committing"
         );
     }
+}
+
+/// What the Autopilot word now standing makes of `record`, when it moves the task
+/// ([`note_autopilot_word`]): a working worker whose word someone other than aterm turned Off after
+/// it began to work has nothing carrying it on, so it fails, `why=off` where a person did it and
+/// `why=off-ctl` where anything else did; one that failed by the word (those two, or `why=expired`,
+/// whose end is Off too) goes back to working when someone turns it on again. Cruise, set after a
+/// worker failed, reopens it however it failed: Cruise never rests, so it types into the worker
+/// whatever ended it, and a record that said failed while it types would tell a waiter nothing
+/// true. aterm's own Off is the expiry's, which marks its own `why=`.
+///
+/// AN OFF FAILS THE TASK ONCE IT HAS STOOD [`OFF_SETTLES_MS`] (`now_unix_ms`): the chip's click
+/// order passes through Off on its way from Land to Cruise, and a click that only passes through
+/// tells a waiter nothing ([`off_settles_in`] says when to look again).
+#[must_use]
+pub(crate) fn autopilot_mark(
+    record: &TaskRecord,
+    word: Option<aterm_agent::supervise::Autopilot>,
+    set_by: Option<&crate::session_timeline::AutopilotSetBy>,
+    now_unix_ms: u64,
+) -> Option<TaskMark> {
+    use aterm_agent::supervise::Autopilot;
+    let set_by = set_by.filter(|by| by.actor != aterm_slog::Actor::Aterm)?;
+    let set_ms = u64::try_from(set_by.since_ms).ok();
+    let set_since = set_ms.is_some_and(|ms| ms >= record.since_unix_ms);
+    let off_stood = set_ms.is_some_and(|ms| now_unix_ms >= ms.saturating_add(OFF_SETTLES_MS));
+    match (word?, record.state, record.why) {
+        (Autopilot::Cruise, TaskState::Failed, _) if set_since => {
+            let mut mark = TaskMark::new(TaskState::Working);
+            mark.why = Some("turn");
+            Some(mark)
+        }
+        (Autopilot::Off, TaskState::Working, _) if set_since && off_stood => {
+            let mut mark = TaskMark::new(TaskState::Failed);
+            mark.why = Some(if set_by.actor == aterm_slog::Actor::Human {
+                WHY_OFF
+            } else {
+                WHY_OFF_CTL
+            });
+            Some(mark)
+        }
+        (
+            Autopilot::Land | Autopilot::Cruise,
+            TaskState::Failed,
+            Some(WHY_OFF | WHY_OFF_CTL | WHY_EXPIRED),
+        ) => {
+            let mut mark = TaskMark::new(TaskState::Working);
+            mark.why = Some("turn");
+            Some(mark)
+        }
+        _ => None,
+    }
+}
+
+/// How long an Off of someone other than aterm stands before it fails a working task
+/// ([`autopilot_mark`]): longer than a person's two clicks from Land through Off to Cruise.
+pub(crate) const OFF_SETTLES_MS: u64 = 3_000;
+
+/// How long until the Off standing on `record`'s session has stood [`OFF_SETTLES_MS`], where it is
+/// one that will fail the task then ([`autopilot_mark`]); `None` where no Off waits to fail it.
+#[must_use]
+pub(crate) fn off_settles_in(
+    record: &TaskRecord,
+    word: Option<aterm_agent::supervise::Autopilot>,
+    set_by: Option<&crate::session_timeline::AutopilotSetBy>,
+    now_unix_ms: u64,
+) -> Option<std::time::Duration> {
+    let set_by = set_by.filter(|by| by.actor != aterm_slog::Actor::Aterm)?;
+    let set_ms = u64::try_from(set_by.since_ms).ok()?;
+    let settles = set_ms.saturating_add(OFF_SETTLES_MS);
+    (word? == aterm_agent::supervise::Autopilot::Off
+        && record.state == TaskState::Working
+        && set_ms >= record.since_unix_ms
+        && now_unix_ms < settles)
+        .then(|| std::time::Duration::from_millis(settles - now_unix_ms))
+}
+
+/// Holds session `local_id`'s task record to its Autopilot word ([`autopilot_mark`]), read together
+/// under the mark's lock. On the window's thread, so it waits on no update's fence: every later
+/// move of the session's meta looks again. Returns how long until an Off not yet settled is due to
+/// be looked at again ([`off_settles_in`]), which the caller owes.
+#[must_use]
+pub(crate) fn note_autopilot_word(ctx: &SessionCtx, local_id: u64) -> Option<std::time::Duration> {
+    let (word, set_by) = {
+        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        (meta.autopilot_word(), meta.autopilot_set_by)
+    };
+    let current = ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .task()
+        .cloned();
+    let current = current?;
+    let now_ms = unix_ms_now();
+    let Some(mark) = autopilot_mark(&current, word, set_by.as_ref(), now_ms) else {
+        return off_settles_in(&current, word, set_by.as_ref(), now_ms);
+    };
+    let same = |now: Option<&TaskRecord>| now.is_some_and(|now| now.rev == current.rev);
+    if mark_session_task_if(ctx, local_id, &mark, std::time::Duration::ZERO, same).is_err() {
+        aterm_log::warn!(
+            "task: the record does not yet say Autopilot's move: an update is committing"
+        );
+    }
+    None
 }
 
 /// Usage error line for `result`.
@@ -972,7 +1267,7 @@ pub(crate) fn cmd_result(ctx: &SessionCtx, local_id: u64, rest: &str) -> String 
         return "ERR no task\n".to_string();
     };
     match (&record.result_path, record.state) {
-        (Some(path), TaskState::Done | TaskState::Exited) => {
+        (Some(path), TaskState::Done | TaskState::Exited | TaskState::Failed) => {
             let claim = || crate::self_claim::rollout_target(ctx).map(|t| (t.home, t.thread));
             match aterm_agent::harness::result::reread_with(path, claim) {
                 Some(found) => {
@@ -1025,6 +1320,98 @@ fn repair_result(
     }
 }
 
+/// `ctx`'s task record for a restore manifest ([`crate::restore::TerminalLeafRestore::task`]): the
+/// carry row without its ages, which grow while the record stands still and would have every image
+/// written anew. A row without them goes by the wall clock ([`TaskRecord::from_carry_row`]), which
+/// is what a restore has: aterm was not running to measure the time between.
+pub(crate) fn restore_row(ctx: &SessionCtx) -> Option<String> {
+    let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    let row = timeline.task()?.carry_row(Instant::now());
+    Some(TaskRecord::carry_face(&row))
+}
+
+/// Restores a parked worker's record ([`restore_row`]) onto `ctx`, in a restore other than a
+/// seamless update. A worker still running when the image was taken reads `working
+/// why=restored`, which no startup or held deadline reads as one just spawned, or, where its agent
+/// is not coming back, `exited why=exit`: `gone` (a plain quit forgets it, and no keeper handed its
+/// shell back), or a disposable worker whose shell did not come back running (`kept`). aterm's disk
+/// worker is disposable: a later need starts a new one, so a cold restart never relaunches it
+/// ([`disposable_worker`]). Returns whether this is such a worker, whose agent the restore leaves
+/// unlaunched. One whose relaunch is over without its agent is marked exited then
+/// ([`mark_restored_over`]).
+pub(crate) fn seed_restored(ctx: &SessionCtx, row: &str, gone: bool, kept: bool) -> bool {
+    let now = Instant::now();
+    let now_unix_ms = unix_ms_now();
+    let Some(mut record) =
+        TaskRecord::from_carry_row(row, tasks_dir().as_deref(), now, now_unix_ms)
+    else {
+        aterm_log::warn!(
+            "task: the restored task record does not read ({row:?}); its tab returns as a person's"
+        );
+        return false;
+    };
+    let disposable = !kept && disposable_worker(record.trusted_cwd.as_deref());
+    let gone = gone || disposable;
+    match record.state {
+        TaskState::Working | TaskState::Stalled if gone => {
+            record.rev += 1;
+            record.entered = record.rev;
+            record.state = TaskState::Exited;
+            record.why = Some("exit");
+            record.exit = None;
+            record.attention = false;
+            record.since = now;
+            record.since_unix_ms = now_unix_ms;
+        }
+        TaskState::Working => {
+            record.why = Some(WHY_RESTORED);
+            record.carried_entered = Some(record.entered);
+        }
+        // A failure told before the quit is not news after it.
+        TaskState::Stalled | TaskState::Done | TaskState::Failed | TaskState::Exited => {
+            record.carried_entered = Some(record.entered);
+        }
+    }
+    ctx.timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .seed_task(record);
+    crate::session_timeline::keep_worker_autopilot(ctx);
+    disposable
+}
+
+/// Whether a worker trusted to folder `trusted_cwd` is disposable: aterm's disk worker, which a
+/// cold restart does not resume ([`seed_restored`]).
+#[must_use]
+pub(crate) fn disposable_worker(trusted_cwd: Option<&str>) -> bool {
+    trusted_cwd.is_some_and(|folder| {
+        aterm_agent::harness::disk::fence::is_worker_folder(Path::new(folder))
+    })
+}
+
+/// A RESTORED WORKER WHOSE RELAUNCH IS OVER WITHOUT ITS AGENT (every attempt failed, the restore did
+/// not hand it on, the harness or its Autopilot is off, or its tab was held): a record still
+/// `working why=restored`, or still the stall it carried across the restart, reads `exited
+/// why=exit`, a failed conclusion, as one whose agent a quit forgot does ([`seed_restored`]). A
+/// record that moved since, by its agent, a look or a person, stands.
+/// On the window's thread, so it waits on no update's fence.
+pub(crate) fn mark_restored_over(ctx: &SessionCtx, local_id: u64) {
+    let mut mark = TaskMark::new(TaskState::Exited);
+    mark.why = Some(WHY_EXIT);
+    let restored = |now: Option<&TaskRecord>| {
+        now.is_some_and(|r| {
+            (r.state == TaskState::Working && r.why == Some(WHY_RESTORED))
+                || (r.state == TaskState::Stalled && r.carried_entered == Some(r.entered))
+        })
+    };
+    if mark_session_task_if(ctx, local_id, &mark, std::time::Duration::ZERO, restored).is_err() {
+        aterm_log::warn!(
+            "task: a restored worker whose agent did not come back still reads working: an update \
+             is committing"
+        );
+    }
+}
+
 /// Restores a carried task record onto `ctx` during seamless-update adoption.
 pub(crate) fn seed_carried(ctx: &SessionCtx, row: Option<&str>) {
     let Some(row) = row else {
@@ -1038,6 +1425,7 @@ pub(crate) fn seed_carried(ctx: &SessionCtx, row: Option<&str>) {
         );
         return;
     };
+    record.carried_entered = Some(record.entered);
     record.attention = supervisor_attention(&ctx.meta.lock().unwrap_or_else(|p| p.into_inner()));
     ctx.timeline
         .lock()
@@ -1107,6 +1495,12 @@ pub(crate) fn cmd_task(ctx: &SessionCtx, local_id: u64, scope: Scope, rest: &str
     };
     if parsed.checked.is_some() && crate::control::serving_principal() != Principal::Harness {
         return CHECKED_BY_HAND.to_string();
+    }
+    if parsed.state == TaskState::Failed
+        && crate::control::serving_principal() != Principal::Harness
+        && loop_carries(ctx)
+    {
+        return FAILED_UNDER_A_LOOP.to_string();
     }
     let deadline_stall =
         parsed.state == TaskState::Stalled && matches!(parsed.why, Some("startup" | "held"));
@@ -1279,10 +1673,12 @@ pub(crate) fn parse_await_task(words: &[&str], list: bool) -> Result<AwaitTaskAr
     Ok(args)
 }
 
-/// Formats a single `await task` reply row (` checked=` where a landing named what aterm checked,
-/// §14.9 slice 9c, and ` fact= fact_rev=` at its end once the record's fact word was ever edited,
-/// [`TaskRecord::push_fact`]); `program` is the `program_state=` column, a claim shown beside
-/// `agent=` that no wait reads.
+/// Formats a single `await task` reply row (` conclusion=` once the task ended,
+/// [`TaskRecord::conclusion`], ` why=` where something said, ` checked=` where a landing named what
+/// aterm checked, §14.9 slice 9c, and ` fact= fact_rev=` at its end once the record's fact word was
+/// ever edited, [`TaskRecord::push_fact`]); `program` is the `program_state=` column, a claim shown
+/// beside `agent=` that no wait reads. A tab closed on a task with no conclusion yet reads
+/// `conclusion=failed`: nothing is left to finish it.
 #[must_use]
 pub(crate) fn await_row(
     sid: &str,
@@ -1300,6 +1696,15 @@ pub(crate) fn await_row(
          attention={attention} result_bytes={result_bytes}"
     );
     if let Some(record) = record {
+        let conclusion = record.conclusion().or(closed.then_some(Conclusion::Failed));
+        if let Some(conclusion) = conclusion {
+            row.push_str(" conclusion=");
+            row.push_str(conclusion.word());
+        }
+        if let Some(why) = record.why {
+            row.push_str(" why=");
+            row.push_str(why);
+        }
         if let Some(checked) = &record.checked {
             row.push_str(" checked=");
             row.push_str(checked);

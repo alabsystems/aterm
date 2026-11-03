@@ -178,7 +178,7 @@ pub(super) fn keep_join_held(
 /// The run [`JOIN_HELD`] marks in `root`, and the process holding it: its pid and its
 /// [`aterm_uds::process::Identity::token`].
 fn join_held(root: &Path) -> Option<(u64, i32, String)> {
-    let bytes = std::fs::read(root.join(JOIN_HELD)).ok()?;
+    let bytes = crate::macos_doctor::read_record_bytes(&root.join(JOIN_HELD)).ok()?;
     let mark: Value = aterm_json::from_slice(&bytes).ok()?;
     Some((
         mark["revision"].as_u64()?,
@@ -697,6 +697,7 @@ impl UpgradeProgress {
 
     pub(super) fn save(&self, root: &Path, plan: &Plan) -> Result<(), String> {
         validate_plan(plan)?;
+        carry_older_person_access(root)?;
         settle_put_back(root)?;
         let mut record = plan_record(plan, true);
         let mut marker = json!({
@@ -776,7 +777,8 @@ fn progress_checkpoint(progress: Progress) -> Value {
 /// before its own progress rename. Different plans never inherit it, and once
 /// physical progress catches up normal saves drop the marker.
 pub(super) fn keep_upgrade(root: &Path, plan: &Plan, record: &mut Value) -> Result<(), String> {
-    let Ok(bytes) = std::fs::read(root.join("automatic-plan.json")) else {
+    let Ok(bytes) = crate::macos_doctor::read_record_bytes(&root.join("automatic-plan.json"))
+    else {
         return Ok(());
     };
     let Ok(existing) = aterm_json::from_slice::<Value>(&bytes) else {
@@ -808,7 +810,7 @@ pub(super) fn upgrade_progress(
     physical: Option<Progress>,
 ) -> Result<Option<Progress>, String> {
     let path = root.join("automatic-plan.json");
-    let Ok(bytes) = std::fs::read(&path) else {
+    let Ok(bytes) = crate::macos_doctor::read_record_bytes(&path) else {
         return Ok(physical);
     };
     let Ok(record) = aterm_json::from_slice::<Value>(&bytes) else {
@@ -1021,7 +1023,8 @@ fn held_widen(root: &Path, revision: u64) -> Result<Option<PutBack>, String> {
     if held.revision != revision {
         return Ok(None);
     }
-    let Ok(bytes) = std::fs::read(root.join("automatic-plan.json")) else {
+    let Ok(bytes) = crate::macos_doctor::read_record_bytes(&root.join("automatic-plan.json"))
+    else {
         return Ok(None);
     };
     let Ok(record) = aterm_json::from_slice::<Value>(&bytes) else {
@@ -1096,7 +1099,8 @@ fn put_back_progress(
 /// put-back that a process ended part-way through ([`put_back_held_widen`]), so the run it
 /// puts back is not lost with its marker.
 pub(super) fn settle_put_back(root: &Path) -> Result<(), String> {
-    let Ok(bytes) = std::fs::read(root.join("automatic-plan.json")) else {
+    let Ok(bytes) = crate::macos_doctor::read_record_bytes(&root.join("automatic-plan.json"))
+    else {
         return Ok(());
     };
     let Ok(record) = aterm_json::from_slice::<Value>(&bytes) else {
@@ -1125,7 +1129,7 @@ mod tests {
     fn a_kept_answer_of_another_vault_stands_for_the_look_on_its_network() {
         use aterm_secrets::heard::{self, ABSENT_FOR, Heard, Verdict};
         let home = aterm_tempfile::tempdir().unwrap();
-        let lan = "aabbcc112233@192.168.4.0/24";
+        let lan = "n00112233445566aa";
         let paths = aterm_secrets::client::Paths::for_home(home.path());
         let verdict = Verdict {
             at: 1_000,
@@ -1145,10 +1149,7 @@ mod tests {
         };
         assert_eq!(look(Some(lan), 1_000 + ABSENT_FOR - 1), VaultHere::Absent);
         assert_eq!(looks.get(), 0, "no request on its network");
-        assert_eq!(
-            look(Some("ddeeff445566@10.0.0.0/8"), 1_001),
-            VaultHere::Unreached
-        );
+        assert_eq!(look(Some("n66778899aabbccdd"), 1_001), VaultHere::Unreached);
         assert_eq!(look(Some(lan), 1_000 + ABSENT_FOR), VaultHere::Unreached);
         assert_eq!(look(None, 1_001), VaultHere::Unreached);
         assert_eq!(looks.get(), 3);
@@ -2007,6 +2008,7 @@ mod tests {
             provisional,
             stop_request: None,
             cancelled: None,
+            person_access: false,
         };
         let widened = upgrade_of(&records(true, Decision::Pending), || true).unwrap();
         assert_eq!(widened.selection, Selection::all());
@@ -2277,6 +2279,75 @@ mod tests {
             upgrade_of(&records, || false),
             None,
             "a plan a person shaped stays as it is"
+        );
+    }
+
+    /// NEGATIVE CONTROL: widening an older provisional setup carries over its admitted
+    /// Permissions approval across `UpgradeProgress::save` (including an interrupted retry), while
+    /// an older unverified provisional setup carries nothing.
+    #[test]
+    fn widening_an_older_provisional_setup_carries_its_permissions_approval_and_retry_prefix() {
+        let strip_older = |root: &Path| {
+            let path = root.join("initial-setup.json");
+            let mut record: Value = aterm_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            record.as_object_mut().unwrap().remove(PROGRESS_BY_PRESS);
+            write_json(&path, &record).unwrap();
+            let _ = std::fs::remove_file(root.join(PERSON_ACCESS));
+        };
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        provisional(root.path());
+        note_person_asked_at(root.path()).unwrap();
+        strip_older(root.path());
+        assert_eq!(person_access_at(root.path()), PersonAccess::Older);
+        assert!(
+            initial_setup_snapshot_at(root.path(), Plan::default())
+                .unwrap()
+                .permissions_allowed
+        );
+
+        let (mut ticket, full) = prepare_upgrade(root.path(), || true, || Ok(None))
+            .unwrap()
+            .unwrap();
+        assert!(
+            ticket
+                .persist_for_watch_test(root.path(), &full, true, Some((1, false)))
+                .is_err()
+        );
+        let widened = ticket
+            .upgrade_at(root.path(), &full)
+            .result
+            .unwrap()
+            .expect("retry after UpgradePlan matches prefix");
+        assert!(widened > 0);
+        assert_eq!(person_access_at(root.path()), PersonAccess::Asked);
+        assert!(
+            initial_setup_snapshot_at(root.path(), Plan::default())
+                .unwrap()
+                .permissions_allowed
+        );
+
+        let unverified = aterm_tempfile::tempdir().unwrap();
+        provisional(unverified.path());
+        strip_older(unverified.path());
+        write_json(
+            &unverified.path().join("first-run.json"),
+            &json!({"profile":PROFILE,"state":"applied","accounts_verified":false}),
+        )
+        .unwrap();
+        let (mut ticket, full) = prepare_upgrade(unverified.path(), || true, || Ok(None))
+            .unwrap()
+            .unwrap();
+        ticket
+            .upgrade_at(unverified.path(), &full)
+            .result
+            .unwrap()
+            .unwrap();
+        assert_eq!(person_access_at(unverified.path()), PersonAccess::NotAsked);
+        assert!(
+            !initial_setup_snapshot_at(unverified.path(), Plan::default())
+                .unwrap()
+                .permissions_allowed
         );
     }
 }

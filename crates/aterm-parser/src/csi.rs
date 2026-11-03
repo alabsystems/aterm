@@ -9,9 +9,20 @@ use crate::action::ActionSink;
 use crate::state::State;
 use crate::{MAX_INTERMEDIATES, MAX_PARAMS, Parser};
 
+/// Whether `mask` is a live `subparam_mask` for `len` parameters: bit `i` for `params[i]`, and
+/// nothing past them but bit `MAX_PARAMS`, which a full list carries once the cap has dropped a
+/// sub-parameter. A handler reads that bit to tell a colon group the cap cut from one that ended
+/// at the cap: the bit does not say which later element fell, only that a colon came after the cap.
+#[inline]
+pub(crate) const fn subparam_mask_fits(mask: u32, len: usize) -> bool {
+    let past = mask >> len;
+    past == 0 || (len == MAX_PARAMS && past == 1)
+}
+
 impl Parser {
     /// Finalize the current parameter (clamped to `u16`) and push it, setting
-    /// its `subparam_mask` bit if `is_subparam`; past `MAX_PARAMS` it is dropped.
+    /// its `subparam_mask` bit if `is_subparam`. Past `MAX_PARAMS` it is dropped,
+    /// and a dropped sub-parameter sets bit `MAX_PARAMS` ([`subparam_mask_fits`]).
     #[inline]
     pub(crate) fn push_current_param(&mut self, is_subparam: bool) {
         let param_index = self.params.len();
@@ -22,16 +33,20 @@ impl Parser {
             if is_subparam {
                 self.subparam_mask |= 1 << param_index;
             }
+        } else if is_subparam {
+            self.subparam_mask |= 1 << MAX_PARAMS;
         }
         self.current_param = 0;
         self.param_started = false;
     }
 
     /// Close the parameter list at the final byte or at the intermediate byte that ends it.
-    /// An empty trailing parameter after `;` pushes `0` (ECMA-48 §5.4.2), while a trailing `:` opens no subparameter.
+    /// An empty last element is pushed as `0`, after `;` (ECMA-48 §5.4.2) as after `:` (T.416
+    /// 13.1.8, xterm's `CASE_ESC_COLON`), so `P:` and `P:;Q` read `P`'s group alike. Only a list
+    /// with no separator closes empty.
     #[inline]
     pub(crate) fn close_params(&mut self, after_colon: bool) {
-        if self.param_started || (!self.params.is_empty() && !after_colon) {
+        if self.param_started || !self.params.is_empty() {
             self.push_current_param(after_colon);
         }
     }

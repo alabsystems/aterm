@@ -268,7 +268,7 @@ exit(3)
 /// Returns the last 80 lines of a smoke child log, indented under the ladder.
 #[must_use]
 pub fn smoke_log_tail(label: &str, path: &Path) -> String {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(text) = crate::read_regular_text(path) else {
         return String::new();
     };
     if text.is_empty() {

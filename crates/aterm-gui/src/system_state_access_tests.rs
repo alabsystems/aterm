@@ -266,6 +266,56 @@ fn setup_field_names_what_is_left_and_done_once_the_plan_finished() {
     );
 }
 
+/// A run parked to ask again by itself reads `done`, nothing being left for anyone to do now,
+/// and names what it still asks for (`;asking:`), so `done` is never read as a finished record;
+/// grants on offer ride behind it without making it pending.
+#[test]
+fn setup_field_names_what_a_parked_run_asks_for_and_what_is_on_offer() {
+    use aterm_types::macos_setup::{ACCESS_OFFERED, SECRETS_VAULT_ROW};
+    let mut selection = Selection::none();
+    selection.set(Setting::Permissions, true);
+    selection.set(Setting::Secrets, true);
+    let debugger = Subject::Access(Access::Debugger);
+    let vault = Subject::Setting(Setting::Secrets);
+    let offer = observed(debugger, Standing::NotNeeded, Some(ACCESS_OFFERED));
+    let finished = SetupStatus {
+        finished: true,
+        ..status(
+            selection,
+            vec![offer.clone(), observed(vault, Standing::InPlace, None)],
+        )
+    };
+    assert_eq!(setup_field(&finished), "done;offered:debugger");
+    let no_offer = SetupStatus {
+        finished: true,
+        ..status(selection, vec![observed(vault, Standing::InPlace, None)])
+    };
+    assert_eq!(setup_field(&no_offer), "done", "CONTROL: nothing on offer");
+    // A vault that did not answer (`unreached`), or none on this network (`waiting`), on a Mac
+    // off the ALab LAN: the headline counts it settled and the run asks again by itself.
+    for parked_as in ["unreached", "waiting"] {
+        let mut parked = crate::system_state::fixture_status("non-alab").unwrap();
+        assert!(!parked.finished);
+        parked.rows = vec![crate::system_state::SetupStatusRow {
+            name: SECRETS_VAULT_ROW.to_owned(),
+            status: parked_as.to_owned(),
+            detail: "The ALab vault did not answer on this network".to_owned(),
+        }];
+        assert_eq!(setup_field(&parked), "done;asking:vault", "{parked_as}");
+        let offered = parked
+            .observed
+            .iter_mut()
+            .find(|seen| seen.subject == debugger)
+            .unwrap();
+        *offered = offer.clone();
+        assert_eq!(
+            setup_field(&parked),
+            "done;asking:vault;offered:debugger",
+            "{parked_as}"
+        );
+    }
+}
+
 /// The menu line says only rows the approved plan manages that need a person or failed: one is
 /// named, several are counted; a regressed Full Disk Access grant counts once, as needing a
 /// person; the Secrets row's approval code rides along.

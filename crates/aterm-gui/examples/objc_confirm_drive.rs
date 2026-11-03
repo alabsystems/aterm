@@ -1,0 +1,23 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! Drives owner and general menu confirmations on real `NSAlert`s through the macOS runtime
+//! adapter, checking their words, buttons, clicks, Return/keypad Enter defaults and Escape in process.
+
+/// The drive could not execute here; not a pass.
+#[cfg(not(target_os = "macos"))]
+const NOT_RUN: u8 = 2;
+
+#[cfg(not(target_os = "macos"))]
+fn main() -> std::process::ExitCode {
+    eprintln!(
+        "objc-confirm-drive: NOT RUN — this drive is about \
+         crates/aterm-gui/src/menu.rs's AppKit confirmation, which does not exist off macOS."
+    );
+    std::process::ExitCode::from(NOT_RUN)
+}
+
+#[cfg(target_os = "macos")]
+fn main() -> std::process::ExitCode {
+    std::process::ExitCode::from(u8::try_from(aterm_gui::run_confirm_drive()).unwrap_or(1))
+}

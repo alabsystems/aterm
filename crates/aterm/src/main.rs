@@ -16,6 +16,10 @@ mod compact_zone;
 mod macho_order;
 #[cfg(unix)]
 mod release_probe;
+#[cfg(unix)]
+mod service_repair;
+#[cfg(unix)]
+mod service_repair_remote;
 
 use aterm_cli::{AliasRoute, alias_route};
 
@@ -25,6 +29,157 @@ aterm_durable::plain_durable_flushes_in_tests!();
 aterm_secrets::memoized_x25519_in_tests!();
 #[cfg(all(test, unix))]
 aterm_db::admission_waits_in_tests!(aterm_spec::wait::MUST_HAPPEN);
+
+/// `aterm pkg` and its `atpkg` alias: the package pass, then, after an install or update that
+/// succeeded and that a person typed at a terminal ([`a_person_at_their_own_account`],
+/// [`atpkg::cli::pass_finishes_setup`]), setup's follow-up ([`InitEntry::PackageFollowUp`]) in
+/// this process. The pass's store lock is [`atpkg::cli::main_entry`]'s own and is let go as it
+/// returns, before the follow-up starts.
+fn package_entry(args: Vec<OsString>) -> ExitCode {
+    package_entry_with(
+        args,
+        a_person_at_their_own_account(),
+        |args| {
+            #[cfg(target_os = "macos")]
+            if aterm_machines::cli::pkg_retires(&args) {
+                aterm_machines::cli::retire_lan_agent();
+            }
+            atpkg::cli::main_entry(args)
+        },
+        || {
+            #[cfg(unix)]
+            {
+                run_init(InitEntry::PackageFollowUp)
+            }
+            #[cfg(not(unix))]
+            {
+                ExitCode::SUCCESS
+            }
+        },
+    )
+}
+
+/// Whether a person runs this command at a terminal ([`atpkg::cli::a_person_typed_this`]: its
+/// standard input and standard error both are), as themselves (not as root, which `aterm init`
+/// refuses) and in their own login's home ([`aterm_machines::sessions::is_live_account`], which
+/// no private state root is). A pass a program runs with its input or its error elsewhere (the
+/// window's package lanes and Settings ▸ Packages, a worker's admission, a detached pass,
+/// init's own toolset pass, the machines items) is no person's. A pass a command runs on the
+/// person's terminal as one step of its own work (`aterm ai doctor`'s and `aterm ai login`'s
+/// installs, the AI screen's Install tab) reads as theirs here, and says itself that no setup
+/// follows it ([`atpkg::cli::NO_INIT_FLAG`]).
+fn a_person_at_their_own_account() -> bool {
+    #[cfg(unix)]
+    {
+        atpkg::cli::a_person_typed_this()
+            && aterm_uds::peer::our_uid() != 0
+            && aterm_machines::sessions::is_live_account()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// [`package_entry`] with whether a person runs it (`person`), the package pass (`packages`) and
+/// the follow-up (`setup`). The follow-up runs only after a pass a person ran whose words
+/// setup follows ([`atpkg::cli::pass_finishes_setup`]), and only once that pass succeeded. The
+/// command's exit status is always the pass's.
+fn package_entry_with(
+    args: Vec<OsString>,
+    person: bool,
+    packages: impl FnOnce(Vec<OsString>) -> ExitCode,
+    setup: impl FnOnce() -> ExitCode,
+) -> ExitCode {
+    let finish = person && atpkg::cli::pass_finishes_setup(&args);
+    let code = packages(args);
+    if finish && code == ExitCode::SUCCESS {
+        // The follow-up's rows and summary on the person's terminal, and its line in aterm.log,
+        // say what it left unfinished. Its status (75, 77, 69 or 1 for an unfinished run) would
+        // read as the pass's own store contention, offline or failure.
+        let _ = setup();
+    }
+    code
+}
+
+/// How `aterm init` is entered ([`run_init`]).
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum InitEntry {
+    /// `aterm init` with its own words, and the running window's permission walk for the grants
+    /// the run leaves to the person.
+    Typed(Vec<OsString>),
+    /// The follow-up of a person's own package install or update ([`package_entry`]). Running it
+    /// is aterm's decision, not theirs ([`aterm_machines::init::Decider::Aterm`]), so it puts no
+    /// question of macOS's on the screen: its words leave out the sign-outs and the workstation
+    /// preferences ([`aterm_machines::init::PACKAGE_FOLLOW_UP`]), at this Mac's console its look
+    /// for the ALab vault waits until macOS has answered aterm's Local Network question (over
+    /// SSH, where macOS asks none, it looks as a typed `aterm init` there does), Rust in
+    /// Spotlight searches no folder of the person's, and it hands no grant to the permission
+    /// walk.
+    PackageFollowUp,
+}
+
+#[cfg(unix)]
+impl InitEntry {
+    /// The words init parses for this entry.
+    fn words(self) -> Vec<OsString> {
+        match self {
+            Self::Typed(words) => words,
+            Self::PackageFollowUp => aterm_machines::init::PACKAGE_FOLLOW_UP
+                .iter()
+                .map(OsString::from)
+                .collect(),
+        }
+    }
+
+    /// Who decided that this run happens.
+    const fn decided(&self) -> aterm_machines::init::Decider {
+        match self {
+            Self::Typed(_) => aterm_machines::init::Decider::Person,
+            Self::PackageFollowUp => aterm_machines::init::Decider::Aterm,
+        }
+    }
+}
+
+/// `aterm init`, entered as `entry` says. Every entry composes the same base layer
+/// ([`doctor::init_base`], the toolset row included) and the same host; the follow-up differs
+/// in its words, in who decided it ([`InitEntry::decided`]) and in handing no grant to the
+/// permission walk. The run's phase totals go to aterm.log, never to this terminal.
+#[cfg(unix)]
+fn run_init(entry: InitEntry) -> ExitCode {
+    aterm_gui::install_session_log();
+    #[cfg(target_os = "macos")]
+    let host = aterm_machines::init::Host {
+        decided: entry.decided(),
+        base: &doctor::init_base,
+        full_disk_access: &aterm_cli::macos_doctor::full_disk_access,
+        records: &aterm_cli::macos_doctor::InitRecords,
+        grants: aterm_cli::macos_doctor::init_grants,
+        walk: match entry {
+            InitEntry::Typed(_) => &aterm_cli::init_permissions_walk,
+            InitEntry::PackageFollowUp => &|_| None,
+        },
+        converge: &converge::Live,
+        alab: &aterm_cli::macos_doctor::alab_mac,
+        present: aterm_gui::person_at_this_screen,
+    };
+    // Elsewhere (Linux): the base layer, the vault and the repositories; each workstation row
+    // reads "macOS only".
+    #[cfg(not(target_os = "macos"))]
+    let host = aterm_machines::init::Host {
+        decided: entry.decided(),
+        base: &doctor::init_base,
+        full_disk_access: &|| None,
+        records: &aterm_machines::init::NoRecords,
+        grants: aterm_machines::init::no_grants,
+        walk: &|_| None,
+        converge: &converge::Live,
+        alab: &aterm_machines::init_secrets::alab_member_here,
+        present: || false,
+    };
+    aterm_machines::init::main_entry(entry.words(), &host)
+}
 
 macro_rules! println {
     () => {
@@ -114,16 +269,29 @@ fn start_node_commons_runtime(
     config: std::path::PathBuf,
 ) -> Option<aterm_db::runtime::Runtime> {
     let lan = commons_lan::gate(&config, commons_lan::Host::NodeServe);
-    match aterm_db::runtime::Runtime::start_background(paths, config, lan, |status| match status {
-        aterm_db::runtime::Status::Refused(why) => aterm_log::warn!(
-            "Commons node background repair refused local configuration or trust state: {why}"
-        ),
-        aterm_db::runtime::Status::LanHeld => {
-            aterm_log::info!("Commons node background repair: {status:?}");
+    let rounds = alab_register::reports(paths.clone(), config.clone());
+    match aterm_db::runtime::Runtime::start_background_with_reports(
+        paths,
+        config,
+        lan,
+        // A refusal warns once per cause (`Status::news`); a standing one logs at debug.
+        |status| {
+            if let Some(refusal) = status.news() {
+                aterm_log::warn!(
+                    "Commons node background repair refused local configuration or trust state: {refusal}"
+                );
+            } else if status == aterm_db::runtime::Status::LanHeld {
+                aterm_log::info!("Commons node background repair: {status:?}");
+            } else {
+                aterm_log::debug!("Commons node background repair: {status:?}");
+            }
+        },
+        rounds,
+    ) {
+        Ok(runtime) => {
+            alab_journal::start_backfill();
+            Some(runtime)
         }
-        _ => aterm_log::debug!("Commons node background repair: {status:?}"),
-    }) {
-        Ok(runtime) => Some(runtime),
         Err(error) => {
             aterm_log::warn!("Commons node background runtime could not start: {error}");
             None
@@ -294,7 +462,38 @@ fn dispatch_link(args: &[String]) -> ExitCode {
     aterm_link::cli::dispatch_with_inherited_lanes(args, take_startup_lanes)
 }
 
+/// Name the Command Line Tools shim's developer directory for this process while the tools are
+/// missing, or drop one inherited once they exist ([`aterm_types::clt_shim::developer_dir_move`]).
+/// A stat and a readlink on a Mac with the tools: no child process, and no write.
+#[cfg(target_os = "macos")]
+fn settle_developer_dir() {
+    use aterm_types::clt_shim::{DEVELOPER_DIR_ENV, DeveloperDirMove};
+    // SAFETY: `geteuid` is a side-effect-free getter.
+    let root = unsafe { libc::geteuid() } == 0;
+    match aterm_types::clt_shim::developer_dir_move(
+        std::env::var_os(DEVELOPER_DIR_ENV).as_deref(),
+        aterm_types::clt_shim::developer_git(),
+        aterm_types::clt_shim::shim_dir().as_deref(),
+        root,
+    ) {
+        DeveloperDirMove::Keep => {}
+        // SAFETY: `main` calls this first, before this process starts any thread.
+        DeveloperDirMove::Set(dir) => unsafe { std::env::set_var(DEVELOPER_DIR_ENV, dir) },
+        // SAFETY: as above.
+        DeveloperDirMove::Clear => unsafe { std::env::remove_var(DEVELOPER_DIR_ENV) },
+    }
+}
+
 pub(crate) fn main() -> ExitCode {
+    let code = front_door_main();
+    // A pass the lab's mailbox discovery started on its own thread finishes before a
+    // short-lived invocation returns (a bounded wait; nothing runs in most processes).
+    #[cfg(unix)]
+    alab_mailbox::settle();
+    code
+}
+
+fn front_door_main() -> ExitCode {
     // First, while this process has one thread: a build's claim holder forks away from its
     // front's spawn (BUILD-ADMIT), and a window's tethered helper starts as its verb.
     if let Some(code) = atpkg::build_admit::hold::entry() {
@@ -307,6 +506,10 @@ pub(crate) fn main() -> ExitCode {
     if let Some(code) = aterm_machines::port::claude_keychain::entry() {
         return code;
     }
+    // While this process still has one thread: every program it starts, from `/usr/bin/git` by
+    // absolute path to a tab's agent, reaches aterm's shim and not Apple's install dialog.
+    #[cfg(target_os = "macos")]
+    settle_developer_dir();
     #[cfg(target_os = "macos")]
     aterm_uds::process::register_allocator_relief(compact_zone::release_free_memory);
     #[cfg(windows)]
@@ -320,13 +523,25 @@ pub(crate) fn main() -> ExitCode {
     // connector rows say where each keeps it (aterm-secrets cannot read them itself).
     #[cfg(unix)]
     aterm_secrets::text::on_cli_login(aterm_agent::ai::connector::login_file);
-    // A Mac waiting to be let into ALab asks ALab's members on the LAN to show its request from
-    // its vault subscriber, every minute, over the fleet port's `ask` (aterm-secrets cannot dial
-    // it itself), with the ask the Secrets stage registers below.
+    // A mailbox the harness opens to read a sign-in code tells the lab registry which addresses
+    // it receives (a release build only; the hook is inert in tests and debug builds).
+    #[cfg(unix)]
+    alab_mailbox::install();
+    // A Mac waiting to be let into ALab proves itself to ALab's members on the LAN from its vault
+    // subscriber, then asks those that did not let it in to show its request: about half a
+    // minute after its first ask, then after 1, 2, 4 and 8 minutes, then every 15, over the fleet
+    // port's `ask` (aterm-secrets cannot dial it itself), with the ask the Secrets stage
+    // registers below.
     #[cfg(unix)]
     aterm_secrets::client::on_ask_members(|paths| {
         aterm_agent::members_cli::ask_members(&paths.home).map_err(aterm_secrets::Error::new)
     });
+    #[cfg(unix)]
+    aterm_agent::service_repair_rpc::install_dispatcher(service_repair::rpc)
+        .expect("service repair dispatcher is installed once before any listener");
+    #[cfg(unix)]
+    aterm_agent::service_repair_rpc::install_startup_recovery(service_repair::start_recovery)
+        .expect("service recovery callback is installed once before any coordinator");
     // The vault subscriber's first Local Network use is kept for this Mac and app, so a window's
     // System State step reads macOS's question as already put to aterm.
     #[cfg(target_os = "macos")]
@@ -381,6 +596,11 @@ pub(crate) fn main() -> ExitCode {
     aterm_agent::harness::account_catalog::install_reader(shared_accounts::read);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     account_claims::install(claims_observation, claims_pusher);
+    #[cfg(unix)]
+    alab_journal::install();
+    // The lab registry's preferences, as the harness's roster source (a release build only).
+    #[cfg(unix)]
+    alab_view::install();
     #[cfg(windows)]
     let _ = aterm_gui::attach_parent_console();
     let mut args_os = std::env::args_os();
@@ -410,7 +630,7 @@ pub(crate) fn main() -> ExitCode {
         AliasRoute::MachinesAskpass => return aterm_machines::askpass::main(&rest),
         #[cfg(not(target_os = "macos"))]
         AliasRoute::MachinesAskpass => return machines_unavailable(),
-        AliasRoute::Pkg => return atpkg::cli::main_entry(rest),
+        AliasRoute::Pkg => return package_entry(rest),
         AliasRoute::Abrew => return atpkg::abrew::main_entry(rest),
         AliasRoute::Agh => return agh::cli::main_entry(rest),
         AliasRoute::Fleet => return aterm_agent::fleet_cli::main_entry(rest),
@@ -469,13 +689,7 @@ pub(crate) fn main() -> ExitCode {
             aterm_cli::Verb::Ctl => aterm_ctl::main_entry_with(forwarded, CTL_LOCAL),
             aterm_cli::Verb::Conn => aterm_ctl::conn_main_entry(forwarded),
             aterm_cli::Verb::ResourceRun => aterm_ctl::resource_run_main_entry(forwarded),
-            aterm_cli::Verb::Pkg => {
-                #[cfg(target_os = "macos")]
-                if aterm_machines::cli::pkg_retires(&forwarded) {
-                    aterm_machines::cli::retire_lan_agent();
-                }
-                atpkg::cli::main_entry(forwarded)
-            }
+            aterm_cli::Verb::Pkg => package_entry(forwarded),
             aterm_cli::Verb::Agh => agh::cli::main_entry(forwarded),
             aterm_cli::Verb::Fleet => aterm_agent::fleet_cli::main_entry(forwarded),
             #[cfg(unix)]
@@ -523,6 +737,7 @@ pub(crate) fn main() -> ExitCode {
                 eprintln!("aterm db: not available on this platform (Unix only)");
                 ExitCode::from(2)
             }
+            aterm_cli::Verb::Email => aterm_agent::harness::email_cli::main_entry(forwarded),
             aterm_cli::Verb::Harness => {
                 #[cfg(unix)]
                 if let Some(result) = shared_login::try_run(&forwarded) {
@@ -542,43 +757,8 @@ pub(crate) fn main() -> ExitCode {
             aterm_cli::Verb::Machines => aterm_machines::cli::main_entry(forwarded),
             #[cfg(not(target_os = "macos"))]
             aterm_cli::Verb::Machines => machines_unavailable(),
-            #[cfg(target_os = "macos")]
-            aterm_cli::Verb::Init => {
-                // The run's phase totals go to aterm.log, never to this terminal.
-                aterm_gui::install_session_log();
-                aterm_machines::init::main_entry(
-                    forwarded,
-                    &aterm_machines::init::Host {
-                        base: &doctor::init_base,
-                        full_disk_access: &aterm_cli::macos_doctor::full_disk_access,
-                        records: &aterm_cli::macos_doctor::InitRecords,
-                        grants: aterm_cli::macos_doctor::init_grants,
-                        walk: &aterm_cli::init_permissions_walk,
-                        converge: &converge::Live,
-                        alab: &aterm_cli::macos_doctor::alab_mac,
-                        present: aterm_gui::person_at_this_screen,
-                    },
-                )
-            }
-            // Elsewhere (Linux): the base layer, the vault and the repositories; each
-            // workstation row reads "macOS only".
-            #[cfg(all(unix, not(target_os = "macos")))]
-            aterm_cli::Verb::Init => {
-                aterm_gui::install_session_log();
-                aterm_machines::init::main_entry(
-                    forwarded,
-                    &aterm_machines::init::Host {
-                        base: &doctor::init_base,
-                        full_disk_access: &|| None,
-                        records: &aterm_machines::init::NoRecords,
-                        grants: aterm_machines::init::no_grants,
-                        walk: &|_| None,
-                        converge: &converge::Live,
-                        alab: &aterm_machines::init_secrets::alab_member_here,
-                        present: || false,
-                    },
-                )
-            }
+            #[cfg(unix)]
+            aterm_cli::Verb::Init => run_init(InitEntry::Typed(forwarded)),
             #[cfg(not(unix))]
             aterm_cli::Verb::Init => {
                 eprintln!("aterm init: not available on this platform (Unix only)");
@@ -595,6 +775,9 @@ pub(crate) fn main() -> ExitCode {
                     return aterm_db::credentials::cli::main_entry(
                         forwarded.into_iter().skip(1).collect(),
                     );
+                }
+                if first.as_deref() == Some("service-repair") {
+                    return service_repair::run(forwarded.into_iter().skip(1).collect());
                 }
                 let code = aterm_secrets::cli::main_entry(forwarded);
                 if code == ExitCode::SUCCESS
@@ -1415,23 +1598,32 @@ fn start_commons_runtime(
 ) {
     let config = config.to_owned();
     let lan = commons_lan::gate(&config, host);
-    match aterm_db::runtime::Runtime::start(paths, config, lan, |status| {
-        // In a window, the owner thread can report its first status before the window installs
-        // its logger, and it reports a status only when it changes, so a dropped one stays
-        // unsaid. A terminal session has settled its logging before this runtime starts.
-        let _ = aterm_log::wait_for_logger(EARLY_LOG_WAIT);
-        match status {
-            aterm_db::runtime::Status::Refused(why) => aterm_log::warn!(
-                "Commons automatic control repair refused local configuration or trust state: {why}"
-            ),
-            aterm_db::runtime::Status::LanHeld => {
+    let rounds = alab_register::reports(paths.clone(), config.clone());
+    match aterm_db::runtime::Runtime::start_with_reports(
+        paths,
+        config,
+        lan,
+        |status| {
+            // In a window, the owner thread can report its first status before the window installs
+            // its logger, and it reports a status only when it changes, so a dropped one stays
+            // unsaid. A terminal session has settled its logging before this runtime starts.
+            let _ = aterm_log::wait_for_logger(EARLY_LOG_WAIT);
+            // A refusal warns once per cause (`Status::news`); a standing one logs at debug.
+            if let Some(refusal) = status.news() {
+                aterm_log::warn!(
+                    "Commons automatic control repair refused local configuration or trust state: {refusal}"
+                );
+            } else if status == aterm_db::runtime::Status::LanHeld {
                 aterm_log::info!("Commons control repair: {status:?}");
+            } else {
+                aterm_log::debug!("Commons control repair: {status:?}");
             }
-            _ => aterm_log::debug!("Commons control repair: {status:?}"),
-        }
-    }) {
+        },
+        rounds,
+    ) {
         Ok(runtime) => {
             let _ = COMMONS_RUNTIME.set(runtime);
+            alab_journal::start_backfill();
         }
         Err(error) => warn_when_logging(format!("Commons runtime could not start: {error}")),
     }
@@ -1624,6 +1816,7 @@ fn wire_window(args: &[OsString]) -> Option<fn() -> bool> {
         settle: settle_initial_setup,
         cut_off: cut_off_initial_setup,
         sync_on: turn_sync_on,
+        ask_access: person_asked_for_access,
         tools_installed: command_line_tools_installed,
         fda_granted: verified_full_disk_access_granted,
         join_phrase: join_alab_with_phrase,
@@ -4788,10 +4981,7 @@ mod alab_watch_tests {
                 let resumed = self.setup.snapshot().unwrap();
                 assert_eq!(resumed.plan.selection, Selection::all());
                 assert!(!resumed.finished, "the widened stages are still owed");
-                assert!(
-                    resumed.permissions_allowed,
-                    "recovery confirms real admission"
-                );
+                assert!(resumed.run_allowed, "recovery confirms real admission");
                 assert_eq!(resumed.revision, *self.recovered.last().unwrap());
             }
         }
@@ -7408,6 +7598,20 @@ fn read_github_again_if_its_token_moved_with(
     })
 }
 
+/// System State's offer was pressed by a person ([`aterm_gui::InitialSetupHandlers::ask_access`]):
+/// the access steps may run from now on, and the Access rows and a parked run read that at once.
+#[cfg(target_os = "macos")]
+fn person_asked_for_access() -> bool {
+    use aterm_types::macos_setup::{Access, Subject};
+    if let Err(why) = aterm_cli::macos_doctor::note_person_asked_for_access() {
+        aterm_log::warn!("setup: a person's ask for macOS's grants was not saved: {why}");
+        return false;
+    }
+    request_observation(None, Access::ALL.map(Subject::Access).to_vec(), false);
+    wake_setup();
+    true
+}
+
 /// System State's Turn On Sync ([`aterm_gui::InitialSetupHandlers::sync_on`]): on its own worker
 /// (`launchctl` can take seconds), installs the subscriber the person turned off again, as
 /// `aterm secrets agent on` does, which removes the record of their choice; then the Secrets row
@@ -9756,7 +9960,8 @@ mod initial_setup_result_tests {
         );
         assert!(!status.cancelled);
         assert_eq!(status.plan, Some(reviewed));
-        assert!(status.permissions.unwrap().allowed);
+        // Set up now asks for no macOS grant: they are on offer, a press of their own away.
+        assert!(!status.permissions.unwrap().allowed);
     }
 
     #[test]
@@ -9765,6 +9970,7 @@ mod initial_setup_result_tests {
 
         let root = aterm_tempfile::tempdir().unwrap();
         let mut setup = ProvisionalSetupWatchTest::new(root.path()).unwrap();
+        setup.person_asks_for_access().unwrap();
         let before = setup.snapshot().unwrap();
         let approval = before.access_revision;
         let run = setup.upgrade(None).unwrap().unwrap();
@@ -14091,6 +14297,12 @@ fn routes_to_doctor(first: &str, rest: &[OsString]) -> bool {
     first == "doctor" && !rest.iter().any(|arg| arg == "-h" || arg == "--help")
 }
 
+/// What a Proton mailbox the harness opened for a sign-in code tells the lab registry.
+#[cfg(unix)]
+mod alab_mailbox;
+/// A Mac's self-registration in the lab registry, woken by the Commons runtime's repair rounds.
+#[cfg(unix)]
+mod alab_register;
 /// `aterm db alab` with the harness's reading of the account sheet.
 #[cfg(unix)]
 mod alab_sheet;
@@ -14102,6 +14314,14 @@ mod shared_login;
 /// The Commons table account claims ride.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod account_claims;
+
+/// The lab journal's sink for the harness's notes.
+#[cfg(unix)]
+mod alab_journal;
+
+/// LabView's cache: the harness's roster source from the lab registry.
+#[cfg(unix)]
+mod alab_view;
 
 /// `aterm init --converge`'s live ports.
 #[cfg(unix)]
@@ -14129,6 +14349,67 @@ mod startup_scope_tests;
 
 #[cfg(test)]
 mod tests {
+    /// The command exits with the package pass's own status whatever the follow-up's, and the
+    /// follow-up runs after the pass, only for a person's pass that succeeded and whose words
+    /// setup follows ([`atpkg::cli::pass_finishes_setup`] holds the grammar).
+    #[test]
+    fn a_package_pass_keeps_its_status_and_setup_follows_only_a_persons_finished_pass() {
+        use std::cell::RefCell;
+        use std::ffi::OsString;
+        use std::process::ExitCode;
+        for (words, person, package_code, follows) in [
+            (&["install", "trust"][..], true, ExitCode::SUCCESS, true),
+            (&["update"], true, ExitCode::SUCCESS, true),
+            (&["update"], true, ExitCode::FAILURE, false),
+            (&["update"], true, ExitCode::from(75), false),
+            (&["update"], false, ExitCode::SUCCESS, false),
+            (
+                &["update", "claude", "--wait-lock", "1800"],
+                true,
+                ExitCode::SUCCESS,
+                false,
+            ),
+            (&["install", "--help"], true, ExitCode::SUCCESS, false),
+            (&["install", "clt"], true, ExitCode::SUCCESS, false),
+            (
+                &["install", "claude", atpkg::cli::NO_INIT_FLAG],
+                true,
+                ExitCode::SUCCESS,
+                false,
+            ),
+        ] {
+            for setup_code in [
+                ExitCode::SUCCESS,
+                ExitCode::from(75),
+                ExitCode::from(77),
+                ExitCode::from(69),
+                ExitCode::FAILURE,
+            ] {
+                let events = RefCell::new(Vec::new());
+                let code = super::package_entry_with(
+                    words.iter().map(OsString::from).collect(),
+                    person,
+                    |args| {
+                        assert_eq!(args, words.iter().map(OsString::from).collect::<Vec<_>>());
+                        events.borrow_mut().push("packages");
+                        package_code
+                    },
+                    || {
+                        assert_eq!(*events.borrow(), ["packages"]);
+                        events.borrow_mut().push("setup");
+                        setup_code
+                    },
+                );
+                let want: &[&str] = if follows {
+                    &["packages", "setup"]
+                } else {
+                    &["packages"]
+                };
+                assert_eq!(events.borrow().as_slice(), want, "{words:?}");
+                assert_eq!(code, package_code, "{words:?} then {setup_code:?}");
+            }
+        }
+    }
 
     /// The offer of a resumed run's plan ([`super::run_resume_offer`]) on a scripted reach.
     mod resume_offer {

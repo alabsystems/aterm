@@ -1969,7 +1969,7 @@ fn receipt_report(ctx: &Reading, receipts: &[Receipt], spent: &Spent) -> (Value,
         ),
         row_u("the ask acked -> visible to B", &acked_to_b, ctx.unit),
         row_u(
-            "B's turnaround (the bench: wake, list)",
+            "B's turnaround (its wake, its `inbox` listing)",
             &turnaround,
             ctx.unit,
         ),

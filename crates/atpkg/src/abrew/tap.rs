@@ -204,9 +204,62 @@ const DEPRECATED_OFFICIAL_TAPS: &[&str] = &[
     "x11",
 ];
 
-fn redirect_refusal(name: &str) -> String {
+/// Every target of git's `warning: redirecting to <url>` lines, as
+/// brew's `GIT_REDIRECT_REMOTE_REGEX` captures them. ASCII case-folding
+/// preserves UTF-8 byte offsets when slicing `line` after a non-ASCII prefix.
+fn redirected_remotes(stderr: &str) -> impl DoubleEndedIterator<Item = &str> {
+    stderr.lines().filter_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        let at = lower.find("redirecting to ")? + "redirecting to ".len();
+        line.get(at..)?.split_whitespace().next()
+    })
+}
+
+/// The final redirected remote that differs from `current` (for example after an
+/// initial `repo` -> `repo.git/` hop followed by a cross-repo redirect), or any
+/// intermediate hop that left `current`.
+fn unsafe_redirect(current: &str, stderr: &str) -> Option<String> {
+    redirected_remotes(stderr)
+        .rfind(|remote| !same_remote(current, remote))
+        .map(str::to_string)
+}
+
+/// Brew's `Tap.normalize_remote`, reduced to the forms a tap
+/// remote actually takes: case-fold, canonicalize GitHub SSH
+/// forms to HTTPS, drop a trailing slash or `.git`.
+fn normalize_remote(remote: &str) -> String {
+    let mut out = remote.trim().to_lowercase();
+    for prefix in [
+        "git@github.com:",
+        "ssh://git@github.com/",
+        "git://github.com/",
+    ] {
+        if let Some(rest) = out.strip_prefix(prefix) {
+            out = format!("https://github.com/{rest}");
+            break;
+        }
+    }
+    let trimmed = out.trim_end_matches('/');
+    trimmed
+        .strip_suffix(".git")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn same_remote(a: &str, b: &str) -> bool {
+    let na = normalize_remote(a);
+    !na.is_empty() && na == normalize_remote(b)
+}
+
+/// Without brew's trust machinery no redirect can be proven
+/// safe, so every redirect takes brew's unsafe-redirect
+/// refusal verbatim (its remedy — untap, then tap the new
+/// location — is native).
+fn redirect_refusal(name: &str, remote: &str) -> String {
     format!(
-        "abrew: tap {name} was redirected by its remote; following a redirected tap is not native (run real brew)"
+        "Error: Refusing automatic redirect from {name} to {remote}.\n\
+         Untap {name}, then tap the new location directly to review its source and trust."
     )
 }
 
@@ -285,11 +338,10 @@ pub fn add(
             if !fetched.status.success() {
                 return Err(format!("abrew: git fetch failed for tap {shown}"));
             }
-            if String::from_utf8_lossy(&fetched.stderr)
-                .to_lowercase()
-                .contains("redirecting to ")
-            {
-                return Err(redirect_refusal(&shown));
+            let stderr = String::from_utf8_lossy(&fetched.stderr);
+            let current = git_out(&path, &["remote", "get-url", "origin"]).unwrap_or_default();
+            if let Some(remote) = unsafe_redirect(&current, &stderr) {
+                return Err(redirect_refusal(&shown, &remote));
             }
         }
         return Ok((tap, false));
@@ -372,6 +424,19 @@ fn pull(path: &std::path::Path, user: &str, repo: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The tap's origin remote URL, when it is a git checkout.
+/// brew's dump prints it when it differs from the GitHub default.
+pub(super) fn remote_url(tap: &Tap) -> Option<String> {
+    git_out(&tap.path, &["config", "--get", "remote.origin.url"])
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// brew's `Tap#default_remote` for `user/repo`.
+pub(super) fn default_remote(user: &str, repo: &str) -> String {
+    format!("https://github.com/{user}/homebrew-{repo}")
 }
 
 fn git_out(path: &std::path::Path, args: &[&str]) -> Result<String, String> {
@@ -464,9 +529,10 @@ fn fix_remote_configuration(tap: &Tap, requested_remote: Option<&str>) -> Result
     if !fetched.status.success() {
         return Err(format!("abrew: git fetch failed for tap {}", tap.name()));
     }
-    let stderr = String::from_utf8_lossy(&fetched.stderr).to_lowercase();
-    if stderr.contains("redirecting to ") {
-        return Err(redirect_refusal(&tap.name()));
+    let stderr = String::from_utf8_lossy(&fetched.stderr);
+    let current_remote = git_out(path, &["remote", "get-url", "origin"]).unwrap_or_default();
+    if let Some(remote) = unsafe_redirect(&current_remote, &stderr) {
+        return Err(redirect_refusal(&tap.name(), &remote));
     }
     git_out(path, &["remote", "set-head", "origin", "--auto"])?;
     let Some(new_branch) = origin_branch_name(path) else {
@@ -541,11 +607,44 @@ fn tap_installed_names(
     Ok(by_kind)
 }
 
+/// brew `TapUnavailableError` for an untapped name.
+fn unavailable_error(user: &str, repo: &str) -> String {
+    let name = format!("{user}/{repo}");
+    if user == "homebrew" && matches!(repo, "core" | "cask") {
+        format!("Error: No available tap {name}.\nRun brew tap --force {name} to tap {name}!")
+    } else {
+        format!(
+            "Error: No available tap {name}.\nRun brew tap-new {name} to create a new {name} tap!"
+        )
+    }
+}
+
+/// `brew untap`: brew resolves every name to an installed
+/// tap before removing any (`to_installed_taps`).
+pub fn remove_all(prefix: &Prefix, names: &[&str]) -> Result<(), String> {
+    let mut parsed = Vec::new();
+    for name in names {
+        let (user, repo) = parse_tap_name(name)
+            .ok_or_else(|| format!("abrew: tap name must be user/repo, got {name}"))?;
+        if tap_path(prefix, &user, &repo).is_ok_and(|p| std::fs::symlink_metadata(p).is_err()) {
+            return Err(unavailable_error(&user, &repo));
+        }
+        let full = format!("{user}/{repo}");
+        if !parsed.contains(&full) {
+            parsed.push(full);
+        }
+    }
+    for name in &parsed {
+        remove(prefix, name)?;
+    }
+    Ok(())
+}
+
 pub fn remove(prefix: &Prefix, name: &str) -> Result<(), String> {
     let (user, repo) = parse_tap_name(name)
         .ok_or_else(|| format!("abrew: tap name must be user/repo, got {name}"))?;
     if tap_path(prefix, &user, &repo).is_ok_and(|p| std::fs::symlink_metadata(p).is_err()) {
-        return Err(format!("abrew: tap {user}/{repo} is not tapped"));
+        return Err(unavailable_error(&user, &repo));
     }
     let official = user == "homebrew" && matches!(repo.as_str(), "core" | "cask");
     if !official {
@@ -618,8 +717,11 @@ pub fn list(prefix: &Prefix) -> Vec<Tap> {
 /// One brew Settings-style boolean kept in the prefix's own
 /// state (`var/homebrew/<name>`).
 pub(super) fn setting_bool(prefix: &Prefix, name: &str) -> bool {
-    std::fs::read_to_string(prefix.root.join("var/homebrew").join(name))
-        .is_ok_and(|v| v.trim() == "true")
+    crate::metadata_io::read_bounded_regular_utf8(
+        &prefix.root.join("var/homebrew").join(name),
+        1024,
+    )
+    .is_ok_and(|v| v.trim() == "true")
 }
 
 pub(super) fn set_setting_bool(prefix: &Prefix, name: &str, value: bool) -> Result<(), String> {
@@ -785,8 +887,11 @@ fn report_link_conflicts(conflicts: &[PathBuf], command: &str) {
 /// Whether the one-time completions hint has been shown
 /// (brew's `completionsmessageshown` setting, same store).
 fn completions_message_shown(prefix: &Prefix) -> bool {
-    std::fs::read_to_string(prefix.root.join("var/homebrew/completionsmessageshown"))
-        .is_ok_and(|v| v.trim() == "true")
+    crate::metadata_io::read_bounded_regular_utf8(
+        &prefix.root.join("var/homebrew/completionsmessageshown"),
+        1024,
+    )
+    .is_ok_and(|v| v.trim() == "true")
 }
 
 fn mark_completions_message_shown(prefix: &Prefix) {
@@ -1422,5 +1527,59 @@ mod tests {
         assert!(!p.root.join("share/man/man1/tool.1").exists());
         assert!(!p.root.join("share/zsh/site-functions/_tool").exists());
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn git_redirect_parsing_and_refusal_match_brew() {
+        let stderr = "warning: redirecting to https://github.com/New/tools.git/\nFrom https://github.com/old/tools\n";
+        assert_eq!(
+            redirected_remotes(stderr).collect::<Vec<_>>(),
+            vec!["https://github.com/New/tools.git/"]
+        );
+        // Non-ASCII prefix whose Unicode `.to_lowercase()` expands UTF-8 byte length (`İ` -> `i\u{307}`)
+        // must not shift or panic the byte slice into `line`.
+        assert_eq!(
+            unsafe_redirect(
+                "https://github.com/old/tools",
+                "İhtar: Redirecting to https://github.com/New/tools.git/\n",
+            )
+            .as_deref(),
+            Some("https://github.com/New/tools.git/")
+        );
+        // Multi-hop redirect where the first hop canonicalizes `.git/` (`same_remote`) and the
+        // second hop crosses to a new repository must still be refused with the new target.
+        let multi_hop = "warning: redirecting to https://github.com/old/tools.git/\n\
+                         warning: redirecting to https://github.com/New/tools.git/\n";
+        assert_eq!(
+            unsafe_redirect("https://github.com/old/tools", multi_hop).as_deref(),
+            Some("https://github.com/New/tools.git/")
+        );
+        assert_eq!(
+            unsafe_redirect(
+                "https://github.com/old/tools",
+                "warning: redirecting to https://github.com/old/tools.git/\n",
+            ),
+            None
+        );
+        assert_eq!(redirected_remotes("From https://x\n").next(), None);
+        assert!(same_remote(
+            "git@github.com:Old/Tools.git",
+            "https://github.com/old/tools/"
+        ));
+        assert!(same_remote(
+            "https://github.com/old/tools",
+            "https://github.com/old/tools.git"
+        ));
+        assert!(!same_remote(
+            "https://github.com/old/tools",
+            "https://github.com/new/tools"
+        ));
+        assert!(!same_remote("", "https://github.com/new/tools"));
+        assert!(!same_remote("   ", "   "));
+        assert_eq!(
+            redirect_refusal("old/tools", "https://github.com/new/tools"),
+            "Error: Refusing automatic redirect from old/tools to https://github.com/new/tools.\n\
+             Untap old/tools, then tap the new location directly to review its source and trust."
+        );
     }
 }

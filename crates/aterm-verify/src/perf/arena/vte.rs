@@ -46,7 +46,7 @@ pub(crate) fn trimmed_benchmarks(stock: &Path, copy: &Path) -> Result<usize, Str
     for bench in benchmark_dirs(copy)? {
         for name in ["benchmark", "setup"] {
             let script = bench.join(name);
-            let Ok(text) = std::fs::read_to_string(&script) else {
+            let Ok(text) = crate::read_regular_text(&script) else {
                 continue;
             };
             let (out, changed) =
@@ -348,7 +348,7 @@ fn judge_trial(
         ));
     }
     let text =
-        std::fs::read_to_string(&dat_path).map_err(|e| format!("{}: {e}", dat_path.display()))?;
+        crate::read_regular_text(&dat_path).map_err(|e| format!("{}: {e}", dat_path.display()))?;
     let dat = parse_dat(&text);
     if dat.len() != n_bench {
         return refuse(format!("{} of {n_bench} benchmarks ran", dat.len()));

@@ -115,6 +115,8 @@ pub struct ChromeTokens {
     pub accent: [u8; 3],
     /// Where [`Self::accent`] came from.
     pub accent_source: AccentSource,
+    /// The theme's own hue: its accent with the system's left out, or its foreground where that accent has no chroma to lend.
+    pub theme_tint: [u8; 3],
     /// The authored seam colour, if any ([`Self::seam_on`] floors it).
     pub border: Option<[u8; 3]>,
     /// The authored active-tab background, if any.
@@ -144,10 +146,8 @@ impl ChromeTokens {
             }
             BarBase::Blend => mix3(s.bg, s.fg, if light { 0.10 } else { 0.16 }),
         };
-        let (accent, accent_source) = if let Some(authored) = s.authored.accent {
+        let (own_accent, own_source) = if let Some(authored) = s.authored.accent {
             (authored, AccentSource::Authored)
-        } else if let Some(system) = s.system_accent {
-            (system, AccentSource::System)
         } else if !near_grey(s.cursor) {
             (s.cursor, AccentSource::Cursor)
         } else if let Some(a) = s.ansi {
@@ -160,6 +160,15 @@ impl ChromeTokens {
         } else {
             (s.cursor, AccentSource::Neutral)
         };
+        let (accent, accent_source) = match s.system_accent {
+            Some(system) if s.authored.accent.is_none() => (system, AccentSource::System),
+            _ => (own_accent, own_source),
+        };
+        let theme_tint = if chroma(own_accent) >= BORROW_CHROMA {
+            own_accent
+        } else {
+            s.fg
+        };
         let hue_of = |c: [u8; 3]| (chroma(c) >= BORROW_CHROMA).then(|| oklch(c).2);
         Self {
             light,
@@ -169,6 +178,7 @@ impl ChromeTokens {
             bar_bg,
             accent,
             accent_source,
+            theme_tint,
             border: s.authored.border,
             active_tab: s.authored.active_tab,
             danger_hue: s.ansi.and_then(|a| hue_of(a.red)),

@@ -668,7 +668,7 @@ fn tab_mode(opts: &Opts, tab: &str) -> Option<String> {
 }
 
 /// The `--permission-mode` value of the pill under Claude's composer on `rows` ([`super::lights::read_screen`]).
-pub(super) fn screen_mode(rows: &[String]) -> Option<String> {
+pub(crate) fn screen_mode(rows: &[String]) -> Option<String> {
     super::lights::read_screen(rows)
         .and_then(|shown| shown.mode)
         .map(|mode| mode_flag(mode).to_string())
@@ -1805,7 +1805,7 @@ fn await_held(
     wait_every(limit, poll_gap(limit).min(opts.timings.shell_look), || {
         hand.keep(c);
         if st.native.is_some() && super::native_restart::resume_observed(c, &tab, st) {
-            let _completed = super::native_restart::complete(c, &tab, st);
+            let _completed = super::native_restart::complete(opts, session, c, &tab, st);
             save(opts, session, st);
         }
         new = roster.files(&records, wait_now()).and_then(|files| {
@@ -1834,7 +1834,7 @@ fn await_held(
                 .is_some_and(|sf| sf.status == "idle")
         });
     }
-    if new.is_some() && !super::native_restart::complete(c, &st.tab.clone(), st) {
+    if new.is_some() && !super::native_restart::complete(opts, session, c, &st.tab.clone(), st) {
         save(opts, session, st);
         return said(r, "wait:native-outcome");
     }
@@ -2039,18 +2039,21 @@ pub(super) fn settled_with_nothing(
     r
 }
 
-/// The word of a relaunch under Land whose agent's last reply defends the work: nothing is typed,
-/// and the loop's land check at this point reads the defense ([`DEFENDED`]).
+/// The word of a relaunch under Land whose agent's last reply defends the work or says it could not
+/// finish: nothing is typed, and the tab's loop reads that reply at this point ([`DEFENDED`]).
 pub const LANDING: &str = "done:landing";
 
 /// Why [`LANDING`] types nothing.
-pub const DEFENDED: &str =
-    "its last reply defends its work as landed, and the tab's loop checks it";
+pub const DEFENDED: &str = "its last reply defends its work as landed or says it could not finish, and the tab's loop \
+     reads it";
 
-/// Whether the last reply on the screen `rows` draws for `program` is a clean defense of the work
-/// (`Nothing left:`), the reading a relaunch under Land with no transcript of Claude Code's has.
+/// Whether the last reply on the screen `rows` draws for `program` ends the question of more typing
+/// ([`crate::supervise::policy::turn_end::reply_for_the_loop`]), the reading a relaunch under Land
+/// with no transcript of Claude Code's has.
 pub(super) fn defended_on_screen(program: aterm_phase::Program, rows: &[String]) -> bool {
-    crate::supervise::policy::turn_end::clean_defense(program.reader().said_tail(rows).as_deref())
+    crate::supervise::policy::turn_end::reply_for_the_loop(
+        program.reader().said_tail(rows).as_deref(),
+    )
 }
 
 /// [`LANDING`] for a lane that reads the screen ([`defended_on_screen`]); the caller saves `st`.
@@ -3104,6 +3107,11 @@ pub(super) fn starts_afresh(cause: &str) -> bool {
 /// The [`St::cause`] of a restart the host made for Claude Code's critical-memory banner ([`restart_here`], [`Restart::Memory`]).
 pub(super) const CAUSE_MEMORY: &str = "memory";
 
+/// The [`St::cause`] of a restart the host made because the worker read the line the loop wrote to
+/// it and drew none of it a minute on ([`restart_here`], [`Restart::InputLost`]): the process that
+/// may hold it ends, and its relaunch resumes the conversation as a memory restart's does.
+pub(super) const CAUSE_INPUT_LOST: &str = "input-lost";
+
 /// The [`St::cause`] of a relaunch after the stall's remedy ended an agent that had stopped reading its input ([`after_exit`] with [`super::restart_stamp::Cause::Stall`]).
 pub(super) const CAUSE_STALL: &str = "stall";
 
@@ -3148,10 +3156,15 @@ pub(super) fn model_restart(
 ) -> ModelRestart {
     let origin = prior.and_then(fallback_origin);
     match why {
-        Restart::Memory => ModelRestart {
+        Restart::Memory | Restart::InputLost => ModelRestart {
             fallback_from: fallback_carried(origin, riding.as_deref(), hand.as_deref()),
             model: riding.or(hand),
-            cause: CAUSE_MEMORY.to_string(),
+            cause: if matches!(why, Restart::Memory) {
+                CAUSE_MEMORY
+            } else {
+                CAUSE_INPUT_LOST
+            }
+            .to_string(),
             launch_model: launched,
         },
         Restart::Model { to } => ModelRestart {
@@ -3229,6 +3242,7 @@ pub(super) fn fallback_carried(
 pub(super) fn relaunch_cause(cause: &str) -> bool {
     cause == CAUSE_EXIT
         || cause == CAUSE_MEMORY
+        || cause == CAUSE_INPUT_LOST
         || cause == CAUSE_STALL
         || cause == CAUSE_ASKED
         || cause == CAUSE_HOST
@@ -3242,6 +3256,7 @@ pub(super) fn ends_its_agent(cause: &str) -> bool {
     cause.is_empty()
         || cause == CAUSE_UPGRADE_FRESH
         || cause == CAUSE_MEMORY
+        || cause == CAUSE_INPUT_LOST
         || cause.starts_with(CAUSE_MODEL)
         || cause.starts_with(CAUSE_MODEL_BACK)
         || cause.starts_with(CAUSE_ACCOUNT)
@@ -3262,6 +3277,11 @@ pub fn resumed_prompt_as(agent: &str, version: &str, cause: &str) -> String {
             "Restarted: {agent}'s memory was critical (its own warning, or the Mac short of \
              memory with it the largest past aterm's ceiling), so this session was ended and \
              restarted"
+        )
+    } else if cause == CAUSE_INPUT_LOST {
+        format!(
+            "Restarted: {agent} read the line aterm wrote to it and drew none of it a minute on, \
+             so this session was ended and restarted"
         )
     } else if cause == CAUSE_HOST {
         "Relaunched: aterm ended while this session ran (a crash, a kill or a restart), and \
@@ -3830,7 +3850,10 @@ pub(super) fn restart_as(
         &snap.start,
         &session,
         &snap.argv,
-        matches!(why, Restart::Memory | Restart::Account { .. }),
+        matches!(
+            why,
+            Restart::Memory | Restart::InputLost | Restart::Account { .. }
+        ),
         snap.profile.as_ref(),
     );
     let model_list = riding.clone().unwrap_or_default();
@@ -5042,6 +5065,88 @@ pub fn after_exit(
     after_exit_as(opts, snap, left, upgrade, cause, None)
 }
 
+/// [`after_exit`] of an exit an Autopilot carries ([`Carried::Yes`]): relaunched on its
+/// conversation as a crash is, whatever the exit left of its agent's own record, and said to the
+/// owner when it cannot be made (a `refused:` step where [`after_exit`] says `ended:`).
+#[must_use]
+pub fn after_carried_exit(
+    opts: &Opts,
+    snap: &Snapshot,
+    left: &ExitRecord,
+    upgrade: bool,
+) -> Report {
+    after_exit_as(opts, snap, left, upgrade, ExitCause::Carried, None)
+}
+
+/// Whose an exit [`on_exit`] found nobody owns is, under the session's Autopilot ([`carried`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Carried {
+    /// Not the Autopilot's to carry: decided as any exit is ([`after_exit`]).
+    No,
+    /// Nobody's: it comes back whatever it left of its agent's own record
+    /// ([`after_carried_exit`]), once a healthy run ([`Relaunches::carry`]).
+    Yes,
+    /// Whose it is could not be read (no `status` at the exit, so neither a person's keys nor a
+    /// hand could be seen): decided as any exit is, so an end the crash rule would not bring
+    /// back is left, and the host records whose it could not read.
+    Unread,
+}
+
+/// THE EXIT AN AUTOPILOT CARRIES: whose an exit [`on_exit`] found nobody owns (`decision`
+/// [`OnExit::Relaunch`]: no person's key within the grace, no hold, lease or driver's turn, no
+/// restart stamp, and, as the host reads it first, no end asked through aterm's `signal` verb)
+/// is, under an `autopilot` that carries the session's work (Cruise, Land; Land's only until its
+/// work landed, `landed`: the task's face the session's loop last told, which the host keeps
+/// whatever the tab publishes once its agent is gone). An agent ends itself in order on a
+/// `SIGTERM` no one in aterm sent (Claude Code removes its record, and its shell reads 143), so a
+/// graceful end alone says nothing of who wanted it. Such an exit is
+///
+/// - not the Autopilot's ([`Carried::No`]) under Land once its work landed;
+/// - unread when the tab's `status` could not be read, so no person's keys or hand could be seen
+///   ([`Carried::Unread`]);
+/// - a driver's ([`Carried::No`]) when a control client other than aterm's own typed into the
+///   session within the person's grace `grace_s` (`driven_ms`, the age of that typing: a
+///   driver's `/exit` is the driver's, as a person's is the person's);
+/// - else nobody's: [`Carried::Yes`].
+#[must_use]
+pub fn carried(
+    decision: OnExit,
+    autopilot: crate::supervise::Autopilot,
+    status: Option<&str>,
+    driven_ms: Option<u64>,
+    landed: bool,
+    grace_s: u32,
+) -> Carried {
+    use crate::supervise::Autopilot;
+    let carries = match autopilot {
+        Autopilot::Cruise => true,
+        Autopilot::Land => !landed,
+        Autopilot::Off => false,
+    };
+    if decision != OnExit::Relaunch || !carries {
+        return Carried::No;
+    }
+    if !status.is_some_and(crate::is_ok_reply) {
+        return Carried::Unread;
+    }
+    if driven_ms.is_some_and(|ms| ms < u64::from(grace_s).saturating_mul(1000)) {
+        Carried::No
+    } else {
+        Carried::Yes
+    }
+}
+
+/// The step of an exit whose relaunch cannot be made for `why`: `ended:<why>`, left as its
+/// launch's own end and said to nobody, for every cause but [`ExitCause::Carried`], whose exit
+/// nobody owns: `refused:<why>`, which the host says to the owner ([`outcome`]'s `Cannot`).
+pub(super) fn cannot_step(cause: ExitCause, why: &str) -> String {
+    if cause == ExitCause::Carried {
+        format!("refused:{why}")
+    } else {
+        format!("ended:{why}")
+    }
+}
+
 /// Consume the explicit restart's stamp once the relaunch of the exit it named has filed its record (under the caller's sweep lock).
 pub(super) fn consume_stamp(opts: &Opts, snap: &Snapshot, cause: ExitCause) {
     if opts.dry_run || !matches!(cause, ExitCause::Stall | ExitCause::Asked) {
@@ -5056,6 +5161,9 @@ pub(super) fn consume_stamp(opts: &Opts, snap: &Snapshot, cause: ExitCause) {
 pub(super) enum ExitCause {
     /// Its own exit: relaunched only when it left Claude's record (a crash), never after a graceful one.
     Exit,
+    /// Its own exit, which nobody owns, under an Autopilot that carries the work
+    /// ([`Carried::Yes`]): relaunched as a crash is, whatever it left of its agent's record.
+    Carried,
     /// The stall's remedy ended it.
     Stall,
     /// The explicit restart ended it (`aterm ctl restart`, its stamp naming the process).
@@ -5118,7 +5226,7 @@ fn after_exit_as(
 ) -> Report {
     match &snap.run {
         AgentRun::Codex(_) => {
-            if cause != ExitCause::Exit
+            if !matches!(cause, ExitCause::Exit | ExitCause::Carried)
                 && let Some(resume) = self_claimed_line(snap)
             {
                 return super::upgrade_drive::self_claimed_relaunch(opts, snap, resume, cause);
@@ -5173,7 +5281,7 @@ fn after_exit_as(
         .or_else(|| snap.session.clone())
         .filter(|s| upgrade::is_session_id(s))
     else {
-        return said(r, "ended:no-conversation");
+        return said(r, cannot_step(cause, "no-conversation"));
     };
     r.session.clone_from(&session);
     let version = survivor
@@ -5321,7 +5429,7 @@ fn after_exit_as(
             (true, ExitCause::Stall) => CAUSE_STALL,
             (true, ExitCause::Asked) => CAUSE_ASKED,
             (true, ExitCause::HostEnded) => CAUSE_HOST,
-            (true, ExitCause::Exit) => CAUSE_EXIT,
+            (true, ExitCause::Exit | ExitCause::Carried) => CAUSE_EXIT,
         }
         .to_string(),
         salt: now_s(),
@@ -6054,7 +6162,10 @@ pub fn resume_held(opts: &Opts, only: Option<upgrade::Agent>) -> Report {
 /// What a relaunch settles on with nothing typed: its step's word and why ([`carried_done`]).
 type Ending = (&'static str, &'static str);
 
-const END_LANDED: Ending = (CARRIED_DONE, "nothing typed: under Land, its task landed");
+const END_LANDED: Ending = (
+    CARRIED_DONE,
+    "nothing typed: under Land, its task concluded",
+);
 
 const END_HELD: Ending = (
     CARRIED_HELD,
@@ -6672,6 +6783,10 @@ pub struct Relaunches {
     left: bool,
     badged: bool,
     restarted: bool,
+    /// The exit relaunched now is one an Autopilot carries ([`Self::carry`]).
+    carrying: bool,
+    /// When the relaunch of the last exit an Autopilot carried landed.
+    carried_landed: Option<Instant>,
 }
 
 impl Relaunches {
@@ -6690,6 +6805,7 @@ impl Relaunches {
     ) -> Result<Duration, Say> {
         self.forgive(now);
         self.crash = crash;
+        self.carrying = false;
         self.tries = 0;
         self.failing = false;
         self.failing_said = false;
@@ -6697,6 +6813,27 @@ impl Relaunches {
             None => Ok(self.pause()),
             Some(say) => Err(say),
         }
+    }
+
+    /// THE AUTOPILOT CARRIES AN EXIT ONCE A HEALTHY RUN: whether the exit [`Self::exited_as`] was
+    /// last told of, one [`carried`] found nobody's at `now` and the crash rule would not bring
+    /// back anyway (a crash is relaunched under any Autopilot, and asks nothing of this), comes
+    /// back. It does unless the relaunch of the last exit an Autopilot carried landed less than
+    /// [`HEALTHY`] before: an agent that ends again so soon, on nobody's word aterm can see, is
+    /// being ended on purpose (a person's `kill` from outside aterm, Activity Monitor's Quit) or
+    /// ends itself, and coming back again would fight either, so it is left and recorded instead.
+    /// The host asks again before every attempt at a carried exit's relaunch, so one that landed
+    /// and is gone again before its landing was read is not carried twice. One that comes back
+    /// starts that clock as its relaunch lands ([`Self::attempted`]), or as an agent is read back
+    /// attached in the tab while that relaunch is still due ([`Self::running`]: its line's agent
+    /// registered late, or one a person started meanwhile; either way an agent came back), and
+    /// nothing but the next such landing starts it over: an attach with no carried relaunch due
+    /// (a person's own start later on) starts no clock.
+    pub fn carry(&mut self, now: Instant) -> bool {
+        self.carrying = self
+            .carried_landed
+            .is_none_or(|at| now.saturating_duration_since(at) >= HEALTHY);
+        self.carrying
     }
 
     /// [`on_exit`] asked again during the pause (a person or holder may be back, or configuration changed).
@@ -6777,6 +6914,9 @@ impl Relaunches {
                 } else {
                     self.start_healthy_clock(now);
                 }
+                if std::mem::take(&mut self.carrying) {
+                    self.carried_landed = Some(now);
+                }
                 self.tries = 0;
                 self.misses = 0;
                 self.pending = false;
@@ -6831,9 +6971,15 @@ impl Relaunches {
         }
     }
 
-    /// An agent runs in the tab again at `now`, started by someone else.
+    /// An agent runs in the tab again at `now`, read back attached rather than landed by an
+    /// attempt (started by someone else, or by an attempt whose agent registered after its own
+    /// wait gave up). One read back while a carried exit's relaunch is due ([`Self::carry`]) counts
+    /// as that relaunch's landing: the clock the next carry reads starts.
     pub fn running(&mut self, now: Instant) -> Say {
         self.start_healthy_clock(now);
+        if std::mem::take(&mut self.carrying) && self.pending {
+            self.carried_landed = Some(now);
+        }
         self.pending = false;
         self.left = false;
         self.restarted = false;

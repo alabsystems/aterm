@@ -22,6 +22,13 @@ pub(crate) struct Replica {
     /// Why each write is refused at its commit though the read says it may write, as a full
     /// table refuses it.
     refused: Option<String>,
+    /// What the table says of this Mac's clock (F22).
+    clock: Option<ClockRead>,
+    /// The peers the table reads as skewed (F22), each one held for too, as the db's hold line
+    /// covers every peer it names.
+    skewed: Vec<SkewedPeer>,
+    /// The peers the table holds for beyond those it names skewed (F22).
+    held: Vec<SkewedPeer>,
 }
 
 impl Replica {
@@ -32,6 +39,9 @@ impl Replica {
             book: Mutex::new(Book::default()),
             writable: Ok(()),
             refused: None,
+            clock: None,
+            skewed: Vec::new(),
+            held: Vec::new(),
         }
     }
 
@@ -61,6 +71,9 @@ impl Table for Replica {
             me: self.me.clone(),
             book: self.book.lock().expect("replica").clone(),
             writable: self.writable.clone(),
+            clock: self.clock.clone(),
+            skewed: self.skewed.clone(),
+            held: self.skewed.iter().chain(&self.held).cloned().collect(),
         })
     }
 
@@ -1303,6 +1316,7 @@ fn a_presence_reading_lapses_only_on_current_evidence() {
             at,
             heard: heard.map(|h| ("bb02".to_owned(), h)).into_iter().collect(),
         }),
+        ..View::default()
     };
     let late = NOW + PRESENCE_TTL_S + MIN;
     assert!(
@@ -1329,6 +1343,7 @@ fn a_presence_reading_lapses_only_on_current_evidence() {
     let none = View {
         me: "aa01".into(),
         presence: None,
+        ..View::default()
     };
     assert!(none.live(&row, claim, late));
     assert!(!none.live(&row, claim, row.until), "the row lapsed");
@@ -1559,6 +1574,7 @@ fn a_mac_that_powers_off_frees_its_accounts_on_every_other_mac() {
     let view = View {
         me: "bb02".into(),
         presence: None,
+        ..View::default()
     };
     let senior = |mac: &Mac, account: &str, now: i64| {
         let book = mac.table.book.lock().expect("replica").clone();
@@ -1617,4 +1633,620 @@ fn keys_prefers_expected_identity_email_for_default_and_alias_rows() {
             ("alias-row".into(), expected),
         ]
     );
+}
+
+// F22: claims under a wrong clock (docs/DESIGN-fluid-swarm-2026-10-28.md).
+
+/// What the table says of a clock its peers read two days ahead of theirs, five of six.
+fn clock_off() -> ClockRead {
+    ClockRead {
+        standing: accounts::ClockStanding::Off { ahead: true },
+        by_s: 2 * 24 * HOUR,
+        against: 5,
+        of: 6,
+    }
+}
+
+/// What the table says of a clock its peers are split over, one each way.
+fn clock_split() -> ClockRead {
+    ClockRead {
+        standing: accounts::ClockStanding::Split,
+        by_s: 0,
+        against: 1,
+        of: 2,
+    }
+}
+
+/// A peer read as skewed: Commons machine `machine`, swarm label `label`, its holds lasting to
+/// `until`.
+fn skewed_peer(machine: &str, label: &str, until: i64) -> SkewedPeer {
+    SkewedPeer {
+        machine: machine.to_owned(),
+        labels: vec![label.to_owned()],
+        until,
+        ahead_s: 0,
+    }
+}
+
+/// The db's refusal of a row from a Mac its peers read off.
+const OFF_REFUSAL: &str = "this Mac's clock reads at least 2 d ahead of 5 of the 6 Macs it hears; \
+                           it writes no account claim until the clock agrees";
+
+impl Mac {
+    /// This Mac's peers read its clock as `clock` (none: they agree, or it heard none).
+    fn clock(&mut self, clock: Option<ClockRead>) {
+        let off = clock
+            .as_ref()
+            .is_some_and(|clock| matches!(clock.standing, accounts::ClockStanding::Off { .. }));
+        self.table.writable = if off {
+            Err(OFF_REFUSAL.to_owned())
+        } else {
+            Ok(())
+        };
+        self.table.clock = clock;
+    }
+
+    /// Whether this Mac's session on `account` keeps it at its next turn end: it stays, or reads
+    /// its usage first; a move or a wait leaves it.
+    fn keeps(&self, account: &str, now: i64) -> bool {
+        let me = Me {
+            account: Some(account),
+            left: None,
+            default_home: true,
+            stored_login: true,
+        };
+        matches!(
+            accounts::advise(
+                &roster(),
+                &self.state,
+                &enrolled(),
+                &me,
+                &Point::TurnEnd,
+                Mode::Early,
+                now,
+            ),
+            Advice::Stay(_) | Advice::Probe
+        )
+    }
+
+    /// [`Self::touch`] with `homes` (each account's key and its home Mac's label) for the holds
+    /// this Mac keeps for the peers its table reads as skewed.
+    fn touch_holding(&mut self, act: Act<'_>, homes: &[(LeaseKey, String)], now: i64) -> Touched {
+        let presence = Presence {
+            at: now,
+            heard: self.heard.clone(),
+        };
+        touch_homes(
+            &self.table,
+            Some(presence),
+            &mut self.state,
+            Cli::Claude,
+            &keys(Cli::Claude, &roster()),
+            homes,
+            act,
+            now,
+        )
+    }
+}
+
+/// A's peers read its clock as off, and its own view still shows B's senior lease on A's home
+/// row: A's home row is Ok all the same, any other row is `ClockOff`, its session on one moves or
+/// waits at its turn end, and its claims write nothing.
+///
+/// Negative controls: with an Off Mac reading its home row by its own view (the `Off` arm of
+/// `lease_verdict` for a home row left out), A's home row was refused (`left:
+/// Err(LeasedElsewhere { .. })`, `right: Ok(())`); with `ClockOff` exempted from the turn-end
+/// yield (`row_available_here` taking a `ClockOff` verdict as available), A's session kept its
+/// lease (`its lease moves or waits at its turn end`).
+#[test]
+fn an_off_mac_keeps_its_home_row_behind_a_stale_lease() {
+    let mut a = Mac::new("aa01", "m1");
+    let mut b = Mac::new("bb02", "m2");
+    a.state.home_accounts.insert("pool-a".into());
+    b.runs("pool-a", NOW);
+    assert_eq!(b.touch(Act::Claim("pool-a"), NOW), Touched::Claimed);
+    replicate(&b, &a);
+    a.hear(&b, NOW);
+    a.clock(Some(clock_off()));
+    a.runs("pool-b", NOW + 1);
+    a.touch(Act::Look, NOW + 1);
+    assert_eq!(
+        a.state
+            .leases
+            .get("pool-a")
+            .map(|lease| lease.holder.as_str()),
+        Some("m2"),
+        "A's view holds B's lease on its home row"
+    );
+    assert_eq!(
+        a.state.clock.as_ref().map(|clock| clock.standing),
+        Some(accounts::ClockStanding::Off { ahead: true })
+    );
+    assert_eq!(a.state.lease_verdict("pool-a", NOW + 2), Ok(()));
+    assert_eq!(
+        a.state.lease_verdict("pool-b", NOW + 2),
+        Err(WhyNot::ClockOff)
+    );
+    assert!(
+        !a.keeps("pool-b", NOW + 2),
+        "its lease moves or waits at its turn end"
+    );
+    assert_eq!(
+        a.touch(Act::Claim("pool-a"), NOW + 3),
+        Touched::Unrecorded(OFF_REFUSAL.to_owned())
+    );
+    assert!(a.table.row("aa01").is_none(), "an Off Mac writes no row");
+    // The record, renewed by each read, lapses with the reading behind it.
+    assert!(a.state.clock_at(NOW + 2 + CLOCK_HOLD_S).is_some());
+    assert_eq!(a.state.clock_at(NOW + 3 + CLOCK_HOLD_S), None);
+}
+
+/// A Mac its peers split over claims its home account and nothing else: a lease is refused and
+/// written nowhere, and the home claim lands.
+///
+/// Negative control: without the Split arm in `touch_using` (`clock_refusal` refusing nothing
+/// under Split), the lease was not refused (`a lease under Split`).
+#[test]
+fn a_tie_refuses_leases_and_keeps_home_claims() {
+    let mut a = Mac::new("aa01", "m1");
+    a.state.home_accounts.insert("pool-a".into());
+    a.clock(Some(clock_split()));
+    a.runs("pool-a", NOW);
+    a.runs("pool-b", NOW);
+    assert!(
+        matches!(a.touch(Act::Claim("pool-b"), NOW), Touched::Unrecorded(_)),
+        "a lease under Split"
+    );
+    assert!(a.table.row("aa01").is_none(), "a lease is written nowhere");
+    assert_eq!(a.touch(Act::Claim("pool-a"), NOW + 1), Touched::Claimed);
+    let row = a.table.row("aa01").expect("the home claim");
+    assert_eq!(
+        row.claims
+            .iter()
+            .map(|claim| (claim.key.clone(), claim.kind))
+            .collect::<Vec<_>>(),
+        vec![(key("pool-a"), Kind::Home)]
+    );
+    assert_eq!(
+        a.state.lease_verdict("pool-b", NOW + 2),
+        Err(WhyNot::ClockOff)
+    );
+    assert_eq!(a.state.lease_verdict("pool-a", NOW + 2), Ok(()));
+}
+
+/// B reads A, pool-a's home Mac, as skewed: B's lease on pool-a yields at its turn end, B's claim
+/// there is held elsewhere, and C never cold-claims it, until the reading is no longer fresh.
+///
+/// Negative control: with no hold (`holds` returning none), B's claim on pool-a stood (`B's
+/// claim on A's home row: Held`).
+#[test]
+fn a_skewed_peers_home_rows_are_held_for_it() {
+    let homes = [(key("pool-a"), "m1".to_owned())];
+    let mut b = Mac::new("bb02", "m2");
+    b.runs("pool-a", NOW);
+    assert_eq!(
+        b.touch_holding(Act::Claim("pool-a"), &homes, NOW),
+        Touched::Claimed
+    );
+    assert!(b.keeps("pool-a", NOW));
+    let until = NOW + 30 * MIN;
+    b.table.skewed = vec![skewed_peer("aa01", "m1", until)];
+    match b.touch_holding(Act::Claim("pool-a"), &homes, NOW + 1) {
+        Touched::HeldElsewhere(holder) => {
+            assert_eq!(
+                (holder.machine.as_str(), holder.label.as_str(), holder.kind),
+                ("aa01", "m1", Kind::Home)
+            );
+            assert_eq!(holder.until, until);
+        }
+        other => panic!("B's claim on A's home row: {other:?}"),
+    }
+    assert!(!b.keeps("pool-a", NOW + 1), "B's lease yields");
+    let mut c = Mac::new("cc03", "m3");
+    c.table.skewed = vec![skewed_peer("aa01", "m1", until)];
+    assert!(matches!(
+        c.touch_holding(Act::Claim("pool-a"), &homes, NOW + 2),
+        Touched::HeldElsewhere(_)
+    ));
+    assert_eq!(
+        c.touch_holding(Act::Claim("pool-a"), &homes, until),
+        Touched::Claimed,
+        "the hold ends with the reading"
+    );
+}
+
+/// B reads A, pool-a's home Mac, within the tolerance yet past the hold line, as a peer that
+/// counted A Off does while A sits between half the tolerance and the tolerance: B names nobody
+/// skewed, and still its claim on pool-a is held elsewhere and its lease there yields.
+///
+/// Negative control: with the holds taken from the peers the table names skewed (`holds(&read.
+/// skewed, ..)`), B's claim stood (`B's claim on A's home row: Held`).
+#[test]
+fn a_peer_held_but_not_named_keeps_its_home_rows() {
+    let homes = [(key("pool-a"), "m1".to_owned())];
+    let mut b = Mac::new("bb02", "m2");
+    b.runs("pool-a", NOW);
+    assert_eq!(
+        b.touch_holding(Act::Claim("pool-a"), &homes, NOW),
+        Touched::Claimed
+    );
+    b.table.held = vec![skewed_peer("aa01", "m1", NOW + 30 * MIN)];
+    match b.touch_holding(Act::Claim("pool-a"), &homes, NOW + 1) {
+        Touched::HeldElsewhere(holder) => assert_eq!(holder.machine, "aa01"),
+        other => panic!("B's claim on A's home row: {other:?}"),
+    }
+    assert!(!b.keeps("pool-a", NOW + 1), "B's lease yields");
+}
+
+/// A held peer's lease stays live past its row's `until` by as far as this Mac's clock runs ahead
+/// of the peer's, while the reading of it is fresh and its Mac is heard: a peer two days behind
+/// keeps it two days more, one 10 minutes behind keeps it 10 minutes more and no longer, and one
+/// whose clock runs ahead keeps none. It lapses once the reading is stale, or once its Mac goes
+/// unheard.
+///
+/// Negative controls: with `View::live` ignoring the held peers, B claimed pool-b past A's row's
+/// `until` (`a lease two days behind, past its row`); with every held peer's claims live until the
+/// reading lapses (the offset ignored), B could not claim pool-b once the 10 minutes passed
+/// (`left: HeldElsewhere(..)`, `right: Claimed`).
+#[test]
+fn a_held_peers_visible_claims_outlast_until_by_its_offset_while_heard() {
+    let mut a = Mac::new("aa01", "m1");
+    a.runs("pool-b", NOW);
+    assert_eq!(a.touch(Act::Claim("pool-b"), NOW), Touched::Claimed);
+    let until = a.table.row("aa01").expect("A's row").until;
+    let observer = |label: &str, reading_until: i64, ahead_s: i64, heard: i64, at: i64| {
+        let mut b = Mac::new(&format!("{label}{label}"), label);
+        replicate(&a, &b);
+        b.heard.insert("aa01".to_owned(), heard);
+        b.table.held = vec![SkewedPeer {
+            ahead_s,
+            ..skewed_peer("aa01", "m1", reading_until)
+        }];
+        b.runs("pool-b", at);
+        b
+    };
+    let past = until + MIN;
+    let mut days = observer("b2", past + 10 * MIN, 2 * 24 * HOUR, past, past);
+    assert!(
+        matches!(
+            days.touch(Act::Claim("pool-b"), past),
+            Touched::HeldElsewhere(_)
+        ),
+        "a lease two days behind, past its row"
+    );
+    let mut minutes = observer("b3", past + 30 * MIN, 10 * MIN, past, past);
+    assert!(matches!(
+        minutes.touch(Act::Claim("pool-b"), past),
+        Touched::HeldElsewhere(_)
+    ));
+    let later = until + 10 * MIN;
+    let mut minutes = observer("b4", later + 20 * MIN, 10 * MIN, later, later);
+    assert_eq!(minutes.touch(Act::Claim("pool-b"), later), Touched::Claimed);
+    let mut ahead = observer("b5", past + 10 * MIN, -2 * 24 * HOUR, past, past);
+    assert_eq!(ahead.touch(Act::Claim("pool-b"), past), Touched::Claimed);
+    let mut stale = observer("b6", past, 2 * 24 * HOUR, past, past);
+    assert_eq!(stale.touch(Act::Claim("pool-b"), past), Touched::Claimed);
+    let mut unheard = observer(
+        "b7",
+        past + 10 * MIN,
+        2 * 24 * HOUR,
+        past - PRESENCE_TTL_S - 1,
+        past,
+    );
+    assert_eq!(unheard.touch(Act::Claim("pool-b"), past), Touched::Claimed);
+}
+
+/// A hold keys the account as its claims do: an `ai-pool.toml` account whose roster row expects
+/// another identity than its login address (an alias login) is held under the roster's key,
+/// which every claim and `Book::senior` use, and under its login's key too, so a peer whose
+/// roster still names it by login is held off as well.
+///
+/// Negative control: with `home_keys` keying each account by its pool login alone, B claimed
+/// pool-a under the roster's key while A was held (`B's claim on pool-a under the roster's key:
+/// Claimed`).
+#[test]
+fn a_hold_keys_the_account_as_its_claims_do() {
+    let login = LeaseKey::new("claude", "alias-login@example.test").expect("a key");
+    let pool = [("pool-a".to_owned(), login.clone(), "m1".to_owned())];
+    let homes = home_keys(&pool, &keys(Cli::Claude, &roster()));
+    let mut b = Mac::new("bb02", "m2");
+    b.table.held = vec![skewed_peer("aa01", "m1", NOW + 30 * MIN)];
+    b.runs("pool-a", NOW);
+    match b.touch_holding(Act::Claim("pool-a"), &homes, NOW) {
+        Touched::HeldElsewhere(holder) => assert_eq!(holder.machine, "aa01"),
+        other => panic!("B's claim on pool-a under the roster's key: {other:?}"),
+    }
+    assert_eq!(
+        homes,
+        vec![(key("pool-a"), "m1".to_owned()), (login, "m1".to_owned())]
+    );
+    // An account the roster keys by its login is held once.
+    let same = [("pool-b".to_owned(), key("pool-b"), "m1".to_owned())];
+    assert_eq!(home_keys(&same, &keys(Cli::Claude, &roster())).len(), 1);
+}
+
+/// A liar that makes itself look skewed gets holds on its own home accounts and no other: an
+/// account whose home is another Mac stays free, an alias names it as its primary label does, and
+/// a label that only starts like its own never does.
+///
+/// Negative control: with `holds` holding every home account for the first skewed peer (whatever
+/// Mac the home names), pool-b was held too (`left: [("pool-a@example.test", "aa01"),
+/// ("pool-b@example.test", "aa01")]`). With no hold at all, pool-a was not held (`left: []`).
+#[test]
+fn a_liar_that_looks_skewed_holds_only_its_own_home_rows() {
+    let homes = [
+        (key("pool-a"), "m1".to_owned()),
+        (key("pool-b"), "m3".to_owned()),
+    ];
+    let liar = vec![skewed_peer("aa01", "m1", NOW + 30 * MIN)];
+    let held = |skewed: &[SkewedPeer], homes: &[(LeaseKey, String)]| {
+        holds(skewed, homes)
+            .into_iter()
+            .map(|(key, holder)| (key.email, holder.machine))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        held(&liar, &homes),
+        vec![("pool-a@example.test".to_owned(), "aa01".to_owned())]
+    );
+    let mut b = Mac::new("bb02", "m2");
+    b.table.skewed = liar.clone();
+    assert!(matches!(
+        b.touch_holding(Act::Claim("pool-a"), &homes, NOW),
+        Touched::HeldElsewhere(_)
+    ));
+    b.runs("pool-b", NOW);
+    assert_eq!(
+        b.touch_holding(Act::Claim("pool-b"), &homes, NOW),
+        Touched::Claimed
+    );
+    let aliased = vec![SkewedPeer {
+        labels: vec!["m1".to_owned(), "m7".to_owned()],
+        ..liar[0].clone()
+    }];
+    assert_eq!(held(&aliased, &[(key("pool-b"), "M7".to_owned())]).len(), 1);
+    assert!(held(&liar, &[(key("pool-b"), "m10".to_owned())]).is_empty());
+}
+
+/// The clock record survives the store (`state.json`'s `claims_clock`): each standing, its counts
+/// and its peers read back, and a record past its `until` is not kept.
+///
+/// Negative control: with `from_json` reading `ahead` as false whatever the file says, the record
+/// read back behind (`left: Some(Clock { standing: Off { ahead: false }, .. })`).
+#[test]
+fn the_clock_record_survives_the_store_and_lapses_there() {
+    for standing in [
+        accounts::ClockStanding::Off { ahead: true },
+        accounts::ClockStanding::Off { ahead: false },
+        accounts::ClockStanding::Split,
+    ] {
+        let state = accounts::State {
+            clock: Some(accounts::Clock {
+                standing,
+                by_s: HOUR,
+                against: 2,
+                of: 3,
+                peers: vec!["m3".to_owned()],
+                until: NOW + 10,
+            }),
+            ..accounts::State::default()
+        };
+        let text = state.to_json();
+        let read = |now| {
+            accounts::State::from_json(&text, now)
+                .expect("a state")
+                .clock
+        };
+        assert_eq!(read(NOW), state.clock, "{standing:?}");
+        assert_eq!(read(NOW + 10), None, "{standing:?}");
+    }
+}
+
+/// The code's step for each `AccountClaimClock` action: A's standing, its stale view, its
+/// session and B's hold are set as the model's state says; `Verdict` and `Launch` are
+/// `lease_verdict` on A's home row and on a row that is not, `TurnEnd` the turn-end advice of A's
+/// session on that row, `BRound` B's look with A read as skewed (the holds, then its turn-end
+/// advice), and `BCold` B's claim on A's home row. `Judge`, `StalePeer` and `Skew` (the
+/// environment) step as the model does.
+pub(crate) fn claim_clock_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut next = state.clone();
+    let homes = [(key("pool-a"), "m1".to_owned())];
+    let mut a = Mac::new("aa01", "m1");
+    a.state.home_accounts.insert("pool-a".into());
+    a.state.clock = match state["st"] {
+        2 | 3 => Some(accounts::Clock {
+            standing: if state["st"] == 3 {
+                accounts::ClockStanding::Off { ahead: true }
+            } else {
+                accounts::ClockStanding::Split
+            },
+            by_s: 0,
+            against: 1,
+            of: 2,
+            peers: Vec::new(),
+            until: NOW + CLOCK_HOLD_S,
+        }),
+        _ => None,
+    };
+    if state["plive"] == 1 {
+        a.state.note_lease("pool-a", "m2", NOW + HOUR, NOW);
+    }
+    if state["lease"] == 1 {
+        a.runs("pool-b", NOW);
+    }
+    // B, holding a claim on pool-a where `bcold` says so, and reading A as skewed where `skewed`.
+    let peer_b = |holds: bool, skewed: bool| {
+        let mut b = Mac::new("bb02", "m2");
+        if holds {
+            b.runs("pool-a", NOW);
+            assert_eq!(
+                b.touch_holding(Act::Claim("pool-a"), &homes, NOW),
+                Touched::Claimed
+            );
+        }
+        if skewed {
+            b.table.skewed = vec![skewed_peer("aa01", "m1", NOW + 30 * MIN)];
+        }
+        b
+    };
+    match action {
+        "Judge" => {
+            next.insert("st", (state["st"] + 1) % 4);
+            next.insert("turned", 0);
+            next.insert("homeok", 2);
+            // The round that moved A Off read it past the hold line on B's side too (aterm-db's
+            // `every_peer_that_counted_an_off_mac_holds_for_it`).
+            if state["st"] == 2 {
+                next.insert("askew", 1);
+            }
+        }
+        "StalePeer" => {
+            next.insert("plive", 1);
+            next.insert("homeok", 2);
+        }
+        "Skew" => {
+            next.insert("askew", 1 - state["askew"]);
+        }
+        "Launch" => {
+            let launches = a.state.lease_verdict("pool-b", NOW + 1).is_ok();
+            next.insert("lease", i64::from(launches));
+        }
+        "Verdict" => {
+            let ok = a.state.lease_verdict("pool-a", NOW + 1).is_ok();
+            next.insert("homeok", i64::from(ok));
+        }
+        "TurnEnd" => {
+            if state["st"] >= 2 {
+                next.insert("turned", 1);
+            }
+            if state["lease"] == 1 && !a.keeps("pool-b", NOW + 1) {
+                next.insert("lease", 0);
+            }
+        }
+        "BRound" => {
+            let skewed = state["askew"] == 1;
+            let mut b = peer_b(state["bcold"] == 1, skewed);
+            b.touch_holding(Act::Look, &homes, NOW + 1);
+            next.insert("bseen", state["askew"]);
+            if state["bcold"] == 1 && !b.keeps("pool-a", NOW + 1) {
+                next.insert("bcold", 0);
+            }
+        }
+        "BCold" => {
+            // A claim reads the table: B's latest reading of A, held or not.
+            let mut b = peer_b(false, state["askew"] == 1);
+            b.runs("pool-a", NOW + 1);
+            let claimed =
+                b.touch_holding(Act::Claim("pool-a"), &homes, NOW + 1) == Touched::Claimed;
+            next.insert("bcold", i64::from(claimed));
+            next.insert("bseen", state["askew"]);
+            if claimed && state["st"] == 3 {
+                next.insert("bnew", 1);
+            }
+        }
+        other => panic!("no AccountClaimClock step {other}"),
+    }
+    next
+}
+
+/// Every enabled `AccountClaimClock` step of the code is a model successor; A launches onto a row
+/// that is not its home exactly where the model enables `Launch`, and B cold-claims A's home row
+/// exactly where it enables `BCold`.
+///
+/// Negative controls: the model's own, an Off Mac whose home verdict is refused breaks
+/// `OffKeepsItsHome` and is no `Verdict` successor, and a Split Mac going Off with B not holding
+/// it is no `Judge` successor, B's cold claim then breaking `NoColdOnAnOffHome`. In the code:
+/// - with the `Off` arm of `lease_verdict` for a home row left out, `Verdict` from an Off state
+///   with a stale peer lease gave homeok 0, no model successor (`Verdict from {"askew": 1,
+///   "bcold": 0, "bnew": 0, "bseen": 0, "homeok": 2, "lease": 0, "plive": 1, "st": 3, "turned":
+///   0} gave {.., "homeok": 0, ..}`);
+/// - with `ClockOff` exempted from the turn-end yield (`row_available_here` taking a `ClockOff`
+///   verdict as available), a Split Mac kept its lease (`TurnEnd from {"askew": 0, "bcold": 0,
+///   "bnew": 0, "bseen": 0, "homeok": 2, "lease": 1, "plive": 0, "st": 2, "turned": 0} gave {..,
+///   "lease": 1, .., "turned": 1}`);
+/// - with no hold (`holds` finding no peer), B cold-claimed A's home row while it held A (`BCold
+///   from {"askew": 1, "bcold": 0, "bnew": 0, "bseen": 0, "homeok": 2, "lease": 0, "plive": 0,
+///   "st": 0, "turned": 0}`, `left: true`, `right: false`).
+#[test]
+fn account_claim_clock_conforms() {
+    let model = aterm_models_harness::account_claim_clock_model();
+    assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        if state["lease"] == 0 {
+            let launched = claim_clock_transition(&state, "Launch")["lease"] == 1;
+            assert_eq!(
+                launched,
+                model.action_enabled("Launch", &state),
+                "Launch from {state:?}"
+            );
+        }
+        if state["bcold"] == 0 {
+            let cold = claim_clock_transition(&state, "BCold")["bcold"] == 1;
+            assert_eq!(
+                cold,
+                model.action_enabled("BCold", &state),
+                "BCold from {state:?}"
+            );
+        }
+        for action in &model.actions {
+            if !model.action_enabled(action.name, &state) {
+                continue;
+            }
+            let next = claim_clock_transition(&state, action.name);
+            assert!(
+                model.successors(action.name, &state).contains(&next),
+                "{} from {state:?} gave {next:?}",
+                action.name
+            );
+        }
+    }
+    let off = aterm_spec::interp::State::from([
+        ("st", 3),
+        ("plive", 1),
+        ("lease", 0),
+        ("turned", 0),
+        ("homeok", 2),
+        ("askew", 1),
+        ("bseen", 0),
+        ("bcold", 0),
+        ("bnew", 0),
+    ]);
+    let mut refused = off.clone();
+    refused.insert("homeok", 0);
+    assert!(!model.successors("Verdict", &off).contains(&refused));
+    assert!(!model.check_invariant("OffKeepsItsHome", &refused));
+    // A Split Mac going Off: B, whose reading counted it, holds it at once (the band case, where B
+    // judging against its own tolerance reads A as agreeing, is what this rules out), so no cold
+    // claim of B's on A's home row follows while A is Off.
+    let split = aterm_spec::interp::State::from([
+        ("st", 2),
+        ("plive", 0),
+        ("lease", 0),
+        ("turned", 0),
+        ("homeok", 1),
+        ("askew", 0),
+        ("bseen", 0),
+        ("bcold", 0),
+        ("bnew", 0),
+    ]);
+    let mut unheld = split.clone();
+    unheld.insert("st", 3);
+    unheld.insert("homeok", 2);
+    assert!(!model.successors("Judge", &split).contains(&unheld));
+    let mut cold = unheld.clone();
+    cold.insert("bcold", 1);
+    cold.insert("bnew", 1);
+    assert!(!model.check_invariant("NoColdOnAnOffHome", &cold));
+    assert_eq!(claim_clock_transition(&split, "Judge")["askew"], 1);
+    assert_eq!(
+        claim_clock_transition(&unheld, "BCold")["bcold"],
+        1,
+        "an unheld B claims A's home row"
+    );
+    let mut held = unheld;
+    held.insert("askew", 1);
+    assert_eq!(claim_clock_transition(&held, "BCold")["bcold"], 0);
 }

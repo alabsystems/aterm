@@ -41,17 +41,20 @@ impl Trouble {
     }
 }
 
-/// The file's text for `trouble`: `why` made one printable line of at most [`WHY_CAP`]
-/// characters.
-#[must_use]
-pub fn encode(trouble: &Trouble) -> String {
-    let why: String = trouble
-        .why
+fn clean_why(raw: &str) -> String {
+    let why: String = raw
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .take(WHY_CAP)
         .collect();
-    format!("since={}\nwhy={}\n", trouble.since, why.trim())
+    why.trim().to_string()
+}
+
+/// The file's text for `trouble`: `why` made one printable line of at most [`WHY_CAP`]
+/// characters.
+#[must_use]
+pub fn encode(trouble: &Trouble) -> String {
+    format!("since={}\nwhy={}\n", trouble.since, clean_why(&trouble.why))
 }
 
 /// The trouble `text` keeps, `None` unless it names both keys.
@@ -60,8 +63,12 @@ pub fn decode(text: &str) -> Option<Trouble> {
     let (mut since, mut why) = (None, None);
     for line in text.lines() {
         match line.split_once('=') {
-            Some(("since", value)) => since = value.parse().ok(),
-            Some(("why", value)) => why = Some(value.to_string()),
+            Some(("since", value)) => {
+                since = (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| value.parse().ok())
+                    .flatten();
+            }
+            Some(("why", value)) => why = Some(clean_why(value)),
             _ => {}
         }
     }
@@ -79,12 +86,25 @@ pub fn read(paths: &Paths) -> Option<Trouble> {
 
 fn read_at(path: &Path) -> Option<Trouble> {
     use std::io::Read as _;
-    let file = std::fs::File::open(path).ok()?;
+    if !crate::paths::parent_is_real_dir(path) {
+        return None;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
     if !file.metadata().ok()?.is_file() {
         return None;
     }
     let mut text = String::new();
-    file.take(READ_CAP).read_to_string(&mut text).ok()?;
+    file.take(READ_CAP + 1).read_to_string(&mut text).ok()?;
+    if text.len() as u64 > READ_CAP {
+        return None;
+    }
     decode(&text)
 }
 
@@ -100,10 +120,19 @@ pub fn note_at(paths: &Paths, why: &str, now: u64) -> io::Result<()> {
         since,
         why: why.to_string(),
     });
-    std::fs::create_dir_all(&paths.state_dir)?;
+    crate::paths::ensure_real_dir(&paths.state_dir)?;
     #[cfg(unix)]
     {
-        aterm_uds::atomic_file::write(&path, text.as_bytes(), 0o600)
+        aterm_uds::atomic_file::write_checked(&path, text.as_bytes(), 0o600, || {
+            if crate::paths::existing_real_dir(&paths.state_dir)? {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{} does not exist", paths.state_dir.display()),
+                ))
+            }
+        })
     }
     #[cfg(not(unix))]
     {
@@ -124,6 +153,17 @@ pub fn note(paths: &Paths, why: &str) {
 
 /// Remove the record: the mug holds its activity, or the person turned keep-awake off.
 pub fn clear(paths: &Paths) {
+    match crate::paths::existing_real_dir(&paths.state_dir) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            aterm_log::warn!(
+                "acaffiene: could not remove {}: {e}",
+                paths.trouble_file().display()
+            );
+            return;
+        }
+    }
     match std::fs::remove_file(paths.trouble_file()) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => aterm_log::warn!(
             "acaffiene: could not remove {}: {e}",
@@ -187,8 +227,63 @@ mod tests {
                 why: "launchctl said: no [2J".to_string()
             })
         );
-        for bad in ["", "since=7\n", "why=x\n", "since=x\nwhy=y\n"] {
+        for bad in [
+            "",
+            "since=7\n",
+            "why=x\n",
+            "since=x\nwhy=y\n",
+            "since=+7\nwhy=y\n",
+        ] {
             assert_eq!(decode(bad), None, "{bad:?}");
         }
+        let dirty = format!(
+            "since=7\nwhy=\u{1b}[2J\u{9b}31m{}\n",
+            "x".repeat(WHY_CAP + 32)
+        );
+        let cleaned = decode(&dirty).expect("scrubbed");
+        assert!(!cleaned.why.chars().any(char::is_control));
+        assert!(cleaned.why.chars().count() <= WHY_CAP);
+    }
+
+    /// TROUBLE READ REFUSES SYMLINKS, FIFOS, AND OVERSIZE FILES: `read` opens with
+    /// `O_NOFOLLOW | O_NONBLOCK`, rejects files past `READ_CAP`, and never blocks on a FIFO.
+    /// NEGATIVE CONTROL: a regular trouble file under `READ_CAP` decodes cleanly.
+    #[cfg(unix)]
+    #[test]
+    fn trouble_read_refuses_symlinks_fifos_and_oversize_files() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = scratch(dir.path());
+        std::fs::create_dir_all(&paths.state_dir).expect("state dir");
+
+        note_at(&paths, "steady", 42).expect("regular trouble");
+        assert_eq!(
+            read(&paths),
+            Some(Trouble {
+                since: 42,
+                why: "steady".into(),
+            })
+        );
+
+        let real = dir.path().join("real.trouble");
+        std::fs::write(&real, "since=99\nwhy=aliased\n").expect("real");
+        let trouble_path = paths.trouble_file();
+        std::fs::remove_file(&trouble_path).expect("remove regular");
+        std::os::unix::fs::symlink(&real, &trouble_path).expect("symlink");
+        assert_eq!(read(&paths), None, "symlinked trouble file must be refused");
+
+        std::fs::remove_file(&trouble_path).expect("remove symlink");
+        let c_fifo = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(
+            trouble_path.as_os_str(),
+        ))
+        .expect("cstring");
+        // SAFETY: `c_fifo` is a NUL-terminated path inside our exclusive scratch directory.
+        let rc = unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo");
+        assert_eq!(read(&paths), None, "FIFO trouble path must not block");
+
+        std::fs::remove_file(&trouble_path).expect("remove fifo");
+        let huge = format!("since=42\nwhy=ok\n# {}\n", "pad".repeat(READ_CAP as usize));
+        std::fs::write(&trouble_path, huge).expect("oversize");
+        assert_eq!(read(&paths), None, "oversize trouble file must be refused");
     }
 }

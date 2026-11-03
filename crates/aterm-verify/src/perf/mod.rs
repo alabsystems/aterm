@@ -18,11 +18,11 @@
 //! not time. The ARENA lanes ([`arena`]) open real
 //! windows and take minutes; they run only when named, and what they measure
 //! has no floor, so they report MEASURED, never a pass. The MEASURED lanes
-//! ([`fabric`], [`restore_e2e`], [`aos`], [`commons`]) are headless but just as unjudgeable —
+//! ([`fabric`], [`restore_e2e`], [`aos`], [`commons`], [`journal`]) are headless but just as unjudgeable —
 //! their numbers are a disk's fsync, or a shared desk's scheduler, before they
 //! are aterm's — so they too run only when named and report MEASURED (fabric
 //! writing a ledger entry under `docs/measured/fabric/`, restore-e2e one under
-//! `docs/measured/restore/`, aos and commons-quiet a summary, and JSON with `--json-out`).
+//! `docs/measured/restore/`, aos, commons-quiet and journal-note a summary, and JSON with `--json-out`).
 //!
 //! `--no-windows` (the house switch for an agent sharing the owner's desktop)
 //! turns every lane that opens a window into a named skip and runs the rest.
@@ -49,6 +49,8 @@ mod driver;
 #[cfg(unix)]
 mod fabric;
 mod floors;
+#[cfg(unix)]
+mod journal;
 #[cfg(unix)]
 mod restore_e2e;
 #[cfg(unix)]
@@ -126,6 +128,7 @@ pub(crate) enum Lane {
     RestoreE2e,
     Aos,
     CommonsQuiet,
+    JournalNote,
 }
 
 /// Which kind of lane, and so whether a bare run includes it.
@@ -141,7 +144,7 @@ pub(crate) enum Kind {
 }
 
 impl Lane {
-    pub(crate) const ALL: [Lane; 23] = [
+    pub(crate) const ALL: [Lane; 24] = [
         Lane::Throughput,
         Lane::Pathological,
         Lane::ScrollScrub,
@@ -165,6 +168,7 @@ impl Lane {
         Lane::RestoreE2e,
         Lane::Aos,
         Lane::CommonsQuiet,
+        Lane::JournalNote,
     ];
 
     pub(crate) const fn name(self) -> &'static str {
@@ -192,6 +196,7 @@ impl Lane {
             Lane::RestoreE2e => "restore-e2e",
             Lane::Aos => "aos",
             Lane::CommonsQuiet => "commons-quiet",
+            Lane::JournalNote => "journal-note",
         }
     }
 
@@ -212,7 +217,11 @@ impl Lane {
             | Lane::Wasm
             | Lane::VteEngine => Kind::Floor,
             Lane::Start | Lane::Compare | Lane::Cat | Lane::Scroll | Lane::Vte => Kind::Arena,
-            Lane::Fabric | Lane::RestoreE2e | Lane::Aos | Lane::CommonsQuiet => Kind::Measured,
+            Lane::Fabric
+            | Lane::RestoreE2e
+            | Lane::Aos
+            | Lane::CommonsQuiet
+            | Lane::JournalNote => Kind::Measured,
         }
     }
 
@@ -294,6 +303,9 @@ impl Lane {
             Lane::CommonsQuiet => {
                 "process CPU per converged loopback Commons repair round, both peers together"
             }
+            Lane::JournalNote => {
+                "one journal note's latency, the spool's single append: p50, p95 and p99"
+            }
         }
     }
 
@@ -351,6 +363,9 @@ impl Lane {
                  for the stranded repair); macOS for its instruction, fault and syscall counters"
             }
             Lane::CommonsQuiet => "unix, targo (opt-test build of aterm-db's isolated repair test)",
+            Lane::JournalNote => {
+                "unix, targo (opt-test build of aterm-db's ignored journal_note measurement)"
+            }
         }
     }
 
@@ -446,6 +461,7 @@ impl LaneRun {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn failed(&self) -> bool {
         matches!(self.status, Status::Fail(_))
     }
@@ -486,6 +502,7 @@ const JSON_LANES: &[Lane] = &[
     Lane::RestoreE2e,
     Lane::Aos,
     Lane::CommonsQuiet,
+    Lane::JournalNote,
 ];
 const BUILT_LANES: &[Lane] = &[Lane::Fabric, Lane::RestoreE2e];
 const GHOSTTY_LANES: &[Lane] = &[Lane::Cat, Lane::Vte];
@@ -719,6 +736,14 @@ const OPTIONS: &[OptSpec] = &[
                most 1024, the table's cap)",
     },
     OptSpec {
+        flag: "--paced-notes",
+        value: Some("N"),
+        lanes: &[Lane::Fabric],
+        help: "one-way notes the messaging scenario posts after its burst, 1.1 s apart and none \
+               answered, so each delivery owes the bus mirror its snapshot (default 0: none; at \
+               most 545)",
+    },
+    OptSpec {
         flag: "--mix-every",
         value: Some("N"),
         lanes: &[Lane::Fabric],
@@ -757,6 +782,18 @@ const OPTIONS: &[OptSpec] = &[
         value: Some("N"),
         lanes: &[Lane::RestoreE2e],
         help: "crashes and recoveries per session count (default 3)",
+    },
+    OptSpec {
+        flag: "--catalog",
+        value: None,
+        lanes: &[Lane::CommonsQuiet],
+        help: "measure catalog-discovered application tables instead of one explicit table",
+    },
+    OptSpec {
+        flag: "--sustained",
+        value: None,
+        lanes: &[Lane::CommonsQuiet],
+        help: "measure 256 quiet repair rounds instead of 8, for sustained CPU profiling",
     },
     OptSpec {
         flag: "--lines",
@@ -938,7 +975,7 @@ fn list() -> String {
             Kind::Measured => {
                 "MEASURED lanes (only when named; headless, real processes, minutes; measured, \
                  not judged: fabric writes a docs/measured/fabric entry, restore-e2e a \
-                 docs/measured/restore entry, aos and commons-quiet print a summary, and JSON with --json-out)\n"
+                 docs/measured/restore entry, aos, commons-quiet and journal-note print a summary, and JSON with --json-out)\n"
             }
         });
         for lane in Lane::ALL.into_iter().filter(|l| l.kind() == kind) {
@@ -1127,10 +1164,21 @@ fn main(args: &[String]) -> ExitCode {
                 "run it on macOS or Linux",
             ),
             #[cfg(unix)]
-            Lane::CommonsQuiet => commons::run(cli.options.get("--json-out").map(Path::new)),
+            Lane::CommonsQuiet => commons::run(
+                cli.options.get("--json-out").map(Path::new),
+                cli.options.contains_key("--sustained"),
+                cli.options.contains_key("--catalog"),
+            ),
             #[cfg(not(unix))]
             Lane::CommonsQuiet => LaneRun::skip(
                 "the Commons measurement uses unix process and loopback helpers",
+                "run it on macOS or Linux",
+            ),
+            #[cfg(unix)]
+            Lane::JournalNote => journal::run(cli.options.get("--json-out").map(Path::new)),
+            #[cfg(not(unix))]
+            Lane::JournalNote => LaneRun::skip(
+                "the journal measurement runs through the unix build helpers",
                 "run it on macOS or Linux",
             ),
         };
@@ -1152,7 +1200,9 @@ fn main(args: &[String]) -> ExitCode {
             .filter(|(l, _, _)| l.kind() == Kind::Floor)
             .map(|(_, r, _)| r)
             .collect();
-        let lanes_ok = floors.iter().all(|r| !r.failed());
+        let lanes_ok = floors
+            .iter()
+            .all(|r| matches!(r.status, Status::Pass | Status::Recorded(_)));
         let recorded: Vec<&str> = floors
             .iter()
             .filter(|r| matches!(r.status, Status::Recorded(_)))
@@ -1178,11 +1228,9 @@ fn main(args: &[String]) -> ExitCode {
     }
 }
 
-/// The quiet machine for one lane (`docs/DESIGN-adaptive-build-2026-10-24.md`, QUIET-ADMIT and
-/// QUIET-BOUND): admitted alone among quiet claims once the load is low, or at its bound whatever
-/// the load (saying once a minute what it waits for, and how it started), or at once under
-/// `--admit now`; its own build runs under it too. A ledger that cannot be used is said, and the
-/// lane runs unadmitted.
+/// Resource admission for one timing lane, alone among quiet claims once load and sampled CPU
+/// are ready. Its build runs under this reservation; collectors sample again after compilation.
+/// Immediate, forced, unknown and unavailable admission starts no acceptance callback.
 ///
 /// # Errors
 /// An interrupt ended the wait (WAIT-INTERRUPT): why, and the run ends COULD NOT RUN.
@@ -1190,6 +1238,12 @@ fn quiet(lane: Lane, mode: aterm_capacity::Admit) -> Result<Option<aterm_capacit
     let need = aterm_capacity::Need::timing(format!("verify perf {}", lane.name()));
     match aterm_capacity::admit(need, mode) {
         Ok(claim) => {
+            claim.timing_admission().map_err(|why| {
+                format!(
+                    "{}: unqualified admission: {why}; no acceptance callback",
+                    lane.name()
+                )
+            })?;
             let to = aterm_capacity::Live.read(None);
             eprintln!(
                 "  quiet machine: admitted{} at {}{}",
@@ -1210,11 +1264,40 @@ fn quiet(lane: Lane, mode: aterm_capacity::Admit) -> Result<Option<aterm_capacit
             "{}: its quiet claim was {e}; it started nothing",
             lane.name()
         )),
-        Err(e) => {
-            eprintln!("  {e}; the lane runs unadmitted");
-            Ok(None)
-        }
+        Err(e) => Err(format!(
+            "{}: timing admission unavailable: {e}; no acceptance callback",
+            lane.name()
+        )),
     }
+}
+
+/// A new postcompile observation, never an outer lane's retained/precompile sample.
+/// The returned guard stays alive through execution of the already built measurement artifact.
+pub(crate) fn measurement_entry() -> Result<aterm_capacity::Claim, String> {
+    let mut claim = aterm_capacity::admit(
+        aterm_capacity::Need::timing("perf postcompile measurement entry"),
+        aterm_capacity::Admit::Wait,
+    )
+    .map_err(|why| format!("measurement entry admission: {why}"))?;
+    let window = claim
+        .measurement_entry()
+        .map_err(|why| format!("measurement entry not qualified: {why}"))?;
+    let evidence = claim.record().timing;
+    let expires = evidence
+        .admitted_ms
+        .zip(claim.record().need.patience)
+        .and_then(|(at, p)| at.checked_add(u64::try_from(p.hold.as_millis()).ok()?));
+    eprintln!(
+        "  timing phase=postcompile_measurement_entry provider=sysprobe_core_ticks scope=sampled_global_cpu_window;not_continuous_quiet observed_ms={} interval_ns={} cores={} busy_ticks={} total_ticks={} entry_load1={:?} actual_admitted_ms={:?} expires_ms={expires:?}",
+        window.observed_ms,
+        window.interval_ns,
+        window.cores,
+        window.busy_ticks,
+        window.total_ticks,
+        evidence.entry_load1,
+        evidence.admitted_ms
+    );
+    Ok(claim)
 }
 
 /// Format the per-lane summary and overall exit code.
@@ -1395,6 +1478,13 @@ mod tests {
         assert!(!parse(&[]).unwrap().lanes.contains(&Lane::CommonsQuiet));
         assert!(parse(&args("commons-quiet aos --json-out /tmp/out.json")).is_err());
         assert!(parse(&args("commons-quiet --burst 9")).is_err());
+        let sustained = parse(&args("commons-quiet --sustained")).unwrap();
+        assert!(sustained.options.contains_key("--sustained"));
+        assert!(parse(&args("aos --sustained")).is_err());
+        let catalog = parse(&args("commons-quiet --catalog --sustained")).unwrap();
+        assert!(catalog.options.contains_key("--catalog"));
+        assert!(catalog.options.contains_key("--sustained"));
+        assert!(parse(&args("aos --catalog")).is_err());
     }
 
     #[test]

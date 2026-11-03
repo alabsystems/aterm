@@ -33,9 +33,9 @@ fn later() -> Instant {
     Instant::now() + Duration::from_secs(3600)
 }
 
-/// An instant gone: a refusal or a notice whose show ended.
-fn gone() -> Instant {
-    Instant::now()
+/// An instant a second before `w`'s clock: a refusal or a notice whose show ended.
+fn gone(w: &World) -> Instant {
+    w.now
         .checked_sub(Duration::from_secs(1))
         .expect("an instant before now")
 }
@@ -85,6 +85,8 @@ struct World {
     room: usize,
     /// Autopilot's title is read ([`World::title`]).
     titled: bool,
+    /// The one instant every fit and frame reads ([`super::at_clock`]).
+    now: Instant,
 }
 
 impl World {
@@ -109,6 +111,7 @@ impl World {
             focus: (None, None),
             room: 80,
             titled: false,
+            now: Instant::now(),
         }
     }
 
@@ -165,11 +168,11 @@ impl World {
             .fit_into(
                 S,
                 self.blank,
-                Instant::now(),
+                self.now,
                 self.accent,
                 self.focus.0,
                 self.focus.1,
-                self.room,
+                (self.room, true),
                 (autopilot, None, None),
                 &mut block,
             )
@@ -191,15 +194,20 @@ impl World {
             .map(|&pane| {
                 let anew = self.anew();
                 let _ = crate::work_counts::take_footer_block_fits();
-                let block = self.w.lend_block(
-                    S,
-                    pane,
-                    self.blank,
-                    self.accent,
-                    self.targets(),
-                    self.room,
-                    at.map(TitleAt::Autopilot),
-                );
+                let (targets, blank, accent, room) =
+                    (self.targets(), self.blank, self.accent, self.room);
+                let w = &mut self.w;
+                let block = super::at_clock(self.now, || {
+                    w.lend_block(
+                        S,
+                        pane,
+                        blank,
+                        accent,
+                        targets,
+                        (room, true),
+                        at.map(TitleAt::Autopilot),
+                    )
+                });
                 let fits = crate::work_counts::take_footer_block_fits();
                 let lent = block.as_ref().map(Laid::of);
                 if let Some(block) = block {
@@ -219,6 +227,7 @@ impl World {
 fn pending() -> Pending {
     Pending {
         light: Light::Mode,
+        goal: Goal::On,
         started: Mode::Plan,
         mode_at_press: Mode::Plan,
         seen: Vec::new(),
@@ -241,6 +250,18 @@ fn planned(w: &mut World) {
 
 fn land(w: &mut World) {
     w.session().autopilot = Some(AutopilotView::Land);
+}
+
+/// Land, just reached by a click: its name after the glyph, whole.
+fn named(w: &mut World) {
+    land(w);
+    let from = w.now;
+    w.session().word = Some(ChipWord {
+        mode: Autopilot::Land,
+        from,
+        fades: true,
+        asked: 0,
+    });
 }
 
 /// Cruise's title as `autopilot_title` composes it with a trail of `last`,
@@ -298,18 +319,31 @@ fn cases() -> Vec<Case> {
         }),
         ("a refusal on show", nothing, refusing),
         ("a refusal's show ending", refusing, |w| {
-            w.session().refused.as_mut().expect("refused").2 = gone();
+            let gone = gone(w);
+            w.session().refused.as_mut().expect("refused").2 = gone;
         }),
         ("a refusal's new reason", refusing, |w| {
             w.session().refused = Some((Light::Mode, Refusal::StoppedMidTurn(Mode::Plan), later()));
         }),
         ("a notice on show", nothing, noticing),
         ("a notice's show ending", noticing, |w| {
-            w.session().notice.as_mut().expect("noticed").1 = gone();
+            let gone = gone(w);
+            w.session().notice.as_mut().expect("noticed").1 = gone;
         }),
         ("Autopilot's word", nothing, land),
         ("an Autopilot click in flight", nothing, |w| {
             w.session().autopilot_pending = Some((Autopilot::Land, later()));
+        }),
+        ("a click's mode name", land, named),
+        ("the name's fade a step on", named, |w| {
+            let from = w.now.checked_sub(WORD_HOLD + WORD_FADE / 2);
+            w.session().word.as_mut().expect("named").from =
+                from.expect("the clock is past a second and a half");
+        }),
+        ("the name gone", named, |w| {
+            let from = w.now.checked_sub(WORD_HOLD + WORD_FADE);
+            w.session().word.as_mut().expect("named").from =
+                from.expect("the clock is past its hold and fade");
         }),
         ("an act lit", nothing, lit),
         ("an act's dwell out", lit, |w| w.session().glass.lit = None),
@@ -392,7 +426,7 @@ fn a_kept_block_costs_a_frame_nothing_and_each_pane_keeps_its_own() {
                     world.blank,
                     world.accent,
                     world.targets(),
-                    world.room,
+                    (world.room, true),
                     None,
                 );
                 world.w.give_back(block.expect("drawn"));
@@ -425,7 +459,7 @@ fn a_kept_block_costs_a_frame_nothing_and_each_pane_keeps_its_own() {
             world.blank,
             world.accent,
             world.targets(),
-            world.room,
+            (world.room, true),
             None,
         )
         .expect("drawn");
@@ -437,7 +471,7 @@ fn a_kept_block_costs_a_frame_nothing_and_each_pane_keeps_its_own() {
             world.blank,
             world.accent,
             world.targets(),
-            world.room,
+            (world.room, true),
             None,
         )
         .expect("drawn");

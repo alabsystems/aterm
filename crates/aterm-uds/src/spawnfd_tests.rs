@@ -19,6 +19,230 @@ const BOUND_NAME: &str = if cfg!(target_vendor = "apple") {
     "the hard RLIMIT_NOFILE"
 };
 
+#[test]
+fn failed_guarded_exec_keeps_parent_guard_close_on_exec() {
+    use std::os::fd::AsFd as _;
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let file = std::fs::File::create(scratch.path().join("guard")).unwrap();
+    let mut cmd = command(scratch.path().join("missing-program"));
+    cmd.inherit_guards(vec![file.as_fd().try_clone_to_owned().unwrap()])
+        .unwrap();
+    let fd = cmd.guard_targets().next().unwrap();
+    // SAFETY: the command exclusively owns this live guard slot throughout both queries.
+    let before = unsafe { fcntl(fd, F_GETFD) };
+    assert_ne!(before & FD_CLOEXEC, 0);
+    let error = cmd.exec();
+    #[cfg(not(target_vendor = "apple"))]
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{error:?}");
+    #[cfg(target_vendor = "apple")]
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error:?}");
+    // SAFETY: failed exec retained the command and its occupied descriptor.
+    assert_eq!(unsafe { fcntl(fd, F_GETFD) }, before);
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_guarded_exec_keeps_only_the_advertised_guard_at_the_same_number() {
+    use std::os::{fd::AsFd as _, unix::fs::MetadataExt as _};
+    const NAME: &str =
+        "spawnfd::tests::a_guarded_exec_keeps_only_the_advertised_guard_at_the_same_number";
+    const PATH_ENV: &str = "ATERM_UDS_EXEC_GUARD_PATH";
+    const FD_ENV: &str = "ATERM_UDS_EXEC_GUARD_FD";
+    const PID_ENV: &str = "ATERM_UDS_EXEC_GUARD_PID";
+    match std::env::var(STAGE_ENV).as_deref() {
+        Ok("guard-exec-observer") => {
+            let path = std::path::PathBuf::from(std::env::var_os(PATH_ENV).unwrap());
+            let fd: RawFd = std::env::var(FD_ENV).unwrap().parse().unwrap();
+            assert_eq!(
+                std::env::var(PID_ENV).unwrap(),
+                std::process::id().to_string()
+            );
+            let expected = std::fs::metadata(&path).unwrap();
+            let same_inode = |metadata: &std::fs::Metadata| {
+                (metadata.dev(), metadata.ino()) == (expected.dev(), expected.ino())
+            };
+            assert!(same_inode(&descriptor_metadata(fd).unwrap()));
+            assert_eq!(flags(fd) & FD_CLOEXEC, 0);
+            let guards: Vec<_> = std::fs::read_dir("/dev/fd")
+                .unwrap()
+                .map(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_str()
+                        .unwrap()
+                        .parse::<RawFd>()
+                        .unwrap()
+                })
+                .filter(|&number| descriptor_metadata(number).is_ok_and(|meta| same_inode(&meta)))
+                .collect();
+            assert_eq!(
+                guards,
+                [fd],
+                "temporary exec copies must not reach the image"
+            );
+            let fresh = std::fs::File::open(path).unwrap();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "negative control: only the inherited description keeps this fixture lock"
+            )]
+            let locked = fresh.try_lock();
+            assert!(matches!(locked, Err(std::fs::TryLockError::WouldBlock)));
+            println!("guarded-exec-observer-kept-original-number-and-lock");
+            return;
+        }
+        Ok("guard-exec-actor") => {
+            let file = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(std::env::var_os(PATH_ENV).unwrap())
+                .unwrap();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "fixture description must survive a real in-place exec"
+            )]
+            file.try_lock().unwrap();
+            let mut exec = command(std::env::current_exe().unwrap());
+            exec.inherit_guards(vec![file.as_fd().try_clone_to_owned().unwrap()])
+                .unwrap();
+            let fd = exec.guard_targets().next().unwrap();
+            exec.args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(STAGE_ENV, "guard-exec-observer")
+                .env(FD_ENV, fd.to_string())
+                .env(PID_ENV, std::process::id().to_string());
+            panic!("guarded in-place exec returned: {:?}", exec.exec());
+        }
+        _ => {}
+    }
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let path = scratch.path().join("guard");
+    std::fs::write(&path, b"guarded exec fixture").unwrap();
+    let mut actor = command(std::env::current_exe().unwrap());
+    actor
+        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .env(STAGE_ENV, "guard-exec-actor")
+        .env(PATH_ENV, &path);
+    let output = crate::deadline::output_within(&mut actor, Duration::from_secs(60)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("guarded-exec-observer-kept-original-number-and-lock")
+    );
+}
+
+#[test]
+fn explicit_guards_keep_the_shared_lock_after_parent_descriptors_close() {
+    use std::os::fd::AsFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::time::Instant;
+    const CHILD: &str = "ATERM_UDS_GUARD_LIFETIME_CHILD";
+    const HANG: Duration = Duration::from_secs(60);
+    if std::env::var_os(CHILD).is_some() {
+        let fd: RawFd = std::env::var("ATERM_UDS_GUARD_FD")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let path = std::path::PathBuf::from(std::env::var_os("ATERM_UDS_GUARD_PATH").unwrap());
+        let go = std::path::PathBuf::from(std::env::var_os("ATERM_UDS_GUARD_GO").unwrap());
+        let expected = std::fs::metadata(&path).unwrap();
+        let inherited = descriptor_metadata(fd).expect("explicit descriptor inherited");
+        assert_eq!(
+            (inherited.dev(), inherited.ino()),
+            (expected.dev(), expected.ino())
+        );
+        // SAFETY: read-only flag query for the inherited descriptor admitted above.
+        assert_eq!(unsafe { fcntl(fd, F_GETFD) } & FD_CLOEXEC, 0);
+        let unrelated: RawFd = std::env::var("ATERM_UDS_UNRELATED_FD")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let unrelated_path = std::env::var_os("ATERM_UDS_UNRELATED_PATH").unwrap();
+        let other = std::fs::metadata(unrelated_path).unwrap();
+        assert!(match descriptor_metadata(unrelated) {
+            Err(_) => true,
+            Ok(meta) => (meta.dev(), meta.ino()) != (other.dev(), other.ino()),
+        });
+        let until = Instant::now() + HANG;
+        while !go.exists() {
+            assert!(Instant::now() < until, "parent descriptor-close signal");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let fresh = std::fs::File::open(path).unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "negative control: only the inherited description must retain this fixture lock"
+        )]
+        let locked = fresh.try_lock();
+        assert!(matches!(locked, Err(std::fs::TryLockError::WouldBlock)));
+        println!("guard-description-kept-lock");
+        return;
+    }
+    let scratch = aterm_tempfile::tempdir().expect("private guard fixture");
+    let path = scratch.path().join("held");
+    let file = std::fs::File::create(&path).unwrap();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "fixture open-description lifetime, with no unlock before the child proof"
+    )]
+    file.try_lock().unwrap();
+    let mut cmd = command(std::env::current_exe().unwrap());
+    cmd.inherit_guards(vec![file.as_fd().try_clone_to_owned().unwrap()])
+        .unwrap();
+    let guard = cmd.guard_targets().next().unwrap();
+    let unrelated_path = scratch.path().join("unrelated");
+    let unrelated = std::fs::File::create(&unrelated_path).unwrap();
+    // SAFETY: this owned fixture descriptor carries no private data. Intentionally unmark it
+    // to prove the default strip still excludes unrequested descriptors beside named guards.
+    assert_eq!(unsafe { fcntl(unrelated.as_raw_fd(), F_SETFD, 0) }, 0);
+    let go = scratch.path().join("parent-closed");
+    cmd.args([
+        "--exact",
+        "spawnfd::tests::explicit_guards_keep_the_shared_lock_after_parent_descriptors_close",
+        "--nocapture",
+    ])
+    .env(CHILD, "1")
+    .env("ATERM_UDS_GUARD_FD", guard.to_string())
+    .env("ATERM_UDS_GUARD_PATH", &path)
+    .env("ATERM_UDS_GUARD_GO", &go)
+    .env("ATERM_UDS_UNRELATED_FD", unrelated.as_raw_fd().to_string())
+    .env("ATERM_UDS_UNRELATED_PATH", &unrelated_path)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::inherit());
+    let mut child = cmd.spawn().expect("guard child");
+    crate::keep_out_of_children(&unrelated).unwrap();
+    drop(cmd);
+    drop(file);
+    std::fs::write(go, b"closed").unwrap();
+    let until = Instant::now() + HANG;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= until {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("guard child hang detector");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut output = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert!(status.success(), "{output}");
+    assert!(
+        output.contains("guard-description-kept-lock"),
+        "actual child body output: {output}"
+    );
+}
+
 /// Skip the test as COULD NOT RUN unless [`descriptor_bound`] is above `need`.
 #[track_caller]
 pub(super) fn require_host_holds(need: RawFd, what: &str) {
@@ -1325,10 +1549,18 @@ fn staged_shell_probe() {
             crate::host::sh_held(absent),
         );
         let mut misread = Vec::new();
+        let mut shells = 0;
         let rounds = test_support::racing_lookups(held, 20, |looker| {
+            let mut contended = false;
             for _ in 0..PER_ROUND {
-                looker.probe();
+                contended |= looker.probe();
             }
+            // Spend the shell work on observed contention, not on unsuccessful
+            // calibration rounds that consume the same hang detector.
+            if !contended {
+                return;
+            }
+            shells += 1;
             let status =
                 test_support::leaky_status("/bin/sh", &["-c", &script]).expect("run the probe");
             if status.code() != Some(0) {
@@ -1337,7 +1569,8 @@ fn staged_shell_probe() {
         });
         assert!(
             misread.is_empty(),
-            "fd {held}: {} of {rounds} shells misread (exit: how many of their \
+            "fd {held}: {} of {shells} shells misread in {rounds} calibration rounds \
+             (exit: how many of their \
              2 × {PER_ROUND} reads were wrong): {misread:?}",
             misread.len()
         );

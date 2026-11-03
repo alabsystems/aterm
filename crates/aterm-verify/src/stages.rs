@@ -76,7 +76,7 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
     r
 }
 
-/// `targo --unverified test <scope> --no-fail-fast --tests --no-run` — the test compile row's one child and the test stage's first: compile every test target and run nothing.
+/// `targo --unverified test <scope> --no-fail-fast --tests --no-run` — the test compile row's child: compile every test target and run nothing.
 #[must_use]
 pub fn test_compile_args(scope: &Scope) -> Vec<String> {
     let mut a = test_base_args(scope);
@@ -241,7 +241,7 @@ fn workspace_member_dirs(root: &std::path::Path) -> Vec<(String, std::path::Path
         .flatten()
         .flatten()
         .filter_map(|e| {
-            let text = std::fs::read_to_string(e.path().join("Cargo.toml")).ok()?;
+            let text = crate::read_regular_text(e.path().join("Cargo.toml")).ok()?;
             if text.lines().any(|l| l.trim() == "[workspace]") {
                 return None;
             }
@@ -270,7 +270,7 @@ pub fn gated_lint_features(root: &std::path::Path) -> Vec<(String, String)> {
         .into_iter()
         .flatten()
         .flatten()
-        .filter_map(|e| std::fs::read_to_string(e.path().join("Cargo.toml")).ok())
+        .filter_map(|e| crate::read_regular_text(e.path().join("Cargo.toml")).ok())
         .flat_map(|text| manifest_required_features(&text))
         .collect();
     v.sort();
@@ -379,7 +379,7 @@ pub fn ship_args(verb: impl IntoIterator<Item = impl Into<String>>) -> Vec<Strin
 /// The redraw harness's target name — the `[[bin]]`, the built file and the argv below all have to agree, so they read it from here.
 pub const REDRAW_CONFORMANCE_BIN: &str = "aterm-redraw-conformance";
 
-/// The profile of every binary the run builds in the main target to drive (`spec-check`, the redraw harness, the objc drivers, the Linux lane's lab): the test compile's, so each links against the units that compile already built instead of compiling the dev profile's graph a second time.
+/// The profile of every binary the run builds in the main target to drive (`spec-check`, the redraw harness, the objc drivers, the Linux lane's lab). Both this profile and the helper's feature unification must match the test compile to reuse its dependencies.
 pub const MAIN_PROFILE: [&str; 2] = ["--profile", "test"];
 
 /// `targo --unverified build --profile test -q -p aterm-gui --bin aterm-redraw-conformance`, in the main target with no feature: the harness's conformance seam is compiled in wherever debug assertions are on.
@@ -427,7 +427,7 @@ pub struct ObjcDrive {
 }
 
 /// The objc drivers the `objc drives` stage builds and runs, in order — every row on every macOS run, whatever the scope, and every row after a failure.
-pub const OBJC_DRIVES: [ObjcDrive; 6] = [
+pub const OBJC_DRIVES: [ObjcDrive; 7] = [
     ObjcDrive {
         package: "aterm-gui",
         example: "objc_live_class_audit",
@@ -474,6 +474,13 @@ pub const OBJC_DRIVES: [ObjcDrive; 6] = [
         // A death by a signal is a crash in the link's callback or AppKit's window teardown while the drive held them: a finding. (A link left uninvalidated did not crash it at the desk, 2026-10-27 and 2026-10-28: no tick came after the close. On 2026-10-28 the drive's weak reference, still loading the link after the close, caught it, exit 1.)
         no_status: Severity::GateFailed,
         pass: "a real window's display link ran the deck's clock: by the link's own timestamps its ticks each named a period the screen runs, targeted the coming vsync (the median tick's and the best tick's lead both positive) and never stalled LINK_SILENCE, and the clock's hang detector never tripped; paused, the CADisplayLink said so (-isPaused) and fired nothing while the clock's detector tripped on real time and timed the window as one with no link, and the restarted link's first tick resumed the clock; the link ticked while the main run loop ran in NSEventTrackingRunLoopMode; and closing the window invalidated every link its view made (a weak reference to each CADisplayLink, which its run loop retains until -invalidate, loaded nil after the close, and no tick fired for a vsync after it)",
+    },
+    ObjcDrive {
+        package: "aterm-gui",
+        example: "objc_confirm_drive",
+        code3: Code3::Hung,
+        no_status: Severity::CouldNotRun,
+        pass: "the Stop Worker sheet came up on a real NSAlert with its title, body and buttons; a click on Stop answered yes, and a click on Cancel, Return and Escape each no",
     },
 ];
 
@@ -687,7 +694,46 @@ pub fn in_lane(ctx: &Ctx, lane: Lane, cmd: Cmd) -> Cmd {
 /// A build of a binary the run drives, in the main target.
 #[must_use]
 pub fn main_build_cmd(ctx: &Ctx, args: Vec<String>) -> Cmd {
-    main_targo(ctx, args).demoted()
+    main_targo(ctx, helper_scope_args(&ctx.scope, args)).demoted()
+}
+
+/// Keep named helper targets on the workspace test graph when the run checks the
+/// workspace. Selecting their packages alone changes Cargo feature unification
+/// and rebuilds otherwise identical dependencies. Narrow runs keep their scope;
+/// arguments after `--` belong to the helper and are never rewritten. A `run`
+/// keeps its package: it runs one package's binary and refuses `--workspace`
+/// ("unexpected argument '--workspace' found", which stopped `spec-check`).
+fn helper_scope_args(scope: &Scope, args: Vec<String>) -> Vec<String> {
+    let subcommand = args.iter().find(|a| !a.starts_with('-'));
+    if !scope.is_workspace() || subcommand.is_some_and(|c| c == "run") {
+        return args;
+    }
+    let mut selected = args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a == "--workspace");
+    let mut out = Vec::with_capacity(args.len());
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            out.push(arg);
+            out.extend(args);
+            break;
+        }
+        if matches!(arg.as_str(), "-p" | "--package") {
+            let Some(_) = args.next() else {
+                out.push(arg);
+                break;
+            };
+            if !selected {
+                out.push("--workspace".into());
+                selected = true;
+            }
+        } else {
+            out.push(arg);
+        }
+    }
+    out
 }
 
 /// A binary the main target holds: `<target>/debug/<name>`.
@@ -980,7 +1026,7 @@ fn test(ctx: &Ctx, r: &mut Report) {
         return;
     }
     let (suffix, bind) = test_doc_binding(ctx);
-    let [compile, run] = test_cmds(ctx, bind);
+    let [_, run] = test_cmds(ctx, bind);
     let run_label = format!("{label} --tests{suffix}");
     let behind = "the compile above failed, and cargo runs no test after a compile error";
     if ctx
@@ -990,13 +1036,8 @@ fn test(ctx: &Ctx, r: &mut Report) {
         not_run_behind(r, &run_label, behind);
         return;
     }
-    let compile_label = format!("{label} --no-run{suffix}");
-    let (compiled, exes, _) = compile_tests(ctx, r, &compile_label, &compile);
-    if compiled {
-        crate::testrun::run_tests(ctx, r, &run_label, &run, exes);
-    } else {
-        not_run_behind(r, &run_label, behind);
-    }
+    // The recording Cargo pass checks freshness and supplies its own target metadata.
+    crate::testrun::run_tests(ctx, r, &run_label, &run);
 }
 
 /// Why a `measure` stage handed no bundle ran nothing, and the fix.
@@ -1016,6 +1057,7 @@ const MEASURE_WINDOW_ROWS_SKIP: &str = "spin's window rows (--no-windows: each o
                                         desktop is free)";
 
 fn measuring_cmd(ctx: &Ctx, artifact: &crate::MeasureArtifact, args: Vec<String>) -> (String, Cmd) {
+    let args = helper_scope_args(&ctx.scope, args);
     let label = format!("targo {}", args[1..].join(" "));
     let bin = artifact.bin("aterm");
     let mut cmd = main_targo(ctx, args)
@@ -1576,7 +1618,7 @@ pub fn spec_check_cmd(ctx: &Ctx) -> Cmd {
     if ctx.release {
         args.extend(["--".to_string(), "--full".to_string()]);
     }
-    main_targo(ctx, args)
+    main_targo(ctx, helper_scope_args(&ctx.scope, args))
 }
 
 /// Why a `spec-check` that decided nothing did not run: the machine's failure, else its own `could not run` line (a missing `ty` or `ay` names its install).
@@ -1648,29 +1690,22 @@ pub fn gpu_oracle_args() -> Vec<String> {
     .into()
 }
 
-fn no_run(mut args: Vec<String>) -> Vec<String> {
-    args.push("--no-run".to_string());
-    args
-}
-
-fn feature_compile(ctx: &Ctx, r: &mut Report, lane: Lane, args: Vec<String>, what: &str) {
+fn checkers_compile(ctx: &Ctx, r: &mut Report) {
     if !ctx.tools.have_targo() {
-        r.skip(format!("{what} compile (no targo)"));
+        r.skip("checkers compile (no targo)");
         return;
     }
+    let args = spec_checkers_args();
     let label = format!("targo {} --no-run", args[1..].join(" "));
-    let cmd = in_lane(ctx, lane, targo(ctx, no_run(args))).demoted();
-    run_labeled(ctx, r, &label, &cmd);
+    let cmd = spec_checkers_cmd(ctx).arg("--no-run").demoted();
+    if !run_labeled(ctx, r, &label, &cmd) {
+        ctx.checkers_compile_failed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
-fn checkers_compile(ctx: &Ctx, r: &mut Report) {
-    feature_compile(
-        ctx,
-        r,
-        Lane::CheckersTarget,
-        spec_checkers_args(),
-        "checkers",
-    );
+fn spec_checkers_cmd(ctx: &Ctx) -> Cmd {
+    in_lane(ctx, Lane::CheckersTarget, targo(ctx, spec_checkers_args()))
 }
 
 fn spec_checkers(ctx: &Ctx, r: &mut Report) {
@@ -1678,13 +1713,19 @@ fn spec_checkers(ctx: &Ctx, r: &mut Report) {
         r.skip("checkers (no targo)");
         return;
     }
-    let cmd = in_lane(ctx, Lane::CheckersTarget, targo(ctx, spec_checkers_args()));
-    run_tests_labeled(
-        ctx,
-        r,
-        "targo test --workspace --features aterm-spec/checkers",
-        &cmd,
-    );
+    const LABEL: &str = "targo test --workspace --features aterm-spec/checkers --tests";
+    if ctx
+        .checkers_compile_failed
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        not_run_behind(
+            r,
+            LABEL,
+            "checker-enabled compilation failed; its runtime stage does not retry compilation",
+        );
+        return;
+    }
+    crate::testrun::run_tests(ctx, r, LABEL, &spec_checkers_cmd(ctx));
 }
 
 /// Did a passing gpu-oracle child not pass the oracle's test ([`crate::checks::GOLDEN`])?
@@ -2416,7 +2457,7 @@ mod tests {
 
         let r = run_stage(&cc, &spec(StageId::Test));
         let outcomes: Vec<Outcome> = r.outcomes().map(|(o, _)| o).collect();
-        assert_eq!(outcomes, [Outcome::Ok, Outcome::Ok], "{}", r.render());
+        assert_eq!(outcomes, [Outcome::Ok], "{}", r.render());
 
         let r = run_stage(&cc, &spec(StageId::Doctests));
         let outcomes: Vec<_> = r.outcomes().collect();
@@ -3527,6 +3568,42 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn failed_checker_compilation_is_not_retried_by_the_runtime() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let mut c = Ctx::new(
+            temp.path().into(),
+            Scope::workspace(),
+            EnvSnapshot::default(),
+            temp.path().join("scratch"),
+        );
+        c.tools.targo = "/usr/bin/false".into();
+        c.tools.refused = None;
+        let mut compile = Report::new("checkers compile");
+        checkers_compile(&c, &mut compile);
+        assert!(
+            c.checkers_compile_failed
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(
+            !c.test_compile_failed
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        c.scratch = temp.path().join("runtime-must-not-start");
+        let mut runtime = Report::new("checkers");
+        spec_checkers(&c, &mut runtime);
+        assert!(
+            !c.scratch.exists(),
+            "a recording pass would create the scratch directory"
+        );
+        assert!(
+            runtime
+                .outcomes()
+                .all(|(outcome, _)| outcome == Outcome::Fail(Severity::CouldNotRun))
+        );
+    }
+
     #[test]
     fn the_spec_check_runs_whole_under_release_and_names_a_missing_checker() {
         let c = ctx(Scope::workspace());
@@ -3541,8 +3618,9 @@ mod tests {
         assert_eq!(tail(&dev), ["spec-check"]);
         let argv = dev.argv();
         assert!(
-            argv.windows(2).any(|w| w == ["-p", "aterm-models"]),
-            "the bin's package: {argv:?}"
+            argv.windows(2).any(|w| w == ["-p", "aterm-models"])
+                && !argv.iter().any(|a| a == "--workspace"),
+            "a run keeps its package; `targo run` refuses --workspace: {argv:?}"
         );
         assert!(
             !dev.envs.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"),
@@ -3628,6 +3706,67 @@ mod tests {
         assert!(
             !build.envs.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"),
             "the main target, inherited"
+        );
+    }
+
+    #[test]
+    fn workspace_helpers_unify_features_without_changing_targets_or_child_arguments() {
+        let args: Vec<String> = [
+            "build",
+            "-p",
+            "aterm",
+            "--package",
+            "aterm-lab",
+            "--bin",
+            "aterm",
+            "--bin",
+            "aterm-lab",
+            "--",
+            "-p",
+            "child-value",
+        ]
+        .map(String::from)
+        .into();
+        assert_eq!(
+            helper_scope_args(&Scope::workspace(), args.clone()),
+            [
+                "build",
+                "--workspace",
+                "--bin",
+                "aterm",
+                "--bin",
+                "aterm-lab",
+                "--",
+                "-p",
+                "child-value"
+            ]
+        );
+        assert_eq!(
+            helper_scope_args(&Scope::Packages(vec!["aterm".into()]), args.clone()),
+            args
+        );
+        let already: Vec<String> = ["build", "--workspace", "-p", "aterm", "--bin", "aterm"]
+            .map(String::from)
+            .into();
+        assert_eq!(
+            helper_scope_args(&Scope::workspace(), already),
+            ["build", "--workspace", "--bin", "aterm"]
+        );
+        let run: Vec<String> = [
+            "--unverified",
+            "run",
+            "-q",
+            "-p",
+            "aterm-models",
+            "--bin",
+            "x",
+        ]
+        .map(String::from)
+        .into();
+        assert_eq!(
+            helper_scope_args(&Scope::workspace(), run.clone()),
+            run,
+            "a run keeps its package"
         );
     }
 
@@ -4028,7 +4167,21 @@ mod tests {
             c.main_build_dir.clone().expect("a build dir"),
         ];
         assert_eq!(build.argv()[1..3], lead);
-        assert_eq!(build.argv()[3..], codex_aterm_build_args()[..]);
+        assert_eq!(
+            build.argv()[3..],
+            [
+                "--unverified",
+                "build",
+                "--profile",
+                "test",
+                "-q",
+                "--workspace",
+                "--bin",
+                "aterm",
+                "--bin",
+                "aterm-lab"
+            ]
+        );
         assert!(build.demoted, "the build only compiles");
         assert!(!suite.demoted, "the suite runs code");
         assert_eq!(lane(&build), None, "the main target, inherited");
@@ -4061,7 +4214,19 @@ mod tests {
             c.main_build_dir.clone().expect("a build dir"),
         ];
         assert_eq!(build.argv()[1..3], lead);
-        assert_eq!(build.argv()[3..], linux_lab_build_args()[..]);
+        assert_eq!(
+            build.argv()[3..],
+            [
+                "--unverified",
+                "build",
+                "--profile",
+                "test",
+                "-q",
+                "--workspace",
+                "--bin",
+                "aterm-lab"
+            ]
+        );
         assert!(linux_lab_build_args().windows(2).any(|w| w == MAIN_PROFILE));
         assert!(
             !build.envs.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"),

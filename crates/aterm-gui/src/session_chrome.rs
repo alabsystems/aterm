@@ -66,6 +66,8 @@ pub(crate) struct AgentMenu {
     pub stoppable: bool,
     /// The workers whose tasks THIS session started: `(sid, its row's words)`, in session order — the `Workers (n)` rows.
     pub workers: Vec<(SessionId, String)>,
+    /// The session's tab is parked under the window's Workers tab: Move to Tab is offered.
+    pub parked: bool,
 }
 
 /// The session log's clause as the chrome shows it ([`SessionChromeInput::clause`]).
@@ -240,6 +242,8 @@ pub(crate) enum ConnVerb {
     Show,
     /// Stop Worker…: after the person confirms the sheet (or, with no sheet to ask on, the Overview's inline confirm), SIGTERM to the session's agent, in process (`App::stop_worker`).
     StopWorker,
+    /// Move to Tab: a parked worker's tab joins the strip (`App::unpark_session`).
+    MoveToTab,
 }
 
 /// The per-tab tooltip and context-menu model the app pushes to the native strip.
@@ -249,6 +253,9 @@ pub(crate) struct TabChromeExt {
     pub tooltip: Option<String>,
     /// Context-menu model (`empty` = no context menu pops).
     pub menu: Vec<TabMenuEntry>,
+    /// The tab the menu's rows act on where it is not the chip's own: the worker the Workers chip
+    /// shows.
+    pub menu_tab: Option<crate::tab_model::TabId>,
 }
 
 impl TabChromeExt {
@@ -724,6 +731,16 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
             label: "Stop Worker\u{2026}".to_string(),
             peer_sid: sid,
             verb: ConnVerb::StopWorker,
+            enabled: true,
+        });
+    }
+    if agent.parked
+        && let Some(sid) = input.sid.clone()
+    {
+        entries.push(TabMenuEntry::ConnectionAction {
+            label: "Move to Tab".to_string(),
+            peer_sid: sid,
+            verb: ConnVerb::MoveToTab,
             enabled: true,
         });
     }

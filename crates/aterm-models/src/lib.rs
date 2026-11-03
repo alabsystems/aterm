@@ -10,7 +10,7 @@ use aterm_spec::derive::Model;
 type Domain = (&'static str, fn() -> Model);
 
 /// One model of each domain crate.
-const DOMAINS: [Domain; 16] = [
+const DOMAINS: [Domain; 17] = [
     ("aterm-models-agh", aterm_models_agh::agh_route_wall_model),
     ("aterm-models-db", aterm_models_db::offline_rights_model),
     (
@@ -20,6 +20,10 @@ const DOMAINS: [Domain; 16] = [
     (
         "aterm-models-atpkg",
         aterm_models_atpkg::atpkg_contention_release_park_model,
+    ),
+    (
+        "aterm-models-capacity",
+        aterm_models_capacity::capacity_cohort_model,
     ),
     (
         "aterm-models-core",

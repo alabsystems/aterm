@@ -17,7 +17,7 @@ use crate::census::{self, Rec};
 use crate::clock::{self, Clock, Heads, StopOnDrop, ms};
 use crate::harness::{self, DEADLINE, FLEET, World, kv, until};
 use crate::profile::{self, Profile};
-use crate::spec::{Log, ORDERED_HORIZON_MS, Scenario, Spec, Tier};
+use crate::spec::{Log, NOTE_PACE, ORDERED_HORIZON_MS, Scenario, Spec, Tier};
 use crate::stats;
 
 #[path = "run/pingpong.rs"]
@@ -121,12 +121,17 @@ fn rows_of(reply: &Reply) -> Vec<Row> {
         .collect()
 }
 
-/// List `sid`'s rows newer than `since` — not `--peek`.
-fn list_since(ctl: &mut Ctl, sid: &str, since: u64) -> Vec<Row> {
+/// `sid`'s `inbox` reply for its rows newer than `since` — not `--peek`.
+fn listing_since(ctl: &mut Ctl, sid: &str, since: u64) -> Reply {
     let line = format!("@{sid} inbox since={since}");
     let reply = request(ctl, &line);
     assert!(reply.ok(), "{line}: {}", reply.header());
-    rows_of(&reply)
+    reply
+}
+
+/// List `sid`'s rows newer than `since` — not `--peek`.
+fn list_since(ctl: &mut Ctl, sid: &str, since: u64) -> Vec<Row> {
+    rows_of(&listing_since(ctl, sid, since))
 }
 
 /// The newest row id `sid` holds, or 0.
@@ -1097,6 +1102,303 @@ fn burst(
     }
 }
 
+/// One paced note ([`paced_notes`]).
+struct PacedNote {
+    text: String,
+    /// When A's post call went out.
+    t_post: u64,
+    /// When its row was visible in B's inbox.
+    t_seen: u64,
+    /// The writer batches that appended a record from just before its post to just before
+    /// the next note's (the last note's: once its pace was out).
+    batches: u64,
+}
+
+/// What the paced-notes phase measured.
+struct PacedRaw {
+    /// The sending and the receiving session.
+    sids: (String, String),
+    notes: Vec<PacedNote>,
+    /// The broker's flushes over the phase, from the first note's post to the last one's pace.
+    flushes: FlushCounts,
+    /// The broker's retention ticks over the same window ([`Ticks`]).
+    ticks: Ticks,
+}
+
+/// The paced-notes phase (C13): `spec.paced_notes` one-way notes from A to B, [`NOTE_PACE`]
+/// apart, none answered. Each delivery moves B's mail count, and the notes go slower than
+/// the mirror's one snapshot of a moved count a second, so each owes the bus mirror B's
+/// snapshot, as an agent's delivery does. Each note waits for its delivery's inbox commit
+/// ([`await_commit`]) and then the rest of its pace, so its window holds what that delivery
+/// cost and nothing of the next. It starts one pace after the burst's fence, so the burst's
+/// own snapshots are out of its first window.
+fn paced_notes(
+    w: &World,
+    broker: &Broker,
+    spec: &Spec,
+    clock: Clock,
+    a: &str,
+    b: &str,
+) -> PacedRaw {
+    let group = aterm_link::subject::inbox_group(FLEET, &w.node);
+    let mut ctl = w.ctl();
+    let batches = || {
+        let stats = broker.stats();
+        stats.writer_batches - stats.empty_batches
+    };
+    std::thread::sleep(NOTE_PACE);
+    let mut since = newest_id(&mut ctl, b);
+    let mut notes = Vec::with_capacity(spec.paced_notes);
+    let flushes_before = broker.flush_counts();
+    let ticks_before = ticks(broker);
+    let mut before = batches();
+    for i in 0..spec.paced_notes {
+        let paced = Instant::now() + NOTE_PACE;
+        let text = format!("paced-{i}");
+        let t_post = clock.us();
+        post(&mut ctl, clock, a, b, &text);
+        let (woke_at, t_seen) =
+            await_note(&mut ctl, clock, b, since).unwrap_or_else(|e| panic!("paced note {i}: {e}"));
+        let rows = list_since(&mut ctl, b, since);
+        assert!(
+            rows.len() == 1 && rows[0].text == text && rows[0].id == woke_at,
+            "paced note {i}: woke at row {woke_at}, listed {rows:?}"
+        );
+        await_commit(broker, &group, rows[0].off, &format!("paced note {i}"));
+        since = woke_at;
+        std::thread::sleep(paced.saturating_duration_since(Instant::now()));
+        let after = batches();
+        notes.push(PacedNote {
+            text,
+            t_post,
+            t_seen,
+            batches: after - before,
+        });
+        before = after;
+    }
+    PacedRaw {
+        sids: (a.to_string(), b.to_string()),
+        notes,
+        flushes: flushes_between(flushes_before, broker.flush_counts()),
+        ticks: ticks_between(ticks_before, ticks(broker)),
+    }
+}
+
+/// One paced note's records, as the visible head took them ([`paced_report`]): each step of
+/// the head (one writer batch, as far as the 100 µs sampling tells two apart) in log order,
+/// `|` between steps and `+` within one; `note` is the delivery, `commit` the inbox commit
+/// covering it, `evA` and `evB` the sender's and the recipient's mirror rows, anything else
+/// its kind's last segment. A record before the delivery belongs to the note when it landed
+/// after the post call; after `||`, what landed past the commit's step before the next
+/// note's post call (the last note's: within its pace). `landed` is when the visible head
+/// first passed an offset ([`clock::Timeline::landed`]).
+fn paced_shape(
+    recs: &[Rec],
+    landed: &dyn Fn(u64) -> Option<u64>,
+    sids: (&str, &str),
+    note: (u64, u64, u64),
+    from: u64,
+    tail_before: u64,
+) -> String {
+    let (seq, end, t_post) = note;
+    let label = |r: &Rec| -> String {
+        if r.seq == seq {
+            "note".to_string()
+        } else if r.commit.is_some() {
+            "commit".to_string()
+        } else if r.subject.ends_with("/ev") && r.subject.contains(&format!("/{}/", sids.0)) {
+            "evA".to_string()
+        } else if r.subject.ends_with("/ev") && r.subject.contains(&format!("/{}/", sids.1)) {
+            "evB".to_string()
+        } else {
+            census::class_of(&r.subject)
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        }
+    };
+    let steps = |rows: Vec<&Rec>| -> String {
+        let mut out = String::new();
+        let mut last: Option<Option<u64>> = None;
+        for r in rows {
+            let at = landed(r.seq);
+            match last {
+                None => {}
+                Some(prev) if prev == at && at.is_some() => out.push('+'),
+                Some(_) => out.push_str(" | "),
+            }
+            out.push_str(&label(r));
+            last = Some(at);
+        }
+        out
+    };
+    let own: Vec<&Rec> = census::window(recs, from, end)
+        .filter(|r| r.seq >= seq || landed(r.seq).is_some_and(|t| t >= t_post))
+        .collect();
+    let tail: Vec<&Rec> = recs
+        .iter()
+        .filter(|r| r.seq > end)
+        .take_while(|r| landed(r.seq).is_some_and(|t| t < tail_before))
+        .collect();
+    let mut shape = steps(own);
+    if !tail.is_empty() {
+        shape.push_str(" || ");
+        shape.push_str(&steps(tail));
+    }
+    shape
+}
+
+/// The paced-notes phase's section ([`paced_notes`]), read off the stopped log: per note, its
+/// commit, the `ev` rows that landed between the delivery and that commit, and the `ev` rows
+/// that landed in the commit's own step of the visible head (one batch with it), past it.
+fn paced_report(
+    raw: &PacedRaw,
+    recs: &[Rec],
+    group: &str,
+    heads: &Heads,
+    seq_of: impl Fn(&str) -> u64,
+) -> (Value, Vec<String>) {
+    let n = raw.notes.len();
+    let ev = |r: &Rec| r.subject.ends_with("/ev");
+    let mut visible_to_committed = Vec::new();
+    let (mut before, mut notes_before, mut with, mut notes_with) = (0usize, 0usize, 0usize, 0usize);
+    let mut by_batches: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut spans: Vec<(u64, u64, u64)> = Vec::with_capacity(n);
+    for note in &raw.notes {
+        let seq = seq_of(&note.text);
+        let commit = census::covering_commit(recs, group, seq, seq)
+            .unwrap_or_else(|| panic!("`{}`: no commit of {group} covers offset {seq}", note.text));
+        let landed = heads.acked.landed(commit.seq);
+        visible_to_committed.extend(ms_opt(Some(note.t_seen), landed));
+        let owed = census::before_its_commit(recs, group, seq)
+            .expect("the commit covers it")
+            .into_iter()
+            .filter(|r| ev(r))
+            .count();
+        before += owed;
+        notes_before += usize::from(owed > 0);
+        let step: Vec<&Rec> = recs
+            .iter()
+            .filter(|r| r.seq > commit.seq)
+            .take_while(|r| landed.is_some() && heads.acked.landed(r.seq) == landed)
+            .collect();
+        spans.push((seq, step.last().map_or(commit.seq, |r| r.seq), note.t_post));
+        let rode = step.into_iter().filter(|r| ev(r)).count();
+        with += rode;
+        notes_with += usize::from(rode > 0);
+        *by_batches.entry(note.batches).or_default() += 1;
+    }
+    let pace_us = u64::try_from(NOTE_PACE.as_micros()).unwrap_or(u64::MAX);
+    let mut shapes: BTreeMap<String, usize> = BTreeMap::new();
+    for (i, span) in spans.iter().enumerate() {
+        let from = if i == 0 { 0 } else { spans[i - 1].1 + 1 };
+        let tail_before = spans
+            .get(i + 1)
+            .map_or(span.2.saturating_add(pace_us), |next| next.2);
+        let shape = paced_shape(
+            recs,
+            &|seq| heads.acked.landed(seq),
+            (&raw.sids.0, &raw.sids.1),
+            *span,
+            from,
+            tail_before,
+        );
+        *shapes.entry(shape).or_default() += 1;
+    }
+    let mut shapes: Vec<(String, usize)> = shapes.into_iter().collect();
+    shapes.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+    let first = raw.notes.first().map(|note| seq_of(&note.text));
+    let last = raw.notes.last().map(|note| seq_of(&note.text));
+    let window = first.zip(last).map(|(lo, last)| {
+        let hi = census::covering_commit(recs, group, last, last).map_or(last, |r| r.seq);
+        (lo, hi)
+    });
+    let phase = window.map(|(lo, hi)| census::census(census::window(recs, lo, hi)));
+    let batches: u64 = raw.notes.iter().map(|note| note.batches).sum();
+    let per = |v: usize| (n > 0).then(|| stats::round3(v as f64 / n as f64));
+    let json = json!({
+        "notes": n,
+        "pace_ms": u64::try_from(NOTE_PACE.as_millis()).unwrap_or(u64::MAX),
+        "visible_to_commit_acked_ms": stats::to_json(&visible_to_committed),
+        "broker_batches": batches,
+        "broker_batches_per_note": (n > 0).then(|| stats::round3(batches as f64 / n as f64)),
+        "notes_by_batches": by_batches
+            .iter()
+            .map(|(k, v)| (k.to_string(), json!(v)))
+            .collect::<aterm_json::Map>(),
+        "flushes": flushes_json(raw.flushes, n),
+        "retention_ticks": ticks_json(raw.ticks),
+        "ev_between_delivery_and_commit": {"records": before, "notes_with_any": notes_before, "per_note": per(before)},
+        "ev_in_the_commits_batch": {"records": with, "notes_with_any": notes_with, "per_note": per(with)},
+        "shapes": shapes
+            .iter()
+            .map(|(shape, count)| json!({"shape": shape, "notes": count}))
+            .collect::<Vec<_>>(),
+        "census": match (&phase, window) {
+            (Some(c), Some(w)) => census::to_json(c, n, w),
+            _ => Value::Null,
+        },
+    });
+    let mut md = vec![
+        format!(
+            "## Paced notes: {n} one-way notes, {} ms apart (C13)\n",
+            NOTE_PACE.as_millis()
+        ),
+        format!(
+            "After the burst, A posts `kind=note` to B {n} times, {} ms apart, and B never \
+             answers: each delivery moves B's mail count past the bus mirror's one snapshot a \
+             second, so each owes the mirror B's snapshot, as an agent's delivery does. Each \
+             note waits for its inbox commit, then the rest of its pace. A note's batches are \
+             the writer batches that appended a record from just before its post to just \
+             before the next one's; an `ev` row in the commit's batch is one past the commit \
+             that the visible head passed in the same step as the commit.\n",
+            NOTE_PACE.as_millis()
+        ),
+        "| measure (ms) | n | mean | p50 | p95 | p99 |".to_string(),
+        "|---|---:|---:|---:|---:|---:|".to_string(),
+        stats::row("visible -> the inbox commit acked", &visible_to_committed),
+        String::new(),
+        format!(
+            "Broker batches per note: {} ({batches} over {n}); notes by their batches: {}.\n",
+            per(usize::try_from(batches).unwrap_or(usize::MAX))
+                .map_or("–".to_string(), |v| format!("{v:.3}")),
+            by_batches
+                .iter()
+                .map(|(k, v)| format!("{v} with {k}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        flushes_line(raw.flushes, n),
+        ticks_line(raw.ticks),
+        format!(
+            "`ev` rows between a delivery and its inbox commit: {before}, in {notes_before} of \
+             {n} notes. `ev` rows in the commit's own batch, past it: {with}, in {notes_with} \
+             of {n} notes.\n"
+        ),
+        format!(
+            "Each note's records as the visible head took them (`|` between its steps, `+` \
+             within one, `note` the delivery, `evA`/`evB` the sender's and the recipient's \
+             mirror rows; after `||`, what landed past the commit's step before the next \
+             post): {}.\n",
+            shapes
+                .iter()
+                .map(|(shape, count)| format!("`{shape}` {count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    ];
+    if let (Some(c), Some((lo, hi))) = (&phase, window) {
+        md.push(format!(
+            "Records the broker wrote per note (offsets {lo}..={hi}, through the commit covering \
+             the last one):\n"
+        ));
+        md.extend(census::rows(c, n));
+        md.push(String::new());
+    }
+    (json, md)
+}
+
 /// What a world's broker serves, in one line for its section.
 fn served_line(w: &World, spec: &Spec) -> String {
     served_line_of(
@@ -1160,7 +1462,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "fabric bench: latency, {} round trips ({} warm-up)",
         spec.samples, spec.warmup
     );
-    let ((lat_raw, bur), heads) = sampled(&w, clock, || {
+    let ((lat_raw, bur, paced_raw), heads) = sampled(&w, clock, || {
         let broker = w.broker.as_ref().expect("the world serves its own broker");
         let lat = latency(&w, broker, spec, clock, &a, &b);
         eprintln!(
@@ -1169,8 +1471,16 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             spec.burst_senders()
         );
         let bur = burst(&w, broker, spec, clock, &a, &b, lat.since);
+        let paced = (spec.paced_notes > 0).then(|| {
+            eprintln!(
+                "fabric bench: paced notes, {} one-way notes {} ms apart",
+                spec.paced_notes,
+                NOTE_PACE.as_millis()
+            );
+            paced_notes(&w, broker, spec, clock, &a, &b)
+        });
         await_durable(broker);
-        (lat, bur)
+        (lat, bur, paced)
     });
     let cal_after = calibrate(&ruler, &w.node, clock, &mut cal_seq);
     let unit = yardstick(&cal_before, &cal_after);
@@ -1301,6 +1611,9 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     let deliver_x = per_unit(p50(&deliver), unit);
     let burst_ms_per_message = after(Some(t_all_visible)).map(|t| t / n as f64);
     let burst_x = per_unit(burst_ms_per_message, unit);
+    let (paced_json, paced_md) = paced_raw.as_ref().map_or((Value::Null, Vec::new()), |raw| {
+        paced_report(raw, &recs, &group, &heads, seq_of)
+    });
 
     let json = json!({
         "node": w.node.clone(),
@@ -1360,6 +1673,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "post_to_durable_head_ms": stats::to_json(&b_to_durable),
             "census": census::to_json(&b_census, n, (b_lo, b_hi)),
         },
+        "paced_notes": paced_json,
     });
 
     let fmt_ms = |v: Option<f64>| v.map_or("not seen".to_string(), |v| format!("{v:.1}"));
@@ -1465,6 +1779,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     ]);
     md.extend(census::rows(&b_census, n));
     md.push(String::new());
+    md.extend(paced_md);
     md.extend(yardstick_rows(&ruler, &cal_before, &cal_after));
     md.extend([format!(
         "Normalized to the strict yardstick's p50 ({} ms): post -> visible p50 = **{} \
@@ -2579,5 +2894,50 @@ mod tests {
         ];
         let found = attach_rows(&node_last, node, std::slice::from_ref(&sa), 80).expect("complete");
         assert_eq!((found.last(), found.last_session()), (21, Some(20)));
+    }
+
+    /// A paced note's shape names its records in the visible head's steps: a record ahead of
+    /// the delivery only when it landed after the post call (the one before is the previous
+    /// note's), the commit's step with the recipient's snapshot in it, and, after `||`, what
+    /// landed past that step before the next post call, and nothing after it.
+    #[test]
+    fn a_paced_notes_shape_is_its_records_by_the_heads_steps() {
+        use super::*;
+
+        let rec = |seq: u64, subject: &str, commit: bool| Rec {
+            seq,
+            producer: (1, seq),
+            subject: subject.to_string(),
+            text: String::new(),
+            head: String::new(),
+            commit: commit.then(|| ("/f/f1/cur/n-x/node/inbox".to_string(), 10)),
+        };
+        let recs = [
+            rec(9, "/f/f1/pub/n-x/s-a/ev", false),
+            rec(10, "/f/f1/in/n-x/s-b", false),
+            rec(11, "/f/f1/pub/n-x/s-a/ev", false),
+            rec(12, "/a/commit", true),
+            rec(13, "/f/f1/pub/n-x/s-b/ev", false),
+            rec(14, "/f/f1/pub/n-x/s-b/presence", false),
+            rec(15, "/f/f1/pub/n-x/s-a/ev", false),
+        ];
+        // When the visible head passed each offset: 9 before the post call at 100, 12 and 13
+        // in one step, 14 at 500, 15 at 1200.
+        let landed = |seq: u64| match seq {
+            9 => Some(90),
+            10 => Some(120),
+            11 => Some(150),
+            12 | 13 => Some(300),
+            14 => Some(500),
+            15 => Some(1200),
+            _ => None,
+        };
+        let shape = paced_shape(&recs, &landed, ("s-a", "s-b"), (10, 13, 100), 0, 1000);
+        assert_eq!(shape, "note | evA | commit+evB || presence");
+        let alone = paced_shape(&recs, &landed, ("s-a", "s-b"), (10, 13, 100), 0, 400);
+        assert_eq!(
+            alone, "note | evA | commit+evB",
+            "nothing past the step landed by then"
+        );
     }
 }

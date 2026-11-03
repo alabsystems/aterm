@@ -244,10 +244,12 @@ fn the_marker_is_the_package_layout_and_the_alab_build_record() {
     let vendor = d.join("vendor");
     package(&vendor, "0.164.0", b"x", false);
     assert!(!is_alab_package(&vendor));
+    assert_eq!(package_version(&vendor), None);
     let dir_marker = d.join("dir-marker");
     package(&dir_marker, "0.1.0-dev.1+g0", b"x", false);
     std::fs::create_dir_all(dir_marker.join(ALAB_BUILD_JSON)).unwrap();
     assert!(!is_alab_package(&dir_marker));
+    assert_eq!(package_version(&dir_marker), None);
     #[cfg(unix)]
     {
         let linked_marker = d.join("linked-marker");
@@ -261,6 +263,27 @@ fn the_marker_is_the_package_layout_and_the_alab_build_record() {
             !is_alab_package(&linked_marker),
             "a symlinked record is no record"
         );
+        let linked_bin = d.join("linked-bin-dir");
+        std::fs::create_dir_all(&linked_bin).unwrap();
+        std::os::unix::fs::symlink(alab.join("bin"), linked_bin.join("bin")).unwrap();
+        std::fs::write(
+            linked_bin.join(PACKAGE_JSON),
+            package_json_naming("0.1.0-dev.1+g0", "bin/codex"),
+        )
+        .unwrap();
+        std::fs::write(linked_bin.join(ALAB_BUILD_JSON), br#"{"source":"0"}"#).unwrap();
+        assert!(
+            !is_alab_package(&linked_bin),
+            "a symlinked bin directory is no package entrypoint directory"
+        );
+        assert_eq!(package_link_bin("codex", &linked_bin), None);
+        let linked_root = d.join("linked-root");
+        std::os::unix::fs::symlink(&alab, &linked_root).unwrap();
+        assert!(
+            !is_alab_package(&linked_root),
+            "a symlinked package root is no package"
+        );
+        assert_eq!(package_link_bin("codex", &linked_root), None);
     }
     let no_entry = d.join("no-entry");
     package(&no_entry, "0.1.0-dev.1+g0", b"x", true);
@@ -270,6 +293,13 @@ fn the_marker_is_the_package_layout_and_the_alab_build_record() {
         r#"{"layoutVersion":2,"entrypoint":"bin/codex"}"#,
         r#"{"layoutVersion":1,"entrypoint":"../bin/codex"}"#,
         r#"{"layoutVersion":1,"entrypoint":"/bin/codex"}"#,
+        r#"{"layoutVersion":1,"entrypoint":"./bin/codex"}"#,
+        r#"{"layoutVersion":1,"entrypoint":"bin/./codex"}"#,
+        r#"{"layoutVersion":1,"entrypoint":"bin//codex"}"#,
+        r#"{"layoutVersion":1,"entrypoint":"bin/codex/"}"#,
+        r#"{"layoutVersion":1,"entrypoint":"bin\\codex"}"#,
+        r#"{"layoutVersion":1,"entrypoint":""}"#,
+        r#"{"layoutVersion":1,"entrypoint":"."}"#,
         r#"{"layoutVersion":1}"#,
         "not json",
     ] {
@@ -281,12 +311,6 @@ fn the_marker_is_the_package_layout_and_the_alab_build_record() {
         package_entrypoint(r#"{"layoutVersion":1,"entrypoint":"bin/codex"}"#),
         Some(PathBuf::from("bin/codex"))
     );
-    std::fs::write(
-        alab.join(PACKAGE_JSON),
-        r#"{"layoutVersion":1,"entrypoint":""}"#,
-    )
-    .unwrap();
-    assert!(!is_alab_package(&alab));
 }
 
 #[test]
@@ -415,6 +439,12 @@ fn the_upstream_is_read_off_the_record_whole_or_not_at_all() {
         ),
         format!(
             r#"{{"release":"rust-v0.163.0","commit":"{sha}","commit_date":"2026-1O-20T13:50:13Z"}}"#
+        ),
+        format!(
+            r#"{{"release":"rust-v0.163.0","commit":"{sha}","commit_date":"2026-00-20T13:50:13Z"}}"#
+        ),
+        format!(
+            r#"{{"release":"rust-v0.163.0","commit":"{sha}","commit_date":"2026-10-20T25:50:13Z"}}"#
         ),
         format!(r#"{{"release":"rust-v0.163.0","commit":"{sha}","commit_date":20261020}}"#),
         format!(r#"{{"release":"rust-v0.163.0","commit":"{sha}","commit_date":null}}"#),
@@ -651,6 +681,26 @@ fn an_alab_row_is_named_alab_build_and_a_vendor_row_its_vendor() {
         build_words(&l, "codex", BUILD),
         format!("ALab build 0.164.0-dev.{BUILD}+gabc (build {BUILD})")
     );
+    let rebuilt = crate::status::store_row(&l, "codex", BUILD);
+    assert_eq!(rebuilt.installed_build, Some(BUILD));
+    assert!(
+        crate::state::is_managed(&rebuilt.state),
+        "{}",
+        rebuilt.state
+    );
+    assert!(
+        crate::state::is_alab_kept(&rebuilt.state),
+        "{}",
+        rebuilt.state
+    );
+    assert_eq!(
+        crate::state::source_words("codex", &rebuilt.state, 0),
+        "ALab build"
+    );
+    assert!(rebuilt.tree_root.is_empty());
+    let root = "a".repeat(64);
+    crate::vendor_direct::ProgramStamp::record_legacy_root(&l, "codex", BUILD, &root).unwrap();
+    assert_eq!(crate::status::store_row(&l, "codex", BUILD).tree_root, root);
 }
 
 #[test]
@@ -1372,7 +1422,18 @@ fn the_pairing_reads_the_records_aterm_min_and_names_no_floor_of_its_own() {
         Some((0, 110, 0))
     );
     assert_eq!(parse_aterm_version("1.2.3-dev.4"), Some((1, 2, 3)));
-    for bad in ["", "0.110", "0.110.0.1", "v0.110.0", "0.x.0", "0..0"] {
+    for bad in [
+        "",
+        "0.110",
+        "0.110.0.1",
+        "v0.110.0",
+        "0.x.0",
+        "0..0",
+        "0.01.0",
+        "0.110.0-",
+        "0.110.0+",
+        "0.110.0+bad space",
+    ] {
         assert_eq!(parse_aterm_version(bad), None, "{bad:?}");
     }
     assert_eq!(
@@ -1519,7 +1580,23 @@ fn a_vendor_choice_never_writes_through_a_link() {
     );
     assert!(result.is_err(), "an existing linked marker must be refused");
     assert!(!vendor_chosen(&l, "codex"));
+    assert!(!clear_vendor_choice(&l, "codex"));
     assert_eq!(std::fs::read_link(&marker).unwrap(), target);
+    std::fs::remove_file(&marker).unwrap();
+
+    let foreign_sources = l.prefix.join("foreign-sources");
+    std::fs::create_dir_all(&foreign_sources).unwrap();
+    std::fs::write(foreign_sources.join("codex.vendor"), b"").unwrap();
+    let sources_dir = l.prefix.join("sources");
+    std::fs::remove_dir(&sources_dir).unwrap();
+    std::os::unix::fs::symlink(&foreign_sources, &sources_dir).unwrap();
+    assert!(
+        !vendor_chosen(&l, "codex"),
+        "a symlinked sources directory is not a choice directory"
+    );
+    assert!(choose_vendor(&l, "codex").is_err());
+    assert!(!clear_vendor_choice(&l, "codex"));
+    assert!(foreign_sources.join("codex.vendor").exists());
 }
 
 /// CODEX-ALAB'S COMPOUND VERSION (codex-alab `alab/README.md`, Decision 8, 2026-10-24): its own
@@ -1670,4 +1747,26 @@ fn a_compound_package_is_read_verbatim_and_its_baseline_field_changes_nothing() 
         upstream_of(&root).map(|u| u.words()).as_deref(),
         Some("based on upstream rust-v0.163.0+g0123456789ab")
     );
+}
+
+#[test]
+fn vendor_choice_steers_watch_and_have_words_while_an_alab_build_is_active() {
+    let l = scratch("watch-and-have-words");
+    store_build(&l, BUILD, true);
+    let spec = crate::vendor_direct::spec("codex").unwrap();
+    assert_eq!(
+        crate::vendor_direct::have_words(&l, "codex", Some(BUILD)),
+        build_words(&l, "codex", BUILD)
+    );
+    assert!(
+        !crate::vendor_direct::watch::follows_vendor(&l, spec),
+        "an ALab build without vendor_chosen follows ALab's channel, not the vendor"
+    );
+    choose_vendor(&l, "codex").unwrap();
+    assert!(
+        crate::vendor_direct::watch::follows_vendor(&l, spec),
+        "choosing the vendor source makes HeadWatch follow the vendor even while an ALab build is active"
+    );
+    clear_vendor_choice(&l, "codex");
+    assert!(!crate::vendor_direct::watch::follows_vendor(&l, spec));
 }

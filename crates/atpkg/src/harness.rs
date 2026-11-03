@@ -103,12 +103,23 @@ fn harness_version_valid(version: &str, source: Option<&str>, require_stamp: boo
     true
 }
 
+/// Whether `s` is a lowercase hexadecimal digest of `len` bytes.
+fn hex_len(s: &str, len: usize) -> bool {
+    s.len() == len
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// A local harness artifact's validated `(version, bin/<command>)` from [`LOCAL_BUILD_JSON`].
 fn local_build_manifest(
     root: &std::path::Path,
     program: &str,
 ) -> Option<(String, std::path::PathBuf)> {
     if !is_harness(program) {
+        return None;
+    }
+    let root_meta = std::fs::symlink_metadata(root).ok()?;
+    if !root_meta.file_type().is_dir() || crate::platform::is_reparse(&root_meta) {
         return None;
     }
     let text = crate::metadata_io::read_bounded_regular_utf8(
@@ -124,11 +135,48 @@ fn local_build_manifest(
         return None;
     }
     let command = v.get("command").and_then(aterm_json::Value::as_str)?;
+    if command != default_harness_tool(program) {
+        return None;
+    }
     crate::store::ToolName::new(command)?;
+    if let Some(build) = v.get("build_number")
+        && build.as_u64().is_none_or(|n| n == 0)
+    {
+        return None;
+    }
     if let Some(policy) = v.get("source_policy")
         && policy.as_str() != Some("clean-main")
     {
         return None;
+    }
+    if let Some(target) = v.get("target")
+        && target.as_str() != Some(crate::cli::current_triple())
+    {
+        return None;
+    }
+    if let Some(policy) = v.get("policy")
+        && !matches!(policy.as_str(), Some("repository" | "unverified"))
+    {
+        return None;
+    }
+    if let Some(profile) = v.get("profile")
+        && !matches!(profile.as_str(), Some("release" | "dev"))
+    {
+        return None;
+    }
+    if let Some(compiler) = v.get("compiler")
+        && !compiler.as_str().is_some_and(|c| hex_len(c, 40))
+    {
+        return None;
+    }
+    for key in ["sysroot", "checkout", "logs"] {
+        if let Some(path) = v.get(key)
+            && !path
+                .as_str()
+                .is_some_and(|s| std::path::Path::new(s).is_absolute() && !s.contains('\0'))
+        {
+            return None;
+        }
     }
     if let Some(exposes) = v.get("exposes") {
         let [only] = exposes.as_array()?.as_slice() else {
@@ -138,9 +186,14 @@ fn local_build_manifest(
             return None;
         }
     }
+    let bin_meta = std::fs::symlink_metadata(root.join("bin")).ok()?;
+    if !bin_meta.file_type().is_dir() || crate::platform::is_reparse(&bin_meta) {
+        return None;
+    }
     let entry = std::path::Path::new("bin").join(command);
-    let meta = std::fs::symlink_metadata(root.join(&entry)).ok()?;
-    if !meta.file_type().is_file() {
+    let exe_path = root.join(&entry);
+    let meta = std::fs::symlink_metadata(&exe_path).ok()?;
+    if !meta.file_type().is_file() || crate::platform::is_reparse(&meta) || meta.len() == 0 {
         return None;
     }
     if let Some(executables) = v.get("executables") {
@@ -151,12 +204,9 @@ fn local_build_manifest(
         let size = exe.get("size").and_then(aterm_json::Value::as_u64)?;
         let sha256 = exe.get("sha256").and_then(aterm_json::Value::as_str)?;
         if exe.get("path").and_then(aterm_json::Value::as_str) != Some(expected_path.as_str())
-            || size == 0
             || size != meta.len()
-            || sha256.len() != 64
-            || !sha256
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || !hex_len(sha256, 64)
+            || crate::sha256_file(&exe_path).ok().as_deref() != Some(sha256)
         {
             return None;
         }
@@ -188,6 +238,30 @@ pub fn local_build_version_of_exe(exe: &std::path::Path, program: &str) -> Optio
     })
 }
 
+/// The default exposed tool name for a harness `program` (`claude-alab` for `claude-code-alab`,
+/// `program` for all other `-alab` harnesses).
+pub(crate) const fn default_harness_tool(program: &str) -> &str {
+    match program.as_bytes() {
+        b"claude-code-alab" => "claude-alab",
+        _ => program,
+    }
+}
+
+/// The producer-stamped version of the local harness artifact that `program`'s current
+/// development link selects, or `None` when `program` is not a live dev-linked harness artifact.
+#[must_use]
+pub fn linked_local_build_version(layout: &crate::store::Layout, program: &str) -> Option<String> {
+    if !is_harness(program) {
+        return None;
+    }
+    let checkout = crate::linkmode::live_linked_checkout(layout, program).ok()??;
+    let (version, entry) = local_build_manifest(&checkout, program)?;
+    let tool = entry.file_name()?.to_str()?;
+    let exe = crate::ops::which(layout, tool)?.canonicalize().ok()?;
+    (std::fs::canonicalize(checkout.join(entry)).ok().as_deref() == Some(exe.as_path()))
+        .then_some(version)
+}
+
 /// The recorded store version for a ready harness build of `program` whose exposed executable is
 /// `exe`, independent of the currently selected store build or development link.
 #[must_use]
@@ -212,18 +286,27 @@ pub fn store_build_version_of_exe(
         return None;
     }
     let tool = crate::store::ToolName::new(parts.next()?.as_os_str().to_str()?)?;
-    if parts.next().is_some() {
+    if parts.next().is_some() || tool.as_str() != default_harness_tool(program) {
         return None;
     }
     let dir = layout.build_dir(program, build);
-    if !crate::store::build_is_complete(&dir) {
+    let dir_meta = std::fs::symlink_metadata(&dir).ok()?;
+    let bin_meta = std::fs::symlink_metadata(dir.join("bin")).ok()?;
+    let exe_meta = std::fs::symlink_metadata(dir.join("bin").join(tool.as_str())).ok()?;
+    if !dir_meta.file_type().is_dir()
+        || crate::platform::is_reparse(&dir_meta)
+        || !bin_meta.file_type().is_dir()
+        || crate::platform::is_reparse(&bin_meta)
+        || !exe_meta.file_type().is_file()
+        || crate::platform::is_reparse(&exe_meta)
+        || exe_meta.len() == 0
+        || !crate::store::build_is_complete(&dir)
+    {
         return None;
     }
-    if let Some(exposes) = crate::store::recorded_exposes(&dir) {
-        if !exposes.contains(&tool) {
-            return None;
-        }
-    } else if tool.as_str() != program {
+    if let Some(exposes) = crate::store::recorded_exposes(&dir)
+        && exposes.as_slice() != [tool]
+    {
         return None;
     }
     let version = crate::store::recorded_version(&dir)?;
@@ -271,10 +354,20 @@ pub fn installed(layout: &crate::store::Layout) -> Vec<Installed> {
             let agent = crate::alab::agent(program);
             let harness = agent.map_or(program, |a| a.repo).to_string();
             if let Some(checkout) = crate::linkmode::linked_checkout(layout, program) {
-                let version = if agent.is_some() {
-                    crate::alab::package_version(&checkout)
+                let tool = if agent.is_some() {
+                    program
                 } else {
-                    local_build_version(&checkout, program)
+                    default_harness_tool(program)
+                };
+                let version = match crate::ops::which(layout, tool) {
+                    Some(_) if agent.is_some() => {
+                        crate::alab::linked_package_version(layout, program)
+                    }
+                    Some(_) => linked_local_build_version(layout, program),
+                    None if agent.is_some() => crate::alab::is_alab_package(&checkout)
+                        .then(|| crate::alab::package_version(&checkout))
+                        .flatten(),
+                    None => local_build_version(&checkout, program),
                 };
                 return Some(Installed {
                     harness,
@@ -502,6 +595,11 @@ mod tests {
             .unwrap();
         assert_eq!(kimi_stamped.version.as_deref(), Some("0.1.0+gaa5d5fe00"));
         assert_eq!(
+            linked_local_build_version(&l, "kimi-alab").as_deref(),
+            Some("0.1.0+gaa5d5fe00")
+        );
+        assert_eq!(linked_local_build_version(&l, "codex"), None);
+        assert_eq!(
             local_build_version_of_exe(&checkout.join("bin/kimi-alab"), "kimi-alab").as_deref(),
             Some("0.1.0+gaa5d5fe00")
         );
@@ -517,8 +615,17 @@ mod tests {
             r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","source":"1111111111111111111111111111111111111111","version":"0.1.0+gaa5d5fe00"}"#,
             r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","source":123,"version":"0.1.0+gaa5d5fe00"}"#,
             r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","source_policy":"dirty","version":"0.1.0+gaa5d5fe00"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","target":"another-target","version":"0.1.0+gaa5d5fe00"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","policy":"signed","version":"0.1.0+gaa5d5fe00"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","profile":"bench","version":"0.1.0+gaa5d5fe00"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","compiler":"short","version":"0.1.0+gaa5d5fe00"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","checkout":"relative/path","version":"0.1.0+gaa5d5fe00"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","build_number":0,"version":"0.1.0+gaa5d5fe00"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","build_number":"1","version":"0.1.0+gaa5d5fe00"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"other","version":"0.1.0+gaa5d5fe00"}"#,
             r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","exposes":["other"],"version":"0.1.0+gaa5d5fe00"}"#,
             r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","executables":[{"path":"bin/kimi-alab","size":999,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}],"version":"0.1.0+gaa5d5fe00"}"#,
+            r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","executables":[{"path":"bin/kimi-alab","size":17,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}],"version":"0.1.0+gaa5d5fe00"}"#,
         ] {
             std::fs::write(checkout.join(LOCAL_BUILD_JSON), bad).unwrap();
             assert_eq!(
@@ -527,5 +634,126 @@ mod tests {
                 "malformed version or source mismatch is refused: {bad}"
             );
         }
+        let kimi_sha = crate::sha256_file(&checkout.join("bin/kimi-alab")).unwrap();
+        std::fs::write(
+            checkout.join(LOCAL_BUILD_JSON),
+            format!(
+                r#"{{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","target":{:?},"policy":"unverified","profile":"release","compiler":"20565c3255adf151f9eb920e89cdf83c38f84abe","executables":[{{"path":"bin/kimi-alab","size":17,"sha256":{:?}}}],"version":"0.1.0+gaa5d5fe00"}}"#,
+                crate::cli::current_triple(),
+                kimi_sha
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            local_build_version(&checkout, "kimi-alab").as_deref(),
+            Some("0.1.0+gaa5d5fe00")
+        );
+
+        #[cfg(unix)]
+        {
+            let sym_checkout = l.prefix.join("kimi-sym-bin");
+            std::fs::create_dir_all(&sym_checkout).unwrap();
+            std::os::unix::fs::symlink(checkout.join("bin"), sym_checkout.join("bin")).unwrap();
+            std::fs::write(
+                sym_checkout.join(LOCAL_BUILD_JSON),
+                r#"{"schema":2,"origin":"local-build","program":"kimi-alab","command":"kimi-alab","version":"0.1.0+gaa5d5fe00"}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                local_build_version(&sym_checkout, "kimi-alab"),
+                None,
+                "symlinked bin/ directory in local-build root is refused"
+            );
+        }
+
+        // claude-code-alab's exposed tool is claude-alab, not claude-code-alab.
+        let cc_checkout = l.prefix.join("claude-checkout");
+        std::fs::create_dir_all(cc_checkout.join("bin")).unwrap();
+        let cc_exe = cc_checkout.join("bin/claude-alab");
+        std::fs::write(&cc_exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&cc_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(
+            cc_checkout.join(LOCAL_BUILD_JSON),
+            r#"{"schema":2,"origin":"local-build","program":"claude-code-alab","command":"claude-alab","version":"0.8.0+g123456789"}"#,
+        )
+        .unwrap();
+        crate::linkmode::link(
+            &l,
+            "claude-code-alab",
+            &cc_checkout,
+            &[std::path::PathBuf::from("bin/claude-alab")],
+        )
+        .unwrap();
+        assert_eq!(
+            linked_local_build_version(&l, "claude-code-alab").as_deref(),
+            Some("0.8.0+g123456789")
+        );
+        let cc_row = installed(&l)
+            .into_iter()
+            .find(|r| r.harness == "claude-code-alab")
+            .unwrap();
+        assert_eq!(cc_row.version.as_deref(), Some("0.8.0+g123456789"));
+
+        let cc_store = l.build_dir("claude-code-alab", 5);
+        std::fs::create_dir_all(cc_store.join("bin")).unwrap();
+        let cc_store_exe = cc_store.join("bin/claude-alab");
+        let cc_wrong_exe = cc_store.join("bin/claude-code-alab");
+        std::fs::write(&cc_store_exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&cc_wrong_exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        crate::store::mark_build_ready(&cc_store).unwrap();
+        crate::store::write_version(&cc_store, "0.8.0+g987654321").unwrap();
+        assert_eq!(
+            store_build_version_of_exe(&l, "claude-code-alab", &cc_store_exe).as_deref(),
+            Some("0.8.0+g987654321")
+        );
+        assert_eq!(
+            store_build_version_of_exe(&l, "claude-code-alab", &cc_wrong_exe),
+            None,
+            "claude-code-alab exposes claude-alab, not claude-code-alab"
+        );
+        std::fs::write(
+            cc_store.with_extension("exposes"),
+            b"exposes v1\nclaude-code-alab\n",
+        )
+        .unwrap();
+        assert_eq!(
+            store_build_version_of_exe(&l, "claude-code-alab", &cc_wrong_exe),
+            None,
+            "a forged exposes sidecar cannot admit claude-code-alab as the exposed tool"
+        );
+        std::fs::write(
+            cc_store.with_extension("exposes"),
+            b"exposes v1\nclaude-alab\nother\n",
+        )
+        .unwrap();
+        assert_eq!(
+            store_build_version_of_exe(&l, "claude-code-alab", &cc_store_exe),
+            None,
+            "a multi-entry exposes sidecar is refused for a single-tool harness build"
+        );
+        std::fs::write(
+            cc_store.with_extension("exposes"),
+            b"exposes v1\nclaude-alab\n",
+        )
+        .unwrap();
+        assert_eq!(
+            store_build_version_of_exe(&l, "claude-code-alab", &cc_store_exe).as_deref(),
+            Some("0.8.0+g987654321")
+        );
+        std::fs::write(cc_checkout.join("bin/claude-code-alab"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(
+            cc_checkout.join(LOCAL_BUILD_JSON),
+            r#"{"schema":2,"origin":"local-build","program":"claude-code-alab","command":"claude-code-alab","version":"0.8.0+g123456789"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            local_build_version(&cc_checkout, "claude-code-alab"),
+            None,
+            "claude-code-alab local receipt naming command claude-code-alab is refused"
+        );
     }
 }

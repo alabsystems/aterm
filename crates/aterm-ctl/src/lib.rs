@@ -25,6 +25,7 @@ pub mod askpass;
 pub use askpass::main_entry as askpass_main_entry;
 pub mod census;
 mod conn;
+mod sudo_run;
 pub use conn::conn_main_entry;
 pub use conn::resource_run_main_entry;
 mod await_legs;
@@ -182,12 +183,14 @@ OUTPUT:
 STDIN PAYLOADS:
     Inline arguments are joined with single spaces and may not contain a
     newline or carriage return. These forms read STDIN instead, every byte
-    kept:
+    kept except where `send -` says:
     feed-bin      feed the STDIN bytes (<= 256 KiB) to the PTY verbatim (a
                   length-prefixed frame; no inline argument); prints the
                   server's OK <n> bytes.
     send --stdin | send -
-                  the same raw feed as feed-bin.
+                  send's text from STDIN, by the rule of its inline text: a
+                  trailing newline or \\n (backslash, n) is written as Enter
+                  (CR). feed-bin keeps those bytes.
     paste --stdin | paste -
                   paste the STDIN bytes (<= 256 KiB) with the server's paste
                   handling (control bytes sanitized; ESC[200~/201~ bracketing
@@ -322,7 +325,7 @@ CLIENT VERBS (answered by aterm-ctl itself; not in the protocol table):
                   path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->
                   copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>>
                   land_at=<unix-s|-> task=<open|landed|theirs|->
-                  pause=<unix-s|-> task_state=<working|done|exited|stalled|->
+                  pause=<unix-s|-> task_state=<working|done|exited|stalled|failed|->
                   task_rev=<n>[ *]
                   `help sessions` explains each field. detail=, program= and
                   agent= say whether a peer is another agent: a tab whose
@@ -690,26 +693,47 @@ fn front_door_probe(path: &str) -> Option<String> {
 pub enum FrontDoorAnswer {
     /// No control socket takes a connection: no aterm runs here.
     Absent,
+    /// One takes a connection, from this stopped process, which answers nothing until resumed.
+    Stopped(u32),
     /// One takes a connection but answered nothing within the wait; the process behind it, where the socket names one.
     Silent(Option<u32>),
     /// Its first reply line, trimmed.
     Answered(String),
 }
 
-/// Hand `request` to the instance a front-door request goes to, each step of it waited for at most `within`: whether an aterm runs here and answers, not merely takes a connection.
+/// Hand `request` to the instance a front-door request goes to, each step of it waited for at most `within`: whether an aterm runs here and answers, not merely takes a connection; one stopped is read as that before anything is sent or waited for.
 #[must_use]
 pub fn front_door_ask(request: &str, within: std::time::Duration) -> FrontDoorAnswer {
     match resolve_path(None, None, env::var(SELF_SID_ENV).ok()) {
-        Ok(path) => front_door_ask_at(&aterm_uds::latest::resolve(&path), request, within),
+        Ok(path) => front_door_ask_at(
+            &aterm_uds::latest::resolve(&path),
+            (request, within),
+            aterm_uds::process::is_stopped,
+        ),
         Err(_) => FrontDoorAnswer::Absent,
     }
 }
 
-fn front_door_ask_at(path: &str, request: &str, within: std::time::Duration) -> FrontDoorAnswer {
+/// [`front_door_ask`] at `path`, `stopped` saying whether a process is stopped.
+fn front_door_ask_at(
+    path: &str,
+    (request, within): (&str, std::time::Duration),
+    stopped: impl Fn(u32) -> bool,
+) -> FrontDoorAnswer {
+    // A stopped aterm's socket takes a connection in the kernel and answers nothing: the process
+    // behind it is read first, with nothing sent.
+    let behind =
+        || CtlStream::connect(path).map(|stream| aterm_uds::fdpass::peer_pid(&stream).ok());
+    match behind() {
+        Ok(Some(pid)) if stopped(pid) => return FrontDoorAnswer::Stopped(pid),
+        Ok(_) => {}
+        Err(_) => return FrontDoorAnswer::Absent,
+    }
     match front_door_send_within(path, request, within, within) {
         Ok(line) => FrontDoorAnswer::Answered(line),
-        Err(_) => match CtlStream::connect(path) {
-            Ok(stream) => FrontDoorAnswer::Silent(aterm_uds::fdpass::peer_pid(&stream).ok()),
+        Err(_) => match behind() {
+            Ok(Some(pid)) if stopped(pid) => FrontDoorAnswer::Stopped(pid),
+            Ok(pid) => FrontDoorAnswer::Silent(pid),
             Err(_) => FrontDoorAnswer::Absent,
         },
     }
@@ -3839,6 +3863,17 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         }
     }
 
+    // Before any rewrite of the words: what follows `sudo` is a command, exact, not a request.
+    if let Some(command) = sudo_run::command_words(&request_parts) {
+        if host.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "`sudo` runs on this Mac: its password sheet needs the person at this desk",
+            ));
+        }
+        return sudo_run::run(command, sock, pid);
+    }
+
     // A read's session named after its verb (`text @s-…`, `status s-…`, `read` for `text`)
     // moves in front of it first, so every reader below, `--help` and `--host` included, sees
     // the protocol's one form.
@@ -3987,12 +4022,7 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         && verb_args.len() == 1
         && matches!(verb_args[0].as_str(), "--stdin" | "-")
     {
-        let payload = read_stdin_payload()?;
-        let frame_verb = if verb_tok == Some("paste") {
-            "paste-bin"
-        } else {
-            "feed-bin"
-        };
+        let (frame_verb, payload) = stdin_frame(verb_tok == Some("paste"), read_stdin_payload()?);
         let prefix = binary_frame_prefix(selector, frame_verb);
         return targets.run(|t| feed_bin_exchange(&t.path, t.origin, &prefix, &payload, deadline));
     }
@@ -4217,6 +4247,19 @@ fn oversized_feed_bin_error() -> io::Error {
         io::ErrorKind::InvalidData,
         "stdin payload exceeds the 256 KiB feed-bin cap; split it into smaller frames",
     )
+}
+
+/// The frame `paste -` or `send -` carries its stdin in: a paste is the server's to handle, with
+/// every byte kept; `send` applies the rule its inline text has, so its Enter is one Enter.
+fn stdin_frame(paste: bool, payload: Vec<u8>) -> (&'static str, Vec<u8>) {
+    if paste {
+        ("paste-bin", payload)
+    } else {
+        (
+            "feed-bin",
+            aterm_types::control_request::send_payload(&payload),
+        )
+    }
 }
 
 fn read_stdin_payload() -> io::Result<Vec<u8>> {

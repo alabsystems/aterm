@@ -112,6 +112,18 @@ pub(crate) enum Mutant {
     HeldCommitPastTheFloor,
     /// The wind-down drops a held inbox commit: neither landed nor left for the next bridge.
     DropHeldCommitAtWindDown,
+    /// The bus mirror sends its slots without the inbox commit a round holds, as before
+    /// critic item C13 (`Bridge::mirror_send`): a snapshot a delivery owed lands in a batch
+    /// of its own, and the commit in another once the grace is out.
+    MirrorSendsItsSlotsBare,
+    /// The bus mirror's burst carries only a commit a round already holds
+    /// (`Bridge::take_commit_for_the_mirror`): a pass right after a delivery, before the
+    /// round's settle holds the commit it owes, sends the snapshot bare.
+    MirrorRidesOnlyAHeldCommit,
+    /// Every park that takes nothing sends a held inbox commit, one the bus mirror's pass
+    /// cut short of the grace included (`Bridge::park_and_take`), so a commit that pass
+    /// would carry goes alone.
+    ShortParkSendsTheHeldCommit,
     /// A drain peeks the outbox with a post still in flight, its answer not read first.
     PeekPastOwedPost,
     /// Every read of an owed ack waits for it (`Bridge::try_settle_one`).
@@ -154,6 +166,11 @@ pub(crate) enum Mutant {
     NoSubjectRetire,
     /// The sweep gives a subject back with the unconditional `/a/retire`, whatever landed on it since it read it.
     RetireUnconditionally,
+    /// The first start of a boot sweeps the files an earlier boot's sessions left and retires
+    /// none of their post reservations, as before item C14
+    /// (`StateDir::sweep_sessions_of_an_earlier_boot`): a post whose `outbox sent` a power cut
+    /// stopped holds its session, and the subjects it names, back from the budget for good.
+    KeepEarlierBootReservations,
     /// An in-flight entry is published again at its pinned sequence without reading its
     /// record back first (`Bridge::landed_since`), trusting astream's dedup past a cut.
     ReplayWithoutReadingBack,
@@ -3118,6 +3135,7 @@ impl World {
         if self.opts.topics {
             bad.extend(self.topic_rows());
         }
+        bad.extend(self.routed_after_exit());
         let gone = self.core.broker.gone();
         for (marker, records) in self.bus_markers() {
             // Every copy but the newest given up by retention (sim item B05): the replay of an
@@ -3156,6 +3174,37 @@ impl World {
                 self.violations.push(b);
             }
         }
+    }
+
+    /// THE DOOR LOOKS BEFORE IT COMMITS (69979209f1): a post first listed after its recipient
+    /// left is published to that recipient's lane on this node, where nothing would read it and
+    /// its sender would be told it landed, by no bridge still holding the roster that names it
+    /// ([`super::endpoint::EpState::listed_after_exit`]).
+    fn routed_after_exit(&self) -> Vec<String> {
+        let listed = lock(&self.ep.state).listed_after_exit.clone();
+        if listed.is_empty() {
+            return Vec::new();
+        }
+        let lanes = format!("/f/{FLEET}/in/{NODE}/");
+        self.log()
+            .iter()
+            .enumerate()
+            .filter(|(_, rec)| !rec.hidden)
+            .filter_map(|(off, rec)| {
+                let sid = rec
+                    .subject
+                    .strip_prefix(lanes.as_str())?
+                    .split('/')
+                    .next()?;
+                let marker = &rec.fabric().text;
+                (listed.get(marker).map(String::as_str) == Some(sid)).then(|| {
+                    format!(
+                        "routing: {marker} was first listed after {sid} left, and landed on \
+                         its lane @{off}"
+                    )
+                })
+            })
+            .collect()
     }
 
     /// THE RECLAIM, AT EVERY RETIRE (sim item B02): the node gives back only what a
@@ -3812,6 +3861,151 @@ pub(crate) fn run_reclaim(opts: &Opts, n: usize, revive: bool) -> Reclaimed {
         revived,
         trace,
         journal,
+    }
+}
+
+/// What [`run_reclaim_across_a_cut`] found.
+#[derive(Debug)]
+pub(crate) struct ReclaimedAcrossACut {
+    pub(crate) violations: Vec<String>,
+    /// The sender's post was on the bus and reserved, its retire not landed, when the power went.
+    pub(crate) pinned_at_the_cut: bool,
+    /// The two sessions' subjects this node is charged for (each one's presence row and the
+    /// lane this node wrote to it), each with whether the last-value index held it when the
+    /// power went and once the next boot's reclaim was due.
+    pub(crate) subjects: Vec<(String, bool, bool)>,
+    pub(crate) trace: Vec<String>,
+}
+
+/// A RESERVATION A POWER CUT LEFT (item C14): aterm opens two sessions beside its two; the
+/// second mails the first, then the first's post to the second is pinned and lands, but its
+/// retire does not (aterm answers its `outbox sent` as for a session it no longer finds,
+/// [`super::endpoint::EpState::unretired`]) before the power goes, the state dir's device
+/// keeping every write. The next boot's bridge runs until its reclaim's wait has passed twice
+/// over after the ghost sweep's: its first start's sweep of the earlier boot retires that
+/// reservation, so neither the sender nor the lane its post named is owed, and the reclaim
+/// gives both sessions' presence rows and lanes back. Every law of a world and every retire's
+/// ([`World::judge_retire`]) holds throughout.
+pub(crate) fn run_reclaim_across_a_cut(opts: &Opts) -> ReclaimedAcrossACut {
+    let _slot = WorldSlot::take();
+    let mut w = World::new(Opts {
+        lossless_device: true,
+        ..opts.clone()
+    });
+    w.launch();
+    w.settle();
+    let (sender, recipient) = (w.open_session(), w.open_session());
+    w.settle();
+    let (Some(from), Some(to)) = (w.ep.sid(sender), w.ep.sid(recipient)) else {
+        unreachable!("the two sessions just opened are hosted");
+    };
+    w.post_as(
+        recipient,
+        &to,
+        &format!("@{from}"),
+        "note",
+        Some(from.clone()),
+    );
+    w.settle();
+    lock(&w.ep.state).unretired.insert(from.clone());
+    w.post_as(sender, &from, &format!("@{to}"), "note", Some(to.clone()));
+    let marker = format!("m{}", w.marker);
+    let id = w
+        .sent
+        .get(&marker)
+        .and_then(|s| s.post.as_ref())
+        .map(|(_, id)| *id);
+    // Until the bridge asked aterm to retire the post (its publish answered), which aterm did not.
+    let asked = id.map(|id| format!("ctl outbox sent {from} {id} "));
+    for _ in 0..1_000 {
+        if asked
+            .as_ref()
+            .is_none_or(|asked| w.core.trace().iter().any(|l| l.starts_with(asked)))
+        {
+            break;
+        }
+        if w.live.is_none() {
+            break;
+        }
+        match w.core.readable().first() {
+            Some(&(conn, _)) => {
+                w.core.pump(conn);
+            }
+            None => w.pass(),
+        }
+        w.collect_notes();
+        w.check_always();
+    }
+    let pinned = id.is_some_and(|id| {
+        crate::state::StateDir::peek(&w.cfg.state_dir)
+            .post_pin(&from, id)
+            .is_ok_and(|pin| pin.is_some())
+    });
+    let unretired = lock(&w.ep.state)
+        .sessions
+        .values()
+        .filter(|x| x.sid == from)
+        .flat_map(|x| &x.posts)
+        .any(|p| Some(p.id) == id && p.retired.is_none());
+    let pinned_at_the_cut = pinned && unretired && w.bus_markers().contains_key(&marker);
+    let subjects: Vec<String> = [&from, &to]
+        .into_iter()
+        .flat_map(|sid| {
+            [
+                crate::subject::session_face(FLEET, NODE, sid, "presence"),
+                crate::subject::post_lane(FLEET, NODE, sid, NODE, "note"),
+            ]
+        })
+        .collect();
+    let at_the_cut: Vec<bool> = subjects
+        .iter()
+        .map(|s| w.core.broker.last_row(s).is_some())
+        .collect();
+    w.power_cut();
+    // The ghost sweep's patience, then the reclaim's (the same wait), each judged at a sweep.
+    let wait = 2 * crate::bridge::RECLAIM_AFTER + crate::bridge::GHOST_SWEEP;
+    let until = w.core.elapsed() + 2 * wait;
+    for _ in 0..100_000 {
+        if w.core.elapsed() >= until {
+            break;
+        }
+        if w.live.is_none() {
+            w.launch();
+            continue;
+        }
+        match w.core.readable().first() {
+            Some(&(conn, _)) => {
+                w.core.pump(conn);
+            }
+            None => w.pass(),
+        }
+        w.collect_notes();
+        w.check_always();
+    }
+    if w.core.elapsed() < until {
+        w.violations
+            .push("liveness: the reclaim's wait never passed".to_string());
+    }
+    w.settle();
+    w.collect_notes();
+    w.check_settled();
+    let subjects = subjects
+        .into_iter()
+        .zip(at_the_cut)
+        .map(|(s, then)| {
+            let now = w.core.broker.last_row(&s).is_some();
+            (s, then, now)
+        })
+        .collect();
+    let trace = w.core.trace();
+    if let Some(live) = w.live.take() {
+        live.process.kill();
+    }
+    ReclaimedAcrossACut {
+        violations: w.violations,
+        pinned_at_the_cut,
+        subjects,
+        trace,
     }
 }
 

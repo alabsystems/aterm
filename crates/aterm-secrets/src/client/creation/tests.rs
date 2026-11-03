@@ -447,7 +447,11 @@ fn unfinished_creation_refuses_a_join_and_completed_resume_does_no_outbox_io() {
         "{refused}"
     );
     assert!(config(&paths).unwrap().is_none());
-    finish(&paths, context, pending).unwrap();
+    let created = finish(&paths, context, pending).unwrap();
+    assert_eq!(
+        created.local, None,
+        "the retained founder installs under its writer lock"
+    );
     std::fs::remove_dir_all(paths.dir.join("creation-outbox")).unwrap();
     resume(&paths).unwrap();
     assert!(create(&paths, source.to_str().unwrap(), None, Some("m1")).is_err());

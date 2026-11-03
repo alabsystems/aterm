@@ -166,7 +166,7 @@ fn chrome_reads_the_chip_the_frame_drew() {
     assert_eq!(token(&line, "face"), "land", "{line}");
     assert_eq!(
         drawn(&line).as_deref(),
-        Some("\u{2913} land"),
+        Some("\u{2913}"),
         "the frame drew the new face: {line}"
     );
     assert_eq!(drawn(&line), on_glass(&app, wid, session), "{line}");
@@ -234,7 +234,7 @@ fn a_background_pane_names_no_drawn_chip() {
 
     frame(&mut app, wid);
     let line = line_of(&app, a);
-    assert_eq!(drawn(&line).as_deref(), Some("\u{2913} land"), "{line}");
+    assert_eq!(drawn(&line).as_deref(), Some("\u{2913}"), "{line}");
     assert_eq!(drawn(&line), on_glass(&app, wid, a), "{line}");
 }
 
@@ -750,7 +750,7 @@ fn a_chip_the_rule_did_not_take_names_no_cells() {
     w.note_autopilot(7, None, AutopilotView::Cruise, now);
     w.clear_hits();
     let block = w
-        .lend_block(7, 0, blank, [0, 128, 255], (None, None), 40, None)
+        .lend_block(7, 0, blank, [0, 128, 255], (None, None), (40, true), None)
         .expect("a chip fits in 40 cells");
     w.give_back(block);
     assert_eq!(
@@ -788,7 +788,7 @@ fn a_chip_the_rule_did_not_take_names_no_cells() {
     w.note_autopilot(8, None, AutopilotView::Unhosted, now);
     w.clear_hits();
     assert!(
-        w.lend_block(8, 0, blank, [0, 128, 255], (None, None), 40, None)
+        w.lend_block(8, 0, blank, [0, 128, 255], (None, None), (40, true), None)
             .is_none(),
         "control: no host, no chip"
     );

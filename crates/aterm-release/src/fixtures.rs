@@ -117,7 +117,7 @@ impl Staged {
 #[must_use]
 pub fn staged(root: &Path, pins: &Pins) -> Option<Staged> {
     let at = pins.staged_in(root);
-    if fs::read_to_string(at.join(STAGED_MARK)).ok()? != pins.mark() {
+    if crate::durable::read_text(&at.join(STAGED_MARK)).ok()? != pins.mark() {
         return None;
     }
     let dir = at.join(pins.tag());
@@ -163,7 +163,7 @@ pub fn generator_args() -> Vec<&'static str> {
 ///
 /// # Errors
 /// Each refusal above, no `rendezvous.toml` on macOS, a `targo` that cannot run, an
-/// unreadable handoff guard, and a staging or target directory that cannot be cleared,
+/// unreadable handoff guard, and a staging or target directory that cannot be prepared,
 /// read or written.
 pub fn stage(
     targo: &Path,
@@ -191,13 +191,27 @@ pub fn stage(
     let dir = at.join(pins.tag());
     fs::create_dir_all(&dir).map_err(|e| io("cannot create", &dir, e))?;
     let target = tree.join(HANDOFF_FIXTURE_GUARD_TARGET);
+    match fs::symlink_metadata(&target) {
+        Ok(meta) if !meta.is_dir() => {
+            return Err(Error::new(format!(
+                "handoff fixtures: retained target {} is not a directory",
+                target.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io("cannot read", &target, error)),
+    }
     let unjudged = target.join(UNJUDGED);
+    // A single copy's `ran` marker cannot attest to every program in a Cargo target.
+    clear_marker(&target.join(aterm_uds::deadline::RAN))
+        .map_err(|e| io("cannot clear", &target, e))?;
     if fs::symlink_metadata(&unjudged).is_ok() {
         // The release that ran the generator here ended before it judged the target, so a
         // program built there may never have shown it ran. The run claim keeps a rerun out
         // while that release's child lives, so its run is over by now: the hold runs from
         // here.
-        aterm_uds::deadline::stamp_exec(&target);
+        stamp_hold(&target).map_err(|e| io("cannot renew execution hold", &target, e))?;
         fs::remove_file(&unjudged).map_err(|e| io("cannot remove", &unjudged, e))?;
     }
     if let Some(left) = crate::gates::first_exec_hold(&target) {
@@ -209,11 +223,12 @@ pub fn stage(
             left.as_secs()
         )));
     }
-    crate::gates::clear_path(&target).map_err(|e| io("cannot clear", &target, e))?;
     // Stamped and marked unjudged before anything runs from it: a release killed before it
     // judges the target leaves the mark, and the next stage holds the target from then.
+    // Cargo owns invalidation of retained compiler outputs. Fixture outputs live in `at`,
+    // separately keyed by all release pins, and are regenerated above for each new identity.
     fs::create_dir_all(&target).map_err(|e| io("cannot create", &target, e))?;
-    aterm_uds::deadline::stamp_exec(&target);
+    stamp_hold(&target).map_err(|e| io("cannot stamp before execution", &target, e))?;
     fs::write(&unjudged, b"").map_err(|e| io("cannot write", &unjudged, e))?;
     println!(
         "==> handoff fixtures: {} build {} ({}) written by its own producer (targo \
@@ -250,8 +265,13 @@ pub fn stage(
             })
         });
     if !proven && !built_nothing {
-        aterm_uds::deadline::stamp_exec(&target);
-        if let Err(error) = fs::remove_file(&unjudged) {
+        if let Err(error) = stamp_hold(&target) {
+            println!(
+                "==> handoff fixtures: could not renew {} ({error}); the unjudged marker \
+                 keeps the next run from reusing the target",
+                target.display()
+            );
+        } else if let Err(error) = fs::remove_file(&unjudged) {
             println!(
                 "==> handoff fixtures: could not remove {} ({error}); the next run holds the \
                  target from when it finds it",
@@ -261,15 +281,22 @@ pub fn stage(
         println!(
             "==> handoff fixtures: kept {}: the generator did not exit on its own, so a \
              program built there may never have shown it ran and macOS may still be assessing \
-             its first exec; a run {} min from now removes it",
-            target.display(),
-            aterm_uds::deadline::FIRST_EXEC_HANG.as_secs() / 60
-        );
-    } else if let Err(error) = crate::gates::clear_path(&target) {
-        println!(
-            "==> handoff fixtures: could not remove {} ({error}); remove it by hand",
+             its first exec; the next run checks its execution hold before reusing it",
             target.display()
         );
+    } else {
+        // A completed Cargo process has reaped its children. Clear only our execution
+        // markers; removing the target here forces a cold compiler graph at the next cut.
+        for marker in [aterm_uds::deadline::EXEC_STAMP, UNJUDGED] {
+            let path = target.join(marker);
+            if let Err(error) = clear_marker(&path) {
+                println!(
+                    "==> handoff fixtures: could not clear {} ({error}); the next run may \
+                     conservatively hold the retained target",
+                    path.display()
+                );
+            }
+        }
     }
     let output = outcome.map_err(|e| {
         Error::new(format!(
@@ -310,7 +337,8 @@ pub fn stage(
     }
     let desks = desks_in(&dir).map_err(|e| io("cannot read", &dir, e))?;
     let guard_path = tree.join(HANDOFF_FIXTURE_GUARD);
-    let guard = fs::read_to_string(&guard_path).map_err(|e| io("cannot read", &guard_path, e))?;
+    let guard =
+        crate::durable::read_text(&guard_path).map_err(|e| io("cannot read", &guard_path, e))?;
     let mut missing = Vec::new();
     for required in crate::gates::required_desks(&guard)? {
         if crate::gates::release_at_least(&pins.version, &required.from)?
@@ -333,7 +361,8 @@ pub fn stage(
     }
     let answers = at.join(STAGED_ANSWERS);
     let prefix = format!("{}/", pins.tag());
-    if !fs::read_to_string(&answers).is_ok_and(|text| text.lines().any(|l| l.starts_with(&prefix)))
+    if !crate::durable::read_text(&answers)
+        .is_ok_and(|text| text.lines().any(|l| l.starts_with(&prefix)))
     {
         return Err(refuse(format!(
             "it wrote no shipped-state answers for {}'s desks (${ANSWERS_OUT}, {})",
@@ -343,7 +372,7 @@ pub fn stage(
     }
     for desk in &desks {
         let parent = dir.join(desk).join("parent.toml");
-        let text = fs::read_to_string(&parent).map_err(|e| io("cannot read", &parent, e))?;
+        let text = crate::durable::read_text(&parent).map_err(|e| io("cannot read", &parent, e))?;
         for line in [
             format!("producer_version = \"{}\"", pins.version),
             format!("producer_commit = \"{}\"", pins.short()),
@@ -367,6 +396,21 @@ pub fn stage(
         answers,
         fresh: true,
     })
+}
+
+fn clear_marker(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn stamp_hold(target: &Path) -> std::io::Result<()> {
+    // A retained marker can be a link. Unlink its directory entry before writing,
+    // so renewing the hold never overwrites a file outside the compiler cache.
+    clear_marker(&target.join(aterm_uds::deadline::EXEC_STAMP))?;
+    aterm_uds::deadline::try_stamp_exec(target)
 }
 
 /// Inspects release `version`'s handoff fixtures at `commit`, if present.
@@ -596,7 +640,7 @@ fn files_under(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
             if ft.is_dir() {
                 stack.push((entry.path(), path));
             } else if ft.is_file() {
-                let bytes = fs::read(entry.path())
+                let bytes = crate::durable::read_file(&entry.path())
                     .map_err(|e| Error::new(format!("read {}: {e}", entry.path().display())))?;
                 out.push((path, bytes));
             }
@@ -657,7 +701,7 @@ fn fixture_commit(
         })
         .collect();
     files.push((HANDOFF_FIXTURE_GUARD.to_string(), guard.into_bytes()));
-    let answers = fs::read_to_string(&staged.answers)
+    let answers = crate::durable::read_text(&staged.answers)
         .map_err(|e| Error::new(format!("read {}: {e}", staged.answers.display())))
         .and_then(|answers| {
             let corpus = git_ok(

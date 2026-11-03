@@ -2,7 +2,7 @@
 name: supervise-agent
 description: Run other Claude Code, codex-alab, agy or Muse Code sessions in aterm tabs as workers — start each on a task, wait for them in the background, read each one's result and check it against ground truth (tests, diff, exit codes) — or oversee another program (a codex-alab, a REPL, a long build) in an aterm session. Use when asked to hand work to other sessions or windows, run work in parallel in aterm, say what every aterm session or machine is doing, manage or babysit another agent, or act as a lead over workers.
 ---
-<!-- aterm skill v25 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v27 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Workers: other aterm sessions doing the work
 
@@ -58,8 +58,8 @@ call returns while the wait still runs, read that same process until it exits; n
 second wait beside it.
 
 Its exit wakes you and prints `@<sid> rev=<n> state=<s> agent=<word> program_state=<w|->
-attention=<pct|-> result_bytes=<n>` per worker as soon as one is `done`, `exited`, `stalled`
-or needs attention (`all` waits for all of them; `state=closed` if its tab closed; exit 124
+attention=<pct|-> result_bytes=<n> [conclusion=<finished|failed>] [why=<word>]` per worker as
+soon as one is `done`, `failed`, `exited`, `stalled` or needs attention (`all` waits for all of them; `state=closed` if its tab closed; exit 124
 with `OK timeout` on stderr after 60 min or `timeout=<ms>`). `program_state=` is a codex's
 or Grok Build's own report (a claim, `-` for every other agent); it never wakes the wait.
 
@@ -77,7 +77,16 @@ and old news never fires twice.
   change off the remote main, a check skipped, flaky, failing or not run, work deferred,
   partial or on another branch, a `NEEDS YOU:` line) with only `LANDED`; codex-alab runs
   its own check.
-- `exited`: the agent exited and nothing relaunches it.
+- `failed`: the work ended unfinished with its agent still there, and `why=` says how:
+  `could-not-finish` (the first line of its reply starts `Could not finish: <why>`, the word a
+  worker under Autopilot Land ends with when it cannot finish; `result` is that reply; codex-alab
+  runs its own Land and does not read it), `off` (a person turned its Autopilot Off; turning it on
+  again reopens it), `off-ctl` (a manager or a script did), `expired` (the disk worker's time ran
+  out), or `repeated` (Land stopped typing to a reply that came back the same with no work). A
+  `turn` into it reopens it. `task mark failed` by hand is refused while a loop carries the
+  session: its Autopilot Off stops the typing, and that fails the task.
+- `exited`: the agent exited and nothing relaunches it: `conclusion=finished` if the task had
+  finished, whatever word finished it (a landing keeps `why=landed`), else `conclusion=failed`.
 - `stalled`: its shell ended or a person used it before its first prompt (`why=shell`), no
   composer within 2 minutes, a shell still drawing no prompt included (`why=startup`), or 2
   minutes at a screen the harness could not handle (`why=held`).

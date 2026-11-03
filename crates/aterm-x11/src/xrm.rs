@@ -181,13 +181,30 @@ fn parse_file_into(
     });
 }
 
+#[cfg(target_os = "macos")]
+const NONBLOCK_OPEN_FLAG: i32 = 0x0004;
+#[cfg(all(unix, not(target_os = "macos")))]
+const NONBLOCK_OPEN_FLAG: i32 = 0o4000;
+
 /// Reads a regular file at `path` if its size is at most `limit` bytes.
 pub fn read_regular_file(path: &Path, limit: u64) -> Option<Vec<u8>> {
     let regular = |meta: std::fs::Metadata| meta.is_file() && meta.len() <= limit;
-    if !regular(std::fs::metadata(path).ok()?) {
-        return None;
-    }
-    let file = std::fs::File::open(path).ok()?;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(NONBLOCK_OPEN_FLAG)
+            .open(path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        if !regular(std::fs::metadata(path).ok()?) {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
     if !regular(file.metadata().ok()?) {
         return None;
     }

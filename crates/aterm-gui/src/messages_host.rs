@@ -927,8 +927,8 @@ impl App {
             .live(id)
             .is_some_and(|l| l.msg.actions.contains(&Intent::ApplyUpdate { build }));
         let staged_ready = self.staged_update_ready();
-        let handoff_available =
-            self.seamless_handoff_unavailable().is_none() && !self.kept_image_waits_for_terminal();
+        let handoff_available = self.seamless_handoff_unavailable().is_none()
+            && !self.kept_image_installs_at_next_launch();
         Self::update_bar_press_applies(offered, staged_ready, handoff_available)
     }
 

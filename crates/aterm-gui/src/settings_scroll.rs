@@ -1117,6 +1117,25 @@ impl ScrollPlan {
         None
     }
 
+    /// Whether the shortest span identifying control `key` fits: its last name line above it
+    /// and the whole control. Self-naming buttons and names beside or below need no extra span.
+    fn named_control_fits(&self, key: &UiKey) -> bool {
+        let Some(index) = self.stop_of(key).or_else(|| self.stop_holding(key)) else {
+            return true;
+        };
+        let control = self.resolve(key);
+        if self.names[index]
+            .self_named
+            .iter()
+            .any(|(key, _)| self.resolve(key) == control)
+        {
+            return true;
+        }
+        self.name_above(index, key)
+            .zip(self.whole_control(index, key))
+            .is_none_or(|((_, last), (_, bottom))| bottom - last <= self.room + 0.01)
+    }
+
     /// Where control `key` of stop `index` begins and ends in it, whole: a segmented control's
     /// every segment.
     fn whole_control(&self, index: usize, key: &UiKey) -> Option<(f32, f32)> {
@@ -1778,30 +1797,28 @@ impl ScrollPlan {
                     (part.top - at).abs() < 0.5 && (part.bottom - (at + height)).abs() < 0.5
                 })
         });
-        let rows = controls
-            .iter()
-            .filter(|(_, at, height)| {
-                top + at < offset - 0.5 && (name_cut || top + at + height - offset < PEEK_MIN)
-            })
-            .map(|(_, at, height)| top + at + height);
+        let veiled = controls.iter().any(|(_, at, height)| {
+            top + at < offset - 0.5 && (name_cut || top + at + height - offset < PEEK_MIN)
+        });
         // Nor is a control cut from its name, or through its own words ([`Self::cut_unseen`]).
         let unnamed = self
             .spans
             .get(index)
             .into_iter()
             .flatten()
-            .filter(|(key, at, height)| {
+            .any(|(key, at, height)| {
                 top + at < offset - 0.5
                     && top + at + height > offset + 0.5
                     && self.cut_unseen(index, key, top + at, offset)
-            })
-            .map(|(_, at, height)| top + at + height);
-        let Some(veiled) = rows.chain(unnamed).reduce(f32::max) else {
+            });
+        if !(veiled || unnamed) {
             return false;
-        };
+        }
+        // A row's words can stand beside its control. A full line left beside a hidden
+        // control is still an orphan: it need not start below the control's bottom.
         parts
             .iter()
-            .any(|part| part.whole && top + part.top >= veiled.max(offset) - 0.5)
+            .any(|part| part.whole && top + part.top >= offset - 0.5)
     }
 
     /// Whether a screen starting `offset` down the list cuts control `key` of stop `index`,
@@ -5238,6 +5255,39 @@ impl SettingsViewState {
         };
         self.land_list_focus(controls[target].clone());
         true
+    }
+
+    /// Whether the current keyboard reveal can show an identifying name with its control.
+    /// Wheel places and held presses do not request a different chrome through this check.
+    pub(super) fn keyboard_name_fits(&self) -> bool {
+        self.scroll_plan()
+            .is_none_or(|plan| self.keyboard_name_fits_in(&plan))
+    }
+
+    /// [`Self::keyboard_name_fits`] on an already measured candidate list.
+    pub(super) fn keyboard_name_fits_in(&self, plan: &ScrollPlan) -> bool {
+        self.keyboard_name_reveal()
+            .is_none_or(|key| plan.named_control_fits(key))
+    }
+
+    /// The keyboard reveal that owes a name; neither a wheel place nor a held press.
+    pub(super) fn keyboard_name_reveal(&self) -> Option<&UiKey> {
+        if self.reveal_as != Reveal::Keep || self.press_holds_place() {
+            return None;
+        }
+        // The declared control kind identifies switches and possible segments without
+        // laying out a candidate just to discover that a card or text field owes no span.
+        // Candidate geometry still decides the name span and any self-naming exemption.
+        let switch = self
+            .focused_setting_key()
+            .and_then(|key| self.field_by_key(key))
+            .is_some_and(|field| matches!(field.kind, super::EditKind::Bool));
+        if !switch && self.focused_segment().is_none() {
+            return None;
+        }
+        self.page_reveal
+            .as_ref()
+            .filter(|key| self.common.last_focus.as_ref() == Some(*key))
     }
 
     /// Whether the stop holding the control the list keeps in view ([`Self::page_reveal`])
@@ -8911,6 +8961,105 @@ mod tests {
             "a row whose switch shows under the caption is drawn: {screen:?}"
         );
         assert!(screen.offset > 0.0);
+    }
+
+    #[test]
+    fn a_controls_name_line_and_control_must_fit_together() {
+        let key = UiKey::new("settings/control/named");
+        let row = UiKey::new("settings/row/named");
+        let mut plan = ScrollPlan::new(4.0);
+        let group = plan.group(0.0, 0.0);
+        plan.row(group, 100.0, vec![key.clone()]);
+        plan.set_control_rows(vec![(0.0, 52.0, 48.0)]);
+        plan.set_control_spans(vec![(key.clone(), 52.0, 48.0)]);
+        plan.set_names(RowNames {
+            lines: vec![(row.clone(), 0.0, 24.0), (row.clone(), 24.0, 48.0)],
+            controls: vec![(key.clone(), row)],
+            self_named: Vec::new(),
+        });
+        plan.set_room(72.0);
+        assert!(48.0 < plan.room(), "the control alone fits");
+        assert!(
+            !plan.named_control_fits(&key),
+            "a live control still needs its name"
+        );
+        plan.set_room(76.0);
+        assert!(
+            plan.named_control_fits(&key),
+            "one complete name line suffices"
+        );
+        assert!(100.0 > plan.room(), "the full two-line name need not fit");
+        let mut names = plan.names.last().expect("the measured row").clone();
+        names.self_named.push((key.clone(), 52.0));
+        plan.set_names(names);
+        plan.set_room(48.0);
+        assert!(
+            plan.named_control_fits(&key),
+            "a self-naming button needs no extra row name"
+        );
+    }
+
+    #[test]
+    fn the_last_screen_drops_a_hidden_control_with_words_left_beside_it() {
+        let mut plan = ScrollPlan::new(5.0);
+        let first = plan.group(50.0, 40.0);
+        plan.set_caption(first, 14.0, 36.0);
+        plan.row(first, 48.0, vec![UiKey::new("color")]);
+        plan.set_control_rows(vec![(0.0, 4.0, 36.0)]);
+        plan.set_control_spans(vec![(UiKey::new("color"), 4.0, 36.0)]);
+        plan.set_names(RowNames {
+            lines: vec![
+                (UiKey::new("name"), 5.0, 21.0),
+                (UiKey::new("name"), 23.0, 39.0),
+            ],
+            controls: vec![(UiKey::new("color"), UiKey::new("name"))],
+            self_named: Vec::new(),
+        });
+        plan.set_ink(40.0);
+        plan.set_ink_top(4.0);
+        plan.set_drawn_bands(vec![
+            DrawnPart {
+                top: 5.0,
+                bottom: 21.0,
+                whole: true,
+            },
+            DrawnPart {
+                top: 23.0,
+                bottom: 39.0,
+                whole: true,
+            },
+            DrawnPart {
+                top: 4.0,
+                bottom: 40.0,
+                whole: false,
+            },
+        ]);
+        let after = plan.group(50.0, 40.0);
+        plan.set_caption(after, 14.0, 36.0);
+        for (key, height) in [("next", 48.0), ("middle", 66.0), ("last", 66.0)] {
+            plan.row(after, height, vec![UiKey::new(key)]);
+            plan.set_control_rows(vec![(0.0, 4.0, 36.0)]);
+            plan.set_ink(height - 4.0);
+            plan.set_ink_top(4.0);
+        }
+        seat_room(&mut plan, 272.0, Overhang::NONE);
+        // The first name line ends at 61, but its second line at 63..79 is whole
+        // beside the control's remaining 19pt. No line starts below the control at 80.
+        assert!(plan.veils_controls_from(0, 61.0));
+        assert!(!plan.draws_nothing_from(0, 61.0));
+        assert_eq!(plan.screen(plan.limit()).drawn.start, 1);
+        assert!(
+            !plan.veils_controls_from(0, 40.0),
+            "the whole control stays"
+        );
+        assert!(!plan.veils_controls_from(0, 82.0), "no surviving words");
+        assert!(plan.draws_nothing_from(0, 82.0));
+        seat_room(&mut plan, 310.0, Overhang::NONE);
+        assert_eq!(
+            plan.screen(plan.limit()).drawn.start,
+            0,
+            "a whole row stays"
+        );
     }
 
     #[test]

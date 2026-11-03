@@ -94,7 +94,8 @@ fn the_scripted_transport_records_each_permit() {
 }
 
 /// Off unix a write is never sent (`write::unix_only`), so `agh api`'s dry run answers what
-/// the real run answers: the same exit and the same report, and nothing reaches the fake.
+/// the real run answers: the same exit and the same `not_sent` report but for its `dry_run`
+/// mark, and nothing reaches the fake.
 /// The writer is an env profile, which loads off unix as a token file does not.
 #[cfg(not(unix))]
 #[test]
@@ -130,11 +131,25 @@ fn off_unix_an_api_dry_run_answers_as_the_real_run() {
             args.push("--dry-run");
         }
         let exit = common::run_cli(&mut ctx, &args);
-        (exit, captured.stdout_text())
+        let report: aterm_json::Value =
+            aterm_json::from_str(captured.stdout_text().trim_end()).expect("the report");
+        (exit, report)
     };
-    let dry = run(true);
-    let real = run(false);
-    assert_eq!(dry, real, "the dry run predicts the real run");
+    let (dry_exit, mut dry) = run(true);
+    let (real_exit, mut real) = run(false);
+    assert_eq!(
+        dry_exit, real_exit,
+        "the dry run predicts the real run's exit"
+    );
+    assert_eq!(dry.get("dry_run"), Some(&aterm_json::Value::from(true)));
+    assert_eq!(real.get("dry_run"), Some(&aterm_json::Value::from(false)));
+    dry.as_object_mut().expect("an object").remove("dry_run");
+    real.as_object_mut().expect("an object").remove("dry_run");
+    assert_eq!(dry, real, "the dry run predicts the real run's report");
+    assert_eq!(
+        real.get("outcome"),
+        Some(&aterm_json::Value::from("not_sent"))
+    );
     assert!(
         fake.seen().iter().all(|seen| seen.method == "GET"),
         "{:?}",

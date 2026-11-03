@@ -34,10 +34,12 @@ fn settings_window(drafts: &[(&str, &str)]) -> WindowLayout {
         native_tabs: Vec::new(),
         tab_order: Vec::new(),
         active_item: Some(0),
+        workers_in_front: false,
         restored_tabs: vec![RestoredTab {
             root: RestoredSplitTree::leaf(RestoredView::Native(leaf)),
             focused_path: Vec::new(),
             zoomed: false,
+            parked: false,
         }],
     }
 }

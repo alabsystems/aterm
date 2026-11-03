@@ -99,15 +99,27 @@ fn task_prompt_at(path: &Path, tasks: &Path) -> Option<String> {
     if !plain || !path.starts_with(tasks) || path == tasks {
         return None;
     }
-    if !std::fs::symlink_metadata(path).ok()?.is_file() {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        if !std::fs::symlink_metadata(path).ok()?.is_file() {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
+    if !file.metadata().ok()?.is_file() {
         return None;
     }
     let mut head = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(TASK_HEAD_BYTES)
-        .read_to_end(&mut head)
-        .ok()?;
+    file.take(TASK_HEAD_BYTES).read_to_end(&mut head).ok()?;
     let text = String::from_utf8_lossy(&head);
     let text = if head.len() as u64 == TASK_HEAD_BYTES {
         text.trim_end_matches(|c: char| !c.is_whitespace())
@@ -271,11 +283,39 @@ fn is_hex40(word: &str) -> bool {
     word.len() == 40 && word.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// `text` as a surface may show it: redacted and capped, or nothing when it is blank.
+fn excerpt_plain(text: Option<&str>) -> Option<String> {
+    text.map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|text| excerpt::cap(&redact(text), excerpt::EXCERPT_BYTES))
+}
+
 fn excerpt_token(text: Option<&str>) -> String {
-    match text.map(str::trim).filter(|t| !t.is_empty()) {
-        Some(text) => pct_encode(&excerpt::cap(&redact(text), excerpt::EXCERPT_BYTES)),
-        None => "-".to_string(),
+    excerpt_plain(text).map_or_else(|| "-".to_string(), |text| pct_encode(&text))
+}
+
+/// The last words of the session behind `h`, read here in the process and redacted and capped as a
+/// `survey` row's are: what its agent said (at the end, once `finished`, as `said=` does), else
+/// what it is doing, else a shell's bottom rows.
+pub(crate) fn last_words(h: &SessionHandle, finished: bool) -> Option<String> {
+    let excerpts = {
+        let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline
+            .claude_excerpts()
+            .cloned()
+            .or_else(|| timeline.codex_survey().map(CodexSurvey::excerpts))
+    };
+    if let Some(excerpts) = &excerpts {
+        let said = if finished {
+            excerpts.excerpts.said_end.as_deref()
+        } else {
+            excerpts.excerpts.said.as_deref()
+        };
+        if let Some(words) = excerpt_plain(said.or(excerpts.excerpts.doing.as_deref())) {
+            return Some(words);
+        }
     }
+    excerpt_plain(engine_read(h, true).rows.as_deref())
 }
 
 fn branch_token(text: Option<&str>) -> String {
@@ -696,7 +736,8 @@ fn session_row(
     let held_from = h.ctx.fabric.holds().remote().map(|hold| hold.node.clone());
     let mut row = format!(
         "session local={} sid={} state={} program={} program_kind={}{} agent={} agent_detail={} \
-         agent_ms={} human_ms={} bg={} task={} task_rev={} task_from={} task_ms={} model={} \
+         agent_ms={} human_ms={} bg={} task={} task_rev={} task_from={} task_ms={} \
+         task_conclusion={} model={} \
          effort={} ctx_left_pct={} usage_5h_pct={} usage_7d_pct={} account={} detail={} \
          doing={} role={} supervisor={} \
          attention={attention} goal={goal} needs={needs} needs_by={needs_by} hold_by={hold_by} \
@@ -716,6 +757,9 @@ fn session_row(
         task.as_ref().map_or(0, |t| t.rev),
         word_token(task.as_ref().map(|t| t.from.as_str())),
         number_token(task_ms),
+        task.as_ref()
+            .and_then(crate::task_record::TaskRecord::conclusion)
+            .map_or("-", crate::task_record::Conclusion::word),
         word_token(
             footer
                 .as_ref()
@@ -754,7 +798,11 @@ fn session_row(
         let prompt = prompt_of(h, task.is_some(), excerpts.as_ref());
         let finished = matches!(
             task.as_ref().map(|t| t.state),
-            Some(crate::task_record::TaskState::Done | crate::task_record::TaskState::Exited)
+            Some(
+                crate::task_record::TaskState::Done
+                    | crate::task_record::TaskState::Exited
+                    | crate::task_record::TaskState::Failed
+            )
         ) || agent_word == "idle";
         let said = excerpts.as_ref().and_then(|e| {
             if finished {

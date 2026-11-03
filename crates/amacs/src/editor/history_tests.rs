@@ -603,6 +603,58 @@ fn undo_stops_at_a_recovered_draft() {
     assert_eq!(text(&store, document), "draft disk\n");
 }
 
+/// A history started at a revert puts nothing from before it back: not the
+/// typing the revert replaced by C-/, nor an undone frame by redo; typing
+/// after it undoes as usual.
+/// NEGATIVE CONTROL: the same steps without the start bring both back.
+#[test]
+fn a_history_started_here_puts_back_nothing_from_before() {
+    for started in [true, false] {
+        let (mut store, mut workspace, mut view, document) = editor("disk\n");
+        view.selections = vec![Selection::caret(0)];
+        workspace.insert_text(&mut store, &mut view, "AB").unwrap();
+        workspace.insert_text(&mut store, &mut view, "CD").unwrap();
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::Undo)
+            .unwrap();
+        let head = seq(&store, document);
+        let (reverted, deltas) = workspace
+            .replace_text(&mut store, document, head, "disk\n", Origin::Revert)
+            .unwrap();
+        view.observe_external(reverted, &deltas);
+        if started {
+            workspace.start_history_here(document);
+        }
+        assert_eq!(workspace.can_undo(document), !started, "started={started}");
+        let undone = workspace.execute(&mut store, &mut view, EditorCommand::Undo);
+        assert_eq!(undone.is_ok(), !started, "started={started}");
+        let expected = if started { "disk\n" } else { "ABdisk\n" };
+        assert_eq!(text(&store, document), expected, "started={started}");
+
+        let (mut store, mut workspace, mut view, document) = editor("disk\n");
+        view.selections = vec![Selection::caret(0)];
+        workspace.insert_text(&mut store, &mut view, "AB").unwrap();
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::Undo)
+            .unwrap();
+        if started {
+            workspace.start_history_here(document);
+        }
+        assert_eq!(workspace.can_redo(document), !started, "started={started}");
+        let redone = workspace.execute(&mut store, &mut view, EditorCommand::Redo);
+        assert_eq!(redone.is_ok(), !started, "started={started}");
+        let expected = if started { "disk\n" } else { "ABdisk\n" };
+        assert_eq!(text(&store, document), expected, "started={started}");
+
+        view.selections = vec![Selection::caret(0)];
+        workspace.insert_text(&mut store, &mut view, "xy").unwrap();
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::Undo)
+            .unwrap();
+        assert_eq!(text(&store, document), expected, "the later typing undoes");
+    }
+}
+
 /// The history holds at most `UNDO_BYTE_LIMIT` bytes to put back, but always
 /// its newest frame, however large.
 #[test]

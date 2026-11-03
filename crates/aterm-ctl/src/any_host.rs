@@ -39,6 +39,9 @@ pub(crate) struct Row {
     pub(crate) five_hour: Option<u64>,
     /// The week used, in percent, as [`Self::five_hour`].
     pub(crate) seven_day: Option<u64>,
+    /// When its seven-day window resets, in Unix milliseconds on the member's clock
+    /// (`week_reset=`, in seconds).
+    pub(crate) week_reset_ms: Option<u64>,
     /// When its wall ends, in Unix milliseconds on the member's clock (`walled_until=`, in
     /// seconds).
     pub(crate) walled_until_ms: Option<u64>,
@@ -53,8 +56,22 @@ impl Row {
             condition: fields.get("condition").unwrap_or_default().to_owned(),
             five_hour: fields.number("pct5"),
             seven_day: fields.number("pct7"),
+            week_reset_ms: survey::week_reset_ms(fields),
             walled_until_ms: survey::walled_until_ms(fields),
         }
+    }
+
+    /// Its seven-day figure at `at_ms`: `None` once its `week_reset=` has passed on the member's
+    /// clock.
+    pub(crate) fn seven_day_at(&self, at_ms: Option<u64>) -> Option<u64> {
+        if self
+            .week_reset_ms
+            .zip(at_ms)
+            .is_some_and(|(reset, at)| reset <= at)
+        {
+            return None;
+        }
+        self.seven_day
     }
 
     /// Whether nothing has shown this row works: it runs a worker only where no read row can, since
@@ -123,12 +140,18 @@ impl Member {
             .flatten()
             .filter(|row| row.takes(program, self.at_ms))
             .min_by(|a, b| {
-                (a.unproven(), used(a.seven_day), used(a.five_hour), &a.label).cmp(&(
-                    b.unproven(),
-                    used(b.seven_day),
-                    used(b.five_hour),
-                    &b.label,
-                ))
+                (
+                    a.unproven(),
+                    used(a.seven_day_at(self.at_ms)),
+                    used(a.five_hour),
+                    &a.label,
+                )
+                    .cmp(&(
+                        b.unproven(),
+                        used(b.seven_day_at(self.at_ms)),
+                        used(b.five_hour),
+                        &b.label,
+                    ))
             })
     }
 }
@@ -206,7 +229,7 @@ pub(crate) fn pick<'a>(program: &str, members: &'a [Member]) -> Result<Chosen<'a
     let chosen = able.iter().min_by(|(a, ra), (b, rb)| {
         (
             ra.unproven(),
-            used(ra.seven_day),
+            used(ra.seven_day_at(a.at_ms)),
             used(ra.five_hour),
             a.busy,
             a.host().to_ascii_lowercase(),
@@ -214,7 +237,7 @@ pub(crate) fn pick<'a>(program: &str, members: &'a [Member]) -> Result<Chosen<'a
         )
             .cmp(&(
                 rb.unproven(),
-                used(rb.seven_day),
+                used(rb.seven_day_at(b.at_ms)),
                 used(rb.five_hour),
                 b.busy,
                 b.host().to_ascii_lowercase(),
@@ -247,7 +270,10 @@ pub(crate) fn pick<'a>(program: &str, members: &'a [Member]) -> Result<Chosen<'a
 pub(crate) fn why(program: &str, chosen: &Chosen<'_>) -> String {
     let row = chosen.row;
     let mut figures = String::new();
-    for (window, pct) in [("7d", row.seven_day), ("5h", row.five_hour)] {
+    for (window, pct) in [
+        ("7d", row.seven_day_at(chosen.member.at_ms)),
+        ("5h", row.five_hour),
+    ] {
         if let Some(pct) = pct {
             figures.push_str(&format!(" {window} {pct}%"));
         }

@@ -582,6 +582,34 @@ fn all_no_route_is_one_line_and_one_entry() {
     );
 }
 
+/// A read's notes blame this Mac's Local Network privacy when the survey judged a member on this
+/// network refused with none there answering (the on-link note), or, with no address to judge,
+/// every peer refused at once; a read that said where this Mac is instead blames nothing.
+/// NEGATIVE CONTROL: `privacy_refused` reading `NO_ROUTE_NOTE` alone fails "the on-link verdict
+/// blames privacy".
+#[test]
+fn a_reads_privacy_verdict_is_its_on_link_note_or_every_peer_refused() {
+    assert!(
+        privacy_refused(&format!(
+            "{}\n",
+            aterm_netplace::words::ON_LINK_PRIVACY_NOTE
+        )),
+        "the on-link verdict blames privacy"
+    );
+    assert!(privacy_refused(aterm_ctl::NO_ROUTE_NOTE));
+    let words = aterm_netplace::words::Words {
+        now_ms: 1_800_000_060_000,
+        zone: &|_| Some(0),
+    };
+    let away = aterm_netplace::words::survey_note(
+        &aterm_netplace::sample::hotspot(1_800_000_000_000, 1_800_000_000_000),
+        &words,
+    )
+    .expect("away words");
+    assert!(!privacy_refused(&away), "where this Mac is blames nothing");
+    assert!(!privacy_refused(""));
+}
+
 #[test]
 fn should_poll_reads_on_the_minute_or_at_the_menu() {
     let member = BookFacts {

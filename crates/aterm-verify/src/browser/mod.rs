@@ -687,7 +687,15 @@ fn session(
         let _quiet = desk
             .as_ref()
             .map(|(claim, _)| crate::holding_quiet_claim(Some(std::sync::Arc::clone(claim))));
-        session_engine.drive(&session_site, &session_dir, &profile)
+        let result = session_engine.drive(&session_site, &session_dir, &profile);
+        if let Some((claim, _)) = desk {
+            claim.timing_admission().map_err(|why| {
+                Stop::CouldNotRun(format!(
+                    "timing protection ended before session completion: {why}"
+                ))
+            })?;
+        }
+        result
     });
     let session = match driven {
         Ok(Ok(s)) => s,
@@ -1059,7 +1067,7 @@ impl Drop for Running {
 
 /// The last lines of the browser's log, for a refusal.
 fn log_tail(log: &Path) -> String {
-    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let text = crate::read_regular_text(log).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     let tail = lines[lines.len().saturating_sub(20)..].join("\n");
     format!("the browser's log ({}):\n{tail}", log.display())
@@ -1364,9 +1372,9 @@ fn drive_safari(safari: &safari::Safari, site: &Path, work: &Path) -> Result<Ses
 /// `browser-drive`, admitted as `mode` says ([`crate::admit_live`]), with how it was admitted:
 /// one windowed session at a time, on a machine quiet enough for it. `browser-drive` holds no
 /// other claim while it waits; a verify run's stage takes the run's quiet machine before its
-/// memory instead ([`takes_the_desk`]) and hands no mode. `None` with no mode, or where the
-/// ledger cannot be used (said on stderr: the session runs unadmitted, as verify's timed stages
-/// do).
+/// memory instead ([`takes_the_desk`]) and hands no mode. `None` only where the
+/// caller explicitly leaves this session untimed or its outer stage owns the desk. An
+/// unavailable, immediate, forced or expired requested Timing claim starts no session.
 ///
 /// # Errors
 /// An interrupt ended the wait, which ends the run (`exec::group::stop_run`, as a quiet claim's
@@ -1383,6 +1391,9 @@ fn desk_claim(
         mode,
     ) {
         Ok(claim) => {
+            claim.timing_admission().map_err(|why| {
+                format!("timing admission cannot qualify this session: {why}; started nothing")
+            })?;
             let said = crate::admission(&claim, mode, true);
             Ok(Some((std::sync::Arc::new(claim), said)))
         }
@@ -1391,10 +1402,9 @@ fn desk_claim(
             crate::exec::group::stop_run();
             Err(format!("its quiet claim was {e}; it started nothing"))
         }
-        Err(e) => {
-            eprintln!("verify: {e}; {label} runs unadmitted");
-            Ok(None)
-        }
+        Err(e) => Err(format!(
+            "timing admission unavailable: {e}; {label} started nothing"
+        )),
     }
 }
 
@@ -1588,6 +1598,35 @@ pub(crate) fn pin_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn immediate_timing_refusal_stops_the_actual_session_dispatch_before_browser_drive() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let built = Built {
+            site: scratch.path().join("site"),
+            work: scratch.path().join("work"),
+            cost: None,
+            scratch: scratch.path().to_owned(),
+            ceiling: Some(cdp::HANG_DETECTOR),
+            quiet: Some(aterm_capacity::Admit::Now),
+        };
+        // No real browser or driver is eligible to start in this control.
+        let engine = Engine::Safari(safari::Safari {
+            driver: scratch.path().join("no-browser-driver"),
+        });
+        let mut report = Report::new("timing refusal control");
+        assert!(session(&mut report, &built, &engine, None).is_none());
+        let tally = crate::ladder::tally(&[report]);
+        assert_eq!(tally.could_not_run.len(), 2);
+        assert!(tally.gate_failures.is_empty());
+        assert!(tally.could_not_run[0].contains("--admit now"));
+        assert!(tally.could_not_run[0].contains("started nothing"));
+        assert!(
+            desk_claim(None, "explicitly outer-owned")
+                .unwrap()
+                .is_none()
+        );
+    }
 
     /// A normal session retires its held resource. A worker deliberately blocked beyond a
     /// zero ceiling must retain it until released, even though the outer call returned.

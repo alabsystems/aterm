@@ -223,38 +223,64 @@ impl From<io::Error> for LeaseError {
     }
 }
 
-/// `<prefix>/leases`, made if absent — private (`0700`) on Unix, since a lease names the
-/// holder's working directory.
+/// `<prefix>/leases`, made if absent — private (`0700`) and owned by this user on Unix, since
+/// a lease names the holder's working directory.
 fn ensure_dir(prefix: &Path) -> io::Result<PathBuf> {
     let d = dir(prefix);
     match std::fs::symlink_metadata(&d) {
-        Ok(m) if m.is_dir() => return Ok(d),
+        Ok(m) if m.is_dir() => {}
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("{} is not a directory", d.display()),
             ));
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            let created = {
+                use std::os::unix::fs::DirBuilderExt as _;
+                std::fs::DirBuilder::new().mode(0o700).create(&d)
+            };
+            #[cfg(not(unix))]
+            let created = std::fs::DirBuilder::new().create(&d);
+            match created {
+                Ok(()) => {}
+                Err(e)
+                    if e.kind() == io::ErrorKind::AlreadyExists
+                        && std::fs::symlink_metadata(&d).is_ok_and(|m| m.is_dir()) => {}
+                Err(e) => return Err(e),
+            }
+        }
         Err(e) => return Err(e),
     }
     #[cfg(unix)]
-    let created = {
-        use std::os::unix::fs::DirBuilderExt as _;
-        std::fs::DirBuilder::new().mode(0o700).create(&d)
-    };
-    #[cfg(not(unix))]
-    let created = std::fs::DirBuilder::new().create(&d);
-    match created {
-        Ok(()) => Ok(d),
-        Err(e)
-            if e.kind() == io::ErrorKind::AlreadyExists
-                && std::fs::symlink_metadata(&d).is_ok_and(|m| m.is_dir()) =>
-        {
-            Ok(d)
+    {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&d)?;
+        let metadata = opened.metadata()?;
+        // SAFETY: `geteuid` has no preconditions and reads this process's effective UID.
+        let euid = unsafe { libc::geteuid() };
+        if !metadata.is_dir() || metadata.uid() != euid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is not this user's plain directory", d.display()),
+            ));
         }
-        Err(e) => Err(e),
+        if metadata.mode() & 0o777 != 0o700 {
+            opened.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+            let narrowed = opened.metadata()?;
+            if narrowed.mode() & 0o777 != 0o700 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("{} did not become 0700", d.display()),
+                ));
+            }
+        }
     }
+    Ok(d)
 }
 
 /// Open (creating) a lease-directory file for locking: `0600`, never truncated — a lock
@@ -416,7 +442,7 @@ pub enum Hold {
     Held(Lease),
     /// The directory is none of atpkg's ([`Subject::of_dir`]): nothing of atpkg's reclaims or re-lays it, so there is nothing to hold.
     Unmanaged,
-    /// The lease could not be taken; the command runs exactly as exposed as it would have without one — the rule the cutter keeps too.
+    /// The lease could not be taken; the holder command runs without one. Callers that require a lease refuse instead.
     NotTaken(Subject, LeaseError),
 }
 
@@ -507,8 +533,9 @@ fn probe_file(path: &Path, reap: bool) -> io::Result<Option<String>> {
             Ok(None)
         }
         Err(std::fs::TryLockError::WouldBlock) => {
-            let mut who = String::new();
-            let _ = (&mut file).take(WHO_MAX).read_to_string(&mut who);
+            let mut raw = Vec::new();
+            let _ = (&mut file).take(WHO_MAX).read_to_end(&mut raw);
+            let who = String::from_utf8_lossy(&raw);
             let who = who.lines().next().unwrap_or_default().trim().to_string();
             Ok(Some(if who.is_empty() {
                 "a run that named itself nothing".to_string()
@@ -542,8 +569,11 @@ fn scan(prefix: &Path, subject: &Subject, reap: bool) -> Holders {
         if !name.starts_with(&head) || !name.ends_with(LEASE_SUFFIX) {
             continue;
         }
-        if !entry.file_type().is_ok_and(|t| t.is_file()) {
-            continue;
+        match entry.file_type() {
+            Ok(ft) if ft.is_file() => {}
+            Ok(_) => return Holders::Unknown(format!("{name}: not a regular file")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Holders::Unknown(format!("{name}: {e}")),
         }
         match probe_file(&entry.path(), reap) {
             Ok(Some(who)) => live.push(who),
@@ -1035,6 +1065,87 @@ mod tests {
         std::fs::write(dir(&p), b"not a directory").unwrap();
         let err = take(&p, &trust(1), "blocked", Duration::ZERO).expect_err("file at leases path");
         assert!(matches!(err, LeaseError::Io(ref e) if e.kind() == io::ErrorKind::AlreadyExists));
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    /// NEGATIVE CONTROL: a pre-existing permissive `leases` directory is tightened to `0700` on
+    /// Unix, and a symlink at `<prefix>/leases` is refused rather than followed.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_dir_narrows_permissive_directory_and_refuses_symlink() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let p = prefix("narrow-and-symlink");
+        std::fs::create_dir_all(dir(&p)).unwrap();
+        std::fs::set_permissions(dir(&p), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let lease = take(&p, &trust(1), "holder", DEFAULT_WAIT).unwrap();
+        let mode = std::fs::symlink_metadata(dir(&p))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        drop(lease);
+        std::fs::remove_dir_all(dir(&p)).unwrap();
+
+        let target = p.join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, dir(&p)).unwrap();
+        let err =
+            take(&p, &trust(1), "blocked", Duration::ZERO).expect_err("symlink at leases path");
+        assert!(matches!(err, LeaseError::Io(ref e) if e.kind() == io::ErrorKind::AlreadyExists));
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    /// NEGATIVE CONTROL: non-UTF-8 bytes in a live holder's `who` line are decoded lossily
+    /// rather than causing `probe_file` to discard the holder identity.
+    #[test]
+    fn probe_file_decodes_non_utf8_who_bytes_lossily() {
+        use std::io::Seek as _;
+        let p = prefix("lossy-who");
+        let mut lease = take(&p, &trust(5), "placeholder", DEFAULT_WAIT).unwrap();
+        lease.file.seek(io::SeekFrom::Start(0)).unwrap();
+        lease.file.set_len(0).unwrap();
+        lease.file.write_all(b"targo in /w/\xff/repo\n").unwrap();
+        assert_eq!(
+            holders(&p, &trust(5)),
+            Holders::Held(vec!["targo in /w/\u{fffd}/repo".to_string()])
+        );
+        drop(lease);
+        let _ = std::fs::remove_dir_all(&p);
+    }
+
+    /// NEGATIVE CONTROL: a non-regular `<stem>@<tag>.lease` entry (directory or symlink) is
+    /// reported as `Holders::Unknown` (`in_use() == true`) rather than skipped as `Holders::Free`,
+    /// so `reclaim` keeps the build instead of deleting over an anomalous lease slot.
+    #[test]
+    fn non_regular_lease_entry_is_reported_unknown_not_free() {
+        let p = prefix("non-regular-lease");
+        let d = ensure_dir(&p).unwrap();
+        let bogus_dir = d.join("store-trust-11@1-1.lease");
+        std::fs::create_dir(&bogus_dir).unwrap();
+        let seen = holders(&p, &trust(11));
+        assert!(matches!(seen, Holders::Unknown(_)), "{seen:?}");
+        assert!(seen.in_use());
+        assert!(matches!(
+            reclaim(&p, &trust(11)),
+            Reclaim::Keep(Holders::Unknown(_))
+        ));
+        std::fs::remove_dir(&bogus_dir).unwrap();
+
+        #[cfg(unix)]
+        {
+            let target = p.join("outside.lease");
+            std::fs::write(&target, b"holder\n").unwrap();
+            let bogus_link = d.join("store-trust-11@1-1.lease");
+            std::os::unix::fs::symlink(&target, &bogus_link).unwrap();
+            let seen = holders(&p, &trust(11));
+            assert!(matches!(seen, Holders::Unknown(_)), "{seen:?}");
+            assert!(seen.in_use());
+            assert!(matches!(
+                reclaim(&p, &trust(11)),
+                Reclaim::Keep(Holders::Unknown(_))
+            ));
+        }
+
         let _ = std::fs::remove_dir_all(&p);
     }
 }

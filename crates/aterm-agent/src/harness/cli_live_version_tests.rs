@@ -39,7 +39,20 @@ fn a_retained_live_package_stays_distinct_after_the_development_link_advances() 
         format!("schema = 1\nprogram = \"codex\"\ncheckout = {checkout}\nbins = [\"bin/codex\"]\nlinked_at = \"\"\n"),
     )
     .unwrap();
-    assert_eq!(atpkg::linked_checkout(&layout, "codex"), Some(b));
+    assert_eq!(atpkg::linked_checkout(&layout, "codex"), Some(b.clone()));
+    let b_other = b.join("bin/other");
+    std::fs::write(&b_other, b"not the codex entrypoint").unwrap();
+    assert_eq!(
+        claimant_build_version_reading(
+            &layout,
+            "codex",
+            42,
+            |_| Some(Birth(100)),
+            |_| Some(b_other),
+        ),
+        None,
+        "an unexposed file in the linked codex checkout is refused"
+    );
     let observed = |pid| {
         claimant_build_version_reading(
             &layout,
@@ -239,4 +252,38 @@ fn a_harness_store_build_and_retained_local_artifact_resolve_independently() {
     assert_eq!(installed.len(), 1);
     assert_eq!(installed[0].harness, "grok-alab");
     assert_eq!(installed[0].version.as_deref(), Some("0.3.0+g222222222"));
+
+    let cc_store = layout.build_dir("claude-code-alab", 5);
+    std::fs::create_dir_all(cc_store.join("bin")).unwrap();
+    let cc_store_exe = cc_store.join("bin/claude-alab");
+    let cc_wrong_exe = cc_store.join("bin/claude-code-alab");
+    std::fs::write(&cc_store_exe, b"plain fixture; never executed").unwrap();
+    std::fs::write(&cc_wrong_exe, b"plain fixture; never executed").unwrap();
+    atpkg::store::mark_build_ready(&cc_store).unwrap();
+    std::fs::write(
+        cc_store.with_extension("version"),
+        b"version v1\n0.8.0+g987654321\n",
+    )
+    .unwrap();
+    assert_eq!(
+        claimant_build_version_reading(
+            &layout,
+            "claude-code-alab",
+            42,
+            |_| Some(Birth(100)),
+            |_| Some(cc_store_exe),
+        )
+        .as_deref(),
+        Some("0.8.0+g987654321")
+    );
+    assert_eq!(
+        claimant_build_version_reading(
+            &layout,
+            "claude-code-alab",
+            42,
+            |_| Some(Birth(100)),
+            |_| Some(cc_wrong_exe),
+        ),
+        None
+    );
 }

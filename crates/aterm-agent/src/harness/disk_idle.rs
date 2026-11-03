@@ -402,10 +402,7 @@ pub fn git_quiet(
     let gitdir = match std::fs::symlink_metadata(&dot) {
         Ok(m) if m.is_dir() => dot,
         Ok(m) if m.is_file() => {
-            let text = std::fs::read(&dot)
-                .ok()
-                .filter(|b| b.len() <= 4096)
-                .and_then(|b| String::from_utf8(b).ok())
+            let text = super::discover::small_text(&dot)
                 .ok_or_else(|| format!("{} could not be read", dot.display()))?;
             let named = text
                 .lines()

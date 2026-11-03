@@ -416,15 +416,19 @@ impl LeftPass {
             return;
         };
         for run in dead {
-            aterm_uds::runs::append_dead_seen(&run.path, horizon, at_ms);
+            let Ok(recorded) =
+                aterm_uds::runs::append_dead_seen(&run.path, &run.record, horizon, at_ms)
+            else {
+                continue;
+            };
             if let Some((_, rec)) = self
                 .records
                 .list
                 .iter_mut()
                 .find(|(path, _)| *path == run.path)
             {
-                rec.dead_seen = Some(horizon);
-                rec.dead_seen_ms = Some(at_ms);
+                rec.dead_seen = Some(recorded.horizon);
+                rec.dead_seen_ms = Some(recorded.at_ms);
             }
         }
     }

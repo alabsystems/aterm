@@ -149,6 +149,9 @@ pub fn raw_differences(root: &Path) -> Option<Vec<String>> {
                 }
             }
             (GITLINK_MODE, Some(m)) if m.is_dir() && is_toplevel(&full) => {
+                if hash(&full, &["rev-parse", "HEAD"], b"")?.as_str() != blob {
+                    differ.push(path.clone());
+                }
                 for p in raw_differences(&full)? {
                     differ.push(format!("{path}/{p}"));
                 }
@@ -252,12 +255,17 @@ fn index_entries(root: &Path) -> Option<Vec<IndexEntry>> {
 fn flag_hidden_edits(root: &Path, index: &[IndexEntry]) -> Option<Vec<String>> {
     let flagged: Vec<&IndexEntry> = index
         .iter()
-        .filter(|e| (e.tag.is_ascii_lowercase() || e.tag == 'S') && e.mode != GITLINK_MODE)
+        .filter(|e| e.tag.is_ascii_lowercase() || e.tag == 'S')
         .collect();
     let mut edited = Vec::new();
     for entry in flagged {
         let full = root.join(&entry.path);
         let same = match std::fs::symlink_metadata(&full) {
+            Ok(m) if entry.mode == GITLINK_MODE => {
+                m.is_dir()
+                    && is_toplevel(&full)
+                    && hash(&full, &["rev-parse", "HEAD"], b"")? == entry.blob
+            }
             Ok(m) if m.file_type().is_symlink() => {
                 let target = std::fs::read_link(&full).ok()?;
                 entry.mode == "120000"
@@ -560,6 +568,22 @@ mod tests {
         std::fs::write(root.join("vendor/sub/a.rs"), "edited beneath").unwrap();
         assert_eq!(keys(&root), ["vendor/sub", "vendor/sub/a.rs"]);
         assert_eq!(raw_differences(&root).unwrap(), ["vendor/sub/a.rs"]);
+        std::fs::write(root.join("vendor/sub/a.rs"), "a").unwrap();
+        assert_eq!(strictly_clean(&root), Some(true));
+
+        // NEGATIVE CONTROL: moving the submodule to a different clean commit is caught both by
+        // `raw_differences` (even with `submodule.<name>.ignore=all`) and by `dirty_against_head`
+        // when the gitlink is marked `--skip-worktree`.
+        std::fs::write(root.join("vendor/sub/extra.rs"), "second").unwrap();
+        run(&root.join("vendor/sub"), &["add", "extra.rs"]);
+        run(&root.join("vendor/sub"), &["commit", "-q", "-m", "second"]);
+        assert_eq!(raw_differences(&root).unwrap(), ["vendor/sub"]);
+        run(&root, &["update-index", "--skip-worktree", "vendor/sub"]);
+        assert_eq!(keys(&root), ["vendor/sub"]);
+        assert_eq!(strictly_clean(&root), Some(false));
+        run(&root, &["update-index", "--no-skip-worktree", "vendor/sub"]);
+        run(&root.join("vendor/sub"), &["checkout", "-q", "HEAD~1"]);
+        assert_eq!(strictly_clean(&root), Some(true));
 
         run(&root, &["submodule", "deinit", "-q", "-f", "vendor/sub"]);
         let found = dirty_against_head(&root).unwrap();

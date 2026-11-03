@@ -602,21 +602,16 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         .into_iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    PUBLISHED_INDEX_HINT.with(|hint| hint.set(None));
-    if matches!(
-        args.first().map(String::as_str),
-        Some("seed" | "update" | "install")
-    ) {
-        strip_progress_file_flag(&mut args);
-        HEAD_WATCH_PASS.with(|cell| cell.set(take_flag(&mut args, HEAD_WATCH_FLAG)));
-        if let Some(bound) = take_wait_lock_flag(&mut args) {
-            configure_wait_lock(&args, bound);
-        }
-        if args.first().is_some_and(|verb| verb == "update") {
-            PUBLISHED_INDEX_HINT.with(|hint| hint.set(take_published_index_hint_flag(&mut args)));
-            apply_defer_busy_flip_flag(&mut args);
-        }
+    let lane = LaneFlags::take(&mut args);
+    if let Some(path) = lane.progress_file {
+        let _ = PROGRESS_FILE.set(path);
     }
+    HEAD_WATCH_PASS.with(|cell| cell.set(lane.head_watch));
+    if let Some(bound) = lane.wait_lock {
+        configure_wait_lock(&args, bound);
+    }
+    PUBLISHED_INDEX_HINT.with(|hint| hint.set(lane.published_index_hint));
+    pick_flip_policy(lane.defer_busy_flip);
     let verb = args.first().map(String::as_str);
     if verb == Some("__pending") {
         return cmd_pending(args.get(1), args.get(2..).unwrap_or(&[]));
@@ -1123,13 +1118,54 @@ fn run_target(layout: &crate::store::Layout, tool: &str) -> RunTarget {
 
 static PROGRESS_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-fn strip_progress_file_flag(args: &mut Vec<String>) {
+/// Take every `--progress-file <path>` out of `args`: the first path, which is the one
+/// [`PROGRESS_FILE`] keeps.
+fn take_progress_file_flag(args: &mut Vec<String>) -> Option<std::path::PathBuf> {
+    let mut first = None;
     while let Some(i) = args.iter().position(|a| a == "--progress-file") {
         args.remove(i);
         if i < args.len() {
             let path = args.remove(i);
-            let _ = PROGRESS_FILE.set(std::path::PathBuf::from(path));
+            first.get_or_insert_with(|| std::path::PathBuf::from(path));
         }
+    }
+    first
+}
+
+/// The lane flags a `seed`, `update` or `install` pass takes from anywhere among its words
+/// before the verb reads its own ([`main_entry`], and [`pass_finishes_setup`] of the same
+/// words): the window's progress file, the head watch's mark, the wait a spawner put on the
+/// store lock ([`take_wait_lock_flag`]), [`NO_INIT_FLAG`] and, for an `update`, the
+/// published-index hint and the deferred busy flip. Any other verb's words keep them.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LaneFlags {
+    progress_file: Option<std::path::PathBuf>,
+    head_watch: bool,
+    wait_lock: Option<std::time::Duration>,
+    no_init: bool,
+    published_index_hint: Option<u64>,
+    defer_busy_flip: bool,
+}
+
+impl LaneFlags {
+    /// Take the lane flags out of `args` (a verb and its words).
+    fn take(args: &mut Vec<String>) -> Self {
+        let mut lane = Self::default();
+        if !matches!(
+            args.first().map(String::as_str),
+            Some("seed" | "update" | "install")
+        ) {
+            return lane;
+        }
+        lane.progress_file = take_progress_file_flag(args);
+        lane.head_watch = take_flag(args, HEAD_WATCH_FLAG);
+        lane.wait_lock = take_wait_lock_flag(args);
+        lane.no_init = take_flag(args, NO_INIT_FLAG);
+        if args.first().is_some_and(|verb| verb == "update") {
+            lane.published_index_hint = take_published_index_hint_flag(args);
+            lane.defer_busy_flip = take_flag(args, DEFER_BUSY_FLIP_FLAG);
+        }
+        lane
     }
 }
 
@@ -1229,10 +1265,10 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
     args.len() != before
 }
 
-fn apply_defer_busy_flip_flag(args: &mut Vec<String>) -> bool {
-    let defer = take_flag(args, DEFER_BUSY_FLIP_FLAG);
+/// This pass's flip policy ([`flip_policy`]): deferred while busy when its words carried
+/// [`DEFER_BUSY_FLIP_FLAG`] (`defer`), else at once.
+fn pick_flip_policy(defer: bool) {
     DEFER_BUSY_FLIP.with(|cell| cell.set(defer));
-    defer
 }
 
 fn head_watch_pass() -> bool {
@@ -1242,12 +1278,53 @@ fn head_watch_pass() -> bool {
 /// The flag the unattended lanes (the window's package loop, a terminal session's detached pass) put on every whole `update`.
 pub const DEFER_BUSY_FLIP_FLAG: &str = "--defer-busy-flip";
 
+/// The word that says no setup follows this `install` or `update` ([`pass_finishes_setup`]),
+/// taken from anywhere among a pass's words ([`LaneFlags`]). A command that runs a pass on a
+/// person's terminal as one step of its own work (`aterm ai doctor`'s and `aterm ai login`'s
+/// installs, the AI screen's Install tab) passes it, since that command decides what follows;
+/// a person types it to skip the follow-up.
+pub const NO_INIT_FLAG: &str = "--no-init";
+
 /// The word a window under a private state root puts ahead of the verb of every pass it spawns.
 pub const PRIVATE_STATE_ROOT_FLAG: &str = "--private-state-root";
 
 fn under_private_state_root() -> bool {
     PRIVATE_STATE_ROOT_LEAD.with(std::cell::Cell::get)
         || aterm_types::dirs::runs_under_private_state_root()
+}
+
+/// Whether a successful pass of `argv` (atpkg's words, as [`main_entry`] reads them) is an
+/// install or update a person expects setup to follow (`aterm pkg`'s follow-up, which also
+/// asks [`a_person_typed_this`]): `install` or `update`, its lane flags taken out as
+/// [`main_entry`] takes them (`LaneFlags`), with none of these:
+/// - the private window's lead ([`PRIVATE_STATE_ROOT_FLAG`]), which this crate reads as a pass
+///   under a private state root;
+/// - `--wait-lock`, the wait a spawner puts on a pass it runs and waits behind, which this crate
+///   never reads as a person's typed pass either (`mutator_store_lock`);
+/// - [`NO_INIT_FLAG`], which says no setup follows;
+/// - a help flag the verb answers with its usage;
+/// - a program built into aterm, which the verb answers with no pass;
+/// - the Command Line Tools (`is_clt_alias`), a narrow install that is the whole of what was
+///   asked.
+#[must_use]
+pub fn pass_finishes_setup(argv: &[std::ffi::OsString]) -> bool {
+    if argv.first().and_then(|word| word.to_str()) == Some(PRIVATE_STATE_ROOT_FLAG) {
+        return false;
+    }
+    let mut args: Vec<String> = argv
+        .iter()
+        .map(|word| word.to_string_lossy().into_owned())
+        .collect();
+    let lane = LaneFlags::take(&mut args);
+    let Some((verb, rest)) = args.split_first() else {
+        return false;
+    };
+    matches!(verb.as_str(), "install" | "update")
+        && lane.wait_lock.is_none()
+        && !lane.no_init
+        && !help_flag_addresses_atpkg(verb, rest)
+        && built_in(verb, rest).is_none()
+        && !rest.iter().any(|word| is_clt_alias(word))
 }
 
 fn flip_policy() -> crate::quiet::FlipPolicy {
@@ -1779,7 +1856,9 @@ fn selfupdate_plan(
             let active = crate::ops::active_builds(layout).get(row.program).copied();
             return SelfUpdatePlan::Refuse(
                 match crate::alab::agent(row.program).filter(|_| {
-                    active.is_some_and(|b| crate::alab::build_is_alab(layout, row.program, b))
+                    !crate::alab::vendor_chosen(layout, row.program)
+                        && active
+                            .is_some_and(|b| crate::alab::build_is_alab(layout, row.program, b))
                 }) {
                     Some(agent) => selfupdate::alab_declined_line(agent, &d),
                     None => selfupdate::declined_line(row, &d),
@@ -1803,18 +1882,16 @@ fn selfupdate_check(
 ) -> ExitCode {
     use std::io::Write as _;
     let active = crate::ops::active_builds(layout).get(row.program).copied();
-    match active.filter(|b| crate::alab::build_is_alab(layout, row.program, *b)) {
-        Some(build) => eprintln!(
+    let have = crate::vendor_direct::have_words(layout, row.program, active);
+    if !crate::alab::vendor_chosen(layout, row.program)
+        && active.is_some_and(|b| crate::alab::build_is_alab(layout, row.program, b))
+    {
+        eprintln!(
             "{}",
-            crate::selfupdate::alab_announce_line(
-                row.program,
-                &crate::alab::build_words(layout, row.program, build)
-            )
-        ),
-        None => {
-            let have = crate::vendor_direct::have_words(layout, row.program, active);
-            eprintln!("{}", crate::selfupdate::announce_line(row, &have));
-        }
+            crate::selfupdate::alab_announce_line(row.program, &have)
+        );
+    } else {
+        eprintln!("{}", crate::selfupdate::announce_line(row, &have));
     }
     let _ = std::io::stderr().flush();
     let status = aterm_uds::spawnfd::command(atpkg)
@@ -2817,13 +2894,18 @@ fn arity_refusal(rest: &[String], verb: &str) -> Option<ExitCode> {
     }
 }
 
-fn built_in_answer(verb: &str, rest: &[String]) -> Option<ExitCode> {
+/// What `verb` says of a program built into aterm that `rest` names, with no pass
+/// ([`crate::builtin::verb_answer`]).
+fn built_in(verb: &str, rest: &[String]) -> Option<crate::builtin::VerbAnswer> {
     let flags = match verb_row(verb)?.arity {
         Arity::One { flags } => flags,
         Arity::None | Arity::Own | Arity::Parsed { .. } => &[],
     };
-    let answer =
-        crate::builtin::verb_answer(verb, rest, flags, aterm_types::version::app_version())?;
+    crate::builtin::verb_answer(verb, rest, flags, aterm_types::version::app_version())
+}
+
+fn built_in_answer(verb: &str, rest: &[String]) -> Option<ExitCode> {
+    let answer = built_in(verb, rest)?;
     Some(if answer.refused {
         eprintln!("{}", answer.line);
         ExitCode::from(1)
@@ -2952,7 +3034,11 @@ fn begin_store_mutation(guard: &mut crate::lock::StoreLock) {
 
 const TYPED_LOCK_WAIT: std::time::Duration = crate::lock::TYPED_WAIT;
 
-fn a_person_typed_this() -> bool {
+/// Whether a person typed this command at a terminal: its standard input and standard error
+/// are both terminals. A child whose spawner put either one elsewhere (a window's pass, a
+/// detached one, one whose output is kept) is no person's. Never true in this crate's tests.
+#[must_use]
+pub fn a_person_typed_this() -> bool {
     use std::io::IsTerminal as _;
     !cfg!(test) && std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
@@ -4904,6 +4990,22 @@ fn recover_missing_roots(
     fetcher: &dyn crate::flow::Fetcher,
     trusted: Option<&crate::TrustedIndex>,
 ) {
+    recover_missing_roots_with(
+        layout,
+        fetcher,
+        trusted,
+        &effective_anchor(layout),
+        now_unix(),
+    );
+}
+
+fn recover_missing_roots_with(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    trusted: Option<&crate::TrustedIndex>,
+    anchor: &crate::Anchor,
+    now: i64,
+) {
     let live = crate::active_builds(layout);
     if live.is_empty() {
         return;
@@ -4913,7 +5015,10 @@ fn recover_missing_roots(
         .unwrap_or_default();
     let unattested: Vec<(String, u64)> = live
         .iter()
-        .filter(|(program, _)| !crate::vendor_direct::is_vendor(program))
+        .filter(|(program, build)| {
+            !crate::vendor_direct::is_vendor(program)
+                || crate::alab::build_is_alab(layout, program, **build)
+        })
         .filter(|(program, build)| {
             recorded
                 .get(program.as_str())
@@ -4928,16 +5033,12 @@ fn recover_missing_roots(
         return;
     }
     let resolved;
-    let index = match reusable_index(trusted, now_unix()) {
+    let index = match reusable_index(trusted, now) {
         Some(index) => index,
         None => {
-            let Ok(index) = crate::resolve_verified_index(
-                fetcher,
-                layout,
-                &effective_anchor(layout),
-                build_floor(layout),
-                now_unix(),
-            ) else {
+            let Ok(index) =
+                crate::resolve_verified_index(fetcher, layout, anchor, build_floor(layout), now)
+            else {
                 return;
             };
             resolved = index;
@@ -5123,6 +5224,9 @@ fn keep_replaced_legacy_root(
     program: &str,
     row: Option<&crate::ProgramStatus>,
 ) {
+    if !crate::vendor_direct::is_vendor(program) {
+        return;
+    }
     let Some((build, root)) = row.and_then(|r| {
         r.installed_build
             .filter(|b| !crate::vendor_direct::is_vendor_build(*b) && !r.tree_root.is_empty())
@@ -5236,7 +5340,14 @@ fn write_program_rows(
     let Some(mut status) = status_seed_for_rewrite(layout) else {
         return;
     };
-    status.programs.extend(rows);
+    for (program, row) in rows {
+        if let Some(prior) = status.programs.get(&program)
+            && prior.installed_build != row.installed_build
+        {
+            keep_replaced_legacy_root(layout, &program, Some(prior));
+        }
+        status.programs.insert(program, row);
+    }
     status.schema = 1;
     status.updated_at = now_rfc3339();
     status.enabled = manager_enabled();
@@ -5879,29 +5990,47 @@ fn reconcile_shadowed(
     shadowed
 }
 
+#[cfg(all(test, unix))]
 fn explicit_install_door(
     layout: &crate::store::Layout,
     fetcher: &dyn crate::flow::Fetcher,
     program: &str,
 ) -> Option<std::path::PathBuf> {
+    explicit_install_door_with_index(layout, fetcher, program, None).0
+}
+
+fn explicit_install_door_with_index(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    program: &str,
+    pre_resolved: Option<crate::TrustedIndex>,
+) -> (Option<std::path::PathBuf>, Option<crate::TrustedIndex>) {
     // No index rule decides a vendor-direct program: no system satisfaction, and no index
     // resolve ahead of its own lane.
     if crate::vendor_direct::is_vendor(program) {
-        return None;
+        return (None, pre_resolved);
     }
-    let index = crate::resolve_verified_index(
-        fetcher,
-        layout,
-        &effective_anchor(layout),
-        build_floor(layout),
-        now_unix(),
-    )
-    .ok()?;
-    let prog = index.program(program)?;
-    let path = crate::vendor::system_satisfied(&layout.prefix, prog)?;
+    let Some(index) = pre_resolved.or_else(|| {
+        crate::resolve_verified_index(
+            fetcher,
+            layout,
+            &effective_anchor(layout),
+            build_floor(layout),
+            now_unix(),
+        )
+        .ok()
+    }) else {
+        return (None, None);
+    };
+    let Some(prog) = index.program(program) else {
+        return (None, Some(index));
+    };
+    let Some(path) = crate::vendor::system_satisfied(&layout.prefix, prog) else {
+        return (None, Some(index));
+    };
     let mut installed = crate::active_builds(layout);
     satisfy_by_system(layout, program, &path, &mut installed);
-    Some(path)
+    (Some(path), Some(index))
 }
 
 fn record_removed(layout: &crate::store::Layout, program: &str) -> std::io::Result<()> {
@@ -7549,15 +7678,7 @@ fn record_installed_deps(
     }
 }
 
-fn do_install(
-    layout: &crate::store::Layout,
-    fetcher: &dyn crate::flow::Fetcher,
-    channel: &str,
-    program: &str,
-) -> Result<crate::InstallReport, crate::FlowError> {
-    do_install_with(layout, fetcher, channel, program, &PassSeams::process())
-}
-
+#[cfg(all(test, unix))]
 fn do_install_with(
     layout: &crate::store::Layout,
     fetcher: &dyn crate::flow::Fetcher,
@@ -7565,7 +7686,19 @@ fn do_install_with(
     program: &str,
     seams: &PassSeams<'_>,
 ) -> Result<crate::InstallReport, crate::FlowError> {
-    let installed = crate::active_builds(layout).get(program).copied();
+    do_install_with_index(layout, fetcher, channel, program, None, seams)
+}
+
+fn do_install_with_index(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    channel: &str,
+    program: &str,
+    pre_resolved: Option<crate::TrustedIndex>,
+    seams: &PassSeams<'_>,
+) -> Result<crate::InstallReport, crate::FlowError> {
+    let before = crate::active_builds(layout);
+    let installed = before.get(program).copied();
     let floor = build_floor(layout);
     let req = crate::InstallRequest {
         channel,
@@ -7577,19 +7710,40 @@ fn do_install_with(
     if crate::vendor_direct::is_vendor(program) {
         let _ = crate::vendor_direct::ProgramStamp::clear_refusal(layout, program);
     }
+    let anchor = (seams.anchor)(layout);
+    let now = (seams.now)();
     let mut resolved_assets = std::collections::BTreeMap::new();
     let typed = TypedPass::begin("install");
-    let result = match crate::vendor_direct::spec(program)
-        .filter(|_| !index_owns_now(layout, fetcher, program))
-    {
-        Some(spec) => install_vendor_door(layout, fetcher, channel, spec, seams),
-        None => crate::flow::install_collecting_assets(
+    let result = match crate::vendor_direct::spec(program) {
+        Some(spec) => {
+            let owned = pre_resolved
+                .filter(|index| {
+                    crate::alab::agent(program).is_some_and(|a| a.serves(current_triple()))
+                        && crate::alab::index_owns(layout, program, current_triple(), Some(index))
+                })
+                .or_else(|| index_owning(layout, fetcher, &anchor, now, program));
+            match owned {
+                Some(index) => crate::flow::install_collecting_assets_with_index(
+                    fetcher,
+                    layout,
+                    &anchor,
+                    &req,
+                    floor,
+                    now,
+                    Some(index),
+                    &mut resolved_assets,
+                ),
+                None => install_vendor_door(layout, fetcher, channel, spec, seams),
+            }
+        }
+        None => crate::flow::install_collecting_assets_with_index(
             fetcher,
             layout,
-            &effective_anchor(layout),
+            &anchor,
             &req,
             floor,
-            now_unix(),
+            now,
+            pre_resolved,
             &mut resolved_assets,
         ),
     };
@@ -7615,13 +7769,12 @@ fn do_install_with(
                 outcome,
             );
             if !r.already_current {
+                warm_alab_landed(layout, &before, seams.warm_agents);
                 let channel = last_verified_channel(layout);
                 let _ = crate::gc::run_keeping_pinned_partials(layout, channel.as_ref(), &|p| {
                     resolved_assets.get(p).cloned()
                 });
-            }
-            if !r.already_current {
-                refresh_shell_hooks(layout);
+                (seams.shell_hooks)(layout);
             }
         }
         Err(e) => match failed_install_state(e) {
@@ -7671,7 +7824,9 @@ fn install_vendor_door(
         outcome.verdict,
         crate::vendor_direct::lane::Verdict::Installed { .. }
             | crate::vendor_direct::lane::Verdict::RolledBack { .. }
+            | crate::vendor_direct::lane::Verdict::AlabRolledBack { .. }
             | crate::vendor_direct::lane::Verdict::Tombstoned { .. }
+            | crate::vendor_direct::lane::Verdict::AlabTombstoned { .. }
     );
     record_vendor_status(layout, &outcome, now);
     note_landed(&mut pass, &outcome);
@@ -7825,8 +7980,20 @@ fn cmd_install_with(
     fetcher: &dyn crate::flow::Fetcher,
     invoked_as: &str,
 ) -> ExitCode {
+    cmd_install_with_index(program, layout, cfg, fetcher, None, invoked_as)
+}
+
+fn cmd_install_with_index(
+    program: &str,
+    layout: &crate::store::Layout,
+    cfg: &crate::config::PackagesConfig,
+    fetcher: &dyn crate::flow::Fetcher,
+    pre_resolved: Option<crate::TrustedIndex>,
+    invoked_as: &str,
+) -> ExitCode {
     reconcile_links(layout, cfg);
-    if let Some(path) = explicit_install_door(layout, fetcher, program) {
+    let (door, resolved) = explicit_install_door_with_index(layout, fetcher, program, pre_resolved);
+    if let Some(path) = door {
         println!(
             "atpkg: {program}: nothing to install — the system install at {} satisfies it \
              (remove that install and re-run to have atpkg manage {program})",
@@ -7834,7 +8001,14 @@ fn cmd_install_with(
         );
         return ExitCode::SUCCESS;
     }
-    match do_install(layout, fetcher, crate::config::CHANNEL, program) {
+    match do_install_with_index(
+        layout,
+        fetcher,
+        crate::config::CHANNEL,
+        program,
+        resolved,
+        &PassSeams::process(),
+    ) {
         Ok(r) => {
             if let Some(vendor) = &r.vendor {
                 // The vendor lane's own line: versions, never a store build id.
@@ -8010,7 +8184,7 @@ fn rollback_in(
     }
     let floor = build_floor(layout);
     let fetcher = fetcher();
-    match crate::flow::rollback(
+    match crate::flow::rollback_returning_index(
         &*fetcher,
         layout,
         &effective_anchor(layout),
@@ -8020,7 +8194,7 @@ fn rollback_in(
         floor,
         now_unix(),
     ) {
-        Ok(r) => {
+        Ok((r, index)) => {
             advance_floors(layout, r.index_build, r.roster_seq);
             record_status(
                 layout,
@@ -8032,7 +8206,7 @@ fn rollback_in(
                 },
                 format!("rolled back {program} {} -> {}", r.from_build, r.to_build),
             );
-            recover_missing_roots(layout, &*fetcher, None);
+            recover_missing_roots(layout, &*fetcher, Some(&index));
             println!(
                 "{}",
                 rollback_line(
@@ -8063,7 +8237,8 @@ fn cmd_rollback_vendor(
     spec: &'static crate::vendor_direct::VendorSpec,
 ) -> ExitCode {
     let program = spec.program;
-    let policy = crate::vendor_direct::policy::Policy::current(layout, None);
+    let cached = cached_index(layout);
+    let policy = crate::vendor_direct::policy::Policy::current(layout, cached.as_ref());
     match crate::vendor_direct::lane::roll_back_by_hand(layout, &policy, spec) {
         Ok(moved) => {
             let build = moved.to_build;
@@ -8158,8 +8333,19 @@ enum PinPeers<'a> {
     },
 }
 
+#[cfg(all(test, unix))]
 fn pin_line(program: &str, build: u64, pinned: bool, changed: bool, peers: PinPeers<'_>) -> String {
     let what = crate::vendor_direct::display_build(program, build);
+    pin_line_for(&what, program, pinned, changed, peers)
+}
+
+fn pin_line_for(
+    what: &str,
+    program: &str,
+    pinned: bool,
+    changed: bool,
+    peers: PinPeers<'_>,
+) -> String {
     if let PinPeers::Group {
         group,
         pinned: others,
@@ -8260,9 +8446,7 @@ fn unlink_returns_to_alab(layout: &crate::store::Layout, program: &str) -> bool 
     if crate::alab::agent(program).is_none() || crate::alab::vendor_chosen(layout, program) {
         return false;
     }
-    let active = std::fs::read_link(layout.program_current(program))
-        .ok()
-        .and_then(|t| t.file_name()?.to_str()?.replace('+', "?").parse().ok())
+    let active = crate::alab::current_build(layout, program)
         .is_some_and(|b| crate::alab::build_is_alab(layout, program, b));
     active
         || cached_index(layout).is_some_and(|index| {
@@ -8322,7 +8506,8 @@ fn cmd_pin(program: Option<&String>, pinned: bool) -> ExitCode {
                 },
                 Some(_) => PinPeers::Alone,
             };
-            println!("{}", pin_line(program, build, pinned, changed, peers));
+            let what = crate::vendor_direct::display_have_build(&layout, program, build);
+            println!("{}", pin_line_for(&what, program, pinned, changed, peers));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -8530,10 +8715,13 @@ fn roll_forward_interrupted_activations(
         let vendor = crate::vendor_direct::spec(&program);
         let admitted = match vendor {
             Some(_) => {
-                let policy = crate::vendor_direct::policy::Policy::current(layout, None);
+                let index = index.get_or_insert_with(|| cached.take().and_then(|f| f()));
+                let policy = crate::vendor_direct::policy::Policy::current(layout, index.as_ref());
                 !crate::vendor_direct::Version::from_build_id(build)
                     .is_some_and(|v| policy.is_yanked(&program, v))
                     && !policy.is_legacy_yanked(&program, build)
+                    && !(crate::alab::build_is_alab(layout, &program, build)
+                        && build < policy.alab_floor(&program))
             }
             None => {
                 let index = index.get_or_insert_with(|| cached.take().and_then(|f| f()));
@@ -8571,7 +8759,7 @@ fn roll_forward_interrupted_activations(
         if tools.is_empty() {
             continue;
         }
-        let label = crate::vendor_direct::display_build(&program, build);
+        let label = crate::vendor_direct::display_have_build(layout, &program, build);
         if build_dir.join("lib").join("rustlib").is_dir()
             && let Err(e) = crate::flow::bundle_resolve_check(&build_dir, &tools)
         {
@@ -8592,11 +8780,11 @@ fn roll_forward_interrupted_activations(
                     "atpkg: {program}: finished an interrupted activation — its shims now run \
                      {label}"
                 );
-                record_row_keeping_outcome(
-                    layout,
-                    &program,
-                    crate::status::store_row(layout, &program, build),
-                );
+                let mut row = crate::status::store_row(layout, &program, build);
+                if row.tree_root.is_empty() {
+                    row.tree_root = legacy_root_of(layout, &program, build);
+                }
+                record_row_keeping_outcome(layout, &program, row);
                 rolled.push(program);
             }
             Err(e) => eprintln!(
@@ -9108,6 +9296,7 @@ fn run_update_pass_in<'scope, 'env>(
         )
     });
     if let Some(Ok(index)) = resolved.as_ref() {
+        resolved_index_build = Some(index.index_build);
         RESOLVED_PASS_INDEX_BUILD.with(|seen| seen.set(seen.get().max(index.index_build)));
     }
     let provenance = resolved.as_ref().and(crate::flow::last_resolve());
@@ -9234,7 +9423,13 @@ fn run_update_pass_in<'scope, 'env>(
         resolved_index_build = Some(report.index_build);
         resolved_assets.extend(report.resolved_assets.clone());
         clear_status_row(layout, "*index*");
-        recover_missing_roots(layout, fetcher, Some(&index));
+        recover_missing_roots_with(
+            layout,
+            fetcher,
+            Some(&index),
+            &(seams.anchor)(layout),
+            (seams.now)(),
+        );
         record_outcome(
             layout,
             vendor_folded_outcome(
@@ -9312,6 +9507,7 @@ fn run_update_pass_in<'scope, 'env>(
             index_answered |= retry.answered;
         }
         if let Some(build) = net.resolved_index_build {
+            resolved_index_build = Some(resolved_index_build.map_or(build, |b| b.max(build)));
             RESOLVED_PASS_INDEX_BUILD.with(|seen| seen.set(seen.get().max(build)));
         }
         index_resolved = settle_net_lane_index(layout, index_resolved, net.index_error.as_deref());
@@ -9811,6 +10007,7 @@ fn install_default_set_inner(
             .filter(|n| crate::stub::is_agent_program(n) && !installed.contains_key(n.as_str()))
             .filter(|name| {
                 let lane_fault = crate::vendor_direct::is_vendor(name)
+                    && !crate::alab::index_owns(layout, name, triple, Some(index))
                     && recorded
                         .as_ref()
                         .and_then(|r| r.programs.get(name.as_str()))
@@ -10738,6 +10935,7 @@ fn install_toolset(
             vendors_after: false,
         },
     );
+    warm_alab_landed(layout, &before, seams.warm_agents);
     if let Some(rider) = rider.take() {
         settle_rider(
             layout,
@@ -10763,7 +10961,10 @@ fn install_toolset(
         .remaining_missing
         .iter()
         .cloned()
-        .partition(|p| crate::vendor_direct::is_vendor(p));
+        .partition(|p| {
+            crate::vendor_direct::is_vendor(p)
+                && !crate::alab::index_owns(layout, p, current_triple(), resolved.as_deref())
+        });
     if default_set_adopts(
         activated,
         index_failures,
@@ -10797,6 +10998,9 @@ fn install_toolset(
         );
         return 1;
     }
+    let resolved_index_build = failures_outcome
+        .resolved_index_build
+        .or_else(|| resolved.as_ref().map(|i| i.index_build));
     let skipped = &failures_outcome.skipped_narrowed;
     if activated == 0 {
         let already = !before.is_empty();
@@ -10816,7 +11020,7 @@ fn install_toolset(
                 &crate::prereq::CcHost::this_machine(),
             );
             print_managed_current(layout, &vendor.unchecked, now);
-            record_index_freshness(layout, now, None);
+            record_index_freshness(layout, now, resolved_index_build);
             return 0;
         }
         println!(
@@ -10841,7 +11045,7 @@ fn install_toolset(
         &crate::prereq::CcHost::this_machine(),
     );
     print_managed_current(layout, &vendor.unchecked, now);
-    record_index_freshness(layout, now, None);
+    record_index_freshness(layout, now, resolved_index_build);
     0
 }
 
@@ -11554,25 +11758,32 @@ fn cmd_update_one(program: &String) -> ExitCode {
         // Update of a not-installed program = a fresh explicit install (single path).
         return cmd_install_for_update(program);
     }
-    if let Some(spec) = crate::vendor_direct::spec(program)
-        && !(crate::alab::agent(program).is_some_and(|a| a.serves(current_triple()))
-            && index_owns_now(&layout, &*resolve_fetcher(&layout), program))
-    {
-        return cmd_update_vendor(&layout, spec, VendorDoor::Person);
-    }
     let cur = installed.get(program).copied();
     let floor = build_floor(&layout);
     let fetcher = resolve_fetcher(&layout);
-    let plan = match crate::flow::plan_update(
+    let anchor = effective_anchor(&layout);
+    let now = now_unix();
+    let pre_resolved = match crate::vendor_direct::spec(program) {
+        Some(spec) => match index_owning(&layout, &*fetcher, &anchor, now, program) {
+            Some(index) => Some(index),
+            None => return cmd_update_vendor(&layout, spec, VendorDoor::Person),
+        },
+        None => None,
+    };
+    let live_pre_resolved =
+        pre_resolved.filter(|_| crate::flow::last_resolve().is_some_and(|r| r.reached));
+    let had_live_resolve = live_pre_resolved.is_some();
+    let (plan, resolved) = match crate::flow::plan_update_with_index(
         &*fetcher,
         &layout,
-        &effective_anchor(&layout),
+        &anchor,
         crate::config::CHANNEL,
         current_triple(),
         program,
         cur,
         floor,
-        now_unix(),
+        now,
+        live_pre_resolved,
     ) {
         Ok(x) => x,
         Err(e) => {
@@ -11583,17 +11794,18 @@ fn cmd_update_one(program: &String) -> ExitCode {
     };
     let decision = plan.decision;
     if plan.group.is_some() {
-        let report = match crate::flow::apply_program(
+        let report = match crate::flow::apply_program_with_index(
             &*fetcher,
             &layout,
-            &effective_anchor(&layout),
+            &anchor,
             crate::config::CHANNEL,
             current_triple(),
             program,
             &installed,
             cfg.exclude(),
             floor,
-            now_unix(),
+            now,
+            Some(resolved),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -11604,6 +11816,7 @@ fn cmd_update_one(program: &String) -> ExitCode {
         };
         advance_floors(&layout, report.index_build, report.roster_seq);
         let failures = report_channel_apply(&layout, &installed, &report, &[], false);
+        warm_alab_landed(&layout, &installed, PassSeams::process().warm_agents);
         for p in &report.skipped_linked {
             println!("atpkg: {p} dev-linked — skipped");
         }
@@ -11641,29 +11854,27 @@ fn cmd_update_one(program: &String) -> ExitCode {
              it anyway"
         );
     }
-    let before = crate::active_builds(&layout);
-    let code = cmd_install_with(program, &layout, cfg, &*fetcher, "update");
-    warm_alab_landed(&layout, &before, crate::warm::spawn_landed);
-    code
+    cmd_install_with_index(
+        program,
+        &layout,
+        cfg,
+        &*fetcher,
+        had_live_resolve.then_some(resolved),
+        "update",
+    )
 }
 
-fn index_owns_now(
+fn index_owning(
     layout: &crate::store::Layout,
     fetcher: &dyn crate::flow::Fetcher,
+    anchor: &crate::sig::Anchor,
+    now: i64,
     program: &str,
-) -> bool {
-    crate::alab::agent(program).is_some_and(|agent| agent.serves(current_triple()))
-        && crate::resolve_verified_index(
-            fetcher,
-            layout,
-            &effective_anchor(layout),
-            build_floor(layout),
-            now_unix(),
-        )
-        .ok()
-        .is_some_and(|index| {
-            crate::alab::index_owns(layout, program, current_triple(), Some(&index))
-        })
+) -> Option<crate::TrustedIndex> {
+    crate::alab::agent(program).filter(|agent| agent.serves(current_triple()))?;
+    let index =
+        crate::resolve_verified_index(fetcher, layout, anchor, build_floor(layout), now).ok()?;
+    crate::alab::index_owns(layout, program, current_triple(), Some(&index)).then_some(index)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11872,6 +12083,7 @@ fn legacy_index_for(
         .any(|(p, b)| {
             crate::vendor_direct::is_vendor(p)
                 && ((!crate::vendor_direct::is_vendor_build(*b)
+                    && !crate::alab::build_is_alab(layout, p, *b)
                     && crate::vendor_direct::ProgramStamp::read(layout, p)
                         .and_then(|s| s.legacy_version_of(*b))
                         .is_none())
@@ -12540,7 +12752,11 @@ fn report_vendor(
     }
     if matches!(
         outcome.verdict,
-        Verdict::Installed { .. } | Verdict::RolledBack { .. } | Verdict::Tombstoned { .. }
+        Verdict::Installed { .. }
+            | Verdict::RolledBack { .. }
+            | Verdict::AlabRolledBack { .. }
+            | Verdict::Tombstoned { .. }
+            | Verdict::AlabTombstoned { .. }
     ) {
         pass.changed = true;
     }
@@ -12559,7 +12775,6 @@ fn record_vendor_status(
     let said = line.strip_prefix("atpkg: ").unwrap_or(&line).to_string();
     let active = crate::active_builds(layout).get(program).copied();
     let prior = crate::status::read(layout).and_then(|s| s.programs.get(program).cloned());
-    keep_replaced_legacy_root(layout, program, prior.as_ref());
     let recorded = active.and_then(|b| {
         if crate::vendor_direct::is_vendor_build(b) {
             crate::vendor_direct::complete_record(&layout.build_dir(program, b))
@@ -13192,86 +13407,115 @@ fn cmd_verify(program: Option<&String>) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     for (name, o) in &outcomes {
-        use crate::verify::VerifyOutcome::{
-            BuildMismatch, DevLinkUnavailable, DevLinked, Drift, Match, NoSignedRoot, NotInstalled,
-            Unreadable, VendorRoot, WiredSysroot,
-        };
-        match o {
-            DevLinked { checkout } => {
-                eprintln!(
-                    "atpkg: {name} is dev-linked to {} — not attested against a signed store tree; managed from that checkout",
-                    checkout.display()
-                );
-            }
-            DevLinkUnavailable { error } => {
-                eprintln!(
-                    "atpkg: {name} development link is unavailable: {error} — inspect the checkout and `aterm pkg which {name}`"
-                );
-            }
-            VendorRoot {
-                build,
-                vendor,
-                staged_from: from,
-                drift: None,
-            } => println!(
-                "atpkg: {} OK (matches the tree staged from {})",
-                crate::vendor_direct::display_build(name, *build),
-                staged_from(name, vendor, from)
-            ),
-            VendorRoot {
-                build,
-                vendor,
-                staged_from: from,
-                ..
-            } => {
-                eprintln!(
-                    "atpkg: {} DRIFT — the store tree no longer matches the tree staged from {}",
-                    crate::vendor_direct::display_build(name, *build),
-                    staged_from(name, vendor, from)
-                );
-            }
-            Match { build } => {
-                println!("atpkg: {name} build {build} OK (matches signed tree_root)")
-            }
-            WiredSysroot { build } => println!(
-                "atpkg: {name} build {build} not checked \u{2014} installed by an older aterm \
-                 that changed its files; a newer build is checked"
-            ),
-            Drift { build, .. } => {
-                eprintln!(
-                    "atpkg: {name} build {build} DRIFT — store tree does not match the signed tree_root"
-                );
-            }
-            NoSignedRoot { .. } => {
-                eprintln!(
-                    "atpkg: {name} — no signed tree_root recorded; aterm pkg install {name} \
-                     reinstalls it and records one"
-                );
-            }
-            NotInstalled => {
-                eprintln!("{}", not_installed_fix(name));
-            }
-            Unreadable { build, error } => {
-                eprintln!(
-                    "atpkg: {} unreadable: {error}",
-                    crate::vendor_direct::display_build(name, *build)
-                );
-            }
-            BuildMismatch { active, recorded } => {
-                let recorded = recorded
-                    .map_or_else(|| String::from("none"), crate::vendor_direct::build_words);
-                eprintln!(
-                    "atpkg: {name} active {} differs from recorded {recorded} — cannot attest; \
-                     update/reinstall",
-                    crate::vendor_direct::build_words(*active)
-                );
-            }
+        let (on_stderr, line) = verify_outcome_line(&layout, name, o);
+        if on_stderr {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
         }
     }
     if outcomes.iter().all(|(_, o)| o.passes()) {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+fn verify_outcome_line(
+    layout: &crate::store::Layout,
+    name: &str,
+    o: &crate::verify::VerifyOutcome,
+) -> (bool, String) {
+    use crate::verify::VerifyOutcome::{
+        BuildMismatch, DevLinkUnavailable, DevLinked, Drift, Match, NoSignedRoot, NotInstalled,
+        Unreadable, VendorRoot, WiredSysroot,
+    };
+    let display = |build| crate::vendor_direct::display_have_build(layout, name, build);
+    match o {
+        DevLinked { checkout } => (
+            true,
+            format!(
+                "atpkg: {name} is dev-linked to {} — not attested against a signed store tree; managed from that checkout",
+                checkout.display()
+            ),
+        ),
+        DevLinkUnavailable { error } => (
+            true,
+            format!(
+                "atpkg: {name} development link is unavailable: {error} — inspect the checkout and `aterm pkg which {name}`"
+            ),
+        ),
+        VendorRoot {
+            build,
+            vendor,
+            staged_from: from,
+            drift: None,
+        } => (
+            false,
+            format!(
+                "atpkg: {} OK (matches the tree staged from {})",
+                crate::vendor_direct::display_build(name, *build),
+                staged_from(name, vendor, from)
+            ),
+        ),
+        VendorRoot {
+            build,
+            vendor,
+            staged_from: from,
+            ..
+        } => (
+            true,
+            format!(
+                "atpkg: {} DRIFT — the store tree no longer matches the tree staged from {}",
+                crate::vendor_direct::display_build(name, *build),
+                staged_from(name, vendor, from)
+            ),
+        ),
+        Match { build } => (
+            false,
+            format!("atpkg: {} OK (matches signed tree_root)", display(*build)),
+        ),
+        WiredSysroot { build } => (
+            false,
+            format!(
+                "atpkg: {} not checked \u{2014} installed by an older aterm \
+                 that changed its files; a newer build is checked",
+                display(*build)
+            ),
+        ),
+        Drift { build, .. } => (
+            true,
+            format!(
+                "atpkg: {} DRIFT — store tree does not match the signed tree_root",
+                display(*build)
+            ),
+        ),
+        NoSignedRoot { .. } => (
+            true,
+            format!(
+                "atpkg: {name} — no signed tree_root recorded; aterm pkg install {name} \
+                 reinstalls it and records one"
+            ),
+        ),
+        NotInstalled => (true, not_installed_fix(name)),
+        Unreadable { build, error } => (
+            true,
+            format!("atpkg: {} unreadable: {error}", display(*build)),
+        ),
+        BuildMismatch { active, recorded } => {
+            let recorded = recorded.map_or_else(
+                || String::from("none"),
+                |b| crate::vendor_direct::have_words(layout, name, Some(b)),
+            );
+            (
+                true,
+                format!(
+                    "atpkg: {name} active {} differs from recorded {recorded} — cannot attest; \
+                     update/reinstall",
+                    crate::vendor_direct::have_words(layout, name, Some(*active))
+                ),
+            )
+        }
     }
 }
 

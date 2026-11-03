@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::super::relaunch::{
-    Continued, ExitCause, NO_SHELL, NO_SHELL_DETAIL, WAIT_HAND_LIFTS, exit_clock, first_idle,
-    hand_waits_out,
+    Continued, ExitCause, NO_SHELL, NO_SHELL_DETAIL, WAIT_HAND_LIFTS, cannot_step, exit_clock,
+    first_idle, hand_waits_out,
 };
 use super::super::upgrade_muse::{self as mz, ExitKind};
 use super::upgrade::{Agent, Dialect, Phase};
@@ -336,7 +336,10 @@ pub(super) fn follow(snap: &mut super::super::relaunch::Snapshot) -> bool {
         return false;
     };
     let unmoved = run.lock.as_ref().is_some_and(|lock| {
-        std::fs::read_to_string(lock).is_ok_and(|body| mz::lock_pid(&body) == Some(pid))
+        super::super::accounts::read_bounded(lock, 64 * 1024)
+            .ok()
+            .flatten()
+            .is_some_and(|body| mz::lock_pid(&body) == Some(pid))
     });
     if unmoved || run.started_ms == 0 {
         return false;
@@ -499,7 +502,11 @@ pub(super) fn after_exit_onto(
         }
         closed = Some(st);
     }
-    if let Some(earlier) = closed.or(prior).filter(|st| typed_for_exit(st, snap)) {
+    if let Some(earlier) = closed
+        .as_ref()
+        .or(prior.as_ref())
+        .filter(|st| typed_for_exit(st, snap))
+    {
         let line = connect(opts, &tab)
             .ok()
             .and_then(|mut c| line_word(&mut c, &tab, earlier.line_block));
@@ -533,7 +540,9 @@ pub(super) fn after_exit_onto(
         ExitRecord::Crashed => Some(ExitKind::Crashed),
         ExitRecord::Removed => Some(ExitKind::Clean),
         ExitRecord::Refused => Some(ExitKind::Refused),
-        ExitRecord::Unread | ExitRecord::Survived(_) if cause == ExitCause::Exit => {
+        ExitRecord::Unread | ExitRecord::Survived(_)
+            if matches!(cause, ExitCause::Exit | ExitCause::Carried) =>
+        {
             if relaunched_before {
                 Some(ExitKind::Crashed)
             } else {
@@ -546,13 +555,16 @@ pub(super) fn after_exit_onto(
         }
         ExitRecord::Unread | ExitRecord::Survived(_) => None,
     };
-    if cause == ExitCause::Exit {
-        match word {
-            Some(ExitKind::Crashed) => {}
-            Some(ExitKind::Clean) => return said(r, "ended:graceful-exit"),
-            Some(ExitKind::Refused) => return said(r, "ended:refused-start"),
-            None => return said(r, "ended:exit-unwitnessed"),
+    match (cause, word) {
+        (ExitCause::Exit, Some(ExitKind::Crashed)) => {}
+        (ExitCause::Exit, Some(ExitKind::Clean)) => return said(r, "ended:graceful-exit"),
+        (ExitCause::Exit, None) => return said(r, "ended:exit-unwitnessed"),
+        // An exit an Autopilot carries comes back however it ended, save a start the agent
+        // refused: typed again, it would refuse again.
+        (ExitCause::Exit | ExitCause::Carried, Some(ExitKind::Refused)) => {
+            return said(r, cannot_step(cause, "refused-start"));
         }
+        _ => {}
     }
     if snap.shell == NO_SHELL {
         return said(r, "refused:not-a-shell-job");
@@ -569,7 +581,7 @@ pub(super) fn after_exit_onto(
         Some((session, lock)) => (session, Some(lock)),
         None => {
             let Some(session) = snap.session.clone().filter(|s| mz::is_session_uuid(s)) else {
-                return said(r, "ended:no-conversation");
+                return said(r, cannot_step(cause, "no-conversation"));
             };
             let lock = run
                 .lock
@@ -580,7 +592,7 @@ pub(super) fn after_exit_onto(
         }
     };
     let Some(lock) = lock else {
-        return said(r, "ended:no-session");
+        return said(r, cannot_step(cause, "no-session"));
     };
     let program = match relaunch_program(&snap.program, twin) {
         Ok(p) => p,
@@ -631,7 +643,7 @@ pub(super) fn after_exit_onto(
             ExitCause::Stall => CAUSE_STALL,
             ExitCause::Asked => CAUSE_ASKED,
             ExitCause::HostEnded => CAUSE_HOST,
-            ExitCause::Exit => CAUSE_EXIT,
+            ExitCause::Exit | ExitCause::Carried => CAUSE_EXIT,
         }
         .to_string(),
         salt: now,
@@ -639,6 +651,13 @@ pub(super) fn after_exit_onto(
         phase: Phase::Exiting { at_s: now },
         ..St::default()
     };
+    if let Some(prior) = prior.as_ref() {
+        if upgrade::same_build(Agent::Muse, &st.from, &st.to) {
+            prior.kept_by_restart(&tab, &mut st);
+        } else {
+            prior.retried_by(&mut st);
+        }
+    }
     save(opts, &session_key, &st);
     super::super::relaunch::consume_stamp(opts, snap, cause);
     ledger(
@@ -942,6 +961,9 @@ fn await_held(
             .into_iter()
             .find(|(pid, argv)| relaunched_by_us(*pid, argv, st, k))
             .map(|(pid, _)| pid);
+        if let Some(pid) = new {
+            found(st, pid, k);
+        }
         if new.is_none()
             && looked.is_none_or(|at| {
                 wait_now().saturating_duration_since(at) >= opts.timings.shell_look
@@ -1207,7 +1229,10 @@ fn carry_on(
                 if let Some(h) = hand.as_deref_mut() {
                     h.keep(c);
                 }
-                std::fs::read_to_string(&lock).is_ok_and(|body| mz::lock_pid(&body) == Some(new))
+                super::super::accounts::read_bounded(&lock, 64 * 1024)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|body| mz::lock_pid(&body) == Some(new))
             })
         });
     let mut claim = (false, false);
@@ -1408,28 +1433,44 @@ pub(super) fn holders(
     if !sessions.iter().any(|s| Agent::Muse.record_tab(s).is_some()) {
         return Vec::new();
     }
-    let procs = table();
-    let tab_of = |pid: u32| -> Option<String> {
-        match live_tabs {
-            Some(tabs) => tabs
-                .iter()
-                .find(|t| t.fgpgid == Some(i64::from(pid)))
-                .map(|t| t.sid.clone()),
-            None => atpkg::caller_shell::process_args(pid)
-                .and_then(|a| a.env_var("ATERM_PARENT_SESSION_ID").map(str::to_owned)),
-        }
-    };
-    procs
-        .iter()
+    let pids: Vec<u32> = table()
+        .into_iter()
         .filter(|(_, _, name)| name == mz::PROGRAM)
-        .filter_map(|(pid, _, _)| {
-            let tab = tab_of(*pid)?;
+        .map(|(pid, _, _)| pid)
+        .collect();
+    holders_in(sessions, live_tabs, &pids, &Live)
+}
+
+pub(super) fn holders_in(
+    sessions: &BTreeSet<String>,
+    live_tabs: Option<&[LiveTab]>,
+    pids: &[u32],
+    k: &dyn MuseKernel,
+) -> Vec<super::upgrade_status::Holder> {
+    if !sessions.iter().any(|s| Agent::Muse.record_tab(s).is_some()) {
+        return Vec::new();
+    }
+    pids.iter()
+        .filter_map(|pid| {
+            let args = k.args(*pid)?;
+            if !mz::is_tui_argv(&args.argv) {
+                return None;
+            }
+            let tab = match live_tabs {
+                Some(tabs) => tabs
+                    .iter()
+                    .find(|t| t.fgpgid == Some(i64::from(*pid)))
+                    .map(|t| t.sid.clone()),
+                None => args.env_var("ATERM_PARENT_SESSION_ID").map(str::to_owned),
+            }?;
             let session = key(&tab);
             sessions
                 .contains(&session)
                 .then(|| super::upgrade_status::Holder {
+                    pid: *pid,
                     session,
-                    version: exe_of(*pid)
+                    version: k
+                        .exe(*pid)
                         .and_then(|exe| store_version(&exe))
                         .unwrap_or_default(),
                     tab: Some(tab),

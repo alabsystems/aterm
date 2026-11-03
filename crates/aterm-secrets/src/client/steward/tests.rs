@@ -31,6 +31,14 @@ fn binding_denial_observation_does_not_wait_for_device_custody() {
         local_recipient_denied_in_roster(&lab.m1),
         "the authenticated local writer is denied before custody is held"
     );
+    {
+        let state = StateLock::take(&lab.m1).unwrap();
+        assert!(
+            local_recipient_denied_in_roster(&lab.m1),
+            "a busy state cannot erase a known roster-only denial"
+        );
+        assert!(local_recipient_denied_in_roster_held(&lab.m1, &state));
+    }
 
     let custody_dir = lab.m1.dir.clone();
     let (held_tx, held_rx) = std::sync::mpsc::channel();
@@ -497,10 +505,12 @@ fn an_admin_whose_person_turned_vault_sync_off_is_no_steward() {
 
 /// `admin_revoke` runs the full §7.6 swarm cascade in a single vault publish (putting the
 /// revoked Mac's `m<N>` label + aliases on `deny_labels`, its `node_id` on `deny_nodes`, removing
-/// its `SwarmMember` row, and releasing its `ai-pool.toml` warm slots, leases, and `last_heard`
-/// while leaving `aterm-fleet-code` unchanged); `admin_revoke_stolen` additionally rotates
-/// `aterm-fleet-code` (preserving `@<host>:<port>`) and emits a single-line `NEEDS YOU:` provider
-/// rotation notice naming exposed credentials and warm AI accounts.
+/// its `SwarmMember` row, releasing its `ai-pool.toml` warm slots, leases, and `last_heard`, and
+/// rotating `aterm-fleet-code`, preserving `@<host>:<port>`, as every removal does, F16);
+/// `admin_revoke_stolen` rotates it again and emits a single-line `NEEDS YOU:` provider rotation
+/// notice naming exposed credentials and warm AI accounts.
+///
+/// NEGATIVE CONTROL: rotate the code on `stolen` alone, and the plain revoke leaves it as it was.
 #[test]
 fn revoke_runs_the_full_swarm_cascade_and_stolen_rotates_fleet_code_with_needs_you() {
     let lab = lab("steward-revoke-cascade");
@@ -549,6 +559,7 @@ used = [150, 250]
                     node_key: None,
                     aliases: vec!["m9".into()],
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 1,
                     claimed_label: None,
                     claimed_at_ms: None,
@@ -561,6 +572,7 @@ used = [150, 250]
                     node_key: None,
                     aliases: Vec::new(),
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 1,
                     claimed_label: None,
                     claimed_at_ms: None,
@@ -589,9 +601,10 @@ used = [150, 250]
             .unwrap();
         admin_publish(&lab.m1, &opened, &doc).unwrap();
 
-        // 1. Normal `admin_revoke` on m2: full cascade, fleet code NOT rotated.
+        // 1. Normal `admin_revoke` on m2: full cascade, the fleet code rotated at its place.
         let opened = admin_open(&lab.m1).unwrap();
-        admin_revoke(&lab.m1, &opened, "m2", true).unwrap();
+        let plain = admin_revoke(&lab.m1, &opened, "m2", true).unwrap();
+        assert!(plain.fleet_code_rotated);
 
         let after_m2 = admin_open(&lab.m1).unwrap().doc.clone();
         assert!(after_m2.machines().iter().all(|m| m.name != "m2"));
@@ -618,7 +631,10 @@ used = [150, 250]
         .unwrap();
         assert!(!pool_after_m2.contains("\"m2\""), "{pool_after_m2}");
         assert!(pool_after_m2.contains("\"m3\""), "{pool_after_m2}");
-        assert_eq!(lab.fleet_code().as_deref(), Some(initial_code.as_bytes()));
+        let after_plain = lab.fleet_code().unwrap();
+        let after_plain = std::str::from_utf8(&after_plain).unwrap().to_owned();
+        assert_ne!(after_plain, initial_code);
+        assert!(after_plain.starts_with("atf1-") && after_plain.ends_with("@m1.local:7100"));
         assert!(matches!(
             steward_revoke_check(&lab.m1).unwrap(),
             StewardRevoke::Current(_)
@@ -627,7 +643,7 @@ used = [150, 250]
         // 2. Stolen `admin_revoke_stolen` on m3: rotates fleet code + emits single-line NEEDS YOU.
         let opened = admin_open(&lab.m1).unwrap();
         let stolen = admin_revoke_stolen(&lab.m1, &opened, "m3", true).unwrap();
-        assert!(stolen.fleet_code_rotated);
+        assert!(stolen.revocation.fleet_code_rotated);
         assert!(
             stolen.needs_you_line.starts_with("NEEDS YOU:")
                 && !stolen.needs_you_line.contains('\n')
@@ -641,7 +657,7 @@ used = [150, 250]
         );
         let rotated_bytes = lab.fleet_code().unwrap();
         let rotated_str = std::str::from_utf8(&rotated_bytes).unwrap();
-        assert_ne!(rotated_str, initial_code);
+        assert!(rotated_str != initial_code && rotated_str != after_plain);
         assert!(rotated_str.starts_with("atf1-") && rotated_str.ends_with("@m1.local:7100"));
     });
 }
@@ -668,6 +684,7 @@ fn steward_revoke_detects_and_finishes_a_half_done_vault_only_removal() {
                 node_key: None,
                 aliases: Vec::new(),
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 1,
                 claimed_label: None,
                 claimed_at_ms: None,
@@ -847,6 +864,7 @@ fn denied_roster_and_log_excluded_admins_cannot_serve_or_claim_steward_lease() {
                     node_key: None,
                     aliases: Vec::new(),
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 1,
                     claimed_label: None,
                     claimed_at_ms: None,
@@ -859,6 +877,7 @@ fn denied_roster_and_log_excluded_admins_cannot_serve_or_claim_steward_lease() {
                     node_key: Some("de".repeat(32)),
                     aliases: Vec::new(),
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 1,
                     claimed_label: None,
                     claimed_at_ms: None,

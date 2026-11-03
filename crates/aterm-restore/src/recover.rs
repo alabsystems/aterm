@@ -21,7 +21,7 @@ use crate::layout::{
 use crate::records::{
     ChunkFault, ControlFault, HistoryChunk, HistoryIdentity, KIND_PAD, Keyframe, KeyframeFault,
     KeyframeHead, TAIL_RECORD_HEADER, TailFault, TailHeader, TailRecord, decode_control,
-    decode_history_chunk, decode_keyframe, decode_tail_payload,
+    decode_history_chunk, decode_keyframe, decode_tail_payload, validate_tail_header,
 };
 use crate::store::RegionView;
 
@@ -650,8 +650,19 @@ fn walk_tail<V: RegionView + ?Sized>(
             walk.fault = Some(TailFault::PastCommit);
             return walk;
         };
-        let payload_len = usize::try_from(header.payload_len).unwrap_or(usize::MAX);
-        let mut payload = vec![0u8; payload_len];
+        let payload_len = match validate_tail_header(&header) {
+            Ok(payload_len) => payload_len,
+            Err(fault) => {
+                walk.fault = Some(fault);
+                return walk;
+            }
+        };
+        let mut payload = Vec::new();
+        if payload.try_reserve_exact(payload_len).is_err() {
+            walk.fault = Some(TailFault::Unreadable);
+            return walk;
+        }
+        payload.resize(payload_len, 0);
         if view.read(at + TAIL_RECORD_HEADER, &mut payload).is_err() {
             walk.fault = Some(TailFault::Unreadable);
             return walk;
@@ -762,7 +773,12 @@ fn read_ring<V: RegionView + ?Sized>(view: &V, geometry: &Geometry) -> RingRun {
             run.fault = Some(RingFault::Words);
             return run;
         };
-        let mut bytes = vec![0u8; seg_len];
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(seg_len).is_err() {
+            run.fault = Some(RingFault::Words);
+            return run;
+        }
+        bytes.resize(seg_len, 0);
         if view
             .read(geometry.hist_off + off_usize, &mut bytes)
             .is_err()

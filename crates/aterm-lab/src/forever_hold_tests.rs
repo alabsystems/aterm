@@ -407,7 +407,7 @@ fn l2_the_chips_description_says_the_list() {
     let shown = format!("{OPEN_IN_REPORT}: \u{201c}{list}\u{201d}");
     let chip = |open: &str| {
         format!(
-            "window=2 program=claude face=land drawn=\"\u{2913} land\" spoken=\"Autopilot: \
+            "window=2 program=claude face=land drawn=\"\u{2913}\" spoken=\"Autopilot: \
              land.\" description=\"Not landed yet. Open in its report: {open} Landing since \
              10:22, 1 nudge.\" title=\"-\""
         )
@@ -442,7 +442,7 @@ fn l2_the_chips_description_says_the_list() {
         other.window.held = vec![j(
             81_000,
             &format!(
-                "window=2 program=claude face=land drawn=\"\u{2913} land\" spoken=\"Autopilot: \
+                "window=2 program=claude face=land drawn=\"\u{2913}\" spoken=\"Autopilot: \
                  land.\" description=\"{description}\" title=\"-\""
             ),
         )];

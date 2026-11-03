@@ -102,17 +102,32 @@ impl FileJournal {
         let lock_path = self.dir.join(Self::LOCK);
         let _held = Held::take(&lock_path, self.wait).map_err(|e| shown(e, &lock_path))?;
         let held = match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.is_file() => meta.len(),
+            Ok(meta) if meta.is_file() => {
+                #[cfg(unix)]
+                ensure_effective_owner(&meta, "journal file").map_err(|e| shown(e, &path))?;
+                meta.len()
+            }
             Ok(_) => return Err(format!("{}: not a regular file", path.display())),
             Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
             Err(e) => return Err(shown(e, &path)),
         };
         if held > 0 && held.saturating_add(len) > self.bound {
-            fs::rename(&path, self.rotated()).map_err(|e| {
+            let rotated = self.rotated();
+            match fs::symlink_metadata(&rotated) {
+                Ok(meta) if meta.is_file() => {
+                    #[cfg(unix)]
+                    ensure_effective_owner(&meta, "rotated journal")
+                        .map_err(|e| shown(e, &rotated))?;
+                }
+                Ok(_) => return Err(format!("{}: not a regular file", rotated.display())),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(shown(e, &rotated)),
+            }
+            fs::rename(&path, &rotated).map_err(|e| {
                 format!(
                     "{}: moving it to {}: {e}",
                     path.display(),
-                    self.rotated().display()
+                    rotated.display()
                 )
             })?;
         }
@@ -159,7 +174,30 @@ impl Journal for FileJournal {
     }
 }
 
+#[cfg(unix)]
+fn ensure_effective_owner(meta: &fs::Metadata, what: &str) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    // SAFETY: `geteuid` takes no pointers or preconditions and always returns the effective UID.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{what} is not owned by the current user"),
+        ));
+    }
+    Ok(())
+}
+
 fn make_dir(dir: &Path) -> io::Result<()> {
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty())
+        && let Ok(meta) = fs::symlink_metadata(parent)
+        && !meta.is_dir()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a directory",
+        ));
+    }
     if let Ok(meta) = fs::symlink_metadata(dir)
         && !meta.is_dir()
     {
@@ -173,18 +211,39 @@ fn make_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(dir)?;
-    let meta = fs::symlink_metadata(dir)?;
-    if !meta.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a directory",
-        ));
-    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let dir_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir)
+            .map_err(|e| match e.raw_os_error() {
+                Some(libc::ELOOP | libc::ENOTDIR) => {
+                    io::Error::new(io::ErrorKind::InvalidInput, "not a directory")
+                }
+                _ => e,
+            })?;
+        let meta = dir_file.metadata()?;
+        if !meta.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a directory",
+            ));
+        }
+        ensure_effective_owner(&meta, "journal directory")?;
         if meta.permissions().mode() & 0o7777 != 0o700 {
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+            dir_file.set_permissions(fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let meta = fs::symlink_metadata(dir)?;
+        if !meta.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a directory",
+            ));
         }
     }
     Ok(())
@@ -226,6 +285,7 @@ impl Held {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
+            ensure_effective_owner(&meta, "journal lock")?;
             if meta.permissions().mode() & 0o7777 != 0o600 {
                 file.set_permissions(fs::Permissions::from_mode(0o600))?;
             }
@@ -287,6 +347,7 @@ fn open_append(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
+        ensure_effective_owner(&meta, "journal file")?;
         if meta.permissions().mode() & 0o7777 != 0o600 {
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
@@ -482,6 +543,10 @@ mod tests {
         assert_eq!(applies.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    /// Non-regular journal/lock/rotated paths and symlinked journal or state directories refuse
+    /// every record before any item applies.
+    /// NEGATIVE CONTROL: following a symlinked `state_dir`, `converge` folder, lock, or rotated
+    /// file would create or overwrite targets outside `<state_dir>/converge`.
     #[test]
     fn a_journal_that_is_not_a_regular_file_refuses_and_nothing_is_applied() {
         let scratch = aterm_tempfile::tempdir().unwrap();
@@ -539,6 +604,21 @@ mod tests {
                 .unwrap_err();
             assert!(err.contains("not a directory"), "{err}");
 
+            let state_scratch = aterm_tempfile::tempdir().unwrap();
+            let state_target = state_scratch.path().join("state-elsewhere");
+            fs::create_dir_all(&state_target).unwrap();
+            let state_link = state_scratch.path().join("state-link");
+            std::os::unix::fs::symlink(&state_target, &state_link).unwrap();
+            let mut state_journal = FileJournal::under(&state_link);
+            let err = state_journal
+                .before_change("item.0", "a", "b", None)
+                .unwrap_err();
+            assert!(err.contains("not a directory"), "{err}");
+            assert!(
+                !state_target.join(FileJournal::DIR).exists(),
+                "symlinked state_dir must never have converge created inside its target"
+            );
+
             use std::os::unix::fs::PermissionsExt as _;
             let mode_scratch = aterm_tempfile::tempdir().unwrap();
             let mode_dir = mode_scratch.path().join(FileJournal::DIR);
@@ -570,6 +650,40 @@ mod tests {
                     f.display()
                 );
             }
+
+            let rot_scratch = aterm_tempfile::tempdir().unwrap();
+            let mut rot_journal = FileJournal::bounded(rot_scratch.path(), 128);
+            rot_journal.before_change("item.0", "a", "b", None).unwrap();
+            let before_lines = lines(&rot_journal.path());
+            assert_eq!(before_lines.len(), 1);
+            let target_outside = rot_scratch.path().join("outside");
+            fs::write(&target_outside, b"keep").unwrap();
+            std::os::unix::fs::symlink(&target_outside, rot_journal.rotated()).unwrap();
+            let item = Scripted {
+                id: "item.1.with.enough.text.to.force.rotation",
+                ..Scripted::new(vec![change(), ok()], Ok(()))
+            };
+            let applies = Arc::clone(&item.applies);
+            let items: Vec<Box<dyn Item>> = vec![Box::new(item)];
+            let rows = run(&items, Mode::Apply, &mut rot_journal).unwrap();
+            assert_eq!(rows[0].outcome, Outcome::Failed);
+            assert!(
+                rows[0]
+                    .why
+                    .as_deref()
+                    .unwrap()
+                    .contains("not a regular file"),
+                "{rows:?}"
+            );
+            assert_eq!(applies.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(
+                fs::symlink_metadata(rot_journal.rotated())
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "rotation must refuse a planted symlink without replacing it"
+            );
+            assert_eq!(lines(&rot_journal.path()), before_lines);
         }
     }
 

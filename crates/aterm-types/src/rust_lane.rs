@@ -343,11 +343,7 @@ const MAX_TOOLCHAIN_FILE_BYTES: u64 = 64 * 1024;
 
 fn read_toolchain_file(path: &Path) -> Option<String> {
     use std::io::Read as _;
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_TOOLCHAIN_FILE_BYTES {
-        return None;
-    }
-    let file = std::fs::File::open(path).ok()?;
+    let file = crate::fs_restricted::open_regular_nonblock(path).ok()?;
     let open_meta = file.metadata().ok()?;
     if !open_meta.is_file() || open_meta.len() > MAX_TOOLCHAIN_FILE_BYTES {
         return None;

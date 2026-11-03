@@ -553,14 +553,30 @@ pub fn rebuilt_from_store(layout: &Layout) -> Status {
 /// The row the store itself can vouch for, for `program` active at `build`.
 #[must_use]
 pub fn store_row(layout: &Layout, program: &str, build: u64) -> ProgramStatus {
-    let vendor = crate::vendor_direct::spec(program).and_then(|spec| {
-        crate::vendor_direct::complete_record(&layout.build_dir(program, build))
-            .map(|record| crate::state::vendor_source(&record.version.to_string(), spec.vendor))
-    });
+    let mut tree_root = String::new();
+    let state = if crate::alab::build_is_alab(layout, program, build) {
+        tree_root = crate::vendor_direct::ProgramStamp::read(layout, program)
+            .and_then(|s| s.legacy_root_of(build).map(str::to_string))
+            .unwrap_or_default();
+        crate::state::alab_kept(build, &crate::alab::build_words(layout, program, build))
+    } else if let Some(spec) = crate::vendor_direct::spec(program)
+        && let Some(record) =
+            crate::vendor_direct::complete_record(&layout.build_dir(program, build))
+    {
+        tree_root = record.tree_root;
+        crate::state::vendor_source(&record.version.to_string(), spec.vendor)
+    } else {
+        if crate::vendor_direct::is_vendor(program) {
+            tree_root = crate::vendor_direct::ProgramStamp::read(layout, program)
+                .and_then(|s| s.legacy_root_of(build).map(str::to_string))
+                .unwrap_or_default();
+        }
+        String::from("active")
+    };
     ProgramStatus {
         installed_build: Some(build),
-        state: vendor.unwrap_or_else(|| String::from("active")),
-        tree_root: String::new(),
+        state,
+        tree_root,
     }
 }
 

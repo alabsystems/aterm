@@ -320,6 +320,104 @@ pub fn graph_and_paths(
     parse_tree(&text)
 }
 
+/// A Git package's checked-out source, as reported by the resolver itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GitPackage {
+    pub source: String,
+    pub directory: PathBuf,
+}
+
+/// Git annotations in `targo tree` are URLs, not local source directories.
+/// Read their actual directories and full source IDs from the locked graph.
+pub(crate) fn git_packages(
+    cargo: &Cargo,
+    root: &Path,
+) -> Result<BTreeMap<PkgId, GitPackage>, String> {
+    let mut cmd = cargo.command("metadata", root);
+    cmd.args(["--format-version", "1", "--locked", "--offline"]);
+    let out = cmd
+        .output_owned()
+        .map_err(|e| format!("cannot read Git package metadata: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "cannot read locked Git package metadata: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = std::str::from_utf8(&out.stdout)
+        .map_err(|e| format!("Git package metadata is not UTF-8: {e}"))?;
+    parse_git_packages(text)
+}
+
+fn parse_git_packages(text: &str) -> Result<BTreeMap<PkgId, GitPackage>, String> {
+    let value: aterm_json::Value =
+        aterm_json::from_str(text).map_err(|e| format!("invalid Git package metadata: {e}"))?;
+    let packages = value
+        .get("packages")
+        .and_then(aterm_json::Value::as_array)
+        .ok_or("Git package metadata has no package list")?;
+    let mut out = BTreeMap::new();
+    let mut identities = BTreeMap::new();
+    for package in packages {
+        let field = |key| {
+            package
+                .get(key)
+                .and_then(aterm_json::Value::as_str)
+                .ok_or_else(|| format!("Git package metadata has no {key}"))
+        };
+        let id = PkgId::new(field("name")?, field("version")?);
+        let manifest = PathBuf::from(field("manifest_path")?);
+        let source = package.get("source").and_then(aterm_json::Value::as_str);
+        let identity = (source.map(str::to_owned), manifest.clone());
+        if let Some(previous) = identities.insert(id.clone(), identity.clone())
+            && previous != identity
+        {
+            return Err(format!("Package {id} has ambiguous sources"));
+        }
+        let Some(source) = source.filter(|source| source.starts_with("git+")) else {
+            continue;
+        };
+        if !manifest.is_absolute() || manifest.file_name().is_none_or(|name| name != "Cargo.toml") {
+            return Err(format!("Git package {id} has no absolute manifest path"));
+        }
+        let directory = strip_verbatim_prefix(
+            manifest
+                .parent()
+                .ok_or("Git manifest has no parent")?
+                .to_path_buf(),
+        );
+        let resolved = GitPackage {
+            source: source.to_owned(),
+            directory,
+        };
+        if let Some(previous) = out.insert(id.clone(), resolved.clone())
+            && previous != resolved
+        {
+            return Err(format!("Git package {id} has ambiguous sources"));
+        }
+    }
+    Ok(out)
+}
+
+/// The printed short commit must agree with the resolver's full identity.
+pub(crate) fn matching_git_annotation(annotation: &Path, source: &str) -> bool {
+    let printed = annotation.to_string_lossy();
+    let Some(resolved) = source.strip_prefix("git+") else {
+        return false;
+    };
+    let Some((printed_url, short)) = printed.rsplit_once('#') else {
+        return false;
+    };
+    let Some((resolved_url, full)) = resolved.rsplit_once('#') else {
+        return false;
+    };
+    printed_url == resolved_url
+        && (7..=40).contains(&short.len())
+        && full.len() == 40
+        && full.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && full.starts_with(short)
+}
+
 fn abs_root(root: &Path) -> Result<PathBuf, String> {
     let abs = root.canonicalize().map_err(|e| {
         format!(
@@ -561,5 +659,62 @@ mod tests {
             PathBuf::from("/w/vendor/gamma")
         );
         assert!(!paths.contains_key(&PkgId::new("alpha", "1.0.0")));
+    }
+
+    #[test]
+    fn git_annotations_are_bound_to_resolved_full_commits() {
+        let full = "1234567890123456789012345678901234567890";
+        let source = format!("git+https://github.com/team/core?rev={full}#{full}");
+        assert!(matching_git_annotation(
+            Path::new(&format!("https://github.com/team/core?rev={full}#1234567")),
+            &source,
+        ));
+        for annotation in [
+            format!("https://github.com/other/core?rev={full}#1234567"),
+            format!("https://github.com/team/core?rev={full}#9876543"),
+            format!("https://github.com/team/core?rev={full}#"),
+        ] {
+            assert!(!matching_git_annotation(Path::new(&annotation), &source));
+        }
+    }
+
+    #[test]
+    fn git_metadata_resolves_directories_and_refuses_missing_or_conflicting_identity() {
+        let full = "1234567890123456789012345678901234567890";
+        let row = |path: &str, hash: &str| {
+            format!(
+                r#"{{"name":"leaf","version":"1.0.0","source":"git+https://github.com/team/core?rev={hash}#{hash}","manifest_path":"{path}"}}"#
+            )
+        };
+        let absolute = if cfg!(windows) {
+            "C:/source/leaf/Cargo.toml"
+        } else {
+            "/source/leaf/Cargo.toml"
+        };
+        let valid = row(absolute, full);
+        let packages = parse_git_packages(&format!(r#"{{"packages":[{valid}]}}"#)).unwrap();
+        assert_eq!(
+            packages[&PkgId::new("leaf", "1.0.0")].directory,
+            Path::new(absolute).parent().unwrap()
+        );
+        assert!(
+            parse_git_packages(&format!(
+                r#"{{"packages":[{}]}}"#,
+                row("relative/Cargo.toml", full)
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_git_packages(&format!(
+                r#"{{"packages":[{valid},{}]}}"#,
+                row(absolute, "9876543210987654321098765432109876543210")
+            ))
+            .is_err()
+        );
+        let local = format!(
+            r#"{{"name":"leaf","version":"1.0.0","source":null,"manifest_path":"{absolute}"}}"#
+        );
+        assert!(parse_git_packages(&format!(r#"{{"packages":[{valid},{local}]}}"#)).is_err());
+        assert!(parse_git_packages("{}").is_err());
     }
 }

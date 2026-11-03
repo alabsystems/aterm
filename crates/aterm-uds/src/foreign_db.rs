@@ -131,16 +131,10 @@ pub fn immutable_uri(db: &Path) -> String {
     uri
 }
 
-/// Open `p` to read, never through a link.
+/// Open `p`'s regular final component for reading, refusing a link there.
+/// Ancestor directories may still be links.
 fn open_no_link(p: &Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    }
-    options.open(p)
+    crate::regular_file::open(p).map(|(file, _)| file)
 }
 
 /// Read `from` into memory with plain reads (no lock of any kind), bounded by `max_bytes`.

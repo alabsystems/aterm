@@ -732,6 +732,15 @@ fn term(tok: &str) -> Result<Tok, String> {
     }))
 }
 
+/// The existing quiet preset's strict upper bound for sampled machine CPU busy percent.
+pub const QUIET_CPU_PERCENT: f64 = 25.0;
+
+/// Whether a measured, finite machine CPU percentage meets the quiet preset.
+#[must_use]
+pub fn quiet_cpu_percent(percent: f64) -> bool {
+    percent.is_finite() && (0.0..QUIET_CPU_PERCENT).contains(&percent)
+}
+
 /// The `quiet` preset's terms.
 #[must_use]
 pub fn quiet_terms() -> Vec<Term> {
@@ -745,7 +754,7 @@ pub fn quiet_terms() -> Vec<Term> {
         preset: true,
     };
     vec![
-        num(Metric::Cpu, Op::Lt, 25.0),
+        num(Metric::Cpu, Op::Lt, QUIET_CPU_PERCENT),
         num(Metric::Wait, Op::Lt, 0.25),
         num(Metric::Gpu, Op::Lt, 10.0),
         Term {

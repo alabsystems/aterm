@@ -28,20 +28,26 @@ pub struct Retirement {
     pub changed: bool,
 }
 
+/// The complete local retirement, before any record or journal is written.
+pub(super) struct LogRetirement {
+    pub(super) retirement: Retirement,
+    pub(super) records: Vec<crate::membership_log::Record>,
+}
+
 /// Successful vault removal and its prior Commons retirement, when enrolled.
 pub struct Revocation {
     pub published: Published,
     pub retirement: Option<Retirement>,
+    /// True when `aterm-fleet-code` was present in `[everyone]` and rotated to a fresh secret.
+    pub fleet_code_rotated: bool,
 }
 
 /// Successful `--stolen` revocation (`DESIGN-alab-swarm` §7.6, C25): vault removal, Commons
-/// retirement, swarm deny-list + pool slot release, `aterm-fleet-code` rotation, and the
-/// single-line `NEEDS YOU:` provider rotation list.
+/// retirement, swarm deny-list + pool slot release, `aterm-fleet-code` rotation (which a plain
+/// revocation makes too), and the single-line `NEEDS YOU:` provider rotation list.
 pub struct StolenRevocation {
-    /// Vault publication and prior Commons retirement.
+    /// Vault publication, prior Commons retirement and the fleet code's rotation.
     pub revocation: Revocation,
-    /// True when `aterm-fleet-code` was present in `[everyone]` and rotated to a fresh secret.
-    pub fleet_code_rotated: bool,
     /// Single-line `NEEDS YOU:` provider-credential rotation notice.
     pub needs_you_line: String,
 }
@@ -92,7 +98,7 @@ fn not_a_member(admin: &Admin, me: Option<Recipient>, held: bool) -> Error {
 /// is outside what it can read (or, where the version acted on brings this Mac in, until it
 /// applies that version), and with its own reason for any other (a busy or unapplied vault, and
 /// the rest of [`crate::commons::Unavailable`]).
-fn removal_custody(paths: &Paths, admin: &Admin) -> crate::Result<Bootstrap> {
+pub(super) fn removal_custody(paths: &Paths, admin: &Admin) -> crate::Result<Bootstrap> {
     match Bootstrap::observe(paths)? {
         Availability::Available(bootstrap) => Ok(*bootstrap),
         Availability::Unavailable(Unavailable::ControlNotVisible) => {
@@ -127,6 +133,7 @@ fn removal_access(
     admin: &Admin,
     bootstrap: &Bootstrap,
     journal: &Journal,
+    lock: &StateLock,
 ) -> crate::Result<crate::commons::roster::Access> {
     let request = bootstrap.request()?;
     let bound = journal
@@ -144,14 +151,14 @@ fn removal_access(
             true,
         ));
     }
-    bootstrap.access_in(journal)?.ok_or_else(|| {
+    bootstrap.access_in_held(journal, lock)?.ok_or_else(|| {
         Error::new(
             "Commons retirement needs a current local roster: this Mac's Commons control history is incomplete or conflicting, so it cannot remove a machine until that history is recovered",
         )
     })
 }
 
-fn non_admin_target(admin: &Admin, recipient: Recipient) -> crate::Result<()> {
+pub(super) fn non_admin_target(admin: &Admin, recipient: Recipient) -> crate::Result<()> {
     if recipients_of(&admin.published_doc.admins(), &admin.published_doc)?.contains(&recipient) {
         return Err(Error::new(
             "cannot retire a vault admin while it retains Commons authority; an authority transfer is required",
@@ -169,6 +176,18 @@ impl Admin {
         bootstrap: &Bootstrap,
         journal: &mut Journal,
         recipients: &[Recipient],
+    ) -> crate::Result<Option<Retirement>> {
+        let lock = StateLock::try_take(bootstrap.paths())?
+            .ok_or_else(|| Error::new("vault state is busy; retry Commons retirement"))?;
+        self.retire_commons_members_held(bootstrap, journal, recipients, &lock)
+    }
+
+    fn retire_commons_members_held(
+        &self,
+        bootstrap: &Bootstrap,
+        journal: &mut Journal,
+        recipients: &[Recipient],
+        lock: &StateLock,
     ) -> crate::Result<Option<Retirement>> {
         if recipients.is_empty() || recipients.len() > crate::commons::constraints::MAX_FACTS {
             return Err(Error::new(
@@ -193,9 +212,9 @@ impl Admin {
             crate::client::log_entries::trusted_commons_log(bootstrap.paths(), bootstrap.trust())?
             && log.has_commons_epochs()
         {
-            return self.retire_commons_members_in_log(bootstrap, &log, head, &targets);
+            return self.retire_commons_members_in_log(bootstrap, &log, head, &targets, lock);
         }
-        let access = removal_access(self, bootstrap, journal)?;
+        let access = removal_access(self, bootstrap, journal, lock)?;
         let constraints = journal.constraints()?;
         constraints.check_known_actor(&access.local().binding().actor())?;
         let mut known: std::collections::BTreeSet<_> = constraints
@@ -289,7 +308,7 @@ impl Admin {
             "Commons retirement write is unconfirmed; reopen and retry before assuming it failed: {error}"
         )))?;
         let current = bootstrap
-            .access_in(journal)?
+            .access_in_held(journal, lock)?
             .ok_or_else(|| Error::new("Commons retirement did not retain a usable roster"))?;
         let constraints = journal.constraints()?;
         for recipient in &targets {
@@ -325,7 +344,36 @@ impl Admin {
         log: &crate::membership_log::Log,
         head: [u8; 32],
         targets: &std::collections::BTreeSet<Recipient>,
+        lock: &StateLock,
     ) -> crate::Result<Option<Retirement>> {
+        let Some(plan) = self.plan_commons_members_in_log(bootstrap, log, head, targets, lock)?
+        else {
+            return Ok(None);
+        };
+        if !plan.records.is_empty() {
+            let mut store = load_records(bootstrap.paths())?;
+            let wire = crate::membership_log::encode_records(&plan.records);
+            log_entries::commit_authored_records(
+                bootstrap.paths(),
+                &mut store,
+                &wire,
+                &plan.records,
+            )?;
+            aterm_durable::durable_dir(&bootstrap.paths().dir)
+                .map_err(|error| Error::new(error.to_string()))?;
+            log_entries::post_records_best_effort(bootstrap.paths(), &wire);
+        }
+        Ok(Some(plan.retirement))
+    }
+
+    pub(super) fn plan_commons_members_in_log(
+        &self,
+        bootstrap: &Bootstrap,
+        log: &crate::membership_log::Log,
+        head: [u8; 32],
+        targets: &std::collections::BTreeSet<Recipient>,
+        lock: &StateLock,
+    ) -> crate::Result<Option<LogRetirement>> {
         let request = bootstrap.request()?;
         let local_actor = request.binding().actor();
         let membership = log.membership();
@@ -341,7 +389,7 @@ impl Admin {
                 true,
             ));
         }
-        let access = bootstrap.access()?.ok_or_else(|| {
+        let access = bootstrap.access_held(lock)?.ok_or_else(|| {
             Error::new(
                 "Commons retirement needs a current local roster: this Mac's Commons control history is incomplete or conflicting, so it cannot remove a machine until that history is recovered",
             )
@@ -399,23 +447,34 @@ impl Admin {
                 || log.wraps_maximal_audience_to(&crate::membership_log::EpochAudience::Everyone, r)
         });
         if active_targets.is_empty() && !target_still_wrapped {
-            return Ok(Some(Retirement {
-                head,
-                bindings: actors.len(),
-                recipients: targets.len(),
-                changed: false,
+            return Ok(Some(LogRetirement {
+                retirement: Retirement {
+                    head,
+                    bindings: actors.len(),
+                    recipients: targets.len(),
+                    changed: false,
+                },
+                records: Vec::new(),
             }));
         }
-        let _ = crate::client::log_entries::retire_recipients_in_log_local(
+        let mut store = load_records(bootstrap.paths())?;
+        let records = crate::client::log_entries::draft_retire_in_log_with(
             bootstrap.paths(),
+            &store,
             &active_targets,
             targets,
+            Some(lock),
         )?;
-        let (updated_log, new_head) =
-            crate::client::log_entries::trusted_commons_log(bootstrap.paths(), bootstrap.trust())?
-                .ok_or_else(|| {
-                    Error::new("Commons retirement did not retain a usable membership log")
-                })?;
+        store.ingest_records(records.clone())?;
+        if records.iter().any(|record| !store.holds(record.id())) {
+            return Err(Error::new("the complete retirement could not be retained"));
+        }
+        let (updated_log, new_head) = crate::client::log_entries::trusted_commons_log_from_store(
+            bootstrap.paths(),
+            &store,
+            bootstrap.trust(),
+        )?
+        .ok_or_else(|| Error::new("Commons retirement did not retain a usable membership log"))?;
         if updated_log
             .membership()
             .members()
@@ -434,11 +493,14 @@ impl Admin {
                 "Commons retirement did not retain the requested restriction",
             ));
         }
-        Ok(Some(Retirement {
-            head: new_head,
-            bindings: actors.len(),
-            recipients: targets.len(),
-            changed: true,
+        Ok(Some(LogRetirement {
+            retirement: Retirement {
+                head: new_head,
+                bindings: actors.len(),
+                recipients: targets.len(),
+                changed: true,
+            },
+            records,
         }))
     }
 }
@@ -602,7 +664,7 @@ pub fn admin_revoke(
     let mut doc = admin.published_doc.clone();
     doc.remove_machine(&host, drop_sections)
         .map_err(|error| Error::new(error.to_string()))?;
-    let _ = apply_swarm_revoke_cascade(paths, admin, &mut doc, &host, &recipient, false)?;
+    let cascade = apply_swarm_revoke_cascade(paths, admin, &mut doc, &host, &recipient)?;
     admin_keys::validate_commons_transition(&admin.published_doc, &doc)?;
     let sequence = envelope::next_seq(admin.seq)?;
     let identity = read_identity(paths)?.ok_or_else(|| Error::new("admin identity is missing"))?;
@@ -612,33 +674,12 @@ pub fn admin_revoke(
     // A refused locker rewrite comes before the permanent retirement, not after it.
     custody_readable(paths, admin)?;
 
-    let retirement = retire_cached(paths, admin, &doc, &[recipient])?;
-    remove_from_log(paths, admin, &recipient)?;
-    let published = admin_publish_checked(paths, admin, &doc).map_err(|error| {
-        if retirement.is_some() {
-            Error::new(format!("Commons membership is permanently retired; vault removal was not confirmed: {error}. Retry the same revoke command"))
-        } else { error }
-    })?;
+    let (published, retirement) = admin_publish_revocation(paths, admin, &doc, &[recipient])?;
     Ok(Revocation {
         published,
         retirement,
+        fleet_code_rotated: cascade.fleet_code_rotated,
     })
-}
-
-/// Take the revoked Mac out of the membership log too ([`log_entries::remove_from_log`]), before
-/// the publish that stamps and sends it: a revoke that reached only the envelope left the Mac its
-/// log seat, and with it every epoch key it held, so it could still rewrite or delete an entry on
-/// every Mac that reads the log, and the admin's mirror carried that into the envelope. A Mac with
-/// no seat in the log signs nothing here (F16's `Remove` by any member covers that).
-fn remove_from_log(paths: &Paths, admin: &Admin, recipient: &Recipient) -> crate::Result<()> {
-    log_entries::remove_from_log(
-        paths,
-        &admin.config,
-        &envelope::signer_public(&admin.seed)?,
-        &admin.handoff,
-        recipient,
-    )?;
-    Ok(())
 }
 
 /// Permanently retire known Commons recipients together without editing the vault.
@@ -722,11 +763,39 @@ fn retire_cached(
     doc: &Document,
     recipients: &[Recipient],
 ) -> crate::Result<Option<Retirement>> {
+    retire_cached_with(paths, admin, doc, recipients, None, None)
+}
+
+pub(super) fn retire_cached_held(
+    paths: &Paths,
+    admin: &Admin,
+    doc: &Document,
+    recipients: &[Recipient],
+    lock: &StateLock,
+    bootstrap: Option<&Bootstrap>,
+) -> crate::Result<Option<Retirement>> {
+    retire_cached_with(paths, admin, doc, recipients, Some(lock), bootstrap)
+}
+
+fn retire_cached_with(
+    paths: &Paths,
+    admin: &Admin,
+    doc: &Document,
+    recipients: &[Recipient],
+    held: Option<&StateLock>,
+    bootstrap: Option<&Bootstrap>,
+) -> crate::Result<Option<Retirement>> {
     if let Some(descriptor) = admin_keys::control_descriptor(&admin.published_doc)? {
         for recipient in recipients {
             non_admin_target(admin, *recipient)?;
         }
-        let bootstrap = removal_custody(paths, admin)?;
+        let opened;
+        let bootstrap = if let Some(bootstrap) = bootstrap {
+            bootstrap
+        } else {
+            opened = removal_custody(paths, admin)?;
+            &opened
+        };
         if bootstrap.trust() != descriptor.trust() {
             return Err(Error::new(
                 "cached Commons root differs from the admin snapshot",
@@ -734,14 +803,20 @@ fn retire_cached(
         }
         // Keep local source/configuration updates outside this transaction.
         // The journal lock is released before publishing anything to a server.
-        let _state = configured_admin(paths, &admin.config)?;
+        let acquired;
+        let state = if let Some(held) = held {
+            held
+        } else {
+            acquired = configured_admin(paths, &admin.config)?;
+            &acquired
+        };
         if load_state(paths)?.seq > admin.seq {
             return Err(Error::new(
                 "a newer local vault exists; reopen before revoking",
             ));
         }
         let mut journal = Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust())?;
-        admin.retire_commons_members(&bootstrap, &mut journal, recipients)
+        admin.retire_commons_members_held(bootstrap, &mut journal, recipients, state)
     } else if admin.commons_bound && holds_control(paths, admin, doc)? {
         Err(Error::new(
             "bound Commons custody is missing its descriptor; refusing partial revocation (the vault names a Commons control entry, or this Mac keeps Commons control state)",
@@ -789,7 +864,7 @@ pub(super) fn validate_removals(paths: &Paths, admin: &Admin, doc: &Document) ->
     {
         return Err(Error::new("member removal has another Commons root"));
     }
-    let _state = configured_admin(paths, &admin.config)?;
+    let state = configured_admin(paths, &admin.config)?;
     if load_state(paths)?.seq > admin.seq {
         return Err(Error::new(
             "a newer local vault exists; reopen before removing a member",
@@ -799,7 +874,7 @@ pub(super) fn validate_removals(paths: &Paths, admin: &Admin, doc: &Document) ->
         crate::client::log_entries::trusted_commons_log(paths, bootstrap.trust())?
         && log.has_commons_epochs()
     {
-        if bootstrap.access()?.is_none() {
+        if bootstrap.access_held(&state)?.is_none() {
             return Err(Error::new(
                 "Commons membership is not active on this device",
             ));
@@ -841,7 +916,7 @@ pub(super) fn validate_removals(paths: &Paths, admin: &Admin, doc: &Document) ->
         return Ok(());
     }
     let journal = Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust())?;
-    let access = removal_access(admin, &bootstrap, &journal)?;
+    let access = removal_access(admin, &bootstrap, &journal, &state)?;
     let constraints = journal.constraints()?;
     constraints.check_known_actor(&access.local().binding().actor())?;
     for recipient in removed {
@@ -1148,7 +1223,6 @@ fn apply_swarm_revoke_cascade(
     doc: &mut Document,
     host: &str,
     recipient: &Recipient,
-    stolen: bool,
 ) -> crate::Result<CascadeSummary> {
     let recipient_str = recipient.to_bech32();
     let has_roster_entry = doc
@@ -1398,8 +1472,11 @@ fn apply_swarm_revoke_cascade(
 
     let _ = expire_denied_swarm_lease(doc, &revoked_labels)?;
 
+    // Every removal rotates the fleet secret (docs/DESIGN-fluid-swarm-2026-10-28.md F16), as a
+    // member's does ([`cascade_member_removal`]): the removed Mac's copy of the code then proves
+    // nothing, and each member's fleet sync takes the new secret in place.
     let mut fleet_code_rotated = false;
-    if stolen && let Some(code_entry) = doc.entry(&Audience::Everyone, fleet::FLEET_CODE_ENTRY) {
+    if let Some(code_entry) = doc.entry(&Audience::Everyone, fleet::FLEET_CODE_ENTRY) {
         let existing = std::str::from_utf8(code_entry.value.as_slice())
             .map_err(|_| Error::new(format!("{} is not UTF-8", fleet::FLEET_CODE_ENTRY)))?;
         let rotated = rotate_fleet_code_text(existing)?;
@@ -1702,7 +1779,7 @@ pub fn admin_revoke_stolen(
     let mut doc = admin.published_doc.clone();
     doc.remove_machine(&host, drop_sections)
         .map_err(|error| Error::new(error.to_string()))?;
-    let cascade = apply_swarm_revoke_cascade(paths, admin, &mut doc, &host, &recipient, true)?;
+    let cascade = apply_swarm_revoke_cascade(paths, admin, &mut doc, &host, &recipient)?;
     let needs_you_line = format_stolen_needs_you(
         &admin.published_doc,
         &host,
@@ -1717,23 +1794,13 @@ pub fn admin_revoke_stolen(
     admin.admissions.retained(&doc)?.validate(&doc, sequence)?;
     custody_readable(paths, admin)?;
 
-    let retirement = retire_cached(paths, admin, &doc, &[recipient])?;
-    remove_from_log(paths, admin, &recipient)?;
-    let published = admin_publish_checked(paths, admin, &doc).map_err(|error| {
-        if retirement.is_some() {
-            Error::new(format!(
-                "Commons membership is permanently retired; vault removal was not confirmed: {error}. Retry the same revoke command"
-            ))
-        } else {
-            error
-        }
-    })?;
+    let (published, retirement) = admin_publish_revocation(paths, admin, &doc, &[recipient])?;
     Ok(StolenRevocation {
         revocation: Revocation {
             published,
             retirement,
+            fleet_code_rotated: cascade.fleet_code_rotated,
         },
-        fleet_code_rotated: cascade.fleet_code_rotated,
         needs_you_line,
     })
 }
@@ -2161,3 +2228,24 @@ fn expire_denied_swarm_lease(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn a_configured_retirement_reuses_its_writer_for_commons_authorization() {
+    let macs = super::log_entries_tests::two_macs(&[]);
+    let admin = admin_open(&macs.m22).unwrap();
+    let recipient = read_identity(&macs.m7).unwrap().unwrap().recipient();
+    let retired = retire_cached(&macs.m22, &admin, &admin.published_doc, &[recipient])
+        .unwrap()
+        .expect("retirement under the configured vault writer");
+    assert!(retired.changed);
+    let bootstrap = Bootstrap::required(&macs.m22).unwrap();
+    let access = bootstrap.access().unwrap().unwrap();
+    assert!(
+        !access
+            .members()
+            .iter()
+            .any(|member| member.binding().recipient() == recipient)
+    );
+    macs.server.stop();
+}

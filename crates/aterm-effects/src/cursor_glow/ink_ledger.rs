@@ -1736,23 +1736,29 @@ impl InkLedger {
                 cut = true;
                 let ny = self.knots_y.len() - 1;
                 let nx = self.knots_x.len() - 1;
+                let x0_knot = self.knots_x[0];
+                let mut ya = self.knots_y[0];
                 let mut yi = 0;
                 while yi < ny {
-                    let (ya, yb) = (self.knots_y[yi], self.knots_y[yi + 1]);
                     yi += 1;
+                    let yb = self.knots_y[yi];
                     let ym = 0.5 * (ya + yb) as f32;
                     let ya_u = ya as u16;
                     let h_u = (yb - ya) as u16;
+                    ya = yb;
+                    let mut xa = x0_knot;
                     let mut xi = 0;
                     while xi < nx {
-                        let (xa, xb) = (self.knots_x[xi], self.knots_x[xi + 1]);
                         xi += 1;
+                        let xb = self.knots_x[xi];
                         let m = self.mask_at_with(0.5 * (xa + xb) as f32, ym, feather);
                         if m <= 0.0 {
+                            xa = xb;
                             continue;
                         }
                         let color = scale_rgb(h.color, m);
                         if color & 0x00FF_FFFF == 0 {
+                            xa = xb;
                             continue;
                         }
                         pieces.push(RainHalo {
@@ -1763,6 +1769,7 @@ impl InkLedger {
                             color,
                             ..*h
                         });
+                        xa = xb;
                     }
                 }
             }
@@ -2198,24 +2205,25 @@ impl CursorGlow {
         }
         let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
         let caret_row = caret_row_i32(caret);
-        let mut any_filled = false;
+        let mut first_hit = None;
         let mut hi = 0;
         while hi < halos.len() {
             let h = &halos[hi];
             let (row, _, _, c0, c1) = halo_col_span(h, (ox, oy), (cw, ch));
             if h.w > 0 && first_filled_col(frame_text, caret_row, page, row, c0, c1).is_some() {
-                any_filled = true;
+                first_hit = Some(hi);
                 break;
             }
             hi += 1;
         }
-        if !any_filled {
+        let Some(first_hit) = first_hit else {
             return;
-        }
+        };
         let mut all = std::mem::take(&mut self.ink_ledger.halo_pieces);
         all.clear();
         std::mem::swap(&mut all, halos);
-        let mut hi = 0;
+        halos.extend_from_slice(&all[..first_hit]);
+        let mut hi = first_hit;
         while hi < all.len() {
             let h = all[hi];
             hi += 1;

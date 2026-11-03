@@ -252,13 +252,32 @@ pub fn relaunch_env<'a>(
 /// Whether `program` is a build in atpkg's store (`…/store/grok/<build>/bin/grok`).
 #[must_use]
 pub fn store_build(program: &Path) -> bool {
+    let plain = program.components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::Normal(_)
+        )
+    });
+    if !program.has_root() || !plain {
+        return false;
+    }
     let names: Vec<&str> = program
         .components()
         .rev()
         .take(5)
-        .filter_map(|c| c.as_os_str().to_str())
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
         .collect();
-    matches!(names.as_slice(), [PROGRAM, "bin", build, PROGRAM, "store"] if !build.is_empty())
+    matches!(
+        names.as_slice(),
+        [PROGRAM, "bin", build, PROGRAM, "store"]
+            if !(build.len() > 1 && build.starts_with('0'))
+                && crate::parse_uint::<u64>(build).is_some()
+    )
 }
 
 /// The sign-in a worker carrying `env` would start Grok Build on, under the user's home `user`:

@@ -269,7 +269,7 @@ pub(super) fn settle_times(tree: &Path) -> Result<(), String> {
             if kind.is_dir() {
                 dirs.push(path);
             } else if kind.is_file() {
-                std::fs::File::open(&path)
+                crate::open_regular(&path)
                     .and_then(|file| file.set_modified(settled))
                     .map_err(|e| format!("could not set {}'s time: {e}", path.display()))?;
             }
@@ -288,13 +288,15 @@ pub(super) struct Built<'a> {
     pub program: &'a Path,
     /// The source's licence, kept beside the program where the source has one.
     pub licence: &'a Path,
-    /// Whether the first line the program's `--version` prints is the pin's.
+    /// Arguments that make the executable identify its version on stdout.
+    pub version_args: &'a [&'a str],
+    /// Whether the first line of the version probe identifies the pin.
     pub answers: &'a dyn Fn(&str) -> bool,
 }
 
 /// Lay `built`'s program at the row's place in a new tree of `scratch`, with the source's
 /// licence; refuse a program that loads a library from outside the OS; ask the copy its
-/// `--version`, which must be the pin's; then stamp the tree and [`place`] it.
+/// version, which must be the pin's; then stamp the tree and [`place`] it.
 pub(super) fn lay_built(
     scratch: Scratch,
     host: &dyn Host,
@@ -306,6 +308,7 @@ pub(super) fn lay_built(
         url,
         program,
         licence,
+        version_args,
         answers,
     } = built;
     if !program.is_file() {
@@ -338,7 +341,7 @@ pub(super) fn lay_built(
     let home = scratch.fresh("home")?;
     let probe = Spawn {
         program: exe,
-        args: vec!["--version".into()],
+        args: version_args.iter().map(|arg| (*arg).into()).collect(),
         cwd: scratch.path().to_path_buf(),
         set: ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"]
             .iter()
@@ -348,7 +351,7 @@ pub(super) fn lay_built(
     };
     let (scratch, said) = scratch
         .run_copied(host, &probe)
-        .map_err(|e| format!("the built {row} did not answer --version: {e}"))?;
+        .map_err(|e| format!("the built {row} did not answer its version probe: {e}"))?;
     let first = said
         .lines()
         .map(str::trim)
@@ -449,7 +452,7 @@ pub(super) fn write_stamp(tree: &Path, stamp: &Stamp) -> Result<(), String> {
 
 /// The stamp in `dir`, where one reads.
 pub(super) fn read_stamp(dir: &Path) -> Option<Stamp> {
-    let text = std::fs::read_to_string(dir.join(super::STAMP)).ok()?;
+    let text = crate::read_regular_text(dir.join(super::STAMP)).ok()?;
     aterm_json::from_str(&text).ok()
 }
 

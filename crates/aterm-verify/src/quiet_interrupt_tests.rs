@@ -25,6 +25,51 @@ const STANDIN: &str = "ATERM_VERIFY_QUIET_INTERRUPT_STANDIN";
 /// Set, the test binary is [`standin_stage_child`], which writes its pid into this directory.
 const CHILD: &str = "ATERM_VERIFY_QUIET_INTERRUPT_CHILD";
 
+#[test]
+fn unavailable_now_and_ledger_failures_never_invoke_the_timed_callback() {
+    fn unavailable(_: Need, _: Admit) -> Result<Claim, Error> {
+        Err(Error::Timing(aterm_capacity::TimingIssue::Unavailable))
+    }
+    fn now(_: Need, _: Admit) -> Result<Claim, Error> {
+        Err(Error::Timing(aterm_capacity::TimingIssue::Now))
+    }
+    fn ledger(_: Need, _: Admit) -> Result<Claim, Error> {
+        Err(Error::Ledger(std::io::Error::other(
+            "injected unavailable ledger",
+        )))
+    }
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let cases: [(Admit, crate::Admitter); 3] = [
+        (Admit::Wait, unavailable),
+        (Admit::Now, now),
+        (Admit::Wait, ledger),
+    ];
+    for (mode, admit) in cases {
+        let ctx = Ctx::new(
+            scratch.path().to_owned(),
+            Scope::crate_only("aterm-capacity"),
+            EnvSnapshot::default(),
+            scratch.path().join("scratch"),
+        )
+        .with_quiet(Some(mode));
+        let quiet = std::sync::Mutex::new(crate::Quiet {
+            claim: None,
+            left: 1,
+            admit,
+        });
+        let calls = std::cell::Cell::new(0);
+        let result = crate::quietly(&ctx, &quiet, "injected timing refusal", || {
+            calls.set(calls.get() + 1)
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            calls.get(),
+            0,
+            "production quietly must not invoke an acceptance callback after failed admission"
+        );
+    }
+}
+
 /// The machine both sides read: idle, so only the quiet claim this test holds keeps the
 /// stand-in waiting.
 fn machine() -> Fixed {
@@ -51,7 +96,7 @@ fn admit_in_scratch(need: Need, mode: Admit) -> Result<Claim, Error> {
     let waiting = dir.join("waiting");
     admit_with(
         &Ledger::at(dir.join("ledger")),
-        &machine(),
+        &crate::timing_test_machine::Measured::new(&machine()),
         need,
         mode,
         Pace {

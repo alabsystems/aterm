@@ -13,6 +13,7 @@ use super::{
 };
 use crate::ctl::Reply;
 use crate::mirror::{self, Bucket, LandedWord, LogMode, Pin, PinSlot};
+use crate::pipeline::{HeldCommit, Publish};
 use crate::state::StateDir;
 use crate::subject;
 use aterm_types::fabric_grammar::{MirrorReason, MirrorState};
@@ -22,6 +23,9 @@ pub(super) const REFUSED_WAIT: Duration = Duration::from_secs(2);
 
 /// How long a take that could take nothing NOW waits before the next one asks: the rate bucket empty, or the endpoint's answer empty with `more=1` (a session's timeline lock was held at the take, which never waits on the UI's lock).
 pub(super) const BUSY_WAIT: Duration = Duration::from_millis(100);
+
+/// The room under [`PIPELINE_WINDOW`] a mirror burst waits for: a slot and the inbox commit it may carry ahead of it ([`Bridge::mirror_send`]), so a pass that starts at the window's edge still carries the commit rather than sending its slots one bare write each.
+const BURST_ROOM: usize = 2;
 
 /// What became of one pinned slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,8 +76,10 @@ pub(super) struct MirrorRun {
     held_back: Option<Instant>,
     /// The batch in flight and the node's total.
     pin: Pin,
-    /// Per slot: whether THIS process sent it (a never-sent slot's deduped
-    /// answer is another writer's).
+    /// Per slot: whether THIS process may have sent it (a never-sent slot's
+    /// deduped answer is another writer's): every slot of a burst it wrote,
+    /// the write taken or not, since a burst cut short lands each frame the
+    /// broker received whole ahead of the cut ([`Bridge::mirror_send`]).
     sent: Vec<bool>,
     /// Per slot: the offset a deduped answer named whose record the read-back
     /// could not see on the slot's face ([`Bridge::mirror_settle`]): the slot
@@ -1087,6 +1093,8 @@ impl Bridge {
     }
 
     /// Send every owed slot pipelined at its pinned sequence, the session's `ev` face opened only through the subject budget's mirror reserve.
+    ///
+    /// Every owed slot's face is judged first, each new face counted against the budget together with the faces the pass already allowed, which the broker's count does not hold until they land; the slots it allows go out in bursts, one write each ([`crate::pipeline::Link::send_burst`]), each as many as the room left under [`PIPELINE_WINDOW`] holds, and each waiting for [`BURST_ROOM`] first. The first burst carries the inbox commit a round holds, or, with no inbox record queued, the one the round's settle would hold for the loop's next write ([`Bridge::take_commit_for_the_mirror`]: only one still due, clamped), ahead of its slots, so a snapshot a delivery owed shares the commit's write rather than going in a write of its own ahead of it (critic item C13). The commit is taken just before the write, after every ack the window waited on was read, so it crosses no item the loop takes. A burst the link does not take is judged, the commit concluded failed, and every slot in it left owed and counted sent ([`MirrorRun::sent`]): a write cut short lands each frame the broker received whole ahead of the cut, so a resend's dedup is read back, never taken for another writer's.
     pub(super) fn mirror_send(&mut self) {
         let k = self.mirror.as_deref().map_or(0, |m| m.pin.slots.len());
         if k > 0 && !(self.mirror_key_on_the_media() && self.mirror_floor_covers()) {
@@ -1094,66 +1102,109 @@ impl Bridge {
         }
         let mut judged: std::collections::BTreeMap<String, bool> =
             std::collections::BTreeMap::new();
+        let mut opening = 0u64;
+        let mut allowed: Vec<(usize, String)> = Vec::new();
         for i in 0..k {
             if self.conn.is_none() || self.mirror.as_deref().is_some_and(|m| m.repin) {
                 return;
             }
-            let Some((pseq, sid, body, first)) = self.mirror.as_deref().and_then(|m| {
-                (m.outcome[i] == Outcome::Owed).then(|| {
-                    let s = &m.pin.slots[i];
-                    (s.pseq, s.sid.clone(), s.body.clone(), !m.sent[i])
-                })
-            }) else {
+            let Some(sid) = self
+                .mirror
+                .as_deref()
+                .and_then(|m| (m.outcome[i] == Outcome::Owed).then(|| m.pin.slots[i].sid.clone()))
+            else {
                 continue;
             };
             let face = subject::session_face(&self.cfg.fleet, &self.node, &sid, "ev");
-            let allowed = match judged.get(&face) {
-                Some(allowed) => *allowed,
+            let opens = match judged.get(&face) {
+                Some(opens) => *opens,
                 None => {
-                    let allowed = self.budget_allows(&face, Opens::Mirror);
-                    judged.insert(face.clone(), allowed);
-                    allowed
+                    let opens = self.budget_allows(&face, Opens::Mirror, opening);
+                    if opens && !self.indexed_subjects.contains(&face) {
+                        opening += 1;
+                    }
+                    judged.insert(face.clone(), opens);
+                    opens
                 }
             };
-            if !allowed {
-                if let Some(m) = self.mirror.as_deref_mut() {
-                    m.outcome[i] = Outcome::Refused;
-                }
-                continue;
+            if opens {
+                allowed.push((i, face));
+            } else if let Some(m) = self.mirror.as_deref_mut() {
+                m.outcome[i] = Outcome::Refused;
+            }
+        }
+        let mut rest = allowed.as_slice();
+        while !rest.is_empty() {
+            if self.conn.is_none() || self.mirror.as_deref().is_some_and(|m| m.repin) {
+                return;
             }
             let waiting = self.fx.now();
             while self
                 .conn
                 .as_ref()
-                .is_some_and(|link| link.unacked() >= PIPELINE_WINDOW)
+                .is_some_and(|link| link.unacked() + BURST_ROOM > PIPELINE_WINDOW)
                 && self.settle_one(waiting)
             {}
-            let producer = self.producer_id;
+            if self.conn.is_none() || self.mirror.as_deref().is_some_and(|m| m.repin) {
+                return;
+            }
+            let room = self
+                .conn
+                .as_ref()
+                .map_or(0, |link| PIPELINE_WINDOW.saturating_sub(link.unacked()));
+            if room < BURST_ROOM {
+                return;
+            }
+            #[cfg(test)]
+            let bare = self
+                .fx
+                .mutant(crate::sim::world::Mutant::MirrorSendsItsSlotsBare);
+            #[cfg(not(test))]
+            let bare = false;
+            let held = if bare {
+                None
+            } else {
+                self.take_commit_for_the_mirror()
+                    .map(|upto| (upto, subject::inbox_group(&self.cfg.fleet, &self.node)))
+            };
+            let (burst, later) = rest.split_at(rest.len().min(room - usize::from(held.is_some())));
+            rest = later;
+            let (retry, producer_id, inc) = (self.commit_refused, self.producer_id, self.inc);
             let started = self.fx.now();
-            let Some(link) = self.conn.as_mut() else {
+            let (Some(m), Some(link)) = (self.mirror.as_deref(), self.conn.as_mut()) else {
                 return;
             };
-            match link.send(
-                producer,
-                pseq,
-                first,
-                &face,
-                body.as_bytes(),
-                Then::Mirror { slot: i },
-                started,
-            ) {
-                Ok(()) => {
-                    let inc = self.inc;
-                    if let Some(m) = self.mirror.as_deref_mut() {
-                        m.sent[i] = true;
-                        m.outcome[i] = Outcome::Sending;
-                        m.sent_inc = inc;
-                    }
+            let commit = held.as_ref().map(|(upto, group)| HeldCommit {
+                group,
+                upto: *upto,
+                tag: Then::Commit { upto: *upto, retry },
+            });
+            let publishes = burst
+                .iter()
+                .map(|(i, face)| Publish {
+                    producer_id,
+                    seq: m.pin.slots[*i].pseq,
+                    first: !m.sent[*i],
+                    subject: face,
+                    body: m.pin.slots[*i].body.as_bytes(),
+                    tag: Then::Mirror { slot: *i },
+                })
+                .collect();
+            let written = link.send_burst(commit, publishes, started);
+            if let Some(m) = self.mirror.as_deref_mut() {
+                for (i, _) in burst {
+                    m.sent[*i] = true;
                 }
-                Err((e, _)) => {
-                    self.judge(started, Err(&e), None);
-                    return;
+            }
+            if let Err(unsent) = written {
+                self.burst_unsent(started, unsent.error, unsent.commit);
+                return;
+            }
+            if let Some(m) = self.mirror.as_deref_mut() {
+                for (i, _) in burst {
+                    m.outcome[*i] = Outcome::Sending;
                 }
+                m.sent_inc = inc;
             }
         }
     }

@@ -25,6 +25,8 @@ pub mod att;
 pub mod catalog;
 #[cfg(unix)]
 pub mod cli;
+#[cfg(unix)]
+pub mod clock;
 pub mod contacts;
 #[cfg(unix)]
 pub mod control;

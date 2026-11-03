@@ -51,6 +51,13 @@ const CODEX_AND_KIMI: &str = "[ai]\npreferred = \"codex\"\n[ai.claude]\nuse = fa
 const CODEX_AND_GROK: &str = "[ai]\npreferred = \"codex\"\n[ai.claude]\nuse = false\n[ai.agy]\nuse \
                               = false\n[ai.muse]\nuse = false\n[ai.kimi]\nuse = false\n";
 
+/// Whether `aterm pkg`'s follow-up ([`atpkg::cli::pass_finishes_setup`]) would run setup after
+/// a pass of `args` (`pkg` and atpkg's words) that succeeded at a person's terminal.
+fn finishes_setup(args: &[String]) -> bool {
+    let words: Vec<std::ffi::OsString> = args[1..].iter().map(Into::into).collect();
+    atpkg::cli::pass_finishes_setup(&words)
+}
+
 fn run_cli(env: &Env, runner: &FakeRunner, args: &[&str]) -> (u8, String, String) {
     run_net(env, runner, &FakeFetcher::default(), args)
 }
@@ -185,9 +192,18 @@ fn the_doctor_repairs_definite_unmeasured_vendor_failures_but_not_unknown_logins
     let runner = FakeRunner::quiet();
     let (code, out, _) = run_cli(&env, &runner, &["doctor"]);
     assert_eq!(code, 1, "the stand-in did not install anything: {out}");
-    assert_eq!(runner.calls().len(), 1);
-    assert_eq!(runner.calls()[0].args, ["pkg", "install", "agy"]);
-    assert!(runner.calls()[0].terminal);
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 1);
+    let install = &calls[0].args;
+    assert_eq!(
+        install,
+        &["pkg", "install", "agy", atpkg::cli::NO_INIT_FLAG]
+    );
+    assert!(calls[0].terminal);
+    // The doctor runs the install on the person's terminal as one step of its own work, so no
+    // setup follows it. CONTROL: the same install without the word is followed.
+    assert!(!finishes_setup(install), "{install:?}");
+    assert!(finishes_setup(&install[..3]), "{install:?}");
 
     let installed = machine(&["agy"]);
     let env = env_of(&installed, only_agy, &[], true);
@@ -728,8 +744,8 @@ fn the_doctor_makes_aterms_own_fixes_under_an_agent_and_holds_only_a_persons() {
     let h = state::health(&look(&env).rows);
     assert_eq!(
         (h.by_aterm.clone(), h.by_person.clone()),
-        (vec!["claude", "kimi"], vec!["codex"]),
-        "{out}"
+        (Vec::<&str>::new(), vec!["codex"]),
+        "only the preferred CLI was asked for: {out}"
     );
 
     let (code, out, err) = run_cli(&env, &runner, &["doctor"]);
@@ -741,11 +757,13 @@ fn the_doctor_makes_aterms_own_fixes_under_an_agent_and_holds_only_a_persons() {
         .collect();
     let args = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
     assert!(
-        calls.contains(&("aterm".to_string(), args(&["pkg", "install", "claude"])))
-            && calls.contains(&(
-                "aterm".to_string(),
-                args(&["harness", "accounts", "renew", "kimi-one", "--cli", "kimi"])
-            )),
+        calls.contains(&(
+            "aterm".to_string(),
+            args(&["pkg", "install", "claude", atpkg::cli::NO_INIT_FLAG])
+        )) && calls.contains(&(
+            "aterm".to_string(),
+            args(&["harness", "accounts", "renew", "kimi-one", "--cli", "kimi"])
+        )),
         "{calls:?}"
     );
     assert!(
@@ -860,7 +878,12 @@ fn logging_in_grok_where_nobody_installed_it_installs_it_first() {
     assert!(out.contains("grok: not started: not installed"), "{out}");
     let calls = runner.calls();
     assert_eq!(calls.len(), 1, "{calls:?}");
-    assert_eq!(calls[0].args, ["pkg", "install", "grok"], "{calls:?}");
+    assert_eq!(
+        calls[0].args,
+        ["pkg", "install", "grok", atpkg::cli::NO_INIT_FLAG],
+        "{calls:?}"
+    );
+    assert!(!finishes_setup(&calls[0].args), "{calls:?}");
     let excluded = Env {
         exclude: vec!["grok".to_string()],
         ..env
@@ -1633,4 +1656,75 @@ fn env_var_prefers_the_last_duplicate_entry() {
         false,
     );
     assert_eq!(env.var("CLAUDE_CONFIG_DIR").as_deref(), Some("/new"));
+}
+
+/// A sign-in only a person makes, of a CLI nobody asked for: a quiet line that asks nobody, with
+/// nobody at the run or with a person at its terminal, who is never handed a vendor's sign-in for
+/// it. CONTROL: once it is asked for, the same run says a person does it.
+#[test]
+fn a_doctor_asks_nobody_for_a_cli_nobody_asked_for() {
+    let b = machine(&["codex", "kimi"]);
+    let off = "[ai.claude]\nuse = false\n[ai.agy]\nuse = false\n[ai.muse]\nuse = false\n\
+               [ai.grok]\nuse = false\n";
+    let doctor = |config: String| {
+        let env = env_of(&b, &config, &[("CLAUDECODE", "1")], false);
+        run_cli(&env, &FakeRunner::quiet(), &["doctor"]).1
+    };
+    let out = doctor(format!("[ai]\npreferred = \"kimi\"\n{off}"));
+    assert!(
+        out.contains("codex: not started: nobody has asked"),
+        "{out}"
+    );
+    assert!(!out.contains("and codex in"), "{out}");
+    let person = env_of(&b, &format!("[ai]\npreferred = \"kimi\"\n{off}"), &[], true);
+    let runner = FakeRunner::quiet();
+    let (_, out, _) = run_cli(&person, &runner, &["doctor"]);
+    assert!(
+        out.contains("codex: not started: nobody has asked"),
+        "a person here: {out}"
+    );
+    assert!(
+        !runner
+            .calls()
+            .iter()
+            .any(|call| format!("{call:?}").contains("codex")),
+        "a person here is handed no codex sign-in: {:?}",
+        runner.calls()
+    );
+    let out = doctor(format!(
+        "[ai]\npreferred = \"kimi\"\n[ai.codex]\nuse = true\n{off}"
+    ));
+    assert!(out.contains("codex: not started: "), "{out}");
+    assert!(!out.contains("nobody has asked"), "{out}");
+    assert!(out.contains("sign kimi and codex in"), "{out}");
+}
+
+/// THE RUN'S LAST WORD: a renewal of a CLI someone asked for that the run tried and did not finish
+/// is said as such, and the same run is not offered again as its fix. CONTROL: before the run the
+/// read-only look offers it as a try, never as a fix.
+#[test]
+fn a_doctor_that_did_not_finish_a_fix_says_so_instead_of_offering_itself() {
+    let b = machine(&["codex", "kimi"]);
+    std::fs::write(
+        b.dir.path().join("accounts-kimi.toml"),
+        "[[account]]\nlabel = \"kimi-one\"\nclass = \"dedicated\"\n\
+         email = \"kimi-one@example.com\"\nregion = \"global\"\n",
+    )
+    .expect("roster");
+    let config = format!("[ai.kimi]\nuse = true\n{CODEX_AND_KIMI}");
+    let mut env = env_of(&b, &config, &[("CLAUDECODE", "1")], false);
+    env.harness_state = Some(b.state.clone());
+    let (_, before, _) = run_cli(&env, &FakeRunner::quiet(), &["doctor", "--read-only"]);
+    assert!(
+        before.contains("`aterm ai doctor` tries kimi itself"),
+        "{before}"
+    );
+    let (code, after, _) = run_cli(&env, &FakeRunner::quiet(), &["doctor"]);
+    assert_eq!(code, 1, "{after}");
+    let health = after
+        .lines()
+        .rfind(|l| l.starts_with("health:"))
+        .expect(&after);
+    assert!(health.contains("did not finish kimi"), "{health}");
+    assert!(!health.contains("`aterm ai doctor`"), "{health}");
 }

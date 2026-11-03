@@ -1035,6 +1035,9 @@ fn a_delivery_whose_hook_drops_the_fact_writes_no_row_and_no_mail_mark() {
         fn session(&self, sid: &SessionId) -> Option<Arc<dyn FabricSession>> {
             (sid == self.0.self_id()).then(|| Arc::clone(&self.0))
         }
+        fn roster_seq(&self) -> u64 {
+            0
+        }
         fn bridge_lost_advised(&self, _: usize) {}
         fn torn_state_set_aside(&self, _: u64, _: bool) {}
         fn torn_state_held(&self, _: u64) {}

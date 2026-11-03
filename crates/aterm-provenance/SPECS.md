@@ -56,22 +56,13 @@ src/pty_wrap.rs	wrap_scalar_reference_preserves_identity	pty-wrap-ref-identity	f
 src/pty_wrap.rs	wrap_str_preserves_bytes	pty-wrap-ref-identity	from-pty-as-ref-roundtrip (as_ref projection), layout-transparent (unsized str)
 ```
 
-## 3. Tests outside the map
+## 3. Coverage
 
-`src/provenance.rs::pty_slice_inspectors_preserve_provenance_and_bounds` samples the slice readers
-(`pty_slice_*`), the byte classifiers and the CSI parameter and rectangle codecs, which no row states.
+- All 4 live `#[test]` functions across `src/provenance.rs` (1) and `src/pty_wrap.rs` (3) are mapped in §2 across the 4 specs.
 
-## 4. Where the tests fall short of the specs
+## 4. Tests that are not spec samples
 
-1. `provenance_adds_no_bytes` checks only `size_of` at three sized `T` (`u8`, `u32`, `&[u8]`, the last a
-   sized reference field): not alignment, not an unsized `Prov<[u8]>` or `Prov<str>`, and not the
-   attribute, without which the sizes would likely still match. A const assertion of size and alignment
-   at sized `T` plus `size_of_val` on `&Prov<[u8]>` and `&Prov<str>` is the faithful replacement, and
-   needs no Trust lane.
-2. The identity tests compare a thin pointer (`u8`) and `str`'s `as_ptr` and `len` separately; neither
-   tries another element type or a ZST `T`.
-
-## 5. Proof order (easiest, high value first)
+None: every test maps to a spec in §2, and the sized/fat-reference layout equalities in `src/pty_wrap.rs` are additionally enforced at compile time (§5.1).
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

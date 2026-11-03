@@ -22,7 +22,7 @@ macro_rules! opaque {
         }
     )*};
 }
-opaque! { IONotificationPort, __CFRunLoop, __CFRunLoopSource, __CFString }
+opaque! { IONotificationPort, __CFRunLoop, __CFRunLoopSource, __CFString, __CFAllocator }
 
 pub type kern_return_t = i32;
 pub type IOReturn = kern_return_t;
@@ -36,11 +36,30 @@ pub type IOServiceInterestCallback =
     Option<unsafe extern "C" fn(*mut c_void, io_service_t, u32, *mut c_void)>;
 
 pub type Boolean = u8;
+pub type CFIndex = isize;
+pub type CFHashCode = usize;
+pub type CFTypeRef = *const c_void;
+pub type CFAllocatorRef = *const __CFAllocator;
 pub type CFTimeInterval = f64;
 pub type CFStringRef = *const __CFString;
 pub type CFRunLoopMode = CFStringRef;
 pub type CFRunLoopRef = *mut __CFRunLoop;
 pub type CFRunLoopSourceRef = *mut __CFRunLoopSource;
+
+/// A version-0 source's context; CoreFoundation copies it at creation.
+#[repr(C)]
+pub struct CFRunLoopSourceContext {
+    pub version: CFIndex,
+    pub info: *mut c_void,
+    pub retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
+    pub release: Option<extern "C" fn(*const c_void)>,
+    pub copyDescription: Option<extern "C" fn(*const c_void) -> CFStringRef>,
+    pub equal: Option<extern "C" fn(*const c_void, *const c_void) -> Boolean>,
+    pub hash: Option<extern "C" fn(*const c_void) -> CFHashCode>,
+    pub schedule: Option<extern "C" fn(*mut c_void, CFRunLoopRef, CFRunLoopMode)>,
+    pub cancel: Option<extern "C" fn(*mut c_void, CFRunLoopRef, CFRunLoopMode)>,
+    pub perform: extern "C" fn(*mut c_void),
+}
 
 /// `iokit_common_msg(0x270)`: the system ponders an idle sleep; answered by
 /// `IOAllowPowerChange` (or `IOCancelPowerChange`, which vetoes it).
@@ -79,6 +98,20 @@ unsafe extern "C" {
     pub fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     pub fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFRunLoopMode);
     pub fn CFRunLoopRemoveSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFRunLoopMode);
+    /// Thread-safe: a source signalled before its run loop runs is handled at the next run.
+    pub fn CFRunLoopSourceCreate(
+        allocator: CFAllocatorRef,
+        order: CFIndex,
+        context: *mut CFRunLoopSourceContext,
+    ) -> CFRunLoopSourceRef;
+    pub fn CFRunLoopSourceSignal(source: CFRunLoopSourceRef);
+    pub fn CFRunLoopSourceInvalidate(source: CFRunLoopSourceRef);
+    /// Wakes `rl` from its wait, from any thread.
+    pub fn CFRunLoopWakeUp(rl: CFRunLoopRef);
+    /// Ends the current run of `rl`; a stop while it is not running is lost.
+    pub fn CFRunLoopStop(rl: CFRunLoopRef);
+    pub fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
+    pub fn CFRelease(cf: CFTypeRef);
     /// Runs the calling thread's run loop in `mode` for at most `seconds`; returns a
     /// `CFRunLoopRunResult`.
     pub fn CFRunLoopRunInMode(

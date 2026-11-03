@@ -663,6 +663,7 @@ pub const BOX_WORDS: &[&str] = &[
     "goal-resume",
     "mcp-server",
     "auto-mode-setup",
+    "chrome-intro",
     "other",
 ];
 
@@ -748,6 +749,7 @@ pub const NEED_WORDS: &[&str] = &[
     "approval:goal-resume",
     "approval:mcp-server",
     "approval:auto-mode-setup",
+    "approval:chrome-intro",
     "approval:other",
     "question",
     "wall:usage-session",
@@ -860,6 +862,11 @@ pub const WHY_WORDS: &[&str] = &[
     "signin",
     "install",
     "restored",
+    "could-not-finish",
+    "off",
+    "off-ctl",
+    "expired",
+    "repeated",
     // A post the bridge retired undelivered (`mail-landed why=`, aterm_types'
     // `DeadReason`; `not-carried` and `log-replaced` above are aterm's own).
     "undeliverable",
@@ -923,6 +930,7 @@ pub const STATE_WORDS: &[&str] = &[
     "done",
     "exited",
     "stalled",
+    "failed",
     "connected",
     "disconnected",
     "absent",

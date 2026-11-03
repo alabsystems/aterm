@@ -15,7 +15,6 @@
 #[cfg(unix)]
 mod common;
 
-mod arena_interrupt;
 mod conformance_end_by_proof;
 mod gate_contract;
 mod tether_entry;

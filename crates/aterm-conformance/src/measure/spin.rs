@@ -331,6 +331,8 @@ pub struct SpinReport {
     pub owner_fires: Vec<(&'static str, Option<u64>)>,
     /// The dial's needle in the window, as the metrics read it.
     pub needle: NeedleCounts,
+    /// Display-clock counters over the observation window, for wake diagnosis.
+    pub deck_clock: Vec<(&'static str, Option<u64>)>,
     /// A pet take's [`PET_FIELDS`] as the window opened.
     pub pet_open: Option<String>,
     /// A pet take's [`PET_FIELDS`] at the end of the window.
@@ -354,7 +356,7 @@ impl std::fmt::Display for SpinReport {
             "SPIN scene={:?} window={:?} past_deadline_arms={} max_arms={} stale_arm_heals={:?} \
              frames={:?} timer_wakes={:?} max_timer_wakes={:?} wakes={:?} max_wakes={} \
              owner_fires={:?} max_owner_fires={:?} needle_fires={:?} needle_sweeps={:?} \
-             needle_frames_owed={:?} needle_episode_left={:?} needle_owed={} \
+             needle_frames_owed={:?} needle_episode_left={:?} needle_owed={} deck_clock={:?} \
              wait_cancelled_wakes={:?} turns={:?} \
              wakes_by_variant={:?} fires_by_owner={:?} os_events={:?} os_event_kinds={:?} \
              pet_open={:?} pet={:?} \
@@ -377,6 +379,7 @@ impl std::fmt::Display for SpinReport {
             self.needle.owed,
             self.needle.carried,
             self.row.needle_owed,
+            self.deck_clock,
             self.wait_cancelled_wakes,
             self.turns,
             self.wakes_by_variant,
@@ -585,7 +588,7 @@ fn pet_fields(line: &str) -> String {
 
 /// Measure one row.
 /// # Errors
-/// [`CouldNotRun`] when the instance did not start, a counter is missing, the
+/// [`CouldNotRun`] when first-exec warm-up is unavailable, the instance did not start, a counter is missing, the
 /// claude scene was not the shape it claims (off the alt screen, or its output
 /// moved the grid), the window took more than [`MAX_OS_EVENTS`] events other than
 /// a redraw (a person's pointer or keys: not idle) or the pet scene's took any
@@ -596,7 +599,7 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     let _one = super::ONE_TAKE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    super::instance::first_exec(&rig.fake_tui);
+    super::instance::first_exec(&rig.fake_tui)?;
     let settle = if row.scene.pet() {
         PET_DEEP_SLEEP
     } else {
@@ -753,6 +756,23 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         return unanswered("ctl metrics does not report frames");
     }
     let arms = after.saturating_sub(before);
+    let deck_clock = [
+        "deck_clock_ticks",
+        "deck_clock_frames",
+        "deck_clock_link_ticks",
+        "deck_clock_link_fallbacks",
+        "deck_clock_link_resumes",
+    ]
+    .into_iter()
+    .map(|key| {
+        (
+            key,
+            uint_field(&metrics, key)
+                .zip(uint_field(&opened, key))
+                .map(|(end, start)| end.saturating_sub(start)),
+        )
+    })
+    .collect();
     Ok(SpinReport {
         row: *row,
         sampled,
@@ -783,6 +803,7 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         ),
         owner_fires: fired,
         needle,
+        deck_clock,
         checks: super::instance::replay_checks(ctl),
     })
 }

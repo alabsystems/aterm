@@ -162,12 +162,11 @@ fn read_bytes_slurps_main_and_wal_in_memory_without_links_or_copies() {
         let fifo_c = std::ffi::CString::new(wal.as_os_str().as_bytes()).expect("cstr");
         // SAFETY: `fifo_c` is a valid NUL-terminated path in the test's private tempdir.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-        let opened = open_no_link(&wal).expect("O_NONBLOCK opens FIFO without blocking");
-        assert!(
-            !opened.metadata().expect("fifo metadata").is_file(),
-            "FIFO is non-regular so TOCTOU swap fails identity check without hanging"
+        assert_eq!(
+            open_no_link(&wal).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+            "the shared regular-file opener refuses the FIFO without blocking"
         );
-        drop(opened);
         assert_eq!(
             read_bytes(&db, 1024, |_, _| Some(())),
             Err(Unread::Failed),

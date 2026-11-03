@@ -9,7 +9,7 @@ use crate::{Fail, stop};
 use astream_wire::sync::Digest;
 use aterm_db::accounts::proposals::{Proposals, Snapshot};
 use aterm_json::{Value, json};
-use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
+use aterm_secrets::client::Paths;
 use aterm_types::network_state::{
     HistoryState, MachineIdentity, NetworkObservation, Reachability, ServiceAvailability,
 };
@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod activation;
+mod catchup;
 pub(super) mod gui;
 mod history;
 mod lens;
@@ -63,6 +64,8 @@ pub(super) struct Cycle<'a> {
     pub out: &'a Path,
     pub peer_details: Option<PathBuf>,
     pub accounts: &'a [(Digest, &'a str, &'a Value)],
+    pub application: &'a super::table::Table,
+    pub rows: &'a mut super::table::Rows,
 }
 
 #[derive(Clone, Copy)]
@@ -854,7 +857,7 @@ impl Cycle<'_> {
             .aterm_pid()
             .ok_or_else(|| Fail::die("peer-cycle recipient has no app pid"))?
             as u32;
-        let bootstrap = Bootstrap::required(&Paths::for_home(&self.source.home)).map_err(fail)?;
+        let bootstrap = super::observed_bootstrap(&Paths::for_home(&self.source.home))?;
         let request = bootstrap.request().map_err(fail)?;
         let peer = MachineIdentity {
             machine_id: *request.binding().machine(),
@@ -869,6 +872,7 @@ impl Cycle<'_> {
         save(self.out, "peer-cycle-source-stopped.json", &stopped)?;
         let lost = self.wait(pid, &peer, Stage::Lost, Some(&before.network))?;
         self.capture(pid, &peer, Stage::Lost, &lost, logical_window)?;
+        let offline_operation = self.write_while_offline()?;
         let mut cycle = self.restart(pid, source_pid, &peer, &lost)?;
         let restarted_pid = cycle
             .window
@@ -878,6 +882,7 @@ impl Cycle<'_> {
         let restored = cycle.wait(restarted_pid, &peer, Stage::Restored, Some(&lost.network))?;
         let restored_window =
             cycle.capture(restarted_pid, &peer, Stage::Restored, &restored, None)?;
+        cycle.require_offline_row_after_restart()?;
         let node = Node::start(
             cycle.source,
             &cycle.window.aterm,
@@ -903,6 +908,7 @@ impl Cycle<'_> {
             &reconnected,
             restored_window,
         )?;
+        cycle.require_returned_peer_caught_up()?;
         let source_pid = node.0.id();
         Ok((
             node,
@@ -917,7 +923,9 @@ impl Cycle<'_> {
                 "restored_revision":restored.network.revision,
                 "reconnected_revision":reconnected.network.revision,
                 "source_stopped":stopped,"source_restarted_pid":source_pid,
-                "scope":"Authenticated contact loss, absent-peer history restoration across observer restart, and reconnect with retained local synthetic accounts; no provider-login or global-currency claim",
+                "offline_table_operation":aterm_codec::hex::encode_lower(&offline_operation),
+                "application_rows_after_return":cycle.rows.len(),
+                "scope":"Authenticated contact loss, absent-peer history restoration across observer restart, and exact table catch-up after an offline write; no provider-login or global-currency claim",
             })),
         ))
     }

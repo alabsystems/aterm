@@ -543,7 +543,7 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
 }
 
 /// The chip's accessibility description at each `chrome` read from `from` to `until` (the hold
-/// standing) that drew the tab's chip under `⤓ land` (`face=land`, a description printed), as
+/// standing) that drew the tab's chip under Land's `⤓` (`face=land`, a description printed), as
 /// `chrome` prints it beside the node the screen reader is handed (§14.3's windowed read): a tab
 /// behind says none. Every one is held to the list, whatever its words.
 fn described_open(seen: &Seen, (from, until): (i64, i64)) -> Vec<(i64, String)> {

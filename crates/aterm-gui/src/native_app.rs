@@ -42,6 +42,7 @@ pub(crate) enum AppKind {
     Markdown,
     Editor,
     Recovery,
+    Workers,
 }
 
 impl AppKind {
@@ -54,6 +55,7 @@ impl AppKind {
             Self::Markdown => "markdown",
             Self::Editor => "editor",
             Self::Recovery => "recovery",
+            Self::Workers => "workers",
         }
     }
 
@@ -67,6 +69,7 @@ impl AppKind {
             Self::Markdown => "Markdown",
             Self::Editor => "Editor",
             Self::Recovery => "Recovery",
+            Self::Workers => "Workers",
         }
     }
 
@@ -76,10 +79,11 @@ impl AppKind {
             Self::Mail => AppIcon::Mail,
             Self::About => AppIcon::About,
             Self::Settings => AppIcon::Settings,
-            Self::SystemState => AppIcon::Settings,
+            Self::SystemState => AppIcon::SystemState,
             Self::Markdown => AppIcon::Markdown,
             Self::Editor => AppIcon::Editor,
             Self::Recovery => AppIcon::Recovery,
+            Self::Workers => AppIcon::Workers,
         }
     }
 }
@@ -168,6 +172,7 @@ pub(crate) enum AppViewState {
     Markdown(MarkdownViewState),
     Editor(Box<EditorViewState>),
     Recovery(RecoveryViewState),
+    Workers(Box<crate::native_workers::WorkersViewState>),
 }
 
 impl AppViewState {
@@ -180,6 +185,7 @@ impl AppViewState {
             Self::Markdown(_) => AppKind::Markdown,
             Self::Editor(_) => AppKind::Editor,
             Self::Recovery(_) => AppKind::Recovery,
+            Self::Workers(_) => AppKind::Workers,
         }
     }
 
@@ -192,6 +198,7 @@ impl AppViewState {
             Self::Markdown(view) => &view.common,
             Self::Editor(view) => &view.common,
             Self::Recovery(view) => &view.common,
+            Self::Workers(view) => &view.common,
         }
     }
 
@@ -211,6 +218,7 @@ impl AppViewState {
             Self::Markdown(view) => &mut view.common,
             Self::Editor(view) => &mut view.common,
             Self::Recovery(view) => &mut view.common,
+            Self::Workers(view) => &mut view.common,
         }
     }
 }
@@ -510,6 +518,7 @@ pub(crate) enum NativeApp {
     Markdown(MarkdownApp),
     Editor(EditorApp),
     Recovery(RecoveryApp),
+    Workers(Box<crate::native_workers::WorkersApp>),
 }
 
 type UpdateCallback = for<'a> fn(
@@ -547,6 +556,7 @@ impl NativeApp {
             Self::Markdown(_) => &markdown_vtable::VTABLE,
             Self::Editor(_) => &editor_vtable::VTABLE,
             Self::Recovery(_) => &recovery_vtable::VTABLE,
+            Self::Workers(_) => &workers_vtable::VTABLE,
         }
     }
 
@@ -559,7 +569,7 @@ impl NativeApp {
             Self::Mail(_) | Self::About(_) | Self::Settings(_) | Self::SystemState(_) => None,
             Self::Markdown(app) => Some(app.document),
             Self::Editor(app) => Some(app.document),
-            Self::Recovery(_) => None,
+            Self::Recovery(_) | Self::Workers(_) => None,
         }
     }
 
@@ -747,6 +757,13 @@ define_app_vtable!(
     Recovery,
     AppKind::Recovery,
     "recovery"
+);
+define_app_vtable!(
+    workers_vtable,
+    Workers,
+    Workers,
+    AppKind::Workers,
+    "workers"
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2778,12 +2795,12 @@ impl Default for NativeRuntime {
 impl NativeRuntime {
     pub(crate) fn poll_mail(&mut self) -> bool {
         let mut changed = false;
-        let mut connected = false;
+        let mut leave_setup = false;
         for app in self.instances.values_mut() {
             if let NativeApp::Mail(mail) = app {
                 let had = mail.connected();
                 changed |= mail.poll();
-                connected |= !had && mail.connected();
+                leave_setup |= mail.take_leave_setup() || (!had && mail.connected());
             }
         }
         if changed {
@@ -2791,8 +2808,8 @@ impl NativeRuntime {
                 if let AppViewState::Mail(view) = state {
                     view.common.presentation_revision =
                         view.common.presentation_revision.wrapping_add(1);
-                    if connected {
-                        view.setup = false;
+                    if leave_setup {
+                        view.leave_setup();
                     }
                     state.touch();
                 }
@@ -2852,7 +2869,8 @@ impl NativeRuntime {
             | AppViewState::SystemState(_)
             | AppViewState::Markdown(_)
             | AppViewState::Editor(_)
-            | AppViewState::Recovery(_) => {}
+            | AppViewState::Recovery(_)
+            | AppViewState::Workers(_) => {}
         }
         self.views.insert(view, state);
         self.view_generations.insert(view, 1);
@@ -3072,6 +3090,49 @@ impl NativeRuntime {
         }
     }
 
+    /// Give one window's Workers page the rows as they stand ([`crate::app_workers`]). Whether
+    /// anything it shows moved.
+    pub(crate) fn publish_workers(
+        &mut self,
+        instance: AppInstanceId,
+        view: ViewId,
+        rows: Vec<crate::native_workers::WorkerRow>,
+    ) -> bool {
+        let Some(NativeApp::Workers(app)) = self.instances.get_mut(&instance) else {
+            return false;
+        };
+        if !app.publish(rows) {
+            return false;
+        }
+        if let Some(state @ AppViewState::Workers(_)) = self.views.get_mut(&view) {
+            if let AppViewState::Workers(workers) = state {
+                workers.common.presentation_revision =
+                    workers.common.presentation_revision.wrapping_add(1);
+            }
+            state.touch();
+        }
+        true
+    }
+
+    /// The sessions instance `instance`'s Workers page lists, in tab order.
+    pub(crate) fn workers_listed(&self, instance: AppInstanceId) -> Vec<u64> {
+        match self.instances.get(&instance) {
+            Some(NativeApp::Workers(app)) => app.sessions(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// What a press on `instance`'s Workers page asked for ([`crate::app_workers`]).
+    pub(crate) fn take_workers_action(
+        &mut self,
+        instance: AppInstanceId,
+    ) -> Option<crate::native_workers::WorkersAction> {
+        match self.instances.get_mut(&instance) {
+            Some(NativeApp::Workers(app)) => app.take_action(),
+            _ => None,
+        }
+    }
+
     /// Removing an already-dispatched action changes no visible controls.
     pub(crate) fn take_system_state_action(
         &mut self,
@@ -3116,7 +3177,8 @@ impl NativeRuntime {
             | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
-            | NativeApp::Recovery(_) => None,
+            | NativeApp::Recovery(_)
+            | NativeApp::Workers(_) => None,
         }) else {
             return false;
         };
@@ -3148,7 +3210,8 @@ impl NativeRuntime {
             | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
-            | NativeApp::Recovery(_) => None,
+            | NativeApp::Recovery(_)
+            | NativeApp::Workers(_) => None,
         }) else {
             return false;
         };
@@ -3170,7 +3233,8 @@ impl NativeRuntime {
             | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
-            | NativeApp::Recovery(_) => None,
+            | NativeApp::Recovery(_)
+            | NativeApp::Workers(_) => None,
         }) else {
             return false;
         };
@@ -3192,7 +3256,8 @@ impl NativeRuntime {
             | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
-            | NativeApp::Recovery(_) => None,
+            | NativeApp::Recovery(_)
+            | NativeApp::Workers(_) => None,
         }) else {
             return false;
         };
@@ -3361,7 +3426,8 @@ impl NativeRuntime {
                 | AppViewState::SystemState(_)
                 | AppViewState::Markdown(_)
                 | AppViewState::Editor(_)
-                | AppViewState::Recovery(_) => {
+                | AppViewState::Recovery(_)
+                | AppViewState::Workers(_) => {
                     continue;
                 }
             };
@@ -3383,7 +3449,8 @@ impl NativeRuntime {
                 | AppViewState::Mail(_)
                 | AppViewState::SystemState(_)
                 | AppViewState::Markdown(_)
-                | AppViewState::Recovery(_) => {}
+                | AppViewState::Recovery(_)
+                | AppViewState::Workers(_) => {}
             }
         }
     }
@@ -3485,7 +3552,8 @@ impl NativeRuntime {
             | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
-            | NativeApp::Recovery(_) => None,
+            | NativeApp::Recovery(_)
+            | NativeApp::Workers(_) => None,
         }
     }
 
@@ -3506,7 +3574,8 @@ impl NativeRuntime {
             | NativeApp::About(_)
             | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
-            | NativeApp::Recovery(_) => None,
+            | NativeApp::Recovery(_)
+            | NativeApp::Workers(_) => None,
         }
     }
 
@@ -3646,7 +3715,8 @@ impl NativeRuntime {
                 | NativeApp::Mail(_)
                 | NativeApp::Settings(_)
                 | NativeApp::SystemState(_)
-                | NativeApp::Recovery(_) => None,
+                | NativeApp::Recovery(_)
+                | NativeApp::Workers(_) => None,
             })
             .collect()
     }
@@ -3667,7 +3737,8 @@ impl NativeRuntime {
                 | NativeApp::Mail(_)
                 | NativeApp::Settings(_)
                 | NativeApp::SystemState(_)
-                | NativeApp::Recovery(_) => None,
+                | NativeApp::Recovery(_)
+                | NativeApp::Workers(_) => None,
             })
             .collect::<Vec<_>>();
         let mut by_basename = BTreeMap::<String, Vec<(AppInstanceId, String)>>::new();
@@ -8440,7 +8511,8 @@ mod markdown_reader_tests {
                 | AppKind::About
                 | AppKind::Settings
                 | AppKind::SystemState
-                | AppKind::Recovery => {
+                | AppKind::Recovery
+                | AppKind::Workers => {
                     unreachable!()
                 }
             };

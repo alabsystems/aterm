@@ -1296,13 +1296,14 @@ impl CursorGlow {
             };
             let n = ((major + 2.0 * past * major) * inv_step_px).ceil().max(1.0) as usize;
             let inv_nf = (1.0 + 2.0 * past) / (n as f32);
+            let step_off = (2.0 * half) / (reads as f32);
             let mut k = 0;
             while k <= n {
                 let f = k as f32 * inv_nf - past;
                 let (x, y) = (xa + dx * f, ya + dy * f);
                 let mut j = 0;
                 while j <= reads {
-                    let off = -half + 2.0 * half * j as f32 / reads as f32;
+                    let off = -half + j as f32 * step_off;
                     let met = if across_x {
                         on_bar(x + off, y)
                     } else {

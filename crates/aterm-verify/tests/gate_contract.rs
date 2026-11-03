@@ -292,7 +292,7 @@ fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
 /// A TEST COMPILE THAT DID NOT PASS STARTS NO CARGO BEHIND IT: its stand-in compile exits 101,
 /// and the test stage, behind it in the main lane, is one COULD NOT RUN row naming the failed
 /// compile and starts no compile of its own, so the trace holds the test compile's start line
-/// alone. NEGATIVE CONTROL: without the flag the test stage compiled again, a second line.
+/// alone. NEGATIVE CONTROL: without the flag the test stage would start a recording pass.
 #[test]
 fn a_failed_test_compile_starts_no_cargo_behind_it() {
     let repo = FakeRepo::new();
@@ -489,9 +489,36 @@ const COMPILE_RED: &str = "echo 'error[E0425]: cannot find value `gone` in this 
      echo '  --> crates/aterm-gui/src/bin/rot.rs:3:13' >&2; exit 101";
 
 fn with_recording_cargo(repo: &FakeRepo, bins: &[(&str, &str, &str)], extra: &str) {
+    with_recording_cargo_from(repo, bins, bins, extra, true);
+}
+
+fn with_recording_cargo_from(
+    repo: &FakeRepo,
+    compiled_bins: &[(&str, &str, &str)],
+    bins: &[(&str, &str, &str)],
+    extra: &str,
+    report_artifacts: bool,
+) {
     let deps = repo.root.join("target/debug/deps");
     fs::create_dir_all(&deps).expect("mkdir");
-    let mut compile = String::new();
+    let metadata = |bins: &[(&str, &str, &str)]| {
+        bins.iter().map(|(_, flag, name)| {
+            let (kind, target) = flag.split_once(' ')
+                .map_or(("lib", *name), |(kind, target)| (kind.trim_start_matches("--"), target));
+            let message = format!(
+                "{{\"reason\":\"compiler-artifact\",\"target\":{{\"kind\":[{}],\"name\":{}}},\"profile\":{{\"test\":true}},\"executable\":{}}}",
+                aterm_json::json!(kind), aterm_json::json!(target),
+                aterm_json::json!(deps.join(format!("{name}-1")).to_str().unwrap()),
+            );
+            format!("printf '%s\\n' {}\n", sh_quote(&message))
+        }).collect::<String>()
+    };
+    let compile = metadata(compiled_bins);
+    let current = if report_artifacts {
+        metadata(bins)
+    } else {
+        String::new()
+    };
     let mut record = String::new();
     let mut serial = String::new();
     for (pkg, flag, name) in bins {
@@ -500,11 +527,6 @@ fn with_recording_cargo(repo: &FakeRepo, bins: &[(&str, &str, &str)], extra: &st
             Some((k, n)) => (k.trim_start_matches("--"), n),
             None => ("lib", *name),
         };
-        compile.push_str(&format!(
-            "printf '%s\\n' '{{\"reason\":\"compiler-artifact\",\"target\":{{\"kind\":[\"{kind}\"],\
-             \"name\":\"{tname}\"}},\"profile\":{{\"test\":true}},\"executable\":\"{}\"}}'\n",
-            exe.display()
-        ));
         let src = if kind == "test" {
             format!("tests/{tname}.rs")
         } else {
@@ -529,7 +551,8 @@ fn with_recording_cargo(repo: &FakeRepo, bins: &[(&str, &str, &str)], extra: &st
         ));
     }
     repo.with_stage2_body(&format!(
-        r#"status=0
+        r#"printf '%s\n' "$*" >> {trace}
+status=0
 cfg=""; prev=""; seen=0; targs=""
 for a in "$@"; do
   if [ "$seen" = 1 ]; then targs="$targs $a"; fi
@@ -544,6 +567,9 @@ case "$*" in
     echo '   Compiling fixture v0.1.0' >&2
 {compile}    exit 0 ;;
   *--tests*)
+    echo '   Compiling fixture v0.1.0' >&2
+    case "$*" in *--message-format=json-render-diagnostics*)
+{current}    ;; esac
 {extra}
     if [ -n "$cfg" ]; then
       arr=${{cfg#*=\[\"}}; arr=${{arr%\"\]}}
@@ -553,8 +579,300 @@ case "$*" in
 {serial}    fi
     exit $status ;;
 esac
-exit 0"#
+exit 0"#,
+        trace = sh_quote(&repo.scratch.join("cargo-starts").display().to_string()),
     ));
+}
+
+#[test]
+fn whole_and_shaped_compiles_are_followed_by_one_fresh_recording_pass() {
+    use aterm_verify::shape::{Part, Piece};
+    for shaped in [false, true] {
+        let repo = FakeRepo::new();
+        with_recording_cargo(&repo, &[("fixture", "--test current", "current")], "");
+        let ran = repo.scratch.join("ran");
+        common::standin_body(
+            &repo.root.join("target/debug/deps/current-1"),
+            &format!(
+                "echo current >> {}\nprintf '\\nrunning 1 test\\ntest current::fine ... ok\\n\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n'",
+                sh_quote(&ran.display().to_string()),
+            ),
+        );
+        let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
+        ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+        let planned = plan::plan(&ctx);
+        let compile = planned
+            .iter()
+            .find(|spec| spec.id == StageId::TestCompile)
+            .unwrap();
+        let run = planned
+            .iter()
+            .find(|spec| spec.id == StageId::Test)
+            .unwrap();
+        let mut expected = Vec::new();
+        if shaped {
+            let cut = Piece::of(&["fixture".into()], true);
+            let mut first = compile.clone();
+            first.part = Some(Part {
+                piece: cut.clone(),
+                index: 0,
+                of: 2,
+                after: Vec::new(),
+                said: String::new(),
+                planned: None,
+                refused: Vec::new(),
+            });
+            let report = stages::run_stage(&ctx, &first);
+            assert!(
+                !tally(std::slice::from_ref(&report)).failed(),
+                "{}",
+                report.render()
+            );
+            expected.push(
+                stages::main_targo(&ctx, stages::piece_compile_args(&cut)).argv()[1..].join(" "),
+            );
+            let mut closing = compile.clone();
+            closing.part = Some(Part {
+                piece: Piece::of(&["fixture".into()], false),
+                index: 1,
+                of: 2,
+                after: vec![cut],
+                said: String::new(),
+                planned: None,
+                refused: Vec::new(),
+            });
+            let report = stages::run_stage(&ctx, &closing);
+            assert!(
+                !tally(std::slice::from_ref(&report)).failed(),
+                "{}",
+                report.render()
+            );
+        } else {
+            let report = stages::run_stage(&ctx, compile);
+            assert!(
+                !tally(std::slice::from_ref(&report)).failed(),
+                "{}",
+                report.render()
+            );
+        }
+        expected.push(
+            stages::main_targo(&ctx, stages::test_compile_args(&ctx.scope)).argv()[1..].join(" "),
+        );
+        let report = stages::run_stage(&ctx, run);
+        assert!(
+            !tally(std::slice::from_ref(&report)).failed(),
+            "{}",
+            report.render()
+        );
+        let calls = fs::read_to_string(repo.scratch.join("cargo-starts")).unwrap();
+        let calls: Vec<_> = calls.lines().collect();
+        assert_eq!(calls.len(), expected.len() + 1, "{calls:?}");
+        for (got, wanted) in calls.iter().zip(&expected) {
+            assert_eq!(*got, wanted);
+        }
+        let recording = calls.last().unwrap();
+        assert!(!recording.contains("--no-run"));
+        assert!(recording.contains(aterm_verify::testrun::RECORD_FLAG));
+        assert!(recording.contains("--message-format=json-render-diagnostics"));
+        assert!(recording.contains(&stages::test_run_args(&ctx.scope).join(" ")));
+        assert_eq!(fs::read_to_string(ran).unwrap(), "current\n");
+    }
+}
+
+#[test]
+fn recording_metadata_names_the_fresh_executable_and_target() {
+    let repo = FakeRepo::new();
+    with_recording_cargo_from(
+        &repo,
+        &[("fixture", "--lib", "old")],
+        &[("fixture", "--test changed", "fresh")],
+        "",
+        true,
+    );
+    let ran = repo.scratch.join("ran");
+    for (name, body) in [
+        ("old", "echo old"),
+        (
+            "fresh",
+            "printf 'fresh\\nrunning 1 test\\ntest current::failed ... FAILED\\n\\nfailures:\\n\\n---- current::failed stdout ----\\n\\nthread '\"'\"'current::failed'\"'\"' panicked at fixture.rs:1:1:\\nexpected assertion fixture\\n\\nfailures:\\n    current::failed\\n\\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n'",
+        ),
+    ] {
+        common::standin_body(
+            &repo.root.join(format!("target/debug/deps/{name}-1")),
+            &format!(
+                "echo {name} >> {}\n{body}\nexit 101",
+                sh_quote(&ran.display().to_string()),
+            ),
+        );
+    }
+    let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
+    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    let planned = plan::plan(&ctx);
+    let compile = planned
+        .iter()
+        .find(|spec| spec.id == StageId::TestCompile)
+        .unwrap();
+    let report = stages::run_stage(&ctx, compile);
+    assert!(
+        !tally(std::slice::from_ref(&report)).failed(),
+        "{}",
+        report.render()
+    );
+    let run = planned
+        .iter()
+        .find(|spec| spec.id == StageId::Test)
+        .unwrap();
+    let report = stages::run_stage(&ctx, run);
+    let block = report.render();
+    assert_eq!(tags(&block), ["FAIL"], "{block}");
+    assert!(!block.contains("run by cargo, one at a time"), "{block}");
+    assert_eq!(fs::read_to_string(ran).unwrap(), "fresh\n");
+    assert_eq!(
+        fs::read_to_string(repo.scratch.join("cargo-starts"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    assert_eq!(
+        report
+            .findings()
+            .iter()
+            .map(|finding| finding.id.as_str())
+            .collect::<Vec<_>>(),
+        ["-p fixture --test changed -- current::failed"],
+        "{block}"
+    );
+}
+
+#[test]
+fn an_overriding_runner_keeps_runtime_json_without_an_extra_compile() {
+    let repo = FakeRepo::new();
+    with_recording_cargo(&repo, &[("fixture", "--test current", "current")], "cfg=''");
+    let ran = repo.scratch.join("ran");
+    let payload = "{\"reason\": this is runtime output, not cargo metadata}";
+    common::standin_body(
+        &repo.root.join("target/debug/deps/current-1"),
+        &format!(
+            "echo current >> {}\nprintf '%s\\n' {}\nprintf '\\nrunning 1 test\\ntest current::fine ... ok\\n\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n'",
+            sh_quote(&ran.display().to_string()),
+            sh_quote(payload),
+        ),
+    );
+    let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
+    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|spec| spec.id == StageId::Test)
+        .unwrap();
+    let report = stages::run_stage(&ctx, &spec);
+    let block = report.render();
+    assert!(!tally(std::slice::from_ref(&report)).failed(), "{block}");
+    assert!(block.contains(payload), "{block}");
+    assert_eq!(fs::read_to_string(ran).unwrap(), "current\n");
+    let calls = fs::read_to_string(repo.scratch.join("cargo-starts")).unwrap();
+    assert_eq!(calls.lines().count(), 1, "{calls}");
+    assert!(!calls.contains("--no-run"));
+}
+
+#[test]
+fn missing_recording_artifacts_cannot_reuse_the_previous_compile() {
+    let repo = FakeRepo::new();
+    with_recording_cargo_from(
+        &repo,
+        &[("fixture", "--lib", "old")],
+        &[("fixture", "--test current", "current")],
+        "",
+        false,
+    );
+    let ran = repo.scratch.join("ran");
+    common::standin_body(
+        &repo.root.join("target/debug/deps/current-1"),
+        &format!(
+            "echo current >> {}\nprintf '\\nrunning 1 test\\ntest current::fine ... ok\\n\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n'",
+            sh_quote(&ran.display().to_string()),
+        ),
+    );
+    let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
+    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    let planned = plan::plan(&ctx);
+    let compile = planned
+        .iter()
+        .find(|spec| spec.id == StageId::TestCompile)
+        .unwrap();
+    let report = stages::run_stage(&ctx, compile);
+    assert!(
+        !tally(std::slice::from_ref(&report)).failed(),
+        "{}",
+        report.render()
+    );
+    let run = planned
+        .iter()
+        .find(|spec| spec.id == StageId::Test)
+        .unwrap();
+    let report = stages::run_stage(&ctx, run);
+    let block = report.render();
+    assert!(!tally(std::slice::from_ref(&report)).failed(), "{block}");
+    assert!(block.contains("run by cargo, one at a time"), "{block}");
+    assert_eq!(fs::read_to_string(ran).unwrap(), "current\n");
+    let calls = fs::read_to_string(repo.scratch.join("cargo-starts")).unwrap();
+    assert_eq!(calls.lines().count(), 3, "{calls}");
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.contains("--no-run"))
+            .count(),
+        1,
+        "{calls}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.contains(aterm_verify::testrun::RECORD_FLAG))
+            .count(),
+        1,
+        "{calls}"
+    );
+    assert!(!calls.lines().last().unwrap().contains("--message-format"));
+}
+
+#[test]
+fn a_failed_recording_build_is_not_replayed_after_valid_metadata() {
+    let repo = FakeRepo::new();
+    with_recording_cargo(
+        &repo,
+        &[("fixture", "--test current", "current")],
+        "if [ -n \"$cfg\" ]; then echo 'error: current recording build failed' >&2; exit 101; fi",
+    );
+    let ran = repo.scratch.join("ran");
+    common::standin_body(
+        &repo.root.join("target/debug/deps/current-1"),
+        &format!(
+            "echo current >> {}\nexit 0",
+            sh_quote(&ran.display().to_string()),
+        ),
+    );
+    let mut ctx = repo.ctx(&[Check::Test], Scope::crate_only("fixture"));
+    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|spec| spec.id == StageId::Test)
+        .unwrap();
+    let report = stages::run_stage(&ctx, &spec);
+    let block = report.render();
+    assert_eq!(tags(&block), ["FAIL"], "{block}");
+    assert!(
+        block.contains("error: current recording build failed"),
+        "{block}"
+    );
+    assert!(!ran.exists());
+    assert_eq!(
+        fs::read_to_string(repo.scratch.join("cargo-starts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -719,7 +1037,7 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
     let report = stages::run_stage(&ctx, &spec);
     let block = report.render();
 
-    assert_eq!(tags(&block), ["ok", "FAIL"], "{block}");
+    assert_eq!(tags(&block), ["FAIL"], "{block}");
     assert!(block.contains("   Compiling fixture v0.1.0"), "{block}");
     assert!(
         !block.contains("{\"reason\""),
@@ -774,9 +1092,19 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
 fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
     let bins = [("fixture", "--test b", "b"), ("fixture", "--test c", "c")];
     let cases = [
-        "echo '     Running tests/ghost.rs (target/debug/deps/ghost-1)' >&2",
-        "if [ -n \"$cfg\" ]; then cfg=$(printf '%s' \"$cfg\" | sed 's#\",\"/#\",\"/nonexistent/#'); fi",
-        "cfg=''",
+        (
+            "echo '     Running tests/ghost.rs (target/debug/deps/ghost-1)' >&2",
+            2,
+        ),
+        (
+            "if [ -n \"$cfg\" ]; then cfg=$(printf '%s' \"$cfg\" | sed 's#\",\"/#\",\"/nonexistent/#'); fi",
+            2,
+        ),
+        ("cfg=''", 1),
+        (
+            "if [ -n \"$cfg\" ]; then echo '{\"reason\": malformed'; fi",
+            2,
+        ),
     ];
     let repo = FakeRepo::new();
     let deps = repo.root.join("target/debug/deps");
@@ -799,7 +1127,9 @@ fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
             ),
         );
     }
-    for extra in cases {
+    for (extra, calls) in cases {
+        let trace = repo.scratch.join("cargo-starts");
+        let _ = fs::remove_file(&trace);
         with_recording_cargo(&repo, &bins, extra);
         let mut ctx = repo.ctx(&land(), Scope::workspace());
         ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
@@ -811,6 +1141,13 @@ fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
         let block = report.render();
         assert!(
             block.contains("RAN-b") && block.contains("RAN-c"),
+            "{block}"
+        );
+        assert_eq!(block.matches("RAN-b").count(), 1, "{block}");
+        assert_eq!(block.matches("RAN-c").count(), 1, "{block}");
+        assert_eq!(
+            fs::read_to_string(trace).unwrap().lines().count(),
+            calls,
             "{block}"
         );
         let t = tally(std::slice::from_ref(&report));
@@ -846,7 +1183,7 @@ fn a_runner_that_ran_no_test_is_could_not_run_never_ok() {
     let block = report.render();
     assert_eq!(
         tags(&block),
-        ["ok", "NOT RUN"],
+        ["NOT RUN"],
         "a run of no test passed:\n{block}"
     );
     let t = tally(std::slice::from_ref(&report));

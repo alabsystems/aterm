@@ -379,7 +379,7 @@ fn executable_of(stream: &[u8], bin: &str) -> Option<PathBuf> {
                     t.get("name").and_then(aterm_json::Value::as_str) == Some(bin)
                         && t.get("kind")
                             .and_then(aterm_json::Value::as_array)
-                            .is_none_or(|ks| ks.iter().any(|k| k.as_str() == Some("bin")))
+                            .is_some_and(|ks| ks.iter().any(|k| k.as_str() == Some("bin")))
                 })
         })
         .filter_map(|v| {

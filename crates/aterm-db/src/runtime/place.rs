@@ -65,6 +65,11 @@ pub(super) fn answer(round: &RepairRound, local: &Binding, peer: &Binding) -> Op
         ),
         addr: Some(connection.peer.ip().to_canonical()),
         via: Some(via),
+        // The socket names no interface. A Commons contact words the place and admits nobody:
+        // the vault's automatic ALab LAN admission counts fleet answers only.
+        iface: None,
+        network: None,
+        logged: false,
         began_ms: connection.began_ms,
         at_ms: connection.authenticated_ms,
     })

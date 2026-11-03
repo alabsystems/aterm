@@ -308,12 +308,10 @@ fn record_and_replay_of_one_file() {
 }
 
 #[test]
-fn tapes_are_anonymous() {
-    usage(
-        &["--record", "t.atape", "--as", "dev", "repo", "view", "o/r"],
-        "repo.view",
-        "--as",
-    );
+fn tapes_take_as() {
+    let inv = run(&["--record", "t.atape", "--as", "dev", "repo", "view", "o/r"]);
+    assert_eq!(inv.global.as_profile.as_deref(), Some("dev"));
+    assert_eq!(inv.global.record, Some(PathBuf::from("t.atape")));
     usage(&["--replay", "t.atape", "--as", "dev"], "-", "--as");
     usage(&["--replay", "t.atape", "--profile", "dev"], "-", "--as");
 }
@@ -326,7 +324,7 @@ fn a_bare_replay_takes_no_other_flag() {
 }
 
 #[test]
-fn local_verbs_and_downloads_cannot_be_taped() {
+fn local_provision_and_git_verbs_cannot_be_taped() {
     usage(&["--replay", "t.atape", "whoami"], "whoami", "whoami");
     usage(
         &["auth", "add", "n", "--replay", "t.atape"],
@@ -334,18 +332,19 @@ fn local_verbs_and_downloads_cannot_be_taped() {
         "auth add",
     );
     usage(
-        &[
-            "release",
-            "download",
-            "o/r",
-            "v1",
-            "--asset",
-            "a",
-            "--replay=t.atape",
-        ],
-        "release.download",
-        "release download",
+        &["--record", "t.atape", "auth", "git-credential", "get"],
+        "auth.git-credential",
+        "auth git-credential",
     );
+    usage(
+        &["--record", "t.atape", "repo", "clone", "o/r", "d"],
+        "repo.clone",
+        "repo clone",
+    );
+    let inv = run(&[
+        "--record", "t.atape", "release", "download", "o/r", "v1", "--asset", "x",
+    ]);
+    assert_eq!(inv.path, ["release", "download"]);
 }
 
 #[test]

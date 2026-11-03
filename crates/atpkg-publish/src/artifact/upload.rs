@@ -7,16 +7,38 @@ use std::path::{Path, PathBuf};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::host::rest::STAGED;
-use crate::host::{HostError, Release, ReleaseHost, Replace, Slug};
+use crate::host::{HostError, HostRole, Release, ReleaseHost, Replace, Slug, gh_serves};
 
 #[path = "upload_version.rs"]
 mod version;
 pub use version::VERSION_RESERVATION;
 
-/// Check that the staging owner's token file exists and is non-empty before building.
+/// Check that the staging owner can be written before building: its token file exists and is
+/// non-empty where the staging host is `RestHost` (`host::gh_serves`), and otherwise the staging
+/// host's own pre-claim check (`write_preflight`, finding F2) of the staging index repository.
+/// A pack verb asks [`program_preflight`] instead, of the repository its upload goes to.
 /// # Errors
-/// Returns a refusal naming the missing or unusable token file.
+/// Returns a refusal naming the missing or unusable token file, or the staging writer the host
+/// refused.
 pub fn token_preflight(ctx: &Ctx) -> Result<()> {
+    token_preflight_for(ctx, atpkg::manifest::INDEX_REPO)
+}
+
+/// [`token_preflight`] of the staging repository `repo`, the one `publish` writes a pack of
+/// that program to: under agh both push and a release-tier grant are per repository, so the
+/// pre-claim check asks it of the repository the upload goes to.
+/// # Errors
+/// Returns a refusal naming the missing or unusable token file, or the staging writer the host
+/// refused on `repo`.
+pub fn token_preflight_for(ctx: &Ctx, repo: &str) -> Result<()> {
+    if !gh_serves(ctx, HostRole::Staging) {
+        let slug = ctx.staging_slug(repo);
+        return ctx.hosts.staging.write_preflight(&slug).map_err(|e| {
+            Error::refused(format!(
+                "--upload needs the staging owner's writer on {slug}: {e} — nothing built"
+            ))
+        });
+    }
     match ctx.usable_token(&ctx.tokens.staging) {
         Ok(true) => Ok(()),
         Ok(false) => Err(Error::refused(format!(
@@ -29,6 +51,19 @@ pub fn token_preflight(ctx: &Ctx) -> Result<()> {
             "--upload needs the staging owner's token at {}: {why} — nothing built",
             ctx.shown(&ctx.tokens.staging),
         ))),
+    }
+}
+
+/// [`token_preflight_for`] of the staging repository `program`'s packs are uploaded to
+/// (`programs::get(program).repo`): what `pack`, `pack-bundle`, `pack-bottle` and
+/// `pack-package --upload` check before anything is built. A program the channel does not pin
+/// asks nothing here, so the verb's own usage error names it.
+/// # Errors
+/// As [`token_preflight_for`].
+pub fn program_preflight(ctx: &Ctx, program: &str) -> Result<()> {
+    match crate::programs::get(program) {
+        Some(def) => token_preflight_for(ctx, def.repo),
+        None => Ok(()),
     }
 }
 
@@ -293,9 +328,22 @@ pub(crate) fn reserve_pack_version(
                 notes,
                 std::slice::from_ref(&prepared.reservation),
             );
-            host.release(owner, tag).map_err(|error| Error::cannot_run(format!(
-                "could not reconcile creating {owner} {tag} ({error}; create: {made:?}) — no payload uploaded"
-            )))?
+            // A refused create converges onto the release a racing publisher made, and onto
+            // nothing else: with none there, the refusal was the host's own (finding F1), so
+            // it stands, in the create's own words.
+            match (host.release(owner, tag), made) {
+                (Ok(release), _) => release,
+                (Err(HostError::NotFound), Err(refused @ HostError::Refused(_))) => {
+                    return Err(Error::refused(format!(
+                        "creating {tag} on {owner} failed: {refused}"
+                    )));
+                }
+                (Err(error), made) => {
+                    return Err(Error::cannot_run(format!(
+                        "could not reconcile creating {owner} {tag} ({error}; create: {made:?}) — no payload uploaded"
+                    )));
+                }
+            }
         }
         Err(e) => return Err(unread(e)),
     };
@@ -325,8 +373,9 @@ fn manifest_version(bytes: &[u8]) -> Option<String> {
 /// rebuild, or a manifest merged with a second target): one build number names one version
 /// (D51). A replace the REST host cut short between deleting the old manifest and renaming its
 /// replacement leaves the replacement under that name plus [`STAGED`] alone, and that copy is
-/// then what the release stages, so it is read too. A release with neither holds nothing to
-/// keep.
+/// then what the release stages, so it is read too; so is a temporary asset agh's clobber left
+/// (`{name}.agh-{8 hex}`, `agh::github::releases::is_clobber_temporary_of`). A release with
+/// none of them holds nothing to keep.
 /// # Errors
 /// A refusal when a staged manifest records another version or none readable; a could-not-run
 /// when one cannot be downloaded.
@@ -344,6 +393,13 @@ fn check_staged(
     let present: Vec<String> = [name.clone(), format!("{name}{STAGED}")]
         .into_iter()
         .filter(|n| release.assets.contains(n))
+        .chain(
+            release
+                .assets
+                .iter()
+                .filter(|asset| agh::github::releases::is_clobber_temporary_of(asset, &name))
+                .cloned(),
+        )
         .collect();
     if present.is_empty() {
         return Ok(());

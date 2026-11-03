@@ -41,6 +41,71 @@ pub(crate) enum PathEvent {
     /// axis says what this network gives. Built on every platform: [`NetProbe::settled`] hands it
     /// on.
     Settled,
+    /// The path came back after a loss (a usable reading after an unusable one, [`PathEdge`]),
+    /// told right after that [`PathEvent::Usable`]: on the network the path left and came back
+    /// to no place settles (a settle back within `aterm_netplace::moves::REST_MS` is not told),
+    /// so the API's reach is measured again under the [`SETTLED_LEASE`]
+    /// ([`NetProbe::remeasure`]) and the internet answer from before the loss does not stand
+    /// untested. Only macOS's path source hears it.
+    #[cfg_attr(
+        all(not(target_os = "macos"), not(test)),
+        expect(dead_code, reason = "the path monitor is macOS's")
+    )]
+    Back,
+    /// This Mac woke from a sleep (`aterm_uds::power`'s wake after a will-sleep, [`WakeEdge`]):
+    /// whatever network it woke on, the internet answer measured before the sleep says nothing
+    /// of now, so the API's reach is measured again under the [`SETTLED_LEASE`]
+    /// ([`NetProbe::remeasure`]). On the network it slept on no place settles, so nothing else
+    /// would. Only macOS's path source hears it.
+    #[cfg_attr(
+        all(not(target_os = "macos"), not(test)),
+        expect(dead_code, reason = "the wake source is macOS's")
+    )]
+    Woke,
+}
+
+/// WHICH PATH READING IS A RETURN ([`PathEvent::Back`]): a usable reading after an unusable one.
+/// The watch's first reading is none (nothing was lost), nor a usable one after a usable one.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PathEdge {
+    /// The last reading.
+    last: Option<bool>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl PathEdge {
+    /// `usable` read: whether it is the path's return after a loss.
+    pub(crate) fn read(&mut self, usable: bool) -> bool {
+        let back = usable && self.last == Some(false);
+        self.last = Some(usable);
+        back
+    }
+}
+
+/// WHICH POWER ANNOUNCEMENT IS A WAKE ([`PathEvent::Woke`]): `aterm_uds::power` hands a
+/// [`Power::Woke`](aterm_uds::power::Power::Woke) both for a wake and for an idle sleep that did
+/// not come (`kIOMessageSystemWillNotSleep`, after which nothing slept), so a wake is the first
+/// `Woke` after a `WillSleep`, and each sleep owes one measure.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WakeEdge {
+    /// A will-sleep was heard and its wake not yet.
+    slept: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl WakeEdge {
+    /// `power` heard: whether it is the wake from a sleep heard before it.
+    pub(crate) fn hear(&mut self, power: aterm_uds::power::Power) -> bool {
+        match power {
+            aterm_uds::power::Power::WillSleep => {
+                self.slept = true;
+                false
+            }
+            aterm_uds::power::Power::Woke => std::mem::take(&mut self.slept),
+        }
+    }
 }
 
 /// The lease a settled place takes on the probe ([`NetProbe::settled`]): one measure, then it
@@ -96,7 +161,10 @@ pub(crate) trait PathSource: Send + Sync {
 /// fleet herd shares, so it waits out no spread: [`crate::network_moved::watch_at_once`]); the
 /// other sources that signal tells of
 /// (the fleet's browse and beacons, the Local Network answer) say nothing of the API's reach and
-/// are not passed on. Elsewhere none.
+/// are not passed on. On macOS the path's return after a loss is told too, as a
+/// [`PathEvent::Back`] after its reading ([`PathEdge`]), and so is a wake from sleep
+/// (`aterm_uds::power::listen`, IOKit's root power domain, on a thread of its own that ends
+/// with the watch), as a [`PathEvent::Woke`] ([`WakeEdge`]). Elsewhere none.
 ///
 /// [`Woke::Route`]: crate::network_moved::Woke::Route
 #[derive(Debug, Default, Clone, Copy)]
@@ -108,14 +176,35 @@ impl PathSource for SystemPath {
         use aterm_objc::path_monitor::PathMonitor;
         let sink: Arc<dyn Fn(PathEvent) + Send + Sync> = Arc::from(sink);
         let routes = RouteMoves::start(Arc::clone(&sink), crate::network_moved::watch_at_once());
+        let woke = Arc::clone(&sink);
+        let mut edge = WakeEdge::default();
+        let power = aterm_uds::power::listen(Box::new(move |announced| {
+            if edge.hear(announced) {
+                woke(PathEvent::Woke);
+            }
+        }));
+        if power.is_none() {
+            aterm_log::info!(
+                "harness: no wake announcement; the API reach is measured again at a wake only \
+                 once the path or the network place moves"
+            );
+        }
+        let edge = Mutex::new(PathEdge::default());
         let monitor = PathMonitor::start(c"aterm.harness.net-path", move |reading| {
             if let Some(usable) = usable(reading.status) {
                 sink(PathEvent::Usable(usable));
+                if edge
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .read(usable)
+                {
+                    sink(PathEvent::Back);
+                }
             }
         });
         match (monitor, routes) {
             (None, None) => None,
-            (monitor, routes) => Some(Box::new((monitor, routes))),
+            (monitor, routes) => Some(Box::new((monitor, routes, power))),
         }
     }
 
@@ -655,10 +744,7 @@ impl NetProbe {
         let me = Arc::downgrade(self);
         *watch = source.watch(Box::new(move |event| {
             if let Some(me) = me.upgrade() {
-                match event {
-                    PathEvent::Settled => me.settled(),
-                    event => me.path_moved(event),
-                }
+                me.heard(event);
             }
         }));
         if watch.is_none() {
@@ -666,6 +752,21 @@ impl NetProbe {
                 "harness: no network path watch; the probe's cadence alone finds the API's \
                  return, and a session it does not measure reads unknown"
             );
+        }
+    }
+
+    /// ONE READING OF THE INSTALLED PATH SOURCE's watch ([`Self::watch_path`]): the place settled
+    /// ([`Self::settled`]); the path came back after a loss ([`PathEvent::Back`]) or this Mac
+    /// woke from a sleep ([`PathEvent::Woke`]), each measured again once under the
+    /// [`SETTLED_LEASE`] ([`Self::remeasure`]), since on the network the path came back to, or
+    /// the one this Mac slept on, no place settles and the internet answer from before would
+    /// stand untested. Every other reading is [`Self::path_moved`]'s. Only this, the instance's
+    /// own probe, takes the lease: an endpoint's probe ([`Self::to`]) is fed the path alone.
+    fn heard(self: &Arc<Self>, event: PathEvent) {
+        match event {
+            PathEvent::Settled => self.settled(),
+            PathEvent::Back | PathEvent::Woke => self.remeasure(),
+            PathEvent::Usable(_) | PathEvent::Moved => self.path_moved(event),
         }
     }
 
@@ -704,6 +805,7 @@ impl NetProbe {
                     st.path(satisfied, Instant::now(), SystemTime::now())
                 }
                 PathEvent::Moved | PathEvent::Settled => st.moved(Instant::now()),
+                PathEvent::Back | PathEvent::Woke => false,
             };
             if owed {
                 self.wake.notify_all();
@@ -712,6 +814,7 @@ impl NetProbe {
         };
         let satisfied = match event {
             PathEvent::Usable(satisfied) => satisfied,
+            PathEvent::Back | PathEvent::Woke => return,
             PathEvent::Moved | PathEvent::Settled => {
                 if owed {
                     aterm_log::info!(
@@ -744,6 +847,16 @@ impl NetProbe {
     /// measured" for as long as no turn ended on one.
     pub(crate) fn settled(self: &Arc<Self>) {
         self.path_moved(PathEvent::Settled);
+        self.remeasure();
+    }
+
+    /// THE API's REACH MEASURED AGAIN with no session asking: the [`SETTLED_LEASE`] taken, which
+    /// no session renews, so it lapses after one measure, or, while the API reads down, once an
+    /// Up came or [`SETTLED_DOWN_FOR`] passed ([`keep_settled`]). The place settling
+    /// ([`Self::settled`]), the path's return after a loss and a wake from sleep
+    /// ([`Self::heard`]) each take it once; the measure lands in the place's internet axis
+    /// ([`Self::settle`]).
+    pub(crate) fn remeasure(self: &Arc<Self>) {
         *self
             .settled_until
             .lock()
@@ -1196,6 +1309,10 @@ mod tests {
     /// NEGATIVE CONTROL: `settled` without its `ask` (a route move's handling alone) probes
     /// nothing, and the wait for the probe's resolve hangs past the one-minute detector: "the
     /// settled network is measured".
+    /// NEGATIVE CONTROL: `heard`'s Moved arm handed to `remeasure` takes the lease at once (the
+    /// witness is the state's lease count and the spawned thread, read on this thread, never a
+    /// probe's resolve that a thread may not have sent yet): "a route move owes no session-less
+    /// probe".
     #[test]
     fn a_settled_place_measures_the_api_once_with_no_session_asking() {
         let (probe, resolved) = Answering::new();
@@ -1204,16 +1321,113 @@ mod tests {
         assert!(np.path_from(Arc::clone(&path) as Arc<dyn PathSource>));
         assert_eq!(np.peek(), Reach::Unknown, "a peek takes no lease");
         path.send(PathEvent::Moved);
-        assert!(
-            resolved.try_recv().is_err(),
+        assert_eq!(
+            np.lock().waiting(Instant::now()),
+            0,
             "a route move owes no session-less probe"
         );
+        assert_eq!(np.spawned.load(Ordering::SeqCst), 0, "nor a thread");
         path.send(PathEvent::Settled);
         assert!(
             resolved.recv_timeout(aterm_spec::wait::MUST_HAPPEN).is_ok(),
             "the settled network is measured"
         );
         np.stop();
+    }
+
+    /// THE PATH's RETURN IS MEASURED ONCE, with no session asking: a loss and the usable reading
+    /// after it owe a session-less probe nothing (a read takes no lease), and the return told
+    /// after it ([`PathEvent::Back`]) probes the API under the place's lease: the network the
+    /// path came back to was not left, so no place settles, and the internet answer from before
+    /// the loss would stand untested.
+    /// NEGATIVE CONTROL: `heard`'s Back arm handed to `path_moved` (no `remeasure`) probes
+    /// nothing, and the wait hangs past the one-minute detector: "the path's return is measured".
+    #[test]
+    fn the_paths_return_after_a_loss_measures_the_api_once_with_no_session_asking() {
+        let (probe, resolved) = Answering::new();
+        let np = NetProbe::with(probe, Duration::from_secs(5));
+        let path = Arc::new(Handing::default());
+        assert!(np.path_from(Arc::clone(&path) as Arc<dyn PathSource>));
+        assert_eq!(np.peek(), Reach::Unknown, "a peek takes no lease");
+        path.read(true);
+        path.read(false);
+        path.read(true);
+        assert_eq!(
+            np.lock().waiting(Instant::now()),
+            0,
+            "the readings alone owe no session-less probe"
+        );
+        assert_eq!(np.spawned.load(Ordering::SeqCst), 0, "nor a thread");
+        path.send(PathEvent::Back);
+        assert!(
+            resolved.recv_timeout(aterm_spec::wait::MUST_HAPPEN).is_ok(),
+            "the path's return is measured"
+        );
+        np.stop();
+    }
+
+    /// THE PATH's RETURN IS A USABLE READING AFTER AN UNUSABLE ONE, once: the watch's first
+    /// reading is none (nothing was lost), nor a usable one after a usable one, nor a loss.
+    /// NEGATIVE CONTROL: `read` answering `usable` alone (no look at the last reading) fails
+    /// "the first reading is no return".
+    #[test]
+    fn the_paths_return_is_a_usable_reading_after_an_unusable_one() {
+        let mut edge = PathEdge::default();
+        assert!(!edge.read(true), "the first reading is no return");
+        assert!(!edge.read(true), "nor a usable one after a usable one");
+        assert!(!edge.read(false), "a loss is no return");
+        assert!(!edge.read(false));
+        assert!(edge.read(true), "the return after the loss");
+        assert!(!edge.read(true), "once");
+        let mut first_lost = PathEdge::default();
+        assert!(!first_lost.read(false));
+        assert!(first_lost.read(true), "a watch that began lost");
+    }
+
+    /// A WAKE FROM SLEEP IS MEASURED ONCE, with no session asking: on the network this Mac slept
+    /// on no place settles, and the answer measured before the sleep says nothing of now.
+    /// NEGATIVE CONTROL: `heard`'s Woke arm doing nothing probes nothing, and the wait hangs past
+    /// the one-minute detector: "the wake is measured".
+    #[test]
+    fn a_wake_measures_the_api_once_with_no_session_asking() {
+        let (probe, resolved) = Answering::new();
+        let np = NetProbe::with(probe, Duration::from_secs(5));
+        let path = Arc::new(Handing::default());
+        assert!(np.path_from(Arc::clone(&path) as Arc<dyn PathSource>));
+        assert_eq!(np.peek(), Reach::Unknown, "a peek takes no lease");
+        path.read(true);
+        assert_eq!(
+            np.lock().waiting(Instant::now()),
+            0,
+            "the first reading owes none"
+        );
+        assert_eq!(np.spawned.load(Ordering::SeqCst), 0, "nor a thread");
+        path.send(PathEvent::Woke);
+        assert!(
+            resolved.recv_timeout(aterm_spec::wait::MUST_HAPPEN).is_ok(),
+            "the wake is measured"
+        );
+        np.stop();
+    }
+
+    /// A WAKE IS THE FIRST `Woke` AFTER A WILL-SLEEP: `aterm_uds::power` hands an idle sleep that
+    /// did not come (`kIOMessageSystemWillNotSleep`, no will-sleep before it) as `Woke` too, and
+    /// nothing slept then; each sleep owes one measure.
+    /// NEGATIVE CONTROL: `hear` answering `true` for every `Woke` fails "an idle sleep that did
+    /// not come is no wake".
+    #[test]
+    fn a_wake_is_the_first_woke_after_a_will_sleep() {
+        use aterm_uds::power::Power;
+        let mut edge = WakeEdge::default();
+        assert!(
+            !edge.hear(Power::Woke),
+            "an idle sleep that did not come is no wake"
+        );
+        assert!(!edge.hear(Power::WillSleep), "a will-sleep is no wake");
+        assert!(edge.hear(Power::Woke), "the wake after it");
+        assert!(!edge.hear(Power::Woke), "one measure a sleep");
+        assert!(!edge.hear(Power::WillSleep));
+        assert!(edge.hear(Power::Woke), "the next sleep's wake");
     }
 
     /// A SETTLED PLACE READING DOWN IS MEASURED AGAIN UNTIL UP: no session asks, so the settled
@@ -1339,6 +1553,7 @@ mod tests {
                     np.lock().path(satisfied, Instant::now(), SystemTime::now())
                 }
                 PathEvent::Moved | PathEvent::Settled => np.lock().moved(Instant::now()),
+                PathEvent::Back | PathEvent::Woke => false,
             };
             assert!(
                 owed,

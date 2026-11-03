@@ -10,9 +10,11 @@
 #[path = "hash_island.rs"]
 mod hash_island;
 #[cfg(not(clean_islands))]
-pub use crate::twins::{crc32_poly_select, crc_table_index_clamp, fnv1a_64_mul_prime};
+pub use crate::twins::{
+    crc32_poly_select, crc_table_index_clamp, fnv1a_64_mul_prime, fnv1a_64_xor,
+};
 #[cfg(clean_islands)]
-pub use hash_island::{crc32_poly_select, crc_table_index_clamp, fnv1a_64_mul_prime};
+pub use hash_island::{crc32_poly_select, crc_table_index_clamp, fnv1a_64_mul_prime, fnv1a_64_xor};
 
 /// The reflected IEEE 802.3 CRC-32 generator polynomial (`0xEDB8_8320`).
 pub const CRC32_IEEE_POLY: u32 = 0xEDB8_8320;
@@ -49,33 +51,55 @@ contract_fn! {
     }
 }
 
-/// Whether `poly` is the reflected IEEE 802.3 CRC-32 generator polynomial
-/// [`CRC32_IEEE_POLY`] (`0xEDB8_8320`).
-#[must_use]
-pub const fn crc32_is_ieee_poly(poly: u32) -> bool {
-    poly == CRC32_IEEE_POLY
+contract_fn! {
+    /// Whether `poly` is the reflected IEEE 802.3 CRC-32 generator polynomial
+    /// [`CRC32_IEEE_POLY`] (`0xEDB8_8320`).
+    ///
+    /// Verified against `Astream.Wire.TlaSlicingCrc32.crc32_is_ieee_poly_isl` by
+    /// `clean-kernel-defeq`.
+    #[must_use]
+    pub const fn crc32_is_ieee_poly(poly: u32) -> bool
+    clauses [ensures result == (poly == 0xEDB8_8320)]
+    {
+        poly == CRC32_IEEE_POLY
+    }
 }
 
-/// Whether `h` is the published 64-bit FNV-1a offset basis [`FNV1A_64_INIT`]
-/// (`0xcbf2_9ce4_8422_2325`).
-#[must_use]
-pub const fn fnv1a_64_is_init(h: u64) -> bool {
-    fnv1a_64_state_matches(h, FNV1A_64_INIT)
+contract_fn! {
+    /// Whether `h` is the published 64-bit FNV-1a offset basis [`FNV1A_64_INIT`]
+    /// (`0xcbf2_9ce4_8422_2325`).
+    ///
+    /// Verified against `Astream.Wire.TlaSlicingCrc32.fnv1a_64_is_init_isl` by
+    /// `clean-kernel-defeq`.
+    #[must_use]
+    pub const fn fnv1a_64_is_init(h: u64) -> bool
+    clauses [ensures result == (h == 0xcbf2_9ce4_8422_2325)]
+    {
+        h == FNV1A_64_INIT
+    }
 }
 
-/// Whether `p` is the published 64-bit FNV-1a prime [`FNV1A_64_PRIME`]
-/// (`0x0000_0100_0000_01b3`).
-#[must_use]
-pub const fn fnv1a_64_is_prime(p: u64) -> bool {
-    fnv1a_64_state_matches(p, FNV1A_64_PRIME)
+contract_fn! {
+    /// Whether `p` is the published 64-bit FNV-1a prime [`FNV1A_64_PRIME`]
+    /// (`0x0000_0100_0000_01b3`).
+    ///
+    /// Verified against `Astream.Wire.TlaSlicingCrc32.fnv1a_64_is_prime_isl` by
+    /// `clean-kernel-defeq`.
+    #[must_use]
+    pub const fn fnv1a_64_is_prime(p: u64) -> bool
+    clauses [ensures result == (p == 0x0000_0100_0000_01b3)]
+    {
+        p == FNV1A_64_PRIME
+    }
 }
 
 /// Mix a 64-bit word `word` into an ongoing 64-bit FNV-1a hash state `h`:
-/// `(h ^ word).wrapping_mul(FNV1A_64_PRIME)` via the Clean-origin
-/// [`fnv1a_64_mul_prime`] kernel.
+/// `(h ^ word).wrapping_mul(FNV1A_64_PRIME)`, composed from the Clean-origin
+/// [`fnv1a_64_xor`] and [`fnv1a_64_mul_prime`] kernels
+/// (`Astream.Wire.TlaSlicingCrc32.fnv1a_64_mix_u64_eq_pieces`).
 #[must_use]
 pub const fn fnv1a_64_mix_u64(h: u64, word: u64) -> u64 {
-    fnv1a_64_mul_prime(h ^ word, FNV1A_64_PRIME)
+    fnv1a_64_mul_prime(fnv1a_64_xor(h, word), FNV1A_64_PRIME)
 }
 
 /// Feed `bytes` into an ongoing 64-bit FNV-1a hash state `h` (started at

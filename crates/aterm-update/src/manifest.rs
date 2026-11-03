@@ -549,7 +549,10 @@ impl Floor {
         )
     }
 
-    fn observe_reporting(path: &Path, observation: &FloorObservation<'_>) -> Result<(), String> {
+    pub(crate) fn observe_reporting(
+        path: &Path,
+        observation: &FloorObservation<'_>,
+    ) -> Result<(), String> {
         Self::commit_observation(path, observation).map_err(|error| {
             format!(
                 "could not raise the update floor at {} to (min_build {}, high_water {}, \

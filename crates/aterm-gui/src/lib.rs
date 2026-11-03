@@ -146,6 +146,9 @@ mod app_update_handoff;
 pub mod app_update_handoff_boundary;
 mod app_update_screen;
 mod app_window;
+mod app_workers;
+#[cfg(test)]
+mod app_workers_tests;
 #[cfg(target_os = "macos")]
 mod appkit;
 #[cfg(test)]
@@ -181,6 +184,7 @@ mod native_mail;
 mod native_mail_host;
 mod native_observe;
 mod native_session_policy;
+mod native_workers;
 #[cfg(all(test, target_os = "macos"))]
 mod nudge_conformance;
 mod os_appearance;
@@ -657,6 +661,9 @@ pub use control::native_host_fixture::run_native_host_fixture;
 pub use control::native_host_fixture::run_native_host_fixture_with_policy;
 #[cfg(all(unix, debug_assertions))]
 #[doc(hidden)]
+pub use control::native_host_fixture::{NativeRenewalFixture, run_native_renewal_host_fixture};
+#[cfg(all(unix, debug_assertions))]
+#[doc(hidden)]
 pub use native_session_policy::{FixtureConstructors, FixtureImages, FixturePolicy};
 #[cfg(target_os = "macos")]
 mod askpass_sheet;
@@ -669,6 +676,8 @@ mod control_edit;
 mod control_listener;
 mod control_privacy;
 mod control_socket_identity;
+#[cfg(target_os = "macos")]
+mod control_sudo;
 #[cfg(target_os = "macos")]
 mod cpu_policy_authorization;
 mod crash_journal;
@@ -689,6 +698,7 @@ mod crash_restore;
 mod keeper_link;
 mod selection_custody_conformance;
 
+mod agh_needs;
 mod ai_screen;
 mod command_ran;
 #[cfg(unix)]
@@ -756,6 +766,7 @@ mod occupancy_host;
 mod occupancy_ring;
 mod occupancy_wakes;
 mod owned_endpoint;
+mod owner_keys_save;
 mod palette;
 mod paste_banner;
 mod path_link;
@@ -918,6 +929,8 @@ mod qos;
 mod quit_reopen;
 mod quit_safety;
 mod reader_guard;
+#[cfg(any(debug_assertions, feature = "dev-seams"))]
+mod recording_cost;
 #[cfg(unix)]
 mod recovery_census;
 mod render_epoch_host;
@@ -1011,6 +1024,11 @@ mod toolbar;
 mod toolbar_drive;
 #[cfg(target_os = "macos")]
 pub use toolbar_drive::run_toolbar_drive;
+#[cfg(target_os = "macos")]
+mod confirm_drive;
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use confirm_drive::run_confirm_drive;
 #[cfg(unix)]
 mod credential_needs_host;
 mod diskwalk_host;
@@ -3235,6 +3253,8 @@ enum Wake {
     /// Whether a setup pass's Repositories stage, at its end, waits on Apple's Command Line
     /// Tools: a tab installs them ([`clt_install`]).
     DeveloperToolsInstall(u64, bool),
+    /// The second of a watch for Apple's Command Line Tools, on a Mac that lacks them.
+    DeveloperToolsWatch,
     /// Whether the network this Mac uses now is in Low Data Mode, read while a pass wants the
     /// Command Line Tools: their tab waits for a network without it ([`clt_install`]).
     #[cfg_attr(
@@ -3737,7 +3757,7 @@ enum Wake {
         nonce: LaunchNonce,
         prompt: task_launch::PromptFence,
         line: String,
-        reply: std::sync::mpsc::Sender<Result<&'static str, String>>,
+        reply: std::sync::mpsc::Sender<Result<&'static str, task_launch::Untyped>>,
     },
     HwKeyTarget {
         reply: std::sync::mpsc::Sender<Result<(i64, bool), &'static str>>,
@@ -5874,6 +5894,7 @@ impl TabIndex {
         self.active
     }
 
+    #[cfg(test)]
     const fn cycle(&mut self, forward: bool) -> usize {
         if self.count <= 1 {
             return self.active;
@@ -8364,7 +8385,7 @@ impl WindowState {
             (Some(front_content::FrontContent::Native { .. }) | None, None) => true,
             _ => false,
         });
-        let strip_shadow = (tab_set.len(), tab_set.active_index().unwrap_or(0));
+        let strip_shadow = (tab_set.shown_len(), tab_set.strip_active().unwrap_or(0));
         let mut window = WindowState {
             os_window: None,
             #[cfg(any(test, feature = "bench-support"))]
@@ -8925,6 +8946,7 @@ struct HandoffPreverification {
     reason: Option<String>,
     policy: Option<aterm_update_core::handoff_policy::HandoffPolicy>,
     grant_chunks: bool,
+    grant_empty: bool,
 }
 
 #[cfg(unix)]
@@ -9644,6 +9666,8 @@ struct HandoffPrelaunch {
     #[cfg(target_os = "macos")]
     booked_launch_unregistered: bool,
     history_export: Option<handoff_history::HistoryExporter>,
+    /// The attempt was admitted with no live terminal session (a sessionless grant).
+    sessionless: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -9691,6 +9715,7 @@ enum DeferredHandoffTeardown {
     #[cfg(unix)]
     NativeTerminate {
         generation: u64,
+        confirmed: bool,
     },
     CleanQuitReady,
 }
@@ -9706,7 +9731,17 @@ impl DeferredHandoffTeardown {
             (CleanQuitReady, _) | (_, None) => {}
             (_, CleanQuitReady) => *self = CleanQuitReady,
 
-            (NativeTerminate { generation }, NativeTerminate { generation: next }) => {
+            (
+                NativeTerminate {
+                    generation,
+                    confirmed,
+                },
+                NativeTerminate {
+                    generation: next,
+                    confirmed: accepted,
+                },
+            ) => {
+                *confirmed = accepted || (*generation == next && *confirmed);
                 *generation = next;
             }
             (NativeTerminate { .. }, QuitRequested | Mutations(_)) => {}
@@ -10082,6 +10117,11 @@ struct App {
     incoming_handoff_pending: bool,
     nudges: app_nudge::NudgeHost,
     nudge_wake_ms: Option<u64>,
+    /// When a Workers list on screen last read its workers ([`App::tick_workers`]).
+    workers_read_at: Option<Instant>,
+    /// `ATERM_DEV_WORKERS_FIXTURE` has been read ([`crate::app_workers`]).
+    #[cfg(any(test, debug_assertions))]
+    workers_fixture_landed: bool,
     nudge_gen_seen: u64,
     chrome_regrid_batch: Option<crate::app_presence::ChromeRegridBatch>,
     handoff_degraded: bool,
@@ -10313,6 +10353,8 @@ struct App {
     >,
     resume_stories: std::collections::BTreeMap<String, exceptions_host::NoticeStory>,
     resume_swept: bool,
+    /// The window's look at agh's need files, stated as `Family::Agh` (`agh_needs`).
+    agh_needs: agh_needs::AghNeedsLook,
     resume_looked: Option<std::time::Instant>,
     render_unrepaired: std::collections::HashMap<u64, (String, u64)>,
     render_lines_swept: bool,
@@ -10324,6 +10366,22 @@ struct App {
     last_ledger_plan: Option<ledger_key::LedgerPlan>,
     done_seen: std::collections::HashMap<u64, u64>,
     task_done: std::collections::HashMap<u64, u64>,
+    /// The end each session's record last told the Messages log, by the rev its task entered it: a
+    /// failed conclusion, or a claim worker's end either way
+    /// ([`harness_task::note_worker_conclusion`]).
+    worker_end_told: std::collections::HashMap<u64, u64>,
+    /// When each session's Off, not yet stood long enough to fail its task, is due to be looked at
+    /// again ([`crate::task_record::note_autopilot_word`], [`Self::tick_autopilot_offs`]).
+    autopilot_off_due: std::collections::HashMap<u64, Instant>,
+    /// Each sid a cold restore gave a session that had another, by the one it had: a worker's
+    /// `from=` follows its manager across ([`Self::carry_restored_managers`]).
+    restored_sids: std::collections::HashMap<String, String>,
+    /// The sessions of this window that managed workers and closed, by sid: nobody waits on those
+    /// workers ([`harness_task::note_manager_gone`]).
+    managers_gone: std::collections::HashSet<String>,
+    /// The sessions whose task exited, by the rev its task entered its end: their end is read once
+    /// like a [`Self::task_done`]'s, with no `•` on their tab.
+    task_exited: std::collections::HashMap<u64, u64>,
     turn_end_seen: std::collections::HashMap<u64, u64>,
     teams: std::collections::HashMap<u64, team::Team>,
     agents: app_take_over::AgentsState,
@@ -10380,6 +10438,11 @@ struct App {
     launch_record_renewal: launch_record_renewal::LaunchRecordRenewal,
     #[cfg(unix)]
     launch_image_kept: bool,
+    /// Why the last admission found that the sessionless handoff cannot carry this kept image
+    /// with no live terminal session (`App::admit_update_handoff`); `None` after any other
+    /// outcome.
+    #[cfg(unix)]
+    sessionless_handoff_refused: Option<&'static str>,
     #[cfg(target_os = "macos")]
     launch_left_stage: Option<(u64, Instant)>,
     log_closes_deferred: std::collections::BTreeSet<u64>,
@@ -13728,7 +13791,7 @@ impl App {
                     .words
                     .unwrap_or(consent_card::NeedWords {
                         cause: consent_card::NeedCause::ProtectedRead { session: None },
-                        tab_number: None,
+                        tab: None,
                         regressed: false,
                     });
                 self.hold_fda_need(&words, now);
@@ -13813,9 +13876,9 @@ impl App {
             host.need_logged = Some(now);
             let words = consent_card::NeedWords {
                 cause,
-                tab_number: cause
+                tab: cause
                     .session()
-                    .and_then(|session| self.tab_number_of_session(session)),
+                    .and_then(|session| self.tab_place_of_session(session)),
                 regressed: false,
             };
             aterm_log::info!(
@@ -13866,7 +13929,10 @@ impl App {
         }
     }
 
-    fn tab_number_of_session(&self, session: u64) -> Option<usize> {
+    pub(crate) fn tab_place_of_session(&self, session: u64) -> Option<consent_card::TabPlace> {
+        if self.session_is_parked(session) {
+            return Some(consent_card::TabPlace::Workers);
+        }
         self.windows
             .values()
             .filter_map(|ws| {
@@ -13881,7 +13947,7 @@ impl App {
                 })
             })
             .min()
-            .map(|index| index + 1)
+            .map(|index| consent_card::TabPlace::Number(index + 1))
     }
 
     fn stamp_fda_verified_host(&self) {
@@ -14103,7 +14169,7 @@ impl App {
                             service: Some(aterm_containment::consent::Folder::AppData),
                             session: None,
                         },
-                        tab_number: None,
+                        tab: None,
                         regressed: record.verified_at.is_some(),
                     };
                     self.reassert_fda_need(&words);
@@ -14156,9 +14222,9 @@ impl App {
                 if let consent_card::NeedVerdict::Ask { regressed } = verdict {
                     self.consent_card_host.words = Some(consent_card::NeedWords {
                         cause,
-                        tab_number: cause
+                        tab: cause
                             .session()
-                            .and_then(|session| self.tab_number_of_session(session)),
+                            .and_then(|session| self.tab_place_of_session(session)),
                         regressed,
                     });
                 }
@@ -14410,14 +14476,14 @@ impl App {
                 .accessing_pid
                 .and_then(|pid| self.consent_observer.session_for_pid(pid, &sessions));
             if service != Some(aterm_containment::consent::Folder::AppData) {
-                let tab = session.and_then(|session| self.tab_number_of_session(session));
+                let tab = session.and_then(|session| self.tab_place_of_session(session));
                 let pid = need
                     .accessing_pid
                     .map_or_else(|| "-".to_owned(), |pid| pid.to_string());
-                let tab_word = tab.map_or_else(|| "-".to_owned(), |n| n.to_string());
+                let tab_word = tab.map_or_else(|| "-".to_owned(), consent_card::TabPlace::words);
                 aterm_log::info!(
                     "macOS showed a consent dialog for {short} to a program of this aterm \
-                     (msgID {}, pid {pid}, tab {tab_word}); its Allow is durable, so the access \
+                     (msgID {}, pid {pid}, {tab_word}); its Allow is durable, so the access \
                      card is not about it",
                     need.msg_id
                 );
@@ -15372,6 +15438,7 @@ impl App {
     }
 
     fn sync_window(&mut self, wid: WindowId) {
+        self.settle_workers_tab(wid);
         // A tab that came or went may move the least the window keeps.
         self.push_least_window_size(wid);
         let next_front = self.derived_front_content(wid);
@@ -16064,6 +16131,9 @@ impl App {
             incoming_handoff_pending: false,
             nudges: app_nudge::NudgeHost::new(aterm_core::terminal::repaint_nudge::Mode::Off),
             nudge_wake_ms: None,
+            workers_read_at: None,
+            #[cfg(any(test, debug_assertions))]
+            workers_fixture_landed: false,
             nudge_gen_seen: 0,
             chrome_regrid_batch: None,
             handoff_degraded: false,
@@ -16212,6 +16282,7 @@ impl App {
             resume_standing: std::collections::BTreeMap::new(),
             resume_stories: std::collections::BTreeMap::new(),
             resume_swept: false,
+            agh_needs: agh_needs::AghNeedsLook::default(),
             resume_looked: None,
             render_unrepaired: std::collections::HashMap::new(),
             render_lines_swept: false,
@@ -16257,6 +16328,11 @@ impl App {
             last_ledger_plan: None,
             done_seen: std::collections::HashMap::new(),
             task_done: std::collections::HashMap::new(),
+            worker_end_told: std::collections::HashMap::new(),
+            autopilot_off_due: std::collections::HashMap::new(),
+            restored_sids: std::collections::HashMap::new(),
+            managers_gone: std::collections::HashSet::new(),
+            task_exited: std::collections::HashMap::new(),
             turn_end_seen: std::collections::HashMap::new(),
             teams: std::collections::HashMap::new(),
             agents: app_take_over::AgentsState::default(),
@@ -16311,6 +16387,8 @@ impl App {
             launch_record_renewal: launch_record_renewal::LaunchRecordRenewal::new(None),
             #[cfg(unix)]
             launch_image_kept: false,
+            #[cfg(unix)]
+            sessionless_handoff_refused: None,
             #[cfg(target_os = "macos")]
             launch_left_stage: None,
             log_closes_deferred: std::collections::BTreeSet::new(),
@@ -16760,18 +16838,22 @@ impl App {
 
     /// The `Wake::TaskChanged` arm.
     pub(crate) fn on_task_changed(&mut self, session: u64) {
+        self.note_worker_conclusion(session);
         self.rebuild_teams();
         self.refresh_presence_session(session);
         self.refresh_team_chrome(session);
+        self.publish_workers_all();
         self.mark_status_dirty();
     }
 
     /// The `Wake::MetaChanged` arm.
     pub(crate) fn on_meta_changed(&mut self, session: u64) {
+        self.hold_task_to_autopilot(session);
         let dropped = self.autopilot_timers.glass(session);
         self.index_autopilot_timer_unstamped(session, None);
         self.refresh_meta_dependent_chrome(session);
         self.rebuild_teams();
+        self.publish_workers_all();
         self.refresh_presence_session(session);
         self.reproject_pill_of(session);
         self.mark_status_dirty();
@@ -17432,6 +17514,8 @@ impl App {
             return Some(text);
         };
 
+        // A native parent exists: failure to build its question drops the unconfirmed paste,
+        // rather than returning text for the no-window delivery fallback.
         let lines = crate::paste_banner::lines_words(crate::paste_banner::paste_lines(&text).len());
         let id = alert_keys::next_confirm_id();
         let payload: PasteConfirmPayload = std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -17453,9 +17537,7 @@ impl App {
             });
         };
         // SAFETY: completion block matches `void (^)(NSModalResponse)` and never unwinds across FFI.
-        let Some(handler) = (unsafe { RcBlock::new1(completion) }) else {
-            return Some(text);
-        };
+        let handler = unsafe { RcBlock::new1(completion) }?;
 
         let _: crate::appkit::MainThread = mtm;
         let (Some(message), Some(informative), Some(paste_title), Some(cancel_title)) = (
@@ -17464,12 +17546,10 @@ impl App {
             appkit::nsstring("Paste"),
             appkit::nsstring("Cancel"),
         ) else {
-            return Some(text);
+            return None;
         };
         // An alert whose icon draws with no IconServices call on the main thread.
-        let Some(alert) = crate::app_icon::alert(mtm) else {
-            return Some(text);
-        };
+        let alert = crate::app_icon::alert(mtm)?;
         // SAFETY: standard `NSAlert` setters on the main thread. The text setters copy;
         // `-addButtonWithTitle:` and `-window` answer +0 and are retained.
         let (panel, accept, cancel) = unsafe {
@@ -18557,6 +18637,11 @@ impl ApplicationHandler<Wake> for App {
                 window.request_redraw();
             }
         }
+        for wid in self.claude_chip_words_due(Instant::now()) {
+            if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                window.request_redraw();
+            }
+        }
         self.service_due_scroll_motion(Instant::now());
         if matches!(cause, StartCause::ResumeTimeReached { .. }) {
             let now = Instant::now();
@@ -19235,6 +19320,14 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::AgentsPanel,
             );
         }
+        if let Some(d) = self.claude_chip_word_wake(Instant::now()) {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                d,
+                metrics::DeadlineOwner::ChipWord,
+            );
+        }
         if let Some(d) = self.harness_acts_wait() {
             fold_owned_deadline(
                 &mut deadline,
@@ -19523,6 +19616,8 @@ impl ApplicationHandler<Wake> for App {
         self.sync_settings_theme_trial(Instant::now());
         self.expire_theme_preview(Instant::now());
         self.tick_overview_fabric(Instant::now());
+        self.tick_workers(Instant::now());
+        self.tick_autopilot_offs(Instant::now());
         self.expire_autopilot_timers();
         self.expire_autopilot_offer();
         self.tick_nudges();
@@ -19601,6 +19696,22 @@ impl ApplicationHandler<Wake> for App {
                 &mut deadline_owner,
                 epoch_wake,
                 metrics::DeadlineOwner::RenderEpoch,
+            );
+        }
+        if let Some(workers_wake) = self.workers_wake() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                workers_wake,
+                metrics::DeadlineOwner::Presence,
+            );
+        }
+        if let Some(off_wake) = self.autopilot_off_wake() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                off_wake,
+                metrics::DeadlineOwner::AutopilotTimer,
             );
         }
         if let Some(nudge_wake) = self.next_nudge_wake() {
@@ -20261,6 +20372,7 @@ impl App {
             Wake::DeveloperToolsInstall(revision, wanted) => {
                 self.want_developer_tools_install(revision, wanted)
             }
+            Wake::DeveloperToolsWatch => self.developer_tools_watch(),
             Wake::DeveloperToolsLowData(on) => self.developer_tools_low_data(on),
             Wake::InitialSetupStatus { generation, status } => {
                 self.receive_system_state_status(generation, status)
@@ -20667,6 +20779,7 @@ impl App {
             Wake::SystemColorsChanged => {
                 // The accent among them: a native control wears the new one at once.
                 self.resample_os_preferences(ResampleCause::SettingsBurst);
+                self.publish_app_tiles();
                 for ws in self.windows.values() {
                     if let Some(w) = ws.os_window.as_ref() {
                         w.request_redraw();
@@ -27390,8 +27503,16 @@ pub fn main_entry_with_network(
     };
 
     let seamless_adopting = !seamless_adopt.is_empty();
+    // A sessionless handoff hands over its windows alone: its successor is one all the same.
+    let successor = seamless::successor_boot(
+        headless,
+        overlap_admitted,
+        seamless_adopting,
+        overlap_channels_present,
+    );
+    let handed_over = successor.handed_over;
     let keeper_recovery = keeper_link::boot(
-        config.keeper_enabled(),
+        config.keeper_setting(),
         keeper_link::is_update_candidate(overlap_admitted, seamless_adopting),
         headless,
         session_factory.terminal_config.as_ref(),
@@ -27405,6 +27526,10 @@ pub fn main_entry_with_network(
         seamless_adopt.extend(keeper_recovery.adopted);
     }
     let adopting = !seamless_adopt.is_empty();
+    // The Command Line Tools shim, reconciled ahead of this launch's first shell: an earlier
+    // launch's marks go, its directory stays, linked onto this executable, and with the tools
+    // missing it is laid and wanted at once. The setup host keeps it.
+    let developer_tools_shim = crate::clt_shim::Shim::for_launch();
     let desk = desk::Desk::of(headless);
     if desk == desk::Desk::LabHeadless {
         crate::logging::stderr_line!(
@@ -27415,7 +27540,7 @@ pub fn main_entry_with_network(
     let mut journal_claim = crash_journal::BootClaim::default();
     let mut layout_writers: Vec<Option<u32>> = Vec::new();
     let mut quit_windows = 0usize;
-    let mut restore_manifest = if !headless && seamless_adopting {
+    let mut restore_manifest = if successor.takes_handed_layout {
         seamless_layout.filter(|manifest| !manifest.is_empty())
     } else if desk.kept() && config.restore_session_or_default() {
         let logs = logging::log_dir();
@@ -28322,6 +28447,7 @@ pub fn main_entry_with_network(
         workstation_setup: workstation_setup::Host::for_launch(
             first_run.filter(|_| first_run_eligible),
             headless,
+            developer_tools_shim,
         ),
         system_state_host: system_state_host::Host::for_launch(headless),
         apprt,
@@ -28542,15 +28668,18 @@ pub fn main_entry_with_network(
         handoff_control_preparation,
         #[cfg(unix)]
         recovery_count_admission,
-        incoming_handoff_pending: overlap_channels_present && seamless_adopting,
+        incoming_handoff_pending: successor.incoming_handoff_pending,
         nudges: app_nudge::NudgeHost::new(config.repaint_nudge_mode()),
         nudge_wake_ms: None,
+        workers_read_at: None,
+        #[cfg(any(test, debug_assertions))]
+        workers_fixture_landed: false,
         nudge_gen_seen: 0,
         chrome_regrid_batch: None,
         handoff_degraded: overlap_degraded,
         #[cfg(unix)]
         handoff_device_proof_term: device_proof_term,
-        handoff_successor: seamless_adopting,
+        handoff_successor: handed_over,
         keeper_recovered: keeper_recovered_shells.clone(),
         #[cfg(unix)]
         keeper_history_owed: keeper_recovering,
@@ -28600,9 +28729,7 @@ pub fn main_entry_with_network(
         devtools_watch: devtools_watch::DevToolsWatch::default(),
         devtools_helper: {
             let mut lane = devtools_helper::Lane::new(headless);
-            if !seamless_adopting
-                && !relaunch_of_running
-                && !JUST_UPDATED.get().copied().unwrap_or(false)
+            if !handed_over && !relaunch_of_running && !JUST_UPDATED.get().copied().unwrap_or(false)
             {
                 lane.note_cold_start();
             }
@@ -28610,10 +28737,7 @@ pub fn main_entry_with_network(
         },
         permission_walk: {
             let mut lane = permission_walk::WalkLane::new(headless);
-            if seamless_adopting
-                || relaunch_of_running
-                || JUST_UPDATED.get().copied().unwrap_or(false)
-            {
+            if handed_over || relaunch_of_running || JUST_UPDATED.get().copied().unwrap_or(false) {
                 // An update's successor gives this Mac its first walk too, and walks on from
                 // the pages a Quit & Reopen left as it opened into the update.
                 lane.note_successor();
@@ -28683,7 +28807,7 @@ pub fn main_entry_with_network(
             .map(|(sid, row)| (sid.clone(), status_item::StatusCarry::parse(row)))
             .collect(),
         end_carry: seamless_end_carry,
-        fleet_adopt: seamless_adopting.then(|| fleet_glance::parse_told(&seamless_fleet_told)),
+        fleet_adopt: handed_over.then(|| fleet_glance::parse_told(&seamless_fleet_told)),
         pending_deminiaturize_focus: None,
         #[cfg(target_os = "linux")]
         notice_activation: None,
@@ -28734,6 +28858,7 @@ pub fn main_entry_with_network(
         resume_standing: std::collections::BTreeMap::new(),
         resume_stories: std::collections::BTreeMap::new(),
         resume_swept: false,
+        agh_needs: agh_needs::AghNeedsLook::production(),
         resume_looked: None,
         render_unrepaired: std::collections::HashMap::new(),
         render_lines_swept: false,
@@ -28782,6 +28907,11 @@ pub fn main_entry_with_network(
         last_ledger_plan: None,
         done_seen: std::collections::HashMap::new(),
         task_done: std::collections::HashMap::new(),
+        worker_end_told: std::collections::HashMap::new(),
+        autopilot_off_due: std::collections::HashMap::new(),
+        restored_sids: std::collections::HashMap::new(),
+        managers_gone: std::collections::HashSet::new(),
+        task_exited: std::collections::HashMap::new(),
         turn_end_seen: std::collections::HashMap::new(),
         teams: std::collections::HashMap::new(),
         agents: app_take_over::AgentsState::default(),
@@ -28838,6 +28968,8 @@ pub fn main_entry_with_network(
         ),
         #[cfg(unix)]
         launch_image_kept: image != aterm_update::ImageReplacement::Replaceable,
+        #[cfg(unix)]
+        sessionless_handoff_refused: None,
         #[cfg(target_os = "macos")]
         launch_left_stage: match &boot_apply {
             aterm_update::ApplyOutcome::LeftForSession { build, .. } => {
@@ -28887,12 +29019,8 @@ pub fn main_entry_with_network(
         perf_env_at_flip: 1.0,
         event_loop_failed: false,
     };
-    // The Command Line Tools shim an earlier launch left: its mark goes, and its directory too
-    // unless this launch adopted live shells that may run through it.
-    app.workstation_setup
-        .developer_tools_shim
-        .reconcile(adopting);
     app.recover_developer_tools_install(0);
+    app.developer_tools_watch();
     if !headless {
         let launch_ms = aterm_time::unix_millis()
             .and_then(|ms| i64::try_from(ms).ok())
@@ -28908,14 +29036,14 @@ pub fn main_entry_with_network(
             // writes one too), so the strip's restore dates a crash by it only where the strip is
             // older than it: no reading since, nor a quit's clean write
             // (`vitals_host::open_strip`).
-            if (seamless_adopting || relaunch_of_running || (cfg!(windows) && just_updated))
+            if (handed_over || relaunch_of_running || (cfg!(windows) && just_updated))
                 && !startup_prior_stop.is_some_and(vitals_startup::PriorStop::killed)
             {
                 app.vitals.note_handed_off_start();
             }
             if let Some(prior) = startup_prior_stop {
                 vitals_startup::startup_marks(prior, launch_ms).note(&mut app.vitals);
-            } else if seamless_adopting || relaunch_of_running || just_updated {
+            } else if handed_over || relaunch_of_running || just_updated {
                 app.vitals.note_strip_event(aterm_vitals::StripEvent {
                     at_unix_ms: launch_ms,
                     kind: aterm_vitals::StripEventKind::Restart,
@@ -28941,7 +29069,7 @@ pub fn main_entry_with_network(
     if let Some(carry) = carry_frame.as_ref() {
         app.seed_carried_messages(
             carry,
-            (just_updated && overlap_channels_present && seamless_adopting)
+            (just_updated && overlap_channels_present && handed_over)
                 .then_some(crate::build_info::version_display()),
         );
         app.update_verified = crate::update_words::carried_verification(
@@ -30054,8 +30182,8 @@ mod tab_strip_conformance {
         };
         let (seg_count, selected) = ws.strip_shadow.get();
         [
-            ws.tab_set.len() as i64,
-            ws.tab_set.active_index().unwrap_or(0) as i64,
+            ws.tab_set.shown_len() as i64,
+            ws.tab_set.strip_active().unwrap_or(0) as i64,
             seg_count as i64,
             selected as i64,
         ]

@@ -479,7 +479,7 @@ pub fn parse_services(xml: &[u8]) -> Result<Pins, String> {
     services
         .into_iter()
         .map(|(id, service)| {
-            if !crate::agent::platform::uuid_shaped(&id) {
+            if !crate::hardware::uuid_shaped(&id) {
                 return Err(format!("network service id {id:?} is not a UUID"));
             }
             let pinned = field(&service, "SMB")
@@ -505,7 +505,7 @@ pub fn pin_script<'a>(
     };
     let mut script = String::from("open\nlock\n");
     for (id, name) in pins {
-        if !crate::agent::platform::uuid_shaped(id) {
+        if !crate::hardware::uuid_shaped(id) {
             return None;
         }
         let path = format!("/NetworkServices/{id}/SMB");

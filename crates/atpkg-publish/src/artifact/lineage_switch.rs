@@ -216,7 +216,8 @@ fn note_live(repo: &Path, live: &str) {
     let Some(note) = note_path(repo) else {
         return;
     };
-    if std::fs::read_to_string(&note).is_ok_and(|s| s.lines().next() == Some(live)) {
+    if crate::identity::read_regular_text(&note, 4096).is_ok_and(|s| s.lines().next() == Some(live))
+    {
         return;
     }
     let seq = SWITCH_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -247,7 +248,7 @@ fn quarantined_fetch(repo: &Path) -> std::result::Result<(), Bounded> {
     let od = std::fs::canonicalize(&od).map_err(|e| fail(&e.to_string()))?;
     let mut tips = vec!["--negotiation-tip=refs/remotes/origin/main".to_string()];
     if let Some(noted) = note_path(repo)
-        .and_then(|n| std::fs::read_to_string(n).ok())
+        .and_then(|n| crate::identity::read_regular_text(&n, 4096).ok())
         .and_then(|s| s.lines().next().map(str::to_string))
         .filter(|s| is_sha(s) && has_commit(repo, s))
     {

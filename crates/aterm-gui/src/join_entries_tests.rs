@@ -17,26 +17,7 @@ fn row(id: u64, name: &str, code: &str) -> Row {
         state: RowState::Asking,
         removed: None,
         restore: false,
-        automatic: false,
     }
-}
-
-/// A row the default ALab policy forwards to the vault's own admission (`Row::automatic`) files
-/// nothing: its Mac joins with nobody, so no entry asks anybody to let it in.
-/// NEGATIVE CONTROL: `desk_askers` without its `row.automatic` filter files the forwarded row's
-/// entry too (left holds `members.join.ABCD-EFGH-JKMN-PQRS.asking` as well).
-#[test]
-fn a_forwarded_row_files_no_entry() {
-    let forwarded = Row {
-        automatic: true,
-        ..row(8, "m21", "ABCD-EFGH-JKMN-PQRS")
-    };
-    let made = entries(desk_askers(
-        &[row(7, "m20", "WXYZ-WXYZ-WXYZ-WXYZ"), forwarded],
-        true,
-    ));
-    let keys: Vec<String> = made.iter().map(Entry::key).collect();
-    assert_eq!(keys, ["members.join.WXYZ-WXYZ-WXYZ-WXYZ.asking"]);
 }
 
 /// An asking Mac is one Info entry for later, never an alert on screen: its key is its join

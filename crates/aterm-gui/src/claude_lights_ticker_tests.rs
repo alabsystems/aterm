@@ -598,11 +598,34 @@ fn a_reader_cannot_press_a_chip_under_painted_chrome() {
 #[cfg(a11y_tree)]
 #[test]
 fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
-    use super::gesture_tests::{MODE, PGID, PLAN, autopilot, pty, px_of};
+    use super::gesture_tests::{MODE, PGID, PLAN, a_minute_ago, autopilot, pty, px_of};
     use crate::a11y_tree::{GridChip, HarnessChip};
     use crate::autopilot::AutopilotView;
-    use aterm_agent::harness::lights::{Mode, SHIFT_TAB};
+    use aterm_agent::harness::lights::{Goal, Mode, SHIFT_TAB};
     let of = |chips: &[GridChip], chip| chips.iter().find(|c| c.chip == chip).cloned();
+    // What a screen reader hears of the light in `mode`, built from the producers: the mode's gist
+    // first, Claude's name for it where the chip wears aterm's word, and the click's goal last,
+    // as sentences with none of the hover's separators.
+    let spoken = |description: Option<&str>, mode: Mode, rewritten: bool| {
+        let said = description.unwrap_or_else(|| panic!("{mode:?}: a description"));
+        assert!(
+            said.to_lowercase().starts_with(mode.gist()),
+            "{mode:?}: what it does, first: {said:?}"
+        );
+        assert_eq!(
+            said.contains(mode.claude_name()),
+            mode.word_on_glass(rewritten) != mode.word(),
+            "{mode:?}: Claude's name for it where the chip wears aterm's word: {said:?}"
+        );
+        assert!(
+            said.ends_with(&format!(" {}.", Goal::of_mode(mode).words(rewritten))),
+            "{mode:?}: where a press goes, last: {said:?}"
+        );
+        assert!(
+            !said.contains('\u{2014}') && !said.contains('\u{b7}'),
+            "{mode:?}: read as sentences, no separators: {said:?}"
+        );
+    };
     let (mut app, wid, session, (_hosted, mut reader)) = ticker_app(120);
     {
         let ctx = app.pool.get(session).expect("session").ctx.clone();
@@ -623,17 +646,38 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     draw_claude(&app, session, BYPASS);
     frame(&mut app, wid);
     let strip = usize::from(app.chrome_rows(wid));
-    // The rewritten mode row leaves the light the mode's one home: bypass reads `yolo` there, a
-    // mode a press has nothing to move from.
-    assert_eq!(
-        of(&app.claude_chips_a11y(wid), HarnessChip::Mode).map(|c| c.label),
-        Some("Permission mode: yolo.".to_owned())
-    );
+    // The rewritten mode row leaves the light the mode's one home: bypass reads `yolo` there, its
+    // description says what it does and where a press goes, and a press turns it off.
+    let yolo = of(&app.claude_chips_a11y(wid), HarnessChip::Mode).expect("the light");
+    assert_eq!(yolo.label, "Permission mode: yolo.");
+    spoken(yolo.description.as_deref(), Mode::Bypass, true);
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Mode);
-    assert!(
-        pty(&mut reader, 0).is_empty(),
-        "an expected mode, nothing typed"
+    assert_eq!(
+        pty(&mut reader, SHIFT_TAB.len()),
+        SHIFT_TAB,
+        "a press on yolo turns it off"
     );
+    draw_claude(
+        &app,
+        session,
+        "  \u{23F8} manual mode on \u{00B7} ? for shortcuts",
+    );
+    app.on_claude_footer_changed(session);
+    frame(&mut app, wid);
+    let lame = of(&app.claude_chips_a11y(wid), HarnessChip::Mode).expect("the light");
+    assert_eq!(
+        lame.label, "Permission mode: lame.",
+        "the painted word is in the name"
+    );
+    spoken(lame.description.as_deref(), Mode::Manual, true);
+    // The arrival's notice ends before the title slot is read at rest.
+    app.windows
+        .get_mut(&wid)
+        .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
+        .and_then(|s| s.notice.as_mut())
+        .expect("the arrival's notice")
+        .1 = Instant::now();
+    app.drain_claude_lights();
     draw_claude(&app, session, PLAN);
     frame(&mut app, wid);
     let chips = app.claude_chips_a11y(wid);
@@ -642,13 +686,7 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     assert_eq!((light.row, light.col), (row - strip, col));
     assert_eq!(light.label, "Permission mode: plan.");
     let rewritten = app.windows[&wid].claude_lights.sessions[&session].rewritten;
-    assert_eq!(
-        light.description,
-        Some(format!(
-            "Click for {} or auto.",
-            Mode::Bypass.word_on_glass(rewritten)
-        ))
-    );
+    spoken(light.description.as_deref(), Mode::Plan, rewritten);
     let switch = of(&chips, HarnessChip::Switch).unwrap_or_else(|| panic!("{chips:?}"));
     let label = crate::claude_footer::probe::harness_label(aterm_phase::CliHarness::ClaudeCode);
     assert_eq!(switch.label, format!("{label} on"));
@@ -679,8 +717,8 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     let title = of(&app.claude_chips_a11y(wid), HarnessChip::Title).expect("the title slot");
     assert_eq!(title.row, row - strip);
     assert!(
-        title.label.starts_with("Permission mode: "),
-        "{:?}",
+        title.label.starts_with(Mode::Plan.gist()),
+        "the title says what plan does: {:?}",
         title.label
     );
     assert!(
@@ -689,6 +727,12 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
         title.label,
         rule(&app, wid)
     );
+    // A press of its own, not a double click's second: the first press was stamped a minute ago.
+    app.windows
+        .get_mut(&wid)
+        .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
+        .expect("noted")
+        .light_pressed = Some(a_minute_ago());
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Mode);
     assert_eq!(pty(&mut reader, SHIFT_TAB.len()), SHIFT_TAB);
     let carried = autopilot(&app, session);

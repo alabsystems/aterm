@@ -154,16 +154,7 @@ tests/conformance_text_selection.rs	real_calls_conform_to_the_lifecycle_model	li
 tests/conformance_text_selection.rs	a_dropped_phase_check_is_rejected	lifecycle-refines-model	
 ```
 
-Eight tests are missing from the map: `src/rules_tests.rs::builtin_patterns_match_their_tokens`
-and `builtin_patterns_reject_lookalikes` sample the `pat-*` specs;
-`src/rules_tests.rs::basic_word_boundaries_over_scripts` samples
-`basic-word-is-containing-word`; `src/tests.rs::builtin_rules_select_the_token_under_the_cursor`
-samples `rule-precedence` and `builtin-rule-table`;
-`src/text_selection/tests.rs::adjust_for_scroll_shifts_or_clears_at_the_bounds` samples
-`adjust-for-scroll`; `project_range_projects_every_shape` samples `project-range`;
-`a_block_selects_a_wide_glyph_either_of_whose_cells_is_inside` samples
-`contains-cell-glyph-whole`; and `precomputed_bounds_equivalent_to_contains` samples
-`side-adjusted-bounds`'s corollary on fixtures whose side adjustment is the identity.
+## 3. Coverage
 
 - 58 live tests mapped in §2 across the 34 specs (0 non-spec tests remain; 146 original tests read in the initial 2026-10-15 audit).
 - One spec, `selection-no-panic`, has no test of its own. Every test above samples it in passing,
@@ -177,19 +168,9 @@ samples `rule-precedence` and `builtin-rule-table`;
   7 → 15, 10 → 1, 11 → 2, 12 → 17, 13 → 5. Gaps 6, 8, 9 and 14–17 block no spec here directly.
   6, 14, 16 and 17 still apply to every proof, as the audit says.
 
-6. **`truncate_to_floor` has an unstated precondition.** Its `debug_assert!` that the history
-   floor is not below the live top (`oldest_abs ≤ live_top_abs`) is in no caller contract, and
-   release builds clamp instead. The spec must carry it as `requires`, or the function must
-   make the release clamp the contract and drop the assert.
+## 4. Tests that are not spec samples
 
-## 6. Proof order
-
-The text-selection specs are the cheapest lane: most need only gaps 1–4 (in-crate structs and
-enums, `&self`/`&mut self` views, straight-line saturating arithmetic, callee composition). The
-smart-selection specs also need loops (7), cross-crate citation (12) and, for the patterns,
-aterm-regex's spec.
-
-No test is a pure regression of a removed bug with no general property. Every regression-shaped
+None. No test is a pure regression of a removed bug with no general property. Every regression-shaped
 test (uuid vs git_hash precedence, the bare-relative file path, the zero-floor clear, the
 cross-anchor extension, the wide-glyph halves) is an instance of a general spec above.
 

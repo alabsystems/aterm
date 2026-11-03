@@ -72,15 +72,16 @@ tests/differential.rs	statement_arm_preserves_caller_hygiene_for_let_bindings	cf
 tests/differential.rs	cfg_if_expansion_conformance_and_tripwire_negative_controls	cfgif-first-match-selection	cfgif-dead-arm-fully-absent, cfgif-linear-recursion-depth
 ```
 
-`a_dead_arm_contributes_none_of_its_items` has no row; it samples `cfgif-dead-arm-fully-absent`.
-`real_macro_matches_rustc_on_every_chain` samples that spec only weakly: every arm of its chains
-defines the same `pick()`, so a leaked first item would be a duplicate-definition error.
+`real_macro_matches_rustc_on_every_chain` samples `cfgif-dead-arm-fully-absent` only weakly: every
+arm of its chains defines the same `pick()`, so a leaked first item would be a duplicate-definition
+error.
 
-## 3. Doctests
+## 3. Coverage and doctests
 
-- 6 tests: 5 are retired by a spec and 1 is not a spec sample.
-- 1 spec retires 3 tests; 2 specs retire 1 test each.
-- **Doctests (4, not in the 6).** They are on the macro in `src/lib.rs`: the unix/windows example,
+- 7 tests in `tests/differential.rs`: all 7 are retired by a spec (`cfgif-first-match-selection`
+  retires 5; `cfgif-dead-arm-fully-absent` and `cfgif-linear-recursion-depth` retire 1 each and are
+  also sampled by `cfg_if_expansion_conformance_and_tripwire_negative_controls`).
+- **Doctests (4, not in the 7).** They are on the macro in `src/lib.rs`: the unix/windows example,
   an empty expansion in statement position, `compile_error!` parked in a dead arm, and a
   `compile_fail` control. The first two sample `cfgif-first-match-selection`. The third samples a
   STRONGER form of `cfgif-dead-arm-fully-absent`: a dead arm is never *expanded*, not only
@@ -98,7 +99,7 @@ Status 2026-10-28: `CfgIfExpansion` (`aterm_models_core::cfg_if_expansion_model`
 the N1 route (a) `ty_model!` and both negative-control tripwire mutations (`Buggy = 1` last-match-wins
 and `Buggy = 2` un-grouped multi-item arms).
 
-## 5. Proof order (easiest, high value first)
+## 5. Implied specs that look wrong, or disagree with the code
 
 1. Fixed 2026-10-16: the `case!` comment in `tests/differential.rs` now says "ONE chain in, two
    answers out", which is what `case!` generates (`real` and `expected`).

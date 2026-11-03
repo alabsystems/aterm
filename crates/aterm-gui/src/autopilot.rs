@@ -112,7 +112,7 @@ pub(crate) enum ChipTone {
     Amber,
     /// Dim: the harness's hands are off.
     Dim,
-    /// The off chips' words (`○ off`, `⊘ off`): the dim ink floored to read as words do.
+    /// The off chips (`○`, `⊘ off`): the dim ink floored to read as words do.
     Off,
 }
 
@@ -239,13 +239,24 @@ impl AutopilotView {
         }
     }
 
-    /// The word drawn beside the glyph at rest.
+    /// The word drawn beside the glyph at rest: none for a mode a click cycles through (`∞`, `⤓`,
+    /// `○`), whose name a click brings up and fades out ([`Self::named`]); `off` where no harness
+    /// runs (`⊘ off`), which no click cycles.
     #[must_use]
     pub(crate) const fn word(self) -> Option<&'static str> {
         match self {
-            Self::Cruise => None,
-            Self::Land => Some("land"),
-            Self::Off | Self::MasterOff | Self::Unhosted | Self::AgentOff(_) => Some("off"),
+            Self::Cruise | Self::Land | Self::Off => None,
+            Self::MasterOff | Self::Unhosted | Self::AgentOff(_) => Some("off"),
+        }
+    }
+
+    /// The name a click that reaches this mode brings up beside its glyph, then fades out:
+    /// `cruise`, `land` or `off`; `None` where no harness runs.
+    #[must_use]
+    pub(crate) const fn named(self) -> Option<&'static str> {
+        match self.mode() {
+            Some(mode) => Some(mode.word()),
+            None => None,
         }
     }
 
@@ -697,6 +708,44 @@ impl SetByWords {
 }
 
 impl App {
+    /// Holds session `local_id`'s task record to its Autopilot word
+    /// ([`crate::task_record::note_autopilot_word`]), and owes it another look where an Off has not
+    /// yet stood long enough to fail its task ([`crate::task_record::OFF_SETTLES_MS`]).
+    pub(crate) fn hold_task_to_autopilot(&mut self, local_id: u64) {
+        let Some(ctx) = self.pool.get(local_id).map(|s| s.ctx.clone()) else {
+            self.autopilot_off_due.remove(&local_id);
+            return;
+        };
+        match crate::task_record::note_autopilot_word(&ctx, local_id) {
+            Some(after) => {
+                self.autopilot_off_due
+                    .insert(local_id, std::time::Instant::now() + after);
+            }
+            None => {
+                self.autopilot_off_due.remove(&local_id);
+            }
+        }
+    }
+
+    /// Looks again at each Off whose time to settle is up ([`Self::hold_task_to_autopilot`]).
+    pub(crate) fn tick_autopilot_offs(&mut self, now: std::time::Instant) {
+        let due: Vec<u64> = self
+            .autopilot_off_due
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(session, _)| *session)
+            .collect();
+        for session in due {
+            self.hold_task_to_autopilot(session);
+        }
+    }
+
+    /// The next look [`Self::tick_autopilot_offs`] owes.
+    #[must_use]
+    pub(crate) fn autopilot_off_wake(&self) -> Option<std::time::Instant> {
+        self.autopilot_off_due.values().min().copied()
+    }
+
     /// The window's harness posture now: whether it has a host, and the policy in force.
     #[must_use]
     pub(crate) fn harness_posture(&self) -> HarnessPosture {
@@ -885,6 +934,9 @@ impl App {
         publish: bool,
     ) -> bool {
         let moved = write.moved;
+        if moved {
+            self.hold_task_to_autopilot(local_id);
+        }
         let dropped = self.autopilot_timers.glass(local_id);
         let timer_moved = self.index_autopilot_timer_unstamped(local_id, None);
         self.refresh_autopilot_menu(local_id);
@@ -1249,13 +1301,13 @@ mod tests {
             ),
             (
                 AutopilotView::Land,
-                "\u{2913} land",
+                "\u{2913}",
                 ChipTone::Amber,
                 Some(Autopilot::Off),
             ),
             (
                 AutopilotView::Off,
-                "\u{25cb} off",
+                "\u{25cb}",
                 ChipTone::Off,
                 Some(Autopilot::Cruise),
             ),

@@ -13,6 +13,12 @@ use std::sync::{Barrier, mpsc};
 #[path = "native_restart_slots_tests.rs"]
 mod restart_slots;
 
+#[path = "native_closed_restart_tests.rs"]
+mod closed_restart;
+#[cfg(unix)]
+#[path = "native_resume_only_tests.rs"]
+mod resume_only;
+
 #[path = "native_cancel_prepare_tests.rs"]
 mod initial_cancel;
 
@@ -36,6 +42,11 @@ struct Facts {
     reservation_gate: Option<PublicationGate>,
     conversation_valid: Arc<AtomicBool>,
     clock: Arc<AtomicU64>,
+    watch_available: AtomicBool,
+    watch_unknown: AtomicBool,
+    watch_count: AtomicU32,
+    watched_after_signals: AtomicU32,
+    change_birth_on_watch: AtomicBool,
 }
 
 impl Facts {
@@ -59,6 +70,11 @@ impl Facts {
             prepare_gate: None,
             reservation_gate: None,
             conversation_valid: Arc::new(AtomicBool::new(true)),
+            watch_available: AtomicBool::new(true),
+            watch_unknown: AtomicBool::new(false),
+            watch_count: AtomicU32::new(0),
+            watched_after_signals: AtomicU32::new(0),
+            change_birth_on_watch: AtomicBool::new(false),
             clock: Arc::new(AtomicU64::new(
                 aterm_agent::harness::native_act::monotonic_us().unwrap_or(1),
             )),
@@ -103,6 +119,18 @@ impl Kernel for Facts {
         "OK signalled\n".into()
     }
     fn watch(&self, process: &Process) -> Option<DeathWatch> {
+        self.watch_count.fetch_add(1, Ordering::SeqCst);
+        self.watched_after_signals
+            .store(self.signals.load(Ordering::SeqCst), Ordering::SeqCst);
+        if !self.watch_available.load(Ordering::SeqCst) {
+            return None;
+        }
+        if self.change_birth_on_watch.swap(false, Ordering::SeqCst) {
+            self.processes.lock().unwrap().get_mut(&process.pid)?.birth += 1;
+        }
+        if self.watch_unknown.load(Ordering::SeqCst) {
+            return Some(DeathWatch::Unknown);
+        }
         Some(DeathWatch::Facts(
             process.clone(),
             Arc::clone(&self.processes),
@@ -1339,4 +1367,51 @@ fn queued_own_image_reproves_actor_identity_while_allowing_diagnostic_reparent()
         }
         assert_eq!(facts.signals.load(Ordering::SeqCst), 0);
     }
+}
+
+#[test]
+fn codex_renewal_ready_retirement_requires_a_closed_native_capability() {
+    let handle = crate::session_store::test_handle_on(8002, -1);
+    let ctx = &handle.ctx;
+    install(ctx, 71, &[Scope::Upgrade]);
+    let facts = Facts::new();
+    let request = plan(ctx, &facts);
+    let id = request.id.clone();
+    assert!(renewal::ready_native_no_go(ctx, &id));
+    ctx.fenced_writes
+        .native
+        .lock()
+        .unwrap()
+        .reservations
+        .insert(id.clone());
+    assert!(!renewal::ready_native_no_go(ctx, &id));
+    ctx.fenced_writes
+        .native
+        .lock()
+        .unwrap()
+        .reservations
+        .remove(&id);
+    let binding = admitted_binding(&run(ctx, &facts, Request::prepare(request), caller()));
+    assert!(
+        !renewal::ready_native_no_go(ctx, &id),
+        "a live native capability is not absent"
+    );
+    assert_eq!(
+        run(ctx, &facts, Request::Abort(binding.clone()), caller()),
+        ROLLBACK_SAFE
+    );
+    assert!(
+        renewal::ready_native_no_go(ctx, &id),
+        "actual terminal NoGo closes old authority"
+    );
+    assert_eq!(
+        run(
+            ctx,
+            &facts,
+            Request::Commit(binding, ImagePhase::Forward, "1.2.3".into()),
+            caller()
+        ),
+        ROLLBACK_SAFE
+    );
+    assert_eq!(facts.signals.load(Ordering::SeqCst), 0);
 }

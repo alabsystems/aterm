@@ -191,15 +191,28 @@ fn await_over(
     uri: &str,
 ) -> Result<EditOutcome, AwaitErr> {
     let selector = edit_selector(sid).map_err(AwaitErr::Unsendable)?;
+    let timeout_ms = Some(u64::try_from(LEG.as_millis()).unwrap_or(u64::MAX));
+    AwaitEdit {
+        key: key.clone(),
+        timeout_ms,
+    }
+    .format()
+    .map_err(|e| AwaitErr::Unsendable(e.to_string()))?;
+    AwaitEdit {
+        key: AwaitKey::Uri(uri.to_string()),
+        timeout_ms,
+    }
+    .format()
+    .map_err(|e| AwaitErr::Unsendable(e.to_string()))?;
     let mut sock = wire.resolve();
     let mut cut_since: Option<Instant> = None;
     loop {
         let request = AwaitEdit {
             key: key.clone(),
-            timeout_ms: Some(u64::try_from(LEG.as_millis()).unwrap_or(u64::MAX)),
+            timeout_ms,
         }
         .format()
-        .map_err(|e| AwaitErr::Unreadable(e.to_string()))?;
+        .map_err(|e| AwaitErr::Unsendable(e.to_string()))?;
         let request = format!("{selector} await {request}\n");
         let leg = match &sock {
             Ok(sock) => match wire.send(sock, &request, LEG + crate::await_task::LEG_SLACK) {
@@ -218,7 +231,13 @@ fn await_over(
                 key = AwaitKey::Uri(uri.to_string());
                 continue;
             }
-            Leg::End(AwaitErr::Refused(line)) if cut_since.is_some() => line,
+            Leg::End(AwaitErr::Refused(line))
+                if cut_since.is_some()
+                    && (line == "ERR no such session"
+                        || line.starts_with("ERR no such session ")) =>
+            {
+                line
+            }
             Leg::End(end) => return Err(end),
             Leg::Cut(why) => why,
         };

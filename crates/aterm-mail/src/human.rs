@@ -33,7 +33,10 @@ impl Recovery {
             .into_iter()
             .find(|method| challenge.methods.iter().any(|offered| offered == method))
             .ok_or("Proton offered no unattended recovery-code verification method")?;
-        if challenge.token.expose().is_empty() || challenge.token.expose().len() > 8192 {
+        if challenge.token.expose().is_empty()
+            || challenge.token.expose().len() > 8192
+            || challenge.token.expose().chars().any(char::is_control)
+        {
             return Err("Invalid verification challenge".into());
         }
         let mut recovery = Self {
@@ -43,17 +46,9 @@ impl Recovery {
             purpose: Purpose::Unknown,
         };
         let details = request(Method::Get, &recovery.path())?;
-        recovery.destination = details["ChallengeDestination"]
-            .as_str()
-            .filter(|s| !s.is_empty() && s.len() <= 512)
-            .ok_or("Proton returned no recovery destination")?
-            .into();
-        recovery.purpose = match details["ChallengeType"].as_str() {
-            Some("login") => Purpose::Login,
-            Some("external") => Purpose::External,
-            Some("verify_address") => Purpose::VerifyAddress,
-            _ => Purpose::Unknown,
-        };
+        let (destination, purpose) = decode_details(&details)?;
+        recovery.destination = destination;
+        recovery.purpose = purpose;
         Ok(recovery)
     }
     pub fn is_email(&self) -> bool {
@@ -80,6 +75,20 @@ impl Recovery {
             crate::oauth::encode(self.token.expose())
         )
     }
+}
+fn decode_details(details: &Value) -> Result<(String, Purpose), String> {
+    let destination = details["ChallengeDestination"]
+        .as_str()
+        .filter(|s| !s.is_empty() && s.len() <= 512 && !s.chars().any(char::is_control))
+        .ok_or("Proton returned no recovery destination")?
+        .into();
+    let purpose = match details["ChallengeType"].as_str() {
+        Some("login") => Purpose::Login,
+        Some("external") => Purpose::External,
+        Some("verify_address") => Purpose::VerifyAddress,
+        _ => Purpose::Unknown,
+    };
+    Ok((destination, purpose))
 }
 fn verified(response: &Value, method: &str) -> Result<Verified, String> {
     let token = response["Token"]
@@ -152,6 +161,26 @@ mod tests {
                 "ownership-email"
             )
             .is_err()
+        );
+        let poisoned = Challenge {
+            token: Secret::new("tok\r\ninjected".into()),
+            methods: vec!["ownership-email".into()],
+        };
+        assert!(Recovery::prepare(&poisoned).is_err());
+        assert!(
+            decode_details(&aterm_json::json!({
+                "ChallengeDestination": "user\x1b[2J@proton.example",
+                "ChallengeType": "login"
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            decode_details(&aterm_json::json!({
+                "ChallengeDestination": "u***@proton.example",
+                "ChallengeType": "login"
+            }))
+            .unwrap(),
+            ("u***@proton.example".into(), Purpose::Login)
         );
     }
 }

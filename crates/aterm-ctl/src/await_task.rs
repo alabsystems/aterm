@@ -206,11 +206,12 @@ fn global_sid(selector: &str) -> Option<&str> {
         .then_some(selector)
 }
 
-/// The targets of one instance, and where it answers.
+/// The targets of one instance, where it answers, and each target's caller-chosen index.
 #[derive(Clone, Debug)]
 struct Group {
     sock: String,
     targets: Vec<Target>,
+    order: Vec<usize>,
 }
 
 fn group(
@@ -220,7 +221,7 @@ fn group(
     dir: Option<&Path>,
 ) -> io::Result<Vec<Group>> {
     let mut groups: Vec<Group> = Vec::new();
-    for target in targets {
+    for (pos, target) in targets.into_iter().enumerate() {
         let sock = match global_sid(&target.selector) {
             Some(sid) if !pinned => dir
                 .and_then(|dir| self_instance_sock_in(dir, Some(sid)))
@@ -236,10 +237,14 @@ fn group(
             _ => default.to_string(),
         };
         match groups.iter_mut().find(|g| same_socket_path(&g.sock, &sock)) {
-            Some(group) => group.targets.push(target),
+            Some(group) => {
+                group.targets.push(target);
+                group.order.push(pos);
+            }
             None => groups.push(Group {
                 sock,
                 targets: vec![target],
+                order: vec![pos],
             }),
         }
     }
@@ -514,10 +519,12 @@ fn row_news(row: &str, target: &Target, facts: bool) -> bool {
         Some(_) => return false,
         None => {}
     }
-    let terminal = matches!(row_field(row, "state"), Some("done" | "exited" | "stalled"))
-        && row_rev(row)
-            .zip(target.since)
-            .is_some_and(|(rev, edge)| rev > edge);
+    let terminal = matches!(
+        row_field(row, "state"),
+        Some("done" | "exited" | "stalled" | "failed")
+    ) && row_rev(row)
+        .zip(target.since)
+        .is_some_and(|(rev, edge)| rev > edge);
     let fact = facts
         && target
             .fact_since
@@ -533,6 +540,8 @@ fn closed_row(last: Option<&str>, target: &Target) -> String {
             .map(|t| {
                 if t.starts_with("state=") {
                     "state=closed"
+                } else if t.starts_with("task_news=") {
+                    "task_news=1"
                 } else {
                     t
                 }
@@ -622,20 +631,24 @@ fn malformed(what: &str) -> io::Error {
 }
 
 fn run_group(
-    index: usize,
-    mut group: Group,
+    (index, mut group): (usize, Group),
     (combine, facts): (Combine, bool),
     until: Option<Instant>,
     follow: redial::Redial,
     legs: &Legs,
+    stop: &std::sync::atomic::AtomicBool,
     tx: &mpsc::Sender<Report>,
 ) -> End {
+    use std::sync::atomic::Ordering::Relaxed;
     let n = group.targets.len();
     let mut rows: Vec<Option<String>> = vec![None; n];
     let mut ready = vec![false; n];
     let mut baseline_read = false;
     let mut unserved_since: Option<Instant> = None;
     loop {
+        if baseline_read && stop.load(Relaxed) {
+            return End::TimedOut(rows.into_iter().flatten().collect());
+        }
         let live: Vec<usize> = (0..n).filter(|&i| !ready[i]).collect();
         if live.is_empty() {
             return End::Answered(rows.into_iter().flatten().collect());
@@ -686,6 +699,9 @@ fn run_group(
             Leg::Spent(e) => return ran_out(baseline_read, rows, (unserved_since, e)),
             Leg::Silent(e) if !baseline_read => return End::Failed(e),
             Leg::Again(e) | Leg::Silent(e) => {
+                if baseline_read && stop.load(Relaxed) {
+                    return End::TimedOut(rows.into_iter().flatten().collect());
+                }
                 let now = Instant::now();
                 let since = *unserved_since.get_or_insert(asked);
                 if until.is_some_and(|until| now >= until) {
@@ -702,6 +718,9 @@ fn run_group(
                 std::thread::sleep(until.map_or(after, |until| {
                     until.saturating_duration_since(now).min(after)
                 }));
+                if baseline_read && stop.load(Relaxed) {
+                    return End::TimedOut(rows.into_iter().flatten().collect());
+                }
                 if until.is_some_and(|until| Instant::now() >= until) {
                     return ran_out(baseline_read, rows, (Some(since), e));
                 }
@@ -774,7 +793,7 @@ fn run_group(
         {
             return End::Answered(latest);
         }
-        if until.is_some_and(|until| Instant::now() >= until) {
+        if until.is_some_and(|until| Instant::now() >= until) || stop.load(Relaxed) {
             return End::TimedOut(latest);
         }
         let _ = tx.send(Report::Rows(index, latest));
@@ -830,20 +849,46 @@ fn wait_task_groups(
     follow: &redial::Redial,
     legs: &Legs,
 ) -> io::Result<Waited> {
+    use std::sync::atomic::{AtomicBool, Ordering};
     let (tx, rx) = mpsc::channel();
     let count = groups.len();
     let group_socks: Vec<String> = groups.iter().map(|g| g.sock.clone()).collect();
+    let mut next_pos = 0usize;
+    let group_orders: Vec<Vec<usize>> = groups
+        .iter()
+        .map(|g| {
+            if g.order.len() == g.targets.len() {
+                next_pos = next_pos.max(g.order.iter().copied().max().map_or(0, |m| m + 1));
+                g.order.clone()
+            } else {
+                let start = next_pos;
+                next_pos += g.targets.len();
+                (start..next_pos).collect()
+            }
+        })
+        .collect();
+    let stop = Arc::new(AtomicBool::new(false));
     for (index, group) in groups.into_iter().enumerate() {
-        let (tx, follow, legs) = (tx.clone(), follow.clone(), legs.clone());
+        let (tx, follow, legs, stop) =
+            (tx.clone(), follow.clone(), legs.clone(), Arc::clone(&stop));
         std::thread::Builder::new()
             .name("aterm-ctl-await-task".into())
             .spawn(move || {
-                let end = run_group(index, group, (combine, facts), until, follow, &legs, &tx);
+                let end = run_group(
+                    (index, group),
+                    (combine, facts),
+                    until,
+                    follow,
+                    &legs,
+                    &stop,
+                    &tx,
+                );
                 let _ = tx.send(Report::End(index, end));
             })?;
     }
     drop(tx);
     let mut rows: Vec<Vec<String>> = vec![Vec::new(); count];
+    let mut baseline = vec![false; count];
     let mut ended = vec![false; count];
     let mut answered = vec![false; count];
     let mut unanswered = None;
@@ -854,13 +899,20 @@ fn wait_task_groups(
     };
     while let Ok(report) = rx.recv() {
         match report {
-            Report::Rows(index, latest) => rows[index] = latest,
+            Report::Rows(index, latest) => {
+                rows[index] = latest;
+                baseline[index] = true;
+            }
             Report::End(index, end) => {
                 ended[index] = true;
+                baseline[index] = true;
                 match end {
                     End::Answered(latest) => {
                         rows[index] = latest;
                         answered[index] = true;
+                        if done(&answered) {
+                            stop.store(true, Ordering::Relaxed);
+                        }
                     }
                     End::TimedOut(latest) => rows[index] = latest,
                     End::Unanswered {
@@ -879,16 +931,34 @@ fn wait_task_groups(
                         rows[index] = latest;
                         ungranted = Some((group_socks[index].clone(), why, lowered));
                     }
-                    End::Failed(e) => return Err(e),
-                    End::Code(code) => return Ok(Waited::Code(code)),
-                }
-                if done(&answered) || ended.iter().all(|e| *e) {
-                    break;
+                    End::Failed(e) => {
+                        stop.store(true, Ordering::Relaxed);
+                        return Err(e);
+                    }
+                    End::Code(code) => {
+                        stop.store(true, Ordering::Relaxed);
+                        return Ok(Waited::Code(code));
+                    }
                 }
             }
         }
+        if (done(&answered) && baseline.iter().all(|b| *b)) || ended.iter().all(|e| *e) {
+            stop.store(true, Ordering::Relaxed);
+            break;
+        }
     }
-    let rows = rows.into_iter().flatten().collect();
+    let mut ordered: Vec<(usize, String)> = rows
+        .into_iter()
+        .zip(group_orders.iter())
+        .flat_map(|(group_rows, order)| {
+            group_rows
+                .into_iter()
+                .enumerate()
+                .map(move |(k, row)| (order.get(k).copied().unwrap_or(usize::MAX), row))
+        })
+        .collect();
+    ordered.sort_by_key(|(pos, _)| *pos);
+    let rows: Vec<String> = ordered.into_iter().map(|(_, row)| row).collect();
     Ok(match (ungranted, unanswered) {
         _ if done(&answered) => Waited::Rows {
             rows,
@@ -929,7 +999,7 @@ pub(crate) fn run_await_task(
     };
     let until = total.map(|t| instant_after(Instant::now(), t));
     let dir = socket_dir();
-    let targets = request
+    let targets: Vec<_> = request
         .targets
         .iter()
         .map(|t| Target {
@@ -1018,7 +1088,7 @@ fn driven_wait_any(
         .map(|_| crate::remote::Longer::Wait(request.timeout));
 
     let mut groups: Vec<Group> = Vec::new();
-    for (t, host) in request.targets.iter().zip(hosts.iter()) {
+    for (pos, (t, host)) in request.targets.iter().zip(hosts.iter()).enumerate() {
         let target = Target {
             selector: t.selector.clone(),
             since: t.since.or(request.since),
@@ -1026,10 +1096,12 @@ fn driven_wait_any(
         };
         if let Some(existing) = groups.iter_mut().find(|g| g.sock == *host) {
             existing.targets.push(target);
+            existing.order.push(pos);
         } else {
             groups.push(Group {
                 sock: host.clone(),
                 targets: vec![target],
+                order: vec![pos],
             });
         }
     }
@@ -1098,7 +1170,7 @@ fn driven_wait(
     let longer = inside
         .filter(|&inside| total.is_some_and(|t| inside < t))
         .map(|_| crate::remote::Longer::Wait(request.timeout));
-    let targets = request
+    let targets: Vec<_> = request
         .targets
         .iter()
         .map(|t| Target {
@@ -1115,9 +1187,11 @@ fn driven_wait(
         }),
         again: (AGAIN_AFTER, AGAIN_FOR),
     };
+    let order = (0..targets.len()).collect();
     let groups = vec![Group {
         sock: host,
         targets,
+        order,
     }];
     wait_task_groups(
         groups,
@@ -1355,6 +1429,23 @@ mod tests {
         );
     }
 
+    /// `failed` WAKES A WAIT like the other terminal words, past the edge the waiter last read.
+    /// NEGATIVE CONTROL: at or before its edge it is old news, and `working` is none.
+    #[test]
+    fn a_failed_row_is_news_past_its_edge() {
+        let target = |since| Target {
+            selector: "s-a".into(),
+            since,
+            fact_since: None,
+        };
+        let row = "@s-a rev=4 state=failed agent=claude program_state=- attention=- result_bytes=0 \
+                   conclusion=failed why=could-not-finish";
+        assert!(row_news(row, &target(Some(3)), false));
+        assert!(!row_news(row, &target(Some(4)), false));
+        let working = row.replace("state=failed", "state=working");
+        assert!(!row_news(&working, &target(Some(3)), false));
+    }
+
     #[test]
     fn a_leg_names_each_targets_baseline() {
         let targets = vec![
@@ -1530,6 +1621,7 @@ mod tests {
                     fact_since: None,
                 })
                 .collect(),
+            order: Vec::new(),
         }]
     }
 
@@ -2590,5 +2682,133 @@ mod tests {
                 Err(e) => panic!("ended before its timeout: {e}"),
             }
         }
+    }
+
+    /// NEGATIVE CONTROL: multi-instance `any` waits must still read every other group's baseline
+    /// row (and surface any baseline refusal), keep interleaved targets in caller order, and set
+    /// `task_news=1` when synthesizing a `state=closed` row from a baseline row that carried
+    /// `task_news=0`.
+    #[test]
+    fn multi_group_any_wait_keeps_interleaved_order_baseline_rows_and_closed_task_news() {
+        let target = Target {
+            selector: "s-a".into(),
+            since: Some(1),
+            fact_since: None,
+        };
+        assert_eq!(
+            closed_row(
+                Some(
+                    "@s-a rev=1 state=working agent=busy program_state=- attention=- result_bytes=0 task_news=0"
+                ),
+                &target,
+            ),
+            "@s-a rev=1 state=closed agent=busy program_state=- attention=- result_bytes=0 task_news=1"
+        );
+
+        let (x, y) = ("/x.sock", "/y.sock");
+        let interleaved = || {
+            vec![
+                Group {
+                    sock: x.to_string(),
+                    targets: vec![
+                        Target {
+                            selector: "s-a".into(),
+                            since: Some(0),
+                            fact_since: None,
+                        },
+                        Target {
+                            selector: "s-c".into(),
+                            since: Some(0),
+                            fact_since: None,
+                        },
+                    ],
+                    order: vec![0, 2],
+                },
+                Group {
+                    sock: y.to_string(),
+                    targets: vec![Target {
+                        selector: "s-b".into(),
+                        since: Some(0),
+                        fact_since: None,
+                    }],
+                    order: vec![1],
+                },
+            ]
+        };
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let legs = scripted(vec![
+            (
+                x,
+                "await task @s-a:0,@s-c:0 any timeout=0\n",
+                step(move || {
+                    let _ = done_tx.send(());
+                    Leg::Answered(rows(&[
+                        "@s-a rev=2 state=done agent=- attention=- result_bytes=3 task_news=1",
+                        "@s-c rev=1 state=working agent=- attention=- result_bytes=0 task_news=0",
+                    ]))
+                }),
+            ),
+            (
+                y,
+                "await task @s-b:0 any timeout=0\n",
+                step(move || {
+                    done_rx
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("x answered first");
+                    std::thread::sleep(Duration::from_millis(10));
+                    Leg::TimedOut(rows(&[
+                        "@s-b rev=4 state=working agent=- attention=- result_bytes=0 task_news=0",
+                    ]))
+                }),
+            ),
+        ]);
+        let (got, woke) = waited(interleaved(), Combine::Any, None, &legs);
+        assert!(woke);
+        assert_eq!(
+            got,
+            rows(&[
+                "@s-a rev=2 state=done agent=- attention=- result_bytes=3 task_news=1",
+                "@s-b rev=4 state=working agent=- attention=- result_bytes=0 task_news=0",
+                "@s-c rev=1 state=working agent=- attention=- result_bytes=0 task_news=0",
+            ])
+        );
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let legs = scripted(vec![
+            (
+                x,
+                "await task @s-a:0,@s-c:0 any timeout=0\n",
+                step(move || {
+                    let _ = done_tx.send(());
+                    Leg::Answered(rows(&[
+                        "@s-a rev=2 state=done agent=- attention=- result_bytes=3 task_news=1",
+                        "@s-c rev=1 state=working agent=- attention=- result_bytes=0 task_news=0",
+                    ]))
+                }),
+            ),
+            (
+                y,
+                "await task @s-b:0 any timeout=0\n",
+                step(move || {
+                    done_rx
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("x answered first");
+                    std::thread::sleep(Duration::from_millis(10));
+                    Leg::Failed(io::Error::other("ERR no such session @s-b"))
+                }),
+            ),
+        ]);
+        let err = match wait_task_groups(
+            interleaved(),
+            Combine::Any,
+            false,
+            None,
+            &redial::Redial::none(),
+            &legs,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("baseline refusal on another group must not be dropped"),
+        };
+        assert_eq!(err.to_string(), "ERR no such session @s-b");
     }
 }

@@ -23,6 +23,7 @@ fn sample_member(
         label: label.to_owned(),
         aliases: aliases.iter().map(|s| (*s).to_owned()).collect(),
         hint: None,
+        hw_hint: None,
         admitted_ms: 1_793_000_000_000,
         claimed_label: None,
         claimed_at_ms: None,
@@ -110,6 +111,7 @@ fn census_joins_five_sources_identically_across_stewards_and_classifies_straggle
 
     let inputs_a = CensusInputs {
         now_s,
+        fleet_names: BTreeMap::new(),
         steward: Some("m1".to_owned()),
         roster: roster.clone(),
         server_heard: vec![
@@ -341,6 +343,94 @@ fn clock_inputs(now_s: u64) -> CensusInputs {
     }
 }
 
+#[test]
+fn primary_fleet_names_do_not_reassign_pool_identity_or_accounts() {
+    let mut inputs = clock_inputs(1_800_000_000);
+    let node = "22222222222222222222222222222222";
+    let baseline = SwarmCensus::compute(&inputs);
+    inputs.fleet_names.insert(node.into(), "m62".into());
+    inputs
+        .fleet_names
+        .insert("another-node".into(), "unrelated".into());
+    let named = SwarmCensus::compute(&inputs);
+    assert_eq!(named.members[0].label, "m22");
+    assert_eq!(named.members[0].fleet_name.as_deref(), Some("m62"));
+    let mut without_display_name = named.clone();
+    without_display_name.members[0].fleet_name = None;
+    assert_eq!(without_display_name, baseline);
+    let json = named.to_json();
+    assert_eq!(SwarmCensus::from_json(&json).unwrap(), named);
+    let value: aterm_json::Value = aterm_json::from_str(&json).unwrap();
+    let alias = format!("node-{node}");
+    assert_eq!(
+        value["members"][0]["node_alias"].as_str(),
+        Some(alias.as_str())
+    );
+    assert!(named.render_human().contains("m62"));
+
+    inputs.fleet_names.insert(node.into(), "lab-mac".into());
+    assert_eq!(
+        SwarmCensus::compute(&inputs).members[0]
+            .fleet_name
+            .as_deref(),
+        Some("lab-mac")
+    );
+    inputs
+        .fleet_names
+        .insert(node.into(), "invalid\nname".into());
+    assert_eq!(SwarmCensus::compute(&inputs), baseline);
+    inputs.fleet_names.remove(node);
+    assert_eq!(SwarmCensus::compute(&inputs), baseline);
+}
+
+#[cfg(unix)]
+#[test]
+fn census_collects_only_authenticated_peer_names_and_current_local_name() {
+    use aterm_net::fleet::{FleetSecret, NodeIdentity};
+    use aterm_net::fleet_member::{self as member, Began, Peer};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    aterm_uds::private_file::ensure_private_dir(&state).unwrap();
+    let own = member::node_identity(&state).unwrap();
+    let good = NodeIdentity::from_seed("11111111111111111111111111111111", &[11; 32]).unwrap();
+    let bad = NodeIdentity::from_seed("33333333333333333333333333333333", &[33; 32]).unwrap();
+    let secret = [4; member::SECRET_LEN];
+    let mark = FleetSecret::new(&secret).unwrap().mark();
+    let mut good_peer = Peer::own(&good, ("192.168.1.11", 7100, "0.150.0"), 1)
+        .with_primary_name(&good, Some("lab-peer"));
+    good_peer.fleet = Some(mark);
+    let mut bad_peer = Peer::own(&bad, ("192.168.1.33", 7100, "0.150.0"), 1)
+        .with_primary_name(&bad, Some("forged-peer"));
+    bad_peer.fleet = Some(mark);
+    bad_peer.host = "192.168.1.34".into();
+    member::write_held(&state, Began::Here, |book| {
+        book.write_key(&secret).map_err(|e| e.to_string())?;
+        book.update(|peers| {
+            peers.extend([good_peer, bad_peer]);
+            Ok(())
+        })
+    })
+    .unwrap()
+    .unwrap();
+    aterm_uds::private_file::write_private(&state, member::NAME_FILE, b"m62\n").unwrap();
+    let inputs = collect_local_census_inputs(&state, None, Vec::new(), 100);
+    assert_eq!(
+        inputs.fleet_names.get(good.node()).map(String::as_str),
+        Some("lab-peer")
+    );
+    assert!(!inputs.fleet_names.contains_key(bad.node()));
+    assert_eq!(
+        inputs.fleet_names.get(own.node()).map(String::as_str),
+        Some("m62")
+    );
+    std::fs::remove_file(state.join(member::NAME_FILE)).unwrap();
+    assert!(
+        !collect_local_census_inputs(&state, None, Vec::new(), 101)
+            .fleet_names
+            .contains_key(own.node())
+    );
+}
+
 fn one_warm_pool() -> Pool {
     Pool {
         source: "test".to_owned(),
@@ -444,6 +534,7 @@ fn census_clock_future_sources_do_not_outrank_a_known_contact() {
     assert_eq!(member.last_seen, Some(now - 20));
     assert_eq!(member.host.as_deref(), Some("known-m22.local"));
     assert_eq!(member.version.as_deref(), Some("known"));
+    assert_eq!(member.facts_at, Some(now - 20));
     assert_eq!(member.sessions, 2);
     assert_eq!(member.window_last, None);
     assert!(!member.window);
@@ -538,6 +629,26 @@ fn healthy_pool_inputs(now: u64) -> CensusInputs {
         converge_failures: 0,
     });
     inputs
+}
+
+#[test]
+fn census_facts_receipt_stays_old_when_presence_is_fresh() {
+    let now = 1_800_000_000;
+    let mut inputs = healthy_pool_inputs(now);
+    inputs.heartbeats[0].received_at = Some(now - 3600);
+    inputs.server_heard.push(ServerHeardFact {
+        vault: "alab".to_owned(),
+        subject: "m22".to_owned(),
+        at: now,
+    });
+    let census = SwarmCensus::compute(&inputs);
+    let member = &census.members[0];
+    assert_eq!(member.last_seen, Some(now));
+    assert_eq!(member.facts_at, Some(now - 3600));
+    assert_eq!(SwarmCensus::from_json(&census.to_json()).unwrap(), census);
+    assert!(census.render_human().contains("FACTS_AT"));
+    inputs.heartbeats[0].received_at = None;
+    assert_eq!(SwarmCensus::compute(&inputs).members[0].facts_at, None);
 }
 
 #[test]
@@ -719,6 +830,7 @@ fn a_lease_whose_mac_the_census_host_has_not_heard_counts_for_nobody() {
             at: now,
             heard: [("aa100".to_owned(), last)].into_iter().collect(),
         }),
+        ..claims::View::default()
     };
     let leased = |view: claims::View| {
         let census = SwarmCensus::compute(&CensusInputs {
@@ -760,6 +872,7 @@ fn the_census_host_reads_its_claims_with_what_its_commons_hears() {
         claims::View {
             me: "aa01".to_owned(),
             presence: Some(presence),
+            ..claims::View::default()
         }
     );
 }
@@ -1328,6 +1441,7 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
             label: "m40".to_owned(),
             aliases: Vec::new(),
             hint: None,
+            hw_hint: None,
             admitted_ms: 500,
             claimed_label: None,
             claimed_at_ms: None,
@@ -1359,6 +1473,7 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
                 label: "m2".to_owned(),
                 aliases: Vec::new(),
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 100,
                 claimed_label: None,
                 claimed_at_ms: None,
@@ -1371,6 +1486,7 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
                 label: "m8".to_owned(),
                 aliases: Vec::new(),
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 100,
                 claimed_label: None,
                 claimed_at_ms: None,
@@ -1428,10 +1544,12 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
     stale_cached.generated_at = now_s;
     stale_cached.members.push(CensusMember {
         label: "m8".to_owned(),
+        fleet_name: None,
         aliases: Vec::new(),
         node: Some(denied_id.node().to_owned()),
         host: Some("m8.local".to_owned()),
         version: Some("0.147.0".to_owned()),
+        facts_at: Some(now_s - 5),
         window: true,
         window_last: Some(now_s - 5),
         sessions: 1,
@@ -1513,4 +1631,304 @@ fn a_census_that_heard_nobody_prints_none_heard_and_keeps_the_json_ratio() {
             "{human}"
         );
     }
+}
+
+#[test]
+fn census_walled_accounts_follow_limited_condition_wall_expiry_and_enrollment() {
+    let now_s = 1_800_000_000_u64;
+    let now_i64 = i64::try_from(now_s).unwrap();
+    let n22 = "22222222222222222222222222222222";
+    let n23 = "23232323232323232323232323232323";
+
+    // Case 1: real `Condition::Limited::as_str()` ("limited") with `walled_until: None`
+    // marks both pool-backed (`m22`) and heartbeat-fallback (`m23`) enrolled rows walled,
+    // while unenrolled rows (`enrolled: false`) neither inflate `walled > warm` nor mark
+    // another Mac's shared pool account walled.
+    let inputs_active = CensusInputs {
+        now_s,
+        roster: SwarmRoster {
+            members: vec![
+                sample_member("m22", &[], "age1m22", Some(n22)),
+                sample_member("m23", &[], "age1m23", Some(n23)),
+            ],
+            ..SwarmRoster::default()
+        },
+        pool: Some(Pool {
+            source: "test".to_owned(),
+            last_heard: BTreeMap::new(),
+            accounts: vec![
+                PoolAccount {
+                    provider: Cli::Claude,
+                    vendor: Vendor::default(),
+                    label: Some("c01".to_owned()),
+                    email: "c01@example.com".to_owned(),
+                    browser: None,
+                    warm: vec!["m22".to_owned()],
+                    since: Vec::new(),
+                    why: Vec::new(),
+                    used: Vec::new(),
+                },
+                PoolAccount {
+                    provider: Cli::Claude,
+                    vendor: Vendor::default(),
+                    label: Some("c02".to_owned()),
+                    email: "c02@example.com".to_owned(),
+                    browser: None,
+                    warm: vec!["m22".to_owned()],
+                    since: Vec::new(),
+                    why: Vec::new(),
+                    used: Vec::new(),
+                },
+            ],
+        }),
+        heartbeats: vec![
+            HeartbeatInput {
+                node: n22.to_owned(),
+                facts: sample_facts(
+                    n22,
+                    "m22",
+                    "0.148.0",
+                    true,
+                    Some(now_s - 5),
+                    2,
+                    vec![SurveyAccountFact {
+                        pool: "claude".to_owned(),
+                        id: "c01".to_owned(),
+                        condition: crate::harness::accounts::Condition::Limited { until: 0 }
+                            .as_str()
+                            .to_owned(),
+                        enrolled: true,
+                        usage_5h_pct: Some(100),
+                        usage_7d_pct: Some(80),
+                        week_reset: None,
+                        walled_until: None,
+                        last_used: Some(now_i64 - 10),
+                    }],
+                ),
+                received_at: Some(now_s - 5),
+                converge_failures: 0,
+            },
+            HeartbeatInput {
+                node: n23.to_owned(),
+                facts: sample_facts(
+                    n23,
+                    "m23",
+                    "0.148.0",
+                    true,
+                    Some(now_s - 5),
+                    1,
+                    vec![
+                        SurveyAccountFact {
+                            pool: "codex".to_owned(),
+                            id: "x01".to_owned(),
+                            condition: "limited".to_owned(),
+                            enrolled: true,
+                            usage_5h_pct: Some(100),
+                            usage_7d_pct: None,
+                            week_reset: None,
+                            walled_until: None,
+                            last_used: Some(now_i64 - 10),
+                        },
+                        SurveyAccountFact {
+                            pool: "claude".to_owned(),
+                            id: "c02".to_owned(),
+                            condition: "limited".to_owned(),
+                            enrolled: false,
+                            usage_5h_pct: None,
+                            usage_7d_pct: None,
+                            week_reset: None,
+                            walled_until: Some(now_i64 + 3_600),
+                            last_used: None,
+                        },
+                    ],
+                ),
+                received_at: Some(now_s - 5),
+                converge_failures: 0,
+            },
+        ],
+        ..CensusInputs::default()
+    };
+    let active = SwarmCensus::compute(&inputs_active);
+    assert_eq!(active.members[0].label, "m22");
+    assert_eq!(active.members[0].accounts.warm, 2);
+    assert_eq!(
+        active.members[0].accounts.walled, 1,
+        "enrolled `condition=limited` with `walled_until=None` must mark c01 walled while unenrolled c02 on m23 does not"
+    );
+    assert_eq!(active.members[1].label, "m23");
+    assert_eq!(active.members[1].accounts.warm, 1);
+    assert_eq!(
+        active.members[1].accounts.walled, 1,
+        "heartbeat fallback must count enrolled `condition=limited` and exclude unenrolled rows (`walled <= warm`)"
+    );
+
+    // Case 2: once `walled_until <= now_i64` in an older pushed `.facts` heartbeat, the wall has
+    // already ended and neither `"limited"` nor `"rate_limited"` keeps the account walled.
+    let mut inputs_expired = inputs_active;
+    inputs_expired.heartbeats[0].facts.accounts[0].walled_until = Some(now_i64);
+    inputs_expired.heartbeats[1].facts.accounts[0].condition = "rate_limited".to_owned();
+    inputs_expired.heartbeats[1].facts.accounts[0].walled_until = Some(now_i64 - 1);
+    let expired = SwarmCensus::compute(&inputs_expired);
+    assert_eq!(
+        expired.members[0].accounts.walled, 0,
+        "wall at `walled_until == now` must lift for pool-backed accounts"
+    );
+    assert_eq!(
+        expired.members[1].accounts.walled, 0,
+        "wall at `walled_until < now` must lift for heartbeat-fallback accounts"
+    );
+}
+
+/// NEGATIVE CONTROL: `collect_local_census_inputs` resolves `fleet_names` by highest verified
+/// `signed.seq` bound to each node's established key across `fleet-peers` and `fleet-issuer-book`
+/// (including clearing a superseded name when a newer signed descriptor carries none and rejecting
+/// self-signed impostor keys), suppresses `fleet_name` for denied nodes, and refreshes cached
+/// census outputs immediately when the local `fleet-name` file changes.
+#[cfg(unix)]
+#[test]
+fn census_fleet_names_resolve_bound_issuer_book_sequences_reject_impostor_keys_and_refresh_local_renames()
+ {
+    use aterm_net::fleet::{FleetSecret, NodeIdentity};
+    use aterm_net::fleet_member::{self as member, Began, ISSUER_BOOK_FILE, Peer, Via};
+
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let home = dir.path().join("home");
+    aterm_uds::private_file::ensure_private_dir(&state).unwrap();
+    std::fs::create_dir_all(home.join(".config/aterm")).unwrap();
+    std::fs::write(
+        home.join(".config/aterm/aterm.toml"),
+        "[ai]\nmachine = \"m22\"\n",
+    )
+    .unwrap();
+
+    let own = member::node_identity(&state).unwrap();
+    let issuer = NodeIdentity::from_seed("10101010101010101010101010101010", &[10; 32]).unwrap();
+    let peer_a = NodeIdentity::from_seed("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &[11; 32]).unwrap();
+    let peer_b = NodeIdentity::from_seed("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &[12; 32]).unwrap();
+    let peer_c = NodeIdentity::from_seed("cccccccccccccccccccccccccccccccc", &[13; 32]).unwrap();
+    let impostor = NodeIdentity::from_seed("cccccccccccccccccccccccccccccccc", &[99; 32]).unwrap();
+    assert_ne!(peer_c.key(), impostor.key());
+
+    let secret = [7; member::SECRET_LEN];
+    let mark = FleetSecret::new(&secret).unwrap().mark();
+
+    let mut issuer_peer = Peer::own(&issuer, ("192.168.1.10", 7100, "0.150.0"), 1);
+    issuer_peer.via = Via::Issuer;
+    issuer_peer.fleet = Some(mark);
+
+    // `peer_a` is unsigned in `fleet-peers` (`signed = None`), while `fleet-issuer-book` holds a
+    // newer self-signed copy under `peer_a`'s bound key with `primary_name = "mac-a"`.
+    let mut a_unsigned = Peer::own(&peer_a, ("192.168.1.21", 7100, "0.150.0"), 1);
+    a_unsigned.signed = None;
+    a_unsigned.fleet = Some(mark);
+
+    // `peer_b` has `seq = 10` with `"old-b"` in `fleet-peers`, while `fleet-issuer-book` holds a
+    // newer `seq = 20` signed by `peer_b` with `primary_name = None` (clearing the name).
+    let mut b_old = Peer::own(&peer_b, ("192.168.1.22", 7100, "0.150.0"), 10)
+        .with_primary_name(&peer_b, Some("old-b"));
+    b_old.fleet = Some(mark);
+
+    // `peer_c` is bound to `peer_c.key()` in `fleet-peers` (`signed = None`); `fleet-issuer-book`
+    // holds a self-signed copy claiming `peer_c.node()` under `impostor.key()`.
+    let mut c_bound = Peer::own(&peer_c, ("192.168.1.23", 7100, "0.150.0"), 1);
+    c_bound.signed = None;
+    c_bound.fleet = Some(mark);
+
+    member::write_held(&state, Began::Here, |book| {
+        book.write_key(&secret).map_err(|e| e.to_string())?;
+        book.update(|peers| {
+            peers.extend([issuer_peer, a_unsigned, b_old, c_bound]);
+            Ok(())
+        })
+    })
+    .unwrap()
+    .unwrap();
+
+    let mut a_copy = Peer::own(&peer_a, ("192.168.1.21", 7100, "0.150.0"), 5)
+        .with_primary_name(&peer_a, Some("mac-a"));
+    a_copy.via = Via::IssuerBook;
+    a_copy.fleet = None;
+
+    let mut b_cleared = Peer::own(&peer_b, ("192.168.1.22", 7100, "0.150.0"), 20);
+    b_cleared.via = Via::IssuerBook;
+    b_cleared.fleet = None;
+
+    let mut c_forged = Peer::own(&impostor, ("192.168.1.99", 7100, "0.150.0"), 99)
+        .with_primary_name(&impostor, Some("spoofed"));
+    c_forged.via = Via::IssuerBook;
+    c_forged.fleet = None;
+    assert!(c_forged.signature_holds());
+
+    let issuer_book_wire = format!(
+        "issuer node={}\n{}\n{}\n{}\n",
+        issuer.node(),
+        a_copy.line(),
+        b_cleared.line(),
+        c_forged.line(),
+    );
+    aterm_uds::private_file::write_private(&state, ISSUER_BOOK_FILE, issuer_book_wire.as_bytes())
+        .unwrap();
+    aterm_uds::private_file::write_private(&state, member::NAME_FILE, b"m62\n").unwrap();
+
+    let now_s = 1_800_000_000;
+    let inputs = collect_local_census_inputs(&state, Some(&home), Vec::new(), now_s);
+    assert_eq!(
+        inputs.fleet_names.get(peer_a.node()).map(String::as_str),
+        Some("mac-a"),
+        "bound issuer-book copy must supply signed primary name when fleet-peers entry is unsigned"
+    );
+    assert!(
+        !inputs.fleet_names.contains_key(peer_b.node()),
+        "newer signed sequence without primary name must clear older signed name"
+    );
+    assert!(
+        !inputs.fleet_names.contains_key(peer_c.node()),
+        "impostor key claiming an already-bound node id must be rejected"
+    );
+    assert_eq!(
+        inputs.fleet_names.get(own.node()).map(String::as_str),
+        Some("m62")
+    );
+
+    // Local rename or removal invalidates the cached census within `CENSUS_REFRESH_S`.
+    let initial = read_or_compute_census(&state, Some(&home), false, now_s).unwrap();
+    let own_row = initial
+        .members
+        .iter()
+        .find(|m| m.node.as_deref() == Some(own.node()))
+        .unwrap();
+    assert_eq!(own_row.fleet_name.as_deref(), Some("m62"));
+
+    aterm_uds::private_file::write_private(&state, member::NAME_FILE, b"m63\n").unwrap();
+    let renamed = read_or_compute_census(&state, Some(&home), false, now_s + 5).unwrap();
+    let renamed_row = renamed
+        .members
+        .iter()
+        .find(|m| m.node.as_deref() == Some(own.node()))
+        .unwrap();
+    assert_eq!(renamed_row.fleet_name.as_deref(), Some("m63"));
+
+    std::fs::remove_file(state.join(member::NAME_FILE)).unwrap();
+    let served_wire = serve_fleet_census(&state, Some(&home), now_s + 10).unwrap();
+    let cleared = SwarmCensus::from_json(&served_wire).unwrap();
+    let cleared_row = cleared
+        .members
+        .iter()
+        .find(|m| m.node.as_deref() == Some(own.node()))
+        .unwrap();
+    assert_eq!(cleared_row.fleet_name, None);
+
+    // Case-insensitive lookup and `deny_nodes` filtering in `SwarmCensus::compute`.
+    let mut upper_inputs = clock_inputs(now_s);
+    upper_inputs.fleet_names.insert(
+        "22222222222222222222222222222222".to_ascii_uppercase(),
+        "upper-mac".into(),
+    );
+    assert_eq!(
+        SwarmCensus::compute(&upper_inputs).members[0]
+            .fleet_name
+            .as_deref(),
+        Some("upper-mac")
+    );
 }

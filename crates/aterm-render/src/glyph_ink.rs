@@ -255,9 +255,7 @@ impl GlyphInk {
             .filter(|&i| regular[i].max > 0)
             .min_by_key(|&i| thin(&regular[i]))
             .map_or(Self::OTHER, |i| u8::try_from(i).unwrap_or(Self::OTHER));
-        // Word by word, as `aterm_hash::fnv_mix_u64` folds. The step stays spelled out here and in
-        // `with_rasters` unmeasured: a fold moves to the call when no proved row sits in it, and a
-        // decided `ship trust run -p aterm-render` is still owed to say whether one sits in these.
+        // Word by word through `aterm_hash`'s step (astream-wire's).
         let mut fingerprint =
             aterm_hash::FNV64_OFFSET ^ u64::from(corrected) ^ u64::from(other) << 8;
         for glyph in regular.iter().chain(bold.iter()) {
@@ -266,7 +264,7 @@ impl GlyphInk {
                 .chain(glyph.levels)
                 .chain(place.map(|v| v.cast_unsigned()))
             {
-                fingerprint = (fingerprint ^ u64::from(v)).wrapping_mul(aterm_hash::FNV64_PRIME);
+                fingerprint = aterm_hash::fnv_mix_u64(fingerprint, u64::from(v));
             }
         }
         Self {
@@ -300,7 +298,7 @@ impl GlyphInk {
                         .flat_map(|r| r.cov.iter().copied().map(u64::from)),
                 )
             {
-                fingerprint = (fingerprint ^ v).wrapping_mul(aterm_hash::FNV64_PRIME);
+                fingerprint = aterm_hash::fnv_mix_u64(fingerprint, v);
             }
         }
         self.rasters = rasters.into_boxed_slice();
@@ -571,9 +569,9 @@ mod tests {
         assert_eq!(ink.cell_box(GlyphInk::OTHER), None);
     }
 
-    /// The table spells its folds out for the Trust lane, and each is still `aterm_hash`'s word
-    /// step: over every glyph's fullest pixel, levels and place, then every raster's words and
-    /// coverage.
+    /// A table's fingerprint is `aterm_hash`'s word step over every glyph's fullest pixel, levels
+    /// and place, then every raster's words and coverage, and its value does not move: each pin
+    /// was read from a run of the folds as this crate spelled them out before (6ed031fa50).
     #[test]
     fn a_tables_fingerprint_folds_with_aterm_hashs_step() {
         let mut glyph = flat(200, 40);
@@ -590,6 +588,7 @@ mod tests {
             }
         }
         assert_eq!(coverage.fingerprint(), want);
+        assert_eq!(coverage.fingerprint(), 0x316f_a577_ad1e_1a84);
 
         let raster = GlyphRaster::placed(&[0, 9, 200, 0], 2, (-1, 5)).expect("ink");
         let seated = coverage.with_rasters(vec![Some(raster.clone()), None]);
@@ -606,6 +605,7 @@ mod tests {
             want = aterm_hash::fnv_mix_u64(want, u64::from(v));
         }
         assert_eq!(seated.fingerprint(), want);
+        assert_eq!(seated.fingerprint(), 0xbea8_0a8f_ccdb_3eb6);
     }
 
     /// A glyph's raster is its inked pixels, trimmed and seated where the raster's top left lies

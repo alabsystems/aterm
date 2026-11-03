@@ -169,7 +169,8 @@ fn files(root: &Path) -> R<Vec<PathBuf>> {
 
 fn fields(path: &Path) -> R<BTreeMap<String, String>> {
     regular(path)?;
-    let text = std::fs::read_to_string(path).map_err(|e| io(path, &e))?;
+    let text = crate::identity::read_regular_text(path, crate::identity::MAX_META_BYTES)
+        .map_err(|e| io(path, &e))?;
     let selected = [
         "reported_commit",
         "private_sysroot",
@@ -394,7 +395,8 @@ pub fn prepare(
     let marker = target.join(".rustc-commit-hash");
     if std::fs::symlink_metadata(&marker).is_ok() {
         regular(&marker)?;
-        let named = std::fs::read_to_string(&marker).map_err(|e| io(&marker, &e))?;
+        let named = crate::identity::read_regular_text(&marker, crate::identity::MAX_META_BYTES)
+            .map_err(|e| io(&marker, &e))?;
         if named.trim() != commit {
             return Err(Refusal::MarkerCommit);
         }
@@ -422,7 +424,8 @@ pub fn prepare(
         let private_marker = private.join(".rustc-commit-hash");
         regular(&private_marker)?;
         let named =
-            std::fs::read_to_string(&private_marker).map_err(|e| io(&private_marker, &e))?;
+            crate::identity::read_regular_text(&private_marker, crate::identity::MAX_META_BYTES)
+                .map_err(|e| io(&private_marker, &e))?;
         if named.trim() != commit {
             return Err(Refusal::PrivateCommit);
         }

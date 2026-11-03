@@ -102,6 +102,8 @@ Every function is generic (gap 11) and almost every one takes a closure (gap 13)
 on those two gaps comes first. A monomorphic instance (`T = u32`, a concrete closure) is a
 stepping stone but retires no test.
 
+## 5. Implied specs that look wrong, or disagree with the code
+
 1. **`Lazy` panic poisoning documented and sampled (resolved 2026-10-27).** Both `sync::Lazy` and
    `unsync::Lazy` document that a panicking initializer poisons the `Lazy`, and
    `a_panicking_lazy_initialiser_poisons_the_lazy` tests that an unwinding first force leaves `get`

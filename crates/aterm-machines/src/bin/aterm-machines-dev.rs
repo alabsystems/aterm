@@ -89,7 +89,10 @@ fn seal(words: &[String]) -> ExitCode {
         }
     };
     let baseline = match get.get("baseline") {
-        Some(p) => match std::fs::read_to_string(p) {
+        Some(p) => match sys.read_file(Path::new(p)).and_then(|b| {
+            String::from_utf8(b)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }) {
             Ok(t) => Some(t),
             Err(e) => {
                 eprintln!("seal: {p}: {e}");

@@ -18,7 +18,7 @@ fn shipping_constructor_discovery_is_empty_and_disabled_new_prepare_has_no_custo
         -1,
         Request::Constructors,
         caller(),
-        &System(&ctx.native_policy),
+        &System(&ctx.native_policy, false),
         &mut |_| panic!("no mutation"),
     );
     assert_eq!(shipping, "OK native-act state=constructors plans=-\n");

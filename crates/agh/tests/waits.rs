@@ -4,11 +4,13 @@
 
 //! `agh release wait` tests on simulated time.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use agh::cli::{Captured, Ctx};
 use agh::error::Kind;
 use agh::model::Sha256Digest;
+use agh::notify::{RecordingNotifier, Topic};
 use agh::wait::{Backoff, ReleaseCond};
 use agh_fake::{AssetSpec, Change, FakeGithub, Fault, Match, ReleaseSpec, RepoSpec};
 use aterm_json::Value;
@@ -805,4 +807,72 @@ fn a_library_anon_visible_wait_on_a_bad_tag_is_usage_before_any_request() {
         assert_eq!(error.kind, Kind::Usage, "{label:?}: {error:?}");
     }
     assert!(fake.seen().is_empty(), "{:?}", fake.seen());
+}
+
+/// The `notify=` note of the run's receipt line, when it has one.
+fn notify_note(captured: &Captured) -> Option<String> {
+    let stderr = captured.stderr_text();
+    let receipt = stderr.lines().find(|line| line.starts_with("agh: ok"))?;
+    receipt
+        .split(' ')
+        .find_map(|word| word.strip_prefix("notify="))
+        .map(str::to_string)
+}
+
+fn recording(root: &std::path::Path, fake: &FakeGithub) -> (Ctx, Captured, Arc<RecordingNotifier>) {
+    let (ctx, captured) = context(root, fake);
+    let rec = Arc::new(RecordingNotifier::new());
+    (ctx.with_notifier(rec.clone()), captured, rec)
+}
+
+#[test]
+fn wait_notify_posts_once_when_held() {
+    let root = common::scratch("wait-notify");
+    let fake = fake();
+    let id = fake.add_release(REPO, ReleaseSpec::draft("v1.0.0", CREATED));
+    fake.after(Match::api(TAGS), 3, Change::Publish { release_id: id });
+    let (mut ctx, captured, rec) = recording(root.path(), &fake);
+    let exit = wait(&mut ctx, &["v1.0.0", "published", "--notify", "--meta"]);
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    let posted = rec.posted();
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    let notice = &posted[0];
+    assert_eq!(notice.topic, Topic::Release);
+    assert_eq!(notice.event, "published");
+    assert_eq!(notice.repo, common::slug(REPO));
+    assert_eq!(notice.tag, "v1.0.0");
+    assert_eq!(notice.id, Some(id));
+    assert_eq!(notice.n, Some(0));
+    assert_eq!(
+        notify_note(&captured).as_deref(),
+        Some("sent:recorded"),
+        "{}",
+        captured.stderr_text()
+    );
+}
+
+#[test]
+fn wait_without_notify_posts_nothing() {
+    let root = common::scratch("wait-quiet");
+    let fake = fake();
+    let id = fake.add_release(REPO, ReleaseSpec::draft("v1.0.0", CREATED));
+    fake.after(Match::api(TAGS), 3, Change::Publish { release_id: id });
+    let (mut ctx, captured, rec) = recording(root.path(), &fake);
+    let exit = wait(&mut ctx, &["v1.0.0", "published", "--meta"]);
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    assert!(rec.posted().is_empty());
+    assert_eq!(notify_note(&captured), None);
+}
+
+#[test]
+fn a_timed_out_wait_posts_nothing() {
+    let root = common::scratch("wait-timeout-notify");
+    let fake = fake();
+    let (mut ctx, _captured, rec) = recording(root.path(), &fake);
+    let exit = wait(
+        &mut ctx,
+        &["v9.9.9", "published", "--timeout", "10s", "--notify"],
+    );
+    assert_eq!(exit, 8);
+    assert!(rec.posted().is_empty());
 }

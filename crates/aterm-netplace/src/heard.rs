@@ -4,6 +4,8 @@
 //! The evidence every process notes into, `<state>/netplace/heard`, and the fleet book's
 //! snapshot beside it, `<state>/netplace/book`, each answer there with the network it was booked
 //! on.
+//! Direct scan observations live separately under `observations/`: presentation combines them
+//! with this evidence, while admission reads only this ledger.
 //!
 //! THE LOCK RULE: every write of `heard`, by any process (the window, the node job, a vault job,
 //! a CLI), holds `heard.lock` for one bounded read-modify-rename: read the file, add the notes,
@@ -15,8 +17,9 @@
 //!
 //! Only authenticated member answers are noted ([`note_answer`]): a proven node-keyed fleet
 //! answer, a verified Commons contact. Each carries its local route address, sampled when
-//! noted for fleet answers or captured from the authenticated socket for Commons contacts,
-//! so the place counts it for the network it came over and not for the one this Mac moved to.
+//! noted for fleet answers (with the interface that held it) or captured from the authenticated
+//! socket for Commons contacts, so the place counts it for the network it came over and not for
+//! the one this Mac moved to.
 
 use std::collections::HashMap;
 use std::io;
@@ -64,14 +67,31 @@ fn opt<T: ToString>(value: Option<T>) -> String {
 
 fn answer_line(answer: &Answer) -> String {
     format!(
-        "a {} {} {} {} {} {}",
+        "a {} {} {} {} {} {} {} {} {}",
         answer.lane.word(),
         answer.member,
         opt(answer.addr),
         opt(answer.via),
+        opt(answer.iface.as_deref().filter(|iface| valid_iface(iface))),
+        opt(answer.network.as_ref().map(NetworkId::as_str)),
+        if answer.logged { LOGGED } else { "-" },
         answer.began_ms,
         answer.at_ms
     )
+}
+
+/// An answer line's word for [`Answer::logged`] (`-` for not).
+const LOGGED: &str = "log";
+
+/// The longest interface name an answer line takes.
+const MAX_IFACE: usize = 16;
+
+/// Whether `iface` is an interface name an answer line holds: letters and digits, at most
+/// [`MAX_IFACE`] of them (`en0`, `utun4`).
+fn valid_iface(iface: &str) -> bool {
+    !iface.is_empty()
+        && iface.len() <= MAX_IFACE
+        && iface.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 fn round_line(round: &Round) -> String {
@@ -91,8 +111,17 @@ fn internet_line(note: &InternetNote) -> String {
         if note.ok { "ok" } else { "down" },
         note.source.word(),
         note.at_ms,
-        note.endpoint
+        endpoint_word(&note.endpoint)
     )
+}
+
+/// The longest endpoint word an internet line holds.
+const MAX_ENDPOINT: usize = 128;
+
+fn valid_endpoint(endpoint: &str) -> bool {
+    !endpoint.is_empty()
+        && endpoint.len() <= MAX_ENDPOINT
+        && endpoint.bytes().all(|b| b.is_ascii_graphic())
 }
 
 /// One endpoint word: a host name or address, no space or control character.
@@ -100,7 +129,7 @@ fn endpoint_word(endpoint: &str) -> String {
     let word: String = endpoint
         .chars()
         .filter(|c| c.is_ascii_graphic())
-        .take(128)
+        .take(MAX_ENDPOINT)
         .collect();
     if word.is_empty() {
         "-".to_owned()
@@ -120,71 +149,137 @@ fn parse_opt<T: std::str::FromStr>(word: &str) -> Option<Option<T>> {
 /// The evidence an [`FILE`] text holds; lines this build cannot read are passed over.
 #[must_use]
 pub fn parse(text: &str) -> Evidence {
+    parse_counted(text).0
+}
+
+fn is_lower_hex16(s: &str) -> bool {
+    s.len() == 16
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// [`parse`], with how many of the text's lines it passed over: each line that is not empty and
+/// gave no note (malformed, torn, unterminated by `'\n'`, or of a kind this build does not write).
+#[must_use]
+pub fn parse_counted(text: &str) -> (Evidence, usize) {
     let mut evidence = Evidence::default();
-    for line in text.lines() {
-        let words: Vec<&str> = line.split(' ').collect();
-        match words.as_slice() {
-            ["a", lane, member, addr, via, began, at] => {
-                let (Some(lane), Some(addr), Some(via), Ok(began_ms), Ok(at_ms)) = (
-                    Lane::from_word(lane),
-                    parse_opt::<IpAddr>(addr),
-                    parse_opt::<Ipv4Addr>(via),
-                    began.parse(),
-                    at.parse(),
-                ) else {
-                    continue;
-                };
-                if member.len() == 16 && member.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    evidence.answers.push(Answer {
-                        lane,
-                        member: (*member).to_owned(),
-                        addr,
-                        via,
-                        began_ms,
-                        at_ms,
-                    });
-                }
+    let mut passed = 0;
+    for chunk in text.split_inclusive('\n') {
+        let Some(line) = chunk.strip_suffix('\n') else {
+            if !chunk.is_empty() {
+                passed += 1;
             }
-            ["r", lane, answered, began, at, rest @ ..] if rest.len() <= 1 => {
-                // A line with no blocked count (the first build's) reads as none blocked.
-                if let (Some(lane), Ok(answered), Ok(began_ms), Ok(at_ms), Some(blocked)) = (
-                    Lane::from_word(lane),
-                    answered.parse(),
-                    began.parse(),
-                    at.parse(),
-                    rest.first().map_or(Some(0), |blocked| blocked.parse().ok()),
-                ) {
-                    evidence.rounds.push(Round {
-                        lane,
-                        answered,
-                        blocked,
-                        began_ms,
-                        at_ms,
-                    });
-                }
-            }
-            ["i", verdict, source, at, endpoint] => {
-                if let (Some(ok), Some(source), Ok(at_ms)) = (
-                    match *verdict {
-                        "ok" => Some(true),
-                        "down" => Some(false),
-                        _ => None,
-                    },
-                    InternetSource::from_word(source),
-                    at.parse(),
-                ) {
-                    evidence.internet.push(InternetNote {
-                        ok,
-                        source,
-                        at_ms,
-                        endpoint: (*endpoint).to_owned(),
-                    });
-                }
-            }
-            _ => {}
+            continue;
+        };
+        if line.ends_with('\r') {
+            passed += 1;
+            continue;
+        }
+        let notes = evidence.answers.len() + evidence.rounds.len() + evidence.internet.len();
+        parse_line(line, &mut evidence);
+        if !line.is_empty()
+            && evidence.answers.len() + evidence.rounds.len() + evidence.internet.len() == notes
+        {
+            passed += 1;
         }
     }
-    evidence
+    (evidence, passed)
+}
+
+/// Adds the note `line` holds to `evidence`; a line this build cannot read adds none.
+fn parse_line(line: &str, evidence: &mut Evidence) {
+    let words: Vec<&str> = line.split(' ').collect();
+    match words.as_slice() {
+        [
+            "a",
+            lane,
+            member,
+            addr,
+            via,
+            iface,
+            network,
+            logged,
+            began,
+            at,
+        ] => {
+            let (Some(lane), Some(addr), Some(via), Ok(began_ms), Ok(at_ms)) = (
+                Lane::from_word(lane),
+                parse_opt::<IpAddr>(addr),
+                parse_opt::<Ipv4Addr>(via),
+                began.parse(),
+                at.parse(),
+            ) else {
+                return;
+            };
+            let iface = match *iface {
+                "-" => None,
+                iface if valid_iface(iface) => Some(iface.to_owned()),
+                _ => return,
+            };
+            let network = match *network {
+                "-" => None,
+                network => match NetworkId::parse(network) {
+                    Some(network) => Some(network),
+                    None => return,
+                },
+            };
+            let logged = match *logged {
+                LOGGED => true,
+                "-" => false,
+                _ => return,
+            };
+            if is_lower_hex16(member) {
+                evidence.answers.push(Answer {
+                    lane,
+                    member: (*member).to_owned(),
+                    addr,
+                    via,
+                    iface,
+                    network,
+                    logged,
+                    began_ms,
+                    at_ms,
+                });
+            }
+        }
+        ["r", lane, answered, began, at, rest @ ..] if rest.len() <= 1 => {
+            // A line with no blocked count (the first build's) reads as none blocked.
+            if let (Some(lane), Ok(answered), Ok(began_ms), Ok(at_ms), Some(blocked)) = (
+                Lane::from_word(lane),
+                answered.parse(),
+                began.parse(),
+                at.parse(),
+                rest.first().map_or(Some(0), |blocked| blocked.parse().ok()),
+            ) {
+                evidence.rounds.push(Round {
+                    lane,
+                    answered,
+                    blocked,
+                    began_ms,
+                    at_ms,
+                });
+            }
+        }
+        ["i", verdict, source, at, endpoint] if valid_endpoint(endpoint) => {
+            if let (Some(ok), Some(source), Ok(at_ms)) = (
+                match *verdict {
+                    "ok" => Some(true),
+                    "down" => Some(false),
+                    _ => None,
+                },
+                InternetSource::from_word(source),
+                at.parse(),
+            ) {
+                evidence.internet.push(InternetNote {
+                    ok,
+                    source,
+                    at_ms,
+                    endpoint: (*endpoint).to_owned(),
+                });
+            }
+        }
+        _ => {}
+    }
 }
 
 /// `evidence` bounded: the newest answer per lane and member, the newest [`MAX_ROUNDS`] rounds
@@ -206,9 +301,11 @@ pub fn compact(mut evidence: Evidence) -> Evidence {
         .internet
         .sort_by_key(|note| std::cmp::Reverse(note.at_ms));
     evidence.internet.truncate(MAX_INTERNET);
-    evidence
-        .answers
-        .truncate(MAX_LINES - evidence.rounds.len() - evidence.internet.len());
+    evidence.answers.truncate(
+        MAX_LINES
+            .saturating_sub(evidence.rounds.len())
+            .saturating_sub(evidence.internet.len()),
+    );
     evidence
 }
 
@@ -231,11 +328,64 @@ pub fn format(evidence: &Evidence) -> String {
 /// The evidence in `dir`; empty where there is none or it is not private.
 #[must_use]
 pub fn read(dir: &Path) -> Evidence {
-    aterm_uds::private_file::read_private(dir, FILE, MAX_BYTES)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .map(|text| parse(&text))
-        .unwrap_or_default()
+    read_counted(dir).0
+}
+
+/// Presentation evidence includes direct scans, stored apart from admission evidence.
+/// A newer unlogged scan must neither replace nor postpone a heartbeat's proof.
+#[must_use]
+pub fn read_for_place(dir: &Path) -> Evidence {
+    let mut evidence = read(dir);
+    evidence
+        .answers
+        .extend(read(&dir.join("observations")).answers);
+    compact(evidence)
+}
+
+/// Records proven direct-scan replies for presentation only, in a separately bounded store.
+/// This never writes the admission ledger or its in-process coalescing state. Each explicit
+/// scan writes one batch; it cannot postpone the first heartbeat after a network move.
+pub fn note_observations(dir: &Path, mut answers: Vec<Answer>) {
+    if answers.is_empty() {
+        return;
+    }
+    for answer in &mut answers {
+        answer.logged = false;
+        answer.network = None;
+    }
+    if let Err(error) = add(
+        &dir.join("observations"),
+        Evidence {
+            answers,
+            ..Evidence::default()
+        },
+    ) {
+        aterm_log::debug!("network place: scan observations were not recorded: {error}");
+    }
+}
+
+/// The admission ledger alone, with how many lines it passed over ([`parse_counted`]).
+#[must_use]
+pub fn read_counted(dir: &Path) -> (Evidence, usize) {
+    match aterm_uds::private_file::read_private(dir, FILE, MAX_BYTES) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => parse_counted(&text),
+            Err(_) => (Evidence::default(), 1),
+        },
+        Err(aterm_uds::private_file::PrivateFileError::Missing) => (Evidence::default(), 0),
+        Err(_) => {
+            let dir_is_symlink =
+                std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink());
+            let file_present = !matches!(
+                std::fs::symlink_metadata(dir.join(FILE)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound
+            );
+            (
+                Evidence::default(),
+                usize::from(dir_is_symlink || file_present),
+            )
+        }
+    }
 }
 
 /// Adds `notes` to the evidence in `dir` under [`LOCK`] ([the lock rule](self)), bounded by
@@ -288,6 +438,9 @@ pub fn parse_book(text: &str) -> Book {
                 let ["m", member, addr, answered, network @ ..] = words.as_slice() else {
                     return None;
                 };
+                if !is_lower_hex16(member) {
+                    return None;
+                }
                 // A line with no network (the first build's) seeds nothing.
                 let network = match network {
                     [] | ["-"] => None,
@@ -410,14 +563,18 @@ fn flush(dir: &Path, mut notes: Evidence, keys: Vec<String>, now: u64) {
 
 /// NOTES ONE AUTHENTICATED MEMBER ANSWER into the evidence in `dir` (the place's directory,
 /// [`crate::record::dir`]): `member` (a node id, a Commons identity) answered on `lane` from
-/// `addr` at `at_ms`, the dial having begun at `began_ms`. Call it only for a proven answer.
-/// Coalesced in-process: the same member on the same lane at most once a [`COALESCE_MS`] within
-/// a stay, the first after a move at once.
+/// `addr` at `at_ms`, the dial having begun at `began_ms` in a round that began on `began_on`
+/// (the strong network id [`crate::facts::network_now`] read then). The answer is booked on that
+/// network only where this Mac's traffic still leaves on it now ([`Answer::network`]): a move
+/// under the round, or a gateway not read at either end, books it on none. `logged`: the round
+/// ran under this Mac's vault's membership log ([`Answer::logged`]). Call it only for a proven
+/// answer. Coalesced in-process: the same member on the same lane at most once a
+/// [`COALESCE_MS`] within a stay, the first after a move at once.
 pub fn note_answer(
     dir: &Path,
-    lane: Lane,
-    member: &str,
+    (lane, member): (Lane, &str),
     addr: Option<IpAddr>,
+    (began_on, logged): (Option<&NetworkId>, bool),
     (began_ms, at_ms): (u64, u64),
 ) {
     let key = member_key(lane, member);
@@ -435,11 +592,18 @@ pub fn note_answer(
             return;
         }
     }
+    let via = addr.and_then(crate::facts::route_via);
+    let network = began_on
+        .filter(|began_on| crate::facts::network_now().as_ref() == Some(*began_on))
+        .cloned();
     let answer = Answer {
         lane,
         member: key,
         addr: addr.map(|addr| addr.to_canonical()),
-        via: addr.and_then(crate::facts::route_via),
+        via,
+        iface: via.and_then(crate::facts::interface_holding),
+        network,
+        logged,
         began_ms,
         at_ms,
     };
@@ -554,12 +718,43 @@ pub fn note_internet(dir: &Path, ok: bool, source: InternetSource, endpoint: &st
 mod tests {
     use super::*;
 
+    #[test]
+    fn direct_observations_do_not_replace_or_delay_admission_evidence() {
+        let root = aterm_tempfile::tempdir().expect("scratch state");
+        let dir = root.path();
+        let first = answer("m1", 1_000);
+        add(
+            dir,
+            Evidence {
+                answers: vec![first.clone()],
+                ..Evidence::default()
+            },
+        )
+        .unwrap();
+        let scan = answer("m1", 2_000);
+        note_observations(dir, vec![scan]);
+        assert_eq!(read_counted(dir).0.answers, [first]);
+        let displayed = read_for_place(dir);
+        assert_eq!(displayed.answers.len(), 1);
+        assert_eq!(displayed.answers[0].at_ms, 2_000);
+        assert!(!displayed.answers[0].logged);
+        assert_eq!(displayed.answers[0].network, None);
+
+        let heartbeat = answer("m1", 2_001);
+        note_answers(dir, vec![heartbeat.clone()]);
+        assert_eq!(read_counted(dir).0.answers, [heartbeat]);
+        assert_eq!(read_for_place(dir).answers[0].at_ms, 2_001);
+    }
+
     fn answer(member: &str, at_ms: u64) -> Answer {
         Answer {
             lane: Lane::Fleet,
             member: member_key(Lane::Fleet, member),
             addr: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 4, 7))),
             via: Some(Ipv4Addr::new(192, 168, 4, 31)),
+            iface: Some("en0".to_owned()),
+            network: NetworkId::parse("n00112233445566ff"),
+            logged: true,
             began_ms: at_ms - 100,
             at_ms,
         }
@@ -594,6 +789,105 @@ mod tests {
             sorted.answers.sort_by_key(|a| a.at_ms);
             sorted
         });
+    }
+
+    /// An answer line keeps the interface its route took, the network it was heard on (`-`
+    /// where unread) and whether its round ran under the vault's membership log, and a line whose
+    /// interface word is no interface name, whose network word is no network id, whose log word
+    /// is neither, or one of an earlier build's shape (no interface, no network, no log word), is
+    /// no answer: a member counts only with the interface and network it came over.
+    /// NEGATIVE CONTROLS: `answer_line` leaving the interface word out writes a line `parse`
+    /// passes over, and "the interface, network and log read back" fails; leaving the network
+    /// word out fails it too; writing `-` for every log word reads the logged answer back
+    /// unlogged and fails it.
+    #[test]
+    fn an_answers_interface_network_and_log_read_back() {
+        let unread = Answer {
+            iface: None,
+            network: None,
+            logged: false,
+            ..answer("m1", 2_000)
+        };
+        let evidence = Evidence {
+            answers: vec![answer("m0", 1_000), unread.clone()],
+            ..Evidence::default()
+        };
+        assert_eq!(
+            parse(&format(&evidence)).answers,
+            evidence.answers,
+            "the interface, network and log read back"
+        );
+        let member = member_key(Lane::Fleet, "m2");
+        for line in [
+            format!("a fleet {member} 192.168.4.7 192.168.4.31 en/0 - log 900 1000\n"),
+            format!("a fleet {member} 192.168.4.7 192.168.4.31 en0 home log 900 1000\n"),
+            format!("a fleet {member} 192.168.4.7 192.168.4.31 en0 - yes 900 1000\n"),
+            format!("a fleet {member} 192.168.4.7 192.168.4.31 en0 - 900 1000\n"),
+            format!("a fleet {member} 192.168.4.7 192.168.4.31 en0 900 1000\n"),
+            format!("a fleet {member} 192.168.4.7 192.168.4.31 900 1000\n"),
+        ] {
+            assert!(parse(&line).answers.is_empty(), "{line}");
+        }
+    }
+
+    /// A noted answer is booked on the network its round began on only where this Mac's traffic
+    /// still leaves on that network when it is noted: a round that began on another network (this
+    /// Mac moved under it), one that began before the gateway was read, and a note made while
+    /// the gateway is unread book it on none.
+    /// NEGATIVE CONTROL: `note_answer` booking the answer on `began_on` as given (no comparison
+    /// with `network_now`) books the round begun on the other network there, and "a round begun
+    /// elsewhere is booked on none" fails.
+    #[test]
+    fn an_answer_is_booked_on_the_network_its_round_began_and_ended_on() {
+        let root = aterm_tempfile::tempdir().expect("a scratch directory");
+        let dir = crate::record::dir(root.path());
+        let route = |hw: Option<Vec<u8>>| crate::place::RouteFacts {
+            interface: "en0".to_owned(),
+            address: Ipv4Addr::new(192, 168, 4, 31),
+            prefix: 22,
+            gateway: Some(Ipv4Addr::new(192, 168, 4, 1)),
+            gateway_hw: hw,
+        };
+        let here = route(Some(vec![0, 1, 2, 3, 4, 5]));
+        let there = route(Some(vec![0, 1, 2, 3, 4, 9]));
+        let (here_id, there_id) = (NetworkId::of(&here), NetworkId::of(&there));
+        let script = |route: crate::place::RouteFacts| crate::facts::Script {
+            facts: crate::place::Facts {
+                route: Some(route),
+                ..crate::place::Facts::default()
+            },
+            via: Vec::new(),
+        };
+        let noted =
+            |member: &str, facts: crate::place::RouteFacts, began_on: Option<&NetworkId>| {
+                crate::facts::script_here(script(facts), || {
+                    note_answer(
+                        &dir,
+                        (Lane::Fleet, member),
+                        Some(IpAddr::V4(Ipv4Addr::new(192, 168, 4, 9))),
+                        (began_on, true),
+                        (1_000, 1_500),
+                    );
+                });
+                read(&dir)
+                    .answers
+                    .into_iter()
+                    .find(|answer| answer.member == member_key(Lane::Fleet, member))
+                    .expect("noted")
+                    .network
+            };
+        assert_eq!(noted("m0", here.clone(), here_id.as_ref()), here_id, "here");
+        assert_eq!(
+            noted("m1", here.clone(), there_id.as_ref()),
+            None,
+            "a round begun elsewhere is booked on none"
+        );
+        assert_eq!(noted("m2", here, None), None, "a round begun unread");
+        assert_eq!(
+            noted("m3", route(None), here_id.as_ref()),
+            None,
+            "a note made unread"
+        );
     }
 
     /// Every process can add a note while the keeper runs: the lock is held only for one
@@ -670,8 +964,14 @@ mod tests {
         let dir = crate::record::dir(root.path());
         let addr = Some(IpAddr::V4(Ipv4Addr::new(10, 9, 8, 7)));
         let t = 1_800_000_000_000;
-        note_answer(&dir, Lane::Commons, "peer-a", addr, (t, t));
-        note_answer(&dir, Lane::Commons, "peer-a", addr, (t + 1_000, t + 1_000));
+        note_answer(&dir, (Lane::Commons, "peer-a"), addr, (None, false), (t, t));
+        note_answer(
+            &dir,
+            (Lane::Commons, "peer-a"),
+            addr,
+            (None, false),
+            (t + 1_000, t + 1_000),
+        );
         let lines = |dir: &Path| {
             read(dir)
                 .answers
@@ -696,7 +996,13 @@ mod tests {
             ..crate::record::Written::default()
         };
         crate::record::write(&dir, &moved).expect("the record");
-        note_answer(&dir, Lane::Commons, "peer-a", addr, (t + 3_000, t + 3_000));
+        note_answer(
+            &dir,
+            (Lane::Commons, "peer-a"),
+            addr,
+            (None, false),
+            (t + 3_000, t + 3_000),
+        );
         assert_eq!(
             lines(&dir),
             [t + 3_000],
@@ -704,9 +1010,9 @@ mod tests {
         );
         note_answer(
             &dir,
-            Lane::Commons,
-            "peer-a",
+            (Lane::Commons, "peer-a"),
             addr,
+            (None, false),
             (t + 70_000, t + 70_000),
         );
         assert_eq!(lines(&dir), [t + 70_000], "a minute on");
@@ -808,5 +1114,79 @@ mod tests {
             (book.members[1].addr, book.members[1].answered_ms),
             (None, None)
         );
+    }
+
+    /// Torn internet lines (empty, control-character, or oversize endpoints) count as unread in
+    /// `parse_counted`, and `parse_book` ignores rows whose member word is not a 16-hex-digit hash.
+    /// NEGATIVE CONTROL: accepting `*endpoint` unchecked parses `"i ok api-probe 1000 "` with
+    /// `passed == 0`, and skipping the 16-hex check in `parse_book` inflates `book.members`.
+    #[test]
+    fn torn_internet_endpoints_and_malformed_book_members_are_passed_over() {
+        let overlong = "x".repeat(MAX_ENDPOINT + 1);
+        for bad in [
+            "i ok api-probe 1000 \n".to_owned(),
+            "i ok api-probe 1000 host\x07\n".to_owned(),
+            format!("i ok api-probe 1000 {overlong}\n"),
+        ] {
+            let (ev, passed) = parse_counted(&bad);
+            assert!(ev.internet.is_empty(), "{bad:?}");
+            assert_eq!(passed, 1, "{bad:?}");
+        }
+        let valid_member = member_key(Lane::Fleet, "node-a");
+        let book = parse_book(&format!(
+            "m {valid_member} - - -\n\
+             m  - - -\n\
+             m nothex0123456789 - - -\n\
+             m abcd - - -\n"
+        ));
+        assert_eq!(book.members.len(), 1);
+        assert_eq!(book.members[0].member, valid_member);
+    }
+
+    /// Unterminated trailing lines, uppercase hex member keys, and unreadable/loose evidence files
+    /// count as unread in `parse_counted` / `read_counted` so `proof::read_with` refuses to treat
+    /// partial or untrusted files as clean silence.
+    /// NEGATIVE CONTROL: iterating `text.lines()` in `parse_counted` accepts a truncated trailing
+    /// line without `'\n'`, `is_ascii_hexdigit` admits uppercase member keys, and `unwrap_or_default`
+    /// in `read_counted` returns `passed == 0` when `heard` has mode `0o644` or non-UTF-8 bytes.
+    #[test]
+    fn unterminated_lines_uppercase_members_and_unreadable_ledgers_count_as_unread() {
+        let valid_member = member_key(Lane::Fleet, "node-a");
+        let upper_member = valid_member.to_ascii_uppercase();
+        let truncated = format!("a fleet {valid_member} 192.168.4.7 192.168.4.31 en0 - log 900 10");
+        let (ev_trunc, passed_trunc) = parse_counted(&truncated);
+        assert!(ev_trunc.answers.is_empty());
+        assert_eq!(passed_trunc, 1);
+
+        let upper_line =
+            format!("a fleet {upper_member} 192.168.4.7 192.168.4.31 en0 - log 900 1000\n");
+        let (ev_upper, passed_upper) = parse_counted(&upper_line);
+        assert!(ev_upper.answers.is_empty());
+        assert_eq!(passed_upper, 1);
+        assert!(
+            parse_book(&format!("m {upper_member} - - -\n"))
+                .members
+                .is_empty()
+        );
+
+        let root = aterm_tempfile::tempdir().expect("scratch state");
+        let dir = crate::record::dir(root.path());
+        assert_eq!(read_counted(&dir), (Evidence::default(), 0));
+        aterm_uds::private_file::ensure_private_dir(&dir).expect("private dir");
+        let file = dir.join(FILE);
+        std::fs::write(&file, [0xff, 0xfe, b'\n']).expect("write non-utf8");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(read_counted(&dir), (Evidence::default(), 1));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::write(&file, "r fleet 0 1000 2000 0\n").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(read_counted(&dir), (Evidence::default(), 1));
+        }
     }
 }

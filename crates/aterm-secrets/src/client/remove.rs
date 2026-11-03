@@ -11,8 +11,8 @@
 //!   this log holds, else the record that let it in), mints a new epoch for every audience the Mac
 //!   was in that this Mac opens (`[everyone]`, Commons, and each host list whose newest epoch
 //!   wraps it), wraps each to the members who remain and reseals the current entries under it.
-//!   The `[everyone]` reseal carries the revoke cascade (the roster's deny-lists, the pool's slots,
-//!   and on `--stolen` a new fleet code). It returns the entries the Mac could read, for rotation
+//!   The `[everyone]` reseal carries the revoke cascade (the Mac's roster row and pool slots, a new
+//!   fleet code, and on `--stolen` the roster's deny-lists). It returns the entries the Mac could read, for rotation
 //!   at the provider, and on `--stolen` the one `NEEDS YOU:` line (C25).
 //! - [`tend_epochs`] is the coverage rule on every vault pass: where removals on two sides of a
 //!   split left two newest epochs, or a newest epoch is still wrapped to a Mac the log removed
@@ -193,7 +193,7 @@ fn day(ms: u64) -> String {
 
 /// The trusted log this Mac's vault holds: a genesis its pin trusts, holding epochs. `None` where
 /// it holds none (ALab until F12b, or a vault nobody founded a log for).
-fn trusted_store(paths: &Paths) -> crate::Result<Option<Store>> {
+pub(super) fn trusted_store(paths: &Paths) -> crate::Result<Option<Store>> {
     let Some(config) = config(paths)? else {
         return Ok(None);
     };
@@ -565,7 +565,7 @@ pub fn vault_admin_named(paths: &Paths, who: &str) -> Option<String> {
 /// by a person's act (`aterm members remove`, F16): sign its `Remove`, mint a new epoch for every
 /// audience it was in that this Mac opens, wrap each to the members who remain, reseal the
 /// current entries with the revoke cascade, keep the records, and post them to every server this
-/// Mac reaches. With `stolen` the fleet code rotates too, and the result carries the `NEEDS YOU:`
+/// Mac reaches. The fleet code rotates too; with `stolen` the result carries the `NEEDS YOU:`
 /// line (C25). It runs under this Mac's state lock, never inside the `ask` exchange.
 ///
 /// # Errors
@@ -1369,11 +1369,28 @@ const EPOCH_RANK_DOMAIN: &[u8] = b"aterm/members/epoch-rank/1\0";
 /// [`tend_epochs_at`] at the wall clock, and what it signed posted to every server this Mac
 /// reaches: the subscriber's pass after it pulls records. Best effort: a pass that fails here
 /// tries again on the next.
+///
+/// # Errors
+/// As [`tend_epochs_at`].
 pub fn tend_epochs(paths: &Paths) -> crate::Result<Vec<Record>> {
+    tend_epochs_by(paths, None)
+}
+
+/// [`tend_epochs`], what it signed posted by `posts_by` (one exchange from when it posts where
+/// none is given, [`super::admit::post_records_to_servers_by`]): a deadline the pass's other
+/// posts share.
+///
+/// # Errors
+/// As [`tend_epochs_at`].
+pub(super) fn tend_epochs_by(
+    paths: &Paths,
+    posts_by: Option<Instant>,
+) -> crate::Result<Vec<Record>> {
     let now_ms = aterm_time::unix_millis().unwrap_or(0);
     let signed = tend_epochs_at(paths, now_ms)?;
     if !signed.is_empty() {
-        let _ = post_records_to_servers(paths);
+        let by = posts_by.unwrap_or_else(super::fan_out::one_exchange);
+        let _ = super::admit::post_records_to_servers_by(paths, by);
     }
     Ok(signed)
 }
@@ -1402,10 +1419,10 @@ pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> 
         return Ok(Vec::new());
     };
     let me_recipient = identity.recipient();
-    let active_recipients_of = |log: &Log| -> BTreeSet<Recipient> {
-        let local_roster = log_entries::local_swarm_roster_for_log(paths, log);
+    let active_recipients_of = |log: &Log| -> crate::Result<BTreeSet<Recipient>> {
+        let local_roster = log_entries::local_swarm_roster_for_log(paths, log)?;
         let membership = log.membership();
-        membership
+        Ok(membership
             .members()
             .iter()
             .filter(|(actor, m)| {
@@ -1421,9 +1438,9 @@ pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> 
                         .is_some_and(|r| log_entries::member_denied_by_roster(r, m))
             })
             .map(|(_, m)| m.binding.recipient())
-            .collect()
+            .collect())
     };
-    let active = active_recipients_of(log);
+    let active = active_recipients_of(log)?;
     let hosts_due = log.hosts_rotation_due(&me_recipient);
     if !log.rotation_due(&me_recipient, &active) && hosts_due.is_empty() {
         let _ = std::fs::remove_file(epoch_mark_file(paths));
@@ -1473,7 +1490,7 @@ pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> 
         let Some(mut log) = store.log().cloned() else {
             return Ok((Vec::new(), ()));
         };
-        let active = active_recipients_of(&log);
+        let active = active_recipients_of(&log)?;
         let coalesce = log.rotation_due(&me_recipient, &active);
         if !coalesce && log.hosts_rotation_due(&me_recipient).is_empty() {
             return Ok((Vec::new(), ()));
@@ -1740,7 +1757,7 @@ pub fn member_list(paths: &Paths) -> crate::Result<Option<Vec<ListedMac>>> {
     let Some(log) = store.log() else {
         return Ok(None);
     };
-    let local_roster = log_entries::local_swarm_roster_for_log(paths, log);
+    let local_roster = log_entries::local_swarm_roster_for_log(paths, log)?;
     let membership = log.membership();
     let mut out: Vec<ListedMac> = membership
         .members()

@@ -90,8 +90,8 @@ mod measuring {
         match rewind_cost::measure(rig, row) {
             Ok(report) if report.verdict == ShapeVerdict::Pass => Outcome::Pass(report.line),
             Ok(report) => Outcome::Fail(format!(
-                "REWIND COST FAILED: recording on cost past its bound, or a bundle that records \
-                 by default is past the idle target.\n  {}",
+                "REWIND COST FAILED: recording lost input or exceeded its cost bound, or a bundle \
+                 that records by default is past the idle target.\n  {}",
                 report.line
             )),
             Err(CouldNotRun::Unanswered(why)) => Outcome::Unanswered(why),
@@ -132,11 +132,57 @@ mod measuring {
         );
         support::run("rewind", ROWS, |row| take(&rig, row))
     }
+
+    /// A separate explicit collection mode: never mounted in the acceptance row list.
+    pub fn diagnostic(args: &[String]) -> Option<std::process::ExitCode> {
+        const FLAG: &str = "--recording-cost-diagnostic";
+        const REFERENCE: &str = "--recording-reference-diagnostic";
+        if !args.iter().any(|arg| arg == FLAG || arg == REFERENCE) {
+            return None;
+        }
+        let (_, args) = match super::quiet::parse_args(args.iter().cloned()) {
+            Ok(parsed) => parsed,
+            Err(why) => {
+                eprintln!("recording diagnostic: {why}");
+                return Some(std::process::ExitCode::from(2));
+            }
+        };
+        let [flag, subject, producer, output] = args.as_slice() else {
+            eprintln!(
+                "usage: rewind ({FLAG}|{REFERENCE}) SUBJECT PRODUCER EXISTING_PRIVATE_DIRECTORY [--admit now|wait]"
+            );
+            return Some(std::process::ExitCode::from(2));
+        };
+        if ![FLAG, REFERENCE].contains(&flag.as_str()) {
+            return Some(std::process::ExitCode::from(2));
+        }
+        let rig = Rig {
+            aterm: std::path::PathBuf::from(subject.as_str()),
+            fake_tui: std::path::PathBuf::from(producer.as_str()),
+        };
+        Some(super::quiet::run(
+            "rewind recording diagnostic",
+            || match if flag.as_str() == REFERENCE {
+                rewind_cost::diagnose_reference(&rig, std::path::Path::new(output))
+            } else {
+                rewind_cost::diagnose(&rig, std::path::Path::new(output))
+            } {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("recording diagnostic: REFUSED — {error}; no acceptance verdict");
+                    std::process::ExitCode::from(3)
+                }
+            },
+        ))
+    }
 }
 
 fn main() -> std::process::ExitCode {
     #[cfg(unix)]
     {
+        if let Some(code) = measuring::diagnostic(&std::env::args().skip(1).collect::<Vec<_>>()) {
+            return code;
+        }
         quiet::run("rewind", measuring::run)
     }
     #[cfg(not(unix))]

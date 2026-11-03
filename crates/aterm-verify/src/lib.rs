@@ -104,6 +104,8 @@ pub struct EnvSnapshot {
     pub rust_test_threads: Option<OsString>,
     /// `CARGO_HOME`.
     pub cargo_home: Option<PathBuf>,
+    /// The enabled native package prefix, resolved by the package manager.
+    pub native_packages: Option<PathBuf>,
 }
 
 impl EnvSnapshot {
@@ -111,6 +113,9 @@ impl EnvSnapshot {
     #[must_use]
     pub fn capture() -> Self {
         let var_path = |k: &str| std::env::var_os(k).map(PathBuf::from);
+        let native = atpkg::abrew::prefix::Prefix::resolve();
+        let native_packages =
+            (native.root.is_absolute() && !native.is_disabled()).then_some(native.root);
         Self {
             path: std::env::var_os("PATH").unwrap_or_default(),
             home: var_path("HOME").unwrap_or_default(),
@@ -131,8 +136,24 @@ impl EnvSnapshot {
                 .filter_map(|k| Some((*k, std::env::var_os(k)?)))
                 .collect(),
             rust_test_threads: std::env::var_os("RUST_TEST_THREADS"),
+            native_packages,
         }
     }
+}
+
+/// Keep the caller's choices first, then expose enabled native package tools
+/// to build and test children even when the invoking agent predates shellenv.
+fn native_package_path(path: &OsStr, prefix: Option<&Path>) -> OsString {
+    let Some(prefix) = prefix.filter(|prefix| prefix.is_absolute()) else {
+        return path.to_os_string();
+    };
+    let mut paths: Vec<PathBuf> = std::env::split_paths(path).collect();
+    for dir in [prefix.join("bin"), prefix.join("sbin")] {
+        if !paths.contains(&dir) {
+            paths.push(dir);
+        }
+    }
+    std::env::join_paths(paths).unwrap_or_else(|_| path.to_os_string())
 }
 
 /// The variables that move cargo's target or build directory, and the home whose config may.
@@ -232,6 +253,50 @@ pub struct MeasureArtifact {
     pub commit: Option<String>,
 }
 
+/// Maximum byte size for a single regular file read by `aterm-verify` (128 MiB).
+pub(crate) const MAX_VERIFY_FILE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Open a regular file without blocking on FIFOs.
+pub(crate) fn open_regular(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
+    let path = path.as_ref();
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Read a regular file up to [`MAX_VERIFY_FILE_BYTES`] without blocking on FIFOs.
+pub(crate) fn read_regular(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
+    aterm_uds::atomic_file::read_regular(path.as_ref(), MAX_VERIFY_FILE_BYTES)
+        .map(|(bytes, _)| bytes)
+}
+
+/// Read a regular UTF-8 file up to [`MAX_VERIFY_FILE_BYTES`] without blocking on FIFOs.
+pub(crate) fn read_regular_text(path: impl AsRef<Path>) -> std::io::Result<String> {
+    aterm_uds::atomic_file::read_regular_text(path.as_ref(), MAX_VERIFY_FILE_BYTES)
+}
+
+/// Read what a child of verify wrote into a file verify made for it (its captured stdout or
+/// stderr, a check's log): a regular file opened without blocking on FIFOs, whatever its size.
+/// Its size is the child's, as a pipe's would be, never [`MAX_VERIFY_FILE_BYTES`]: the
+/// workspace's `--no-dedupe` test forest for aarch64-unknown-linux-gnu is over 500 MB.
+pub(crate) fn read_captured(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
+    aterm_uds::atomic_file::read_regular(path.as_ref(), u64::MAX).map(|(bytes, _)| bytes)
+}
+
 impl MeasureArtifact {
     /// The bundle at `app`.
     ///
@@ -246,7 +311,7 @@ impl MeasureArtifact {
                 app.display()
             ));
         }
-        let plist = std::fs::read_to_string(app.join("Contents/Info.plist")).unwrap_or_default();
+        let plist = read_regular_text(app.join("Contents/Info.plist")).unwrap_or_default();
         let read = |key| plist_string(&plist, key).map(str::to_string);
         Ok(Self {
             version: read("CFBundleShortVersionString"),
@@ -336,6 +401,9 @@ pub struct Ctx {
     pub child_env_add: Vec<(OsString, OsString)>,
     /// The `build.build-dir` the main lane's children are handed as `--config`.
     pub main_build_dir: Option<String>,
+    /// Side-lane artifacts under the managed build cache, when the shim selected one.
+    /// Caller-selected layouts keep side lanes beside their target directory.
+    pub cached_lanes_dir: Option<PathBuf>,
     /// What the run's toolchain lease is, for the log ([`hold_toolchain`]).
     pub toolchain_lease: Option<String>,
     /// HEAD, in full, when the run's selection was read ([`report::moved_checkout`]); unset, the
@@ -348,6 +416,8 @@ pub struct Ctx {
     pub no_windows: bool,
     /// A focused GUI pacing measurement, never release qualification.
     pub cursor_pacing: bool,
+    /// Run only the test compilation stage, never a release qualification.
+    pub compile_only: bool,
     /// `--app <APP>`.
     pub measure_artifact: Option<MeasureArtifact>,
     /// Requested `--test-jobs` ceiling; [`Self::test_jobs`] applies admission.
@@ -358,9 +428,10 @@ pub struct Ctx {
     pub test_recorder: Option<PathBuf>,
     /// How the timing stages ([`plan::TIMED`]), and the browser lane where Safari's window takes
     /// the desk (`browser::takes_the_desk`), take the quiet machine: the run waits in the
-    /// per-user capacity ledger for one quiet claim before its first (`Some(Wait)`), or takes it
-    /// at once (`Some(Now)`, `--admit now`), and holds it until its last ends; `None` runs them
-    /// with no claim.
+    /// per-user capacity ledger for measured admission before its first (`Some(Wait)`), and
+    /// retains bounded protection through its stages. `Some(Now)` cannot qualify Timing and
+    /// starts no timed callback. `None` is the caller's explicit untimed/outer-owned contract;
+    /// it supplies no CPU observation or measurement qualification.
     pub quiet: Option<aterm_capacity::Admit>,
     /// This run's record of its stage groups ([`runs::Runs`]), when it keeps one.
     pub runs: Option<runs::Runs>,
@@ -371,6 +442,8 @@ pub struct Ctx {
     /// run's own compile, are COULD NOT RUN behind it and start no cargo, since a recompile of
     /// what failed would run under a claim learned when it passed, or none.
     pub test_compile_failed: std::sync::atomic::AtomicBool,
+    /// Checker-enabled compilation failed; its runtime stage must not retry it.
+    pub checkers_compile_failed: std::sync::atomic::AtomicBool,
     /// What resolves a call's unit graph for the test compile's planner ([`shape::shape`]): its
     /// `--unit-graph` document, or why not; [`stages::unit_graph`] (resolved, never built) but
     /// in a test.
@@ -427,12 +500,19 @@ impl Ctx {
         scratch: PathBuf,
         tools: Toolchain,
     ) -> Self {
-        let path_env = tools.path_with_stage2_first(&env.path);
+        let path_env = native_package_path(
+            &tools.path_with_stage2_first(&env.path),
+            env.native_packages.as_deref(),
+        );
         let target_dir = env
             .cargo_target_dir
             .clone()
             .unwrap_or_else(|| root.join("target"));
         let shim_build_dir = main_build_dir(&env, &root);
+        let cached_lanes_dir = shim_build_dir
+            .as_deref()
+            .and_then(|value| disk::build_dir_path(value, &root))
+            .map(|dir| dir.join("verify").join(aterm_tempfile::QUIET));
         let mut child_env_add: Vec<(OsString, OsString)> = Vec::new();
         if shim_build_dir.is_none() {
             child_env_add.push((
@@ -465,11 +545,13 @@ impl Ctx {
             child_env_remove: CHILD_ENV_REMOVED.to_vec(),
             child_env_add,
             main_build_dir,
+            cached_lanes_dir,
             toolchain_lease: None,
             head_at_start: None,
             child_ceiling: Some(exec::DEFAULT_CHILD_CEILING),
             no_windows: false,
             cursor_pacing: false,
+            compile_only: false,
             measure_artifact: None,
             test_jobs: testrun::DEFAULT_JOBS,
             test_threads: pinned_threads,
@@ -478,6 +560,7 @@ impl Ctx {
             runs: None,
             memory: None,
             test_compile_failed: std::sync::atomic::AtomicBool::new(false),
+            checkers_compile_failed: std::sync::atomic::AtomicBool::new(false),
             unit_graph: stages::unit_graph,
             shape_run: Mutex::new(shape::Run::default()),
             unit_reader: memory::read_unit,
@@ -660,6 +743,12 @@ impl Ctx {
         self
     }
 
+    /// Compile tests with the ordinary test stage's cache and resource admission.
+    pub const fn with_compile_only(mut self, compile_only: bool) -> Self {
+        self.compile_only = compile_only;
+        self
+    }
+
     /// `--app <APP>`.
     #[must_use]
     pub fn with_measure_artifact(mut self, artifact: Option<MeasureArtifact>) -> Self {
@@ -737,6 +826,9 @@ impl Ctx {
         }
         if self.cursor_pacing && check == Check::Measure {
             cmd.push_str(" --cursor-pacing");
+        }
+        if self.compile_only && matches!(check, Check::Test | Check::Checkers) {
+            cmd.push_str(" --compile-only");
         }
         if self.no_windows && check.spec().stages.iter().any(|id| id.opens_windows()) {
             cmd.push_str(" --no-windows");
@@ -831,11 +923,12 @@ fn admit_in(
 /// same bound (`exec::Clock::stuck`).
 pub(crate) const STUCK_ENDS: Duration = aterm_toolchain::stall::STALLED_AFTER;
 
-/// The run's quiet machine ([`Ctx::quiet`]): one claim, admitted before the run's first timed
-/// stage and let go when its last stage and its bounded workers end, so another run's timed
-/// stages wait for all of this run's rather than taking turns with them.
+/// The run's cached stage reservation ([`Ctx::quiet`]), shared while its bounded hold remains
+/// valid. A later stage freshly admits a replacement after expiry; the old record remains
+/// owned by any earlier stage or bounded worker until that work ends. Each measurement
+/// collector separately establishes its own postcompile entry evidence and protection.
 struct Quiet {
-    /// The claim, once admitted.
+    /// The currently cached claim, once admitted; old workers can retain earlier claims.
     claim: Option<Arc<aterm_capacity::Claim>>,
     /// The run's timed stages still to end ([`takes_quiet`]).
     left: usize,
@@ -923,6 +1016,14 @@ pub(crate) fn admission(
     first: bool,
 ) -> String {
     let bound = claim.record().need.quiet.unwrap_or_default();
+    if claim.record().need.quiet_policy == aterm_capacity::QuietPolicy::Timing {
+        let evidence = claim.record().timing;
+        return evidence.admission.map_or_else(
+            || "timing reservation with unknown admission CPU; no measurement qualification".into(),
+            |window|format!("{} timing reservation; admission CPU {:.2}% over {:.3}s at epoch {}ms, load {:?} <= {bound:.1}; admission sample is not fresh measurement-entry evidence or continuous quiet",
+                if first {"acquired"}else{"retained"},window.busy_ticks as f64*100.0/window.total_ticks as f64,window.interval_ns as f64/1e9,window.observed_ms,evidence.admission_load1),
+        );
+    }
     let how = claim
         .quiet()
         .filter(|q| q.at_bound || !q.reserved.is_zero())
@@ -945,8 +1046,12 @@ pub(crate) fn admission(
 /// Run a timed stage on the run's quiet machine ([`Quiet`]): the first one's claim is admitted
 /// before it starts, waiting for the load within its patience ([`aterm_capacity::QUIET_PATIENCE`])
 /// and saying once a minute what it waits for, and let go when the last one's `f` and any bounded
-/// worker it left running end. A ledger that cannot be used is said, and the stage runs
-/// unadmitted, as a run with no claim does.
+/// worker it left running end. Unavailable, forced or expired timing admission starts no
+/// callback. A later stage replaces an expired cached reservation through fresh admission;
+/// existing stage and bounded-worker shares retain ownership of their original claim record,
+/// without extending its expired protection.
+/// Measurement collectors establish their own fresh entry after compilation;
+/// this retained stage reservation is resource exclusion, not fresh CPU evidence.
 /// Also what the claim did, for the stage's time line.
 ///
 /// # Errors
@@ -961,6 +1066,30 @@ fn quietly<T>(
     title: &str,
     f: impl FnOnce() -> T,
 ) -> Result<(T, Option<String>), String> {
+    quietly_with(
+        ctx,
+        quiet,
+        title,
+        f,
+        aterm_capacity::Claim::timing_admission,
+        |q, need, mode| (q.admit)(need, mode),
+    )
+}
+
+fn quietly_with<T>(
+    ctx: &Ctx,
+    quiet: &Mutex<Quiet>,
+    title: &str,
+    f: impl FnOnce() -> T,
+    check: impl Fn(
+        &aterm_capacity::Claim,
+    ) -> Result<aterm_capacity::CpuWindow, aterm_capacity::TimingIssue>,
+    mut admit: impl FnMut(
+        &Quiet,
+        aterm_capacity::Need,
+        aterm_capacity::Admit,
+    ) -> Result<aterm_capacity::Claim, aterm_capacity::Error>,
+) -> Result<(T, Option<String>), String> {
     let Some(mode) = ctx.quiet else {
         return if stopping() {
             Err(ENDING.to_owned())
@@ -969,16 +1098,42 @@ fn quietly<T>(
         };
     };
     let mut q = quiet.lock().unwrap_or_else(PoisonError::into_inner);
+    // Expiry ends qualification, not an existing worker's ownership. Keep this local share
+    // through replacement admission; TLS and bounded workers retain their own old shares.
+    // Only expiry permits replacement, never unknown/forced provenance or another failure.
+    let checked = q.claim.as_ref().map(|c| check(c));
+    let retired = if matches!(checked, Some(Err(aterm_capacity::TimingIssue::Expired))) {
+        q.claim.take()
+    } else {
+        None
+    };
     let said = if stopping() {
         Err(None)
     } else {
         match &q.claim {
-            Some(claim) => Ok(admission(claim, mode, false)),
-            None => match (q.admit)(
+            Some(claim) => {
+                match checked.unwrap_or(Err(aterm_capacity::TimingIssue::UnknownAdmission)) {
+                    Ok(_) => Ok(admission(claim, mode, false)),
+                    Err(why) => {
+                        q.passed();
+                        return Err(format!(
+                            "{title}: timing reservation cannot qualify this stage: {why}; started nothing"
+                        ));
+                    }
+                }
+            }
+            None => match admit(
+                &q,
                 aterm_capacity::Need::timing(format!("verify {title}")).ends_when_stuck(STUCK_ENDS),
                 mode,
             ) {
                 Ok(claim) => {
+                    if let Err(why) = check(&claim) {
+                        q.passed();
+                        return Err(format!(
+                            "{title}: unqualified timing admission: {why}; started nothing"
+                        ));
+                    }
                     let said = admission(&claim, mode, true);
                     q.claim = Some(Arc::new(claim));
                     Ok(said)
@@ -988,12 +1143,15 @@ fn quietly<T>(
                     | aterm_capacity::Error::Stuck { .. }),
                 ) => Err(Some(e)),
                 Err(e) => {
-                    eprintln!("verify: {e}; {title} runs unadmitted");
-                    Ok(format!("unadmitted: {e}"))
+                    q.passed();
+                    return Err(format!(
+                        "{title}: timing admission unavailable: {e}; started nothing"
+                    ));
                 }
             },
         }
     };
+    drop(retired);
     let said = match said {
         Ok(said) => said,
         Err(stopped) => {
@@ -1070,6 +1228,9 @@ fn measured(
     meter: Option<&memory::Meter>,
 ) -> Option<String> {
     let book = ctx.memory.as_ref()?;
+    if !memory::metered(spec) {
+        return None;
+    }
     let meter = meter?;
     let peak = meter.held()?;
     let size = meter.peak().map_or_else(
@@ -1314,15 +1475,18 @@ fn staged(
     spec: &plan::StageSpec,
     held: Option<String>,
     seams: Seams,
-) -> (Report, Instant, String) {
+    on_started: impl Fn(),
+) -> (Report, Instant, String, Option<memory::ObservedCpu>) {
     let stage = seams.stage;
     let could_not_run = |why: String, held: Option<String>| {
         let mut report = Report::new(spec.title.clone());
         report.cannot_run(format!("{} — {why}", spec.title));
-        (report, Instant::now(), held.unwrap_or_default())
+        (report, Instant::now(), held.unwrap_or_default(), None)
     };
-    let meter = (ctx.memory.is_some() && memory::metered(spec)).then(|| {
-        if spec.id == plan::StageId::TestCompile {
+    // Every child can contribute CPU observations; only metered stages keep memory
+    // records, and compiler-unit attribution still requires the memory book.
+    let meter = Some({
+        if ctx.memory.is_some() && spec.id == plan::StageId::TestCompile {
             memory::Meter::attributing(ctx.unit_reader, memory::UNIT_FLOOR)
         } else {
             memory::Meter::new()
@@ -1337,6 +1501,7 @@ fn staged(
         let _covering = memory::covering(claim.as_ref().and_then(MemoryClaim::cover));
         let begun = Instant::now();
         let from = aterm_capacity::Live.read(None);
+        on_started();
         let report = stage(ctx, spec);
         let to = aterm_capacity::Live.read(None);
         Ok((report, begun, aterm_capacity::between(&from, &to), claim))
@@ -1371,7 +1536,8 @@ fn staged(
         machine.push_str(&said);
     }
     drop(claim);
-    (report, begun, machine)
+    let cpu = meter.as_ref().and_then(|meter| meter.observed_cpu());
+    (report, begun, machine, cpu)
 }
 
 /// The one header line.
@@ -1514,13 +1680,18 @@ fn run_with(
                 .unwrap_or_default();
             let owner = owners[i].and_then(|c| ctx.checks.iter().position(|k| *k == c));
             let held = held_note(&stages, i, held, budget);
-            let (report, begun_at, machine) = staged(ctx, &quiet, spec, held, seams);
+            let (report, begun_at, machine, cpu) = staged(ctx, &quiet, spec, held, seams, || {
+                if let Ok(mut o) = out.lock() {
+                    let event = report::stage_started(i, &spec.title);
+                    let _ = o.write_all(event.as_bytes()).and_then(|()| o.flush());
+                }
+            });
             let waiting = begun_at.saturating_duration_since(t0);
             let execution = begun_at.elapsed();
             // The ordered log and aggregate check result can wait for other stages;
             // the completed stage's decisions must already be visible to the caller.
             if let Ok(mut o) = out.lock() {
-                let event = report::stage_event(&report, waiting, execution);
+                let event = report::stage_event(i, &report, waiting, execution, cpu);
                 let _ = o.write_all(event.as_bytes()).and_then(|()| o.flush());
             }
             if let Some(k) = owner
@@ -1613,6 +1784,11 @@ fn toolchain_lines(ctx: &Ctx) -> String {
             .as_deref()
             .unwrap_or("<unpinned>")
     );
+    if ctx.compile_only {
+        s.push_str(
+            "test mode: compilation only; no test binaries execute and no release is qualified\n",
+        );
+    }
     if let Some(d) = &ctx.tools.demoted {
         s.push_str(&format!("toolchain note: {}\n", d.sentence()));
     }
@@ -1644,6 +1820,9 @@ fn toolchain_lines(ctx: &Ctx) -> String {
             "build cache: CARGO_TARGET_DIR={} (no shim cache here; the caller chose the build directory)\n",
             ctx.target_dir.display()
         )),
+    }
+    if let Some(dir) = &ctx.cached_lanes_dir {
+        s.push_str(&format!("verification cache: {}\n", dir.display()));
     }
     s
 }
@@ -1923,6 +2102,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_cells_pulled(cells_pulled)
         .with_no_windows(parsed.no_windows)
         .with_cursor_pacing(parsed.cursor_pacing)
+        .with_compile_only(parsed.compile_only)
         .with_measure_artifact(measure_artifact)
         .with_child_ceiling(parsed.timeout.unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)))
         .with_test_jobs(parsed.test_jobs)
@@ -2132,6 +2312,12 @@ pub use aterm_uds::host::{host_user_cache, user_cache};
 #[cfg(all(test, unix))]
 mod quiet_interrupt_tests;
 
+#[cfg(test)]
+mod timing_test_machine;
+
+#[cfg(test)]
+mod quiet_renewal_tests;
+
 #[cfg(all(test, unix))]
 mod interrupt_report_tests;
 
@@ -2141,6 +2327,62 @@ mod memory_claim_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child's captured output past the cap on the files verify reads is read whole (a sparse
+    /// file, so the test writes no 128 MiB to disk).
+    #[test]
+    fn a_childs_output_is_read_whole_past_the_file_cap() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let out = dir.path().join("stdout");
+        std::fs::File::create(&out)
+            .unwrap()
+            .set_len(MAX_VERIFY_FILE_BYTES + 1)
+            .unwrap();
+        assert!(read_regular(&out).is_err(), "an input file past the cap");
+        let read = read_captured(&out).expect("a child's output past the cap");
+        assert_eq!(
+            u64::try_from(read.len()).unwrap(),
+            MAX_VERIFY_FILE_BYTES + 1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_tools_find_native_packages_after_the_callers_choices() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let caller = dir.path().join("caller");
+        let native = dir.path().join("native");
+        standin(&caller.join("oracle"), "printf caller");
+        standin(&native.join("bin/oracle"), "printf native");
+        let ctx = Ctx::new(
+            dir.path().into(),
+            Scope::workspace(),
+            EnvSnapshot {
+                path: caller.as_os_str().to_owned(),
+                native_packages: Some(native),
+                ..EnvSnapshot::default()
+            },
+            dir.path().into(),
+        );
+        let run = || {
+            exec::run(
+                &exec::Cmd::new(aterm_uds::os_path!("sh")).args(["-c", "oracle"]),
+                ctx.exec_env(),
+            )
+        };
+        let first = run();
+        assert!(first.ok, "{}", first.output);
+        assert_eq!(first.output, "caller");
+        std::fs::remove_file(caller.join("oracle")).unwrap();
+        let second = run();
+        assert!(second.ok, "{}", second.output);
+        assert_eq!(second.output, "native");
+        assert_eq!(
+            native_package_path(caller.as_os_str(), None),
+            caller.as_os_str(),
+            "an absent or disabled native prefix adds no search path"
+        );
+    }
 
     /// A fixture going removes no name of the file another fixture's stand-in of the same text
     /// runs ([`standin`]): that file has one name, outside every fixture, and the stand-in
@@ -2377,6 +2619,38 @@ mod tests {
                 PathBuf::from("/tmp"),
             );
             assert_eq!(c.main_build_dir, got);
+            let cache = disk::build_dir_path(got.as_deref().unwrap(), &root).unwrap();
+            assert_eq!(plan::lanes_dir(&c), cache.join("verify/.ubd"));
+            assert!(plan::lanes_dir(&c).starts_with(&cache));
+            assert!(!plan::lanes_dir(&c).starts_with(&root));
+            let disk = disk::run_of(&c).unwrap();
+            assert!(disk.dirs.contains(&cache));
+            let lane = plan::lane_dir(&c, plan::Lane::TippyTarget).unwrap();
+            std::fs::create_dir_all(&lane).unwrap();
+            std::fs::write(lane.join("retained-artifact"), b"cached").unwrap();
+            std::fs::remove_dir(&root).unwrap();
+            std::fs::create_dir_all(&root).unwrap();
+            let recreated = Ctx::new(
+                root.clone(),
+                Scope::workspace(),
+                env.clone(),
+                PathBuf::from("/tmp"),
+            );
+            let retained = plan::lane_dir(&recreated, plan::Lane::TippyTarget).unwrap();
+            assert_eq!(retained, lane);
+            assert_eq!(
+                std::fs::read(retained.join("retained-artifact")).unwrap(),
+                b"cached"
+            );
+            let other = home.join("Developer/other");
+            std::fs::create_dir_all(&other).unwrap();
+            let other = Ctx::new(
+                other,
+                Scope::workspace(),
+                env.clone(),
+                PathBuf::from("/tmp"),
+            );
+            assert_ne!(plan::lane_dir(&other, plan::Lane::TippyTarget), Some(lane));
             assert!(!c.child_env_add.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"));
             assert_eq!(c.target_dir, root.join("target"));
             for var in &CARGO_LAYOUT_VARS[..3] {
@@ -2385,6 +2659,13 @@ mod tests {
                     ..env.clone()
                 };
                 assert_eq!(main_build_dir(&chosen, &root), None, "{var}");
+                let selected = Ctx::new(
+                    root.clone(),
+                    Scope::workspace(),
+                    chosen,
+                    PathBuf::from("/tmp"),
+                );
+                assert_eq!(selected.cached_lanes_dir, None, "{var}");
             }
             assert_eq!(
                 main_build_dir(&env, &tmp.join("elsewhere")),
@@ -2699,12 +2980,18 @@ mod tests {
     fn a_completed_stage_is_reported_before_its_dependent_runs() {
         use std::sync::atomic::{AtomicBool, Ordering};
         static REPORTED: AtomicBool = AtomicBool::new(false);
+        static STARTED: AtomicBool = AtomicBool::new(false);
         static DEPENDENT_RAN: AtomicBool = AtomicBool::new(false);
         struct LiveOutput;
         impl std::io::Write for LiveOutput {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if bytes.starts_with(b"verify-event: ") {
-                    REPORTED.store(true, Ordering::SeqCst);
+                if let Some(json) = bytes.strip_prefix(b"verify-event: ") {
+                    let event: aterm_json::Value = aterm_json::from_slice(json).unwrap();
+                    match event["event"].as_str() {
+                        Some("stage-started") => STARTED.store(true, Ordering::SeqCst),
+                        Some("stage-finished") => REPORTED.store(true, Ordering::SeqCst),
+                        _ => {}
+                    }
                 }
                 Ok(bytes.len())
             }
@@ -2713,6 +3000,10 @@ mod tests {
             }
         }
         fn stage(_: &Ctx, spec: &plan::StageSpec) -> Report {
+            assert!(
+                STARTED.load(Ordering::SeqCst),
+                "stage start was not reported"
+            );
             if spec.id != plan::StageId::TestCompile {
                 assert!(
                     REPORTED.load(Ordering::SeqCst),
@@ -2725,6 +3016,7 @@ mod tests {
             report
         }
         REPORTED.store(false, Ordering::SeqCst);
+        STARTED.store(false, Ordering::SeqCst);
         DEPENDENT_RAN.store(false, Ordering::SeqCst);
         let ctx = Ctx::new(
             PathBuf::from("/repo"),

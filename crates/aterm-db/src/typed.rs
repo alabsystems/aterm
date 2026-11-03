@@ -76,7 +76,7 @@ pub enum Derive {
     SignerUuid,
     /// Random at birth: for a key whose natural identity is a low-entropy secret.
     Random,
-    /// Built from other keys (a seat, an auth route).
+    /// Built from other keys (a preference, an auth route).
     Composite,
 }
 
@@ -127,6 +127,9 @@ pub enum Ty {
     Uint,
     /// Free text of at most this many bytes, guarded (`guard::text`).
     Text(usize),
+    /// An account's owner-editable name of at most this many bytes: free text that names no
+    /// machine (`guard::account_label`).
+    AccountLabel(usize),
     Enum(&'static [&'static str]),
     /// Unix milliseconds: an author's claim, never an ordering input.
     Time,
@@ -153,6 +156,11 @@ pub enum Ty {
     SrcRef,
     /// Bounded JSON, read-only in the grid.
     Json(usize),
+    /// One signed Commons record of an earlier table generation, at most this many bytes, as
+    /// padded base64 of its wire: still sealed under its own scope, roster and epoch key, so a
+    /// reader authenticates it before it reads anything in it (`registry.2`'s archived owned
+    /// rows, design §3.8). Read-only in the grid.
+    Sealed(usize),
 }
 
 impl Ty {
@@ -182,6 +190,7 @@ impl Ty {
             Self::Int { min, max } => json!({"int": [min, max]}),
             Self::Uint => json!("uint"),
             Self::Text(max) => json!({"text": max}),
+            Self::AccountLabel(max) => json!({"account_label": max}),
             Self::Enum(words) => json!({"enum": words}),
             Self::Time => json!("time"),
             Self::Day => json!("day"),
@@ -200,6 +209,7 @@ impl Ty {
                 .collect::<Vec<_>>()}),
             Self::SrcRef => json!("srcref"),
             Self::Json(max) => json!({"json": max}),
+            Self::Sealed(max) => json!({"sealed": max}),
         }
     }
 }
@@ -216,6 +226,9 @@ pub struct Column {
     /// The collection version that retired it; its name is never reused.
     pub retired: Option<u32>,
     pub writer: Writer,
+    /// The row's key derives from this column, so it is written at birth and never edited: a
+    /// row saying another pair under its key would be two mappings at once.
+    pub fixed: bool,
 }
 
 impl Column {
@@ -229,7 +242,13 @@ impl Column {
             since: 1,
             retired: None,
             writer: Writer::Owner,
+            fixed: false,
         }
+    }
+    /// The row's key derives from it: written at birth, never edited.
+    pub const fn fixed(mut self) -> Self {
+        self.fixed = true;
+        self
     }
     /// The column may be empty.
     pub const fn null(mut self) -> Self {
@@ -543,7 +562,7 @@ pub struct Table {
     /// generation; readers treat the rest as inert (design §3.7).
     pub self_quota: usize,
     /// Cells collections whose rows end rather than retire when the owner removes one (a
-    /// seat's slot ends; an account retires), so a deleted grid row takes that lifecycle word.
+    /// preference ends; an account retires), so a deleted grid row takes that lifecycle word.
     pub ends: &'static [&'static str],
 }
 
@@ -580,5 +599,69 @@ pub fn request_id(application: &str, role: &str, changes: &[Change]) -> crate::R
     Ok(request)
 }
 
+/// The `AlabCells` steps no code here takes (docs/DESIGN-alab-lab-model-2026-11-01.md §11 step
+/// 12): which law a walk checks, and what a writer has received.
+#[cfg(any(test, debug_assertions))]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AlabCells",
+        action = "ChooseRegister",
+        reason = "The model's choice of the law one walk checks: no code chooses it. alab_cells_conforms takes the register area's steps from a fresh history."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AlabCells",
+        action = "ChooseOwned",
+        reason = "The model's choice of the law one walk checks: no code chooses it. alab_cells_conforms takes the owned-row area's steps from a fresh history."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AlabCells",
+        action = "ChooseColumns",
+        reason = "The model's choice of the law one walk checks: no code chooses it. alab_cells_conforms takes the column area's steps from a fresh history."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AlabCells",
+        action = "ChooseQuota",
+        reason = "The model's choice of the law one walk checks: no code chooses it. alab_cells_conforms takes the quota area's steps from a fresh history."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AlabCells",
+        action = "ChoosePreference",
+        reason = "The model's choice of the law one walk checks: no code chooses it. The harness's alab_roster tests take the preference area's steps."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AlabCells",
+        action = "SeeA",
+        reason = "Commons repair delivering writer B's record to writer A is the environment: no typed code chooses it. alab_cells_conforms makes A's next write name B's latest record as a parent."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AlabCells",
+        action = "SeeB",
+        reason = "Commons repair delivering writer A's record to writer B is the environment: no typed code chooses it. alab_cells_conforms makes B's next write name A's latest record as a parent."
+    )
+)]
+#[doc(hidden)]
+pub fn alab_cells_environment() {}
+
+#[cfg(test)]
+mod model_tests;
 #[cfg(test)]
 mod tests;

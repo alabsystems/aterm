@@ -692,7 +692,7 @@ pub(crate) mod dents {
                     break;
                 };
                 let reclen = usize::from(reclen);
-                if reclen == 0 || off + reclen > n {
+                if reclen < 19 || off + reclen > n {
                     break;
                 }
                 let raw = &self.buf[off + 19..off + reclen];

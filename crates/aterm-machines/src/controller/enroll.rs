@@ -673,8 +673,8 @@ pub fn parse_facts(out: &str) -> Result<Facts, String> {
             sections.len()
         ));
     };
-    let uuid = crate::agent::platform::ioreg_value(ioreg, "IOPlatformUUID")
-        .filter(|u| crate::agent::platform::uuid_shaped(u))
+    let uuid = crate::hardware::ioreg_value(ioreg, "IOPlatformUUID")
+        .filter(|u| crate::hardware::uuid_shaped(u))
         .ok_or("the host printed no IOPlatformUUID")?;
     let tmpdir = tmp.trim().to_owned();
     if !tmpdir.starts_with('/') || tmpdir.contains(['\'', '"', '\\', '\n']) {
@@ -684,8 +684,7 @@ pub fn parse_facts(out: &str) -> Result<Facts, String> {
     }
     Ok(Facts {
         uuid,
-        serial: crate::agent::platform::ioreg_value(ioreg, "IOPlatformSerialNumber")
-            .unwrap_or_default(),
+        serial: crate::hardware::ioreg_value(ioreg, "IOPlatformSerialNumber").unwrap_or_default(),
         model: model.trim().to_owned(),
         arch: arch.trim().to_owned(),
         os_version: version.trim().to_owned(),
@@ -2254,7 +2253,7 @@ pub fn unenroll(
     })?;
     let ids: Vec<u64> = state.github_keys.iter().map(|(_, id)| *id).collect();
     if let (Some(github), false) = (&inv.github, ids.is_empty()) {
-        super::github::revoke(sys, &github.account, &ids)?;
+        super::github::revoke_via(sys, github, &ids)?;
         let _ = writeln!(
             out,
             "deleted {} GitHub key(s) from {}",
@@ -4205,6 +4204,39 @@ mod tests {
         assert!(
             sys.calls().is_empty(),
             "nothing asked of GitHub or the host: {:?}",
+            sys.calls()
+        );
+    }
+
+    #[test]
+    fn unenroll_deletes_the_keys_over_agh_when_the_row_says() {
+        let fake = agh_fake::FakeGithub::start();
+        let login = super::super::github_keys_tests::LOGIN;
+        let (sys, _token) = super::super::github_keys_tests::inline_on(Fake::root(), &fake);
+        let inventory = format!(
+            "schema = 1\n[github]\naccount = \"{login}\"\nkeys = \"agh-inline\"\n[[host]]\nname \
+             = \"lab-03\"\nuuid = \"{VM_UUID}\"\naddress = \"192.168.64.4\"\nuser = \"admin\"\n"
+        );
+        sys.file(&format!("{ROOT}/machines.toml"), inventory.as_bytes());
+        let id = fake.add_key(
+            login,
+            "aterm-machines:lab-03:alice",
+            &format!("ssh-ed25519 {VM_KEY}"),
+        );
+        let state = inventory::HostState {
+            github_keys: vec![("alice".into(), id)],
+            ..inventory::HostState::default()
+        };
+        inventory::save_state(&sys, &ctl(), VM_UUID, &state).unwrap();
+        let host = inventory::load(&sys, &ctl()).unwrap().hosts[0].clone();
+        let mut out = Vec::new();
+        unenroll(&sys, &ctl(), &[], &host, true, &mut out).unwrap();
+        let saw = super::super::github_keys_tests::requests(&fake.seen());
+        assert!(saw.contains(&format!("DELETE /user/keys/{id}")), "{saw:?}");
+        assert!(fake.keys(login).is_empty());
+        assert!(
+            !sys.calls().iter().any(|c| c.starts_with("github ")),
+            "no REST call: {:?}",
             sys.calls()
         );
     }

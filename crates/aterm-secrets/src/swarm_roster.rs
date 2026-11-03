@@ -77,6 +77,10 @@ pub struct SwarmMember {
     pub aliases: Vec<String>,
     /// Optional signer-salted hardware hint (`SHA-256(signer_fingerprint || IOPlatformUUID)`).
     pub hint: Option<String>,
+    /// Optional keyed hardware hint of the lab model (`aterm_db::typed::keys::hw_hint`), in a field
+    /// of its own: [`Self::hint`] is salted by a signer and this by the network, so neither can be
+    /// compared with the other.
+    pub hw_hint: Option<String>,
     /// Admission timestamp in Unix milliseconds (`0` when unrecorded).
     pub admitted_ms: u64,
     /// Sheet-named `m<N>` currently under a 24 h provisional hold, if any.
@@ -162,6 +166,7 @@ impl SwarmRoster {
                 })?;
                 let aliases = string_array(row, "aliases")?;
                 let hint = optional_str(row, "hint");
+                let hw_hint = optional_str(row, "hw_hint");
                 let admitted_ms = optional_u64(row, "admitted_ms").unwrap_or(0);
                 let claimed_label = match optional_str(row, "claimed_label") {
                     Some(raw) => Some(
@@ -185,6 +190,7 @@ impl SwarmRoster {
                     label,
                     aliases,
                     hint,
+                    hw_hint,
                     admitted_ms,
                     claimed_label,
                     claimed_at_ms,
@@ -295,6 +301,9 @@ impl SwarmRoster {
                 }
                 if let Some(hint) = m.hint {
                     t.insert("hint".to_owned(), Value::String(hint));
+                }
+                if let Some(hw_hint) = m.hw_hint {
+                    t.insert("hw_hint".to_owned(), Value::String(hw_hint));
                 }
                 if m.admitted_ms > 0
                     && let Ok(ms) = i64::try_from(m.admitted_ms)
@@ -1009,6 +1018,7 @@ pub fn seed_roster(
         taken_labels.insert(label.clone());
         let mut member = SwarmMember {
             hint: None,
+            hw_hint: None,
             recipient: machine.recipient,
             vault_name: machine.name,
             label,
@@ -1269,6 +1279,7 @@ pub fn assign_newcomer(
         label: label.clone(),
         aliases,
         hint: None,
+        hw_hint: None,
         admitted_ms: newcomer.now_ms,
         claimed_label,
         claimed_at_ms,
@@ -1359,6 +1370,34 @@ mod tests {
         Identity::from_secret_bytes([seed_byte; 32])
             .recipient()
             .to_bech32()
+    }
+
+    /// The lab model's hint rides its own roster field: it round-trips apart from the signer-salted
+    /// `hint`, and a roster without it still reads.
+    /// NEGATIVE CONTROL: with `to_toml` not writing `hw_hint`, the reread member's is `None`.
+    #[test]
+    fn hw_hint_round_trips_in_its_own_field() {
+        let roster = |line: &str| {
+            format!(
+                "[[member]]\nrecipient = \"{}\"\nvault_name = \"seven\"\nlabel = \"m7\"\n{line}",
+                sample_recipient(7)
+            )
+        };
+        let read = SwarmRoster::from_toml(&roster(
+            "hint = \"salted\"\nhw_hint = \"aaaaaaaaaaaaaaaa\"\n",
+        ))
+        .unwrap();
+        assert_eq!(read.members[0].hw_hint.as_deref(), Some("aaaaaaaaaaaaaaaa"));
+        let again = SwarmRoster::from_toml(&read.to_toml()).unwrap();
+        assert_eq!(
+            again.members[0].hw_hint.as_deref(),
+            Some("aaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(again.members[0].hint.as_deref(), Some("salted"));
+        assert_eq!(
+            SwarmRoster::from_toml(&roster("")).unwrap().members[0].hw_hint,
+            None
+        );
     }
 
     /// Names that start with `m<N>` parse to canonical `(N, "m<N>")`, while mid-string
@@ -1716,6 +1755,7 @@ email = "one@example.org"
                     label: "m5".to_owned(),
                     aliases: vec!["m105".to_owned()],
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 1_000,
                     claimed_label: None,
                     claimed_at_ms: None,
@@ -1728,6 +1768,7 @@ email = "one@example.org"
                     label: "m5".to_owned(),
                     aliases: Vec::new(),
                     hint: None,
+                    hw_hint: None,
                     admitted_ms: 2_000,
                     claimed_label: None,
                     claimed_at_ms: None,
@@ -1772,6 +1813,7 @@ email = "one@example.org"
                 label: "m1".to_owned(),
                 aliases: Vec::new(),
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 1_000,
                 claimed_label: None,
                 claimed_at_ms: None,
@@ -1848,6 +1890,7 @@ email = "one@example.org"
             label: "m40".to_owned(),
             aliases: Vec::new(),
             hint: None,
+            hw_hint: None,
             admitted_ms: 3_500,
             claimed_label: Some("m11".to_owned()),
             claimed_at_ms: Some(3_500),

@@ -25,8 +25,26 @@ pub struct RateSnapshot {
     pub used: u64,
 }
 
+/// Maximum length of a normalized rate-limit resource name.
+const RESOURCE_MAX_LEN: usize = 64;
+
+/// Maximum distinct resources retained per identity in [`RateBook`].
+#[cfg(unix)]
+const MAX_RESOURCES: usize = 64;
+
+/// Normalizes a rate-limit resource name to lowercase `[a-z0-9_-]{1,64}`.
+fn normalize_resource(raw: &str) -> Option<String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    (!lower.is_empty()
+        && lower.len() <= RESOURCE_MAX_LEN
+        && lower
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'))
+    .then_some(lower)
+}
+
 impl RateSnapshot {
-    /// Parses `x-ratelimit-*` headers (`resource` defaults to `core`).
+    /// Parses `x-ratelimit-*` headers (`resource` defaults to `core`, normalized to lowercase).
     #[must_use]
     pub fn from_headers(headers: &[(String, String)]) -> Option<RateSnapshot> {
         let get = |name: &str| crate::wire::header_in(headers, name).map(str::trim);
@@ -34,11 +52,12 @@ impl RateSnapshot {
         let limit = number("x-ratelimit-limit")?;
         let remaining = number("x-ratelimit-remaining")?;
         let reset = number("x-ratelimit-reset")?;
+        let resource = match get("x-ratelimit-resource") {
+            None | Some("") => "core".to_string(),
+            Some(raw) => normalize_resource(raw)?,
+        };
         Some(RateSnapshot {
-            resource: get("x-ratelimit-resource")
-                .filter(|s| !s.is_empty())
-                .unwrap_or("core")
-                .to_string(),
+            resource,
             limit,
             remaining,
             reset,
@@ -63,7 +82,7 @@ impl RateSnapshot {
     pub fn from_json(value: &Value) -> Option<RateSnapshot> {
         let number = |key: &str| value.get(key).and_then(Value::as_u64);
         Some(RateSnapshot {
-            resource: value.get("resource")?.as_str()?.to_string(),
+            resource: normalize_resource(value.get("resource")?.as_str()?)?,
             limit: number("limit")?,
             remaining: number("remaining")?,
             reset: number("reset")?,
@@ -151,15 +170,16 @@ impl RateBook {
     /// Returns a `PreRefused` rate-limit error when `resource` is exhausted until after `now_unix`.
     #[must_use]
     pub fn refuse_before_send(&self, key: &str, resource: &str, now_unix: u64) -> Option<Error> {
+        let normalized = normalize_resource(resource)?;
         let spent = self
             .read(key)
             .into_iter()
-            .find(|s| s.resource == resource && s.remaining == 0 && s.reset > now_unix)?;
+            .find(|s| s.resource == normalized && s.remaining == 0 && s.reset > now_unix)?;
         Some(
             Error::new(
                 Kind::RateLimited,
                 format!(
-                    "the rate book says {resource} is spent for this identity until {}",
+                    "the rate book says {normalized} is spent for this identity until {}",
                     spent.reset
                 ),
             )
@@ -189,6 +209,11 @@ impl RateBook {
         if !usable_key(key) {
             return None;
         }
+        let resource = normalize_resource(&snapshot.resource)?;
+        let normalized = RateSnapshot {
+            resource,
+            ..snapshot.clone()
+        };
         if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
             if let Some(grand) = parent.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::create_dir_all(grand).ok()?;
@@ -197,8 +222,18 @@ impl RateBook {
         }
         create_private_dir(dir).ok()?;
         let mut held = self.read(key);
-        held.retain(|s| s.resource != snapshot.resource);
-        held.push(snapshot.clone());
+        held.retain(|s| s.resource != normalized.resource);
+        while held.len() >= MAX_RESOURCES {
+            // Evict unspent entries before spent (`remaining == 0`) ones so synthetic unspent
+            // resource churn cannot displace an active `PreRefused` guard.
+            let evict_idx = held
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| (s.remaining == 0, s.reset))
+                .map(|(idx, _)| idx)?;
+            held.swap_remove(evict_idx);
+        }
+        held.push(normalized);
         let mut resources = Map::new();
         for s in &held {
             resources.insert(s.resource.clone(), s.to_json());
@@ -238,8 +273,13 @@ impl RateBook {
         }
         let resources = value.get("resources")?.as_object()?;
         let mut held: Vec<RateSnapshot> = resources
-            .values()
-            .filter_map(RateSnapshot::from_json)
+            .iter()
+            .filter_map(|(name, entry)| {
+                let expected = normalize_resource(name)?;
+                let snap = RateSnapshot::from_json(entry)?;
+                (snap.resource == expected && name == &expected).then_some(snap)
+            })
+            .take(MAX_RESOURCES)
             .collect();
         held.sort_by(|a, b| a.resource.cmp(&b.resource));
         Some(held)

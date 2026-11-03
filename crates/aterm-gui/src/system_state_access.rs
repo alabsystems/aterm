@@ -578,9 +578,12 @@ pub(crate) fn lan_ask(interfaces: &[LanInterface], ipv6_network: bool) -> Option
 /// run goes, still differs (`fda`, `devtools`, `vault`, … [`setup_word`]); `done` once the plan
 /// finished or a person cancelled it with none of those left, or once System State's headline
 /// says this Mac is set up ([`crate::system_state::Headline::set_up`]) before its run finished,
-/// as while its Secrets stage parks to ask again by itself for an ALab vault that did not answer,
-/// which the page does not count; `pending` while a run goes with none read; `-` before the
-/// worker said anything (no setup in this process).
+/// nothing left for anyone to do now; then `;asking:<row,...>` names each stage the run's last
+/// pass parked to ask again by itself (an ALab vault that did not answer or is absent off the
+/// ALab LAN, `vault`; a step an engine put off), so `done` is never read as a finished record;
+/// `pending` while a run goes with none read; `-` before the worker said anything (no setup in
+/// this process). `done` ends in `;offered:<row,...>` while macOS's grants are on offer, which
+/// hold nothing back ([`crate::system_state::offered_access`]).
 pub(crate) fn setup_field(status: &SetupStatus) -> String {
     let selection = status
         .plan
@@ -613,10 +616,45 @@ pub(crate) fn setup_field(status: &SetupStatus) -> String {
             crate::system_state::headline(status, &rows, Some(plan)).set_up
         })
     };
+    let offered = || {
+        let offered = crate::system_state::offered_access(status);
+        if offered.is_empty() {
+            String::new()
+        } else {
+            let words: Vec<&str> = offered
+                .into_iter()
+                .map(|access| setup_word(Subject::Access(access)))
+                .collect();
+            format!(";offered:{}", words.join(","))
+        }
+    };
     if !pending.is_empty() {
         format!("pending:{}", pending.join(","))
-    } else if ended || set_up() {
-        "done".to_owned()
+    } else if ended {
+        format!("done{}", offered())
+    } else if set_up() {
+        // The stages the run's last pass parked to ask again by itself, in the rows' words: a
+        // vault nobody answered (`unreached`) or none here (`waiting`), a step put off.
+        let mut asking: Vec<&str> = Vec::new();
+        for stage in status
+            .rows
+            .iter()
+            .filter(|row| matches!(row.status.as_str(), "waiting" | "unreached" | "deferred"))
+            .filter_map(|row| aterm_types::macos_setup::StageRow::named(&row.name))
+        {
+            for setting in stage.settings.iter().filter(|s| selection.contains(**s)) {
+                let word = setup_word(Subject::Setting(*setting));
+                if !asking.contains(&word) {
+                    asking.push(word);
+                }
+            }
+        }
+        let asking = if asking.is_empty() {
+            String::new()
+        } else {
+            format!(";asking:{}", asking.join(","))
+        };
+        format!("done{asking}{}", offered())
     } else if status.plan.is_some() || status.run.is_some() {
         "pending".to_owned()
     } else {

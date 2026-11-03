@@ -3,6 +3,7 @@
 
 use super::*;
 mod historical;
+mod observation;
 mod publication;
 use crate::{
     commons::binding::{Pending, Request},

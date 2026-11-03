@@ -419,7 +419,14 @@ impl Log {
         }
         Ok(None)
     }
-    pub(crate) fn compensate(&self, request: [u8; 16], target: Digest) -> Result<Command> {
+    /// Compensate a target in the application's visible history. Excluded operations retain
+    /// their causal links but cannot supply the current value, the target or its preimage.
+    pub(crate) fn compensate(
+        &self,
+        request: [u8; 16],
+        target: Digest,
+        excluded: &BTreeSet<Digest>,
+    ) -> Result<Command> {
         let command = self
             .records
             .get(&target)
@@ -429,17 +436,12 @@ impl Log {
             .changes()
             .filter(|changes| !changes.is_empty())
             .ok_or_else(|| Error::new("target proposal has no value changes to revert"))?;
-        let current = self.snapshot();
-        if !current
-            .operations
-            .iter()
-            .any(|op| op.header.id == target && op.eligible)
-        {
+        let (current, _, eligible) = self.project(None, excluded);
+        if !eligible.contains(&target) {
             return Err(Error::new("target proposal is not eligible"));
         }
         for change in changes {
             if !current
-                .cells
                 .get(&(change.collection.clone(), change.key.clone()))
                 .is_some_and(|cell| {
                     !cell.stopped
@@ -452,7 +454,7 @@ impl Log {
                 ));
             }
         }
-        let (past, _, _) = self.project(Some(target), &BTreeSet::new());
+        let (past, _, _) = self.project(Some(target), excluded);
         let mut restored = Vec::new();
         for change in changes {
             let old = past.get(&(change.collection.clone(), change.key.clone()));

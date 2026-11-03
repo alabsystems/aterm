@@ -33,6 +33,63 @@ struct State {
     notes: BTreeMap<(Slug, String), String>,
     anonymous: bool,
     calls: Vec<String>,
+    armed: Vec<(FakeOp, FakeFail)>,
+    own: BTreeSet<(Slug, String)>,
+    immutable: BTreeSet<(Slug, String)>,
+    changes: usize,
+}
+
+/// The write an armed failure fires on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FakeOp {
+    /// [`ReleaseHost::create`].
+    Create,
+    /// [`ReleaseHost::upload`].
+    Upload,
+    /// [`ReleaseHost::publish_draft`].
+    PublishDraft,
+    /// [`ReleaseHost::write_preflight`].
+    Preflight,
+}
+
+/// What an armed write does instead of succeeding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FakeFail {
+    /// A create killed after its draft holds every file: the draft stays, unpublished.
+    KilledCreate,
+    /// The write lands whole, and its answer is lost.
+    LostResponse,
+    /// Nothing changes, and the host refuses.
+    Refuse,
+    /// An upload cut short after its first file.
+    Partial,
+}
+
+/// Whether `fail` is a failure `op` can be armed with (the table of plan §15, body 10).
+const fn armable(op: FakeOp, fail: FakeFail) -> bool {
+    matches!(
+        (op, fail),
+        (
+            FakeOp::Create,
+            FakeFail::KilledCreate | FakeFail::LostResponse | FakeFail::Refuse
+        ) | (
+            FakeOp::Upload,
+            FakeFail::Partial | FakeFail::LostResponse | FakeFail::Refuse
+        ) | (
+            FakeOp::PublishDraft,
+            FakeFail::LostResponse | FakeFail::Refuse
+        ) | (FakeOp::Preflight, FakeFail::Refuse)
+    )
+}
+
+/// The refusal every armed `Refuse` answers.
+fn refused_by_the_test() -> HostError {
+    HostError::Refused("refused by the test".into())
+}
+
+/// The answer every armed `LostResponse` gives once its write has landed.
+fn the_answer_was_lost() -> HostError {
+    HostError::Unreachable("the answer was lost".into())
 }
 
 /// The in-memory release host.
@@ -217,6 +274,166 @@ impl FakeHost {
         self.state().calls.clone()
     }
 
+    /// How many writes (`create`, `upload`, `publish_draft`) changed what this host holds: a
+    /// write that finds every file already there with the same bytes changes nothing.
+    #[must_use]
+    pub fn changes(&self) -> usize {
+        self.state().changes
+    }
+
+    /// The next `op` (any slug) does `fail` instead; one arming fires once.
+    ///
+    /// `Refuse` fires on the next call of `op`, before anything else it decides. A write
+    /// failure (`KilledCreate`, `LostResponse`, `Partial`) fires on the next call of `op` that
+    /// writes: a call refused or converged before any write leaves it armed, as an agh-fake
+    /// fault on a request waits for that request.
+    ///
+    /// # Panics
+    ///
+    /// For a pair no write of `op` can do (plan §15, body 10's table), naming the pair, so the
+    /// mistake fails the test at its own line.
+    pub fn fail_next(&self, op: FakeOp, fail: FakeFail) {
+        assert!(
+            armable(op, fail),
+            "fail_next: {op:?} cannot be armed with {fail:?}"
+        );
+        self.state().armed.push((op, fail));
+    }
+
+    /// Make release `tag` of `slug` immutable, or not.
+    pub fn set_immutable(&self, slug: &Slug, tag: &str, immutable: bool) {
+        let key = (slug.clone(), tag.to_string());
+        let mut s = self.state();
+        if immutable {
+            s.immutable.insert(key);
+        } else {
+            s.immutable.remove(&key);
+        }
+    }
+
+    /// The failure armed for the next `op`, disarmed.
+    fn armed(&self, op: FakeOp) -> Option<FakeFail> {
+        take_armed(&mut self.state(), op)
+    }
+
+    /// Whether the next `op` is armed to `Refuse`, which fires before anything else the call
+    /// decides; when it is, the arming is taken.
+    fn refuses(&self, op: FakeOp) -> bool {
+        let mut s = self.state();
+        let next = s.armed.iter().find(|(o, _)| *o == op).map(|(_, f)| *f);
+        next == Some(FakeFail::Refuse) && take_armed(&mut s, op).is_some()
+    }
+
+    /// Lay `files` as release `tag` of `slug`, marked this host's own, with `notes`.
+    fn lay_own(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        notes: &str,
+        draft: bool,
+        assets: BTreeMap<String, Vec<u8>>,
+    ) {
+        {
+            let mut s = self.state();
+            s.notes
+                .insert((slug.clone(), tag.to_string()), notes.to_string());
+            s.own.insert((slug.clone(), tag.to_string()));
+            s.changes += 1;
+        }
+        self.put(
+            slug,
+            tag,
+            FakeRelease {
+                draft,
+                prerelease: true,
+                assets,
+            },
+        );
+    }
+
+    /// A `create` over release `tag`, which this host marked its own, as agh's created-intent
+    /// rule completes it (plan §15). A published one is never uploaded to, and answers `Ok`
+    /// only when it holds every file with the same bytes and is still a prerelease, as agh's
+    /// publish guard converges only a release published as its patch would leave it. A draft
+    /// is refused where a file has
+    /// other bytes; otherwise it gains the files it lacks and is published only when it then
+    /// holds no name the rerun did not bring, as agh's exact-set publish guard is. An armed
+    /// write failure fires at the publish, so a call refused or converged before it leaves the
+    /// arming for the next `create` that writes.
+    fn complete_own(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        incoming: Vec<(String, Vec<u8>)>,
+    ) -> Result<(), HostError> {
+        let mut guard = self.state();
+        let s = &mut *guard;
+        let release = s
+            .repos
+            .get_mut(slug)
+            .and_then(|tags| tags.get_mut(tag))
+            .ok_or(HostError::NotFound)?;
+        if !release.draft {
+            let same = release.assets.len() == incoming.len()
+                && incoming
+                    .iter()
+                    .all(|(name, bytes)| release.assets.get(name) == Some(bytes));
+            return if !same {
+                Err(HostError::Refused(format!(
+                    "{tag} on {slug} is published with other files"
+                )))
+            } else if !release.prerelease {
+                Err(HostError::Refused(format!(
+                    "{tag} on {slug} is published as a full release, not a prerelease"
+                )))
+            } else {
+                Ok(())
+            };
+        }
+        if let Some((name, _)) = incoming
+            .iter()
+            .find(|(name, bytes)| release.assets.get(name).is_some_and(|there| there != bytes))
+        {
+            return Err(HostError::Refused(format!(
+                "{name} already exists on {slug} {tag}"
+            )));
+        }
+        let brought: BTreeSet<String> = incoming.iter().map(|(name, _)| name.clone()).collect();
+        s.changes += usize::from(lands(&mut release.assets, incoming));
+        let extra: Vec<&str> = release
+            .assets
+            .keys()
+            .filter(|name| !brought.contains(*name))
+            .map(String::as_str)
+            .collect();
+        if !extra.is_empty() {
+            return Err(HostError::Refused(format!(
+                "{tag} on {slug} holds {}, which this create did not bring",
+                extra.join(", ")
+            )));
+        }
+        let armed = take_armed(s, FakeOp::Create);
+        let release = s
+            .repos
+            .get_mut(slug)
+            .and_then(|tags| tags.get_mut(tag))
+            .ok_or(HostError::NotFound)?;
+        match armed {
+            Some(FakeFail::KilledCreate) => Err(HostError::Unreachable("killed".into())),
+            Some(FakeFail::LostResponse) => {
+                release.draft = false;
+                s.changes += 1;
+                Err(the_answer_was_lost())
+            }
+            Some(other) => panic!("fail_next: Create cannot be armed with {other:?}"),
+            None => {
+                release.draft = false;
+                s.changes += 1;
+                Ok(())
+            }
+        }
+    }
+
     fn log(&self, line: String) {
         self.state().calls.push(line);
     }
@@ -387,24 +604,47 @@ impl ReleaseHost for FakeHost {
     ) -> Result<(), HostError> {
         self.log(format!("create {slug} {tag}"));
         self.reachable(slug)?;
-        if self.release_of(slug, tag).is_some() {
-            return Err(HostError::Refused(format!(
-                "{slug} already has a release {tag}"
-            )));
+        let incoming = Self::read_files(files)?;
+        // An armed `Refuse` fires first, whatever is there. A release that is there decides
+        // next: another's is refused, as the unarmed create and agh's created-intent rule
+        // refuse it, writing nothing, so an armed write failure waits for the next create that
+        // writes, as agh-fake's fault on a request waits for that request; this host's own is
+        // completed, and an armed write failure fires at its publish.
+        if self.refuses(FakeOp::Create) {
+            return Err(refused_by_the_test());
         }
-        let assets = Self::read_files(files)?.into_iter().collect();
-        self.state()
-            .notes
-            .insert((slug.clone(), tag.to_string()), notes.to_string());
-        self.put(
-            slug,
-            tag,
-            FakeRelease {
-                draft: false,
-                prerelease: true,
-                assets,
-            },
-        );
+        let key = (slug.clone(), tag.to_string());
+        match self.release_of(slug, tag) {
+            None => {}
+            // agh's created-intent rule converges only a request that agrees with the intent
+            // that made the release, its body among it: other notes are another's create.
+            Some(_)
+                if self.state().own.contains(&key)
+                    && self.state().notes.get(&key).map(String::as_str) == Some(notes) =>
+            {
+                return self.complete_own(slug, tag, incoming);
+            }
+            Some(_) => {
+                return Err(HostError::Refused(format!(
+                    "{slug} already has a release {tag}"
+                )));
+            }
+        }
+        match self.armed(FakeOp::Create) {
+            Some(FakeFail::KilledCreate) => {
+                self.lay_own(slug, tag, notes, true, incoming.into_iter().collect());
+                return Err(HostError::Unreachable("killed".into()));
+            }
+            Some(FakeFail::LostResponse) => {
+                self.lay_own(slug, tag, notes, false, incoming.into_iter().collect());
+                return Err(the_answer_was_lost());
+            }
+            Some(other) => panic!("fail_next: Create cannot be armed with {other:?}"),
+            None => {}
+        }
+        // Marked own as every create's release is, so a rerun converges as agh's created-intent
+        // rule converges it.
+        self.lay_own(slug, tag, notes, false, incoming.into_iter().collect());
         Ok(())
     }
 
@@ -418,33 +658,93 @@ impl ReleaseHost for FakeHost {
         self.log(format!("upload {slug} {tag} {replace:?}"));
         self.reachable(slug)?;
         let incoming = Self::read_files(files)?;
-        let mut s = self.state();
+        // An armed `Refuse` fires first. An armed write failure fires only on an upload that
+        // writes: one refused (no release, an immutable one, other bytes under `Never`) or one
+        // that finds every file there with the same bytes leaves it armed, as agh sends no
+        // POST for either.
+        if self.refuses(FakeOp::Upload) {
+            return Err(refused_by_the_test());
+        }
+        let key = (slug.clone(), tag.to_string());
+        let mut guard = self.state();
+        let s = &mut *guard;
+        let immutable = s.immutable.contains(&key);
         let release = s
             .repos
             .get_mut(slug)
             .and_then(|tags| tags.get_mut(tag))
             .ok_or(HostError::NotFound)?;
+        if immutable {
+            return Err(HostError::Refused(format!("{tag} on {slug} is immutable")));
+        }
         if replace == Replace::Never
             && let Some((name, _)) = incoming
                 .iter()
-                .find(|(n, _)| release.assets.contains_key(n))
+                .find(|(n, bytes)| release.assets.get(n).is_some_and(|there| there != bytes))
         {
             return Err(HostError::Refused(format!(
                 "{name} already exists on {slug} {tag}"
             )));
         }
-        release.assets.extend(incoming);
-        Ok(())
+        if incoming
+            .iter()
+            .all(|(name, bytes)| release.assets.get(name) == Some(bytes))
+        {
+            return Ok(());
+        }
+        let armed = take_armed(s, FakeOp::Upload);
+        let release = s
+            .repos
+            .get_mut(slug)
+            .and_then(|tags| tags.get_mut(tag))
+            .ok_or(HostError::NotFound)?;
+        match armed {
+            Some(FakeFail::Partial) => {
+                s.changes += usize::from(lands(&mut release.assets, incoming.into_iter().take(1)));
+                Err(HostError::Unreachable("cut short".into()))
+            }
+            Some(FakeFail::LostResponse) => {
+                s.changes += usize::from(lands(&mut release.assets, incoming));
+                Err(the_answer_was_lost())
+            }
+            Some(other) => panic!("fail_next: Upload cannot be armed with {other:?}"),
+            None => {
+                s.changes += usize::from(lands(&mut release.assets, incoming));
+                Ok(())
+            }
+        }
     }
 
     fn publish_draft(&self, slug: &Slug, tag: &str) -> Result<(), HostError> {
         self.log(format!("publish-draft {slug} {tag}"));
         self.reachable(slug)?;
-        if self.release_of(slug, tag).is_none() {
-            return Err(HostError::NotFound);
+        // An armed `Refuse` fires first; an armed `LostResponse` fires only on a publish that
+        // writes, so a missing tag or a release already published leaves it armed.
+        if self.refuses(FakeOp::PublishDraft) {
+            return Err(refused_by_the_test());
         }
-        self.set_draft(slug, tag, false);
-        Ok(())
+        match self.release_of(slug, tag) {
+            None => return Err(HostError::NotFound),
+            Some(release) if release.draft => {
+                self.set_draft(slug, tag, false);
+                self.state().changes += 1;
+            }
+            Some(_) => return Ok(()),
+        }
+        match self.armed(FakeOp::PublishDraft) {
+            Some(FakeFail::LostResponse) => Err(the_answer_was_lost()),
+            Some(other) => panic!("fail_next: PublishDraft cannot be armed with {other:?}"),
+            None => Ok(()),
+        }
+    }
+
+    fn write_preflight(&self, slug: &Slug) -> Result<(), HostError> {
+        self.log(format!("preflight {slug}"));
+        match self.armed(FakeOp::Preflight) {
+            Some(FakeFail::Refuse) => Err(refused_by_the_test()),
+            Some(other) => panic!("fail_next: Preflight cannot be armed with {other:?}"),
+            None => Ok(()),
+        }
     }
 
     fn probe_public(&self, slug: &Slug, tag: &str, asset: &str) -> Probe {
@@ -513,6 +813,25 @@ impl FakeHost {
             .cloned()
             .ok_or(HostError::NotFound)
     }
+}
+
+/// The failure armed for the next `op` in `s`, disarmed.
+fn take_armed(s: &mut State, op: FakeOp) -> Option<FakeFail> {
+    let at = s.armed.iter().position(|(o, _)| *o == op)?;
+    Some(s.armed.remove(at).1)
+}
+
+/// Land `incoming` in `assets`: whether any name was new or its bytes differed.
+fn lands(
+    assets: &mut BTreeMap<String, Vec<u8>>,
+    incoming: impl IntoIterator<Item = (String, Vec<u8>)>,
+) -> bool {
+    let mut changed = false;
+    for (name, bytes) in incoming {
+        changed |= assets.get(&name) != Some(&bytes);
+        assets.insert(name, bytes);
+    }
+    changed
 }
 
 fn git(cmd: &mut aterm_uds::spawnfd::Command) -> Result<(), HostError> {

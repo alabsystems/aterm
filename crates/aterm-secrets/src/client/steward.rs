@@ -305,25 +305,58 @@ pub(super) fn member_is_denied_in_roster(
 }
 
 pub fn local_recipient_denied_in_roster(paths: &Paths) -> bool {
-    let Some(identity) = read_identity(paths).ok().flatten() else {
-        return false;
+    match load_state(paths) {
+        Ok(state) => match state.membership {
+            Stored::None | Stored::Pending | Stored::Plain => return false,
+            Stored::Revoked => return true,
+            Stored::In => {}
+        },
+        Err(_) => return true,
+    }
+    if StateLock::narrow_owned(paths).is_err() {
+        return true;
+    }
+    match StateLock::observe_classified(paths) {
+        Ok(StateObservation::Held(lock)) => local_recipient_denied_in_roster_held(paths, &lock),
+        Ok(StateObservation::Absent) => match config(paths) {
+            Ok(None) => false,
+            Ok(Some(config)) if config.signer.is_none() => false,
+            Ok(Some(_)) => load_state(paths).map_or(true, |state| state.membership == Stored::In),
+            Err(_) => true,
+        },
+        Ok(StateObservation::Busy) | Err(_) => true,
+    }
+}
+
+pub(super) fn local_recipient_denied_in_roster_held(paths: &Paths, lock: &StateLock) -> bool {
+    local_recipient_denial_held(paths, lock).unwrap_or(true)
+}
+
+pub(crate) fn local_recipient_denial_held(paths: &Paths, lock: &StateLock) -> crate::Result<bool> {
+    local_recipient_denied_with(paths, || roster::swarm_roster_held(paths, lock))
+}
+
+fn local_recipient_denied_with(
+    paths: &Paths,
+    read_roster: impl FnOnce() -> crate::Result<Option<crate::swarm_roster::SwarmRoster>>,
+) -> crate::Result<bool> {
+    let Some(identity) = read_identity(paths)? else {
+        return Ok(false);
     };
     let my_rec = identity.recipient();
     let recipient = my_rec.to_bech32();
-    let cfg = super::config(paths).ok().flatten();
-    let local_log = cfg.as_ref().and_then(|c| {
-        super::log_entries::trusted_local_log(paths, c)
-            .ok()
-            .flatten()
-    });
+    let cfg = super::config(paths)?;
+    let local_log = cfg
+        .as_ref()
+        .map(|c| super::log_entries::trusted_local_log(paths, c))
+        .transpose()?
+        .flatten();
     if let (Some(c), Some(log)) = (&cfg, &local_log) {
         if log.removes(&my_rec) {
-            return true;
+            return Ok(true);
         }
-        let state = load_state(paths).ok();
-        let behind = state
-            .as_ref()
-            .and_then(|s| super::held_copy(paths, c, s))
+        let state = load_state(paths)?;
+        let behind = super::read_held_copy(paths, c, &state)?
             .and_then(|bytes| envelope::parse(&bytes).ok())
             .is_some_and(|env| {
                 super::log_entries::log_base(Some(log), &env, &identity).ok()
@@ -335,19 +368,19 @@ pub fn local_recipient_denied_in_roster(paths: &Paths) -> bool {
                 &my_rec,
             )
         {
-            return true;
+            return Ok(true);
         }
     }
-    let r = roster::swarm_roster(paths).ok().flatten();
+    let r = read_roster()?;
     if let Some(log) = &local_log
         && log_entries::recipient_denied_by_roster_or_log(r.as_ref(), log, &my_rec)
     {
-        return true;
+        return Ok(true);
     }
     let Some(r) = r else {
-        return false;
+        return Ok(false);
     };
-    roster_denies_local(paths, &r, cfg.as_ref(), &recipient)
+    Ok(roster_denies_local(paths, &r, cfg.as_ref(), &recipient))
 }
 
 fn roster_denies_local(

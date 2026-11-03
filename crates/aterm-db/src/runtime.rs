@@ -116,6 +116,10 @@ const ADMISSION: Duration = Duration::from_secs(60);
 /// How often the contact ledger is kept, and a steward refreshes the roster from it.
 const KEEP: Duration = Duration::from_secs(600);
 
+/// What a transport open fails with where its network fails every open (tests).
+#[cfg(test)]
+const OPEN_FAILS: &str = "the test fails the transport's open";
+
 #[derive(Default)]
 struct Network {
     /// Public scheduling hints survive a rebuilt endpoint, scoped to its
@@ -135,7 +139,7 @@ struct Network {
     /// true ([`transport::Transport::standing_in`]).
     #[cfg(test)]
     stand_in: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// Every transport open fails (tests).
+    /// Every transport open fails with [`OPEN_FAILS`] (tests).
     #[cfg(test)]
     open_fails: bool,
     /// Each wait the owner took after a try that did not serve, in order (tests; [`Self::retry`]).
@@ -265,7 +269,7 @@ impl Network {
         }
         #[cfg(test)]
         if self.open_fails {
-            return Err(crate::Error::new("the test fails the transport's open"));
+            return Err(crate::Error::new(OPEN_FAILS));
         }
         #[cfg(test)]
         if let Some(up) = &self.stand_in {
@@ -295,7 +299,7 @@ impl Network {
 
 /// Local observation, not a claim of global convergence. Counts of peers are
 /// address hints, not authenticated members.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Dormant,
     Disabled,
@@ -306,11 +310,10 @@ pub enum Status {
         interfaces: usize,
         hints: usize,
     },
-    /// Local configuration or trust state refused the owner. It names the step that refused, a
-    /// bounded label that quotes no path, key or payload. A window's owner tries again after a
-    /// delay that doubles with each consecutive refusal, the background owner every [`POLL`]
-    /// ([`Refusals`]).
-    Refused(&'static str),
+    /// Local configuration or trust state refused the owner ([`Refusal`]). A window's owner tries
+    /// again after a delay that doubles with each consecutive refusal, the background owner every
+    /// [`POLL`] ([`Refusals`]).
+    Refused(Refusal),
     /// A local writer or changed authenticated snapshot requires fresh admission.
     /// The owner retries after [`POLL`] without accumulating refusal backoff.
     Retrying(&'static str),
@@ -318,14 +321,54 @@ pub enum Status {
     /// socket yet, or (its host deferred the use, [`LanGate::before_use`]) no LAN socket.
     LanHeld,
 }
+impl Status {
+    /// The refusal a host warns of: one that does not stand ([`Refusal::standing`]). Every other
+    /// status, a standing refusal among them, is detail its host logs below a warning.
+    #[must_use]
+    pub fn news(&self) -> Option<&Refusal> {
+        match self {
+            Self::Refused(refusal) if !refusal.standing => Some(refusal),
+            _ => None,
+        }
+    }
+}
 
-/// Preserve the failed boundary and any typed local admission contention.
+/// What refused an owner's try ([`Status::Refused`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    /// The step that refused, a bounded label that quotes no path, key or payload.
+    pub step: &'static str,
+    /// The error the step gave, which names the failed boundary without quoting payloads or keys
+    /// ([`crate::Error`]).
+    pub error: String,
+    /// The previous refusal of this streak ([`Refusals`]) had the same step and error: the
+    /// refusal stands, a fact its host has already reported, so a host warns of a refusal once
+    /// per cause ([`Status::news`]) and its standing repeats at debug.
+    pub standing: bool,
+}
+impl Refusal {
+    fn new(step: &'static str, error: &crate::Error) -> Self {
+        Self {
+            step,
+            error: error.to_string(),
+            standing: false,
+        }
+    }
+}
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.step, self.error)
+    }
+}
+
+/// Preserve the failed boundary, its error and any typed local admission contention.
 fn refusal<E: Into<crate::Error>>(why: &'static str) -> impl FnOnce(E) -> Status {
     move |error| {
-        if error.into().is_busy() {
+        let error = error.into();
+        if error.is_busy() {
             Status::Retrying(why)
         } else {
-            Status::Refused(why)
+            Status::Refused(Refusal::new(why, &error))
         }
     }
 }
@@ -343,35 +386,54 @@ const REFUSED_MAX: Duration = Duration::from_secs(30);
 /// [`POLL`]: it looks for a window that opened only at its next try, and past its gate it holds
 /// the observer while it waits, so a doubled wait would keep that window's Commons waiting for up
 /// to [`REFUSED_MAX`].
+///
+/// A streak, in either mode, is one standing refusal while its cause holds: a refusal with the
+/// step and error of the streak's previous refusal stands ([`Refusal::standing`]), whatever the
+/// tries between reported, and the first refusal of a streak, or one with another cause, does not.
+/// A disabled Commons also lifts the cause, though not the doubling: the owner was switched off,
+/// so a refusal once it is switched on again is news.
 #[derive(Debug)]
 struct Refusals {
     /// Consecutive refused tries.
     streak: u32,
     /// The owner serves in the background, where every wait is [`POLL`].
     background: bool,
+    /// The step and error of this streak's previous refusal, until Commons is disabled.
+    cause: Option<(&'static str, String)>,
 }
 impl Refusals {
     const fn new(background: bool) -> Self {
         Self {
             streak: 0,
             background,
+            cause: None,
         }
     }
     /// The wait after a try that ended with `status` (`None`: it ended to rebuild), having served
-    /// for `served` (`None`: it never served). Typed local contention keeps [`POLL`]
-    /// rather than increasing the persistent-refusal streak.
-    fn after(&mut self, status: Option<Status>, served: Option<Duration>) -> Duration {
-        if self.background {
-            return POLL;
-        }
-        let base = TICK * 2;
+    /// for `served` (`None`: it never served), marking a refusal in `status` that stands. Typed
+    /// local contention keeps [`POLL`] rather than increasing the persistent-refusal streak.
+    fn after(&mut self, status: Option<&mut Status>, served: Option<Duration>) -> Duration {
         if status.is_none() || served.is_some_and(|served| served >= REFUSED_MAX) {
             self.streak = 0;
+            self.cause = None;
         }
+        let base = TICK * 2;
         match status {
+            Some(Status::Refused(refusal)) => {
+                let cause = Some((refusal.step, refusal.error.clone()));
+                refusal.standing = self.cause == cause;
+                self.cause = cause;
+            }
             Some(Status::Retrying(_)) => return POLL,
-            Some(Status::Refused(_)) => {}
-            _ => return base,
+            other => {
+                if matches!(other, Some(Status::Disabled)) {
+                    self.cause = None;
+                }
+                return if self.background { POLL } else { base };
+            }
+        }
+        if self.background {
+            return POLL;
         }
         let wait = base
             .saturating_mul(1 << self.streak.min(16))
@@ -711,6 +773,17 @@ impl Runtime {
         Self::start_background_on(paths, config, observe, Network::gated(lan)?)
     }
 
+    /// [`Self::start_background`] with [`Self::start_with_reports`]'s completed-round reports.
+    pub fn start_background_with_reports(
+        paths: Paths,
+        config: PathBuf,
+        lan: LanGate,
+        observe: impl Fn(Status) + Send + 'static,
+        reports: impl Fn(RepairRound) + Send + 'static,
+    ) -> Result<Self> {
+        Self::start_mode_with_reports(paths, config, observe, Network::gated(lan)?, true, reports)
+    }
+
     fn start_on(
         paths: Paths,
         config: PathBuf,
@@ -781,9 +854,9 @@ impl Runtime {
                 let observer_dir = crate::network_state::directory(&observer_config);
                 let mut window_claim = None;
                 let mut previous = None;
-                let mut report = |status| {
-                    if previous != Some(status) {
-                        observe(status);
+                let mut report = |status: Status| {
+                    if previous.as_ref() != Some(&status) {
+                        observe(status.clone());
                         previous = Some(status);
                     }
                 };
@@ -810,15 +883,16 @@ impl Runtime {
                     // shows the journal owner's live observation where one answers, else its own
                     // wait, which it serves to other local processes as an open owner serves its
                     // observation.
-                    if let Some((visibility, detail, status)) = network.lan.held(&config) {
+                    if let Some((visibility, detail, mut status)) = network.lan.held(&config) {
                         published.replace_publication(
                             transport_publication(&paths)
                                 .or_else(|| crate::network_state::read_owner_publication(&config).ok())
                                 .unwrap_or_else(|| held_publication(&config, visibility, detail)),
                         );
                         wait_relay.keep(&observer_config, &published);
+                        let wait = refusals.after(Some(&mut status), None);
                         report(status);
-                        network.retry(&worker, refusals.after(Some(status), None));
+                        network.retry(&worker, wait);
                         continue;
                     }
                     if !background && window_claim.is_none() {
@@ -849,7 +923,7 @@ impl Runtime {
                     };
                     while !worker.requested() {
                         let mut serving = None;
-                        let served = serve_mode_with_recovery(
+                        let mut served = serve_mode_with_recovery(
                             (&paths, &config, recover_writer),
                             background.then_some(observer_dir.as_path()),
                             &worker,
@@ -865,7 +939,7 @@ impl Runtime {
                             &board,
                         );
                         let wait = refusals.after(
-                            served.err(),
+                            served.as_mut().err(),
                             serving.map(|since: Instant| since.elapsed()),
                         );
                         if let Err(status) = served {
@@ -1209,6 +1283,14 @@ fn serve_selected(
         vault::Reader::start(paths, config, &lease, &custody).map_err(refusal("vault reader"))?
     };
     let mut hearing = (!pending).then(|| Hearing::open(&bootstrap));
+    let mut clocks = if pending {
+        None
+    } else {
+        ClockStore::open(&bootstrap)
+    };
+    // The lab journal's flusher, on a thread of its own; an enrolling owner has no writer to
+    // publish anything with.
+    let mut lab = (!pending).then(|| crate::alab::upkeep::Upkeep::new(Instant::now()));
     let mut refused = network.lan.refused();
     let mut refresh = Instant::now() + Duration::from_secs(30);
     let result = (|| {
@@ -1299,14 +1381,24 @@ fn serve_selected(
                 }
             }
             let completed: Vec<_> = transport.reports().collect();
+            if let Some(lab) = &mut lab {
+                lab.tick(paths, now);
+            }
             #[cfg(test)]
             network.observed(&transport);
             let contacts = transport.take_contacts();
             if let Some(hearing) = &mut hearing {
                 hearing.tick(paths, &bootstrap, &contacts, now);
             }
+            // The Commons journal and this custody's access, read once this tick for every
+            // reader of its contacts, and only by the first that needs them.
+            let resolved = std::cell::OnceCell::new();
+            if let Some(clocks) = &mut clocks {
+                clocks.tick(&bootstrap, &resolved, &contacts, now);
+            }
             observe_contacts(
                 &bootstrap,
+                &resolved,
                 history,
                 contacts
                     .into_iter()
@@ -1415,6 +1507,80 @@ impl Hearing {
     }
 }
 
+/// This device's readings of its clock against each peer's (`crate::clock`, F22): the latest per
+/// Commons machine, resolved through the current members as [`observe_contacts`] does, kept in
+/// `clock.state` in the claim directory when a reading's class or the standing changes, or every
+/// [`KEEP`] once a reading changed. Every claims read and write judges that file on its own clock.
+/// A write that fails stops nothing: the claims read the file they find, or none.
+struct ClockStore {
+    dir: std::path::PathBuf,
+    clocks: crate::clock::Clocks,
+}
+impl ClockStore {
+    fn open(bootstrap: &Bootstrap) -> Option<Self> {
+        let dir = crate::clock::dir(bootstrap)?;
+        Some(Self {
+            clocks: crate::clock::Clocks::open(&dir),
+            dir,
+        })
+    }
+
+    fn tick(
+        &mut self,
+        bootstrap: &Bootstrap,
+        resolved: &std::cell::OnceCell<Option<Resolved>>,
+        contacts: &[transport::Contact],
+        now: Instant,
+    ) {
+        let read: Vec<_> = contacts
+            .iter()
+            .filter_map(|contact| Some((contact.actor, contact.clock?, contact.clock_at)))
+            .collect();
+        if read.is_empty() && !self.clocks.due(now, KEEP) {
+            return;
+        }
+        let Some(now_ms) = aterm_time::unix_millis() else {
+            return;
+        };
+        let Some(Resolved { access, .. }) =
+            resolved.get_or_init(|| Resolved::read(bootstrap)).as_ref()
+        else {
+            return;
+        };
+        for (actor, reading, at) in read {
+            if let Some(member) = access
+                .members()
+                .iter()
+                .find(|member| member.binding().actor() == actor)
+            {
+                self.clocks
+                    .observe(*member.binding().machine(), reading, at);
+            }
+        }
+        let members = crate::clock::members(access.members().iter().map(|m| m.binding()));
+        let me = *access.local().binding().machine();
+        self.clocks
+            .tick(&self.dir, &members, &me, now_ms, now, KEEP);
+    }
+}
+
+/// The Commons journal and this custody's access in it, as the readers of one tick's contacts
+/// resolve their peers ([`ClockStore::tick`], [`observe_contacts`]).
+struct Resolved {
+    journal: Journal,
+    access: aterm_secrets::commons::roster::Access,
+}
+impl Resolved {
+    /// The journal and the access it gives this custody, revalidated now; none where the journal
+    /// cannot be read, the custody is no longer valid, or it grants no access.
+    fn read(bootstrap: &Bootstrap) -> Option<Self> {
+        let journal = Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust()).ok()?;
+        bootstrap.revalidate_custody().ok()?;
+        let access = bootstrap.access_in(&journal).ok()??;
+        Some(Self { journal, access })
+    }
+}
+
 /// On an admin, refresh the Commons roster from `ledger`; elsewhere, nothing.
 fn refresh(paths: &Paths, bootstrap: &Bootstrap, ledger: &mut Ledger, now_ms: u64) {
     if bootstrap.is_log_backed().unwrap_or(false) {
@@ -1438,6 +1604,7 @@ fn refresh(paths: &Paths, bootstrap: &Bootstrap, ledger: &mut Ledger, now_ms: u6
 /// independent of speed.
 fn observe_contacts(
     bootstrap: &Bootstrap,
+    resolved: &std::cell::OnceCell<Option<Resolved>>,
     history: &mut Observer,
     contacts: Vec<(astream_wire::sync::Actor, Instant)>,
     completed: &[RepairRound],
@@ -1459,14 +1626,9 @@ fn observe_contacts(
     if contacts.is_empty() && endpoints.is_empty() && exchanges.is_empty() && attempts.is_empty() {
         return;
     }
-    let journal = aterm_secrets::commons::journal::Journal::read_existing(
-        bootstrap.journal_dir(),
-        bootstrap.trust(),
-    );
     let mut answers = Vec::new();
-    if let Ok(journal) = journal
-        && bootstrap.revalidate_custody().is_ok()
-        && let Ok(Some(access)) = bootstrap.access_in(&journal)
+    if let Some(Resolved { journal, access }) =
+        resolved.get_or_init(|| Resolved::read(bootstrap)).as_ref()
     {
         for (actor, authenticated_at) in contacts {
             if let Some(member) = access
@@ -1502,7 +1664,7 @@ fn observe_contacts(
         }
         for exchange in exchanges {
             if let Some(candidate) =
-                accounts_exchange_candidate(bootstrap, &journal, &access, exchange)
+                accounts_exchange_candidate(bootstrap, journal, access, exchange)
             {
                 history.accounts_exchange(candidate);
             }
@@ -1892,6 +2054,7 @@ mod accounts_exchange_tests {
         history.local(local.clone(), bootstrap.trust()).unwrap();
         observe_contacts(
             &bootstrap,
+            &std::cell::OnceCell::new(),
             &mut history,
             Vec::new(),
             std::slice::from_ref(&completed),
@@ -1916,6 +2079,7 @@ mod accounts_exchange_tests {
         refused.local(local, bootstrap.trust()).unwrap();
         observe_contacts(
             &bootstrap,
+            &std::cell::OnceCell::new(),
             &mut refused,
             Vec::new(),
             &[completed],
@@ -1955,6 +2119,7 @@ mod accounts_exchange_tests {
         failed.completed_at_ms = 1500;
         observe_contacts(
             &bootstrap,
+            &std::cell::OnceCell::new(),
             &mut history,
             vec![(actor, at)],
             std::slice::from_ref(&failed),
@@ -1989,6 +2154,7 @@ mod accounts_exchange_tests {
         failed.completed_at_ms = 2500;
         observe_contacts(
             &bootstrap,
+            &std::cell::OnceCell::new(),
             &mut history,
             Vec::new(),
             &[failed.clone()],
@@ -1999,6 +2165,7 @@ mod accounts_exchange_tests {
         failed.actor = Some(actor);
         observe_contacts(
             &bootstrap,
+            &std::cell::OnceCell::new(),
             &mut history,
             Vec::new(),
             &[failed],

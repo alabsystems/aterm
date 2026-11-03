@@ -386,7 +386,7 @@ fn answer(
         .flatten()
         .filter(|p| p.is_file());
     let mut out = stream;
-    match file.and_then(|p| std::fs::read(&p).ok().map(|b| (p, b))) {
+    match file.and_then(|p| crate::read_regular(&p).ok().map(|b| (p, b))) {
         Some((path, body)) => {
             write!(
                 out,

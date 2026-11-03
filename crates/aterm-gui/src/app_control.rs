@@ -39,11 +39,34 @@ pub(crate) struct ActRequest {
     pub(crate) value: Option<String>,
 }
 
+/// The Settings actions `act` presses for no control client, each with the buttons its refusal
+/// names: a person presses them in the window. Refused by the action's prefix before any view
+/// is read, so a page that does not show the button yet refuses it the same way.
+const PERSON_ONLY_PREFIXES: [(&str, &str); 2] = [
+    (
+        crate::native_settings::MACOS_ACCESS_GESTURE_PREFIX,
+        "Settings ▸ Security's macOS access buttons",
+    ),
+    (
+        crate::native_settings::OWNER_RULES_PREFIX,
+        "Settings ▸ Harness's Owner rules buttons",
+    ),
+];
+
+/// Why `act` refuses `action` ([`PERSON_ONLY_PREFIXES`]); `None` for every other action.
+fn person_only_refusal(action: &str) -> Option<String> {
+    PERSON_ONLY_PREFIXES
+        .iter()
+        .find(|(prefix, _)| action.starts_with(prefix))
+        .map(|(_, buttons)| format!("`act` does not press {buttons}; press them in the window"))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenRequest {
     Mail,
     About,
     SystemState,
+    Workers,
     Settings(crate::native_settings::SettingsRoute),
     Markdown(String),
     Editor(String),
@@ -145,6 +168,7 @@ pub(crate) fn parse_open(rest: &str) -> Result<OpenRequest, String> {
         WireOpenAppRequest::Mail => Ok(OpenRequest::Mail),
         WireOpenAppRequest::About => Ok(OpenRequest::About),
         WireOpenAppRequest::SystemState => Ok(OpenRequest::SystemState),
+        WireOpenAppRequest::Workers => Ok(OpenRequest::Workers),
         WireOpenAppRequest::Settings { route } => {
             let route = if route == "/" {
                 Some(crate::native_settings::SettingsRoute::Home)
@@ -226,6 +250,9 @@ impl App {
     }
 
     pub(crate) fn act_app(&mut self, request: ActRequest) -> Result<String, String> {
+        if let Some(refusal) = person_only_refusal(&request.action) {
+            return Err(refusal);
+        }
         let (wid, _) = self.locate_native_view(request.view)?;
 
         let mut inspected = self.compile_view(request.view)?;
@@ -242,6 +269,9 @@ impl App {
                     state.reveal_listed_control(&key)
                 }
                 Some(crate::native_app::AppViewState::SystemState(state)) => {
+                    state.reveal_listed_control(&key)
+                }
+                Some(crate::native_app::AppViewState::Workers(state)) => {
                     state.reveal_listed_control(&key)
                 }
                 _ => false,
@@ -267,16 +297,6 @@ impl App {
         }
         if node.state.is_some_and(|state| !state.enabled) {
             return Err("semantic action is disabled".to_string());
-        }
-        if node_action
-            .as_str()
-            .starts_with(crate::native_settings::MACOS_ACCESS_GESTURE_PREFIX)
-        {
-            return Err(
-                "`act` does not press Settings ▸ Security's macOS access buttons; press them in \
-                 the window"
-                    .to_string(),
-            );
         }
         let value = semantic_input(&node.role, &node.value, request.value.as_deref())?;
         let result = self.with_gesture_source(true, |app| {
@@ -348,6 +368,7 @@ impl App {
                 .ok_or_else(|| {
                     "System State could not be opened in the requesting window".to_string()
                 }),
+            OpenRequest::Workers => self.open_workers_tab().map(|()| "app workers".to_string()),
             OpenRequest::Settings(route) => self
                 .open_settings_tab(route)
                 .then(|| format!("app settings {}", route.path()))
@@ -602,7 +623,7 @@ impl App {
             .ok_or_else(|| "view has no layout leaf".to_string())
     }
 
-    fn inspect_tabs_body(&self) -> Vec<String> {
+    pub(crate) fn inspect_tabs_body(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for (wid, ws) in &self.windows {
             lines.push(format!(
@@ -627,13 +648,14 @@ impl App {
                     .get(&tab.id)
                     .map_or(stable_fallback, |(_, title)| title.as_str());
                 lines.push(format!(
-                    "  tab id={} index={} kind={} title={:?} state={} active={}",
+                    "  tab id={} index={} kind={} title={:?} state={} active={} parked={}",
                     tab.id.get(),
-                    index,
+                    index + 1,
                     tab_kind(self, tab),
                     title,
                     indicator_state(tab),
                     ws.tab_set.active_id() == Some(tab.id),
+                    tab.parked,
                 ));
                 serialize_split(self, tab, &tab.root, &leaves, "/", 4, &mut lines);
             }
@@ -1524,7 +1546,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// `inspect app/v1 tabs` prints `index=` in the 0-based numbering `tab <N>` and
+    /// `inspect app/v1 tabs` prints `index=` in the one-based numbering `tab <N>` and
     /// `tab close <N>` take, and a number past the end is refused.
     #[test]
     fn tabs_inspection_prints_the_index_the_tab_verb_takes() {
@@ -1535,7 +1557,7 @@ mod tests {
         let count = app.windows[&wid].tab_set.len();
         assert_eq!(count, 3, "fixture: three tabs");
         let lines = app.inspect_app(InspectRequest::Tabs).unwrap();
-        let indexes: Vec<usize> = lines
+        let numbers: Vec<usize> = lines
             .iter()
             .filter(|line| line.starts_with("  tab id="))
             .map(|line| {
@@ -1546,18 +1568,17 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        assert_eq!(indexes, [0, 1, 2], "0-based, in tab order: {lines:?}");
-        for index in &indexes {
+        assert_eq!(numbers, [1, 2, 3], "one-based, in tab order: {lines:?}");
+        for number in &numbers {
+            let action = crate::control::control_input::parse_tab(&number.to_string()).unwrap();
             assert_eq!(
-                app.apply_tab_cmd_in(wid, crate::TabAction::Select(*index)),
-                Ok((*index, count)),
-                "`tab {index}` selects the tab inspect printed as index={index}"
+                app.apply_tab_cmd_in(wid, action),
+                Ok((number - 1, count)),
+                "`tab {number}` selects the tab inspect printed as index={number}"
             );
         }
-        assert!(
-            app.apply_tab_cmd_in(wid, crate::TabAction::Select(count))
-                .is_err()
-        );
+        let action = crate::control::control_input::parse_tab(&(count + 1).to_string()).unwrap();
+        assert!(app.apply_tab_cmd_in(wid, action).is_err());
     }
 
     #[test]
@@ -2184,6 +2205,66 @@ mod tests {
         assert!(
             panel.take_devtools_hand_over_request(),
             "the pressed Open Developer Tools asks the host for the hand-over"
+        );
+    }
+
+    /// `act` refuses an action of Settings ▸ Harness's Owner rules card by its prefix alone,
+    /// naming the window, before the page is asked whether it shows the button.
+    /// NEGATIVE CONTROL: a harness action off the person-only list, on the same page, is pressed.
+    #[test]
+    fn act_refuses_the_owner_rules_presses_and_presses_another_harness_action() {
+        use crate::native_settings::{OWNER_RULES_PREFIX, SettingsRoute};
+        let mut app = App::headless_for_test();
+        if let Some(window) = app.windows.get_mut(&WindowId(0)) {
+            window.cols = 140;
+            window.rows = 160;
+        }
+        assert!(app.open_settings_tab(SettingsRoute::Harness));
+        let (_, view) = app.active_native_view(WindowId(0)).unwrap();
+        for what in ["confirm/0123456789ab", "withdraw/x"] {
+            let action = format!("{OWNER_RULES_PREFIX}{what}");
+            let refused = app
+                .act_app(ActRequest {
+                    view,
+                    ui_key: action.clone(),
+                    action: action.clone(),
+                    value: None,
+                })
+                .unwrap_err();
+            assert_eq!(
+                Some(refused.clone()),
+                super::person_only_refusal(&action),
+                "the person-only list refused it, not the tree: {refused}"
+            );
+            assert!(
+                refused.contains("Owner rules") && refused.contains("in the window"),
+                "{refused}"
+            );
+        }
+
+        let toggle = "harness/config/toggle";
+        assert!(!toggle.starts_with(OWNER_RULES_PREFIX));
+        let controls = app
+            .inspect_app(InspectRequest::View {
+                view,
+                projection: InspectionProjection::Controls,
+            })
+            .unwrap();
+        assert!(
+            controls
+                .iter()
+                .any(|line| line.contains(&format!("action={toggle}"))),
+            "the control is on the page: {controls:#?}"
+        );
+        assert!(
+            app.act_app(ActRequest {
+                view,
+                ui_key: toggle.to_string(),
+                action: toggle.to_string(),
+                value: None,
+            })
+            .is_ok_and(|acted| acted.contains(toggle)),
+            "a harness action off the list is pressed"
         );
     }
 

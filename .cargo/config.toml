@@ -52,6 +52,14 @@
 [target.'cfg(trust_verify)']
 rustflags = ["-Zthreads=4"]
 
+# Trust's Cargo supports content-based Rust freshness. Recreating an identical
+# checkout must not re-run the compiler's expensive certificate checks just
+# because file timestamps changed. Build-script inputs still use timestamps;
+# the release/publication snapshot cache preserves their identical subtrees.
+# Upstream stable Cargo ignores this unstable table on the cross-build lanes.
+[unstable]
+checksum-freshness = true
+
 # EVERY WINDOWS EXECUTABLE RUNS AS ITS INVOKER. Windows' installer detection
 # asks elevation of an unmanifested executable whose name says `update`,
 # `install`, `setup` or `patch` (os error 740, "The requested operation requires

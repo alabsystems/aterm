@@ -30,14 +30,10 @@ pub const PROMPT: &str = "Secrets vault URL or path (none skips): ";
 
 const SKIPPED: &str = "skipped at the prompt; aterm secrets join <url> joins a vault later";
 
-/// How a Mac waiting to join a vault at a URL is let in: by any member, never one leader
-/// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.3.3), in the words `aterm members join` gives:
-/// one shared constant, so every surface gives the steps in one order. The join this crate makes
-/// queues at the vault; at the ALab vault it then asks every member it hears
-/// ([`SecretsOps::ask_members`]), and once one heard it the row says these words. Where none
-/// heard it (no member on this network, or a read that asks nobody), the row first says to ask
-/// them ([`ASK_FIRST`]). That Mac's vault subscriber also asks them again while it waits, less
-/// often as it goes, up to every 15 minutes (`aterm_secrets::client::on_ask_members`).
+use aterm_secrets::alab_join::JoinPlace;
+/// Shared progress for automatic ALab LAN admission, as `aterm members join` reports it.
+/// The join queues at the vault and asks reachable members ([`SecretsOps::ask_members`]); the
+/// subscriber keeps retrying while it waits (`aterm_secrets::client::on_ask_members`).
 pub use aterm_secrets::members::join::LET_IN;
 
 /// Progress while this Mac's automatic ALab join is pending.
@@ -47,6 +43,10 @@ pub fn quiet_first() -> String {
 
 /// What a Mac whose ask no member heard does before [`LET_IN`]: ask them all.
 const ASK_FIRST: &str = "looking for ALab members on this LAN";
+
+/// What a Mac whose ask a member heard says anywhere but the ALab LAN, where nothing may join it
+/// automatically ([`quiet_first`] is the ALab LAN's).
+const ASKED: &str = "the ALab members it reached heard it ask";
 
 /// What a Mac a member let in waits for: its vault to record it, which needs nobody.
 const ALLOWED: &str =
@@ -128,6 +128,13 @@ pub enum Here {
     /// Nobody to ask, in a remote shell (SSH) of the login that owns the console, where macOS
     /// raises no Local Network question.
     Remote,
+    /// A person at a terminal, as [`Here::Person`], in a run nobody asked for: aterm's own,
+    /// finishing setup after their package install or update ([`crate::init::Decider::Aterm`]).
+    /// The row says how an admin lets this Mac in, but the run asks nothing: no `--vault`
+    /// question, no signer for its join to confirm, and on a Mac its look for the ALab vault
+    /// waits for macOS's Local Network answer as [`Here::Session`]'s does, since putting that
+    /// question on the screen is no decision aterm makes by itself.
+    Unbidden,
 }
 
 /// What an unconfigured Mac's row says where no ALab vault answers: nothing is asked.
@@ -361,6 +368,12 @@ pub trait SecretsOps: Send + Sync {
     /// registered ([`on_lan_answered`]); a port with none reads no answer.
     fn lan_answered(&self) -> bool {
         false
+    }
+
+    /// Where this Mac is for its ALab join's words (`aterm_secrets::alab_join::JoinPlace`): the
+    /// live port reads its network place ([`JoinPlace::here`]); a port with none cannot tell.
+    fn join_place(&self) -> JoinPlace {
+        JoinPlace::Unknown
     }
 }
 
@@ -977,6 +990,10 @@ impl SecretsOps for LiveSecrets {
         LAN_ANSWERED.get().is_some_and(|answered| answered())
     }
 
+    fn join_place(&self) -> JoinPlace {
+        JoinPlace::here()
+    }
+
     fn sync(&self) -> aterm_secrets::Result<()> {
         aterm_secrets::client::sync(&self.paths(), None).map(drop)
     }
@@ -1260,18 +1277,21 @@ pub fn items(
     items_at(sys, ctx, ops, mode, vault, Here::Person)
 }
 
-/// What an unconfigured Mac's row says where a run with nobody to answer did not look for the
-/// ALab vault, because the look would raise macOS's Local Network question on the screen.
+/// What an unconfigured Mac's row says where a run that asks nobody (nobody is there to answer,
+/// or aterm decided the run, [`Here::Unbidden`]) did not look for the ALab vault, because the
+/// look would raise macOS's Local Network question on the screen.
 const LAN_NOT_ASKED: &str = "not looked for yet: the look would put macOS's question whether \
-                             aterm may use the local network on this Mac's screen, and nobody \
-                             here answers it; System State asks it, or aterm init at this Mac's \
-                             console looks";
+                             aterm may use the local network on this Mac's screen, which this \
+                             run puts to nobody; System State asks it, or aterm init at this \
+                             Mac's console looks";
 
 /// The secrets step for this run, for `here`. An unconfigured Mac joins the open default ALab
 /// vault on its LAN with no question, and says no code: a person at a terminal included, and an
 /// agent's tab or a remote shell too ([`Here`]). Only the vault `vault` (`--vault`) names may ask
 /// something, of a person at a terminal (its signing key, or another source where none answers
-/// there); a join password is never asked. Where no vault answers, it asks nothing.
+/// there); a join password is never asked. Where no vault answers, it asks nothing. On a Mac,
+/// a run in the console login's session that is no person's own ([`Here::Session`],
+/// [`Here::Unbidden`]) looks only once macOS has answered aterm's Local Network question.
 /// # Errors
 /// The run does not name exactly one user, or the person stopped a prompt (Ctrl-C); nothing
 /// was changed then.
@@ -1285,6 +1305,7 @@ pub fn items_at(
 ) -> Result<Secrets, String> {
     let user = only_user(ctx)?.clone();
     let person = here == Here::Person;
+    let says_codes = matches!(here, Here::Person | Here::Unbidden);
     if vault.is_none() {
         match ops.swarm_enabled() {
             Ok(true) => {}
@@ -1343,7 +1364,7 @@ pub fn items_at(
             Duration::ZERO,
         );
         return Ok(Secrets {
-            items: vec![Box::new(vault.saying_codes(person))],
+            items: vec![Box::new(vault.saying_codes(says_codes).asking(person))],
             waited_on,
         });
     }
@@ -1352,7 +1373,7 @@ pub fn items_at(
     if mode != Mode::Apply || (vault.is_some() && !asks) {
         return Ok(Secrets::not_applicable(user, UNCONFIGURED));
     }
-    if here == Here::Session && sys.macos() && !ops.lan_answered() {
+    if matches!(here, Here::Session | Here::Unbidden) && sys.macos() && !ops.lan_answered() {
         return Ok(Secrets::note(
             user,
             Probe::Deferred {
@@ -1388,7 +1409,7 @@ pub fn items_at(
     let id = item_id(&user);
     let vault = Vault::new(user, ops, source, Origin::Chosen, None, Duration::ZERO);
     Ok(Secrets {
-        items: vec![Box::new(vault.saying_codes(person))],
+        items: vec![Box::new(vault.saying_codes(says_codes).asking(person))],
         waited_on: Some(id),
     })
 }
@@ -1514,6 +1535,11 @@ pub(crate) struct Vault {
     /// ([`Vault::saying_codes`]): only where a person is at the console, never in an agent's
     /// transcript or a remote shell's.
     says_codes: bool,
+    /// Whether its join may ask the person a question (the signer of a vault whose source pins
+    /// none: [`SecretsOps::join`]'s `interactive`), set by [`Vault::asking`]: only in a person's
+    /// own run ([`Here::Person`]), never in one aterm decided ([`Here::Unbidden`]), which shows
+    /// the codes but asks nothing.
+    asks: bool,
 }
 
 impl Vault {
@@ -1538,13 +1564,23 @@ impl Vault {
             replaces: Replaces::Any,
             keeps_off: false,
             says_codes: true,
+            asks: false,
         }
     }
 
     /// This vault item, its row naming the code an admin approves this Mac by only when
-    /// `person` ([`Here::Person`]); its join then asks nothing either (no signer to confirm).
-    const fn saying_codes(mut self, person: bool) -> Self {
-        self.says_codes = person;
+    /// `codes`: a person at the terminal, in their own run or one aterm decided
+    /// ([`Here::Person`], [`Here::Unbidden`]).
+    const fn saying_codes(mut self, codes: bool) -> Self {
+        self.says_codes = codes;
+        self
+    }
+
+    /// This vault item, its chosen source's join ([`Origin::Chosen`]) free to ask the person
+    /// (a signer to confirm) only when `asks`: their own run ([`Here::Person`]). A vault built
+    /// without it asks nothing.
+    const fn asking(mut self, asks: bool) -> Self {
+        self.asks = asks;
         self
     }
 
@@ -1844,14 +1880,10 @@ impl Vault {
         Ok(())
     }
 
-    /// Stand aside waiting to be let in ([`approval`]), naming the fix for a mistyped join
-    /// password when one may have been sent (`retyped`). A Mac waiting on the ALab vault first
-    /// asks every member it hears ([`SecretsOps::ask_members`]), so a member shows its row with
-    /// nobody running `aterm members join`. This runs on the pass that joins and on one that
-    /// starts a subscriber it found down; a pass that finds the subscriber running only reads
-    /// ([`Vault::probe`]), and its row names `aterm members join`, which asks again. Asking again
-    /// is one row on the member, and a row the member ignored stays ignored. A Mac a member
-    /// already let in asks nobody.
+    /// Record pending join progress ([`approval`]), including a mistyped-password remedy when
+    /// one may have been sent (`retyped`). ALab asks reachable members automatically unless a
+    /// member already let this Mac in. The subscriber continues the pending join; a probe only
+    /// reads its progress. Other vaults retain their explicit approval instructions.
     fn wait_to_be_let_in(&self, approve: Option<&str>, retyped: bool) {
         let approve = approve.filter(|_| self.says_codes);
         let alab = self.on_alab();
@@ -1865,7 +1897,12 @@ impl Vault {
             let members = alab || alab_words(None, &self.source);
             format!(
                 "waiting to be let in: {}",
-                approval(approve, &self.source, members, retyped, asked)
+                approval(
+                    approve,
+                    (&self.source, members),
+                    retyped,
+                    (asked, &|| self.ops.join_place())
+                )
             )
         };
         let mut aside = self.aside.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1890,13 +1927,18 @@ fn source_text(source: &Source) -> String {
     }
 }
 
-/// What lets this Mac in: at the ALab vault (`alab`, [`alab_words`]), an Allow on any member
-/// and the phrase it shows ([`LET_IN`], after asking every member ([`ASK_FIRST`]) unless one
-/// heard this Mac ask (`asked`)); at a path, which has no queue for an Allow to reach, or at
-/// another vault, whose members show no Allow, an admin Mac's `approve` of it (`approve`,
-/// [`Status::approve_command`]). When a join password may have been sent (`retyped`), how a
-/// mistyped one is fixed.
-fn approval(approve: Option<&str>, source: &str, alab: bool, retyped: bool, asked: bool) -> String {
+/// Pending join progress: automatic admission at the ALab vault (`alab`, [`alab_words`]) in the
+/// words for where this Mac is (`at`, read only then: [`LET_IN`] on the ALab LAN, else
+/// `aterm_secrets::alab_join::let_in`'s, which promise no automatic admission off it), after
+/// asking every member ([`ASK_FIRST`]) unless one heard this Mac ask (`asked`); or an admin's
+/// approval at a path or another vault (`approve`, [`Status::approve_command`]). When a join
+/// password may have been sent (`retyped`), include its mistyping remedy.
+fn approval(
+    approve: Option<&str>,
+    (source, alab): (&str, bool),
+    retyped: bool,
+    (asked, at): (bool, &dyn Fn() -> JoinPlace),
+) -> String {
     let at_path = source.starts_with('/') || source.starts_with("~/");
     let approve = match approve {
         Some(approve) if at_path || !alab => format!(
@@ -1906,13 +1948,22 @@ fn approval(approve: Option<&str>, source: &str, alab: bool, retyped: bool, aske
             "an admin Mac approves this Mac (the subscriber finishes the join once it is approved)"
                 .to_owned()
         }
-        _ if asked => format!(
-            "{}, {LET_IN} (the subscriber finishes the join once it is let in)",
-            quiet_first()
-        ),
-        _ => format!(
-            "{ASK_FIRST}, then {LET_IN} (the subscriber finishes the join once it is let in)"
-        ),
+        _ => {
+            let at = at();
+            let let_in = aterm_secrets::alab_join::let_in(at);
+            match (asked, at) {
+                (true, JoinPlace::Home) => format!(
+                    "{}, {let_in} (the subscriber finishes the join once it is let in)",
+                    quiet_first()
+                ),
+                (true, _) => format!(
+                    "{ASKED}; {let_in} (the subscriber finishes the join once it is let in)"
+                ),
+                (false, _) => format!(
+                    "{ASK_FIRST}, then {let_in} (the subscriber finishes the join once it is let in)"
+                ),
+            }
+        }
     };
     match retype(source).filter(|_| retyped) {
         Some(retype) => format!("{approve}; {retype}"),
@@ -1971,7 +2022,12 @@ const fn idle(state: &State) -> Option<&'static str> {
 /// What a member Mac whose subscriber the person turned off says of its sync.
 const SYNC_OFF: &str = "sync is off on this Mac by your choice; aterm secrets agent on turns it on";
 
-fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool, off: bool) -> Probe {
+fn judge(
+    status: &Status,
+    source: &str,
+    (unsynced, synced, off): (Option<&str>, bool, bool),
+    at: &dyn Fn() -> JoinPlace,
+) -> Probe {
     let name = status
         .config
         .as_ref()
@@ -2034,7 +2090,7 @@ fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool, of
         Membership::Pending if watched => Probe::Unusable {
             why: format!(
                 "waiting to be let in: {}",
-                approval(approve.as_deref(), source, alab, true, false)
+                approval(approve.as_deref(), (source, alab), true, (false, at))
             ),
         },
         Membership::Pending => unwatched(format!("waiting to be let into vault {name}")),
@@ -2166,7 +2222,9 @@ impl Item for Vault {
             };
             &uncoded
         };
-        let probe = match judge(judged, &self.source, unsynced, synced, off) {
+        let probe = match judge(judged, &self.source, (unsynced, synced, off), &|| {
+            self.ops.join_place()
+        }) {
             // A member let this Mac into the ALab vault: the read says it waits for the vault,
             // as the pass that applies does ([`Vault::wait_to_be_let_in`]).
             Probe::Unusable { .. }
@@ -2211,7 +2269,7 @@ impl Item for Vault {
         self.set_aside(None);
         match self.origin {
             Origin::Configured => self.settle(),
-            Origin::Chosen => self.join(sys, self.says_codes),
+            Origin::Chosen => self.join(sys, self.asks),
             Origin::Selected => {
                 let status = self
                     .ops
@@ -2436,6 +2494,8 @@ pub(crate) mod tests {
         let_in: Mutex<bool>,
         /// macOS has not answered aterm's Local Network question yet (`lan_answered`).
         lan_unanswered: Mutex<bool>,
+        /// Where this Mac is for its join's words (`None`: on the ALab LAN).
+        place: Mutex<Option<JoinPlace>>,
     }
 
     impl Scripted {
@@ -2453,6 +2513,11 @@ pub(crate) mod tests {
                 ))),
                 ..Self::default()
             })
+        }
+
+        /// Puts this Mac where `place` says for its join's words.
+        pub(crate) fn placed(&self, place: JoinPlace) {
+            *self.place.lock().unwrap() = Some(place);
         }
 
         pub(crate) fn alab_answers(&self) {
@@ -2629,6 +2694,10 @@ pub(crate) mod tests {
 
         fn lan_answered(&self) -> bool {
             !*self.lan_unanswered.lock().unwrap()
+        }
+
+        fn join_place(&self) -> JoinPlace {
+            self.place.lock().unwrap().unwrap_or(JoinPlace::Home)
         }
 
         fn swarm_enabled(&self) -> aterm_secrets::Result<bool> {
@@ -3378,39 +3447,43 @@ pub(crate) mod tests {
         assert_eq!(ops.probes(), 0);
     }
 
-    /// In the console login's session with nobody to answer, a look for the ALab vault would put
-    /// macOS's Local Network question on the screen: until macOS has answered it, no look runs,
-    /// the row waits for the person (deferred, not failed), and a look that macOS holds after
-    /// all ends at once rather than waiting a minute for an answer nobody gives.
+    /// In the console login's session with nobody to answer, or in a run aterm decided with a
+    /// person there, a look for the ALab vault would put macOS's Local Network question on the
+    /// screen unasked: until macOS has answered it, no look runs, the row waits for the person
+    /// (deferred, not failed), and a look that macOS holds after all ends at once rather than
+    /// waiting a minute for an answer.
     /// NEGATIVE CONTROL: with the `lan_answered` gate removed from `items_at`, the first run
     /// looks (one probe) and the test fails.
     #[test]
     fn off_the_console_no_look_raises_the_local_network_question() {
-        let sys = fake();
-        let ops = Scripted::new(vec![Ok(unconfigured())]);
-        ops.lan_unanswered();
-        ops.alab_answers();
-        let rows = run_at(&sys, &ops, Mode::Apply, Here::Session);
-        assert_eq!(rows[0].outcome, Outcome::Deferred, "{rows:?}");
-        assert_eq!(rows[0].why.as_deref(), Some(LAN_NOT_ASKED));
-        assert_eq!(ops.probes(), 0, "no look");
-        assert!(ops.joins().is_empty());
+        for here in [Here::Session, Here::Unbidden] {
+            let sys = fake();
+            let ops = Scripted::new(vec![Ok(unconfigured())]);
+            ops.lan_unanswered();
+            ops.alab_answers();
+            let rows = run_at(&sys, &ops, Mode::Apply, here);
+            assert_eq!(rows[0].outcome, Outcome::Deferred, "{here:?}: {rows:?}");
+            assert_eq!(rows[0].why.as_deref(), Some(LAN_NOT_ASKED), "{here:?}");
+            assert_eq!(ops.probes(), 0, "{here:?}: no look");
+            assert!(ops.joins().is_empty(), "{here:?}");
 
-        let sys = fake();
-        let ops = Scripted::new(vec![Ok(unconfigured())]);
-        *ops.probed.lock().unwrap() = Some(pending_look());
-        let rows = run_at(&sys, &ops, Mode::Apply, Here::Session);
-        assert_eq!(rows[0].outcome, Outcome::Deferred, "{rows:?}");
-        assert_eq!(ops.probes(), 1, "one look, no wait");
-        assert_eq!(*ops.pauses.lock().unwrap(), 0);
-        assert!(
-            ops.said.lock().unwrap().is_empty(),
-            "nothing said of macOS's question"
-        );
+            let sys = fake();
+            let ops = Scripted::new(vec![Ok(unconfigured())]);
+            *ops.probed.lock().unwrap() = Some(pending_look());
+            let rows = run_at(&sys, &ops, Mode::Apply, here);
+            assert_eq!(rows[0].outcome, Outcome::Deferred, "{here:?}: {rows:?}");
+            assert_eq!(ops.probes(), 1, "{here:?}: one look, no wait");
+            assert_eq!(*ops.pauses.lock().unwrap(), 0, "{here:?}");
+            assert!(
+                ops.said.lock().unwrap().is_empty(),
+                "{here:?}: nothing said of macOS's question"
+            );
+        }
     }
 
-    /// A pairing code is said only where a person is at the console: off it, a Mac waiting to
-    /// be let into another vault reads that an admin Mac approves it, without its code.
+    /// A pairing code is said only where a person is at the console, in their own run or one
+    /// aterm decided: off it, a Mac waiting to be let into another vault reads that an admin Mac
+    /// approves it, without its code.
     #[test]
     fn off_the_console_a_waiting_row_names_no_code() {
         let url = "https://vault.example/v1/lab";
@@ -3424,6 +3497,7 @@ pub(crate) mod tests {
         };
         for (here, coded) in [
             (Here::Person, true),
+            (Here::Unbidden, true),
             (Here::Session, false),
             (Here::Remote, false),
         ] {
@@ -3523,7 +3597,7 @@ pub(crate) mod tests {
         use aterm_secrets::heard::{self, Heard, Verdict};
         let root = aterm_tempfile::tempdir().unwrap();
         let paths = Paths::for_home(root.path());
-        let here = || Some("aabbcc112233@192.168.4.0/24".to_owned());
+        let here = || Some("n00112233445566aa".to_owned());
         let asked = Cell::new(0);
         let probe = |answer: aterm_secrets::Result<ProbeOutcome>| {
             let asked = &asked;
@@ -3541,7 +3615,7 @@ pub(crate) mod tests {
             Some(Verdict {
                 at: 1_000,
                 heard: Heard::Absent,
-                network: "aabbcc112233@192.168.4.0/24".into(),
+                network: "n00112233445566aa".into(),
             })
         );
         // The next run on this network makes no request.
@@ -3551,19 +3625,16 @@ pub(crate) mod tests {
         // Another network is looked at again; a look macOS held is not kept.
         let looked = look_here_with(
             root.path(),
-            Some("ddeeff445566@10.1.0.0/16".into()),
+            Some("n66778899aabbccdd".into()),
             2_000,
             probe(pending_look()),
         );
         assert!(looked.is_err());
         assert_eq!(asked.get(), 2);
-        assert_eq!(
-            heard::read(&paths).unwrap().network,
-            "aabbcc112233@192.168.4.0/24"
-        );
+        assert_eq!(heard::read(&paths).unwrap().network, "n00112233445566aa");
         // Nor is a 404, an answer that is no vault, a timeout or a refused connect: none is an
         // answer about the network.
-        let elsewhere = || Some("001122334455@172.16.0.0/12".to_owned());
+        let elsewhere = || Some("n0123456789abcdef".to_owned());
         for (n, failed) in [
             Ok(ProbeOutcome::Absent),
             Ok(ProbeOutcome::NotThisVault("503 Service Unavailable".into())),
@@ -3578,7 +3649,7 @@ pub(crate) mod tests {
             let _ = look_here_with(root.path(), elsewhere(), 3_000 + n as u64, probe(failed));
             assert_eq!(
                 heard::read(&paths).unwrap().network,
-                "aabbcc112233@192.168.4.0/24",
+                "n00112233445566aa",
                 "{n}"
             );
         }
@@ -3621,6 +3692,36 @@ pub(crate) mod tests {
                 format!("joining {}…", aterm_secrets::ALAB_DEFAULT_URL)
             ]
         );
+    }
+
+    /// A run aterm decided with a person at the console ([`Here::Unbidden`]) shows them the
+    /// codes, but its join of the open ALab vault, once macOS has answered its Local Network
+    /// question, may ask them nothing: no signer to confirm, whatever its source pins. The
+    /// person's own run, whose join may ask, is
+    /// `the_alab_vault_answering_is_joined_with_no_join_password_asked`.
+    /// NEGATIVE CONTROL: `items_at` building the vault with `.asking(says_codes)` makes this
+    /// join interactive, and the test fails.
+    #[test]
+    fn a_run_aterm_decided_joins_the_alab_vault_asking_nothing() {
+        let sys = fake();
+        let ops = Scripted::new(vec![
+            Ok(unconfigured()),
+            Ok(unconfigured()),
+            Ok(configured(Membership::In {
+                seq: 8,
+                heard: 1_800_000_000,
+            })),
+        ]);
+        ops.alab_answers();
+        let rows = run_at(&sys, &ops, Mode::Apply, Here::Unbidden);
+        assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+        assert_eq!(
+            ops.joins(),
+            [(aterm_secrets::ALAB_DEFAULT_URL.to_owned(), false)],
+            "joined, and the join asks nothing"
+        );
+        assert_eq!(*ops.passwords.lock().unwrap(), [false]);
+        assert_eq!(asked(&sys), 0, "nothing asked: {:?}", sys.calls());
     }
 
     #[test]
@@ -3793,7 +3894,9 @@ pub(crate) mod tests {
         if let Some(config) = status.config.as_mut() {
             config.source = Source::Path(path.into());
         }
-        let Probe::Unusable { why } = judge(&status, path, None, true, false) else {
+        let Probe::Unusable { why } =
+            judge(&status, path, (None, true, false), &|| JoinPlace::Home)
+        else {
             panic!("a watched pending join waits for an admin");
         };
         let key = Recipient([7; 32]).to_bech32();
@@ -3805,13 +3908,57 @@ pub(crate) mod tests {
         let Probe::Unusable { why } = judge(
             &configured(Membership::Pending),
             aterm_secrets::ALAB_DEFAULT_URL,
-            None,
-            true,
-            false,
+            (None, true, false),
+            &|| JoinPlace::Home,
         ) else {
             panic!("a watched pending join waits for an admin");
         };
         assert!(why.contains(LET_IN) && !why.contains("admin"), "{why}");
+    }
+
+    /// A Mac waiting on the ALab vault says what lets it in where it is (`aterm init`'s row and
+    /// System State's Secrets step alike): the automatic admission's words on the ALab LAN only,
+    /// and off it `aterm_secrets::alab_join::let_in`'s, never "joining ALab automatically", whether
+    /// or not a member heard it ask.
+    /// NEGATIVE CONTROL: `approval` giving `LET_IN` (and `quiet_first`) wherever this Mac is fails
+    /// at the first place off the LAN, "Proves: the words for where it is".
+    #[test]
+    fn an_alab_joins_waiting_words_follow_where_this_mac_is() {
+        use aterm_secrets::alab_join::let_in;
+        for at in [
+            JoinPlace::Home,
+            JoinPlace::Proves,
+            JoinPlace::Away,
+            JoinPlace::Unknown,
+        ] {
+            let Probe::Unusable { why } = judge(
+                &configured(Membership::Pending),
+                aterm_secrets::ALAB_DEFAULT_URL,
+                (None, true, false),
+                &|| at,
+            ) else {
+                panic!("a watched pending join waits");
+            };
+            assert!(
+                why.contains(let_in(at)),
+                "{at:?}: the words for where it is: {why}"
+            );
+            let asked = approval(
+                None,
+                (aterm_secrets::ALAB_DEFAULT_URL, true),
+                false,
+                (true, &|| at),
+            );
+            assert!(
+                asked.contains(let_in(at)),
+                "{at:?}: the words for where it is: {asked}"
+            );
+            assert_eq!(
+                asked.contains(&quiet_first()),
+                at == JoinPlace::Home,
+                "{at:?}: automatic only on the ALab LAN: {asked}"
+            );
+        }
     }
 
     /// A Mac waiting on, or removed from, a vault other than ALab is told what lets it in there,
@@ -3830,7 +3977,10 @@ pub(crate) mod tests {
             }
             status
         };
-        let Probe::Unusable { why } = judge(&on(Membership::Pending), url, None, true, false)
+        let Probe::Unusable { why } =
+            judge(&on(Membership::Pending), url, (None, true, false), &|| {
+                JoinPlace::Home
+            })
         else {
             panic!("a watched pending join waits");
         };
@@ -3839,9 +3989,12 @@ pub(crate) mod tests {
             "{why}"
         );
         assert!(!why.contains("ALab") && !why.contains(LET_IN), "{why}");
-        let Probe::Blocked { why } =
-            judge(&on(Membership::Revoked { seq: 9 }), url, None, true, false)
-        else {
+        let Probe::Blocked { why } = judge(
+            &on(Membership::Revoked { seq: 9 }),
+            url,
+            (None, true, false),
+            &|| JoinPlace::Home,
+        ) else {
             panic!("a removed Mac is blocked");
         };
         assert!(

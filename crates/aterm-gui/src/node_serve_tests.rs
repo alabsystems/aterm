@@ -167,14 +167,21 @@ fn relay_header_roundtrips_and_rejects_malformed_frames() {
     let ask = RelayHeader::Ask { peer };
     assert_eq!(RelayHeader::parse(&ask.encode()).expect("parse ask"), ask);
 
-    // Negative controls: malformed, missing, or unknown relay headers are rejected.
+    // Negative controls: malformed, missing, duplicate, control-injected, or unknown relay headers
+    // are rejected.
     for bad in [
         "",
         "PING\n",
         "SURVEY content=2 drive=0 peer=-\n",
         "SURVEY content=1 peer=-\n",
+        "SURVEY content=0 content=1 drive=0 peer=-\n",
+        "SURVEY content=0 drive=0 drive=1 peer=-\n",
+        "SURVEY content=0 drive=0 peer=- peer=-\n",
         "DRIVE node= host=x peer=-\n",
         "DRIVE node=abcd peer=-\n",
+        "DRIVE node=abcd node=efgh host=x peer=-\n",
+        "DRIVE node=ab%0acd host=x peer=-\n",
+        "DRIVE node=abcd host=x%00y peer=-\n",
         "ASK peer=-\n",
         "ASK\n",
         "ASK peer=127.0.0.1:1 more=1\n",
@@ -184,6 +191,103 @@ fn relay_header_roundtrips_and_rejects_malformed_frames() {
             "malformed relay header must be rejected: {bad:?}"
         );
     }
+    assert_eq!(super::parse_relay_filename("wf-42.sock"), Some(42));
+    assert_eq!(super::parse_relay_filename("wf-042.sock"), None);
+    assert_eq!(super::parse_relay_filename("wf-0.sock"), None);
+}
+
+#[test]
+fn query_window_survey_facts_reads_large_account_rosters_beyond_sixty_four_lines() {
+    use aterm_agent::survey_facts::{ServerHeardFact, SurveyAccountFact};
+    use std::collections::BTreeMap;
+
+    let relay_scratch = crate::test_scratch::short_dir("node-serve-large-survey");
+    let relay_dir = relay_scratch.path().to_path_buf();
+    let stop = Arc::new(AtomicBool::new(false));
+    let pid = std::process::id();
+
+    let accounts: Vec<SurveyAccountFact> = (0..75)
+        .map(|idx| SurveyAccountFact {
+            pool: ["claude", "codex", "grok", "kimi"][idx % 4].to_owned(),
+            id: format!("seat-{idx:02}"),
+            condition: "usable".to_owned(),
+            enrolled: true,
+            usage_5h_pct: Some((idx % 50) as u32),
+            usage_7d_pct: Some((idx % 80) as u32),
+            week_reset: Some(1_793_500_000),
+            walled_until: None,
+            last_used: Some(1_793_159_900),
+        })
+        .collect();
+    let expected = SwarmSurveyFacts {
+        node: Some("11111111111111111111111111111111".to_owned()),
+        label: Some("m22".to_owned()),
+        version: "0.150.0".to_owned(),
+        window: true,
+        window_last: Some(1_793_160_000),
+        sessions: 12,
+        ssh_host_key: None,
+        accounts,
+        accounts_unread: Vec::new(),
+        session_accounts: BTreeMap::new(),
+        server_heard: vec![ServerHeardFact {
+            vault: "alab".to_owned(),
+            subject: "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p".to_owned(),
+            at: 1_793_159_995,
+        }],
+    };
+    let mut reply_lines: Vec<String> = Vec::new();
+    let base_wire = expected.to_survey_reply(pid, Some("m22.local"), 1_793_160_000_000, 1, false);
+    for (idx, line) in base_wire.lines().skip(1).enumerate() {
+        reply_lines.push(line.to_owned());
+        if idx == 0 {
+            for s in 0..12 {
+                reply_lines.push(format!("session sid=s-{s} pid=90{s} program=zsh"));
+            }
+        }
+    }
+    assert!(
+        reply_lines.len() > 64,
+        "fixture must exceed the old 64-line relay cap: {}",
+        reply_lines.len()
+    );
+    let full_wire = format!("OK {}\n{}\n", reply_lines.len(), reply_lines.join("\n"));
+
+    let dir_clone = relay_dir.clone();
+    let stop_clone = Arc::clone(&stop);
+    let handle = std::thread::spawn(move || {
+        let _ = serve_window_relay_at(&dir_clone, pid, Some(&stop_clone), move |header, mut s| {
+            let payload = full_wire.clone();
+            std::thread::spawn(move || {
+                if matches!(header, RelayHeader::Survey { .. })
+                    && let Ok(Some(line)) = read_line_raw(&mut s, 4096)
+                    && line.trim() == "survey"
+                {
+                    let _ = s.write_all(payload.as_bytes());
+                    let _ = s.flush();
+                }
+            });
+            true
+        });
+    });
+
+    let sock_path = relay_socket_path(&relay_dir, pid);
+    let wait_until = Instant::now() + DIAL_WITHIN;
+    while !sock_path.exists() {
+        assert!(
+            Instant::now() < wait_until,
+            "window relay socket never bound"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let parsed = query_window_survey_facts(&relay_dir).expect("full 89-line survey facts");
+    assert_eq!(parsed.accounts.len(), 75);
+    assert_eq!(parsed.server_heard.len(), 1);
+    assert_eq!(parsed, expected);
+
+    stop.store(true, Ordering::Release);
+    let _ = handle.join();
 }
 
 #[test]
@@ -297,6 +401,9 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
     for request in [
         "accounts-renew poll=0123456789abcdef0123456789abcdef\n",
         "accounts-renew start=invalid\n",
+        "vault approve invalid\n",
+        "vault status\n",
+        "vault approve abcd-efgh-ijkl-mnop 0123456789abcdef0123456789abcdef\n",
     ] {
         let tcp = TcpStream::connect(addr).expect("connect renewal");
         let mut renewal =
@@ -311,7 +418,10 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
         let reply = read_line_raw(renewal.transport.stream(), 4096)
             .unwrap()
             .unwrap();
-        assert!(reply.starts_with("ERR accounts-renew:"), "{reply}");
+        assert!(
+            reply.starts_with("ERR accounts-renew:") || reply.starts_with("ERR vault:"),
+            "{reply}"
+        );
         assert!(
             !reply.contains("no window") && !reply.contains("logged out"),
             "{reply}"
@@ -479,11 +589,21 @@ fn serve_node_reading(
 }
 
 /// A loopback place the book holds a member at, which the test holds: the node job's heartbeat
-/// dials each member its book binds as soon as it starts, so its dial of this one reaches the test
-/// and no Mac's real listener (a member seeded at the fleet's own port reaches this Mac's aterm).
+/// dials each member its book binds as soon as it starts, and a Mac that joined once a round reads
+/// the book after the join, so its dial of this one reaches the test and no Mac's real listener (a
+/// member at the fleet's own port reaches this Mac's aterm, at the loopback or under this Mac's
+/// name, and another Mac's name reaches that Mac).
 struct MemberPlace(TcpListener);
 
 impl MemberPlace {
+    fn bind() -> Self {
+        Self(TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a member's place"))
+    }
+
+    fn port(&self) -> u16 {
+        self.0.local_addr().expect("a member's place").port()
+    }
+
     /// Once the heartbeat's dial waits here, it is hung up on, as by a member gone dark.
     fn dialed(self) {
         until_dialed(&self.0);
@@ -493,8 +613,8 @@ impl MemberPlace {
 
 /// `driver` joined in the book at `state`, at a [`MemberPlace`].
 fn seed_joined_driver(state: &Path, driver: &NodeIdentity) -> MemberPlace {
-    let place = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the driver's place");
-    let port = place.local_addr().unwrap().port();
+    let place = MemberPlace::bind();
+    let port = place.port();
     write_held(state, Began::Here, |book| {
         book.update(|peers| {
             aterm_net::fleet_member::record(
@@ -517,7 +637,7 @@ fn seed_joined_driver(state: &Path, driver: &NodeIdentity) -> MemberPlace {
         .expect("record joined driver");
     })
     .expect("seed driver in book");
-    MemberPlace(place)
+    place
 }
 
 /// Once a dial waits in `listener`'s backlog, its connect made and its handshake waiting for
@@ -544,12 +664,13 @@ fn until_dialed(listener: &TcpListener) {
     );
 }
 
-/// `id` joins the fleet `secret` opens through the listener at `addr`, registering as `host`.
+/// `id` joins the fleet `secret` opens through the listener at `addr`, registering `place` as
+/// where it listens.
 fn join_as(
     addr: SocketAddr,
     secret: &FleetSecret,
     id: &NodeIdentity,
-    host: &str,
+    place: &MemberPlace,
 ) -> Result<Joined, String> {
     let tcp = TcpStream::connect(addr).map_err(|e| e.to_string())?;
     let mut dial = client_handshake_as(tcp, secret, Some(id), FleetOp::Join, DIAL_WITHIN)
@@ -558,8 +679,8 @@ fn join_as(
         dial.transport.stream(),
         &Registration {
             node: id.node().to_owned(),
-            host: host.to_owned(),
-            port: 7100,
+            host: "127.0.0.1".to_owned(),
+            port: place.port(),
             version: "0.146.0".to_owned(),
             key: Some(id.key()),
             signed: None,
@@ -625,14 +746,15 @@ fn a_member_node_job_answers_join_and_book_with_no_window_open() {
 
     // A Mac joins through the windowless node job of a member that minted no code.
     let joiner_id = seed_id(&root.path().join("m1-state"));
-    let joined = join_as(addr, &secret, &joiner_id, "m19.local")
+    let joiner_at = MemberPlace::bind();
+    let joined = join_as(addr, &secret, &joiner_id, &joiner_at)
         .expect("a member's windowless node job answers a join");
     assert_eq!(joined.issuer.node, member_id.node());
     let recorded = read_peers(&member_state).expect("member book");
     assert!(
         recorded
             .iter()
-            .any(|p| p.node.as_deref() == Some(joiner_id.node()) && p.host == "m19.local"),
+            .any(|p| p.node.as_deref() == Some(joiner_id.node()) && p.port == joiner_at.port()),
         "the member's book must keep the Mac that joined: {recorded:?}"
     );
 
@@ -682,12 +804,13 @@ fn a_removed_node_is_refused_with_the_old_fleet_secret() {
 
     // A member the log admits joins with the fleet secret, and the Mac it removed, which holds
     // that same secret, is refused.
-    let joined = join_as(addr, &secret, &kept_id, "m2.local");
+    let (kept_at, removed_at) = (MemberPlace::bind(), MemberPlace::bind());
+    let joined = join_as(addr, &secret, &kept_id, &kept_at);
     assert!(
         joined.is_ok(),
         "a member the log admits must join: {joined:?}"
     );
-    let refused = join_as(addr, &secret, &removed_id, "m3.local");
+    let refused = join_as(addr, &secret, &removed_id, &removed_at);
     assert!(
         refused.is_err(),
         "the Mac the log removed must be refused with the old fleet secret: {refused:?}"
@@ -768,7 +891,8 @@ fn a_node_job_that_has_not_read_its_deny_list_refuses_a_proven_peer_until_it_has
     );
 
     std::fs::remove_file(&source).expect("unconfigure the vault");
-    let joined = join_as(addr, &secret, &early, "m31.local");
+    let (early_at, later_at) = (MemberPlace::bind(), MemberPlace::bind());
+    let joined = join_as(addr, &secret, &early, &early_at);
     assert!(
         joined.is_ok(),
         "once a read succeeds the Mac joins: {joined:?}"
@@ -776,7 +900,7 @@ fn a_node_job_that_has_not_read_its_deny_list_refuses_a_proven_peer_until_it_has
 
     unreadable();
     let later = seed_id(&root.path().join("later-state"));
-    let kept = join_as(addr, &secret, &later, "m32.local");
+    let kept = join_as(addr, &secret, &later, &later_at);
     assert!(
         kept.is_ok(),
         "a failed read after a good one keeps that list: {kept:?}"

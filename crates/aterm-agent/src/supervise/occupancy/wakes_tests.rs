@@ -1134,7 +1134,7 @@ fn the_book_reads_back_from_its_record() {
             "label=u when=file:~/log~/E[0-9]/ and slots>=1 for=5m need=avail>=8GiB \
              unless=pid:9 exited prio=critical",
         ),
-        Declarer::Owner,
+        Declarer::Agent,
         AGENT,
         T0,
         0,

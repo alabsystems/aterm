@@ -27,6 +27,7 @@ use aterm_agent::harness::laps;
 use aterm_agent::harness::login_latch::{self, LoginLatches};
 use aterm_agent::harness::netwatch::Route;
 use aterm_agent::harness::profile;
+use aterm_agent::harness::provider_read;
 use aterm_agent::harness::relaunch::{
     self, ExitLook, ExitRecord, Foreground, OnExit, Outcome, Relaunches, Restart, Say, Snapshot,
 };
@@ -1404,6 +1405,11 @@ pub(crate) struct Kept {
     due: DueKept,
     /// The session's work record reads ([`WorkKept`]).
     work: WorkKept,
+    /// The task's face the session's loop last told is landed ([`WorkerIdle::work_face`]): kept
+    /// for the session, whatever agent or group it runs in, and read at an agent's exit, when the
+    /// tab's `status` names no task any more (Land carries no exit past a landing,
+    /// [`relaunch::carried`]).
+    task_landed: bool,
 }
 
 /// What the host keeps of a session's work record reads across its workers, for the agent group
@@ -1562,6 +1568,10 @@ struct AccountKept {
     wall_again: u8,
     lagged: u8,
     probing: Option<Probing>,
+    /// No turn ran on this session since its last `/usage` read was claimed: time alone never
+    /// makes another one due ([`WorkerIdle::probe_claim`], the owner's no-polling rule). A session
+    /// that has made no read yet may make its first at the live turn end the loop gates it to.
+    read_unused: bool,
     reset_owed: Option<ResetOwed>,
     /// A move that landed before the loop's point was told it as made there
     /// ([`WorkerIdle::account_move`]'s `adopted` on [`Moved::untold`]): nothing was relaunched at
@@ -1574,6 +1584,8 @@ struct AccountKept {
 /// [`AccountKept::probing`]: the claim of one `/usage` probe and the process it was made for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Probing {
+    /// When the claim was won, the time a typed read reports.
+    at: i64,
     label: String,
     pid: u32,
     start: String,
@@ -2625,9 +2637,17 @@ type SelfRelaunchFn = dyn Fn(&str, u32, &Snapshot, &self_claimed::Resume, Option
     + Sync;
 type SelfSnapshotFn =
     dyn Fn(&str, &self_claimed::Copy, &self_claimed::Resume) -> Option<Snapshot> + Send + Sync;
-type RelaunchFn = dyn Fn(&str, u32, &Snapshot, &ExitRecord, bool, Option<restart_stamp::Cause>) -> String
+/// One attempt at the relaunch of tab `sid`'s agent that left ([`Acts::relaunch`]): its grace, its
+/// snapshot, what its exit left, whether it may upgrade, the restart stamp that asked for it, and
+/// whether an Autopilot carries it ([`relaunch::Carried::Yes`]: [`relaunch::after_carried_exit`]).
+type RelaunchFn = dyn Fn(&str, u32, &Snapshot, &ExitRecord, bool, Option<restart_stamp::Cause>, bool) -> String
     + Send
     + Sync;
+/// Who asked aterm to stop tab `sid`'s process group `group`, of an agent that began at the wall
+/// time given (ms, when known), if that stop stands for its exit now ([`Acts::end_asked`]).
+type EndAskedFn = dyn Fn(&str, i32, Option<u64>) -> Option<EndAsked> + Send + Sync;
+/// How long ago a control client other than aterm's own last typed into tab `sid` ([`Acts::driven`]).
+type DrivenFn = dyn Fn(&str) -> Option<u64> + Send + Sync;
 /// This host's claim on a tab around its relaunch, taken or given back ([`Acts::claim`]).
 type ClaimFn = dyn Fn(&str, bool) + Send + Sync;
 /// Whether the harness's own restart ended the agent that left ([`Acts::restarted`]).
@@ -2804,6 +2824,11 @@ pub(crate) enum HostNote {
     },
     /// That supervisor runs steadily again, or its worker ended.
     SupervisorSteady { sid: String },
+    /// The relaunch after aterm ended of tab `sid`'s agent is over without the agent: every try
+    /// failed, or it is not made (the relaunch or the agent's switch is off, its Autopilot is Off).
+    /// A worker's record still reading restored says it exited
+    /// ([`crate::task_record::mark_restored_over`]).
+    RestoredOver { sid: String },
     /// The disk watch left the home volume below the automatic floor [`DISK_SHORT_LOOKS`] passes running.
     DiskLow {
         free_gib: u64,
@@ -2856,9 +2881,20 @@ pub(crate) enum HostNote {
     /// ([`aterm_agent::harness::disk::ask::worker_step`]); what the spawn did goes back to the
     /// next disk look.
     DiskWorker { task: String, folder: PathBuf },
-    /// The disk worker `sid` ran out of its time: its Autopilot goes Off, so Land types nothing
-    /// more into it.
+    /// The disk worker `sid` ran out of its time: its task fails `why=expired` and its Autopilot
+    /// goes Off, so Land types nothing more into it.
     DiskWorkerExpired { sid: String },
+    /// A disk worker this process moved to over, either way, once: Messages keeps how it ended. It
+    /// has no `sid` where it never started; `volume` is the volume it ran for.
+    DiskWorkerOver {
+        sid: Option<String>,
+        volume: String,
+        why: String,
+        rose: u64,
+        target_met: Option<bool>,
+        removed: u64,
+        report: Vec<String>,
+    },
     /// Start a worker that claims `offer`, a free credit Claude Code offers the account of the
     /// supervised session `sid` (`[harness] claim_credits`, [`credit_claim::step`]): its try is
     /// already recorded.
@@ -2980,8 +3016,13 @@ pub(crate) enum AccountsSaid {
         wrong: Vec<String>,
         /// The rows whose automatic sign-in failed and that still need one (no login to run on,
         /// or one due for renewal), each with the routes it tried (`accounts::failing_sign_ins`):
-        /// a fact for later, since aterm tries each again by itself.
+        /// a fact for later, since aterm tries each again by itself, and none at all while some
+        /// Claude login works here (`accounts::claude_serves`), when `aterm harness accounts`
+        /// shows them on demand.
         no_sign_in: Vec<(String, String)>,
+        /// This Mac's clock where its peers read it Split or Off
+        /// (`accounts::State::clock_at`, docs/DESIGN-fluid-swarm-2026-10-28.md F22).
+        clock: Option<ClockSaid>,
     },
 }
 
@@ -2999,8 +3040,10 @@ impl AccountsSaid {
                 none_soon,
                 wrong,
                 no_sign_in,
+                clock,
             } => {
-                !signed_out.is_empty()
+                clock.is_some()
+                    || !signed_out.is_empty()
                     || !credits.is_empty()
                     || !window_full.is_empty()
                     || !due.is_empty()
@@ -3018,6 +3061,7 @@ impl AccountsSaid {
         logins: &accounts::Logins,
         now: i64,
         carried: &BTreeSet<String>,
+        default_signed_in: &dyn Fn() -> bool,
     ) -> AccountsSaid {
         let enrolled = accounts::enrolled(roster);
         let open = |labels: Vec<String>| -> Vec<String> {
@@ -3040,10 +3084,49 @@ impl AccountsSaid {
                 accounts::NONE_SOON_S,
             ),
             wrong: accounts::wrong_accounts(roster, logins),
-            no_sign_in: accounts::failing_sign_ins(roster, state, logins, now)
-                .into_iter()
-                .map(|(label, attempt)| (label, attempt.routes))
-                .collect(),
+            no_sign_in: {
+                let failing = accounts::failing_sign_ins(roster, state, logins, now);
+                if !failing.is_empty()
+                    && accounts::claude_serves(roster, state, &enrolled, default_signed_in(), now)
+                {
+                    Vec::new()
+                } else {
+                    failing
+                        .into_iter()
+                        .map(|(label, attempt)| (label, attempt.routes))
+                        .collect()
+                }
+            },
+            clock: state.clock_at(now).map(ClockSaid::from),
+        }
+    }
+}
+
+/// This Mac's clock as the digest says it ([`AccountsSaid::Listed`], F22): the accounts store's
+/// record (`accounts::Clock`) without its lapse, which every claims read renews, so a renewal is
+/// no news to the digest.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ClockSaid {
+    /// Split or Off.
+    pub(crate) standing: accounts::ClockStanding,
+    /// Under Off, at least how far off (seconds).
+    pub(crate) by_s: i64,
+    /// The decisive readings against this Mac's clock.
+    pub(crate) against: u32,
+    /// The decisive readings counted.
+    pub(crate) of: u32,
+    /// The labels of the Macs whose clocks disagree with this one's.
+    pub(crate) peers: Vec<String>,
+}
+
+impl From<&accounts::Clock> for ClockSaid {
+    fn from(clock: &accounts::Clock) -> Self {
+        Self {
+            standing: clock.standing,
+            by_s: clock.by_s,
+            against: clock.against,
+            of: clock.of,
+            peers: clock.peers.clone(),
         }
     }
 }
@@ -3059,6 +3142,11 @@ pub(crate) struct PoolSaid {
     pub(crate) wrong: Vec<String>,
     /// Its pending human sign-in steps, kept across restarts in the pool's bindings.
     pub(crate) sign_in: Vec<(String, accounts::SignInAction)>,
+    /// Whether someone asked for this CLI by what the host reads without a look: `aterm.toml`
+    /// or the fleet document names it ([`aterm_agent::ai::state::named`]), a person pinned a row,
+    /// or a launch its logins served. Only then, or when a look found it used here, does it
+    /// reach the digest ([`crate::App::hand_pool_entries`]).
+    pub(crate) asked: bool,
 }
 
 /// What a tab's relaunch says ([`HostNote::Relaunch`]).
@@ -3095,9 +3183,57 @@ pub(crate) enum RelaunchSay {
         restarted: bool,
         command: Option<String>,
     },
+    /// An exit the Autopilot would have carried, left, and why ([`LeftEnd`]): a journal record
+    /// alone (the Messages row), never a tab's mark or an exception, since nobody is asked to act.
+    Left {
+        end: LeftEnd,
+    },
     Back,
     Ended,
     NotRestored,
+}
+
+/// Why an agent's exit an Autopilot would otherwise have carried was left ([`RelaunchSay::Left`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LeftEnd {
+    /// A program asked aterm's `signal` verb to stop it, in the words naming that program (its
+    /// typing's credit): its asker's.
+    AskedBy(String),
+    /// Whose end it was could not be read: the tab's `status` did not answer at the exit.
+    Unread,
+    /// It ended again, nobody asking, less than [`relaunch::HEALTHY`] after the relaunch of the
+    /// last exit its Autopilot carried landed ([`Relaunches::carry`]).
+    EndedAgain,
+}
+
+impl LeftEnd {
+    /// Why it was left, in a person's words.
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Self::AskedBy(by) => format!("{by} asked aterm to stop it"),
+            Self::Unread => "aterm could not read whose end it was".to_string(),
+            Self::EndedAgain => format!(
+                "it ended again, nobody asking, within {} of aterm bringing it back",
+                aterm_agent::harness::outlook::spoken_span(
+                    i64::try_from(relaunch::HEALTHY.as_secs()).unwrap_or(i64::MAX)
+                )
+            ),
+        }
+    }
+}
+
+/// Who asked aterm's `signal` verb to stop an agent whose exit it is
+/// ([`crate::session_log::SessionLog::end_asked_of`], [`Acts::end_asked`]): its asker's, whatever
+/// the end left behind, so it is never relaunched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EndAsked {
+    /// The person through aterm's own window (the Overview's Stop), or aterm itself (its harness,
+    /// its server): theirs, recorded nowhere but aterm.log and the act's own mark.
+    Own,
+    /// A control connection (another program, or the person's own `aterm ctl signal`, which aterm
+    /// cannot tell apart), an edge, the message bus or another Mac, in the words that name it
+    /// (`lab-sweep`, `claude (pid 4242)`): recorded in Messages ([`LeftEnd::AskedBy`]).
+    By(String),
 }
 
 /// The host's seams onto the process.
@@ -3223,6 +3359,13 @@ pub(crate) struct Acts {
     pub(crate) asked: Arc<AskedFn>,
     /// Whether the explicit restart would be carried for tab `sid`'s agent now.
     pub(crate) offered: Arc<OfferedFn>,
+    /// Who asked aterm to stop the agent's process group, if that stop stands for its exit: its
+    /// asker's exit whatever it left behind ([`crate::session_log::SessionLog::end_asked_of`]: the
+    /// `signal` verb's `term`, `kill`, `quit` and `hup`), read at the exit.
+    pub(crate) end_asked: Arc<EndAskedFn>,
+    /// How long ago a control client other than aterm's own last typed into the session
+    /// ([`crate::typed_by::TypedStamp::driven_ms`]), read at the exit: a driver's `/exit`.
+    pub(crate) driven: Arc<DrivenFn>,
     pub(crate) relaunch: Arc<RelaunchFn>,
     /// This host's claim on tab `sid`: taken (`true`, `meta set supervisor <holder> ttl=<lease>`)
     /// just before a relaunch types its line, so the agent it lands paints under it (the glass
@@ -4531,7 +4674,10 @@ impl WorkerIdle {
     fn work_face(&self, face: aterm_agent::harness::acts::TaskFace) {
         let landed = face == aterm_agent::harness::acts::TaskFace::Landed;
         let group = self.group.load(Ordering::SeqCst);
-        with_kept_of(&self.kept, |k| k.work.of(group).landed = landed);
+        with_kept_of(&self.kept, |k| {
+            k.work.of(group).landed = landed;
+            k.task_landed = landed;
+        });
     }
 
     /// The host's account advice for a pooled CLI other than Claude Code. The pool
@@ -4693,6 +4839,7 @@ pub(crate) struct TapKept {
 struct TapIdentity {
     row: accounts::Row,
     login: Option<String>,
+    key: Option<profile::AccountKey>,
     start: String,
     state: PathBuf,
     roster: Option<PathBuf>,
@@ -5388,6 +5535,7 @@ impl IdleHost for WorkerIdle {
 
     /// A turn ran since the loop's last point ([`IdleHost::turn_ran`]).
     fn turn_ran(&self) {
+        with_kept_of(&self.kept, |k| k.account.read_unused = false);
         if let Some(pid) = with_kept_of(&self.kept, |k| k.snapshot.as_ref().map(|s| s.pid)) {
             self.tap
                 .lock()
@@ -6174,6 +6322,25 @@ impl IdleHost for WorkerIdle {
         self.probe_claim()
     }
 
+    /// The claimed `/usage` was entered ([`IdleHost::account_probe_typed`]): the read happened, so
+    /// it is reported and spends this session's turn. A claim that wrote nothing does neither.
+    fn account_probe_typed(&self) {
+        let probe = with_kept_of(&self.kept, |k| {
+            let probing = k.account.probing.as_ref()?;
+            k.account.read_unused = true;
+            Some((probing.at, probing.label.clone()))
+        });
+        if let Some((at, label)) = probe {
+            provider_read::note(&provider_read::ProbeEvent {
+                at,
+                read: provider_read::Read::ClaudePanel,
+                account: Some(label),
+                login: None,
+                why: provider_read::InUse::LiveSession,
+            });
+        }
+    }
+
     /// What the claimed probe read ([`IdleHost::account_probed`]): [`Self::probe_record`].
     fn account_probed(&self, read: Result<&accounts::Sample, ProbeMiss>) {
         self.probe_record(read.map_err(ProbeMiss::word));
@@ -6464,12 +6631,24 @@ impl WorkerIdle {
             .to_owned();
         let several = captured.roster().several();
         let windows = (reading.five_hour, reading.seven_day);
+        // Another login can report the same figures; read its identity before deduplication.
+        let row = captured.row(&label).expect("tap row was attributed");
+        let key = match row.expected_identity_email() {
+            Some(email) => profile::account_for_login(
+                &look.profile_env,
+                &seat.home,
+                look.who.login.as_deref(),
+                email,
+            ),
+            None if !several && look.who.login.is_none() => {
+                profile::account_of(&look.profile_env, &seat.home)
+            }
+            None => None,
+        };
         let identity = TapIdentity {
-            row: captured
-                .row(&label)
-                .expect("tap row was attributed")
-                .clone(),
+            row: row.clone(),
             login: look.who.login.clone(),
+            key,
             start: look.snap.start.clone(),
             state: seat.state.clone(),
             roster: seat.roster.clone(),
@@ -6493,7 +6672,6 @@ impl WorkerIdle {
             .as_ref()
             .map(|b| b.beside(&reading))
             .unwrap_or_default();
-        let key = profile::default_home_key(&seat.home).filter(|_| !several);
         let read = accounts::TapRead {
             born: Some(born),
             ..reading.tap_read(beside, key)
@@ -7853,6 +8031,7 @@ impl WorkerIdle {
                     &logins,
                     seat.now,
                     &self.login_latches.carried_rows(),
+                    &|| default_claude_signed_in(&seat.home),
                 ),
                 false,
             );
@@ -8096,6 +8275,7 @@ impl WorkerIdle {
     fn probe_claimed(&self) -> Result<Probing, NoProbe> {
         const CLAIMED: &str = "probe-claimed";
         const NOT_DUE: &str = "probe-not-due";
+        const NOT_USED: &str = "probe-not-used";
         if self.switches.accounts() != accounts::Mode::Early {
             return Err(NoProbe::Mode);
         }
@@ -8123,12 +8303,16 @@ impl WorkerIdle {
             if advice != accounts::Advice::Probe {
                 return Err(NOT_DUE.to_string());
             }
+            if with_kept_of(&self.kept, |k| k.account.read_unused) {
+                return Err(NOT_USED.to_string());
+            }
             accounts::claim_probe(state, &label, &self.sid, now)
                 .map(|event| vec![event])
                 .ok_or_else(|| CLAIMED.to_string())
         });
         match claimed {
             Ok(_) => Ok(Probing {
+                at: seat.now,
                 label,
                 pid: look.snap.pid,
                 start: look.snap.start,
@@ -8139,6 +8323,7 @@ impl WorkerIdle {
             }),
             Err(why) if why == CLAIMED => Err(NoProbe::Claimed),
             Err(why) if why == NOT_DUE => Err(NoProbe::NotDue),
+            Err(why) if why == NOT_USED => Err(NoProbe::NotUsed),
             Err(why) if why == accounts::LOCK_HELD => Err(NoProbe::LockHeld),
             Err(_) => Err(NoProbe::State),
         }
@@ -9573,6 +9758,13 @@ pub(crate) fn publish_snapshot_for_test(sid: &str, snap: Option<&Snapshot>) {
     publish_snapshot(sid, snap);
 }
 
+/// The real-process debug fixture publishes only snapshots derived through
+/// the production live snapshot reader and the current proven primary copy.
+#[cfg(all(unix, debug_assertions))]
+pub(crate) fn publish_native_fixture_snapshot(sid: &str, snap: &Snapshot) {
+    publish_snapshot(sid, Some(snap));
+}
+
 /// The relaunch snapshot the host keeps for session `sid`, as last published ([`publish_snapshot`]).
 pub(crate) fn published_snapshot(sid: &str) -> Option<Snapshot> {
     PUBLISHED
@@ -10125,10 +10317,21 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
     let end_owed = std::cell::Cell::new(false);
     let hand_waits = std::cell::Cell::new(false);
     let lifted = std::cell::Cell::new(false);
+    let carried_at_exit = std::cell::Cell::new(relaunch::Carried::No);
+    let stopped_by = std::cell::RefCell::new(None::<EndAsked>);
+    let exit_group = match job.group.load(Ordering::SeqCst) {
+        0 => pid.and_then(|pid| i32::try_from(pid).ok()).unwrap_or(0),
+        group => group,
+    };
+    let began_wall_ms = snap
+        .as_ref()
+        .and_then(|snap| aterm_agent::harness::upgrade_models::parse_lstart(&snap.start))
+        .map(|secs| secs.saturating_mul(1000));
     let watched = job.watch_until.is_some();
     let decide_at = |exit: bool| {
         put_off.set(false);
         let carried = hand_waits.replace(false);
+        let at_exit = exit;
         let mut exit = exit;
         if let Some(snap) = act_snap.as_ref() {
             let runs = restart_stamp::alive_as(snap.pid, &snap.start);
@@ -10161,6 +10364,17 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
             return OnExit::Held;
         }
         let asked = cause.get();
+        if at_exit
+            && asked.is_none()
+            && !restarted
+            && let Some(by) = (hooks.acts.end_asked)(sid, exit_group, began_wall_ms)
+        {
+            // A stop asked through aterm's `signal` verb owns the exit whatever the end left of
+            // its agent's record (a `SIGKILL`'s, a crash on the `SIGTERM`), as another
+            // supervisor's claim does: its asker's, under any Autopilot or switch.
+            *stopped_by.borrow_mut() = Some(by);
+            return OnExit::Held;
+        }
         let allowed = relaunches(job.agent) && (job.switches.relaunch() || asked.is_some());
         let decision = relaunch::on_exit(
             allowed,
@@ -10173,6 +10387,20 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
         let waits = carries && status.as_deref().is_some_and(relaunch::hand_on_tab);
         hand_waits.set(waits);
         lifted.set(carried && !waits);
+        if at_exit {
+            // Whose exit it is is read at the exit: under Cruise, or Land until its work landed,
+            // one nobody owns comes back whatever its agent left of its record (the session's own
+            // Autopilot word and task face, not `status`, which names neither once the tab
+            // publishes no agent).
+            carried_at_exit.set(relaunch::carried(
+                decision,
+                OffSessions::read(hooks, job.switches.autopilot()).mode(sid),
+                status.as_deref(),
+                (hooks.acts.driven)(sid),
+                with_kept(job, |k| k.task_landed),
+                grace,
+            ));
+        }
         decision
     };
     let decide = || decide_at(false);
@@ -10196,7 +10424,10 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
         Ok(pause) => pause,
         Err(said) => {
             forget_snapshot(job, hooks);
-            left_alone(job, hooks, decision, said, false);
+            match stopped_by.take() {
+                Some(by) => left_to_asker(job, hooks, &by, said),
+                None => left_alone(job, hooks, decision, said, false),
+            }
             return;
         }
     };
@@ -10233,6 +10464,9 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
         return;
     }
     let Some(snap) = snap else {
+        // Nothing read while it ran, so nothing tells an interactive agent from a wrapper, a
+        // script or a one-shot (agy's or Muse Code's `-p`, which no snapshot reads) that ended
+        // as asked: left, carried or not, as such an end is.
         let why = "nothing-recorded";
         with_kept(job, |k| {
             k.relaunches
@@ -10249,12 +10483,33 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
     let mut snap = snap;
     account_way_back(job, hooks, &mut snap);
     let left = read_at_exit(job, hooks, &snap);
+    // An exit nobody owns comes back, once a healthy run ([`Relaunches::carry`]); a crash is the
+    // crash rule's, relaunched as any is, and spends nothing of that run. One whose owner could
+    // not be read, and one that ended again so soon, are decided as any exit is: an end the crash
+    // rule leaves is left where its launch's own end would be, and recorded (`left_end`).
+    let (carried_exit, left_end) = match carried_at_exit.get() {
+        _ if left.crashed() => (false, None),
+        relaunch::Carried::Yes if with_kept(job, |k| k.relaunches.carry(Instant::now())) => {
+            (true, None)
+        }
+        relaunch::Carried::Yes => (false, Some(LeftEnd::EndedAgain)),
+        relaunch::Carried::Unread => (false, Some(LeftEnd::Unread)),
+        relaunch::Carried::No => (false, None),
+    };
     aterm_log::info!(
-        "harness @{sid}: the agent exited; read at the exit: {}",
-        left.word()
+        "harness @{sid}: the agent exited; read at the exit: {}{}",
+        left.word(),
+        match (carried_exit, left_end.as_ref()) {
+            (true, _) => "; nobody owns it, and its Autopilot carries it".to_string(),
+            (false, Some(end)) => format!(
+                "; not carried ({}): an end the crash rule leaves is left and recorded",
+                end.reason()
+            ),
+            (false, None) => String::new(),
+        }
     );
     keep_exit_read(job, hooks, &mut snap, &left);
-    if asked.is_some() || left.crashed() {
+    if asked.is_some() || left.crashed() || carried_exit {
         with_kept(job, |k| {
             if !job.revoked.load(Ordering::SeqCst) {
                 k.owed = Some(OwedRelaunch {
@@ -10266,6 +10521,8 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
     }
     let away_said = std::cell::Cell::new(false);
     let hand_said = std::cell::Cell::new(false);
+    let carried_exit = std::cell::Cell::new(carried_exit);
+    let left_end = std::cell::RefCell::new(left_end);
     relaunch_until(job, hooks, pause, &decide, None, || {
         if put_off.get() {
             if !away_said.replace(true) {
@@ -10288,10 +10545,70 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
             return relaunch::WAIT_HAND_LIFTS.to_string();
         }
         hand_said.set(false);
-        account_relaunch(job, hooks, &mut snap, |snap| {
-            (hooks.acts.relaunch)(sid, grace, snap, &left, job.switches.upgrade(), cause.get())
-        })
+        // The cap holds on every attempt at a carried exit, not at the exit alone: one made after
+        // that exit's relaunch landed (its agent gone again before the landing was read, and the
+        // attempt made again) is carried no more.
+        if carried_exit.get() && !with_kept(job, |k| k.relaunches.carry(Instant::now())) {
+            carried_exit.set(false);
+            *left_end.borrow_mut() = Some(LeftEnd::EndedAgain);
+        }
+        let step = account_relaunch(job, hooks, &mut snap, |snap| {
+            (hooks.acts.relaunch)(
+                sid,
+                grace,
+                snap,
+                &left,
+                job.switches.upgrade(),
+                cause.get(),
+                carried_exit.get(),
+            )
+        });
+        if left_unowned(&step)
+            && let Some(end) = left_end.borrow().clone()
+        {
+            (hooks.note)(HostNote::Relaunch {
+                sid: sid.to_string(),
+                said: RelaunchSay::Left { end },
+            });
+        }
+        step
     });
+}
+
+/// Whether a relaunch attempt's `step` left the exit as an end only a carry would have brought
+/// back: an orderly end (`ended:graceful-exit`) or, in the Muse and agy lanes, one whose shell
+/// said nothing (`ended:exit-unwitnessed`). The crash rule leaves those, where an Autopilot would
+/// have carried them ([`relaunch::after_carried_exit`]).
+fn left_unowned(step: &str) -> bool {
+    matches!(step, "ended:graceful-exit" | "ended:exit-unwitnessed")
+}
+
+/// An exit a stop asked through aterm's `signal` verb owns ([`EndAsked`]): left as its asker's,
+/// whatever the end left behind, `said` the back-off's own word for it. aterm.log names the asker,
+/// and one another program asked is recorded in Messages ([`RelaunchSay::Left`]), a record that
+/// asks nobody to act.
+fn left_to_asker(job: &WorkerJob, hooks: &Hooks, by: &EndAsked, said: Say) {
+    let sid = job.sid.as_str();
+    let who = match by {
+        EndAsked::Own => "the person or aterm itself",
+        EndAsked::By(by) => by.as_str(),
+    };
+    aterm_log::info!(
+        "harness @{sid}: {} exited; not relaunched: {who} asked aterm's `signal` verb to stop it, \
+         so the exit is theirs",
+        job.agent.name()
+    );
+    tell(job, hooks, said, "", false, false);
+    if let EndAsked::By(by) = by {
+        (hooks.note)(HostNote::Relaunch {
+            sid: sid.to_string(),
+            said: RelaunchSay::Left {
+                end: LeftEnd::AskedBy(by.clone()),
+            },
+        });
+    }
+    account_gone(job, hooks);
+    task_exited(job, hooks);
 }
 
 /// The crash rule: the exit of an agent a proven self-claim supervised, decided by this host's watch-only worker alone.
@@ -11200,6 +11517,9 @@ fn cannot_reason(step: &str) -> String {
             "the relaunched agy started a fresh conversation, not this one".to_string()
         }
         "no-witness" => "aterm could not tell which session it ran".to_string(),
+        "no-conversation" | "no-session" => "it had no conversation aterm could resume".to_string(),
+        "conversation-gone" => "its conversation is gone".to_string(),
+        "refused-start" => "it refused its own start".to_string(),
         "no-turn" => "its session took no turn, so there is nothing to resume".to_string(),
         "history-unsafe" => {
             "its own resume would bring the session back without some of its turns".to_string()
@@ -12874,7 +13194,13 @@ fn queue_restored_guarded(
             (hooks.acts.earlier_tab)(&agent.sid, was);
         }
     }
-    restored.retain(|agent| restored_allowed(shared, agent));
+    restored.retain(|agent| {
+        let allowed = restored_allowed(shared, agent);
+        if !allowed {
+            restored_gone(hooks, &agent.sid);
+        }
+        allowed
+    });
     if restored.is_empty() {
         return Ok(());
     }
@@ -12938,7 +13264,7 @@ fn queue_restored_guarded(
             )
             .is_none()
             {
-                let missed = restored_queue_panicked(&queue_shared, queue_hooks.badge.as_ref());
+                let missed = restored_queue_panicked(&queue_shared, &queue_hooks);
                 let _ = caught(
                     "the restored agents' row",
                     "the tabs it would name are in the log",
@@ -12953,8 +13279,16 @@ fn queue_restored_guarded(
             .restored
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        queue.attempts.clear();
+        let gone: Vec<String> = queue
+            .attempts
+            .drain(..)
+            .map(|attempt| attempt.agent.sid)
+            .collect();
         queue.running = false;
+        drop(queue);
+        for sid in &gone {
+            restored_gone(hooks, sid);
+        }
     }
     Ok(())
 }
@@ -12992,9 +13326,25 @@ fn relaunch_restored_queue(shared: &Arc<Shared>, hooks: &Hooks) {
                 .unwrap_or_else(PoisonError::into_inner);
             continue;
         }
-        queue
-            .attempts
-            .retain(|attempt| restored_allowed(shared, &attempt.agent));
+        let mut disallowed = Vec::new();
+        queue.attempts.retain(|attempt| {
+            let allowed = restored_allowed(shared, &attempt.agent);
+            if !allowed {
+                disallowed.push(attempt.agent.sid.clone());
+            }
+            allowed
+        });
+        if !disallowed.is_empty() {
+            drop(queue);
+            for sid in &disallowed {
+                restored_gone(hooks, sid);
+            }
+            queue = shared
+                .restored
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            continue;
+        }
         if queue.attempts.is_empty() {
             let missed = std::mem::take(&mut queue.missed);
             if missed.is_empty() {
@@ -13106,7 +13456,7 @@ fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunch
             LandingEnd::Keep(attempt) => queue.attempts.push_back(attempt),
             LandingEnd::Over(attempt, last, step) => {
                 drop(queue);
-                let missed = restored_over(badge, attempt, last, step);
+                let missed = restored_over(hooks, attempt, last, step);
                 restored().missed.extend(missed);
             }
         }
@@ -13123,6 +13473,7 @@ fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunch
             }
         }
         restored_word_cleared(badge, &agent.sid);
+        restored_gone(hooks, &agent.sid);
         return;
     }
     if restored_overtaken(typed, seen, runs, &agent.sid) {
@@ -13186,6 +13537,7 @@ fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunch
             &ExitRecord::Unread,
             switches.upgrade(),
             Some(cause),
+            false,
         ),
         None => act(&agent.sid, snap, switches.upgrade(), agent.was.as_deref()),
     });
@@ -13218,7 +13570,7 @@ fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunch
             LandingEnd::Keep(attempt) => queue.attempts.push_back(attempt),
             LandingEnd::Over(attempt, last, step) => {
                 drop(queue);
-                let missed = restored_over(badge, attempt, last, step);
+                let missed = restored_over(hooks, attempt, last, step);
                 restored().missed.extend(missed);
             }
         }
@@ -13238,7 +13590,7 @@ fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunch
         return;
     }
     drop(queue);
-    let missed = restored_over(badge, attempt, last, &step);
+    let missed = restored_over(hooks, attempt, last, &step);
     restored().missed.extend(missed);
 }
 
@@ -13340,7 +13692,7 @@ fn restored_step_panicked(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken,
     let missed = caught(
         &format!("@{sid}: the end of the relaunch after aterm ended"),
         "its tab's word may stand",
-        || restored_over(hooks.badge.as_ref(), attempt, last, step),
+        || restored_over(hooks, attempt, last, step),
     )
     .flatten();
     shared
@@ -13356,7 +13708,7 @@ const RESTORED_PANIC_HELD: &str = "internal-panic:tab-held";
 const RESTORED_PANIC: &str = "internal-panic";
 
 /// The restored queue's worker that panicked outside any one tab's step, the last resort.
-fn restored_queue_panicked(shared: &Shared, badge: &BadgeFn) -> Vec<RestoredMiss> {
+fn restored_queue_panicked(shared: &Shared, hooks: &Hooks) -> Vec<RestoredMiss> {
     let (attempts, mut missed) = {
         let mut queue = shared
             .restored
@@ -13379,7 +13731,7 @@ fn restored_queue_panicked(shared: &Shared, badge: &BadgeFn) -> Vec<RestoredMiss
             caught(
                 &format!("@{sid}: the end of the relaunch after aterm ended"),
                 "its tab's word may stand",
-                || restored_over(badge, attempt, last, RESTORED_PANIC),
+                || restored_over(hooks, attempt, last, RESTORED_PANIC),
             )
             .flatten(),
         );
@@ -13387,9 +13739,10 @@ fn restored_queue_panicked(shared: &Shared, badge: &BadgeFn) -> Vec<RestoredMiss
     missed
 }
 
-/// A restored attempt is over, `last` its last step's outcome (`step` its word).
+/// A restored attempt is over, `last` its last step's outcome (`step` its word); one over without
+/// its agent tells the window so ([`HostNote::RestoredOver`]).
 fn restored_over(
-    badge: &BadgeFn,
+    hooks: &Hooks,
     attempt: RestoredAttempt,
     last: Outcome,
     step: &str,
@@ -13397,6 +13750,9 @@ fn restored_over(
     let RestoredAgent {
         sid, snap, place, ..
     } = attempt.agent;
+    if last != Outcome::Relaunched {
+        restored_gone(hooks, &sid);
+    }
     let miss = (last != Outcome::Relaunched
         && crate::restore::agent_resumes(snap.session.as_deref(), &snap.argv))
     .then(|| {
@@ -13413,8 +13769,21 @@ fn restored_over(
             said: 0,
         }
     });
-    restored_word_cleared(badge, &sid);
+    restored_word_cleared(hooks.badge.as_ref(), &sid);
     miss
+}
+
+/// Tab `sid`'s restored agent is not coming back by this relaunch ([`HostNote::RestoredOver`]).
+fn restored_gone(hooks: &Hooks, sid: &str) {
+    let _ = caught(
+        &format!("@{sid}: the word that the relaunch after aterm ended is over"),
+        "its worker's record may still read restored",
+        || {
+            (hooks.note)(HostNote::RestoredOver {
+                sid: sid.to_owned(),
+            });
+        },
+    );
 }
 
 /// The word a relaunch raised on tab `sid`.
@@ -16983,6 +17352,64 @@ fn holds(store: &Store, sid: &str, group: i32) -> Option<bool> {
     (fg > 0).then(|| fg == group && aterm_uds::process::pid_alive(leader))
 }
 
+/// Who asked aterm to end group `group` of session `sid`, of an agent that began at
+/// `began_wall_ms`, if that end stands for its exit now ([`Acts::end_asked`]).
+fn end_asked(store: &Store, sid: &str, group: i32, began_wall_ms: Option<u64>) -> Option<EndAsked> {
+    let h = store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .by_sid(&aterm_session::SessionId::new(sid))
+        .cloned()?;
+    end_asked_of(&h.ctx, group, began_wall_ms)
+}
+
+/// Who asked aterm's `signal` verb to stop group `group` in `ctx`'s session log, if that stop
+/// stands for the exit of an agent that began at `began_wall_ms` now
+/// ([`crate::session_log::SessionLog::end_asked_of`]): the person through aterm's own window or
+/// aterm itself (its harness, its server) is the session's own ([`EndAsked::Own`]); any other
+/// asker is named, by the words naming the program whose connection asked, else by its kind.
+pub(crate) fn end_asked_of(
+    ctx: &crate::SessionCtx,
+    group: i32,
+    began_wall_ms: Option<u64>,
+) -> Option<EndAsked> {
+    use aterm_slog::Actor;
+    if group <= 0 {
+        return None;
+    }
+    let (by, from) = ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .slog()
+        .end_asked_of(group, began_wall_ms)?;
+    Some(match by {
+        Actor::Human | Actor::Harness | Actor::Aterm => EndAsked::Own,
+        other => EndAsked::By(from.unwrap_or_else(|| {
+            match other {
+                Actor::Bridge => "the message bus",
+                Actor::Sid(_) => "a program on another session's edge",
+                Actor::Nobody => "a program aterm could not name",
+                _ => "a control client",
+            }
+            .to_string()
+        })),
+    })
+}
+
+/// How long ago a control client other than aterm's own last typed into session `sid`
+/// ([`Acts::driven`]).
+fn driven(store: &Store, sid: &str) -> Option<u64> {
+    let h = store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .by_sid(&aterm_session::SessionId::new(sid))
+        .cloned()?;
+    h.ctx
+        .typed
+        .driven_ms(aterm_time::unix_millis().unwrap_or(0))
+}
+
 /// Whether `sid` is still open (not closed, not exited).
 fn open(store: &Store, sid: &str) -> bool {
     let guard = store.read().unwrap_or_else(PoisonError::into_inner);
@@ -17010,6 +17437,15 @@ fn still_supervisable(store: &Store, sid: &str) -> bool {
     };
     admitted(&ctx).is_some()
 }
+
+/// The development seam's ([`aterm_types::domain::ENV_DEBUG_HOST_SLEEP`]) word for no host
+/// sleep: this instance's hosted loops read the clocks of a host that never sleeps
+/// (`Session::set_host_awake`, as a test's in-process loop does). Every live test's
+/// instance sets it, so a Mac with its lid closed, in and out of dark wake every few seconds,
+/// puts no wake to settle into what its loops do next. Unset, and in a build without debug
+/// assertions, they read the machine's.
+#[cfg(debug_assertions)]
+const NO_HOST_SLEEP: &str = "none";
 
 /// One run of the loop over this instance's own socket. The loop types into its session only
 /// while the host's kernel read confirms the agent there ([`crate::agent_act::hosted`], the one
@@ -17050,6 +17486,12 @@ fn hosted_body(sock: &str, store: &Store, job: &WorkerJob) -> BodyEnd {
     session.type_under_hand(true);
     session.set_handover(Arc::clone(&job.handover));
     session.set_beside(job.watch_beside());
+    #[cfg(debug_assertions)]
+    if aterm_types::dev_seam!(aterm_types::domain::ENV_DEBUG_HOST_SLEEP)
+        .is_some_and(|seam| seam == NO_HOST_SLEEP)
+    {
+        session.set_host_awake();
+    }
     if tape::seam_on(aterm_types::dev_seam!(tape::HOSTED_SEAM).as_deref()) {
         let setup = session.setup().clone();
         drop(session);
@@ -17224,6 +17666,8 @@ fn live_acts(store: Store, sock: String) -> Acts {
     let launch_store = store.clone();
     let carry_store = store.clone();
     let offered_store = store.clone();
+    let end_store = store.clone();
+    let driven_store = store.clone();
     let idle_store = store.clone();
     let snapshot_store = store.clone();
     let primary_store = store.clone();
@@ -17456,11 +17900,17 @@ fn live_acts(store: Store, sock: String) -> Acts {
                 }
             }
         }),
-        relaunch: Arc::new(move |sid, grace, snap, left, upgrade, asked| {
+        end_asked: Arc::new(move |sid, group, began| end_asked(&end_store, sid, group, began)),
+        driven: Arc::new(move |sid| driven(&driven_store, sid)),
+        relaunch: Arc::new(move |sid, grace, snap, left, upgrade, asked, carried| {
             let Some(o) = o5(sid, grace) else {
                 return "refused:no-home".to_string();
             };
-            let r = relaunch::after_exit(&o, snap, left, upgrade, asked);
+            let r = if carried {
+                relaunch::after_carried_exit(&o, snap, left, upgrade)
+            } else {
+                relaunch::after_exit(&o, snap, left, upgrade, asked)
+            };
             w6(sid, "relaunch", &r);
             r.step
         }),
@@ -17651,7 +18101,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
                 home,
                 now,
             };
-            codex_cold_at(&seat, snap, &aterm_agent::harness::accounts_pool::LiveUsage)
+            codex_cold_live(&seat, snap)
         }),
         hold: Arc::new(move |sid, until| {
             o12(sid, 0).is_none_or(|o| upgrade_drive::hold_clock(&o, until))
@@ -19172,6 +19622,14 @@ fn account_cold_at(
 /// ([`aterm_agent::harness::accounts_pool::cold_launch_env`], for the program its resume line
 /// runs, so a Codex build that keeps no row's login its own is moved only onto this machine's
 /// own login); `None` keeps it as it is.
+fn codex_cold_live(
+    seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
+    snap: &Snapshot,
+) -> Option<Snapshot> {
+    codex_cold_at(seat, snap, &aterm_agent::harness::accounts_pool::LiveUsage)
+}
+
+/// [`codex_cold_live`] over `read`.
 fn codex_cold_at(
     seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
     snap: &Snapshot,
@@ -19359,8 +19817,22 @@ fn accounts_said(
         return None;
     };
     Some(AccountsSaid::listed(
-        &roster, &state, &logins, seat.now, carried,
+        &roster,
+        &state,
+        &logins,
+        seat.now,
+        carried,
+        &|| default_claude_signed_in(&seat.home),
     ))
+}
+
+/// Whether Claude Code's default home, under the user home `home`, names a signed-in account
+/// (`oauthAccount` in its profile): on macOS its login itself is in the Keychain, which no look
+/// here opens.
+fn default_claude_signed_in(home: &Path) -> bool {
+    use aterm_agent::harness::profile;
+    let dir = home.join(accounts::Cli::Claude.accounts().default_home);
+    profile::read(&profile::path_in(home, None, &dir)).is_ok_and(|p| p.key.is_some())
 }
 
 /// Tell the window what the accounts say, once per change ([`HostNote::Accounts`]).
@@ -19390,6 +19862,11 @@ fn pools_said(seat: &AccountSeat) -> Vec<PoolSaid> {
     else {
         return Vec::new();
     };
+    let settings = aterm_agent::ai::config::load_with(
+        Some(&config),
+        aterm_agent::ai::config::default_ai_dir().as_deref(),
+        seat.now,
+    );
     aterm_agent::harness::accounts_sync::cli_pools(&config, &seat.state, &seat.home, seat.now)
         .into_iter()
         .filter_map(|pool| {
@@ -19401,6 +19878,9 @@ fn pools_said(seat: &AccountSeat) -> Vec<PoolSaid> {
                 due: accounts::renew_due(&roster, &logins, &pool.state, &pool.enrolled, seat.now),
                 wrong: accounts::wrong_accounts(&roster, &logins),
                 sign_in: accounts::sign_in_tasks(&roster, &logins),
+                asked: aterm_agent::ai::state::named(pool.cli.id(), &settings)
+                    || pool.state.pinned
+                    || logins.labels.values().any(|b| b.served_at.is_some()),
             };
             (!said.due.is_empty() || !said.wrong.is_empty() || !said.sign_in.is_empty())
                 .then_some(said)
@@ -20772,7 +21252,7 @@ static DISK_CWD_UNKNOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static DISK_POKED: AtomicBool = AtomicBool::new(false);
 
 /// The visible rows of tab `sid`'s screen, read in memory (the store's lock, then the terminal's, never waited on).
-fn screen_rows(store: &Store, sid: &str) -> Option<Vec<String>> {
+pub(crate) fn screen_rows(store: &Store, sid: &str) -> Option<Vec<String>> {
     let handle = {
         let g = store.read().unwrap_or_else(PoisonError::into_inner);
         g.by_sid(&aterm_session::SessionId::new(sid))?.clone()
@@ -24144,7 +24624,9 @@ impl Acts {
             exited: Arc::new(|_, _| true),
             asked: Arc::new(|_, _| None),
             offered: Arc::new(|_| None),
-            relaunch: Arc::new(|_, _, _, _, _, _| "refused:inert".to_string()),
+            end_asked: Arc::new(|_, _, _| None),
+            driven: Arc::new(|_| None),
+            relaunch: Arc::new(|_, _, _, _, _, _, _| "refused:inert".to_string()),
             claim: Arc::new(|_, _| {}),
             self_copy: Arc::new(|_| None),
             live_self_copy: Arc::new(|_| None),
@@ -24339,7 +24821,7 @@ impl HostHandle {
             })
         });
         let lands = Arc::clone(&landed);
-        acts.relaunch = Arc::new(move |sid, _, _, left, _, _| {
+        acts.relaunch = Arc::new(move |sid, _, _, left, _, _, _| {
             relaunched
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

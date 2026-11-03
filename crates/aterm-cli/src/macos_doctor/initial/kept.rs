@@ -62,7 +62,7 @@ impl Kept {
     /// pass then sets nothing rather than set one of them again.
     pub(in crate::macos_doctor) fn load(root: &Path) -> Result<Self, String> {
         let path = root.join(KEPT_RECORD);
-        let bytes = match std::fs::read(&path) {
+        let bytes = match crate::macos_doctor::read_record_bytes(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());

@@ -821,6 +821,8 @@ mod tests {
 
     fn claim(pid: u32) -> Record {
         Record {
+            accounting: aterm_capacity::Accounting::Holder,
+            timing: aterm_capacity::TimingEvidence::default(),
             pid,
             start_ms: 1,
             seq: 0,

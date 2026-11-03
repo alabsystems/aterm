@@ -1716,6 +1716,8 @@ pub fn plan_or_apply_only(
     let outcomes = ssh::fan_out(&jobs, parallel, |job| {
         send(env, job, agent_archive.as_ref().map(|a| &a.archive))
     });
+    // Every host's key calls share one agh client, so agh paces the run's key writes.
+    let key_calls = super::github::KeyCalls::new(env.sys);
     for (job, outcome) in jobs.iter().zip(outcomes) {
         match outcome {
             Ok(mut report) => {
@@ -1727,7 +1729,7 @@ pub fn plan_or_apply_only(
                 tally.failed |= report.failed();
                 print_report(env, &job.host, &report);
                 let _ = follow_rename(env, &job.host, &report);
-                after_run(env, &inv, &job.host, report, Source::Baseline);
+                after_run_with(env, &inv, &job.host, report, Source::Baseline, &key_calls);
             }
             Err(why) => {
                 tally.failed = true;
@@ -2398,6 +2400,25 @@ fn is_baseline_report(report: &HostReport) -> bool {
 }
 
 fn after_run(env: &Env<'_>, inv: &Inventory, host: &Host, report: HostReport, source: Source) {
+    after_run_with(
+        env,
+        inv,
+        host,
+        report,
+        source,
+        &super::github::KeyCalls::new(env.sys),
+    );
+}
+
+/// `after_run`, its key calls made through `key_calls`, which a run shares across its hosts.
+fn after_run_with(
+    env: &Env<'_>,
+    inv: &Inventory,
+    host: &Host,
+    report: HostReport,
+    source: Source,
+    key_calls: &super::github::KeyCalls<'_>,
+) {
     let mut state = match inventory::load_state(env.sys, &env.paths, &host.uuid) {
         Ok(s) => s,
         Err(why) => {
@@ -2423,7 +2444,7 @@ fn after_run(env: &Env<'_>, inv: &Inventory, host: &Host, report: HostReport, so
         }
         if report.mode == Mode::Apply {
             if let Some(github) = &inv.github {
-                register_keys(env, &github.account, host, &report, &mut state);
+                register_keys(key_calls, github, host, &report, &mut state);
             } else if report
                 .items
                 .iter()
@@ -2503,8 +2524,8 @@ fn key_text_of(state: &HostState, id: u64) -> Option<&str> {
 }
 
 fn register_keys(
-    env: &Env<'_>,
-    account: &str,
+    key_calls: &super::github::KeyCalls<'_>,
+    github: &inventory::Github,
     host: &Host,
     report: &HostReport,
     state: &mut HostState,
@@ -2543,25 +2564,30 @@ fn register_keys(
         .cloned()
         .collect();
     if !fresh.is_empty() {
-        match super::github::register(env.sys, account, &host.name, &fresh) {
-            Ok(done) => {
-                for r in done {
-                    let Some((_, text)) = fresh.iter().find(|(u, _)| *u == r.user) else {
-                        continue;
-                    };
-                    outln!(
-                        "    github    registered {}'s key on {account} (id {})",
-                        shown(&r.user),
-                        r.id
-                    );
-                    if !state.github_keys.contains(&(r.user.clone(), r.id)) {
-                        state.github_keys.push((r.user.clone(), r.id));
-                    }
-                    state.github_key_text.retain(|(id, _)| *id != r.id);
-                    state.github_key_text.push((r.id, text.clone()));
-                }
+        // Each key GitHub holds is recorded, whatever became of the others, so a later
+        // revocation can find it.
+        let registration = key_calls.register(github, &host.name, &fresh);
+        for r in registration.done {
+            let Some((_, text)) = fresh.iter().find(|(u, _)| *u == r.user) else {
+                continue;
+            };
+            outln!(
+                "    github    registered {}'s key on {} (id {})",
+                shown(&r.user),
+                github.account,
+                r.id
+            );
+            if !state.github_keys.contains(&(r.user.clone(), r.id)) {
+                state.github_keys.push((r.user.clone(), r.id));
             }
-            Err(why) => outln!("    github    not registered: {}", shown(&why)),
+            state.github_key_text.retain(|(id, _)| *id != r.id);
+            state.github_key_text.push((r.id, text.clone()));
+        }
+        if !registration.failed.is_empty() {
+            outln!(
+                "    github    not registered: {}",
+                shown(&registration.failed.join("; "))
+            );
         }
     }
     let stale: Vec<u64> = state
@@ -2582,11 +2608,12 @@ fn register_keys(
     if stale.is_empty() {
         return;
     }
-    match super::github::revoke(env.sys, account, &stale) {
+    match key_calls.revoke(github, &stale) {
         Ok(_) => {
             outln!(
-                "    github    deleted {} replaced key(s) from {account}",
-                stale.len()
+                "    github    deleted {} replaced key(s) from {}",
+                stale.len(),
+                github.account
             );
             state.github_keys.retain(|(_, id)| !stale.contains(id));
             state.github_key_text.retain(|(id, _)| !stale.contains(id));
@@ -3252,7 +3279,7 @@ pub fn github_revoke(env: &Env<'_>, name: &str) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let ids: Vec<u64> = state.github_keys.iter().map(|(_, id)| *id).collect();
-    let deleted = match super::github::revoke(env.sys, &github.account, &ids) {
+    let deleted = match super::github::revoke_via(env.sys, github, &ids) {
         Ok(deleted) => deleted,
         Err(why) => {
             errln!("aterm machines github revoke: {}: {why}", host.name);
@@ -3295,6 +3322,19 @@ pub fn github_login(env: &Env<'_>) -> ExitCode {
         errln!("aterm machines github login: machines.toml names no [github] account");
         return ExitCode::from(2);
     };
+    if github.keys_via() == super::inventory::KeysVia::AghFleet {
+        // Under 5b the key calls read agh.toml's fleet profile and never this keychain item, so
+        // a token stored here would go unused while the login said otherwise.
+        errln!(
+            "aterm machines github login: keys = \"agh-fleet\" reads agh.toml's fleet profile, \
+             not the login keychain: agh auth add fleet --file PATH --tier dev (a token of \
+             {}'s with the {} scope); to store a keychain token for keys = \"gh\" or \
+             \"agh-inline\", set that first",
+            github.account,
+            super::github::KEY_SCOPE
+        );
+        return ExitCode::from(2);
+    }
     if !env.tty {
         errln!(
             "aterm machines github login: needs a terminal, where the token is typed with \
@@ -3969,17 +4009,12 @@ mod tests {
 
     fn controller(hosts: &[&Host], github: bool) -> Fake {
         let sys = Fake::root();
-        let mut inv = String::from("schema = 1\n");
-        if github {
-            inv.push_str("[github]\naccount = \"fleetbot\"\n");
-        }
-        for h in hosts {
-            inv.push_str(&format!(
-                "[[host]]\nname = \"{}\"\nuuid = \"{}\"\naddress = \"{}\"\nuser = \"{}\"\n",
-                h.name, h.uuid, h.address, h.user
-            ));
-        }
-        sys.file(&format!("{ROOT}/machines.toml"), inv.as_bytes());
+        let github = if github {
+            "[github]\naccount = \"fleetbot\"\n"
+        } else {
+            ""
+        };
+        names(&sys, hosts, github);
         sys.file(
             &enroll::own_exe().unwrap().to_string_lossy(),
             b"this controller's agent",
@@ -3997,6 +4032,18 @@ mod tests {
             .as_bytes(),
         );
         sys
+    }
+
+    /// Writes `machines.toml` naming `hosts`, with `github`'s table text (or none).
+    fn names(sys: &Fake, hosts: &[&Host], github: &str) {
+        let mut inv = format!("schema = 1\n{github}");
+        for h in hosts {
+            inv.push_str(&format!(
+                "[[host]]\nname = \"{}\"\nuuid = \"{}\"\naddress = \"{}\"\nuser = \"{}\"\n",
+                h.name, h.uuid, h.address, h.user
+            ));
+        }
+        sys.file(&format!("{ROOT}/machines.toml"), inv.as_bytes());
     }
 
     fn request(host: &Host, command: &str) -> String {
@@ -5753,6 +5800,46 @@ mod tests {
     }
 
     #[test]
+    fn a_key_github_created_is_recorded_when_another_key_fails() {
+        let a = lab(1, UUID_1);
+        let sys = controller(&[&a], true);
+        with_token(&sys);
+        let e = env(&sys);
+        let inv = inventory_of(&sys);
+        lists(&sys, &[]);
+        posts(&sys, 9);
+        sys.on_github_rest(
+            crate::port::RestMethod::Post,
+            "/user/keys",
+            rest(
+                422,
+                r#"{"message":"Validation Failed","errors":[{"message":"key is already in use"}]}"#,
+            ),
+        );
+        let mut bob = row("github.key@bob", "github", Outcome::Ok);
+        bob.detail = Some(format!("ssh-ed25519 {ALICE_NEW} aterm-machines:lab-01:bob"));
+        after_run(
+            &e,
+            &inv,
+            &a,
+            report(Mode::Apply, vec![key_row(ALICE_OLD), bob]),
+            Source::Baseline,
+        );
+        let state = state_of(&sys, &a);
+        assert_eq!(state.github_keys, [("alice".to_owned(), 9)]);
+        assert_eq!(
+            state.github_key_text,
+            [(9, format!("ssh-ed25519 {ALICE_OLD}"))]
+        );
+        let posted = sys
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("github POST /user/keys"))
+            .count();
+        assert_eq!(posted, 2);
+    }
+
+    #[test]
     fn a_revoked_key_is_never_registered_again_and_a_plan_registers_nothing() {
         let a = lab(1, UUID_1);
         let sys = controller(&[&a], true);
@@ -5798,6 +5885,109 @@ mod tests {
             Source::Baseline,
         );
         assert_eq!(state_of(&sys, &a).github_keys, [("alice".to_owned(), 11)]);
+    }
+
+    /// A controller of `hosts` whose `[github]` row sends the key calls over agh, inline, to
+    /// `fake` on loopback (plan §17).
+    fn over_agh(hosts: &[&Host], fake: &agh_fake::FakeGithub) -> Fake {
+        let (sys, _token) =
+            super::super::github_keys_tests::inline_on(controller(hosts, false), fake);
+        names(
+            &sys,
+            hosts,
+            &format!(
+                "[github]\naccount = \"{}\"\nkeys = \"agh-inline\"\n",
+                super::super::github_keys_tests::LOGIN
+            ),
+        );
+        sys
+    }
+
+    /// `METHOD path` of each request `fake` saw.
+    fn agh_saw(fake: &agh_fake::FakeGithub) -> Vec<String> {
+        super::super::github_keys_tests::requests(&fake.seen())
+    }
+
+    #[test]
+    fn a_runs_hosts_share_one_agh_client_so_their_key_writes_are_paced() {
+        let fake = agh_fake::FakeGithub::start();
+        let (a, b) = (lab(1, UUID_1), lab(2, UUID_2));
+        let sys = over_agh(&[&a, &b], &fake);
+        let e = env(&sys);
+        let inv = inventory_of(&sys);
+        // `run`'s loop: every host's report through the one `KeyCalls` it opens.
+        let key_calls = super::super::github::KeyCalls::new(&sys);
+        for (host, body) in [(&a, ALICE_OLD), (&b, ALICE_NEW)] {
+            after_run_with(
+                &e,
+                &inv,
+                host,
+                report(Mode::Apply, vec![key_row(body)]),
+                Source::Baseline,
+                &key_calls,
+            );
+        }
+        // The second host's POST waits out agh's second after the first's, and the inline
+        // token's login is bound once.
+        assert_eq!(System::github_fx(&sys).slept(), [Duration::from_secs(1)]);
+        let saw = agh_saw(&fake);
+        assert_eq!(
+            saw.iter().filter(|r| *r == "GET /user").count(),
+            1,
+            "{saw:?}"
+        );
+        assert_eq!(
+            saw.iter().filter(|r| *r == "POST /user/keys").count(),
+            2,
+            "{saw:?}"
+        );
+        let held = fake.keys(super::super::github_keys_tests::LOGIN);
+        for (host, body) in [(&a, ALICE_OLD), (&b, ALICE_NEW)] {
+            let state = state_of(&sys, host);
+            let [(user, id)] = state.github_keys.as_slice() else {
+                panic!("{}: {:?}", host.name, state.github_keys);
+            };
+            assert_eq!(user, "alice");
+            assert!(
+                held.iter()
+                    .any(|k| k.id == *id && k.key == format!("ssh-ed25519 {body}")),
+                "{held:?}"
+            );
+        }
+        assert!(
+            !sys.calls().iter().any(|c| c.starts_with("github ")),
+            "no REST call: {:?}",
+            sys.calls()
+        );
+    }
+
+    #[test]
+    fn github_revoke_deletes_over_agh_when_the_row_says() {
+        let fake = agh_fake::FakeGithub::start();
+        let a = lab(1, UUID_1);
+        let sys = over_agh(&[&a], &fake);
+        let id = fake.add_key(
+            super::super::github_keys_tests::LOGIN,
+            "aterm-machines:lab-01:alice",
+            &format!("ssh-ed25519 {ALICE_OLD}"),
+        );
+        let state = HostState {
+            github_keys: vec![("alice".into(), id)],
+            ..HostState::default()
+        };
+        inventory::save_state(&sys, &paths(), &a.uuid, &state).unwrap();
+        assert_eq!(github_revoke(&env(&sys), "lab-01"), ExitCode::SUCCESS);
+        let saw = agh_saw(&fake);
+        assert!(saw.contains(&format!("DELETE /user/keys/{id}")), "{saw:?}");
+        assert!(fake.keys(super::super::github_keys_tests::LOGIN).is_empty());
+        assert!(
+            !sys.calls().iter().any(|c| c.starts_with("github ")),
+            "no REST call: {:?}",
+            sys.calls()
+        );
+        let state = state_of(&sys, &a);
+        assert!(state.github_keys.is_empty());
+        assert_eq!(state.github_revoked, [format!("ssh-ed25519 {ALICE_OLD}")]);
     }
 
     #[test]
@@ -5857,6 +6047,62 @@ mod tests {
             assert!(
                 calls.iter().all(|c| !c.contains(MACHINE_TOKEN)),
                 "{calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_login_under_agh_fleet_stores_nothing_the_key_calls_never_read() {
+        let a = lab(1, UUID_1);
+        for (keys, code) in [
+            ("agh-fleet", ExitCode::from(2)),
+            ("agh-inline", ExitCode::SUCCESS),
+        ] {
+            let sys = controller(&[&a], false);
+            names(
+                &sys,
+                &[&a],
+                &format!("[github]\naccount = \"fleetbot\"\nkeys = \"{keys}\"\n"),
+            );
+            sys.stat_of(
+                crate::items::github::CLT_GIT,
+                crate::port::Stat {
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o755,
+                    dir: false,
+                    symlink: false,
+                    len: 1,
+                },
+            );
+            sys.answer(Some(MACHINE_TOKEN));
+            sys.on_github_rest(
+                crate::port::RestMethod::Get,
+                "/user",
+                Ok(crate::port::GithubResponse {
+                    status: 200,
+                    headers: vec![("X-OAuth-Scopes".into(), "admin:public_key".into())],
+                    body: br#"{"login":"fleetbot"}"#.to_vec(),
+                }),
+            );
+            let approve = crate::git_credential::script::approves(&sys, None);
+            crate::git_credential::script::holds(
+                &sys,
+                None,
+                super::super::github::TOKEN_HOST,
+                "fleetbot",
+                MACHINE_TOKEN,
+            );
+            let mut e = env(&sys);
+            e.tty = true;
+            assert_eq!(github_login(&e), code, "{keys}");
+            let calls = sys.calls();
+            let stored = code == ExitCode::SUCCESS;
+            assert_eq!(calls.contains(&approve), stored, "{keys}: {calls:?}");
+            assert_eq!(
+                calls.iter().any(|c| c.starts_with("ask")),
+                stored,
+                "{keys}: {calls:?}"
             );
         }
     }

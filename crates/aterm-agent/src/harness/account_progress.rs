@@ -95,6 +95,8 @@ pub struct AccountProgress {
     pub phase: ProgressPhase,
     pub wall: Option<String>,
     pub details: Vec<String>,
+    /// Validated historical provider facts, separate from free-text route records.
+    pub login_diagnostics: Vec<super::accounts_sync::LoginDiagnostic>,
     pub next_at: Option<i64>,
     pub own_claim: Option<OwnClaimFinding>,
 }
@@ -110,6 +112,7 @@ impl AccountProgress {
             phase: ProgressPhase::Unknown,
             wall: None,
             details: Vec::new(),
+            login_diagnostics: Vec::new(),
             next_at: None,
             own_claim: None,
         }

@@ -714,7 +714,7 @@ fn entry_points(s: &CellSurvey, target: &PkgId) -> Vec<PkgId> {
 /// `[patch.crates-io]` entries with the vendored manifest's own version.
 fn read_forks(root: &Path) -> Result<Forks, String> {
     let manifest = root.join("Cargo.toml");
-    let text = std::fs::read_to_string(&manifest).map_err(|e| {
+    let text = crate::read_regular_text(&manifest).map_err(|e| {
         format!(
             "cannot read {}: {e} — Fix: run `targo --unverified forge` from inside the workspace, or pass \
              `--root <workspace>`.",
@@ -740,7 +740,7 @@ fn read_forks(root: &Path) -> Result<Forks, String> {
             continue;
         };
         let name = crate::policy::patched_package(key, item);
-        let version = std::fs::read_to_string(root.join(rel).join("Cargo.toml"))
+        let version = crate::read_regular_text(root.join(rel).join("Cargo.toml"))
             .ok()
             .and_then(|t| t.parse::<aterm_toml::edit::DocumentMut>().ok())
             .and_then(|d| {
@@ -801,7 +801,7 @@ fn patch_state(
 
 /// Versions of `name` in `Cargo.lock`.
 fn lock_versions(root: &Path, name: &str) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(root.join("Cargo.lock")) else {
+    let Ok(text) = crate::read_regular_text(root.join("Cargo.lock")) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -900,7 +900,7 @@ fn rs_lines(dir: &Path) -> u64 {
     }
     files
         .iter()
-        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .filter_map(|f| crate::read_regular_text(f).ok())
         .map(|t| t.lines().count() as u64)
         .sum()
 }

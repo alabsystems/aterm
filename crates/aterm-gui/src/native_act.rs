@@ -25,9 +25,55 @@ use crate::session_timeline::{
 #[path = "native_act_tests.rs"]
 mod tests;
 
+#[path = "native_closed_restart.rs"]
+mod closed_restart;
+use closed_restart::ClosedRestart;
+
 #[path = "native_observe_control.rs"]
 mod observe_control;
 pub(crate) use observe_control::serve as serve_observation;
+
+#[path = "codex_renewal_control.rs"]
+mod renewal;
+pub(crate) use renewal::serve as serve_codex_renewal;
+pub(crate) use renewal::{cancel_owner as cancel_renewal_owner, pending as renewal_pending};
+
+/// A cancelled native cohort is positively closed and its exact original shell
+/// is in front. Stale task chrome must not turn Stop into a shell signal.
+pub(crate) fn cancelled_native_shell_front(ctx: &crate::SessionCtx, master: i32) -> bool {
+    let operations = ctx
+        .fenced_writes
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .by_id
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let kernel = System(&ctx.native_policy, false);
+    operations.iter().any(|operation| {
+        let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+        let NativePlan::Restart { shell, .. } = &op.request.plan else {
+            return false;
+        };
+        op.authority
+            .renewal
+            .as_ref()
+            .is_some_and(|seal| seal.durably_cancelled(ctx))
+            && matches!(op.phase, Phase::Completed(Decision::Retired(_)))
+            && op
+                .closed_restart
+                .as_ref()
+                .is_some_and(|proof| proof.quiescent(&kernel))
+            && op.custody.is_none()
+            && op
+                .completion_drain
+                .as_ref()
+                .is_none_or(NativeDrain::is_drained)
+            && kernel.process(shell.pid).as_ref() == Some(shell)
+            && kernel.foreground(master) == Some(shell.group)
+    })
+}
 
 const DENIED: &str = "ERR denied native operation authority\n";
 const UNKNOWN: &str = "OK native-act state=unknown\n";
@@ -87,6 +133,8 @@ impl Clock {
 #[derive(Debug, Default)]
 pub(crate) struct Operations {
     observations: Arc<Mutex<crate::native_observe::Store>>,
+    renewal_seals: BTreeMap<String, renewal::Seal>,
+    renewal_services: BTreeMap<String, Arc<renewal::Service>>,
     by_id: BTreeMap<String, Arc<Mutex<Operation>>>,
     completed: std::collections::VecDeque<String>,
     coordinated_connections: std::collections::BTreeSet<u64>,
@@ -138,6 +186,7 @@ impl Operations {
                 let op = operation.try_lock().ok()?;
                 (op.request.deadline_us <= now_us
                     && matches!(op.phase, Phase::Completed(_))
+                    && !op.continuation_pending()
                     && op
                         .completion_drain
                         .as_ref()
@@ -240,6 +289,7 @@ struct Authority {
     snapshot: SupervisorAuthority,
     caller: SupervisorInputCaller,
     builtin: bool,
+    renewal: Option<renewal::Seal>,
     actor: Option<Process>,
     conversation: Option<Conversation>,
 }
@@ -266,7 +316,10 @@ fn snapshot_conversation(snapshot: &aterm_agent::harness::relaunch::Snapshot) ->
         .session
         .as_deref()
         .filter(|session| !session.is_empty())?;
-    let root = snapshot.claude_dir.as_ref()?;
+    let root = match &snapshot.run {
+        aterm_agent::harness::relaunch::AgentRun::Codex(run) => &run.home,
+        _ => snapshot.claude_dir.as_ref()?,
+    };
     #[cfg(unix)]
     let path = |path: &std::path::Path| {
         use std::os::unix::ffi::OsStrExt;
@@ -312,6 +365,9 @@ struct Operation {
     observation: Option<Arc<crate::native_observe::Evidence>>,
     outcome_slot: Option<crate::native_observe::OutcomeSlot>,
     completed_observation: Option<aterm_agent::harness::native_observe::SavedObservation>,
+    source_death: Option<Arc<SharedDeath>>,
+    closed_restart: Option<Arc<ClosedRestart>>,
+    resume_only: bool,
 }
 
 #[derive(Debug)]
@@ -373,6 +429,8 @@ enum DeathWatch {
     Linux(std::os::fd::OwnedFd),
     #[cfg(test)]
     Facts(Process, Arc<Mutex<BTreeMap<u32, Process>>>),
+    #[cfg(test)]
+    Unknown,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -427,7 +485,7 @@ impl DeathWatch {
                 Some(fd.as_raw_fd())
             }
             #[cfg(test)]
-            Self::Facts(..) => None,
+            Self::Facts(..) | Self::Unknown => None,
         }
     }
 
@@ -462,6 +520,8 @@ impl DeathWatch {
                     .get(&original.pid)
                     .is_none_or(|actual| actual.birth != original.birth),
             ),
+            #[cfg(test)]
+            Self::Unknown => None,
             // A platform with no kernel death watch has no value of this type to match; a
             // reference to it counts as inhabited, so the match names that arm.
             #[cfg(not(any(target_vendor = "apple", target_os = "linux", test)))]
@@ -521,6 +581,37 @@ struct Completion {
 }
 
 impl Operation {
+    fn continuation_pending(&self) -> bool {
+        self.closed_restart
+            .as_ref()
+            .is_some_and(|proof| proof.pinned())
+            || (self.resume_only
+                && matches!(
+                    self.phase,
+                    Phase::Completed(Decision::ProvenNotCommittedRollbackSafe)
+                )
+                && self
+                    .authority
+                    .renewal
+                    .as_ref()
+                    .is_some_and(|seal| seal.intent_active()))
+    }
+
+    fn seal_without_effect(&mut self, kernel: &dyn Kernel) -> Option<Completion> {
+        if self.resume_only && retirement(self, kernel) == Some(Retirement::NotGranted) {
+            self.seal_retirement(Retirement::NotGranted, kernel)
+        } else {
+            self.seal_completion(Decision::ProvenNotCommittedRollbackSafe)
+        }
+    }
+
+    fn seal_retirement(&mut self, reason: Retirement, kernel: &dyn Kernel) -> Option<Completion> {
+        if !matches!(self.phase, Phase::Completed(_)) {
+            self.closed_restart = ClosedRestart::capture(self, reason, kernel).map(Arc::new);
+        }
+        self.seal_completion(Decision::Retired(reason))
+    }
+
     fn seal_completion(&mut self, decision: Decision) -> Option<Completion> {
         if matches!(self.phase, Phase::Completed(_)) {
             return None;
@@ -571,11 +662,14 @@ trait Kernel {
     fn completion_sealed(&self) {}
 }
 
-struct System<'a>(&'a crate::native_session_policy::SessionPolicy);
+struct System<'a>(&'a crate::native_session_policy::SessionPolicy, bool);
 
 impl Kernel for System<'_> {
     fn constructor_enabled(&self, kind: Constructor) -> bool {
         self.0.constructor_enabled(kind)
+            || (self.1
+                && kind == Constructor::PrivateRestart
+                && self.0.renewal_constructor_enabled())
     }
     fn clock(&self) -> Clock {
         Clock::System
@@ -610,7 +704,7 @@ impl Kernel for System<'_> {
     fn birth_alive(&self, process: &Process) -> Option<bool> {
         process_birth_alive(process)
     }
-    fn signal(&self, master: i32, process: &Process, _: &crate::SessionCtx) -> String {
+    fn signal(&self, master: i32, process: &Process, _ctx: &crate::SessionCtx) -> String {
         #[cfg(unix)]
         {
             use aterm_uds::process::EndControl;
@@ -631,6 +725,8 @@ impl Kernel for System<'_> {
             // EndControlLive uses a pidfd on Linux, with a last identity read. Darwin's
             // documented read-to-kill race remains; no pathname/status is a process handle.
             if control.signal(&identity, libc::SIGTERM).is_ok() {
+                #[cfg(any(test, debug_assertions))]
+                _ctx.native_policy.renewal_signal_effect(process);
                 "OK signalled\n".into()
             } else {
                 "ERR native signal refused\n".into()
@@ -677,6 +773,10 @@ fn image_exists(_: &Image) -> bool {
     false
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep the distinct admission facts and existing call boundary together."
+)]
 fn capture_native_authority(
     ctx: &crate::SessionCtx,
     meta: &crate::session_timeline::SessionMeta,
@@ -685,18 +785,22 @@ fn capture_native_authority(
     actor: Option<Process>,
     conversation: Option<Conversation>,
     now_us: u64,
+    renewal: Option<renewal::Seal>,
 ) -> Result<Authority, String> {
     let snapshot = meta.supervisor_authority(now_us);
     if !matches!(request.duty, Scope::Upgrade | Scope::Relaunch)
         || request.revision != snapshot.revision()
         || caller.connection.is_none()
+        || renewal
+            .as_ref()
+            .is_some_and(|seal| !seal.admits(&snapshot, request))
     {
         return Err(DENIED.into());
     }
     let builtin = caller.principal == crate::control::Principal::Harness;
     if builtin {
         if request.holder != crate::harness_host::holder()
-            || !snapshot.builtin_keeps(&request.holder, request.duty)
+            || (!snapshot.builtin_keeps(&request.holder, request.duty) && renewal.is_none())
             || !matches!(request.plan, NativePlan::Restart { .. })
             || request.expected_human_seq != Some(ctx.human_input.seq())
             || actor
@@ -724,6 +828,7 @@ fn capture_native_authority(
         snapshot,
         caller: caller.clone(),
         builtin,
+        renewal,
         actor,
         conversation,
     })
@@ -768,11 +873,20 @@ fn validate_plan(
             rollback,
         } => {
             authority.builtin
+                && authority.renewal.as_ref().is_none_or(|seal| seal.current())
                 && process.pid != shell.pid
                 && process.group == process.pid
                 && process.parent == shell.pid
                 && process.session == shell.session
-                && if observation.is_some() {
+                && if let Some(proof) = authority
+                    .renewal
+                    .as_ref()
+                    .and_then(|seal| seal.continuation())
+                {
+                    proof.predecessor.plan == request.plan
+                        && proof.quiescent(kernel)
+                        && kernel.foreground(master) == Some(shell.group)
+                } else if observation.is_some() {
                     crash_proven && kernel.foreground(master) == Some(shell.group)
                 } else {
                     kernel.foreground(master) == Some(process.group)
@@ -914,7 +1028,7 @@ fn cancel_prepare(
         if !matches!(op.phase, Phase::Queued | Phase::Started) || !before_mutation {
             return UNKNOWN.into();
         }
-        let completion = op.seal_completion(Decision::ProvenNotCommittedRollbackSafe);
+        let completion = op.seal_without_effect(kernel);
         drop(op);
         drop(meta);
         kernel.completion_sealed();
@@ -983,6 +1097,21 @@ fn prepare(
     caller: SupervisorInputCaller,
     kernel: &dyn Kernel,
 ) -> String {
+    let renewal = ctx
+        .fenced_writes
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .renewal_seals
+        .get(&request.id)
+        .cloned();
+    if renewal
+        .as_ref()
+        .is_some_and(|seal| !seal.bound_to_weak(ctx))
+    {
+        return DENIED.into();
+    }
+
     if host_epoch() != Some(request.host_epoch.as_str()) {
         return "ERR native host epoch changed\n".into();
     }
@@ -1027,6 +1156,13 @@ fn prepare(
             DENIED.into()
         };
     }
+    // Existing exact operations above are observations/reconnections. Their
+    // recorded Signal may have ended the original process; only a genuinely
+    // new preparation requires a fresh live-source proof. Resume/Execute gate
+    // all later mutations against current policy independently.
+    if renewal.as_ref().is_some_and(|seal| !seal.preflight()) {
+        return DENIED.into();
+    }
     if !kernel.constructor_enabled(request.plan.constructor()) {
         return "ERR native constructor disabled\n".into();
     }
@@ -1056,6 +1192,35 @@ fn prepare(
         return "ERR native entropy unavailable\n".into();
     };
     kernel.preparing();
+    // Arm the original process while its complete identity still matches. The
+    // later plan validation brackets this kernel watch before any Signal can
+    // be admitted; a disk journal or a later missing PID cannot replace it.
+    let resume_only = renewal
+        .as_ref()
+        .is_some_and(|seal| seal.continuation().is_some());
+    let source_death = if let Some(proof) = renewal.as_ref().and_then(|seal| seal.continuation()) {
+        Some(proof.source_watch())
+    } else {
+        match &request.plan {
+            NativePlan::Restart {
+                process,
+                observation: None,
+                ..
+            } => {
+                if kernel.process(process.pid).as_ref() != Some(process) {
+                    return DENIED.into();
+                }
+                let Some(watch) = kernel.watch(process) else {
+                    return UNKNOWN.into();
+                };
+                Some(Arc::new(SharedDeath {
+                    watch,
+                    outcome: std::sync::OnceLock::new(),
+                }))
+            }
+            _ => None,
+        }
+    };
     let observations = observe_control::store(ctx);
     // Every watch/slot carrier precedes metadata guards, so refusal disposal stays outside.
     let mut observation = None;
@@ -1104,13 +1269,17 @@ fn prepare(
         None
     };
     let actor = caller.peer.and_then(|pid| kernel.process(pid));
-    let conversation = match &request.plan {
-        NativePlan::Restart {
-            observation: Some(_),
-            ..
-        } => kernel.record_guard(ctx),
-        NativePlan::Restart { process, .. } => kernel.conversation(ctx, process),
-        NativePlan::OwnImage { .. } => None,
+    let conversation = if resume_only {
+        kernel.record_guard(ctx)
+    } else {
+        match &request.plan {
+            NativePlan::Restart {
+                observation: Some(_),
+                ..
+            } => kernel.record_guard(ctx),
+            NativePlan::Restart { process, .. } => kernel.conversation(ctx, process),
+            NativePlan::OwnImage { .. } => None,
+        }
     };
     // Declared before Meta so refused passive proof cannot close its watch under a guard.
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
@@ -1122,6 +1291,7 @@ fn prepare(
         actor,
         conversation,
         crate::metrics::now_us(),
+        renewal,
     ) {
         Ok(authority) => authority,
         Err(refusal) => return refusal,
@@ -1173,6 +1343,33 @@ fn prepare(
     if table.by_id.contains_key(&request.id) {
         return "ERR busy native operation prepare\n".into();
     }
+    let continuation = authority
+        .renewal
+        .as_ref()
+        .and_then(|seal| seal.continuation())
+        .cloned();
+    if let Some(proof) = &continuation {
+        let Some(previous) = table.by_id.get(&proof.predecessor.id).cloned() else {
+            return UNKNOWN.into();
+        };
+        let previous = previous.lock().unwrap_or_else(|p| p.into_inner());
+        if !matches!(previous.phase, Phase::Completed(Decision::Retired(_)))
+            && !(previous.resume_only
+                && previous.phase == Phase::Completed(Decision::ProvenNotCommittedRollbackSafe))
+        {
+            return UNKNOWN.into();
+        }
+        if previous.request != proof.predecessor
+            || !previous
+                .closed_restart
+                .as_ref()
+                .is_some_and(|actual| Arc::ptr_eq(actual, proof))
+            || !proof.available()
+            || !proof.quiescent(kernel)
+        {
+            return DENIED.into();
+        }
+    }
     let Some(boundary) = aterm_types::update_boundary::Boundary::process()
         .try_hold(aterm_types::update_boundary::GuardedItem::HarnessNativeMutation)
     else {
@@ -1190,6 +1387,15 @@ fn prepare(
         capability,
     };
     let custody = Arc::new(custody);
+    if continuation
+        .as_ref()
+        .is_some_and(|proof| !proof.claim_successor(&request))
+    {
+        drop(table);
+        drop(meta);
+        drop(custody);
+        return UNKNOWN.into();
+    }
     let deadline_us = request.deadline_us;
     let actor_history = authority
         .actor
@@ -1226,6 +1432,9 @@ fn prepare(
         observation,
         outcome_slot,
         completed_observation: None,
+        source_death,
+        closed_restart: None,
+        resume_only,
     }));
     slot.publish(&mut table, Arc::clone(&operation));
     {
@@ -1279,7 +1488,7 @@ fn prepare(
         || !conversation_current
         || op.clock.remaining(op.request.deadline_us).is_none()
     {
-        let completion = op.seal_completion(Decision::ProvenNotCommittedRollbackSafe);
+        let completion = op.seal_without_effect(kernel);
         drop(meta);
         drop(op);
         kernel.completion_sealed();
@@ -1328,7 +1537,7 @@ fn same_actor(op: &Operation, caller: &SupervisorInputCaller, kernel: &dyn Kerne
 
 fn image_outcome(op: &Operation, master: i32, phase: ImagePhase, kernel: &dyn Kernel) -> bool {
     if let NativePlan::Restart { process, shell, .. } = &op.request.plan {
-        if (!op.signal_sent && op.observation.is_none())
+        if (!op.signal_sent && op.observation.is_none() && !op.resume_only)
             || !op.resume_sent
             || op.resume_phase != Some(phase)
             || kernel.birth_alive(process) != Some(false)
@@ -1601,6 +1810,11 @@ fn serve_launcher(
                 return DENIED.into();
             };
             if op.clock.remaining(op.request.deadline_us).is_none()
+                || op
+                    .authority
+                    .renewal
+                    .as_ref()
+                    .is_some_and(|seal| !seal.current())
                 || ctx.human_input.seq() != op.human_seq
                 || op
                     .authority
@@ -1651,6 +1865,10 @@ fn retirement(op: &Operation, kernel: &dyn Kernel) -> Option<Retirement> {
             .then_some(Retirement::Exited),
         NativePlan::Restart { process, .. } => {
             if kernel.birth_alive(process) != Some(false)
+                || op
+                    .source_death
+                    .as_ref()
+                    .is_some_and(|watch| !watch.exited())
                 || kernel.group_gone(process.group) != Some(true)
                 || op
                     .resume_attempt
@@ -1696,7 +1914,121 @@ pub(crate) fn maybe_unsettled(ctx: &crate::SessionCtx) -> bool {
 /// child needs retained death/group proof; a terminal no-Go seal rejects delayed helpers,
 /// without claiming an unseen/ungranted helper is dead. Pending actual input stays Unknown.
 pub(crate) fn reconcile_extinct(ctx: &crate::SessionCtx) {
-    reconcile_extinct_by(ctx, &System(&ctx.native_policy));
+    reconcile_extinct_by(ctx, &System(&ctx.native_policy, false));
+}
+
+/// Probe the actual production conversation guard for a still-live source.
+#[cfg(all(unix, debug_assertions))]
+pub(crate) fn fixture_live_conversation(
+    ctx: &crate::SessionCtx,
+    master: i32,
+    source: &Process,
+) -> bool {
+    let kernel = System(&ctx.native_policy, false);
+    kernel.process(source.pid).as_ref() == Some(source)
+        && kernel.foreground(master) == Some(source.group)
+        && kernel
+            .conversation(ctx, source)
+            .is_some_and(|guard| guard.current(ctx))
+}
+
+#[cfg(all(unix, debug_assertions))]
+/// Read the actual fixture operation after the production terminal sweep. This
+/// is an observation-triggered reconciliation, not an admission or a raw effect.
+pub(crate) fn fixture_observe_operation(
+    ctx: &crate::SessionCtx,
+    id: &str,
+) -> Option<aterm_json::Value> {
+    reconcile_extinct(ctx);
+    fixture_operation_state(ctx, id, true)
+}
+
+#[cfg(all(unix, debug_assertions))]
+pub(crate) fn fixture_active_signalled_operation(ctx: &crate::SessionCtx) -> Option<String> {
+    let operations = ctx
+        .fenced_writes
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .by_id
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut ids = operations.iter().filter_map(|operation| {
+        let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+        (!op.resume_only
+            && op.signal_accepted == Some(true)
+            && !matches!(op.phase, Phase::Completed(_))
+            && op
+                .authority
+                .renewal
+                .as_ref()
+                .is_some_and(|seal| seal.bound_to_weak(ctx)))
+        .then(|| op.request.id.clone())
+    });
+    let id = ids.next()?;
+    ids.next().is_none().then_some(id)
+}
+
+/// A completed owner gesture reports what Stop itself did, without a diagnostic
+/// observer silently completing the operation first.
+#[cfg(all(unix, debug_assertions))]
+pub(crate) fn fixture_operation_state(
+    ctx: &crate::SessionCtx,
+    id: &str,
+    observation_reconciled: bool,
+) -> Option<aterm_json::Value> {
+    if !aterm_codec::hex::is_lower(id, 32) {
+        return None;
+    }
+    let operation = ctx
+        .fenced_writes
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .by_id
+        .get(id)?
+        .clone();
+    let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+    let kernel = System(&ctx.native_policy, false);
+    let (state, decision) = match op.phase {
+        Phase::Completed(Decision::Retired(Retirement::NotGranted)) => {
+            ("completed", "retired-no-exec-grant")
+        }
+        Phase::Completed(Decision::Retired(Retirement::Exited)) => {
+            ("completed", "retired-cohort-exited")
+        }
+        Phase::Completed(Decision::ProvenNotCommittedRollbackSafe) => {
+            ("completed", "rollback-safe")
+        }
+        Phase::Completed(_) => ("completed", "other"),
+        _ => ("active", "none"),
+    };
+    let (source_alive, source_group_gone) = match &op.request.plan {
+        NativePlan::Restart { process, .. } => (
+            kernel.birth_alive(process),
+            kernel.group_gone(process.group),
+        ),
+        _ => (None, None),
+    };
+    Some(
+        aterm_json::json!({"operation":id,"observationTriggeredReconciliation":observation_reconciled,
+        "state":state,"decision":decision,"deadlineExpired":op.clock.remaining(op.request.deadline_us).is_none(),
+        "signalSent":op.signal_sent,"signalAccepted":op.signal_accepted,
+        "resumeSent":op.resume_sent,"inputAttemptSettled":op.resume_attempt.as_ref().is_none_or(|a|a.settled()),
+        "inputCustodySettled":op.custody.is_none() && op.completion_drain.as_ref().is_none_or(NativeDrain::is_drained),
+        "goGrantedChildren":op.children.iter().flatten().filter(|child|child.execute_sent).count(),
+        "retainedChildren":op.children.iter().flatten().count(),
+        "sourceBirthAlive":source_alive,"sourceGroupGone":source_group_gone,
+        "retainedSourceWatch":op.source_death.is_some(),"closedRestartWitness":op.closed_restart.is_some(),
+        "sourceWatchExited":op.source_death.as_ref().map(|watch|watch.exited()),
+        "closedRestartQuiescent":op.closed_restart.as_ref().is_some_and(|proof|proof.quiescent(&kernel)),
+        "closedRestartAvailable":op.closed_restart.as_ref().is_some_and(|proof|proof.available()),
+        "resumeOnly":op.resume_only,"deadlineUs":op.request.deadline_us,"monotonicUs":op.clock.now_us(),
+        "expectedHumanSeq":op.request.expected_human_seq,
+        "logicalRoot":op.authority.renewal.as_ref().map(|seal|seal.receipt_id()),
+        "nativePredecessor":op.authority.renewal.as_ref().and_then(|seal|seal.continuation()).map(|proof|proof.predecessor.id.as_str())}),
+    )
 }
 
 fn reconcile_extinct_by(ctx: &crate::SessionCtx, kernel: &dyn Kernel) {
@@ -1733,6 +2065,11 @@ fn reconcile_extinct_by(ctx: &crate::SessionCtx, kernel: &dyn Kernel) {
             NativePlan::OwnImage { .. } => true,
             NativePlan::Restart { shell, .. } => {
                 op.clock.remaining(op.request.deadline_us).is_none()
+                    || op
+                        .authority
+                        .renewal
+                        .as_ref()
+                        .is_some_and(|seal| seal.durably_cancelled(ctx))
                     || (!op.effect_started.load(std::sync::atomic::Ordering::Acquire)
                         && snapshot != op.authority.snapshot)
                     || kernel.birth_alive(shell) == Some(false)
@@ -1746,7 +2083,7 @@ fn reconcile_extinct_by(ctx: &crate::SessionCtx, kernel: &dyn Kernel) {
             && !op.resume_sent
             && op.resume_attempt.is_none()
         {
-            let completion = op.seal_completion(Decision::ProvenNotCommittedRollbackSafe);
+            let completion = op.seal_without_effect(kernel);
             drop(op);
             let _receipt = finish(ctx, &operation, completion);
             ctx.watchers.ring_watchers();
@@ -1755,7 +2092,7 @@ fn reconcile_extinct_by(ctx: &crate::SessionCtx, kernel: &dyn Kernel) {
         let Some(reason) = retirement(&op, kernel) else {
             continue;
         };
-        let completion = op.seal_completion(Decision::Retired(reason));
+        let completion = op.seal_retirement(reason, kernel);
         drop(op);
         let _receipt = finish(ctx, &operation, completion);
         ctx.watchers.ring_watchers();
@@ -1785,12 +2122,35 @@ pub(crate) fn serve(
             .then(|| crate::control::prove_self_claim_for(ctx, &holder, master))
             .flatten(),
     };
+    let renewal_id = match &request {
+        Request::Prepare(prepare) => Some(prepare.id.as_str()),
+        Request::Precommit(binding, _)
+        | Request::Commit(binding, _, _)
+        | Request::Query(binding)
+        | Request::Abort(binding)
+        | Request::Recover(binding)
+        | Request::Signal(binding)
+        | Request::Resume(binding, _, _, _)
+        | Request::Attach(binding, _)
+        | Request::Execute(binding, _)
+        | Request::ExecFailed(binding, _, _)
+        | Request::Reconcile(binding) => Some(binding.id.as_str()),
+        _ => None,
+    };
+    let sealed = renewal_id.is_some_and(|id| {
+        ctx.fenced_writes
+            .native
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .renewal_seals
+            .contains_key(id)
+    });
     serve_by(
         ctx,
         master,
         request,
         caller,
-        &System(&ctx.native_policy),
+        &System(&ctx.native_policy, sealed),
         resume,
     )
 }
@@ -1840,7 +2200,44 @@ fn serve_by(
         request,
         Request::Attach(..) | Request::Execute(..) | Request::ExecFailed(..)
     ) {
-        return serve_launcher(ctx, master, &request, &caller, &operation, kernel);
+        if let Request::Execute(_, phase) = &request
+            && !renewal::execute_recorded(&operation, *phase)
+        {
+            return DENIED.into();
+        }
+        let reply = serve_launcher(ctx, master, &request, &caller, &operation, kernel);
+        if let Request::Attach(_, phase) = &request
+            && reply.starts_with("OK native-act state=launch ")
+            && !renewal::persist_attached(&operation, *phase)
+        {
+            return "ERR native renewal receipt unavailable\n".into();
+        }
+        return reply;
+    }
+    // Account-file and native-history observations never run under Meta or an
+    // operation predicate. The immutable seal and ordinary kernel guards below
+    // bind this preflight to the exact plan and process.
+    if matches!(request, Request::Signal(_)) {
+        let (seal, signal_recorded) = {
+            let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+            (op.authority.renewal.clone(), op.signal_sent)
+        };
+        // An already-recorded effect returns its old outcome below. Resume and
+        // Execute still authorize every subsequent mutation independently.
+        if !signal_recorded && seal.as_ref().is_some_and(|seal| !seal.preflight()) {
+            return DENIED.into();
+        }
+    }
+    if matches!(request, Request::Resume(..)) {
+        let seal = operation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .authority
+            .renewal
+            .clone();
+        if seal.as_ref().is_some_and(|seal| !seal.continuing()) {
+            return DENIED.into();
+        }
     }
     // Retry disposal is deferred beyond both predicates, including early refusal paths.
     let mut retired_children = Vec::new();
@@ -1890,7 +2287,7 @@ fn serve_by(
             if op.phase != Phase::Started || !before_mutation {
                 return UNKNOWN.into();
             }
-            let completion = op.seal_completion(Decision::ProvenNotCommittedRollbackSafe);
+            let completion = op.seal_without_effect(kernel);
             drop(op);
             kernel.completion_sealed();
             finish(ctx, &operation, completion)
@@ -1906,7 +2303,7 @@ fn serve_by(
             let Some(reason) = retirement(&op, kernel) else {
                 return UNKNOWN.into();
             };
-            let completion = op.seal_completion(Decision::Retired(reason));
+            let completion = op.seal_retirement(reason, kernel);
             drop(op);
             finish(ctx, &operation, completion)
         }
@@ -2070,7 +2467,7 @@ fn serve_by(
             reply
         }
         Request::Signal(_) => {
-            if !op.authority.builtin || op.phase != Phase::Started {
+            if op.resume_only || !op.authority.builtin || op.phase != Phase::Started {
                 return DENIED.into();
             }
             if op.signal_sent {
@@ -2090,7 +2487,13 @@ fn serve_by(
             else {
                 return DENIED.into();
             };
-            if ctx.human_input.seq() != op.human_seq
+            if op.source_death.is_none()
+                || ctx.human_input.seq() != op.human_seq
+                || op
+                    .authority
+                    .renewal
+                    .as_ref()
+                    .is_some_and(|seal| !seal.current())
                 || op
                     .authority
                     .conversation
@@ -2111,6 +2514,9 @@ fn serve_by(
             // newly reused pid or performs a second mutation. Only this retained plan is used.
             let process = process.clone();
             op.signal_sent = true;
+            if let Some(seal) = &op.authority.renewal {
+                seal.did_signal();
+            }
             op.effect_started
                 .store(true, std::sync::atomic::Ordering::Release);
             drop(mutation_meta);
@@ -2125,7 +2531,7 @@ fn serve_by(
         Request::Resume(_, phase, generation, expected_human_seq) => {
             if !op.authority.builtin
                 || !matches!(op.phase, Phase::Started | Phase::Precommitted(_))
-                || (!op.signal_sent && op.observation.is_none())
+                || (!op.signal_sent && op.observation.is_none() && !op.resume_only)
             {
                 return DENIED.into();
             }
@@ -2261,7 +2667,7 @@ fn serve_by(
 /// EOF publishes native channel loss without retiring any actual custody. Only an explicit
 /// same-operation recovery with its opaque capability and fresh kernel actor proof can rebind.
 pub(crate) fn connection_closed(ctx: &crate::SessionCtx, connection: u64) {
-    connection_closed_by(ctx, connection, &System(&ctx.native_policy));
+    connection_closed_by(ctx, connection, &System(&ctx.native_policy, false));
 }
 
 fn connection_closed_by(ctx: &crate::SessionCtx, connection: u64, kernel: &dyn Kernel) {

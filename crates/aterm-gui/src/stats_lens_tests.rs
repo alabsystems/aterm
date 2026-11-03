@@ -632,6 +632,150 @@ fn a_split_tabs_lists_take_every_pane() {
     assert!(!c.in_scope(ProcScope::Tab(5)) && !c.in_scope(ProcScope::Aterm));
 }
 
+fn descendant_jobs_scene(descendant: Option<(u32, u64)>) -> Snapshot {
+    use crate::stats_paint::tests::job_row;
+    use aterm_vitals::jobs::{Class, JobKind, JobsView, Verdict};
+
+    let mut snap = lens_scene(Scene::Calm);
+    let mut wrapper = job_row("wrapper", Verdict::Stuck, Some(18_900), Some(2_612_271));
+    wrapper.kind = JobKind::AgentCall;
+    wrapper.class = Class::Polling;
+    wrapper.exe = "observer".into();
+    wrapper.working_descendant = descendant;
+    let mut independent = job_row("independent", Verdict::Stuck, Some(9_000), Some(480_000));
+    independent.class = Class::Waiting;
+    independent.exe = "other-job".into();
+    snap.set_jobs(Some(Arc::new(JobsView {
+        rows: vec![wrapper, independent],
+        ..JobsView::default()
+    })));
+    snap
+}
+
+#[test]
+fn jobs_keep_child_activity_beside_local_stalls_in_both_layouts() {
+    let m = FaceMetrics::helvetica_neue();
+    for descendant in [None, Some((84682, 1_793_674_154_348_639)), None] {
+        let snap = descendant_jobs_scene(descendant);
+        let rows = snap.jobs.as_ref().unwrap().rows.clone();
+        for (width, detailed) in [(1024.0, true), (526.0, false)] {
+            let laid = lay_lens(
+                &shell(width, 250.0, 2.0),
+                &input(&snap, dark_inks()),
+                &pinned(Instrument::Processes),
+                &m,
+                true,
+            );
+            let spoken = well(&laid, "Jobs");
+            assert_eq!(spoken.contains("84682"), descendant.is_some(), "{spoken}");
+            let drawn = laid
+                .boxes
+                .iter()
+                .map(|b| b.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert_eq!(
+                drawn.contains("child activity"),
+                descendant.is_some(),
+                "{width}: {drawn}"
+            );
+            assert_eq!(
+                drawn.contains("local"),
+                descendant.is_some(),
+                "{width}: {drawn}"
+            );
+            assert!(spoken.contains("other-job"), "{width}: {spoken}");
+            if detailed {
+                assert!(drawn.contains("other-job"), "{width}: {drawn}");
+            } else {
+                let independent = if descendant.is_some() { 1 } else { 2 };
+                assert!(
+                    drawn.contains(&format!(
+                        "{independent} {}",
+                        aterm_vitals::jobs::Verdict::Stuck.word()
+                    )),
+                    "{width}: {drawn}"
+                );
+            }
+            assert_eq!(snap.jobs.as_ref().unwrap().rows, rows);
+        }
+    }
+}
+
+#[test]
+fn compact_jobs_count_child_activity_only_inside_the_chosen_scope() {
+    use aterm_vitals::jobs::Verdict;
+    let mut snap = descendant_jobs_scene(Some((84682, 99)));
+    let mut view = snap.jobs.as_ref().unwrap().as_ref().clone();
+    let mut other = view.rows[0].clone();
+    other.tab = 8;
+    other.id = "other-tab".into();
+    other.working_descendant = Some((999, 100));
+    view.rows.push(other);
+    view.findings.zombies = vec![
+        crate::stats_paint::tests::zombies(901, 2, Some(8)),
+        crate::stats_paint::tests::zombies(902, 7, None),
+    ];
+    snap.set_jobs(Some(Arc::new(view)));
+    let m = FaceMetrics::helvetica_neue();
+    let inks = dark_inks();
+    for (bar, children) in [(Bar::Tab, 1), (Bar::Global, 2)] {
+        let sec = jobs_section(Ctx {
+            bar,
+            panes: &[7],
+            ..two_columns(&snap, &m)
+        });
+        let mut pen = Pen {
+            p: Painter::new(&inks, 2.0, 26.0, false),
+            m: &m,
+            inks,
+            ic: false,
+            s: 2.0,
+            ox: 0.0,
+            oy: 0.0,
+            draw: true,
+            line_tab: 0.0,
+            boxes: Vec::new(),
+        };
+        (sec.forms.last().unwrap().draw)(
+            &mut pen,
+            Place {
+                x: 0.0,
+                y: 0.0,
+                w: 526.0,
+                h: LINE_H,
+            },
+        );
+        let text = pen
+            .boxes
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("1 stuck"),
+            "the independent stall stays visible: {text}"
+        );
+        assert!(text.contains(&format!("{children} local stuck")), "{text}");
+        assert!(text.contains("child activity"), "{text}");
+        assert_eq!(text.contains("2 zombies"), bar == Bar::Global, "{text}");
+        assert!(
+            !text.contains("7 zombies") && !text.contains("9 zombies"),
+            "unassigned zombies remain outside the jobs view: {text}"
+        );
+    }
+    assert_eq!(
+        snap.jobs
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .filter(|r| r.verdict == Verdict::Stuck)
+            .count(),
+        3
+    );
+}
+
 /// A program in both panes of a split front tab is one row of "this tab": rustc ×2 with both
 /// panes' cores, not two rows that each read "rustc in Tab 1".
 #[test]
@@ -1542,6 +1686,8 @@ fn lens_gallery() {
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     let calm = lens_scene(Scene::Calm);
     let trouble = lens_scene(Scene::Trouble);
+    let descendant = descendant_jobs_scene(Some((84682, 1_793_674_154_348_639)));
+    let no_descendant = descendant_jobs_scene(None);
     let mut net_live = lens_scene(Scene::Calm);
     let mut net_rng = Rng(11);
     net_live.resources[Resource::Network.index()].capacity = Some(125_000_000.0);
@@ -1589,6 +1735,20 @@ fn lens_gallery() {
         ..aterm_vitals::NetView::default()
     });
     let mut shots: Vec<(String, &Snapshot, Instrument, f64, f64)> = Vec::new();
+    for (name, snap) in [
+        ("child_activity", &descendant),
+        ("no_child_activity", &no_descendant),
+    ] {
+        for width in [1024.0, 526.0] {
+            shots.push((
+                format!("jobs_{name}_{width}x250"),
+                snap,
+                Instrument::Processes,
+                width,
+                250.0,
+            ));
+        }
+    }
     for (name, snap) in [("calm", &calm), ("trouble", &trouble)] {
         for (lw, lh) in [(1024.0, 250.0), (526.0, 250.0), (526.0, 154.0)] {
             shots.push((
@@ -1651,7 +1811,7 @@ fn lens_gallery() {
             written.push(file);
         }
     }
-    assert_eq!(written.len(), (6 + 12 + 3) * 2);
+    assert_eq!(written.len(), (6 + 12 + 3 + 4) * 2);
 }
 
 /// The card a reading splices (its body over the kept shell's raster) is the card one raster of

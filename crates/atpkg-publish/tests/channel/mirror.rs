@@ -8,9 +8,10 @@ use std::sync::Arc;
 
 use atpkg_publish::artifact::upload;
 use atpkg_publish::channel::mirror::{self, MirrorOptions, MirrorReport};
-use atpkg_publish::error::Result;
-use atpkg_publish::host::fake::{FakeHost, FakeRelease};
-use atpkg_publish::host::{HostError, Probe, Release, ReleaseHost, Replace, Slug};
+use atpkg_publish::ctx::HostChoice;
+use atpkg_publish::error::{Error, Result};
+use atpkg_publish::host::fake::{FakeFail, FakeHost, FakeOp, FakeRelease};
+use atpkg_publish::host::{HostError, Hosts, Probe, Release, ReleaseHost, Replace, Slug};
 use atpkg_publish::quad::{self, VerifiedQuad};
 
 use super::{Doc, Rig};
@@ -505,4 +506,109 @@ fn a_quad_missing_its_roster_moves_no_pack() {
         .expect_err("refused");
     assert!(e.to_string().contains("missing aterm-machines.toml"), "{e}");
     assert!(rig.host.calls().is_empty());
+}
+
+#[test]
+fn publishing_asks_the_channel_writer_under_agh() {
+    let (mut rig, _) = setup("mirror-writer", index());
+    std::fs::remove_file(&rig.ctx.tokens.channel).expect("rm token");
+    rig.ctx = rig.ctx.clone().with_host_choice(HostChoice::Agh);
+    let dir = rig.path("quad").display().to_string();
+    rig.host.fail_next(FakeOp::Preflight, FakeFail::Refuse);
+    let e = mirror::run(&rig.ctx, std::slice::from_ref(&dir)).expect_err("no channel writer");
+    assert!(matches!(e, Error::Refused(_)), "{e}");
+    let slug = rig.ctx.index_slug();
+    let why = e.to_string();
+    assert!(why.contains(&format!("writer on {slug}")), "{why}");
+    assert!(why.contains("refused by the test"), "{why}");
+    assert_eq!(rig.host.calls(), vec![format!("preflight {slug}")]);
+
+    mirror::run(&rig.ctx, &[dir.clone(), "--dry-run".into()]).expect("the dry run plans");
+    let calls = rig.host.calls();
+    assert_eq!(
+        calls.iter().filter(|c| c.starts_with("preflight")).count(),
+        1,
+        "{calls:?}"
+    );
+    assert!(writes(&rig.host).is_empty(), "{calls:?}");
+
+    // Each pinned program's public repository is asked too, after the index repository's and
+    // before any pack is read or written: under agh push and a grant are per repository.
+    let ay = rig.ctx.public_slug("ay");
+    rig.ctx.hosts = Hosts::single(Arc::new(RefusesOne {
+        inner: rig.host.clone(),
+        refused: ay.clone(),
+    }));
+    let before = rig.host.calls().len();
+    let e = mirror::run(&rig.ctx, &[dir]).expect_err("no writer on the program repository");
+    assert!(matches!(e, Error::Refused(_)), "{e}");
+    let why = e.to_string();
+    assert!(why.contains(&format!("writer on {ay}")), "{why}");
+    assert!(why.contains("this writer is refused"), "{why}");
+    assert_eq!(rig.host.calls()[before..], [format!("preflight {slug}")]);
+}
+
+/// A `FakeHost` whose `write_preflight` refuses one slug and delegates every other.
+struct RefusesOne {
+    inner: Arc<FakeHost>,
+    refused: Slug,
+}
+
+impl ReleaseHost for RefusesOne {
+    fn releases(&self, slug: &Slug) -> std::result::Result<Vec<Release>, HostError> {
+        self.inner.releases(slug)
+    }
+    fn release(&self, slug: &Slug, tag: &str) -> std::result::Result<Release, HostError> {
+        self.inner.release(slug, tag)
+    }
+    fn download(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        assets: &[&str],
+        dir: &Path,
+    ) -> std::result::Result<(), HostError> {
+        self.inner.download(slug, tag, assets, dir)
+    }
+    fn create(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        title: &str,
+        notes: &str,
+        files: &[PathBuf],
+    ) -> std::result::Result<(), HostError> {
+        self.inner.create(slug, tag, title, notes, files)
+    }
+    fn upload(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        files: &[PathBuf],
+        replace: Replace,
+    ) -> std::result::Result<(), HostError> {
+        self.inner.upload(slug, tag, files, replace)
+    }
+    fn publish_draft(&self, slug: &Slug, tag: &str) -> std::result::Result<(), HostError> {
+        self.inner.publish_draft(slug, tag)
+    }
+    fn write_preflight(&self, slug: &Slug) -> std::result::Result<(), HostError> {
+        if *slug == self.refused {
+            Err(HostError::Refused("this writer is refused".into()))
+        } else {
+            self.inner.write_preflight(slug)
+        }
+    }
+    fn probe_public(&self, slug: &Slug, tag: &str, asset: &str) -> Probe {
+        self.inner.probe_public(slug, tag, asset)
+    }
+    fn fetch_public(&self, slug: &Slug, tag: &str, asset: &str, dest: &Path, cap: u64) -> Probe {
+        self.inner.fetch_public(slug, tag, asset, dest, cap)
+    }
+    fn clone_repo(&self, slug: &Slug, dest: &Path) -> std::result::Result<(), HostError> {
+        self.inner.clone_repo(slug, dest)
+    }
+    fn fetch_repo(&self, slug: &Slug, dir: &Path) -> std::result::Result<(), HostError> {
+        self.inner.fetch_repo(slug, dir)
+    }
 }

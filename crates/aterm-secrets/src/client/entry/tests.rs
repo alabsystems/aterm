@@ -73,6 +73,185 @@ fn set_state(paths: &Paths, change: impl FnOnce(&mut State)) {
 }
 
 #[test]
+fn mailbox_component_index_is_bound_to_verified_source_and_exact_fields() {
+    use crate::mailbox_component::{Component, Part, SOURCE_ENTRY};
+    let f = Fixture::new();
+    let password =
+        Component::for_mailbox("https://mail.example/", "owner@example", Part::Password).unwrap();
+    let second = Component::for_mailbox(
+        "https://mail.example/",
+        "owner@example",
+        Part::SecondPassword,
+    )
+    .unwrap();
+    let other =
+        Component::for_mailbox("https://other.example/", "owner@example", Part::Password).unwrap();
+    assert!(!mailbox_component_held(&f.paths, password).unwrap());
+    f.publish(|doc| {
+        doc.set_entry(&Audience::Everyone, SOURCE_ENTRY, b"user = 'owner@example'\nwebmail_url = 'https://mail.example/'\npassword = 'fixture-login'\nmailbox_password = 'fixture-second'\n").unwrap();
+    });
+    assert!(mailbox_component_held(&f.paths, password).unwrap());
+    assert!(mailbox_component_held(&f.paths, second).unwrap());
+    assert!(!mailbox_component_held(&f.paths, other).unwrap());
+    assert_eq!(
+        read_mailbox_component(&f.paths, password)
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        b"fixture-login"
+    );
+    assert_eq!(
+        read_mailbox_component(&f.paths, second)
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        b"fixture-second"
+    );
+    let index = f.paths.dir.join("mailbox-components.toml");
+    let text = std::fs::read_to_string(&index).unwrap();
+    assert!(
+        !text.contains("fixture-login")
+            && !text.contains("fixture-second")
+            && !text.contains("owner@example")
+    );
+    std::fs::remove_file(&index).unwrap();
+    let reads = MAILBOX_READS.with(std::cell::Cell::get);
+    assert!(!mailbox_component_held(&f.paths, password).unwrap());
+    assert_eq!(
+        reads,
+        MAILBOX_READS.with(std::cell::Cell::get),
+        "a missing-index holder must not open mailbox plaintext"
+    );
+    assert!(matches!(
+        sync(&f.paths, None).unwrap(),
+        SyncOutcome::Unchanged { .. }
+    ));
+    assert!(
+        MAILBOX_READS.with(std::cell::Cell::get) > reads,
+        "authorized unchanged sync backfills the index"
+    );
+    assert!(mailbox_component_held(&f.paths, password).unwrap());
+    let source = materialize::target_path(&f.paths.home, SOURCE_ENTRY).unwrap();
+    std::fs::write(
+        &source,
+        b"user = 'owner@example'\npassword = 'untrusted-change'\n",
+    )
+    .unwrap();
+    assert!(!mailbox_component_held(&f.paths, password).unwrap());
+    assert!(
+        read_mailbox_component(&f.paths, password)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn mailbox_component_index_excludes_ambiguous_fields_and_stale_versions() {
+    use crate::mailbox_component::{Component, Part, SOURCE_ENTRY};
+    let f = Fixture::new();
+    let password =
+        Component::for_mailbox("https://mail.example/", "owner@example", Part::Password).unwrap();
+    f.publish(|doc| {
+        doc.set_entry(&Audience::Everyone, SOURCE_ENTRY, b"user = 'owner@example'\nwebmail_url = 'https://mail.example/'\npassword = 'fixture-one'\n").unwrap();
+    });
+    let index = f.paths.dir.join("mailbox-components.toml");
+    let old = std::fs::read(&index).unwrap();
+    f.publish(|doc| {
+        doc.set_entry(&Audience::Everyone, "other", b"new-version")
+            .unwrap();
+    });
+    std::fs::write(&index, &old).unwrap();
+    assert!(!mailbox_component_held(&f.paths, password).unwrap());
+    assert!(
+        read_mailbox_component(&f.paths, password)
+            .unwrap()
+            .is_none()
+    );
+    assert!(refresh_mailbox_component_index(&f.paths).unwrap());
+    assert!(mailbox_component_held(&f.paths, password).unwrap());
+    f.publish(|doc| {
+        doc.set_entry(&Audience::Everyone, SOURCE_ENTRY, b"user = 'owner@example'\nwebmail_url = 'https://mail.example/'\npassword = 'fixture-one'\n[[mailboxes]]\nlogin = 'owner@example'\nwebmail_url = 'https://mail.example/'\npassword = 'fixture-two'\n").unwrap();
+    });
+    assert!(!mailbox_component_held(&f.paths, password).unwrap());
+    std::fs::write(index, old).unwrap();
+    assert!(!mailbox_component_held(&f.paths, password).unwrap());
+    assert!(
+        read_mailbox_component(&f.paths, password)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// NEGATIVE CONTROL: without checking private mode, parent directory links, and `file_stamp` in
+/// `read_mailbox_component`, a `0644` or symlink-parented `ai-mailbox.toml` still reports held
+/// components, and a hard-linked `ai-mailbox.toml` (`nlink == 2`) opens the vault and discloses
+/// the secret component from `read_mailbox_component`.
+#[test]
+fn mailbox_component_index_refuses_hardlinked_exposed_or_symlink_parented_source_without_vault_reads()
+ {
+    use crate::mailbox_component::{Component, Part, SOURCE_ENTRY};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let f = Fixture::new();
+    let password =
+        Component::for_mailbox("https://mail.example/", "owner@example", Part::Password).unwrap();
+    f.publish(|doc| {
+        doc.set_entry(
+            &Audience::Everyone,
+            SOURCE_ENTRY,
+            b"user = 'owner@example'\nwebmail_url = 'https://mail.example/'\npassword = 'fixture-login'\n",
+        )
+        .unwrap();
+    });
+    assert!(mailbox_component_held(&f.paths, password).unwrap());
+    let source = materialize::target_path(&f.paths.home, SOURCE_ENTRY).unwrap();
+
+    // 1. Hard-linked `ai-mailbox.toml` (`nlink == 2`) must neither claim custody nor open vault plaintext.
+    let hardlink = f.paths.home.join("linked-mailbox.toml");
+    std::fs::hard_link(&source, &hardlink).unwrap();
+    let reads = MAILBOX_READS.with(std::cell::Cell::get);
+    assert!(!mailbox_component_held(&f.paths, password).unwrap());
+    assert!(
+        read_mailbox_component(&f.paths, password)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(reads, MAILBOX_READS.with(std::cell::Cell::get));
+    std::fs::remove_file(&hardlink).unwrap();
+    assert!(refresh_mailbox_component_index(&f.paths).unwrap());
+    assert!(mailbox_component_held(&f.paths, password).unwrap());
+
+    // 2. Group/world-readable `ai-mailbox.toml` (`0644`) must neither claim custody nor open vault plaintext.
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let reads = MAILBOX_READS.with(std::cell::Cell::get);
+    assert!(!mailbox_component_held(&f.paths, password).unwrap());
+    assert!(
+        read_mailbox_component(&f.paths, password)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(reads, MAILBOX_READS.with(std::cell::Cell::get));
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(refresh_mailbox_component_index(&f.paths).unwrap());
+    assert!(mailbox_component_held(&f.paths, password).unwrap());
+
+    // 3. Replacing `.secrets` with a symlink to a moved directory preserves the child inode's
+    // `dev:ino:len:mtime:ctime`, so `file_stamp` must reject parent symlinks directly.
+    let secrets_dir = f.paths.home.join(".secrets");
+    let moved_dir = f.paths.home.join("moved-secrets");
+    std::fs::rename(&secrets_dir, &moved_dir).unwrap();
+    std::os::unix::fs::symlink(&moved_dir, &secrets_dir).unwrap();
+    let reads = MAILBOX_READS.with(std::cell::Cell::get);
+    assert!(!mailbox_component_held(&f.paths, password).unwrap());
+    assert!(
+        read_mailbox_component(&f.paths, password)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(reads, MAILBOX_READS.with(std::cell::Cell::get));
+}
+
+#[test]
 fn authenticated_reads_are_local_redacted_and_bound_to_one_entry() {
     let f = Fixture::new();
     let before = f.bytes();
@@ -328,6 +507,43 @@ fn log_backed_roster_and_admin_reads_terminate_and_keep_their_privileges() {
     );
     assert_eq!(fleet.code.as_slice(), b"inert-reserved-code");
     assert!(f.read_token().is_some());
+}
+
+#[test]
+fn a_selected_reserved_read_distinguishes_a_conditional_host_winner_from_absence() {
+    const NAME: &str = "aterm-selected-control";
+    for log_backed in [false, true] {
+        let f = Fixture::new();
+        f.publish(|doc| {
+            doc.set_entry(&Audience::Everyone, NAME, b"everyone-value")
+                .unwrap();
+            doc.set_entry_with(&Audience::Everyone, "control-anchor", b"anchor", true, None)
+                .unwrap();
+            doc.set_entry_with(
+                &Audience::Hosts(vec!["admin".into()]),
+                NAME,
+                b"conditional-host-value",
+                true,
+                Some("control-anchor"),
+            )
+            .unwrap();
+        });
+        if log_backed {
+            seed_vault_genesis(&f.paths, &f._root.path().join("selected.genesis")).unwrap();
+            admin_mirror_log(&f.paths, &[]).unwrap();
+        }
+        let expected = config(&f.paths).unwrap().unwrap();
+        assert!(
+            observe_reserved_entry(&f.paths, &expected, NAME)
+                .unwrap()
+                .is_none(),
+            "the surviving conditional host winner must not expose Everyone"
+        );
+        let absent = observe_reserved_entry(&f.paths, &expected, "aterm-selected-absent")
+            .unwrap()
+            .expect("an authenticated absent entry still has its source version");
+        assert!(absent.entry.is_none());
+    }
 }
 
 #[test]

@@ -107,7 +107,7 @@ pub fn read_record(root: &Path, git: &dyn GitRunner, ask: &Ask<'_>) -> Result<pi
     let version = crate::publish::canonical_channel_tag_version(ask.tag)
         .map_err(|_| format!("{:?} is not a release tag (vMAJOR.MINOR.PATCH)", ask.tag))?;
     let ledger_path = root.join("RELEASES.ledger");
-    let ledger = std::fs::read_to_string(&ledger_path)
+    let ledger = crate::durable::read_text(&ledger_path)
         .map_err(|e| format!("{}: {e}", ledger_path.display()))?;
     let build = claimed_build(&ledger, &version)?;
     let commit = tag_commit(git, ask.tag)?;

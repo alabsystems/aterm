@@ -29,7 +29,7 @@ TP-PAIRS	data-law	find, scheme::builtin_theme	∀ t ∈ T with t.pair = Some(p):
 TP-PORTS	data-law	port_licence_file, build.rs::port_licence_file, scheme::builtin_theme_list	Every built-in with a source has an admitted licence and the licence file `LICENSES/<spdx>-<repo>.txt`, which the pack embeds; a built-in without a source is a signature theme or Default/Default Light. Derived from the built-ins, never listed.	build.rs (build-time refusal)	TRIVIAL: table lookups.	0
 TP-IDS	data-law	parse	∀ t ∈ T: no built-in is named t.id or t.name; parse(t.text) is Ok with appearance declared = t.appearance, author = t.author and name = t.name.	src/tests.rs::pack_ids_are_free_and_files_declare_their_row	LOW: the native parser over constants.	0
 TP-FIND	contract	find, withdrawn	find(s) is the t ∈ T with t.id = s ignoring ASCII case, else the one with t.name = s ignoring ASCII case; no id or name answers for two themes (build.rs refuses that, ignoring ASCII case). withdrawn(s) is the pack id or built-in that replaces s (matched ignoring ASCII case), an id a release shipped that is no row's id or name now. Negative control: a built-in's name finds nothing.	src/tests.rs::find_answers_the_id_then_the_name_shown	TRIVIAL: table lookups.	0
-TP-INSTALL	io-contract	install, state_in	install(t, None, _) fails; Absent → Wrote with bytes = t.text; Installed → Unchanged; Modified → Exists without replace, Wrote with; a case variant → Failed(case_collision_message); a built-in's name → Refused and nothing written. An earlier copy (t.text but for its `name =` line) is Installed: Unchanged without replace, Wrote with; one other byte changed (a color) is Modified.	src/tests.rs::install_round_trips_in_a_scratch_folder, src/tests.rs::an_earlier_copy_reads_installed_and_an_edit_does_not	HIGH for a proof (filesystem); a test.	filesystem model
+TP-INSTALL	io-contract	install, state_in	install(t, None, _) fails; an id `validate_user_theme_name` rejects → Refused and nothing written; a built-in's name → Refused and nothing written; Absent → Wrote with bytes = t.text; Installed → Unchanged; Modified → Exists without replace, Wrote with; a case variant → Failed(case_collision_message). An earlier copy (t.text but for its `name =` line) is Installed: Unchanged without replace, Wrote with; one other byte changed (a color) is Modified.	src/tests.rs::install_round_trips_in_a_scratch_folder, src/tests.rs::install_refuses_an_id_that_leaves_the_requested_folder, src/tests.rs::an_earlier_copy_reads_installed_and_an_edit_does_not	HIGH for a proof (filesystem); a test.	filesystem model
 ```
 
 ## 2. Test → spec map (TSV)
@@ -56,13 +56,7 @@ src/tests.rs	find_answers_the_id_then_the_name_shown	TP-FIND
   withdrawn id still in use or standing for no pack id or built-in, a bad appearance, an empty
   field, or a missing upstream or licence file. These are build-time checks, not tests.
 
-## 5. Open finding
-
-TP-INSTALL leaves out that `install` refuses an id `validate_user_theme_name` rejects (`Refused`,
-nothing written), which `install_refuses_an_id_that_leaves_the_requested_folder` holds; §2 maps that
-test to TP-INSTALL, but the row's `subsumes` does not name it.
-
-## 6. Proof order (easiest, high value first)
+## 5. Proof order (easiest, high value first)
 
 1. TP-PAIRS, TP-PORTS, TP-FIND: closed-table lookups; a `const` evaluation in the build script could
    discharge them.

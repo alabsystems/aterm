@@ -959,6 +959,24 @@ impl EffectsPipeline {
         }
     }
 
+    /// Whether the last frame drew the Rainbow Kitty's bed glass ([`Ribbon::glass_drew_at`] at
+    /// that frame's instant): the `glass` arm of [`Self::light_arms`], which the release-built
+    /// effects harness reads through `dev-seams` to count its glass frames.
+    ///
+    /// [`Ribbon::glass_drew_at`]: crate::rainbow_kitty::ribbon::Ribbon::glass_drew_at
+    #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+    #[inline]
+    #[must_use]
+    pub fn glass_drew(&self) -> bool {
+        let Some((at, _)) = self.frame_light else {
+            return false;
+        };
+        self.cursor
+            .glow
+            .v2_ribbon()
+            .is_some_and(|ribbon| ribbon.glass_drew_at(at))
+    }
+
     /// Which light arms the last cursor step drew and the streams each touched (§15.0.2(b)):
     /// what `lab trail-diff`'s dump reads as the frame's light report.
     /// - `glass` (§15.2 1.5, 1.7): the Rainbow Kitty's glass, inked by the bed's glass and laid
@@ -982,11 +1000,7 @@ impl EffectsPipeline {
         let Some((at, _)) = self.frame_light else {
             return arms;
         };
-        let glass = self
-            .cursor
-            .glow
-            .v2_ribbon()
-            .is_some_and(|ribbon| ribbon.glass_drew_at(at));
+        let glass = self.glass_drew();
         if glass {
             arms.note(
                 "glass",

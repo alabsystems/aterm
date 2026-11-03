@@ -32,6 +32,7 @@ pub(crate) use start::BackendRequest;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Halt {
     Skip { why: String, fix: String },
+    Timing(String),
     Fail(String),
 }
 
@@ -62,6 +63,9 @@ pub(crate) fn outcome(result: Result<String, Halt>) -> LaneRun {
         Ok(at) => LaneRun::measured(at),
         Err(Halt::Skip { why, fix }) => LaneRun::skip(why, fix),
         Err(Halt::Fail(e)) => LaneRun::fail(e),
+        Err(Halt::Timing(why)) => {
+            LaneRun::could_not_run(why, "obtain fresh measured timing admission")
+        }
     }
 }
 
@@ -243,7 +247,7 @@ pub(crate) fn private(dir: &Path) -> Result<(), String> {
 /// The lowercase hex SHA-256 of a file, streamed.
 pub(crate) fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file =
-        std::fs::File::open(path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+        crate::open_regular(path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
     let mut hasher = aterm_digest::Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
@@ -392,7 +396,7 @@ pub(crate) fn manifest_path() -> PathBuf {
 
 pub(crate) fn pins() -> Result<Pins, String> {
     let path = manifest_path();
-    let text = std::fs::read_to_string(&path)
+    let text = crate::read_regular_text(&path)
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
     aterm_toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -765,7 +769,7 @@ impl LedgerBook {
     pub(crate) fn open() -> Result<LedgerBook, Halt> {
         let dir = workspace_root().join("docs/measured/arena");
         let path = dir.join("TEMPLATE.md");
-        match std::fs::read_to_string(&path) {
+        match crate::read_regular_text(&path) {
             Ok(template) => Ok(LedgerBook { dir, template }),
             Err(e) => Err(Halt::skip(
                 format!("no arena ledger template at {} ({e})", path.display()),

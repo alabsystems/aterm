@@ -506,8 +506,7 @@ fn write_grant(
     add: bool,
 ) -> Result<(&'static str, Vec<String>)> {
     let _ = (dirs, caller, slug, add);
-    Err(Error::could_not_run(
+    Err(Error::local(
         "agh reads and writes agh.toml only on unix, where its permissions are checked",
-    )
-    .with_sub(crate::error::Sub::Local))
+    ))
 }

@@ -17,7 +17,7 @@ use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, admits};
 
 use crate::native_update_admission::{
-    AdmissionBlock, AdmissionDecision, AdmissionFacts, ApplyLane, classify,
+    AdmissionBlock, AdmissionDecision, AdmissionFacts, ApplyLane, Observation, classify,
 };
 use crate::native_update_auto_intent::{ApplyPhase, PollDecision, PollFacts, poll};
 #[cfg(unix)]
@@ -409,7 +409,14 @@ fn real_gui_boot_health_dispatch_requires_first_present_before_model_disarm() {
     assert_exact_model_action(&model, "ProveInstalledHealth", &presented, &proved);
 }
 
+/// The model state before `facts` are classified. `seamless_available` is the overlap
+/// handoff's availability at any number of live PTYs, none included, so `LoseSeamlessLane`
+/// means the handoff cannot carry this attempt.
 fn admission_before(model: &Model, facts: AdmissionFacts) -> State {
+    admission_before_with(model, facts, facts.seamless_capable)
+}
+
+fn admission_before_with(model: &Model, facts: AdmissionFacts, seamless_available: bool) -> State {
     let mut state = model.init_state();
     if facts.image_kept {
         state = model.successors("KeepImage", &state)[0].clone();
@@ -423,7 +430,7 @@ fn admission_before(model: &Model, facts: AdmissionFacts) -> State {
     if !facts.native_state_certified {
         state = model.successors("ObserveUnsafeNativeState", &state)[0].clone();
     }
-    if !facts.seamless_capable {
+    if !seamless_available {
         state = model.successors("LoseSeamlessLane", &state)[0].clone();
     }
     state
@@ -468,62 +475,97 @@ fn admission_action(decision: AdmissionDecision) -> &'static str {
         | AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless) => {
             "BlockForegroundWithoutSeamless"
         }
-        AdmissionDecision::Block(AdmissionBlock::KeptImageNeedsTerminal) => {
-            "BlockKeptImageWithoutTerminal"
+        AdmissionDecision::Block(AdmissionBlock::KeptImageWithoutHandoff) => {
+            "BlockKeptImageWithoutHandoff"
         }
     }
 }
 
-#[test]
-fn real_update_admission_classifier_conforms_for_every_bounded_fact_combination() {
-    let model = native_update_admission_model();
-    for (staged_verified, seamless_capable, image_kept) in
-        [false, true].into_iter().flat_map(|verified| {
-            [false, true].into_iter().flat_map(move |seamless| {
-                [false, true]
-                    .into_iter()
-                    .map(move |kept| (verified, seamless, kept))
-            })
-        })
-    {
-        for live_ptys in [0, 1] {
-            for foreground_jobs in [0, 1] {
-                for unknown_foregrounds in [0, 1] {
-                    for native_state_certified in [false, true] {
-                        if foreground_jobs > live_ptys || unknown_foregrounds > live_ptys {
-                            continue;
-                        }
-                        let facts = AdmissionFacts {
-                            staged_verified,
-                            seamless_capable,
-                            native_state_certified,
-                            live_ptys,
-                            foreground_jobs,
-                            unknown_foregrounds,
-                            image_kept,
-                        };
-                        let before = admission_before(&model, facts);
-                        let decision = classify(facts);
-                        let after = project_admission_decision(&before, decision);
-                        let action = admission_action(decision);
-                        assert_eq!(
-                            model.successors(action, &before).as_slice(),
-                            std::slice::from_ref(&after),
-                            "shipping admission decision {decision:?} for {facts:?} must refine {action}"
-                        );
-                        assert_eq!(admits(&model, &before, &after), Some(action));
-                        for invariant in &model.invariants {
-                            assert!(
-                                model.check_invariant(invariant.name, &after),
-                                "shipping decision violates {} for {facts:?}: {after:?}",
-                                invariant.name
-                            );
+/// The first observation whose shipped facts and decision do not refine the admission model,
+/// with the model's `seamless_available` projected from the observation itself: the overlap
+/// handoff is available, and it has a live session to carry or can run with none.
+fn admission_disagreement(
+    model: &Model,
+    observe: &dyn Fn(Observation) -> AdmissionFacts,
+) -> Option<String> {
+    let bools = [false, true];
+    for staged_verified in bools {
+        for overlap_available in bools {
+            for sessionless_handoff in bools {
+                for image_kept in bools {
+                    for live_ptys in [0, 1] {
+                        for foreground_jobs in [0, 1] {
+                            for unknown_foregrounds in [0, 1] {
+                                for native_state_certified in bools {
+                                    if foreground_jobs > live_ptys
+                                        || unknown_foregrounds > live_ptys
+                                    {
+                                        continue;
+                                    }
+                                    let seen = Observation {
+                                        staged_verified,
+                                        overlap_available,
+                                        sessionless_handoff,
+                                        native_state_certified,
+                                        live_ptys,
+                                        foreground_jobs,
+                                        unknown_foregrounds,
+                                        image_kept,
+                                    };
+                                    let available =
+                                        overlap_available && (live_ptys > 0 || sessionless_handoff);
+                                    let facts = observe(seen);
+                                    let before = admission_before_with(model, facts, available);
+                                    let decision = classify(facts);
+                                    let after = project_admission_decision(&before, decision);
+                                    let action = admission_action(decision);
+                                    if model.successors(action, &before).as_slice()
+                                        != std::slice::from_ref(&after)
+                                        || admits(model, &before, &after) != Some(action)
+                                    {
+                                        return Some(format!(
+                                            "shipping admission decision {decision:?} for \
+                                             {seen:?} does not refine {action}"
+                                        ));
+                                    }
+                                    if let Some(invariant) = model
+                                        .invariants
+                                        .iter()
+                                        .find(|law| !model.check_invariant(law.name, &after))
+                                    {
+                                        return Some(format!(
+                                            "shipping decision violates {} for {seen:?}: \
+                                             {after:?}",
+                                            invariant.name
+                                        ));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
     }
+    None
+}
+
+#[test]
+fn real_update_admission_classifier_conforms_for_every_bounded_fact_combination() {
+    let model = native_update_admission_model();
+    assert_eq!(
+        admission_disagreement(&model, &AdmissionFacts::observed),
+        None
+    );
+    // 0.145.0, 2026-11-02: the facts called the handoff incapable at zero live sessions.
+    let incapable_at_zero = |seen: Observation| AdmissionFacts {
+        seamless_capable: seen.overlap_available && seen.live_ptys > 0,
+        ..AdmissionFacts::observed(seen)
+    };
+    assert!(
+        admission_disagreement(&model, &incapable_at_zero).is_some(),
+        "facts that need a live session for the handoff must disagree with the model"
+    );
 
     let facts = AdmissionFacts {
         staged_verified: true,
@@ -575,12 +617,31 @@ fn real_update_admission_classifier_conforms_for_every_bounded_fact_combination(
     };
     assert_eq!(
         classify(facts),
-        AdmissionDecision::Block(AdmissionBlock::KeptImageNeedsTerminal)
+        AdmissionDecision::Block(AdmissionBlock::KeptImageWithoutHandoff)
     );
     let before = admission_before(&model, facts);
     let exec_in_place = buggy.successors("ClassifyColdOverKeptImage", &before)[0].clone();
     assert_eq!(admits(&model, &before, &exec_in_place), None);
     assert!(!buggy.check_invariant("KeptImageNeverReexecsCold", &exec_in_place));
+
+    let facts = AdmissionFacts {
+        seamless_capable: true,
+        ..facts
+    };
+    assert_eq!(
+        classify(facts),
+        AdmissionDecision::Apply(ApplyLane::Seamless),
+        "a kept image with no terminal tab hands over at once (0.145.0, 2026-11-02: 249 \
+         refusals)"
+    );
+    let before = admission_before(&model, facts);
+    let held = buggy.successors("BlockKeptImageDespiteSeamless", &before)[0].clone();
+    assert_eq!(
+        (held["phase"], held["decision"], held["retry_eligible"]),
+        (3, 3, 1)
+    );
+    assert_eq!(admits(&model, &before, &held), None);
+    assert!(!buggy.check_invariant("KeptImageWithSeamlessIsNeverBlocked", &held));
 }
 
 fn assert_exact_model_action(model: &Model, action: &'static str, before: &State, after: &State) {

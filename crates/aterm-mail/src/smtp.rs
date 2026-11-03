@@ -34,7 +34,7 @@ fn submit(
     let encoded =
         aterm_codec::base64::encode(credentials.ok_or("Missing mail credentials")?.as_bytes())
             .map_err(|e| e.to_string())?;
-    command(&mut wire, &format!("AUTH {mechanism} {encoded}"), 235)?;
+    authenticate(&mut wire, mechanism, &encoded)?;
     command(&mut wire, &format!("MAIL FROM:<{}>", draft.from), 250)?;
     for recipient in draft.to.iter().chain(&draft.cc).chain(&draft.bcc) {
         command(&mut wire, &format!("RCPT TO:<{recipient}>"), 250)?;
@@ -51,29 +51,65 @@ fn submit(
     Ok(())
 }
 
+fn authenticate(wire: &mut Wire, mechanism: &str, encoded: &str) -> Result<(), String> {
+    let inline = format!("AUTH {mechanism} {encoded}");
+    // RFC 4954 §4: when `AUTH <mech> <initial-response>\r\n` would exceed SMTP's 512-octet command
+    // line limit (typical for OAuth2 bearer tokens), send `AUTH <mech>` first and transmit the
+    // base64 response after the server's `334` SASL continuation.
+    let mut code = if inline.len() + 2 <= 512 {
+        wire.write(format!("{inline}\r\n").as_bytes())?;
+        read_code(wire)?
+    } else {
+        command(wire, &format!("AUTH {mechanism}"), 334)?;
+        wire.write(format!("{encoded}\r\n").as_bytes())?;
+        read_code(wire)?
+    };
+    if code == 334 {
+        wire.write(b"\r\n")?;
+        code = read_code(wire)?;
+    }
+    if code != 235 {
+        return Err(format!("Mail server refused operation (SMTP {code})"));
+    }
+    Ok(())
+}
+
 fn command(wire: &mut Wire, text: &str, expected: u16) -> Result<(), String> {
     wire.write(format!("{text}\r\n").as_bytes())?;
     expect(wire, expected)
 }
 
-fn expect(wire: &mut Wire, expected: u16) -> Result<(), String> {
+fn read_code(wire: &mut Wire) -> Result<u16, String> {
+    let mut group_code: Option<u16> = None;
     for _ in 0..100 {
         let line = wire.line()?;
-        if line.len() < 5 || !line[..3].iter().all(u8::is_ascii_digit) {
+        if line.len() < 5 || !line.ends_with(b"\r\n") || !line[..3].iter().all(u8::is_ascii_digit) {
             return Err("Invalid SMTP response".into());
         }
         let code =
             (line[0] - b'0') as u16 * 100 + (line[1] - b'0') as u16 * 10 + (line[2] - b'0') as u16;
-        if code != expected && !(expected == 250 && code == 251) {
-            return Err(format!("Mail server refused operation (SMTP {code})"));
+        if let Some(prev) = group_code
+            && prev != code
+        {
+            return Err("Invalid SMTP response".into());
         }
+        group_code = Some(code);
         match line[3] {
-            b' ' => return Ok(()),
+            b' ' => return Ok(code),
+            b'\r' if line.len() == 5 => return Ok(code),
             b'-' => {}
             _ => return Err("Invalid SMTP response".into()),
         }
     }
     Err("SMTP response exceeded line limit".into())
+}
+
+fn expect(wire: &mut Wire, expected: u16) -> Result<(), String> {
+    let code = read_code(wire)?;
+    if code != expected && !(expected == 250 && code == 251) {
+        return Err(format!("Mail server refused operation (SMTP {code})"));
+    }
+    Ok(())
 }
 
 /// Encode a plain UTF-8 message with base64 transfer encoding and no Bcc header.
@@ -150,10 +186,12 @@ pub fn encode(draft: &Draft) -> Result<Vec<u8>, String> {
         .replace('/', "_");
     let domain = draft.from.split_once('@').ok_or("Invalid sender")?.1;
     let mut message = format!(
-        "Date: {date}\r\nMessage-ID: <{identifier}@{domain}>\r\nFrom: {}\r\nTo: {}\r\n",
-        draft.from,
-        draft.to.join(", ")
+        "Date: {date}\r\nMessage-ID: <{identifier}@{domain}>\r\nFrom: {}\r\n",
+        draft.from
     );
+    if !draft.to.is_empty() {
+        message.push_str(&format!("To: {}\r\n", draft.to.join(", ")));
+    }
     if !draft.cc.is_empty() {
         message.push_str(&format!("Cc: {}\r\n", draft.cc.join(", ")));
     }
@@ -288,5 +326,126 @@ mod tests {
         assert!(!encoded.contains("\r\n.\r\n"));
         draft.subject = "Hello\r\nBcc: bad@example.test".into();
         assert!(encode(&draft).is_err());
+
+        // Bcc-only / Cc-only drafts omit an empty `To:` header rather than emitting invalid `To: \r\n`.
+        let bcc_only = Draft {
+            from: "me@example.test".into(),
+            bcc: vec!["hidden@example.test".into()],
+            subject: "Notice".into(),
+            text: "Body".into(),
+            ..Draft::default()
+        };
+        let bcc_encoded = String::from_utf8(encode(&bcc_only).unwrap()).unwrap();
+        assert!(!bcc_encoded.contains("\r\nTo:"));
+        assert!(!bcc_encoded.contains("hidden@example"));
+    }
+
+    #[test]
+    fn smtp_two_step_oauth_bare_reply_codes_and_oauth_error_challenge() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+
+        let long_token = "t".repeat(600);
+        let auth = Authentication::OAuth {
+            username: "me@example.test".into(),
+            access_token: crate::Secret::new(long_token),
+        };
+        let draft = Draft {
+            from: "me@example.test".into(),
+            bcc: vec!["hidden@example.test".into()],
+            subject: "Hello".into(),
+            text: "Body".into(),
+            ..Draft::default()
+        };
+
+        // Long OAuth2 tokens must use two-step `AUTH XOAUTH2` (RFC 4954 §4 <= 512-byte command line),
+        // and bare `250\r\n` replies without trailing space/text must succeed (RFC 5321 §4.2).
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+                .unwrap();
+            let mut io = BufReader::new(socket);
+            io.get_mut().write_all(b"220\r\n").unwrap();
+            let mut line = String::new();
+            io.read_line(&mut line).unwrap();
+            assert_eq!(line, "EHLO aterm\r\n");
+            io.get_mut()
+                .write_all(b"250-smtp.example.test\r\n250\r\n")
+                .unwrap();
+            line.clear();
+            io.read_line(&mut line).unwrap();
+            assert_eq!(
+                line, "AUTH XOAUTH2\r\n",
+                "oversized initial-response must split across 334 continuation"
+            );
+            io.get_mut().write_all(b"334 \r\n").unwrap();
+            line.clear();
+            io.read_line(&mut line).unwrap();
+            assert!(line.len() > 600);
+            io.get_mut().write_all(b"235\r\n").unwrap();
+            for response in [b"250\r\n".as_slice(), b"250\r\n", b"354\r\n"] {
+                line.clear();
+                io.read_line(&mut line).unwrap();
+                io.get_mut().write_all(response).unwrap();
+            }
+            loop {
+                line.clear();
+                assert!(io.read_line(&mut line).unwrap() > 0);
+                if line == ".\r\n" {
+                    break;
+                }
+            }
+            io.get_mut().write_all(b"250\r\n").unwrap();
+        });
+        let socket = TcpStream::connect(address).unwrap();
+        submit(
+            Wire::for_test(socket),
+            Security::Tls,
+            &auth,
+            &encode(&draft).unwrap(),
+            &draft,
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        // A `334` OAuth error challenge sends empty `\r\n` to surface the server's real `535` code.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut io = BufReader::new(socket);
+            io.get_mut().write_all(b"220 fixture\r\n").unwrap();
+            let mut line = String::new();
+            io.read_line(&mut line).unwrap();
+            io.get_mut().write_all(b"250 fixture\r\n").unwrap();
+            line.clear();
+            io.read_line(&mut line).unwrap();
+            io.get_mut()
+                .write_all(b"334 eyJzdGF0dXMiOiI0MDAifQ==\r\n")
+                .unwrap();
+            line.clear();
+            io.read_line(&mut line).unwrap();
+            assert_eq!(line, "\r\n");
+            io.get_mut()
+                .write_all(b"535 5.7.8 Username and Password not accepted\r\n")
+                .unwrap();
+        });
+        let short_oauth = Authentication::OAuth {
+            username: "me@example.test".into(),
+            access_token: crate::Secret::new("bad".into()),
+        };
+        let err = submit(
+            Wire::for_test(TcpStream::connect(address).unwrap()),
+            Security::Tls,
+            &short_oauth,
+            &encode(&draft).unwrap(),
+            &draft,
+        )
+        .unwrap_err();
+        assert!(err.contains("SMTP 535"), "{err}");
+        server.join().unwrap();
     }
 }

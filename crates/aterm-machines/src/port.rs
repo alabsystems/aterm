@@ -488,9 +488,9 @@ pub trait System: Sync {
     /// and `Endpoints::github_com()`. The default fails closed, as `github_api`'s and
     /// `github_rest`'s do: a `ScriptedTransport` with nothing queued, which opens no socket and
     /// answers every round trip as not sent, beside endpoints on 127.0.0.1's port 1, so a test
-    /// double that never says where GitHub is sends nothing anywhere. WP13 gives `Fake`
-    /// agh-fake's loopback. A release build has no test double, and there the method has no
-    /// default.
+    /// double that never says where GitHub is sends nothing anywhere. `Fake` answers the
+    /// transport `Fake::with_github` gave it (agh-fake's loopback), else this default. A release
+    /// build has no test double, and there the method has no default.
     #[cfg(any(test, debug_assertions))]
     fn github_transport(
         &self,
@@ -498,10 +498,7 @@ pub trait System: Sync {
         std::sync::Arc<dyn agh::wire::Transport>,
         agh::wire::Endpoints,
     ) {
-        (
-            std::sync::Arc::new(agh::wire::scripted::ScriptedTransport::new()),
-            agh::wire::Endpoints::loopback(1, 1, 1, 1),
-        )
+        fail_closed_github()
     }
 
     /// Where the controller's agh client sends: `Live` answers `HttpTransport::new(ProcessEnv)`
@@ -515,15 +512,16 @@ pub trait System: Sync {
     );
 
     /// Where agh.toml is for the `fleet` profile (machines 5b): `Live` answers
-    /// `agh::config::Dirs::from_env()`; WP13 gives `Fake` a scratch `Dirs::under(root)`.
+    /// `agh::config::Dirs::from_env()`; `Fake` answers the scratch `Dirs` `Fake::with_agh_dirs`
+    /// gave it, else this default.
     /// The default is `None`, so a test double never reads the real agh.toml or token files.
     fn agh_dirs(&self) -> Option<agh::config::Dirs> {
         None
     }
 
-    /// The effect seam the controller's agh client runs on: `Fx::live()` by default; WP13 gives
-    /// `Fake` `Fx::simulated`, so the key writes' 1 s pacing (§4.6.5) takes no real time and a
-    /// test reads it in `Fx::slept`.
+    /// The effect seam the controller's agh client runs on: `Fx::live()` by default; `Fake`
+    /// answers the one `Fx::simulated` made with it, so the key writes' 1 s pacing (§4.6.5)
+    /// takes no real time and a test reads it in `Fx::slept`.
     fn github_fx(&self) -> std::sync::Arc<agh::Fx> {
         std::sync::Arc::new(agh::Fx::live())
     }
@@ -702,6 +700,15 @@ pub trait System: Sync {
 
     /// Return `lstat(path)` metadata without following symlinks.
     fn stat(&self, path: &Path) -> io::Result<Stat>;
+
+    /// When the file at `path` last changed, in Unix seconds: its status change time (`st_ctime`)
+    /// as `lstat` reports it, so no link is followed. Every write, truncation and `touch` moves
+    /// it, and no call sets it back. `None` where it cannot be read (no such file, and this
+    /// default).
+    fn changed(&self, path: &Path) -> Option<u64> {
+        let _ = path;
+        None
+    }
 
     /// List entry names in directory `path`.
     fn list_dir(&self, path: &Path) -> io::Result<Vec<String>>;
@@ -1137,13 +1144,7 @@ impl Live {
                 .map_err(failed)
         };
         let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
-        let stdin = match &cmd.stdin {
-            Some(path) => aterm_uds::spawnfd::Stdio::from(
-                std::fs::File::open(path)
-                    .map_err(|e| RunFailed::Spawn(format!("{}: {e}", path.display())))?,
-            ),
-            None => aterm_uds::spawnfd::Stdio::null(),
-        };
+        let stdin = open_stdin_file(cmd.stdin.as_deref())?;
         child
             .process_group(0)
             .stdin(stdin)
@@ -1203,15 +1204,44 @@ fn end_group(child: &mut aterm_uds::spawnfd::Child) {
     let _ = child.wait();
 }
 
+fn open_stdin_file(path: Option<&Path>) -> Result<aterm_uds::spawnfd::Stdio, RunFailed> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let Some(path) = path else {
+        return Ok(aterm_uds::spawnfd::Stdio::null());
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| RunFailed::Spawn(format!("{}: {e}", path.display())))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| RunFailed::Spawn(format!("{}: {e}", path.display())))?;
+    if !meta.is_file() {
+        return Err(RunFailed::Spawn(format!(
+            "{}: not a regular file",
+            path.display()
+        )));
+    }
+    Ok(aterm_uds::spawnfd::Stdio::from(file))
+}
+
 fn kept_tail(path: &Path) -> io::Result<Vec<u8>> {
     use std::io::{Read as _, Seek as _};
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
     let keep = aterm_uds::deadline::OUTPUT_KEEP as u64;
-    let len = file.metadata()?.len();
+    let len = meta.len();
     file.seek(io::SeekFrom::Start(len.saturating_sub(keep)))?;
     let mut bytes = Vec::new();
     file.take(keep).read_to_end(&mut bytes)?;
@@ -1414,13 +1444,7 @@ impl System for Live {
         }
         let (program, args) = self.argv(cmd)?;
         let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
-        let stdin = match &cmd.stdin {
-            Some(path) => aterm_uds::spawnfd::Stdio::from(
-                std::fs::File::open(path)
-                    .map_err(|e| RunFailed::Spawn(format!("{}: {e}", path.display())))?,
-            ),
-            None => aterm_uds::spawnfd::Stdio::null(),
-        };
+        let stdin = open_stdin_file(cmd.stdin.as_deref())?;
         let deadline = deadline_after(cmd.budget);
         match aterm_uds::deadline::output_until_from(&mut child, stdin, deadline) {
             Ok(out) => Ok(Ran {
@@ -1450,13 +1474,7 @@ impl System for Live {
         }
         let (program, args) = self.argv(cmd)?;
         let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
-        let stdin = match &cmd.stdin {
-            Some(path) => aterm_uds::spawnfd::Stdio::from(
-                std::fs::File::open(path)
-                    .map_err(|e| RunFailed::Spawn(format!("{}: {e}", path.display())))?,
-            ),
-            None => aterm_uds::spawnfd::Stdio::null(),
-        };
+        let stdin = open_stdin_file(cmd.stdin.as_deref())?;
         let deadline = deadline_after(cmd.budget);
         let out =
             aterm_uds::deadline::output_until_complete_stdout_from(&mut child, stdin, deadline)
@@ -1581,7 +1599,35 @@ impl System for Live {
     }
 
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
-        std::fs::read(path)
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        const MAX_READ_FILE_BYTES: u64 = 64 * 1024 * 1024;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        if meta.len() > MAX_READ_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file exceeds 64 MiB read limit",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_READ_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_READ_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file exceeds 64 MiB read limit",
+            ));
+        }
+        Ok(bytes)
     }
 
     /// Opened by [`aterm_uds::nofollow::open_reader`] (`O_NOFOLLOW_ANY | O_NONBLOCK`, then
@@ -1702,6 +1748,11 @@ impl System for Live {
             symlink: m.file_type().is_symlink(),
             len: m.len(),
         })
+    }
+
+    fn changed(&self, path: &Path) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt as _;
+        u64::try_from(std::fs::symlink_metadata(path).ok()?.ctime()).ok()
     }
 
     fn list_dir(&self, path: &Path) -> io::Result<Vec<String>> {
@@ -2020,7 +2071,7 @@ impl System for Live {
         let ran = self
             .run(&Cmd::new("/usr/sbin/ioreg").args(["-rd1", "-c", "IOPlatformExpertDevice"]))
             .ok()?;
-        crate::agent::platform::ioreg_value(&ran.out(), "IOPlatformUUID")
+        crate::hardware::ioreg_value(&ran.out(), "IOPlatformUUID")
     }
 
     fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + Send + '_>, String> {
@@ -2143,6 +2194,21 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     aterm_durable::durable_dir(parent)
 }
 
+/// The GitHub a test double that names none sends to: a `ScriptedTransport` with nothing
+/// queued, which opens no socket and answers every round trip as not sent, beside endpoints
+/// on 127.0.0.1's port 1 (`System::github_transport`'s default, and `Fake`'s without
+/// `Fake::with_github`).
+#[cfg(any(test, debug_assertions))]
+fn fail_closed_github() -> (
+    std::sync::Arc<dyn agh::wire::Transport>,
+    agh::wire::Endpoints,
+) {
+    (
+        std::sync::Arc::new(agh::wire::scripted::ScriptedTransport::new()),
+        agh::wire::Endpoints::loopback(1, 1, 1, 1),
+    )
+}
+
 #[cfg(any(test, debug_assertions))]
 pub use fake::Fake;
 
@@ -2195,6 +2261,10 @@ mod fake {
         alive: Mutex<Vec<u32>>,
         /// Each pid's start second ([`Fake::born`]).
         born: Mutex<BTreeMap<u32, u64>>,
+        /// Each file's last change second ([`System::changed`]): set by [`Fake::changed_at`], by
+        /// [`System::write_file`] and [`System::create_new`] at [`Fake::now`], dropped by
+        /// [`System::remove`]; a file seeded otherwise has none, unread.
+        changed: Mutex<BTreeMap<PathBuf, u64>>,
         /// The effective uid the fake reports (0 = root, the agent's case).
         pub euid: u32,
         /// The clock.
@@ -2272,6 +2342,23 @@ mod fake {
         pub linux: bool,
         /// Scripted [`System::tcc_access`] replies keyed by `tcc open` or `tcc <clients>`.
         tcc_replies: Mutex<TccReplies>,
+        /// What [`System::github_transport`] answers ([`Fake::with_github`]): unset, the
+        /// trait's fail-closed default.
+        github: Option<(Arc<dyn agh::wire::Transport>, agh::wire::Endpoints)>,
+        /// What [`System::agh_dirs`] answers ([`Fake::with_agh_dirs`]): `None` unless set.
+        agh_dirs: Option<agh::config::Dirs>,
+        /// What [`System::github_fx`] answers, on every call.
+        github_fx: GithubFx,
+    }
+
+    /// The one simulated effect seam a [`Fake`] hands its agh client, made with the `Fake`, so
+    /// a test reads every sleep in `Fx::slept` and no `Fake` sleeps for real.
+    struct GithubFx(Arc<agh::Fx>);
+
+    impl Default for GithubFx {
+        fn default() -> Self {
+            Self(Arc::new(agh::Fx::simulated(1_760_000_000)))
+        }
     }
 
     type TccReplies =
@@ -2771,6 +2858,27 @@ mod fake {
             self
         }
 
+        /// Send the agh client to `transport` and `endpoints` (agh-fake's loopback): what
+        /// [`System::github_transport`] answers. The client's effect seam stays this `Fake`'s
+        /// one simulated [`agh::Fx`].
+        #[must_use]
+        pub fn with_github(
+            mut self,
+            transport: Arc<dyn agh::wire::Transport>,
+            endpoints: agh::wire::Endpoints,
+        ) -> Self {
+            self.github = Some((transport, endpoints));
+            self
+        }
+
+        /// Read agh.toml under `dirs` (a scratch `Dirs::under(root)`): what
+        /// [`System::agh_dirs`] answers.
+        #[must_use]
+        pub fn with_agh_dirs(mut self, dirs: agh::config::Dirs) -> Self {
+            self.agh_dirs = Some(dirs);
+            self
+        }
+
         /// Script a [`System::github_rest`] response.
         pub fn on_github_rest(
             &self,
@@ -2898,6 +3006,15 @@ mod fake {
             self
         }
 
+        /// Record that the file at `path` last changed at `unix` seconds ([`System::changed`]).
+        pub fn changed_at(&self, path: &str, unix: u64) -> &Self {
+            self.changed
+                .lock()
+                .unwrap()
+                .insert(PathBuf::from(path), unix);
+            self
+        }
+
         /// Set the awake clock [`System::awake_ms`] reads to `ms`.
         pub fn awake_at(&self, ms: u64) -> &Self {
             *self.awake.lock().unwrap() = Some(ms);
@@ -2950,6 +3067,20 @@ mod fake {
                 Some(list) if list.len() == 1 => list[0].clone().map_err(String::from),
                 _ => Err(format!("fake: no GitHub response was scripted for `{key}`")),
             }
+        }
+
+        fn github_transport(&self) -> (Arc<dyn agh::wire::Transport>, agh::wire::Endpoints) {
+            self.github
+                .clone()
+                .unwrap_or_else(super::fail_closed_github)
+        }
+
+        fn agh_dirs(&self) -> Option<agh::config::Dirs> {
+            self.agh_dirs.clone()
+        }
+
+        fn github_fx(&self) -> Arc<agh::Fx> {
+            Arc::clone(&self.github_fx.0)
         }
 
         fn natural_scrolling(&self) -> Result<bool, String> {
@@ -3245,6 +3376,10 @@ mod fake {
                 .lock()
                 .unwrap()
                 .insert(path.to_path_buf(), (bytes.to_vec(), mode));
+            self.changed
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), self.now);
             Ok(())
         }
 
@@ -3311,6 +3446,7 @@ mod fake {
             self.files.lock().unwrap().remove(path);
             self.links.lock().unwrap().remove(path);
             self.stats.lock().unwrap().remove(path);
+            self.changed.lock().unwrap().remove(path);
             Ok(())
         }
 
@@ -3403,6 +3539,10 @@ mod fake {
                     len: b.len() as u64,
                 })
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+        }
+
+        fn changed(&self, path: &Path) -> Option<u64> {
+            self.changed.lock().unwrap().get(path).copied()
         }
 
         fn list_dir(&self, path: &Path) -> io::Result<Vec<String>> {
@@ -3548,6 +3688,10 @@ mod fake {
                 .unwrap()
                 .push(format!("create {} {mode:o}", path.display()));
             files.insert(path.to_path_buf(), (bytes.to_vec(), mode));
+            self.changed
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), self.now);
             Ok(())
         }
 
@@ -4192,34 +4336,32 @@ mod tests {
 
     /// A `System` that never says where GitHub is reaches none of it: its agh client's transport
     /// sends nothing, its endpoints are 127.0.0.1's port 1, and it finds no agh.toml. The
-    /// defaults are read through `Spawns`, a double that overrides neither method, so the check
-    /// holds when WP13 gives `Fake` its own answers; `Fake` keeps the defaults today and is
-    /// checked beside it. NEGATIVE CONTROL: `Live` sends to github.com.
+    /// defaults are read through `Spawns`, a double that overrides neither method; a `Fake`
+    /// never given `with_github` or `with_agh_dirs` answers the same, and is checked beside it.
+    /// NEGATIVE CONTROL: `Live` sends to github.com.
     #[test]
     fn a_system_that_names_no_github_sends_nowhere_and_reads_no_agh_toml() {
+        // A double that names no GitHub: its transport answers a round trip as not sent.
+        fn sends_nowhere(sys: &dyn System) {
+            let (transport, endpoints) = sys.github_transport();
+            assert_eq!(endpoints, agh::wire::Endpoints::loopback(1, 1, 1, 1));
+            let sent = transport.round_trip(agh::wire::WireRequest::new(
+                agh::wire::Method::Get,
+                endpoints.url(agh::wire::OriginRole::Api, "/user"),
+                Vec::new(),
+                1024,
+                agh::wire::Deadlines::JSON,
+            ));
+            assert!(
+                matches!(&sent, Err(e) if e.phase == agh::wire::Phase::NotSent),
+                "{:?}",
+                sent.err()
+            );
+            assert!(sys.agh_dirs().is_none());
+        }
         let live = Live::new();
-        let bare = super::spawns::Spawns::new(&live);
-        let (transport, endpoints) = bare.github_transport();
-        assert_eq!(endpoints, agh::wire::Endpoints::loopback(1, 1, 1, 1));
-        let sent = transport.round_trip(agh::wire::WireRequest::new(
-            agh::wire::Method::Get,
-            endpoints.url(agh::wire::OriginRole::Api, "/user"),
-            Vec::new(),
-            1024,
-            agh::wire::Deadlines::JSON,
-        ));
-        assert!(
-            matches!(&sent, Err(e) if e.phase == agh::wire::Phase::NotSent),
-            "{:?}",
-            sent.err()
-        );
-        assert!(bare.agh_dirs().is_none());
-        let fake = Fake::default();
-        assert_eq!(
-            fake.github_transport().1,
-            agh::wire::Endpoints::loopback(1, 1, 1, 1)
-        );
-        assert!(fake.agh_dirs().is_none());
+        sends_nowhere(&super::spawns::Spawns::new(&live));
+        sends_nowhere(&Fake::default());
         assert_eq!(
             Live::new().github_transport().1,
             agh::wire::Endpoints::github_com()

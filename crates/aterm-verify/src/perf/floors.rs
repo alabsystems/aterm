@@ -65,7 +65,7 @@ fn read_baseline<T>(
     path: &Path,
     parse: impl FnOnce(&Value) -> Result<T, String>,
 ) -> Result<Option<T>, String> {
-    let text = match std::fs::read_to_string(path) {
+    let text = match crate::read_regular_text(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{} is unreadable: {e}", path.display())),
@@ -135,10 +135,12 @@ fn quoted(s: &str) -> String {
 /// Throughput: the median clears `baseline * PASS_RATIO`.
 pub(crate) fn gate_throughput(record: bool) -> LaneRun {
     let report = match measure_example("perf_harness").and_then(|json| {
-        parse_report(&json).ok_or_else(|| format!("perf_harness JSON lacks a field: {json:?}"))
+        parse_report(&json).ok_or_else(|| {
+            MeasureError::Failed(format!("perf_harness JSON lacks a field: {json:?}"))
+        })
     }) {
         Ok(r) => r,
-        Err(e) => return LaneRun::fail(format!("could not measure: {e}")),
+        Err(e) => return e.verdict(),
     };
     let samples = vec![TrendSample {
         lane: "throughput",
@@ -166,7 +168,7 @@ fn record_throughput(path: &Path, report: &PerfReport) -> LaneRun {
             path.display()
         ));
     }
-    let previous = std::fs::read_to_string(path).ok().and_then(|t| object(&t));
+    let previous = crate::read_regular_text(path).ok().and_then(|t| object(&t));
     let (comment, _) = carried_comment(previous.as_ref(), THROUGHPUT_COMMENT, &utc_date());
     write_baseline(path, &baseline_json(report, PASS_RATIO, &comment))
 }
@@ -589,7 +591,7 @@ fn write_baseline(path: &Path, text: &str) -> LaneRun {
 }
 
 /// Run an `aterm-bench` example in release and return its JSON report.
-pub(crate) fn measure_example(example: &str) -> Result<Value, String> {
+pub(crate) fn measure_example(example: &str) -> Result<Value, MeasureError> {
     measure_example_with(example, &[], &[])
 }
 
@@ -599,25 +601,105 @@ pub(crate) fn measure_example_with(
     example: &str,
     features: &[&str],
     harness_args: &[&str],
+) -> Result<Value, MeasureError> {
+    measure_example_for(example, features, harness_args, true)
+}
+
+/// The performance-core-cycle lane deliberately judges cycles at the load it finds.
+pub(crate) fn measure_cycle_example_with(
+    example: &str,
+    features: &[&str],
+    harness_args: &[&str],
 ) -> Result<Value, String> {
+    measure_example_for(example, features, harness_args, false).map_err(|e| e.to_string())
+}
+
+#[derive(Debug)]
+pub(crate) enum MeasureError {
+    Failed(String),
+    Timing(String),
+}
+impl std::fmt::Display for MeasureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(s) | Self::Timing(s) => f.write_str(s),
+        }
+    }
+}
+impl From<String> for MeasureError {
+    fn from(s: String) -> Self {
+        Self::Failed(s)
+    }
+}
+impl From<&str> for MeasureError {
+    fn from(s: &str) -> Self {
+        Self::Failed(s.to_owned())
+    }
+}
+impl MeasureError {
+    pub(crate) fn verdict(self) -> LaneRun {
+        match self {
+            Self::Failed(why) => LaneRun::fail(format!("could not measure: {why}")),
+            Self::Timing(why) => LaneRun::could_not_run(
+                why,
+                "run with measured timing admission at the postcompile entry",
+            ),
+        }
+    }
+}
+
+fn measure_example_for(
+    example: &str,
+    features: &[&str],
+    harness_args: &[&str],
+    timing: bool,
+) -> Result<Value, MeasureError> {
     let driver = super::driver::cargo_driver()?;
     let features = features.join(",");
     let mut args = vec!["--release", "-q", "-p", "aterm-bench"];
     if !features.is_empty() {
         args.extend(["--features", features.as_str()]);
     }
-    args.extend(["--example", example]);
-    if !harness_args.is_empty() {
-        args.push("--");
-        args.extend(harness_args);
-    }
-    eprintln!("  $ {}", driver.display_workspace("run", &args));
-    let out = driver
-        .workspace_command("run")
-        .args(args)
+    args.extend([
+        "--example",
+        example,
+        "--message-format=json-render-diagnostics",
+    ]);
+    eprintln!("  $ {}", driver.display_workspace("build", &args));
+    let built = driver
+        .workspace_command("build")
+        .args(&args)
         .current_dir(workspace_root())
         .output()
-        .map_err(|e| format!("could not spawn {example}: {e}"))?;
+        .map_err(|e| format!("could not build {example}: {e}"))?;
+    if !built.status.success() {
+        return Err(MeasureError::Failed(format!(
+            "{example} build failed: {}",
+            String::from_utf8_lossy(&built.stderr)
+        )));
+    }
+    let executable = super::bench_build::built_executable(
+        &String::from_utf8_lossy(&built.stdout),
+        example,
+        "example",
+    )?;
+    let mut run = aterm_uds::spawnfd::command(&executable);
+    run.args(harness_args).current_dir(workspace_root());
+    // Compilation and command preparation are complete. No targo run/bench prefix can build
+    // after this fresh observation and before the measurement executable starts.
+    let _entry = if timing {
+        Some(super::measurement_entry().map_err(MeasureError::Timing)?)
+    } else {
+        None
+    };
+    let out = run
+        .output()
+        .map_err(|e| format!("could not execute {}: {e}", executable.display()))?;
+    if let Some(entry) = &_entry {
+        entry
+            .timing_admission()
+            .map_err(|why| MeasureError::Timing(why.to_string()))?;
+    }
     let stderr = String::from_utf8_lossy(&out.stderr);
     for line in stderr.lines() {
         if line.contains(&format!("{example}:")) {
@@ -625,13 +707,13 @@ pub(crate) fn measure_example_with(
         }
     }
     if !out.status.success() {
-        return Err(format!(
+        return Err(MeasureError::Failed(format!(
             "{example} exited {:?}\n{stderr}",
             out.status.code()
-        ));
+        )));
     }
     last_json_line(&String::from_utf8_lossy(&out.stdout))
-        .ok_or_else(|| format!("{example} printed no JSON report"))
+        .ok_or_else(|| MeasureError::Failed(format!("{example} printed no JSON report")))
 }
 
 /// The last line of `stdout` that parses as a JSON object.
@@ -681,7 +763,7 @@ fn record_keyed(lane: &FloorLane, path: &Path, values: &[(&'static str, f64)]) -
             path.display()
         ));
     }
-    let previous = std::fs::read_to_string(path).ok().and_then(|t| object(&t));
+    let previous = crate::read_regular_text(path).ok().and_then(|t| object(&t));
     let (comment, carried) = carried_comment(previous.as_ref(), lane.comment, &utc_date());
     if carried {
         eprintln!(
@@ -757,7 +839,7 @@ fn compare_keyed_against_baseline(
 pub(crate) fn gate_keyed(lane: &FloorLane, record: bool) -> LaneRun {
     match measure_example(lane.example) {
         Ok(json) => judge_keyed(lane, &json, record),
-        Err(e) => LaneRun::fail(format!("could not measure: {e}")),
+        Err(e) => e.verdict(),
     }
 }
 
@@ -765,7 +847,7 @@ pub(crate) fn gate_keyed(lane: &FloorLane, record: bool) -> LaneRun {
 pub(crate) fn gate_crash_restore(record: bool) -> LaneRun {
     match measure_example(CRASH_RESTORE_LANE.example) {
         Ok(json) => judge_crash_restore(&json, record),
-        Err(e) => LaneRun::fail(format!("could not measure: {e}")),
+        Err(e) => e.verdict(),
     }
 }
 
@@ -793,7 +875,7 @@ fn judge_crash_restore(json: &Value, record: bool) -> LaneRun {
 pub(crate) fn gate_effects(lane: &EffectsLane, record: bool) -> LaneRun {
     match measure_example_with(lane.full.example, EFFECTS_FEATURES, lane.args) {
         Ok(json) => judge_effects(lane, &json, record),
-        Err(e) => LaneRun::fail(format!("could not measure: {e}")),
+        Err(e) => e.verdict(),
     }
 }
 
@@ -981,7 +1063,7 @@ const STEP_FREEZE: &str = "a bounded pump step costs O(history) again, in every 
 pub(crate) fn gate_resize(record: bool) -> LaneRun {
     let json = match measure_example(RESIZE_LANE.example) {
         Ok(j) => j,
-        Err(e) => return LaneRun::fail(format!("could not measure: {e}")),
+        Err(e) => return e.verdict(),
     };
     judge_resize(&json, record)
 }

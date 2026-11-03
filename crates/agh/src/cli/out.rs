@@ -11,9 +11,10 @@ use aterm_json::{Map, Value};
 use super::args::{Format, Global};
 use super::project::{self, FieldPath};
 use super::verbs::Noun;
+use super::write_out::ReportOutcome;
 use super::{Answer, Completeness, Ctx, FileWritten, Outcome, Receipt, format, jq};
 use crate::download::DigestCheck;
-use crate::error::{Error, Kind, Result, push_escaped};
+use crate::error::{Error, Kind, Result, SideEffect, push_escaped};
 use crate::redact::Redactor;
 
 /// How a verb's answer is rendered.
@@ -54,6 +55,20 @@ pub fn emit(ctx: &mut Ctx, outcome: Outcome, opts: &OutputOpts) -> u8 {
         answer,
         mut receipt,
     } = outcome;
+    // A write's reports, kept whole: a projection that fails once the write was sent (a
+    // `--jq` program's run-time error) must never lose what the write did.
+    let reports = match &answer {
+        Answer::Object {
+            noun: Noun::Write,
+            value,
+        } => Some(value.clone()),
+        Answer::Items {
+            noun: Noun::Write,
+            items,
+            ..
+        } => Some(Value::Array(items.clone())),
+        _ => None,
+    };
     let rendered = match answer {
         Answer::FailedWith { value, error } => {
             let bytes = format!("{value}\n");
@@ -81,7 +96,21 @@ pub fn emit(ctx: &mut Ctx, outcome: Outcome, opts: &OutputOpts) -> u8 {
     };
     let bytes = match rendered {
         Ok(bytes) => bytes,
-        Err(e) => return fail(ctx, &receipt.verb, &with_verb_help(e, &receipt.verb)),
+        Err(e) => {
+            let e = with_verb_help(e, &receipt.verb);
+            let Some(reports) = reports else {
+                return fail(ctx, &receipt.verb, &e);
+            };
+            // As `FailedWith` prints: the reports whole, then the error, which says what the
+            // write did, not `none`.
+            let bytes = format!("{reports}\n");
+            let code = write_stdout(ctx, bytes.as_bytes(), 0);
+            if code != 0 {
+                return code;
+            }
+            let e = e.with_side_effect(side_effect_of(&reports));
+            return fail(ctx, &receipt.verb, &e);
+        }
     };
     if let Some(bytes) = bytes {
         let code = write_stdout(ctx, &bytes, 0);
@@ -120,15 +149,50 @@ pub(crate) fn refuse_projection_flags(verb: &str, opts: &OutputOpts) -> Result<(
     Ok(())
 }
 
-/// Validates `--fields`, `--jq`, and `--raw` before a verb executes.
+/// What the writes `reports` (one report or an array of them) did: `applied` when one that
+/// was not a dry run is `created` or `deleted`, else `unknown` when one is `unknown`, else
+/// `none`.
+fn side_effect_of(reports: &Value) -> SideEffect {
+    let one = std::slice::from_ref(reports);
+    let all = match reports {
+        Value::Array(items) => items.as_slice(),
+        _ => one,
+    };
+    let sent = |report: &&Value| report.get("dry_run") != Some(&Value::Bool(true));
+    let effect = |report: &Value| {
+        report
+            .get("outcome")
+            .and_then(Value::as_str)
+            .and_then(ReportOutcome::from_slug)
+            .map(ReportOutcome::side_effect)
+    };
+    let effects: Vec<SideEffect> = all.iter().filter(sent).filter_map(effect).collect();
+    if effects.contains(&SideEffect::Applied) {
+        SideEffect::Applied
+    } else if effects.contains(&SideEffect::Unknown) {
+        SideEffect::Unknown
+    } else {
+        SideEffect::None
+    }
+}
+
+/// Validates `--fields`, `--jq`, and `--raw` before a verb executes. For a verb whose answer
+/// is one of agh's own fixed documents (a write's report, an intent, a credential), every
+/// `--fields` head must be one of the document's keys, so a projection that names none is
+/// Usage before anything is read or sent, never after a write has taken effect.
 ///
 /// # Errors
 ///
-/// `Plan::of`'s, with `agh help {verb}` as next where the error names no page of its own.
-pub(crate) fn check_opts(verb: &str, opts: &OutputOpts) -> Result<()> {
-    Plan::of(opts)
-        .map(|_| ())
-        .map_err(|e| with_verb_help(e, verb))
+/// `Plan::of`'s and `project::validate_fields`', with `agh help {verb}` as next where the
+/// error names no page of its own.
+pub(crate) fn check_opts(verb: &str, noun: Noun, opts: &OutputOpts) -> Result<()> {
+    let checked = Plan::of(opts).and_then(|plan| match (&plan.fields, noun) {
+        (Some(fields), Noun::Write | Noun::Intent | Noun::Credential) => {
+            project::validate_fields(noun, fields, Some(&Value::Object(Map::new())))
+        }
+        _ => Ok(()),
+    });
+    checked.map_err(|e| with_verb_help(e, verb))
 }
 
 struct Plan {

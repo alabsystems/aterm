@@ -303,6 +303,7 @@ const fn noted_swatch(w: Noted) -> &'static str {
         | Noted::Abandoned
         | Noted::Claim
         | Noted::RepoUnread
+        | Noted::Failed
         | Noted::Watching => "warn",
         Noted::Done
         | Noted::Left
@@ -333,6 +334,7 @@ const fn noted_marks(w: Noted) -> &'static str {
     match w {
         Noted::Done => "watcher: a DONE line, the task's end the loop read",
         Noted::Left => "watcher: a LEFT line, a turn left to the person",
+        Noted::Failed => "watcher: a FAILED line, a managed worker's work ended unfinished",
         Noted::Parked => "watcher: a PARKED line, hands off while Autopilot is off",
         Noted::Unparked => "watcher: an UNPARKED line, Autopilot back on",
         Noted::Halted => "watcher: a HALTED line, the session on hold: the loop waits",

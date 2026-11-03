@@ -12,8 +12,27 @@ pub const INSTALLED_LABEL: &str = "com.aterm.aterm.keeper";
 pub const DEV_LABEL_PREFIX: &str = "com.aterm.aterm.keeper.dev";
 /// The prefix of a test's label: `<prefix>.<pid>.<n>` — never the installed one.
 pub const TEST_LABEL_PREFIX: &str = "com.aterm.aterm.keeper.test";
-/// The installed app's executable.
+/// The installed app's executable in `/Applications`; a person who cannot write there gets it in
+/// `~/Applications` ([`installed_executables`]).
 pub const INSTALLED_EXECUTABLE: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
+
+/// Where aterm installs itself, as the executable in each: `/Applications`
+/// ([`INSTALLED_EXECUTABLE`]), else `~/Applications` under `home` (install.sh and the first
+/// launch pick the second when the first is not writable). Each is the person's own copy.
+#[must_use]
+pub fn installed_executables(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut out = vec![PathBuf::from(INSTALLED_EXECUTABLE)];
+    if let Some(home) = home.filter(|h| h.is_absolute()) {
+        out.push(
+            home.join("Applications")
+                .join("aterm.app")
+                .join("Contents")
+                .join("MacOS")
+                .join("aterm"),
+        );
+    }
+    out
+}
 
 /// Which keeper a build talks to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,10 +45,19 @@ pub struct KeeperPlace {
     pub installed: bool,
 }
 
-/// Returns the keeper label and socket name for executable `exe`.
+/// Returns the keeper label and socket name for executable `exe`, under this login's `HOME`
+/// ([`place_in`]).
 #[must_use]
 pub fn place_for(exe: &Path) -> KeeperPlace {
-    if exe == Path::new(INSTALLED_EXECUTABLE) {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    place_in(exe, home.as_deref())
+}
+
+/// [`place_for`]'s pure core: an [`installed_executables`] copy under `home` is the installed
+/// app's keeper; any other executable gets its own dev place.
+#[must_use]
+pub fn place_in(exe: &Path, home: Option<&Path>) -> KeeperPlace {
+    if installed_executables(home).iter().any(|p| p == exe) {
         return KeeperPlace {
             label: INSTALLED_LABEL.to_string(),
             socket_name: "keeper.sock".to_string(),
@@ -228,6 +256,38 @@ mod tests {
         assert_eq!(
             dev,
             place_for(Path::new("/Users//x/aterm/target/debug/aterm"))
+        );
+    }
+
+    #[test]
+    fn a_copy_installed_in_the_home_applications_is_the_installed_keeper() {
+        let home = Path::new("/Users//x");
+        let user = place_in(
+            Path::new("/Users//x/Applications/aterm.app/Contents/MacOS/aterm"),
+            Some(home),
+        );
+        assert_eq!(user, place_in(Path::new(INSTALLED_EXECUTABLE), Some(home)));
+        assert!(user.installed);
+        let other = place_in(
+            Path::new("/Users//y/Applications/aterm.app/Contents/MacOS/aterm"),
+            Some(home),
+        );
+        assert!(!other.installed, "another login's copy is not this one's");
+        assert!(
+            !place_in(
+                Path::new("/Applications/aterm.app/Contents/MacOS/aterm"),
+                None
+            )
+            .label
+            .starts_with(DEV_LABEL_PREFIX)
+        );
+        assert!(
+            !place_in(
+                Path::new("x/Applications/aterm.app/Contents/MacOS/aterm"),
+                Some(Path::new("x"))
+            )
+            .installed,
+            "a relative HOME names no installed copy"
         );
     }
 

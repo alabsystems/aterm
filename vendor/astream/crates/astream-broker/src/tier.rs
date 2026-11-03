@@ -83,13 +83,68 @@ impl crate::retention::Planned for Summary {
     }
 }
 
+contract_fn! {
+    /// Verified byte charge (`96 + subject_len + body_len`, saturating) for a resident
+    /// decoded record.
+    #[must_use]
+    pub(crate) const fn tier_resident_cost(subject_len: usize, body_len: usize) -> usize
+    clauses [ensures result >= 96 && result >= subject_len && result >= body_len]
+    {
+        96usize
+            .saturating_add(subject_len)
+            .saturating_add(body_len)
+    }
+}
+
+contract_fn! {
+    /// Amortized shrink target for `Tier::hot`: when the ring holds more than `16` slots
+    /// and at most a quarter are occupied (`cap > 16 && len <= cap / 4`), shrink to
+    /// `max(2 * len, 8)`; otherwise return `cap` unchanged (`target < cap` iff shrinking).
+    #[must_use]
+    const fn hot_shrink_target(cap: usize, len: usize) -> usize
+    clauses [ensures result <= cap && (cap <= 16 || result >= 8)]
+    {
+        if cap > 16 && len <= cap / 4 {
+            let doubled = len.saturating_mul(2);
+            if doubled > 8 {
+                doubled
+            } else {
+                8
+            }
+        } else {
+            cap
+        }
+    }
+}
+
 /// The bytes a decoded record is charged against the hot budget: its subject and body
 /// plus a fixed overhead for the record's own fields and its `Arc`.
 pub(crate) fn resident_cost(rec: &BrokerRecord) -> usize {
-    const FIXED: usize = 96;
-    FIXED
-        .saturating_add(rec.subject.len())
-        .saturating_add(rec.body.len())
+    tier_resident_cost(rec.subject.len(), rec.body.len())
+}
+
+/// Start index of the suffix `records[hot_start..]` that stays resident under `budget`
+/// (always keeping at least the newest record when `records` is non-empty).
+fn hot_window_start(records: &[BrokerRecord], budget: usize) -> usize {
+    let Some(mut hot_start) = records.len().checked_sub(1) else {
+        return 0;
+    };
+    let Some(newest) = records.get(hot_start) else {
+        return 0;
+    };
+    let mut acc = resident_cost(newest);
+    while let Some(prev) = hot_start.checked_sub(1) {
+        let Some(rec) = records.get(prev) else {
+            break;
+        };
+        let next_acc = acc.saturating_add(resident_cost(rec));
+        if next_acc > budget {
+            break;
+        }
+        acc = next_acc;
+        hot_start = prev;
+    }
+    hot_start
 }
 
 /// The retained records of one log: positions, broker times and summaries for all of
@@ -214,6 +269,17 @@ impl Tier {
             };
             self.hot_bytes = self.hot_bytes.saturating_sub(resident_cost(&old));
         }
+        self.maybe_shrink_hot();
+    }
+
+    /// Release excess `VecDeque` ring capacity when the resident window shrank below a
+    /// quarter of its allocated buffer (`cap > 16 && len <= cap / 4`).
+    fn maybe_shrink_hot(&mut self) {
+        let cap = self.hot.capacity();
+        let target = hot_shrink_target(cap, self.hot.len());
+        if target < cap {
+            self.hot.shrink_to(target);
+        }
     }
 
     /// The resident record at index `i`, if it is resident.
@@ -251,6 +317,7 @@ impl Tier {
                 }
             }
         }
+        self.maybe_shrink_hot();
         self.at.truncate(keep);
         self.bts.truncate(keep);
         self.sums.truncate(keep);
@@ -263,6 +330,12 @@ impl Tier {
         self.hot.iter()
     }
 
+    /// Allocated slot capacity of the hot `VecDeque` (test helper).
+    #[cfg(test)]
+    pub(crate) fn hot_capacity(&self) -> usize {
+        self.hot.capacity()
+    }
+
     /// Every retained record's broker time, in index order.
     #[cfg(any(feature = "retention", all(feature = "at-rest", unix)))]
     pub(crate) fn bts(&self) -> &[Option<u64>] {
@@ -270,29 +343,33 @@ impl Tier {
     }
 
     /// A tier over records an open (or a rebuild) recovered, with their broker times and
-    /// frame starts; the oldest are evicted at once if they do not fit `budget`.
+    /// frame starts; cold prefix records outside `budget` are summarized and dropped in
+    /// place without allocating `Arc`s or growing the hot `VecDeque` past the hot suffix.
     pub(crate) fn from_parts(
-        records: Vec<Arc<BrokerRecord>>,
+        mut records: Vec<BrokerRecord>,
         bts: Vec<Option<u64>>,
         at: Vec<u64>,
         budget: usize,
     ) -> Tier {
         let mut tier = Tier::with_budget(budget);
         let n = records.len().min(at.len());
+        records.truncate(n);
         tier.at = at;
         tier.at.truncate(n);
         tier.bts = bts;
         tier.bts.truncate(n);
-        for rec in records.into_iter().take(n) {
+        while tier.bts.len() < n {
+            tier.bts.push(None);
+        }
+        let hot_start = hot_window_start(&records, budget);
+        for (i, rec) in records.into_iter().enumerate() {
             let s = tier.summarize(&rec);
             tier.sums.push(s);
-            if tier.bts.len() < tier.sums.len() {
-                tier.bts.push(None);
+            if i >= hot_start {
+                tier.hot_bytes = tier.hot_bytes.saturating_add(resident_cost(&rec));
+                tier.hot.push_back(Arc::new(rec));
             }
-            tier.hot_bytes = tier.hot_bytes.saturating_add(resident_cost(&rec));
-            tier.hot.push_back(rec);
         }
-        tier.evict();
         tier
     }
 
@@ -307,6 +384,7 @@ impl Tier {
                 self.hot_bytes = self.hot_bytes.saturating_sub(resident_cost(&r));
             }
         }
+        self.maybe_shrink_hot();
         let old_at = std::mem::take(&mut self.at);
         for (i, a) in old_at.into_iter().enumerate() {
             if i >= n {
@@ -404,23 +482,24 @@ mod tests {
 
     #[test]
     fn summaries_stay_aligned_and_subjects_prune_on_truncate_and_drain() {
-        fn named(seq: u64, subject: &str, body: usize) -> Arc<BrokerRecord> {
-            Arc::new(BrokerRecord {
+        fn named(seq: u64, subject: &str, body: usize) -> BrokerRecord {
+            BrokerRecord {
                 seq: Offset(seq),
                 producer_id: 1,
                 producer_seq: seq,
                 subject: subject.to_string(),
                 body: vec![3u8; body],
                 commit: None,
-            })
+            }
         }
 
         let r0 = named(10, "/f/a", 12);
+        let r0_bytes = plaintext_frame_bytes(&r0);
         let r1 = named(11, "/f/a", 24);
         let r2 = named(12, "/a/commit", 0);
-        let r3 = named(13, "/f/tail", 8);
+        let r3 = Arc::new(named(13, "/f/tail", 8));
         let mut t = Tier::from_parts(
-            vec![Arc::clone(&r0), Arc::clone(&r1), Arc::clone(&r2)],
+            vec![r0, r1, r2],
             vec![Some(100), Some(101), Some(102)],
             vec![0, 64, 128],
             0,
@@ -437,12 +516,7 @@ mod tests {
                 t.summary(0).map(Summary::bytes),
                 t.summary(0).map(Summary::is_hidden),
             ),
-            (
-                Some(10),
-                Some("/f/a"),
-                Some(plaintext_frame_bytes(&r0)),
-                Some(false)
-            ),
+            (Some(10), Some("/f/a"), Some(r0_bytes), Some(false)),
         );
         assert_eq!(t.summary(2).map(Summary::is_hidden), Some(true));
 
@@ -455,5 +529,126 @@ mod tests {
         assert_eq!(t.summary(0).map(Summary::offset), Some(12));
         assert_eq!(t.summary(0).map(Summary::subject), Some("/a/commit"));
         assert_eq!(t.subjects.len(), 1, "/f/a pruned on drain_front");
+    }
+
+    #[test]
+    fn from_parts_summarizes_cold_prefix_without_growing_hot_capacity() {
+        let owned = |seq: u64, body: usize| BrokerRecord {
+            seq: Offset(seq),
+            producer_id: 1,
+            producer_seq: seq,
+            subject: "/f/t".to_string(),
+            body: vec![7u8; body],
+            commit: None,
+        };
+        let cost = resident_cost(&owned(0, 64));
+        let records: Vec<BrokerRecord> = (0..1_000).map(|i| owned(i, 64)).collect();
+        let bts: Vec<Option<u64>> = (0..1_000).map(|i| Some(10_000 + i)).collect();
+        let at: Vec<u64> = (0..1_000).map(|i| i * 128).collect();
+
+        let t = Tier::from_parts(records, bts, at, cost * 2);
+        assert_eq!((t.len(), t.resident()), (1_000, 2));
+        assert!(
+            t.hot_capacity() <= 16,
+            "hot VecDeque capacity must stay bounded by the budget window, got {}",
+            t.hot_capacity()
+        );
+        assert!(t.hot(997).is_none());
+        assert_eq!(t.hot(998).map(|r| r.seq.0), Some(998));
+        assert_eq!(t.hot(999).map(|r| r.seq.0), Some(999));
+        assert_eq!(t.at(0), Some(0));
+        assert_eq!(t.at(999), Some(999 * 128));
+        assert_eq!(t.bt(0), Some(10_000));
+        assert_eq!(t.bt(999), Some(10_999));
+        assert_eq!(t.summaries().len(), 1_000);
+
+        // Parity against incremental `push` across varying payload sizes and budgets.
+        let sizes = [0usize, 13, 250, 7, 512, 1, 80, 19];
+        for budget in [0, 96, 200, 450, 900, 2_000, Tier::RESIDENT_ALL] {
+            let recs: Vec<BrokerRecord> = sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &sz)| owned(i as u64, sz))
+                .collect();
+            let bts_v: Vec<Option<u64>> = (0..sizes.len()).map(|i| Some(i as u64)).collect();
+            let at_v: Vec<u64> = (0..sizes.len()).map(|i| (i * 64) as u64).collect();
+            let mut inc = Tier::with_budget(budget);
+            for (i, r) in recs.iter().cloned().enumerate() {
+                inc.push(Arc::new(r), bts_v[i], at_v[i]);
+            }
+            let bulk = Tier::from_parts(recs, bts_v, at_v, budget);
+            assert_eq!(bulk.resident(), inc.resident(), "budget={budget}");
+            assert_eq!(
+                bulk.resident_bytes(),
+                inc.resident_bytes(),
+                "budget={budget}"
+            );
+            for i in 0..sizes.len() {
+                assert_eq!(
+                    bulk.hot(i).map(|r| r.seq),
+                    inc.hot(i).map(|r| r.seq),
+                    "budget={budget}, i={i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shrinking_budget_draining_truncating_and_oversized_push_reclaim_hot_capacity() {
+        // 1) `set_budget(0)` after 1,000 resident records reclaims ring slots.
+        let mut t = Tier::with_budget(Tier::RESIDENT_ALL);
+        for i in 0..1_000 {
+            t.push(rec(i, 32), Some(i), i * 64);
+        }
+        assert!(t.hot_capacity() >= 1_000);
+        t.set_budget(0);
+        assert_eq!(t.resident(), 1);
+        assert!(
+            t.hot_capacity() <= 16,
+            "set_budget(0) must shrink hot capacity, got {}",
+            t.hot_capacity()
+        );
+
+        // 2) `drain_front` across a large resident prefix reclaims ring slots.
+        let mut t2 = Tier::with_budget(Tier::RESIDENT_ALL);
+        for i in 0..1_000 {
+            t2.push(rec(i, 32), Some(i), i * 64);
+        }
+        t2.drain_front(999, 999 * 64);
+        assert_eq!((t2.len(), t2.resident()), (1, 1));
+        assert!(
+            t2.hot_capacity() <= 16,
+            "drain_front must shrink hot capacity, got {}",
+            t2.hot_capacity()
+        );
+
+        // 3) `truncate` of a large resident suffix reclaims ring slots.
+        let mut t3 = Tier::with_budget(Tier::RESIDENT_ALL);
+        for i in 0..1_000 {
+            t3.push(rec(i, 32), Some(i), i * 64);
+        }
+        t3.truncate(2);
+        assert_eq!((t3.len(), t3.resident()), (2, 2));
+        assert!(
+            t3.hot_capacity() <= 16,
+            "truncate must shrink hot capacity, got {}",
+            t3.hot_capacity()
+        );
+
+        // 4) An oversized record that evicts hundreds of small resident records shrinks too.
+        let small_cost = resident_cost(&rec(0, 16));
+        let mut t4 = Tier::with_budget(small_cost * 512);
+        for i in 0..512 {
+            t4.push(rec(i, 16), None, i * 32);
+        }
+        assert_eq!(t4.resident(), 512);
+        assert!(t4.hot_capacity() >= 512);
+        t4.push(rec(512, small_cost * 600), None, 512 * 32);
+        assert_eq!(t4.resident(), 1);
+        assert!(
+            t4.hot_capacity() <= 16,
+            "evicting burst via oversized push must shrink hot capacity, got {}",
+            t4.hot_capacity()
+        );
     }
 }

@@ -1705,6 +1705,22 @@ fn reply_is_timeout_detects_await_and_turn_forms() {
 }
 
 #[test]
+fn stdin_send_takes_inline_sends_enter_and_stdin_paste_keeps_every_byte() {
+    assert_eq!(
+        stdin_frame(false, b"ls\\n".to_vec()),
+        ("feed-bin", b"ls\r".to_vec())
+    );
+    assert_eq!(
+        stdin_frame(false, b"a\nb".to_vec()),
+        ("feed-bin", b"a\nb".to_vec())
+    );
+    assert_eq!(
+        stdin_frame(true, b"ls\\n\n".to_vec()),
+        ("paste-bin", b"ls\\n\n".to_vec())
+    );
+}
+
+#[test]
 fn split_selector_peels_leading_at() {
     let p = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
     let parts = p("@s-abc feed-bin");
@@ -2180,7 +2196,7 @@ fn help_is_answered_client_side_only_for_what_the_client_knows() {
         "path_evidence=",
         "upgrade=<-|<state>/<to>/<why>/<age>>",
         "land_at=<unix-s|-> task=<open|landed|theirs|->",
-        "pause=<unix-s|-> task_state=<working|done|exited|stalled|->",
+        "pause=<unix-s|-> task_state=<working|done|exited|stalled|failed|->",
         "task_rev=<n>[ *]",
     ];
     let at: Vec<Option<usize>> = order.iter().map(|field| ls.find(field)).collect();
@@ -3127,14 +3143,15 @@ fn a_front_door_ask_counts_an_aterm_only_where_it_answers() {
     let sock = dir.join("mock.sock");
     let path = sock.to_str().expect("utf8 path").to_string();
     let within = std::time::Duration::from_millis(700);
+    let running = |_: u32| false;
     assert_eq!(
-        front_door_ask_at(&path, "status\n", within),
+        front_door_ask_at(&path, ("status\n", within), running),
         FrontDoorAnswer::Absent
     );
 
     let listener = UnixListener::bind(&sock).expect("bind, never accept");
     assert_eq!(
-        front_door_ask_at(&path, "status\n", within),
+        front_door_ask_at(&path, ("status\n", within), running),
         FrontDoorAnswer::Silent(Some(std::process::id())),
         "a socket that takes a connection and never answers is an aterm not answering"
     );
@@ -3143,20 +3160,59 @@ fn a_front_door_ask_counts_an_aterm_only_where_it_answers() {
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let srv = std::thread::spawn(move || {
-        let (conn, _) = listener.accept().expect("accept");
-        let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
-        let mut w = conn;
-        for answer in [&b""[..], b"OK version=test\n", b"OK schema=1 fleet=off\n"] {
-            let mut line = String::new();
-            r.read_line(&mut line).expect("a request line");
-            w.write_all(answer).expect("answer");
+        'conns: for conn in listener.incoming() {
+            let conn = conn.expect("accept");
+            let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
+            let mut w = conn;
+            for (n, answer) in [&b""[..], b"OK version=test\n", b"OK schema=1 fleet=off\n"]
+                .into_iter()
+                .enumerate()
+            {
+                let mut line = String::new();
+                // The look at who is behind the socket sends nothing.
+                if r.read_line(&mut line).expect("a request line") == 0 && n == 0 {
+                    continue 'conns;
+                }
+                w.write_all(answer).expect("answer");
+            }
+            return;
         }
     });
     assert_eq!(
-        front_door_ask_at(&path, "status\n", HANG_DETECTOR),
+        front_door_ask_at(&path, ("status\n", HANG_DETECTOR), running),
         FrontDoorAnswer::Answered("OK schema=1 fleet=off".to_owned())
     );
     srv.join().expect("mock server");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stopped aterm's socket takes a connection in the kernel and answers nothing until resumed:
+/// the ask reads it as stopped before it sends anything or waits out its accept window.
+///
+/// NEGATIVE CONTROL: look at the process behind the socket only after a silent answer, and the ask
+/// queues its request in the stopped aterm's socket and waits its whole window first.
+#[cfg(unix)]
+#[test]
+fn a_front_door_ask_reads_a_stopped_aterm_as_that_before_it_sends_or_waits() {
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+
+    let dir = tokened_socket_dir("fdstop");
+    let sock = dir.join("mock.sock");
+    let path = sock.to_str().expect("utf8 path").to_string();
+    let listener = UnixListener::bind(&sock).expect("bind, never accept");
+    let us = std::process::id();
+    assert_eq!(
+        front_door_ask_at(&path, ("status\n", HANG_DETECTOR), |pid| pid == us),
+        FrontDoorAnswer::Stopped(us)
+    );
+    listener.set_nonblocking(true).expect("nonblocking");
+    while let Ok((mut conn, _)) = listener.accept() {
+        conn.set_nonblocking(false).expect("blocking");
+        let mut sent = String::new();
+        conn.read_to_string(&mut sent).expect("the queued bytes");
+        assert_eq!(sent, "", "nothing is sent to a stopped aterm");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

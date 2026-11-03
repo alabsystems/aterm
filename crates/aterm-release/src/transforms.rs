@@ -35,11 +35,24 @@ impl Inputs {
     }
 }
 
+const GIT_REDIRECTS: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
 fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+    cmd.arg("-C").arg(dir).arg("--no-optional-locks").args(args);
+    for key in GIT_REDIRECTS {
+        cmd.env_remove(key);
+    }
+    let out = cmd
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .output()
         .map_err(|e| format!("cannot run git: {e}"))?;
@@ -70,7 +83,7 @@ pub fn run(inputs: &Inputs) -> Result<Vec<String>, String> {
         }
         if !withheld.is_empty() {
             let text =
-                std::fs::read_to_string(&lock).map_err(|e| format!("{}: {e}", lock.display()))?;
+                crate::durable::read_text(&lock).map_err(|e| format!("{}: {e}", lock.display()))?;
             if let Some((pruned, gone)) = prune_lock(&text, &withheld)? {
                 std::fs::write(&lock, pruned).map_err(|e| format!("{}: {e}", lock.display()))?;
                 for package in gone {
@@ -218,7 +231,7 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
         }
     }
     let root_manifest = dest.join("Cargo.toml");
-    let text = std::fs::read_to_string(&root_manifest)
+    let text = crate::durable::read_text(&root_manifest)
         .map_err(|e| format!("{}: {e}", root_manifest.display()))?;
     std::fs::write(&root_manifest, memberless_root(&text)?)
         .map_err(|e| format!("{}: {e}", root_manifest.display()))?;
@@ -232,7 +245,7 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
         if !meta.file_type().is_file() {
             return Err("LICENSE: not a regular file".into());
         }
-        std::fs::read(&path).map_err(|e| format!("LICENSE: {e}"))
+        crate::durable::read_file(&path).map_err(|e| format!("LICENSE: {e}"))
     })?;
     std::fs::write(dest.join("LICENSE"), license).map_err(|e| format!("LICENSE: {e}"))?;
     let named: Vec<String> = crates.iter().map(|c| format!("`{c}`")).collect();
@@ -421,7 +434,7 @@ pub fn astream_closure(export: &Path, sub: &Path, rev: &str) -> Result<Vec<Strin
             .parent()
             .map(|d| d.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
-        let text = std::fs::read_to_string(&manifest)
+        let text = crate::durable::read_text(&manifest)
             .map_err(|e| format!("{}: {e}", manifest.display()))?;
         let rows = dependency_rows(&parse(&text, &rel_manifest.display().to_string())?, true);
         for (_, path, _) in rows {
@@ -533,7 +546,7 @@ fn withheld_packages(inputs: &Inputs) -> Result<std::collections::BTreeSet<Strin
     let mut carried = Vec::new();
     manifests(&inputs.export, &mut carried);
     for manifest in carried {
-        if let Some(name) = std::fs::read_to_string(&manifest)
+        if let Some(name) = crate::durable::read_text(&manifest)
             .ok()
             .as_deref()
             .and_then(name_of)
@@ -691,7 +704,7 @@ fn manifests(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// The files a target table of `kind` named `name` may build from, by default.
-fn default_paths(kind: &str, name: &str) -> Vec<String> {
+fn default_paths(kind: &str, name: &str, package_name: Option<&str>) -> Vec<String> {
     match kind {
         "test" => vec![format!("tests/{name}.rs"), format!("tests/{name}/main.rs")],
         "bench" => vec![
@@ -702,19 +715,30 @@ fn default_paths(kind: &str, name: &str) -> Vec<String> {
             format!("examples/{name}.rs"),
             format!("examples/{name}/main.rs"),
         ],
+        "bin" => {
+            let mut paths = vec![
+                format!("src/bin/{name}.rs"),
+                format!("src/bin/{name}/main.rs"),
+            ];
+            if package_name == Some(name) {
+                paths.push("src/main.rs".to_string());
+            }
+            paths
+        }
         _ => Vec::new(),
     }
 }
 
-/// `key = "value"` at the start of a (possibly indented) line.
+/// `key = "value"` or `key = 'value'` at the start of a (possibly indented) line.
 fn string_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let rest = line.trim_start().strip_prefix(key)?;
-    let rest = rest
-        .trim_start()
-        .strip_prefix('=')?
-        .trim_start()
-        .strip_prefix('"')?;
-    rest.split_once('"')
+    let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+    let (quote, rest) = if let Some(r) = rest.strip_prefix('"') {
+        ('"', r)
+    } else {
+        ('\'', rest.strip_prefix('\'')?)
+    };
+    rest.split_once(quote)
         .map(|(v, _)| v)
         .filter(|v| !v.is_empty())
 }
@@ -722,6 +746,9 @@ fn string_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 /// `text` (a Cargo.toml in `dir`) without the target tables whose file is not there,
 /// and what was dropped: (kind, name).
 fn strip_manifest(text: &str, dir: &Path) -> Option<(String, Vec<(String, String)>)> {
+    let package_name = aterm_toml::from_str::<aterm_toml::Value>(text)
+        .ok()
+        .and_then(|v| v.get("package")?.get("name")?.as_str().map(str::to_string));
     let lines: Vec<&str> = text.split('\n').collect();
     let starts: Vec<usize> = (0..lines.len())
         .filter(|i| lines[*i].starts_with('['))
@@ -763,10 +790,13 @@ fn strip_manifest(text: &str, dir: &Path) -> Option<(String, Vec<(String, String
             }
             let candidates = match (path, name) {
                 (Some(p), _) => vec![p.to_string()],
-                (None, Some(n)) => default_paths(kind, n),
+                (None, Some(n)) => default_paths(kind, n, package_name.as_deref()),
                 (None, None) => Vec::new(),
             };
-            if !candidates.is_empty() && !candidates.iter().any(|c| dir.join(c).exists()) {
+            let has_regular_file = candidates.iter().any(|c| {
+                std::fs::symlink_metadata(dir.join(c)).is_ok_and(|m| m.file_type().is_file())
+            });
+            if !candidates.is_empty() && !has_regular_file {
                 dropped.push((kind.to_string(), name.unwrap_or("").to_string()));
                 continue;
             }
@@ -790,7 +820,7 @@ fn strip_targets(export: &Path) -> Result<Vec<(String, String, String)>, String>
     manifests(export, &mut found);
     let mut dropped = Vec::new();
     for manifest in found {
-        let text = std::fs::read_to_string(&manifest)
+        let text = crate::durable::read_text(&manifest)
             .map_err(|e| format!("{}: {e}", manifest.display()))?;
         let dir = manifest.parent().unwrap_or(export);
         if let Some((stripped, gone)) = strip_manifest(&text, dir) {
@@ -810,14 +840,22 @@ fn strip_targets(export: &Path) -> Result<Vec<(String, String, String)>, String>
 /// [`rewrite`] over every text file of the tree (a file holding a NUL is binary and
 /// left alone; symlinks are not followed).
 fn rewrite_tree(dir: &Path) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if !meta.file_type().is_dir() {
+        return Err(format!("{}: not a plain directory", dir.display()));
+    }
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    for e in entries.flatten() {
+    for entry in entries {
+        let e = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
         let path = e.path();
-        let Ok(kind) = e.file_type() else { continue };
+        let kind = e
+            .file_type()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         if kind.is_dir() {
             rewrite_tree(&path)?;
         } else if kind.is_file() {
-            let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let bytes =
+                crate::durable::read_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             if bytes.contains(&0) {
                 continue;
             }
@@ -920,5 +958,28 @@ mod tests {
              \"suite\"\npath = \"tests/suite.rs\"\n\n[lints]\nworkspace = true\n"
         );
         assert_eq!(strip_manifest(&text, dir.path()), None);
+
+        // NEGATIVE CONTROL: pathless `[[bin]]` targets strip when `src/bin/<name>.rs` is
+        // withheld, while the package's own `[[bin]]` backed by `src/main.rs` stays; and a
+        // symlinked `rewrite_tree` root is refused.
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let bins = "[package]\nname = \"fixture\"\n\n[[bin]]\nname = \"fixture\"\n\n\
+                    [[bin]]\nname = 'dev_helper'\n";
+        let (bins_text, bins_dropped) = strip_manifest(bins, dir.path()).unwrap();
+        assert_eq!(
+            bins_dropped,
+            [("bin".to_string(), "dev_helper".to_string())]
+        );
+        assert_eq!(
+            bins_text,
+            "[package]\nname = \"fixture\"\n\n[[bin]]\nname = \"fixture\"\n"
+        );
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("export-link");
+            std::os::unix::fs::symlink(dir.path().join("src"), &link).unwrap();
+            assert!(rewrite_tree(&link).is_err());
+        }
     }
 }

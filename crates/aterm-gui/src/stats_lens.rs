@@ -4289,8 +4289,16 @@ fn jobs_section(c: Ctx<'_>) -> Section<'_> {
         let frac = r
             .phi_milli
             .map_or(crate::stats_paint::QUIET_ARC, crate::stats_paint::quiet_arc);
-        let short = match r.quiet_ms {
-            Some(q) if matches!(r.verdict, Verdict::Stuck | Verdict::Quiet) => format!(
+        let short = match (r.working_descendant, r.quiet_ms) {
+            (Some(_), Some(q)) if matches!(r.verdict, Verdict::Stuck | Verdict::Quiet) => format!(
+                "local {} {}, child activity",
+                r.verdict.word(),
+                aterm_vitals::jobs::wire::age_words(q)
+            ),
+            (Some(_), None) if matches!(r.verdict, Verdict::Stuck | Verdict::Quiet) => {
+                format!("local {}, child activity", r.verdict.word())
+            }
+            (_, Some(q)) if matches!(r.verdict, Verdict::Stuck | Verdict::Quiet) => format!(
                 "{} {}",
                 r.verdict.word(),
                 aterm_vitals::jobs::wire::age_words(q)
@@ -4324,16 +4332,26 @@ fn jobs_section(c: Ctx<'_>) -> Section<'_> {
         ));
     }
     lines.sort_by_key(|(mark, ..)| *mark);
-    let marks = crate::stats_paint::marks_of(view);
-    let summary = if marks.is_empty() {
-        "nothing stuck, quiet or waiting for you".to_owned()
-    } else {
-        marks
-            .iter()
-            .map(|m| m.words())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let scoped = view.rows.iter().filter(|r| tab_ok(r.tab));
+    let zombies: u64 = view
+        .findings
+        .zombies
+        .iter()
+        .filter(|z| z.tab.is_some_and(tab_ok))
+        .map(|z| u64::from(z.count))
+        .sum();
+    let condition = |v| aterm_vitals::jobs::wire::verdict_summary(scoped.clone(), v);
+    let summary = [
+        condition(Verdict::Stuck),
+        (zombies > 0).then(|| format!("{zombies} zombies")),
+        condition(Verdict::Quiet),
+        condition(Verdict::WaitingYou),
+        condition(Verdict::Parked),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ");
     if lines.is_empty() {
         return line_section(
             &name,

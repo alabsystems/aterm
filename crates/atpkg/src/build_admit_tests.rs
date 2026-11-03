@@ -559,10 +559,10 @@ fn a_process_holding_its_own_claim_builds_unclaimed() {
     assert!(matches!(got, Admission::Claimed(_)), "{got:?}");
 }
 
-/// A ledger that cannot be read fails open: one line, and the build runs unclaimed. NEGATIVE
-/// CONTROL: a usable ledger shows the claim.
+/// An unreadable ledger refuses admission and the in-process launch port returns a failure,
+/// rather than delegating an unclaimed execution to its caller. A repaired ledger can claim.
 #[test]
-fn an_unreadable_ledger_fails_open_in_one_line() {
+fn an_unreadable_ledger_refuses_the_build_and_recovers_after_repair() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
     std::fs::write(dir.path().join("ledger"), b"not a directory").expect("a file");
     let m = machine();
@@ -571,14 +571,35 @@ fn an_unreadable_ledger_fails_open_in_one_line() {
     let got = admit(&test_build(), dir.path(), &s, &mut |l| {
         said.push(l.to_owned())
     });
-    assert!(matches!(got, Admission::Open(_)), "{got:?}");
+    assert!(matches!(got, Admission::Refused(_)), "{got:?}");
     assert_eq!(said.len(), 1, "{said:?}");
-    assert!(said[0].contains("runs unclaimed"), "{said:?}");
-    let good = aterm_tempfile::tempdir().expect("scratch");
-    let s = seat(good.path(), &m, std::process::id().wrapping_add(3));
-    let got = admit(&test_build(), good.path(), &s, &mut |_| {});
+    assert!(said[0].contains("no build started"), "{said:?}");
+    #[cfg(unix)]
+    assert_eq!(
+        run_if_claimed_at(
+            Path::new("/bin/echo"),
+            &words(&["--unverified", "build"]),
+            Tool::Targo,
+            &[],
+            dir.path(),
+            &s,
+        ),
+        Some(std::process::ExitCode::from(75)),
+        "the caller must receive a refusal, never an unclaimed-launch fallback"
+    );
+    let mut missing = seat(dir.path(), &m, std::process::id().wrapping_add(3));
+    missing.ledger = None;
+    assert!(matches!(
+        admit(&test_build(), dir.path(), &missing, &mut |_| {}),
+        Admission::Refused(_)
+    ));
+    std::fs::remove_file(dir.path().join("ledger")).expect("remove the fixture's obstruction");
+    // The refused ledger object retains its original namespace judgment. A new admission
+    // observes the repaired path afresh rather than downgrading that old refusal in place.
+    let repaired = seat(dir.path(), &m, std::process::id().wrapping_add(3));
+    let got = admit(&test_build(), dir.path(), &repaired, &mut |_| {});
     assert!(matches!(got, Admission::Claimed(_)), "{got:?}");
-    let listed = Ledger::at(good.path().join("ledger"))
+    let listed = Ledger::at(dir.path().join("ledger"))
         .list()
         .expect("listed");
     assert_eq!(listed.len(), 1);
@@ -1728,6 +1749,8 @@ fn a_reader_finds_the_fronts_ledger_by_the_fronts_own_environment() {
 /// waiting.
 fn record(pid: u32, start_ms: u64, mem: u64, held: bool) -> Record {
     Record {
+        accounting: aterm_capacity::Accounting::Holder,
+        timing: aterm_capacity::TimingEvidence::default(),
         pid,
         start_ms,
         seq: 0,

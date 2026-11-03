@@ -142,7 +142,7 @@ pub(crate) fn collect_harness_stats(
 pub(crate) fn idle_ready_min_under(state_dir: &Path, now_ms: i64) -> Option<u64> {
     use aterm_agent::supervise::occupancy::ring;
     let path = ring::ring_path(state_dir);
-    let body = std::fs::read_to_string(path).ok()?;
+    let body = crate::occupancy_ring::read_ring_text(&path).ok()?;
     let rows = ring::rows_in(&body);
     let since = now_ms.saturating_sub(aterm_agent::supervise::occupancy::rules::DAY_MS);
     Some(ring::idle_ready_ms(&rows, since) / 60_000)
@@ -1038,6 +1038,7 @@ impl HarnessState {
             landing: self.sessions.iter().filter(wears(ChipFace::Land)).count(),
             landed: self.sessions.iter().filter(wears(ChipFace::Landed)).count(),
             quiet: self.sessions.iter().filter(wears(ChipFace::Theirs)).count(),
+            failed: self.sessions.iter().filter(wears(ChipFace::Failed)).count(),
             off: self.sessions.iter().filter(|s| !s.view.carries()).count(),
             pinned_off: steered().filter(|s| s.word == Some(Autopilot::Off)).count(),
             cruise: count(EveryPress::Mode(Autopilot::Cruise)),
@@ -1047,6 +1048,7 @@ impl HarnessState {
             cruise_landing: steered().filter(wears(ChipFace::Land)).count(),
             cruise_landed: steered().filter(wears(ChipFace::Landed)).count(),
             cruise_quiet: steered().filter(wears(ChipFace::Theirs)).count(),
+            cruise_failed: steered().filter(wears(ChipFace::Failed)).count(),
             cruise_timed: steered()
                 .filter(|s| mode(s) == Some(Autopilot::Cruise) && s.armed_at_ms.is_some())
                 .count(),
@@ -1730,7 +1732,7 @@ impl HarnessSessionRow {
             .map_or(self.detail.as_str(), |(lead, _)| lead)
     }
 
-    /// The row's STATE LINE (§9.3.4, §10.2.3 item 2), led by the loop's outage wait where one stands (`waiting: API overload · next try 18:41 · `, §14.17.5.2), then under Land by the one ask the person's switch over a held tab owed while its answer is unread ([`aterm_agent::harness::acts::SWITCH_ASKED`], v6 §14.17 item 3), then by the stop of whoever drives it (aterm's, or a codex-alab's under its own proven claim: [`crate::App::shown_stop`], §14.3.2) while the chip carries a mode (`stopped typing: the same reply twice, no work · types again at your turn or once the agent works · `, naming `your switch to Land` under Cruise, where it asks, §14.3; a self-claim's in its holder's name, `codex-alab stopped typing: …`, with its own loop's restart, [`crate::harness_glass::ShownStop::words`]), then by a harness's need where one stands (`needs you: … (+1 more); carrying on · `, §12.2.1), then formatted from its glass under its view as the chip's face reads it ([`ChipFace::of`]): `lands at 18:00` (`lands Sat 16:00` on another day), under `⤓ land` Land's hold of whoever drives it ([`crate::App::shown_hold`], §14.3.3: `not landed yet: … · landing since 14:02 · 3 nudges`; a self-claim's in its holder's name, `codex-alab: not landed yet: …`, unless its stop named it first, [`crate::harness_glass::ShownHold::words`]), under Land `landed 17:42` with what aterm checked there and what the agent said ([`Self::landed_line`], §14.9 slice 9c) and `quiet: a person's own exchange`; else the loop's pause after short turns (`pausing until 18:41 (3 short turns in a row)`, §10.5.1), which a stop drops; else the trail's newest act (`last: ✓ approved 14:05`; a self-claim's named for its holder, `last: codex-alab: ✓ approved 14:05`).
+    /// The row's STATE LINE (§9.3.4, §10.2.3 item 2), led by the loop's outage wait where one stands (`waiting: API overload · next try 18:41 · `, §14.17.5.2), then under Land by the one ask the person's switch over a held tab owed while its answer is unread ([`aterm_agent::harness::acts::SWITCH_ASKED`], v6 §14.17 item 3), then by the stop of whoever drives it (aterm's, or a codex-alab's under its own proven claim: [`crate::App::shown_stop`], §14.3.2) while the chip carries a mode (`stopped typing: the same reply twice, no work · types again at your turn or once the agent works · `, naming `your switch to Land` under Cruise, where it asks, §14.3; a self-claim's in its holder's name, `codex-alab stopped typing: …`, with its own loop's restart, [`crate::harness_glass::ShownStop::words`]), then by a harness's need where one stands (`needs you: … (+1 more); carrying on · `, §12.2.1), then formatted from its glass under its view as the chip's face reads it ([`ChipFace::of`]): `lands at 18:00` (`lands Sat 16:00` on another day), under Land's `⤓` the hold of whoever drives it ([`crate::App::shown_hold`], §14.3.3: `not landed yet: … · landing since 14:02 · 3 nudges`; a self-claim's in its holder's name, `codex-alab: not landed yet: …`, unless its stop named it first, [`crate::harness_glass::ShownHold::words`]), under Land `landed 17:42` with what aterm checked there and what the agent said ([`Self::landed_line`], §14.9 slice 9c) and `quiet: a person's own exchange`; else the loop's pause after short turns (`pausing until 18:41 (3 short turns in a row)`, §10.5.1), which a stop drops; else the trail's newest act (`last: ✓ approved 14:05`; a self-claim's named for its holder, `last: codex-alab: ✓ approved 14:05`).
     #[must_use]
     pub(crate) fn state_line(&self) -> Option<String> {
         let glass = &self.glass;
@@ -1753,6 +1755,7 @@ impl HarnessSessionRow {
             ChipFace::CruiseUntil => glass.land_at.map(lands),
             ChipFace::Landed => Some(self.landed_line(at("landed"))),
             ChipFace::Theirs => Some("quiet: a person's own exchange".to_owned()),
+            ChipFace::Failed => Some(format!("failed: {}", crate::claude_lights::FAILED_EXPLAINS)),
             ChipFace::Land => hold
                 .and_then(|hold| {
                     hold.words(
@@ -2029,6 +2032,7 @@ pub(crate) struct EveryRow {
     pub(crate) landing: usize,
     pub(crate) landed: usize,
     pub(crate) quiet: usize,
+    pub(crate) failed: usize,
     pub(crate) off: usize,
     pub(crate) pinned_off: usize,
     pub(crate) cruise: usize,
@@ -2038,6 +2042,7 @@ pub(crate) struct EveryRow {
     pub(crate) cruise_landing: usize,
     pub(crate) cruise_landed: usize,
     pub(crate) cruise_quiet: usize,
+    pub(crate) cruise_failed: usize,
     pub(crate) cruise_timed: usize,
     pub(crate) follow_timed: usize,
     pub(crate) follow_to_off: usize,
@@ -2054,12 +2059,17 @@ pub(crate) fn sessions_words(n: usize) -> String {
     }
 }
 
-fn under_land(landing: usize, landed: usize, quiet: usize) -> Vec<String> {
-    [(landing, "landing"), (landed, "landed"), (quiet, "quiet")]
-        .into_iter()
-        .filter(|(n, _)| *n > 0)
-        .map(|(n, word)| format!("{n} {word}"))
-        .collect()
+fn under_land(landing: usize, landed: usize, quiet: usize, failed: usize) -> Vec<String> {
+    [
+        (landing, "landing"),
+        (landed, "landed"),
+        (quiet, "quiet"),
+        (failed, "failed"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, word)| format!("{n} {word}"))
+    .collect()
 }
 
 impl EveryRow {
@@ -2076,7 +2086,7 @@ impl EveryRow {
         }
     }
 
-    /// What is there now, beside the buttons: `6 sessions: 3 cruising, 1 landing, 1 landed, 1 off` (`3 cruising (2 timed)` where timers are armed; a session under Land by its chip's face, `landing`, `landed` or `quiet`, §12.4.1; a zero part is not said); where the harness steers none of them, why, in the rows' own short words (`3 sessions · harness off in Settings`), which fit where a row's detail fits.
+    /// What is there now, beside the buttons: `6 sessions: 3 cruising, 1 landing, 1 landed, 1 off` (`3 cruising (2 timed)` where timers are armed; a session under Land by its chip's face, `landing`, `landed`, `quiet` or `failed`, §12.4.1; a zero part is not said); where the harness steers none of them, why, in the rows' own short words (`3 sessions · harness off in Settings`), which fit where a row's detail fits.
     #[must_use]
     pub(crate) fn line(&self) -> String {
         let all = sessions_words(self.sessions);
@@ -2091,7 +2101,12 @@ impl EveryRow {
                 format!("{} cruising", self.cruising)
             });
         }
-        parts.extend(under_land(self.landing, self.landed, self.quiet));
+        parts.extend(under_land(
+            self.landing,
+            self.landed,
+            self.quiet,
+            self.failed,
+        ));
         if self.off > 0 {
             parts.push(format!("{} off", self.off));
         }
@@ -2161,8 +2176,12 @@ impl EveryRow {
                 "No session is under Land or timed, so this changes nothing".to_string()
             }
             EveryPress::Mode(Autopilot::Cruise) => {
-                let mut how =
-                    under_land(self.cruise_landing, self.cruise_landed, self.cruise_quiet);
+                let mut how = under_land(
+                    self.cruise_landing,
+                    self.cruise_landed,
+                    self.cruise_quiet,
+                    self.cruise_failed,
+                );
                 if self.cruise_timed > 0 {
                     how.push(format!("{} timed", self.cruise_timed));
                 }
@@ -3414,9 +3433,52 @@ fn load_custom_host_names() -> std::collections::BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+const MAX_MACHINES_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+fn read_machines_file(path: &Path, nofollow: bool) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut flags = libc::O_NONBLOCK | libc::O_CLOEXEC;
+        if nofollow {
+            flags |= libc::O_NOFOLLOW;
+        }
+        opts.custom_flags(flags);
+    }
+    #[cfg(not(unix))]
+    if nofollow && std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "machines state file is a symlink",
+        ));
+    }
+    let file = opts.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() > MAX_MACHINES_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "machines file is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    file.take(MAX_MACHINES_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_MACHINES_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "machines file exceeds size bound",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not UTF-8"))
+}
+
 /// The `[names]` overrides `path` (a `machines.toml`) holds (blocking file I/O: a worker's only).
 fn host_names_in(path: &Path) -> std::collections::BTreeMap<String, String> {
-    std::fs::read_to_string(path)
+    read_machines_file(path, false)
         .map(|content| custom_host_names_in(&content))
         .unwrap_or_default()
 }
@@ -4076,18 +4138,17 @@ fn collect_remote_machines_tabs(
         let machines_dir = config_dir.join("machines");
         let toml_path = machines_dir.join("machines.toml");
         state_dir_opt = Some(machines_dir.join("state"));
-        if let Ok(content) = std::fs::read_to_string(&toml_path) {
+        if let Ok(content) = read_machines_file(&toml_path, false) {
             configured = configured_hosts_in(&content, &custom_names);
         }
     }
     let mut tabs = Vec::new();
     for (uuid, identity_name, name, address) in configured {
-        let state_json = state_dir_opt
-            .as_ref()
-            .and_then(|sd| std::fs::read_to_string(sd.join(format!("{uuid}.json"))).ok())
-            .and_then(|s| aterm_json::from_str::<aterm_json::Value>(&s).ok());
+        let state = state_dir_opt.as_ref().map_or(Ok(None), |directory| {
+            read_cached_machine_state(&directory.join(format!("{uuid}.json")))
+        });
         let (cached, host_tabs) =
-            cached_configured_computer(uuid, name, address, state_json.as_ref());
+            cached_configured_computer(uuid, name, address, CachedMachineState::from_read(&state));
         merge_cached_computer(
             &mut computers,
             &known_swarm_names,
@@ -4191,21 +4252,92 @@ fn sweep_lan_after_the_step(
     None
 }
 
+/// An absent state file is distinct from an unreadable or malformed one.
+fn read_cached_machine_state(path: &Path) -> std::io::Result<Option<aterm_json::Value>> {
+    match read_machines_file(path, true) {
+        Ok(raw) => aterm_json::from_str(&raw)
+            .map(Some)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CachedMachineState<'a> {
+    Missing,
+    Unreadable,
+    Parsed(&'a aterm_json::Value),
+}
+
+impl<'a> CachedMachineState<'a> {
+    fn from_read(read: &'a std::io::Result<Option<aterm_json::Value>>) -> Self {
+        match read {
+            Ok(value) => Self::from_json(value.as_ref()),
+            Err(_) => Self::Unreadable,
+        }
+    }
+
+    fn from_json(value: Option<&'a aterm_json::Value>) -> Self {
+        value.map_or(Self::Missing, Self::Parsed)
+    }
+
+    fn json(self) -> Option<&'a aterm_json::Value> {
+        match self {
+            Self::Parsed(value) => Some(value),
+            Self::Missing | Self::Unreadable => None,
+        }
+    }
+}
+
+/// Contact fields persisted by `aterm_machines::controller::inventory::HostState`.
+/// A run's `last_refusal` is separate from whether contact succeeded.
+#[derive(serde::Deserialize)]
+struct CachedHostContact {
+    #[serde(default)]
+    last_seen: u64,
+    #[serde(default)]
+    unreachable_since: Option<u64>,
+    #[serde(default)]
+    contact_error: Option<(u64, String)>,
+}
+
+fn cached_contact_status(state: CachedMachineState<'_>) -> String {
+    use aterm_types::rfc3339::format_rfc3339;
+
+    let state_json = match state {
+        CachedMachineState::Missing => return "contact unobserved".to_owned(),
+        CachedMachineState::Unreadable => return "contact state unreadable".to_owned(),
+        CachedMachineState::Parsed(value) => value,
+    };
+    let Ok(contact) = aterm_json::from_value::<CachedHostContact>(state_json.clone()) else {
+        return "contact state unreadable".to_owned();
+    };
+    let last_seen = if contact.last_seen == 0 {
+        "never reached".to_owned()
+    } else {
+        format!("last seen {}", format_rfc3339(contact.last_seen))
+    };
+    if let Some(since) = contact.unreachable_since {
+        format!("unreachable since {}; {last_seen}", format_rfc3339(since))
+    } else if let Some((since, _)) = contact.contact_error {
+        format!(
+            "contact failed since {}; {last_seen}",
+            format_rfc3339(since)
+        )
+    } else {
+        last_seen
+    }
+}
+
 fn cached_configured_computer(
     uuid: String,
     name: String,
     address: String,
-    state_json: Option<&aterm_json::Value>,
+    state: CachedMachineState<'_>,
 ) -> (TabComputer, Vec<TabSpreadsheetRow>) {
     let mut tabs = Vec::new();
-    let last_seen = state_json
-        .as_ref()
-        .and_then(|v| v.get("last_seen"))
-        .and_then(|v| v.as_u64());
-    let last_error = state_json
-        .as_ref()
-        .and_then(|v| v.get("last_error"))
-        .and_then(|v| v.as_str());
+    let state_json = state.json();
     let hello_json = state_json
         .as_ref()
         .and_then(|v| v.get("hello"))
@@ -4217,12 +4349,7 @@ fn cached_configured_computer(
         .and_then(|v| v.as_str())
         .filter(|version| !version.trim().is_empty())
         .map(|s| format!("macOS {s}"));
-    let status = match (last_seen, last_error) {
-        (Some(_), None) => "online (ssh)".to_string(),
-        (Some(_), Some(_)) => "standby".to_string(),
-        (None, Some(_)) => "offline".to_string(),
-        (None, None) => "configured".to_string(),
-    };
+    let status = cached_contact_status(state);
     let sessions = hello_json
         .as_ref()
         .and_then(|h| h.get("sessions"))

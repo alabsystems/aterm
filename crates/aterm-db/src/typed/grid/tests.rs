@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::{
-    alab::registry::{ACCOUNT, ADDRESS, MACHINE, MAILBOX, REGISTRY, SEAT},
+    alab::registry::{ACCOUNT, ADDRESS, MACHINE, MAILBOX, PREFERENCE, REGISTRY},
     typed::keys,
 };
 use astream_wire::sync::{Actor, Header, Index};
@@ -463,22 +463,25 @@ fn read_only_columns_and_bad_values_refuse_and_name_no_value() {
     );
 }
 
-/// A deleted grid row is retired, so its history stays; a deleted seat's slot ends instead (the
-/// table names seats among the collections whose rows end).
+/// A deleted grid row is retired, so its history stays; a deleted preference ends instead (the
+/// table names preferences among the collections whose rows end).
 /// NEGATIVE CONTROL: with the deleted-rows pass of `plan` removed, deleting the row plans nothing:
 /// `` assertion `left == right` failed  left: [] right: ["mc-0000000000000009"] ``.
 #[test]
-fn a_deleted_row_retires_and_a_deleted_seat_ends() {
+fn a_deleted_row_retires_and_a_deleted_preference_ends() {
     let mut book = Book::new();
     book.write(1, &[], machine(MC));
-    let seat = keys::seat_pk(MC, 2).unwrap();
+    let account = keys::account_pk("claude", "ann.lee@example.invalid").unwrap();
+    let machine_pk = keys::machine_pk("m3");
+    let preference = keys::preference_pk(&machine_pk, &account).unwrap();
     book.write(
         1,
         &[],
         vec![
-            put(&SEAT, &seat, "role", json!("home")),
-            put(&SEAT, &seat, "why", json!("owner")),
-            put(&SEAT, &seat, "row", json!("live")),
+            put(&PREFERENCE, &preference, "machine", json!(machine_pk)),
+            put(&PREFERENCE, &preference, "account", json!(account)),
+            put(&PREFERENCE, &preference, "why", json!("owner")),
+            put(&PREFERENCE, &preference, "row", json!("live")),
         ],
     );
     let cells = book.cells();
@@ -493,12 +496,12 @@ fn a_deleted_row_retires_and_a_deleted_seat_ends() {
         settled.rows[0][0].value.as_ref().unwrap()["x"],
         json!("retired")
     );
-    let seats = export(&REGISTRY, &SEAT, &cells, &[], false).unwrap();
+    let preferences = export(&REGISTRY, &PREFERENCE, &cells, &[], false).unwrap();
     let ended = plan(
         &REGISTRY,
-        &SEAT,
-        &seats.base,
-        &delete(&seats.text, record(&seats.text, &seat)),
+        &PREFERENCE,
+        &preferences.base,
+        &delete(&preferences.text, record(&preferences.text, &preference)),
         &no_birth,
     )
     .unwrap();
@@ -512,6 +515,44 @@ fn a_deleted_row_retires_and_a_deleted_seat_ends() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// A preference's key comes from its pair, so a saved edit of either cell is refused, naming the
+/// way to say it: end the row and add another. Its other cells stay editable.
+/// NEGATIVE CONTROL: with `.fixed()` off `PREFERENCE`'s `machine`, the edit plans: `` called
+/// `Result::unwrap_err()` on an `Ok` value ``.
+#[test]
+fn a_preferences_pair_is_not_edited() {
+    let account = keys::account_pk("claude", "ann.lee@example.invalid").unwrap();
+    let machine_pk = keys::machine_pk("m3");
+    let preference = keys::preference_pk(&machine_pk, &account).unwrap();
+    let mut book = Book::new();
+    book.write(
+        1,
+        &[],
+        vec![
+            put(&PREFERENCE, &preference, "machine", json!(machine_pk)),
+            put(&PREFERENCE, &preference, "account", json!(account)),
+            put(&PREFERENCE, &preference, "why", json!("owner")),
+            put(&PREFERENCE, &preference, "row", json!("live")),
+        ],
+    );
+    let cells = book.cells();
+    let sheet = export(&REGISTRY, &PREFERENCE, &cells, &[], false).unwrap();
+    let other = keys::machine_pk("m5");
+    let edited = sheet.text.replace(&machine_pk, &other);
+    let problems = plan(&REGISTRY, &PREFERENCE, &sheet.base, &edited, &no_birth).unwrap_err();
+    assert!(
+        format!("{problems:?}").contains("end this row"),
+        "{problems:?}"
+    );
+    let ranked = sheet.text.replacen(
+        &format!("{machine_pk}\t{account}\t\t"),
+        &format!("{machine_pk}\t{account}\t2\t"),
+        1,
+    );
+    assert_ne!(ranked, sheet.text);
+    assert!(plan(&REGISTRY, &PREFERENCE, &sheet.base, &ranked, &no_birth).is_ok());
 }
 
 /// A new grid row with its pk left empty is born under the key its natural columns derive (an
@@ -628,6 +669,7 @@ fn a_born_row_a_peer_made_meanwhile_is_written_all_or_nothing() {
     );
     let settled = settle(&ADDRESS, &plan, &book.cells());
     assert_eq!(settled.rows.len(), 0);
+    assert!(settled.born.is_empty());
     assert_eq!(settled.unchanged, 1);
     let mut stale: Vec<&str> = settled.stale.iter().map(|s| s.column.as_str()).collect();
     stale.sort_unstable();
@@ -689,4 +731,84 @@ fn the_baseline_reads_back_as_it_was_stored() {
     let accounts = layout(&ACCOUNT, &Projection::default());
     let billing = accounts.iter().find(|c| c.name == "billing").unwrap();
     assert_eq!(billing.header(), "=billing");
+}
+
+/// Malformed baselines (empty headers, missing `=pk`, duplicate headers or rows, unknown fields)
+/// are refused without panicking, and `--where` filters validate and canonicalize set elements.
+/// NEGATIVE CONTROLS: without `header.last() == Some("=pk")`, `plan` panics on `width - 1` when
+/// `header` is empty; without typed set element canonicalization, `Where::parse("aliases=M1")`
+/// fails to match `"m1"`.
+#[test]
+fn malformed_baselines_and_set_filters_fail_closed_and_canonicalize() {
+    let mut book = Book::new();
+    let mut m = machine(MC);
+    m.push(elem(&MACHINE, MC, "aliases", "m1"));
+    book.write(1, &[], m);
+    let cells = book.cells();
+    let exported = export(&REGISTRY, &MACHINE, &cells, &[], false).unwrap();
+
+    let mut empty_header = exported.base.clone();
+    empty_header.header.clear();
+    assert!(
+        super::plan(
+            &REGISTRY,
+            &MACHINE,
+            &empty_header,
+            &exported.text,
+            &no_birth
+        )
+        .is_err()
+    );
+
+    let valid_json = exported.base.to_json();
+    for header in [
+        json!([]),
+        json!(["label", "status"]),
+        json!(["label", "=label", "=pk"]),
+    ] {
+        let mut bad = valid_json.clone();
+        bad.as_object_mut().unwrap().insert("header".into(), header);
+        assert!(Base::from_json(&bad).is_err());
+    }
+
+    let mut extra_field = valid_json.clone();
+    extra_field
+        .as_object_mut()
+        .unwrap()
+        .insert("extra".into(), json!(1));
+    assert!(Base::from_json(&extra_field).is_err());
+
+    let mut dup_row = valid_json;
+    let first_row = dup_row["rows"][0].clone();
+    dup_row
+        .as_object_mut()
+        .unwrap()
+        .get_mut("rows")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()
+        .push(first_row);
+    assert!(Base::from_json(&dup_row).is_err());
+
+    assert!(Where::parse("=active").is_err());
+    let proj = cell::project(&MACHINE, &cells);
+    let row = &proj.rows[MC];
+    assert!(
+        Where::parse("aliases=M1")
+            .unwrap()
+            .matches(&MACHINE, MC, row)
+            .unwrap()
+    );
+    assert!(
+        !Where::parse("aliases=")
+            .unwrap()
+            .matches(&MACHINE, MC, row)
+            .unwrap()
+    );
+    assert!(
+        Where::parse("aliases=not-a-label")
+            .unwrap()
+            .matches(&MACHINE, MC, row)
+            .is_err()
+    );
 }

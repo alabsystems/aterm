@@ -266,6 +266,54 @@ impl std::fmt::Display for TailFault {
     }
 }
 
+/// Validate a non-`PAD` tail record header and return its bounded payload byte length.
+///
+/// # Errors
+/// Returns the [`TailFault`] that stops tail replay before allocating or reading payload bytes.
+pub fn validate_tail_header(header: &TailHeader) -> Result<usize, TailFault> {
+    if header.reserved != 0 {
+        return Err(TailFault::BadFlags);
+    }
+    let payload_len = usize::try_from(header.payload_len).map_err(|_| TailFault::BadLength)?;
+    match header.kind {
+        KIND_BYTES => {
+            if !matches!(header.flags, 0 | 1) {
+                return Err(TailFault::BadFlags);
+            }
+            if payload_len > MAX_BYTES_PAYLOAD {
+                return Err(TailFault::BadLength);
+            }
+            Ok(payload_len)
+        }
+        KIND_RESIZE => {
+            policy_of(header.flags).ok_or(TailFault::BadFlags)?;
+            if payload_len != RESIZE_PAYLOAD {
+                return Err(TailFault::BadLength);
+            }
+            Ok(payload_len)
+        }
+        KIND_RESIZES_LOST => {
+            if header.flags != 0 {
+                return Err(TailFault::BadFlags);
+            }
+            if payload_len != RESIZES_LOST_PAYLOAD {
+                return Err(TailFault::BadLength);
+            }
+            Ok(payload_len)
+        }
+        KIND_ENGINE_REPLACED | KIND_SUPERSEDED => {
+            if header.flags != 0 {
+                return Err(TailFault::BadFlags);
+            }
+            if payload_len != 0 {
+                return Err(TailFault::BadLength);
+            }
+            Ok(0)
+        }
+        other => Err(TailFault::UnknownKind(other)),
+    }
+}
+
 /// Decode and validate a tail record payload against `header`.
 ///
 /// # Errors
@@ -274,20 +322,15 @@ pub fn decode_tail_payload<'a>(
     header: &TailHeader,
     payload: &'a [u8],
 ) -> Result<TailRecord<'a>, TailFault> {
-    if header.reserved != 0 {
-        return Err(TailFault::BadFlags);
-    }
-    if usize::try_from(header.payload_len).ok() != Some(payload.len()) {
+    let expected_len = validate_tail_header(header)?;
+    if payload.len() != expected_len {
         return Err(TailFault::BadLength);
     }
     match header.kind {
-        KIND_BYTES => match header.flags {
-            0 | 1 => Ok(TailRecord::Bytes {
-                synthesized: header.flags == 1,
-                bytes: payload,
-            }),
-            _ => Err(TailFault::BadFlags),
-        },
+        KIND_BYTES => Ok(TailRecord::Bytes {
+            synthesized: header.flags == 1,
+            bytes: payload,
+        }),
         KIND_RESIZE => {
             let policy = policy_of(header.flags).ok_or(TailFault::BadFlags)?;
             let Some(

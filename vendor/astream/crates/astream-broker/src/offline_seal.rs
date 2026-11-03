@@ -759,7 +759,11 @@ fn seal_keyed(path: &Path, key: &[u8; 32], seam: &Seam) -> io::Result<SealedLog>
     sync_parent_dir(&staged)?;
     seam.crash(Step::Staged)?;
     let sealed_len = sealed_log.len() as u64;
-    let newest = sealed_log.split_off(newest_at.min(sealed_log.len()));
+    let split_at = newest_at.min(sealed_log.len());
+    let mut newest = Vec::new();
+    if let Some(tail) = sealed_log.get(split_at..) {
+        newest.extend_from_slice(tail);
+    }
     drop(sealed_log);
 
     let mut mask = 0u8;

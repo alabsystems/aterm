@@ -77,8 +77,16 @@ const CASES: &[Case] = &[
     (b"\x1b[mX", &[(&[], b"", b'm', 0)]),
     (b"\x1b[1mX", &[(&[1], b"", b'm', 0)]),
     (b"\x1b[1;4:3mX", &[(&[1, 4, 3], b"", b'm', 0b100)]),
-    (b"\x1b[1;4:mX", &[(&[1, 4], b"", b'm', 0)]),
-    (b"\x1b[4:mX", &[(&[4], b"", b'm', 0)]),
+    // A trailing `:` is an empty element, as a trailing `;` is an empty parameter.
+    (b"\x1b[1;4:mX", &[(&[1, 4, 0], b"", b'm', 0b100)]),
+    (b"\x1b[4:mX", &[(&[4, 0], b"", b'm', 0b10)]),
+    (b"\x1b[4::mX", &[(&[4, 0, 0], b"", b'm', 0b110)]),
+    (
+        b"\x1b[38:2::1:2:mX",
+        &[(&[38, 2, 0, 1, 2, 0], b"", b'm', 0b11_1110)],
+    ),
+    (b"\x1b[1;2: qX", &[(&[1, 2, 0], b" ", b'q', 0b100)]),
+    (b"\x1b[5:HX", &[(&[5, 0], b"", b'H', 0b10)]),
 ];
 
 fn expected(case: &Case) -> Dispatched {
@@ -127,6 +135,58 @@ fn a_dcs_header_keeps_its_empty_last_parameter() {
         let shown = String::from_utf8_lossy(bytes);
         for cuts in 0..1u32 << (bytes.len() - 1) {
             assert_eq!(feed_chunked(bytes, cuts), want, "{shown:?} cuts {cuts:#b}");
+        }
+    }
+}
+
+/// The cap's mark: past `MAX_PARAMS` a dropped sub-parameter sets the mask's bit `MAX_PARAMS`, in
+/// every way the bytes can arrive, so a handler can tell a colon group the cap cut from one that
+/// ended there. A dropped plain parameter does not, and a sub-parameter that fits does not.
+#[test]
+fn a_sub_parameter_the_cap_drops_leaves_its_mark() {
+    let group_bits = |from: u32, to: u32| (from..to).fold(0u32, |mask, bit| mask | (1 << bit));
+    let cases = [
+        // A group whose last value fell off the end: 38 is parameter 19, the blue parameter 24.
+        (19, "38:2:3:10:20:9", 24, group_bits(20, 24) | (1 << 24)),
+        // The same group one parameter earlier fits.
+        (18, "38:2:3:10:20:9", 24, group_bits(19, 24)),
+        // No id, ending exactly at the cap: nothing was dropped.
+        (19, "38:2:10:20:9", 24, group_bits(20, 24)),
+        // A trailing colon's empty element is a dropped sub-parameter like any other.
+        (22, "4:3:", 24, (1 << 23) | (1 << 24)),
+        // Plain parameters past the cap leave no mark and stay on the plain dispatch.
+        (24, "1;2", 24, 0),
+    ];
+    for (lead, tail, len, mask) in cases {
+        let bytes = format!("\x1b[{}{tail}mX", "7;".repeat(lead)).into_bytes();
+        let mut whole = Parser::new();
+        let mut sink = RecordingSink::default();
+        whole.advance_fast(&bytes, &mut sink);
+        let got = dispatched(&sink);
+        assert_eq!(got.csi.len(), 1, "{tail} after {lead}");
+        assert_eq!(got.csi[0].0.len(), len, "{tail} after {lead}");
+        assert_eq!(
+            got.csi[0].3, mask,
+            "{tail} after {lead}: {:#x}",
+            got.csi[0].3
+        );
+        let mut byte_at_a_time = Parser::new();
+        let mut sink = RecordingSink::default();
+        for byte in &bytes {
+            byte_at_a_time.advance_fast(std::slice::from_ref(byte), &mut sink);
+            byte_at_a_time.assert_invariants();
+        }
+        assert_eq!(
+            dispatched(&sink),
+            got,
+            "{tail} after {lead}, a byte at a time"
+        );
+        for split in 0..=bytes.len() {
+            assert_eq!(
+                feed_across_carry(&bytes, split),
+                got,
+                "{tail} after {lead}, carried at {split}"
+            );
         }
     }
 }

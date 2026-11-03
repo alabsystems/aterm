@@ -30,6 +30,8 @@ pub mod rate;
 pub mod redact;
 pub mod retry;
 pub mod slug;
+#[cfg(test)]
+mod test_fixtures;
 pub mod wait;
 pub mod wire;
 pub mod write;
@@ -47,47 +49,3 @@ pub use write::{Deleted, Effect, Ensured, Outcome};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The REST API version agh pins (`X-GitHub-Api-Version`), supported until at least 2028-03-10.
 pub const API_VERSION: &str = "2022-11-28";
-
-/// Names each frozen crate-private item whose first caller a later package writes, so the
-/// plain library's `dead_code` lint passes at every commit until then (plan §1, rule 14).
-/// It runs nothing and nothing calls it. No package edits it after WP0b; WP14 deletes it.
-#[doc(hidden)]
-pub fn frozen_roots() {
-    let _ = policy::Router::permit_decided;
-    let _ = policy::Permit::named;
-    let _ = config::edit_writers;
-    let _ = identity::Profile::set_legacy_loose;
-    let _ = identity::provision::add_with_metered;
-    let _ = identity::import::import_from_gh_metered;
-    let _ = Call::write
-        as fn(
-            wire::Method,
-            String,
-            policy::RouteRequest,
-            retry::Idempotency,
-            client::CallBody,
-        ) -> Call;
-    let _ = |call: &Call| call.body.clone();
-    let _ = Github::call_write;
-    let _ = Github::call_write_guarded;
-    let _ = Github::intent_draft;
-    let _ = Github::one_shot;
-    let _ = Github::note_notify;
-    let _ = write::settle_table;
-    let _ = journal::Journal::taped;
-    let _ = github::Releases::create_step;
-    let _ = github::Releases::send_create;
-    let _ = github::Releases::settle_create;
-    let _ = github::Releases::discover;
-    let _ = git::credential::answer;
-    let _ = |asked: &git::credential::Asked<'_>| {
-        asked.stdin_is_terminal
-            || asked.nonce.is_some()
-            || asked.loopback.is_some()
-            || asked.now > 0
-    };
-    let _ = git::grant::write;
-    let _ = git::grant::remove;
-    let _ = git::grant::sweep;
-    let _ = notify::settled;
-}

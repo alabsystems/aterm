@@ -279,7 +279,7 @@ pub fn claim_build_at(
         Admission::Claimed(held) => Ok(Some(held)),
         Admission::Stopped(e) => Err(format!("its memory claim was {e}")),
         Admission::Refused(why) => Err(why),
-        Admission::Covered(_) | Admission::Own(_) | Admission::Open(_) => Ok(None),
+        Admission::Covered(_) | Admission::Own(_) => Ok(None),
     }
 }
 

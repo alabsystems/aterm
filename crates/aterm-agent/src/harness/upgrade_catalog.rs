@@ -8,14 +8,17 @@ use std::path::Path;
 
 use super::upgrade::is_model_id;
 
-/// Whether `s` is a three-part dotted version (`2.1.281`), each part 1-6 digits.
+/// Whether `s` is a three-part dotted version (`2.1.281`), each part 1-6 digits without leading zeros.
 #[must_use]
 pub fn is_version(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
     parts.len() == 3
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.len() <= 6 && p.bytes().all(|b| b.is_ascii_digit()))
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.len() <= 6
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && (p.len() == 1 || !p.starts_with('0'))
+        })
 }
 
 /// `x.y.z` as a comparable triple.
@@ -180,7 +183,7 @@ fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 #[must_use]
 pub fn scan_build(binary: &Path) -> BuildFacts {
     const VNEEDLE: &[u8] = b"VERSION:\"";
-    let Ok(mut f) = std::fs::File::open(binary) else {
+    let Ok((mut f, _)) = super::disk::versions::open_regular_file(binary) else {
         return BuildFacts::default();
     };
     let mut out = BuildFacts::default();
@@ -473,6 +476,16 @@ mod tests {
         };
         assert_eq!(parse_facts(&render_facts(&b)), Some(b));
         assert_eq!(parse_facts("{}"), Some(BuildFacts::default()));
+        for bad in ["02.1.280", "2.01.280", "2.1.0280", "0.0.00"] {
+            assert!(!is_version(bad), "{bad}");
+            assert_eq!(version_triple(bad), None, "{bad}");
+            assert_eq!(
+                parse_facts(&format!(r#"{{"version":"{bad}"}}"#)).and_then(|facts| facts.version),
+                None,
+                "{bad}"
+            );
+        }
+        assert_eq!(version_triple("0.0.0"), Some((0, 0, 0)));
     }
 
     #[test]

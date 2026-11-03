@@ -4081,40 +4081,22 @@ impl Drop for Claimant {
 /// A claimant spawned on a fresh pty ([`CLAIMANT`]).
 #[cfg(target_os = "macos")]
 fn claimant(sock: &std::path::Path, mode: &str) -> Claimant {
-    use aterm_uds::spawnfd::InheritNothing as _;
-    use std::os::fd::{FromRawFd, OwnedFd};
-    use std::os::unix::process::CommandExt;
-    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-    // SAFETY: Both descriptors are fresh and owned by this fixture.
-    let master = unsafe { OwnedFd::from_raw_fd(master) };
-    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
     use std::os::fd::AsRawFd as _;
-    aterm_pty::set_nonblocking(master.as_raw_fd(), true).expect("nonblocking master");
-    let stdio = || std::process::Stdio::from(slave.try_clone().expect("dup slave"));
-    let mut program = std::process::Command::new("/usr/bin/perl");
-    program
-        .inherit_nothing()
-        .env_clear()
-        .env("HOME", sock.parent().expect("scratch socket directory"))
-        .args(["-e", CLAIMANT])
-        .arg(sock)
-        .arg(mode)
-        .stdin(stdio())
-        .stdout(stdio())
-        .stderr(stdio());
-    // SAFETY: Runs in the forked child before exec, after stdio is in place:
-    // `setsid` and `ioctl(TIOCSCTTY)` are async-signal-safe and touch nothing
-    // of the parent's.
-    unsafe {
-        program.pre_exec(|| {
-            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY.into(), 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let child = program.spawn().expect("spawn the claimant");
+    let (master, slave, child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
+        let mut program = std::process::Command::new("/usr/bin/perl");
+        program
+            .env_clear()
+            .env("HOME", sock.parent().expect("scratch socket directory"))
+            .args(["-e", CLAIMANT])
+            .arg(sock)
+            .arg(mode)
+            .stdout(std::process::Stdio::from(slave.try_clone()?))
+            .stderr(std::process::Stdio::from(slave.try_clone()?));
+        Ok(program)
+    })
+    .expect("spawn the claimant");
     drop(slave);
+    aterm_pty::set_nonblocking(master.as_raw_fd(), true).expect("nonblocking master");
     Claimant {
         child,
         master: Some(master),

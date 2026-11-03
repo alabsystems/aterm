@@ -108,6 +108,9 @@ fn measure(json_out: Option<&Path>) -> Result<String, Halt> {
     }
     let (release, opt_test) = (&bins[0], &bins[1]);
     let load_after_build = load_average();
+    // Both harnesses are already built; this observation belongs to execution of the
+    // fixed measurement batch, never to the load before those builds.
+    let _entry = super::measurement_entry().map_err(Halt::Timing)?;
     let mut cold: Vec<(&str, Value, String)> = Vec::new();
     for run in 0..COLD_RUNS {
         for op in COLD_OPS {
@@ -125,6 +128,9 @@ fn measure(json_out: Option<&Path>) -> Result<String, Halt> {
     eprintln!("  export, then import in another process");
     let (export, export_raw) = harness(release, &["--export", &trace_arg])?;
     let (import, import_raw) = harness(release, &["--import", &trace_arg])?;
+    _entry
+        .timing_admission()
+        .map_err(|why| Halt::Timing(why.to_string()))?;
     let load_after = load_average();
     let mut reports: Vec<&Value> = vec![&warm, &stranded, &export, &import];
     reports.extend(cold.iter().map(|(_, v, _)| v));

@@ -358,6 +358,29 @@ fn a_kimi_row_renews_through_its_own_sign_in_and_a_failed_one_changes_nothing() 
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_kimi_row_without_email_renews_through_its_device_flow() {
+    let (tmp, env) = kimi_env("signin-kimi-no-email");
+    let roster = env.accounts_roster_for(Cli::Kimi).expect("roster path");
+    let text = read(&roster).replace("email = \"kimi-one@example.com\"\n", "");
+    std::fs::write(roster, text).expect("email-less roster");
+    let home = tmp.path().join("home");
+    let host = SignInHost::new(Script::Kimi("kimi 0"), &home);
+    let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &host);
+    assert_eq!(code, exit(0), "{out}{err}");
+    assert_eq!(
+        *host.handed.borrow(),
+        [(Some("www.kimi.ai".to_owned()), Some("QXR4-MZK7".to_owned()))],
+        "the unattended approver received the device page and code"
+    );
+    let logins = read(&tmp.path().join("state/accounts-kimi/logins.json"));
+    assert!(
+        logins.contains("kimi-one+1") && logins.contains("\"proved_by\":\"unchecked\""),
+        "{logins}"
+    );
+}
+
 #[test]
 fn a_codex_row_is_proved_by_its_app_servers_account_and_another_account_is_refused() {
     let tmp = tmp_dir("signin-codex");
@@ -403,6 +426,38 @@ fn a_codex_row_is_proved_by_its_app_servers_account_and_another_account_is_refus
         !ledger.contains("oauth/authorize") && !ledger.contains("auth_code_ok"),
         "{ledger}"
     );
+}
+
+#[test]
+fn unavailable_browser_records_codex_renewal_failure_without_a_person_task() {
+    let tmp = tmp_dir("codex-browser-unavailable");
+    let mut env = env_at(&tmp);
+    env.sock = None;
+    let (code, _, err) = run_line(
+        "accounts add codex-one --cli codex --email codex-one@example.com",
+        &env,
+    );
+    assert_eq!(code, exit(0), "{err}");
+    let home = tmp.path().join("home");
+    let host = SignInHost::new(
+        Script::Ends(login_drive::Outcome::NotRun(
+            "pinned browser fetch is unavailable".into(),
+        )),
+        &home,
+    );
+    let (code, out, err) = renew("accounts renew codex-one --cli codex", &env, &host);
+    assert_eq!(code, exit(1), "{out}{err}");
+    assert!(!out.contains("NEEDS YOU"), "{out}");
+    assert!(err.contains("pinned browser fetch is unavailable"), "{err}");
+    let store = env.accounts_store_for(Cli::Codex).unwrap();
+    let (logins, _) = store.load_logins(env.now).unwrap();
+    assert!(
+        logins
+            .get("codex-one")
+            .and_then(|binding| binding.sign_in_task)
+            .is_none()
+    );
+    assert!(read(&store.ledger_path()).contains("browser not-run"));
 }
 
 /// Unix only, as the overlay staging home it signs in to is; off Unix,
@@ -647,10 +702,9 @@ fn accounts_cli_all_lists_each_kept_pool_and_none_is_claudes_empty_report() {
     );
 }
 
-/// A host whose Codex login reader names `account` and whose usage reader is `usage`.
+/// A host whose Codex login reader names `account`.
 struct PoolHost {
     account: Option<&'static str>,
-    usage: Option<crate::harness::accounts_pool::ReadUsage<'static>>,
 }
 
 impl AccountsHost for PoolHost {
@@ -669,9 +723,6 @@ impl AccountsHost for PoolHost {
     fn now(&self) -> i64 {
         1_758_412_900
     }
-    fn usage_reader(&self) -> Option<crate::harness::accounts_pool::ReadUsage<'static>> {
-        self.usage
-    }
     fn codex_account(&self, _: &Path) -> Option<String> {
         self.account.map(str::to_owned)
     }
@@ -684,7 +735,6 @@ fn a_codex_adopt_default_takes_the_email_its_app_server_names() {
     env.sock = None;
     let host = PoolHost {
         account: Some("codex-one@example.com"),
-        usage: None,
     };
     let (code, out, err) = renew("accounts adopt-default codex-1 --cli codex", &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
@@ -699,10 +749,7 @@ fn a_codex_adopt_default_takes_the_email_its_app_server_names() {
     let other = tmp_dir("adopt-codex-none");
     let mut env = env_at(&other);
     env.sock = None;
-    let silent = PoolHost {
-        account: None,
-        usage: None,
-    };
+    let silent = PoolHost { account: None };
     let (code, _, err) = renew("accounts adopt-default codex-1 --cli codex", &env, &silent);
     assert_eq!(code, exit(1), "{err}");
     assert!(err.contains("--email"), "{err}");
@@ -720,10 +767,7 @@ fn codex_adopt_default_checks_an_explicit_canonical_identity() {
         for report in [Some("owner@example.test"), Some("other@example.test"), None] {
             let tmp = tmp_dir("adopt-codex-identity");
             let env = env_at(&tmp);
-            let host = PoolHost {
-                account: report,
-                usage: None,
-            };
+            let host = PoolHost { account: report };
             let (code, out, err) = renew(
                 &format!(
                     "accounts adopt-default account --cli codex --identity-email owner@example.test{alias}"
@@ -757,14 +801,6 @@ fn codex_adopt_default_checks_an_explicit_canonical_identity() {
 
 #[test]
 fn codex_stats_and_adoption_leave_non_file_credentials_untouched() {
-    fn no_file_read(
-        _: Cli,
-        _: &Path,
-        _: Option<&str>,
-        _: i64,
-    ) -> Option<crate::harness::codex_app_login::Usage> {
-        panic!("a non-file backend must not refresh dormant file credentials");
-    }
     for configuration in [
         "cli_auth_credentials_store = 'keyring'",
         "cli_auth_credentials_store = 'auto'",
@@ -776,7 +812,6 @@ fn codex_stats_and_adoption_leave_non_file_credentials_untouched() {
         let env = env_at(&tmp);
         let host = PoolHost {
             account: Some("file-account@example.test"),
-            usage: Some(&no_file_read),
         };
         let path = tmp.path().join("accounts-codex.toml");
         let home = env.home.as_ref().unwrap().join(".codex");
@@ -803,32 +838,10 @@ fn codex_stats_and_adoption_leave_non_file_credentials_untouched() {
     }
 }
 
-fn full_main(
-    cli: Cli,
-    home: &Path,
-    _: Option<&str>,
-    now: i64,
-) -> Option<crate::harness::codex_app_login::Usage> {
-    (cli == Cli::Codex && !home.to_string_lossy().contains("logins")).then(|| {
-        crate::harness::codex_app_login::Usage {
-            sample: accounts::Sample {
-                session_pct: Some(100),
-                session_reset: Some(now + 3600),
-                at: now,
-                ..accounts::Sample::default()
-            },
-            walls: vec![(accounts::SESSION_LIMIT, Some(now + 3600))],
-        }
-    })
-}
-
 #[test]
 fn a_pools_stats_list_each_row_alike_as_text_and_json() {
     let (tmp, env) = kimi_env("stats-kimi");
-    let host = PoolHost {
-        account: None,
-        usage: None,
-    };
+    let host = PoolHost { account: None };
     let (text_code, text, err) = renew("accounts stats --cli kimi", &env, &host);
     let (json_code, json, _) = renew("accounts stats --cli kimi --json", &env, &host);
     assert_eq!(text_code, exit(0), "{err}");
@@ -843,24 +856,57 @@ fn a_pools_stats_list_each_row_alike_as_text_and_json() {
     let rows = doc["rows"].as_array().expect("rows");
     assert!(rows.iter().any(|r| r["label"] == Value::from("kimi-one")));
 
-    // Codex: each row's usage is read in its own home and recorded, so `main` reads limited.
+    // Codex: the report asks no provider. It shows what a launch or a session last read, with its
+    // age, and a row nobody read says so.
     let (code, _, err) = run_line(
         "accounts add codex-one --cli codex --email codex-one@example.com",
         &env,
     );
     assert_eq!(code, exit(0), "{err}");
-    let reads = PoolHost {
-        account: None,
-        usage: Some(&full_main),
-    };
     // `main`, the default home's row, is signed in here only while its login file is there.
     std::fs::create_dir_all(tmp.path().join("home/.codex")).expect("default home");
     std::fs::write(tmp.path().join("home/.codex/auth.json"), "{}").expect("default login");
+    let reads = PoolHost { account: None };
     let (code, out, err) = renew("accounts stats --cli codex", &env, &reads);
     assert_eq!(code, exit(0), "{err}");
     assert!(
-        out.contains("main: limited") && out.contains("5h 100%"),
-        "{out}"
+        !out.contains("5h 100%"),
+        "CONTROL: nothing on record: {out}"
+    );
+    let aged = env.now - 7200;
+    env.accounts_store_for(Cli::Codex)
+        .expect("codex's store")
+        .transact(env.now, &mut None, |state| {
+            let mut events = accounts::note_sample(
+                state,
+                "main",
+                accounts::Sample {
+                    session_pct: Some(100),
+                    session_reset: Some(env.now + 3600),
+                    at: aged,
+                    ..accounts::Sample::default()
+                },
+                aged,
+            );
+            events.extend(accounts::note_wall(
+                state,
+                "main",
+                accounts::SESSION_LIMIT,
+                Some(env.now + 3600),
+                aged,
+                aged,
+            ));
+            Ok(events)
+        })
+        .expect("a reading on record");
+    let (code, out, err) = renew("accounts stats --cli codex", &env, &reads);
+    assert_eq!(code, exit(0), "{err}");
+    assert!(
+        out.contains("main: limited")
+            && out.contains("5h 100%")
+            && out.contains("read 2025-09-20T22:00:00Z")
+            && out.contains("codex-one: not-enrolled · login idle · no reading yet"),
+        "the reading stands with its age: {out}"
     );
 
     // Negative: with no home known, both forms exit 1.
@@ -1426,10 +1472,7 @@ fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
         out.contains("run: aterm harness accounts renew kimi-one --cli kimi"),
         "CONTROL: {out}"
     );
-    let pool = PoolHost {
-        account: None,
-        usage: None,
-    };
+    let pool = PoolHost { account: None };
     for (cli, line) in [
         (Cli::Grok, "accounts --cli grok"),
         (Cli::Grok, "accounts stats --cli grok"),
@@ -2236,4 +2279,296 @@ fn codex_signin_binds_auth_path_overlay_suffixes_reconcile_and_due_renewals_orde
         *plain_host.order.borrow(),
         vec!["kimi-one".to_owned(), "kimi-two".to_owned()]
     );
+}
+
+#[test]
+fn codex_default_completion_preserves_metadata_and_is_idempotent() {
+    for inline in [false, true] {
+        let tmp = tmp_dir("codex-complete");
+        let env = env_at(&tmp);
+        std::fs::create_dir_all(env.home.as_ref().unwrap().join(".codex")).unwrap();
+        let original = if inline {
+            "# keep this\naccount = [{ label = 'main', class = 'shared', identity_email = 'owner@example.test', browser = 'Work' }]\n"
+        } else {
+            "# keep this\n[[account]]\nlabel = 'main'\nclass = 'shared'\nidentity_email = 'owner@example.test'\nbrowser = 'Work' # keep that\n"
+        };
+        let path = tmp.path().join("accounts-codex.toml");
+        std::fs::write(&path, original).unwrap();
+        let host = PoolHost {
+            account: Some("owner@example.test"),
+        };
+        let assert_renewal_metadata = |expected| {
+            let before = read(&path);
+            let (code, out, err) = renew("accounts --cli codex --json", &env, &host);
+            assert_eq!(code, exit(0), "{out}{err}");
+            let value: Value = aterm_json::from_str(out.trim()).unwrap();
+            assert_eq!(value["accounts"][0]["renews"].as_bool(), Some(expected));
+            assert_eq!(read(&path), before, "listing must remain read-only");
+        };
+        assert_renewal_metadata(false);
+        for _ in 0..2 {
+            let (code, out, err) = renew("accounts adopt-default main --cli codex", &env, &host);
+            assert_eq!(code, exit(0), "{out}{err}");
+        }
+        assert_renewal_metadata(true);
+        let edited = read(&path);
+        assert!(edited.contains("# keep this"));
+        if !inline {
+            assert!(edited.contains("# keep that"));
+        }
+        let mut expected = Roster::parse_for(Cli::Codex, original).unwrap().rows;
+        expected[0].email = Some("owner@example.test".into());
+        assert_eq!(
+            Roster::parse_for(Cli::Codex, &edited).unwrap().rows,
+            expected
+        );
+        assert!(
+            !env.accounts_store_for(Cli::Codex)
+                .unwrap()
+                .logins_file()
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn codex_default_completion_rechecks_identity_roster_and_source() {
+    for race in ["identity", "roster", "source", "policy"] {
+        let tmp = tmp_dir("codex-complete-race");
+        let env = env_at(&tmp);
+        std::fs::create_dir_all(env.home.as_ref().unwrap().join(".codex")).unwrap();
+        let path = tmp.path().join("accounts-codex.toml");
+        let original = "[[account]]\nlabel = 'main'\nclass = 'dedicated'\n";
+        std::fs::write(&path, original).unwrap();
+        let calls = Cell::new(0);
+        let result = default_completion::complete(&env, None, |_| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                if race == "roster" {
+                    std::fs::write(&path, format!("{original}held_by = 'm2'\n")).unwrap();
+                }
+                if race == "source" {
+                    let secrets = env.home.as_ref().unwrap().join(".secrets");
+                    std::fs::create_dir_all(&secrets).unwrap();
+                    std::fs::write(secrets.join("ai-accounts-codex.toml"), "[[account]]\nlabel = 'main'\nclass = 'dedicated'\nemail = 'other@example.test'\nmachines = ['m1']\n").unwrap();
+                }
+                if race == "policy" {
+                    std::fs::write(env.config.as_ref().unwrap(), "[harness]\nlogins = 'off'\n")
+                        .unwrap();
+                }
+                if race == "identity" {
+                    return Some("other@example.test".into());
+                }
+            }
+            Some("owner@example.test".into())
+        });
+        assert!(result.is_err(), "{race}: {result:?}");
+        assert!(!read(&path).contains("email ="), "{race}");
+    }
+}
+
+#[test]
+fn codex_default_completion_respects_holds_explicit_metadata_and_backend() {
+    for extra in [
+        "held_by = 'm2'",
+        "email = 'alias@example.test'",
+        "identity_email = 'other@example.test'",
+    ] {
+        let tmp = tmp_dir("codex-complete-preserve");
+        let env = env_at(&tmp);
+        std::fs::create_dir_all(env.home.as_ref().unwrap().join(".codex")).unwrap();
+        let path = tmp.path().join("accounts-codex.toml");
+        let original = format!("[[account]]\nlabel = 'main'\nclass = 'dedicated'\n{extra}\n");
+        std::fs::write(&path, &original).unwrap();
+        let host = PoolHost {
+            account: Some("owner@example.test"),
+        };
+        let (code, _, _) = renew("accounts adopt-default main --cli codex", &env, &host);
+        assert_eq!(code, exit(1));
+        assert_eq!(read(&path), original);
+    }
+}
+
+#[test]
+fn codex_default_completion_runs_in_init_and_upkeep_and_obeys_policy() {
+    for (mode, policy) in [
+        ("init", ""),
+        ("upkeep", ""),
+        ("init", "accounts = 'off'"),
+        ("init", "logins = 'off'"),
+        ("upkeep", "logins = 'off'"),
+    ] {
+        let tmp = tmp_dir("codex-complete-init");
+        let env = env_at(&tmp);
+        let home = env.home.as_ref().unwrap();
+        let login = home.join(".codex");
+        std::fs::create_dir_all(&login).unwrap();
+        let jwt = crate::harness::codex_app_login::tests::make_chatgpt_jwt(
+            Some("owner@example.test"),
+            "pro",
+            1_900_000_000,
+        );
+        let auth = format!(
+            r#"{{"auth_mode":"chatgpt","tokens":{{"id_token":"{jwt}","access_token":"{jwt}","refresh_token":"rt"}}}}"#
+        );
+        std::fs::write(login.join("auth.json"), &auth).unwrap();
+        let path = tmp.path().join("accounts-codex.toml");
+        std::fs::write(&path, "[[account]]\nlabel = 'main'\nclass = 'dedicated'\n").unwrap();
+        if !policy.is_empty() {
+            std::fs::write(
+                env.config.as_ref().unwrap(),
+                format!("[harness]\n{policy}\n"),
+            )
+            .unwrap();
+        }
+        if mode == "init" {
+            let results = crate::harness::accounts_sync::sync_cli_accounts_for_init(
+                home,
+                &env.state,
+                &tmp.path().join("accounts.toml"),
+                env.now,
+            );
+            assert!(
+                results.iter().all(|(_, result)| result.is_ok()),
+                "{results:?}"
+            );
+        } else {
+            let _ = crate::harness::accounts_sync::upkeep_live(
+                home,
+                &env.state,
+                &tmp.path().join("accounts.toml"),
+                env.now,
+                crate::harness::accounts_sync::UpkeepStep::Sync,
+            );
+        }
+        let row = Roster::load_for(Cli::Codex, &path).unwrap().rows.remove(0);
+        assert_eq!(
+            row.email.as_deref(),
+            policy.is_empty().then_some("owner@example.test")
+        );
+        assert_eq!(read(&login.join("auth.json")), auth);
+    }
+}
+
+#[test]
+fn codex_default_completion_retains_alias_and_respects_native_auth_lock() {
+    let tmp = tmp_dir("codex-complete-alias");
+    let env = env_at(&tmp);
+    let login = env.home.as_ref().unwrap().join(".codex");
+    std::fs::create_dir_all(&login).unwrap();
+    let path = tmp.path().join("accounts-codex.toml");
+    let original = "[[account]]\nlabel = 'main'\nclass = 'dedicated'\nemail = 'alias@example.test'\nidentity_email = 'owner@example.test'\n";
+    std::fs::write(&path, original).unwrap();
+    let host = PoolHost {
+        account: Some("owner@example.test"),
+    };
+    let (code, out, err) = renew("accounts adopt-default main --cli codex", &env, &host);
+    assert_eq!(code, exit(0), "{out}{err}");
+    assert_eq!(read(&path), original);
+    let lock = crate::harness::codex_app_login::AuthLock::try_take(&login.join("auth.json"))
+        .unwrap()
+        .unwrap();
+    let (code, _, err) = renew("accounts adopt-default main --cli codex", &env, &host);
+    assert_eq!(code, exit(1), "{err}");
+    assert!(err.contains("being changed"), "{err}");
+    assert_eq!(read(&path), original);
+    drop(lock);
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_default_completion_does_not_write_linked_source_rosters() {
+    for hard in [false, true] {
+        let tmp = tmp_dir("codex-complete-linked");
+        let env = env_at(&tmp);
+        std::fs::create_dir_all(env.home.as_ref().unwrap().join(".codex")).unwrap();
+        let original = "[[account]]\nlabel = 'main'\nclass = 'dedicated'\n";
+        let source = tmp.path().join("source.toml");
+        let roster = tmp.path().join("accounts-codex.toml");
+        std::fs::write(&source, original).unwrap();
+        if hard {
+            std::fs::hard_link(&source, &roster).unwrap();
+        } else {
+            std::os::unix::fs::symlink(&source, &roster).unwrap();
+        }
+        let result =
+            default_completion::complete(&env, None, |_| Some("owner@example.test".into()));
+        if hard {
+            assert_eq!(result.unwrap(), Some("main".into()));
+            assert!(read(&roster).contains("owner@example.test"));
+        } else {
+            assert!(result.unwrap_err().contains("linked roster"));
+            assert_eq!(read(&roster), original);
+        }
+        assert_eq!(read(&source), original);
+    }
+}
+
+#[test]
+fn codex_default_completion_respects_signed_out_state() {
+    let tmp = tmp_dir("codex-complete-signed-out");
+    let env = env_at(&tmp);
+    std::fs::create_dir_all(env.home.as_ref().unwrap().join(".codex")).unwrap();
+    let path = tmp.path().join("accounts-codex.toml");
+    let original = "[[account]]\nlabel = 'main'\nclass = 'dedicated'\n";
+    std::fs::write(&path, original).unwrap();
+    let store = env.accounts_store_for(Cli::Codex).unwrap();
+    std::fs::create_dir_all(&store.dir).unwrap();
+    let mut state = accounts::State::default();
+    state.accounts.insert(
+        "main".into(),
+        accounts::Account {
+            auth: accounts::Auth::SignedOut,
+            ..Default::default()
+        },
+    );
+    std::fs::write(store.state_file(), state.to_json()).unwrap();
+    let result = default_completion::complete(&env, None, |_| Some("owner@example.test".into()));
+    assert!(matches!(result, Ok(None)), "{result:?}");
+    assert_eq!(read(&path), original);
+}
+
+#[test]
+fn codex_default_completion_preserves_pool_holds_and_local_authority() {
+    for warm in ["[]", "['m2']", "['m1']"] {
+        let tmp = tmp_dir("codex-complete-pool");
+        let env = env_at(&tmp);
+        let home = env.home.as_ref().unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(home.join(".secrets")).unwrap();
+        std::fs::write(env.config.as_ref().unwrap(), "[fleet]\nmachine = 'm1'\n").unwrap();
+        let path = tmp.path().join("accounts-codex.toml");
+        std::fs::write(&path, "[[account]]\nlabel = 'main'\nclass = 'dedicated'\n").unwrap();
+        let source = home.join(".secrets/ai-pool.toml");
+        let raw = format!(
+            "version = 1\n[[account]]\nprovider = 'codex'\nemail = 'owner@example.test'\nwarm = {warm}\n"
+        );
+        std::fs::write(&source, &raw).unwrap();
+        let result =
+            default_completion::complete(&env, None, |_| Some("owner@example.test".into()));
+        assert!(result.is_ok(), "{warm}: {result:?}");
+        let filled = Roster::load_for(Cli::Codex, &path).unwrap().rows[0]
+            .email
+            .is_some();
+        assert_eq!(filled, warm == "['m1']", "{warm}");
+        assert_eq!(read(&source), raw);
+    }
+    for label in ["main", "another-machine"] {
+        let tmp = tmp_dir("codex-complete-source-conflict");
+        let env = env_at(&tmp);
+        let home = env.home.as_ref().unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(home.join(".secrets")).unwrap();
+        let path = tmp.path().join("accounts-codex.toml");
+        std::fs::write(&path, "[[account]]\nlabel = 'main'\nclass = 'dedicated'\n").unwrap();
+        let source = home.join(".secrets/ai-accounts-codex.toml");
+        let raw = format!(
+            "[[account]]\nlabel = '{label}'\nemail = 'other@example.test'\nmachines = ['m2']\n"
+        );
+        std::fs::write(&source, &raw).unwrap();
+        let result =
+            default_completion::complete(&env, None, |_| Some("owner@example.test".into()));
+        assert_eq!(result.is_ok(), label != "main", "{result:?}");
+        assert_eq!(read(&source), raw);
+    }
 }

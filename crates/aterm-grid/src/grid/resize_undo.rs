@@ -28,6 +28,7 @@ pub(crate) type BottomRow = Option<(RowSnapshot, Option<Box<ScrolledRowExtras>>)
 pub(crate) struct CursorPicture {
     cursor: Cursor,
     pending_wrap: bool,
+    follows_glyph: bool,
     saved_cursor: Cursor,
     saved_valid: bool,
     saved_pending_wrap: bool,
@@ -59,6 +60,7 @@ impl Grid {
         CursorPicture {
             cursor: s.cursor_state.cursor,
             pending_wrap: s.cursor_state.pending_wrap,
+            follows_glyph: s.cursor_state.follows_glyph,
             saved_cursor: s.cursor_state.saved_cursor.cursor,
             saved_valid: s.cursor_state.saved_cursor.valid,
             saved_pending_wrap: s.cursor_state.saved_cursor.pending_wrap,
@@ -73,6 +75,7 @@ impl Grid {
         let s = &mut self.storage;
         s.cursor_state.cursor = p.cursor;
         s.cursor_state.pending_wrap = p.pending_wrap;
+        s.cursor_state.follows_glyph = p.follows_glyph;
         s.cursor_state.saved_cursor.cursor = p.saved_cursor;
         s.cursor_state.saved_cursor.valid = p.saved_valid;
         s.cursor_state.saved_cursor.pending_wrap = p.saved_pending_wrap;

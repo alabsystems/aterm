@@ -149,6 +149,27 @@ impl Spans {
     }
 }
 
+/// `send`'s text as the PTY receives it, one rule for an inline argument and a `send -` payload:
+/// a trailing line end, a trailing backslash-n, or a backslash-n before a line end (`echo 'ls\\n'`)
+/// is written as one Enter (CR); every other byte is kept, an inner newline or backslash-n included.
+#[must_use]
+pub fn send_payload(text: &[u8]) -> Vec<u8> {
+    let line_end = text
+        .strip_suffix(b"\n")
+        .map(|head| head.strip_suffix(b"\r").unwrap_or(head));
+    let head = line_end.unwrap_or(text);
+    let (head, enter) = match head.strip_suffix(b"\\n") {
+        Some(before) => (before, true),
+        None => (head, line_end.is_some()),
+    };
+    let mut bytes = Vec::with_capacity(head.len() + 1);
+    bytes.extend_from_slice(head);
+    if enter {
+        bytes.push(0x0d);
+    }
+    bytes
+}
+
 /// Read a request line.
 #[inline]
 #[must_use]
@@ -228,6 +249,28 @@ mod tests {
             assert_eq!(Selector::parse(bad), Selector::Invalid(bad), "{bad:?}");
         }
         assert!(Selector::SelfTok.is_self() && !Selector::Local(0).is_self());
+    }
+
+    #[test]
+    fn send_payload_turns_one_trailing_line_end_into_enter_and_keeps_the_rest() {
+        for (typed, sent) in [
+            (&b"ls\\n"[..], &b"ls\r"[..]),
+            (b"ls\n", b"ls\r"),
+            (b"ls\r\n", b"ls\r"),
+            (b"ls\\n\n", b"ls\r"),
+            (b"ls\\n\r\n", b"ls\r"),
+            (b"\\n", b"\r"),
+            (b"\n", b"\r"),
+            (b"", b""),
+            (b"ls", b"ls"),
+            (b"a\\nb", b"a\\nb"),
+            (b"a\nb", b"a\nb"),
+            (b"ls\n\n", b"ls\n\r"),
+            (b"ls\\n\\n", b"ls\\n\r"),
+            (b"\xff\xfe\\n", b"\xff\xfe\r"),
+        ] {
+            assert_eq!(send_payload(typed), sent, "{typed:?}");
+        }
     }
 
     #[test]

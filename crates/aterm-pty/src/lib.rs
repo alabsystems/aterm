@@ -15,6 +15,9 @@
     )
 )]
 
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub mod test_budget;
+
 /// A spawned shell.
 #[derive(Debug, Clone, Copy)]
 pub struct SpawnedShell {

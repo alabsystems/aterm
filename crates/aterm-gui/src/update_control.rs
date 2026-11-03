@@ -121,7 +121,7 @@ impl Snapshot {
         match self.posture {
             Some(ApplyPosture::Automatic) if self.retry_scheduled => "automatic",
             Some(ApplyPosture::Automatic) => "automatic-idle",
-            Some(ApplyPosture::WaitsForTerminal) => "waits-terminal",
+            Some(ApplyPosture::AtNextLaunch) => "next-launch",
             Some(ApplyPosture::ManualByConfig) => "manual-config",
             Some(ApplyPosture::VetoedByEnv { .. }) => "disabled-env",
             Some(ApplyPosture::ManualOnlyLatched { lapses: true }) => "retry-wait",
@@ -340,6 +340,13 @@ mod tests {
         status.staged_commit = status.staged_commit.map(|s| s.to_uppercase());
         status.staged_dmg_sha256 = status.staged_dmg_sha256.map(|s| s.to_uppercase());
         assert_eq!(snapshot.apply_posture(&status), "automatic");
+        snapshot.posture = Some(ApplyPosture::AtNextLaunch);
+        assert_eq!(snapshot.apply_posture(&status), "next-launch");
+        assert_eq!(
+            snapshot.apply_phase(&status),
+            None,
+            "a build that installs at the next launch promises no phase"
+        );
         snapshot.posture = Some(ApplyPosture::ManualByConfig);
         assert_eq!(snapshot.apply_posture(&status), "manual-config");
         assert_eq!(

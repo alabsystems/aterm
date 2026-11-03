@@ -138,7 +138,7 @@ impl Fingerprint {
 
 #[cfg(unix)]
 enum Phase {
-    /// Not taking part (the default, and `[keeper] enabled = false`).
+    /// Not taking part ([`part`] said no).
     Off,
     /// An update's candidate before its Commit.
     Armed,
@@ -612,39 +612,157 @@ pub(crate) const fn is_update_candidate(overlap_admitted: bool, adopted_a_handof
     overlap_admitted || adopted_a_handoff
 }
 
-/// Whether a launch takes part in its keeper: every windowed launch, and a
+/// Whether a launch may take part in its keeper: every windowed launch, and a
 /// headless one only of a build whose keeper is not the installed app's
-/// ([`boot`]'s App-class rule).
+/// ([`part`]'s App-class rule).
 #[cfg_attr(not(unix), allow(dead_code))]
 const fn takes_part(headless: bool, installed_keeper: bool) -> bool {
     !(headless && installed_keeper)
 }
 
-/// `cfg` is the config this window builds a live session's engine with: a recovered session's crash restore replays into an engine built the same way.
+/// `[keeper] enabled` when the file says nothing: on where a keeper exists.
+pub(crate) const DEFAULT_ON: bool = cfg!(target_vendor = "apple");
+
+/// Development seam: the launchd label a headless launch starts its keeper under, as a bundled
+/// window starts its own. A live test proves a default config's keeper on it without a window,
+/// under a test label nothing else uses.
+#[cfg(unix)]
+const JOB_LABEL_SEAM: &str = "ATERM_DEBUG_KEEPER_JOB_LABEL";
+
+/// What a launch does about its keeper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+enum Part {
+    /// No link: its sessions have no journal and a crash hangs them up.
+    None,
+    /// A link that registers with whichever keeper answers, and starts none.
+    Link,
+    /// The link, and this launch starts the keeper if none runs.
+    LinkAndStart,
+}
+
+/// What a launch's own path and mode say about its keeper ([`part`]'s inputs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct Launch {
+    /// A launch with no window: a check or a lab instance.
+    headless: bool,
+    /// Its keeper is the installed app's (`aterm_keeper::job::place_for`).
+    installed: bool,
+    /// It runs from an app bundle that lasts: an installed copy, never one on a mounted image or
+    /// an App Translocation copy, which go away (`aterm_update::first_launch::setup_runs_from_posture`).
+    lasting_bundle: bool,
+}
+
+impl Launch {
+    /// The facts of a launch of executable `exe`.
+    #[cfg(unix)]
+    fn of(exe: &std::path::Path, headless: bool) -> Self {
+        let bundled = aterm_keeper::job::own_bundle(exe).is_some();
+        #[cfg(target_os = "macos")]
+        let lasting = aterm_update::first_launch::setup_runs_from_posture(
+            aterm_update::which_copy::posture_from(exe),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let lasting = true;
+        Self {
+            headless,
+            installed: aterm_keeper::job::place_for(exe).installed,
+            lasting_bundle: bundled && lasting,
+        }
+    }
+
+    /// A headless launch standing in for a lasting bundle's window: the live test's seam, so it
+    /// proves [`part`]'s default on a test label without a window.
+    #[cfg(unix)]
+    const fn as_window(self) -> Self {
+        Self {
+            headless: false,
+            installed: self.installed,
+            lasting_bundle: true,
+        }
+    }
+}
+
+/// What this launch does about its keeper. A lasting app bundle's window is the default's home, so
+/// a new Mac's first window starts one. A bare build's window and a headless launch are checks and
+/// lab instances: they keep to what their config says, so a scratch world's instance leaves no job
+/// in the login's launchd domain and no region per session. A window of a copy that goes away (on
+/// a mounted disk image, or translocated) starts no keeper either: its job would outlive the path
+/// it runs from. A headless launch of the installed app never takes part, whatever the file says,
+/// because the installed keeper is the person's.
+#[cfg_attr(not(unix), allow(dead_code))]
+const fn part(setting: Option<bool>, launch: Launch) -> Part {
+    if !takes_part(launch.headless, launch.installed) {
+        return Part::None;
+    }
+    match (setting, launch.headless, launch.lasting_bundle) {
+        (Some(false), _, _) => Part::None,
+        (None | Some(true), false, true) if DEFAULT_ON => Part::LinkAndStart,
+        (Some(true), _, _) => Part::Link,
+        (None, _, _) => Part::None,
+    }
+}
+
+/// `setting` is `[keeper] enabled`, if the file says. `cfg` is the config this window builds a live session's engine with: a recovered session's crash restore replays into an engine built the same way.
 pub(crate) fn boot(
-    enabled: bool,
+    setting: Option<bool>,
     candidate: bool,
     headless: bool,
     cfg: Option<&aterm_core::config::TerminalConfig>,
 ) -> Recovery {
-    if !enabled {
-        return Recovery::default();
-    }
-    #[cfg(unix)]
-    if !takes_part(headless, aterm_keeper::job::own_place().installed) {
-        aterm_log::info!("keeper: a headless launch of the installed app takes no part");
-        return Recovery::default();
-    }
-    let _ = headless;
     #[cfg(unix)]
     {
-        boot_unix(candidate, cfg)
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.canonicalize().ok())
+            .unwrap_or_default();
+        let seam_label: Option<String> = aterm_types::dev_seam!(JOB_LABEL_SEAM)
+            .and_then(|label| label.to_str().map(str::to_owned));
+        let launch = Launch::of(&exe, headless);
+        let launch = if seam_label.is_some() {
+            launch.as_window()
+        } else {
+            launch
+        };
+        let part = part(setting, launch);
+        if part == Part::None {
+            if setting == Some(true) && headless {
+                aterm_log::info!("keeper: a headless launch of the installed app takes no part");
+            }
+            return Recovery::default();
+        }
+        let recovery = boot_unix(candidate, cfg);
+        if part == Part::LinkAndStart && on() {
+            start_keeper(seam_label);
+        }
+        recovery
     }
     #[cfg(not(unix))]
     {
-        let _ = (candidate, cfg);
-        aterm_log::info!("keeper: not available on this platform");
+        let _ = (candidate, headless, cfg);
+        if setting == Some(true) {
+            aterm_log::info!("keeper: not available on this platform");
+        }
         Recovery::default()
+    }
+}
+
+/// Start this build's keeper off the launch's own path (one or two `launchctl` runs); the link
+/// registers every terminal once it answers, and a launch whose keeper cannot run works as one
+/// with none, with this log line and `aterm keeper status` to say why.
+#[cfg(unix)]
+fn start_keeper(label: Option<String>) {
+    let started = std::thread::Builder::new()
+        .name("keeper-start".to_string())
+        .spawn(move || {
+            match aterm_keeper::cli::ensure_for_window(label, crate::build_info::version()) {
+                Ok(line) => aterm_log::info!("keeper: {line}"),
+                Err(why) => aterm_log::warn!("keeper: not started: {why}"),
+            }
+        });
+    if let Err(e) = started {
+        aterm_log::warn!("keeper: the thread that starts it did not start: {e}");
     }
 }
 
@@ -1813,7 +1931,7 @@ mod tests {
 
     #[test]
     fn with_the_keeper_off_nothing_registers() {
-        let recovery = boot(false, false, false, None);
+        let recovery = boot(Some(false), false, false, None);
         assert!(recovery.adopted.is_empty());
         assert!(!on(), "boot(false) leaves the link off");
         assert!(
@@ -1855,12 +1973,132 @@ mod tests {
     }
 
     #[test]
-    fn the_keeper_is_off_unless_the_file_turns_it_on() {
+    fn the_keeper_is_on_unless_the_file_turns_it_off() {
         let parse = |text: &str| crate::app_config::Config::parse(text).expect("parses");
-        assert!(!parse("").keeper_enabled(), "absent is off");
-        assert!(!parse("[keeper]\n").keeper_enabled());
+        assert_eq!(
+            parse("").keeper_enabled(),
+            DEFAULT_ON,
+            "absent is the default"
+        );
+        assert_eq!(parse("[keeper]\n").keeper_enabled(), DEFAULT_ON);
         assert!(!parse("[keeper]\nenabled = false\n").keeper_enabled());
         assert!(parse("[keeper]\nenabled = true\n").keeper_enabled());
+    }
+
+    #[test]
+    fn a_bundled_window_starts_its_keeper_and_a_check_keeps_to_its_file() {
+        // (setting, l(headless, installed, lasting bundle))
+        let l = |headless, installed, lasting_bundle| Launch {
+            headless,
+            installed,
+            lasting_bundle,
+        };
+        if DEFAULT_ON {
+            assert_eq!(
+                part(None, l(false, true, true)),
+                Part::LinkAndStart,
+                "a new Mac"
+            );
+            assert_eq!(
+                part(None, l(false, false, true)),
+                Part::LinkAndStart,
+                "a dev app"
+            );
+            assert_eq!(part(Some(true), l(false, true, true)), Part::LinkAndStart);
+        }
+        for (headless, installed, bundled) in [
+            (false, true, true),
+            (false, false, true),
+            (false, false, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            assert_eq!(
+                part(Some(false), l(headless, installed, bundled)),
+                Part::None,
+                "its off"
+            );
+        }
+        assert_eq!(
+            part(None, l(false, false, false)),
+            Part::None,
+            "a bare build's window"
+        );
+        assert_eq!(
+            part(None, l(true, false, false)),
+            Part::None,
+            "a lab instance"
+        );
+        assert_eq!(
+            part(None, l(true, false, true)),
+            Part::None,
+            "a dev app, headless"
+        );
+        assert_eq!(part(Some(true), l(false, false, false)), Part::Link);
+        assert_eq!(
+            part(Some(true), l(true, false, false)),
+            Part::Link,
+            "the live lanes"
+        );
+        assert_eq!(
+            part(None, l(true, true, true)),
+            Part::None,
+            "the installed app, headless"
+        );
+        assert_eq!(
+            part(Some(true), l(true, true, true)),
+            Part::None,
+            "whatever the file says"
+        );
+    }
+
+    /// [`Launch::of`] reads each fact off the path [`boot`] passes: a copy on a mounted image or a
+    /// translocated one is no lasting bundle, so its window starts no keeper.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_window_of_a_copy_that_goes_away_starts_no_keeper() {
+        use std::path::Path;
+        let installed = Launch::of(Path::new(aterm_keeper::job::INSTALLED_EXECUTABLE), false);
+        assert_eq!(
+            installed,
+            Launch {
+                headless: false,
+                installed: true,
+                lasting_bundle: true
+            }
+        );
+        assert_eq!(part(None, installed), Part::LinkAndStart, "a new Mac");
+        for (exe, why) in [
+            (
+                "/Volumes/aterm/aterm.app/Contents/MacOS/aterm",
+                "opened inside the disk image",
+            ),
+            (
+                "/private/var/folders/x/T/AppTranslocation/0A1B/d/aterm.app/Contents/MacOS/aterm",
+                "translocated from Downloads",
+            ),
+            ("/Users//x/aterm/target/debug/aterm", "a bare build"),
+        ] {
+            let launch = Launch::of(Path::new(exe), false);
+            assert!(!launch.lasting_bundle, "{why}");
+            assert!(!launch.installed, "{why}");
+            assert_eq!(part(None, launch), Part::None, "{why}");
+        }
+        let dev_app = Launch::of(
+            Path::new("/Users//x/Applications/aterm (dev).app/Contents/MacOS/aterm"),
+            false,
+        );
+        assert!(dev_app.lasting_bundle && !dev_app.installed, "{dev_app:?}");
+        let headless = Launch::of(Path::new(aterm_keeper::job::INSTALLED_EXECUTABLE), true);
+        assert_eq!(part(Some(true), headless), Part::None);
+        assert_eq!(
+            part(
+                None,
+                Launch::of(Path::new("/Users//x/aterm/target/debug/aterm"), true).as_window()
+            ),
+            Part::LinkAndStart,
+            "the live test's seam stands in for a lasting bundle's window"
+        );
     }
 
     #[test]

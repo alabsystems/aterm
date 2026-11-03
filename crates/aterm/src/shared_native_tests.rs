@@ -1073,7 +1073,7 @@ fn automatic_wait_survives_a_temporarily_busy_vault_before_the_grant() {
         if pauses == 1 {
             let (file, _) =
                 aterm_uds::private_file::open_private(&approved.paths.dir, ".lock").unwrap();
-            aterm_uds::private_file::lock_exclusive_until(&file, deadline(), "test lock busy")
+            aterm_uds::file_lock::lock_exclusive_until(&file, deadline(), "test lock busy")
                 .unwrap();
             held = Some(file);
         } else {

@@ -235,26 +235,62 @@ pub(crate) struct Typed {
     pub(crate) at_unix_ms: u64,
 }
 
-/// `SessionCtx.typed`: the session's last [`Typed`].
+/// `SessionCtx.typed`: the session's last [`Typed`], and when a caller other than aterm's own
+/// last typed ([`TypedStamp::driven_ms`]).
 #[derive(Clone, Debug, Default)]
-pub(crate) struct TypedStamp(Arc<Mutex<Option<Typed>>>);
+pub(crate) struct TypedStamp(Arc<Mutex<Stamps>>);
+
+/// What [`TypedStamp`] holds.
+#[derive(Debug, Default)]
+struct Stamps {
+    /// The last typing.
+    last: Option<Typed>,
+    /// When a caller other than aterm's own ([`Who::is_aterms_own`]) last typed.
+    driven_at_unix_ms: Option<u64>,
+}
+
+impl Who {
+    /// Whether typing by this caller is aterm's own: its harness's lines ([`Who::Aterm`]) and the
+    /// message bus's deliveries ([`Who::Bridge`]), neither of which asks a program to end.
+    const fn is_aterms_own(&self) -> bool {
+        matches!(self, Self::Aterm | Self::Bridge)
+    }
+}
 
 impl TypedStamp {
     /// Credit typing at `at_unix_ms` to `by`.
     pub(crate) fn stamp(&self, by: Arc<Caller>, at_unix_ms: u64) -> bool {
         let mut slot = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        let (by, moved) = match slot.take() {
+        if !by.who.is_aterms_own() {
+            slot.driven_at_unix_ms = Some(at_unix_ms);
+        }
+        let (by, moved) = match slot.last.take() {
             Some(last) if last.by.covers(&by.who) => {
                 (last.by, last.at_unix_ms / 60_000 != at_unix_ms / 60_000)
             }
             _ => (by, true),
         };
-        *slot = Some(Typed { by, at_unix_ms });
+        slot.last = Some(Typed { by, at_unix_ms });
         moved
     }
 
     pub(crate) fn last(&self) -> Option<Typed> {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .last
+            .clone()
+    }
+
+    /// How long before `now_unix_ms` a control client other than aterm's own last typed into the
+    /// session (none: none has): a driver's `/exit` stays the driver's whatever aterm's own lines
+    /// or the message bus typed after it, which `typed_by=` (the last typing alone) would lose.
+    pub(crate) fn driven_ms(&self, now_unix_ms: u64) -> Option<u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .driven_at_unix_ms
+            .map(|at| now_unix_ms.saturating_sub(at))
     }
 
     /// Credit the accepted event to the captured session after all timeline locks are released.
@@ -333,6 +369,76 @@ pub(crate) fn name(
     }
 }
 
+/// A tab, `ctx`'s session, as it names who typed from it ([`name`]): its role, else its pinned
+/// title, else its short id.
+pub(crate) fn tab_named(ctx: &SessionCtx) -> Named {
+    let set = |t: &str| {
+        Some(crate::session_timeline::sanitize_presentation_line(t, 40))
+            .filter(|t| !t.is_empty() && !is_credit_word(t))
+    };
+    let (role, pin) = {
+        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            meta.role.as_deref().and_then(set),
+            meta.presentation_value("title").as_deref().and_then(set),
+        )
+    };
+    let sid = aterm_messages::presence::short_sid(ctx.self_id.as_str());
+    match (role, pin) {
+        (Some(role), _) => Named {
+            facts: Some(role.clone()),
+            words: role,
+            by_parent: false,
+        },
+        (None, Some(pin)) => Named {
+            words: pin,
+            facts: Some(sid),
+            by_parent: false,
+        },
+        (None, None) => Named {
+            words: sid.clone(),
+            facts: Some(sid),
+            by_parent: false,
+        },
+    }
+}
+
+/// THE NAME of `who` off the main thread, as [`App::typed_by`](crate::App::typed_by) names a
+/// typist ([`name`]), by the sessions `store` registers now: each tab found by its shell's pid and
+/// named as [`tab_named`] names it, so a program run from a tab (an `aterm ctl` a Claude Code's
+/// tool ran) is that tab's, past the CLI's own process. The `signal` verb names its asker so
+/// (the act's `from=`).
+pub(crate) fn name_by_store(who: &Who, store: &crate::session_store::Store) -> Named {
+    let tabs: Vec<(u64, i32, SessionId, Arc<SessionCtx>)> = store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .live_handles()
+        .map(|h| {
+            (
+                h.local_id,
+                h.shell_identity.pid,
+                h.sid.clone(),
+                Arc::clone(&h.ctx),
+            )
+        })
+        .collect();
+    let shells: Vec<(u64, i32)> = tabs.iter().map(|(local, pid, ..)| (*local, *pid)).collect();
+    name(
+        who,
+        &shells,
+        &|sid| {
+            tabs.iter()
+                .find(|(_, _, of, _)| of == sid)
+                .map(|(local, ..)| *local)
+        },
+        &|local| {
+            tabs.iter()
+                .find(|(of, ..)| *of == local)
+                .map(|(.., ctx)| tab_named(ctx))
+        },
+    )
+}
+
 impl crate::App {
     /// Who last typed into `ctx`'s session and when, its caller named here once ([`name`]).
     pub(crate) fn typed_by(&self, ctx: &SessionCtx) -> Option<Typed> {
@@ -349,38 +455,9 @@ impl crate::App {
         Some(typed)
     }
 
-    /// A tab as it names who typed from it ([`name`]).
+    /// A tab as it names who typed from it ([`name`], [`tab_named`]).
     pub(crate) fn typist_tab(&self, local: u64) -> Option<Named> {
-        let s = self.pool.get(local)?;
-        let set = |t: &str| {
-            Some(crate::session_timeline::sanitize_presentation_line(t, 40))
-                .filter(|t| !t.is_empty() && !is_credit_word(t))
-        };
-        let (role, pin) = {
-            let meta = s.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-            (
-                meta.role.as_deref().and_then(set),
-                meta.presentation_value("title").as_deref().and_then(set),
-            )
-        };
-        let sid = aterm_messages::presence::short_sid(s.ctx.self_id.as_str());
-        Some(match (role, pin) {
-            (Some(role), _) => Named {
-                facts: Some(role.clone()),
-                words: role,
-                by_parent: false,
-            },
-            (None, Some(pin)) => Named {
-                words: pin,
-                facts: Some(sid),
-                by_parent: false,
-            },
-            (None, None) => Named {
-                words: sid.clone(),
-                facts: Some(sid),
-                by_parent: false,
-            },
-        })
+        self.pool.get(local).map(|s| tab_named(&s.ctx))
     }
 
     /// The hover's line: `last typed into by lab-sweep at 14:02`.
@@ -489,6 +566,41 @@ mod tests {
         assert_eq!(named(&gone, &[]).words, "pid 77");
         let unread = Who::client_with(None, 42, &parent, &group, &comm);
         assert_eq!(named(&unread, &[]).words, "a script");
+    }
+
+    /// A DRIVER'S TYPING OUTLIVES aterm's OWN AFTER IT ([`TypedStamp::driven_ms`]): a lab's `/exit`
+    /// followed, before the exit is decided, by mail the message bus delivers and a line the
+    /// harness types is still the lab's, though `typed_by=` names the last typist alone.
+    #[test]
+    fn a_drivers_typing_is_kept_past_aterms_own() {
+        let stamp = TypedStamp::default();
+        assert_eq!(stamp.driven_ms(1_000), None, "nobody typed");
+        let _ = stamp.stamp(Caller::new(Who::Aterm), 500);
+        assert_eq!(
+            stamp.driven_ms(1_000),
+            None,
+            "aterm's own line drives nothing"
+        );
+        let _ = stamp.stamp(Caller::new(client(900)), 10_000);
+        let _ = stamp.stamp(Caller::new(Who::Bridge), 10_400);
+        let _ = stamp.stamp(Caller::new(Who::Aterm), 10_600);
+        assert_eq!(
+            stamp.last().map(|t| t.by.words()).as_deref(),
+            Some("aterm"),
+            "the last typist"
+        );
+        assert_eq!(
+            stamp.driven_ms(11_000),
+            Some(1_000),
+            "the lab's, 1 s before"
+        );
+        let unread = Who::client_with(None, 42, &parent, &group, &comm);
+        let _ = stamp.stamp(Caller::new(unread), 20_000);
+        assert_eq!(
+            stamp.driven_ms(20_250),
+            Some(250),
+            "a script with no peer is no typing of aterm's"
+        );
     }
 
     /// An edge names who presented its token, on the edge's tab, and that

@@ -157,6 +157,12 @@ pub fn plan(src: &Path, tap: &Path) -> Result<Vec<Planned>, String> {
             src.display()
         ));
     }
+    match std::fs::symlink_metadata(tap) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", tap.display())),
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(_) => return Err(format!("{} is not a plain directory", tap.display())),
+    }
     let tap_casks = tap.join("Casks");
     match std::fs::symlink_metadata(&tap_casks) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -180,9 +186,8 @@ pub fn plan(src: &Path, tap: &Path) -> Result<Vec<Planned>, String> {
         }
     };
     for path in &all {
-        let text = String::from_utf8(read(path)?)
-            .unwrap_or_default()
-            .to_lowercase();
+        let raw = read(path)?;
+        let text = String::from_utf8_lossy(&raw).to_lowercase();
         if let Some(w) = INTERNAL_WORDING.iter().find(|w| text.contains(*w)) {
             return Err(format!(
                 "{} carries internal-only wording ({w:?}) — scrub it before deploying",
@@ -207,12 +212,17 @@ pub fn plan(src: &Path, tap: &Path) -> Result<Vec<Planned>, String> {
     for doc in DOCS {
         out.push(against(doc.to_string(), read(&src.join(doc))?, false)?);
     }
-    let mut casks: Vec<PathBuf> = std::fs::read_dir(src.join("Casks"))
-        .map_err(|e| format!("{}: {e}", src.join("Casks").display()))?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "rb"))
-        .collect();
+    let casks_dir = src.join("Casks");
+    let mut casks = Vec::new();
+    for entry in
+        std::fs::read_dir(&casks_dir).map_err(|e| format!("{}: {e}", casks_dir.display()))?
+    {
+        let entry = entry.map_err(|e| format!("{}: {e}", casks_dir.display()))?;
+        let path = entry.path();
+        if path.extension().is_some_and(|x| x == "rb") {
+            casks.push(path);
+        }
+    }
     casks.sort();
     if casks.is_empty() {
         return Err(format!("{} holds no cask", src.join("Casks").display()));
@@ -514,7 +524,7 @@ mod tests {
         assert!(deploy(&src, &not_a_checkout, &mut Vec::new()).is_err());
         std::fs::write(
             src.join("NOTES.md"),
-            "Internal doc for the PRIVATE aterm DEV REPO.\n",
+            b"\xff Internal doc for the PRIVATE aterm DEV REPO.\n",
         )
         .unwrap();
         assert!(deploy(&src, &real, &mut Vec::new()).is_err());
@@ -644,6 +654,12 @@ mod tests {
             assert!(
                 plan(&src, &tap_dir).is_err(),
                 "symlink at destination {rel} must be refused"
+            );
+            let tap_link = dir.path().join("tap-root-link");
+            std::os::unix::fs::symlink(&destination, &tap_link).unwrap();
+            assert!(
+                plan(&src, &tap_link).is_err(),
+                "symlinked tap root must be refused"
             );
         }
     }

@@ -3,6 +3,28 @@
 
 use super::*;
 
+#[cfg(target_os = "macos")]
+#[test]
+fn descriptor_probe_does_not_count_its_own_directory_handle() {
+    let mut setup = (3..=10)
+        .map(|fd| format!("exec {fd}</dev/null; "))
+        .collect::<String>();
+    setup.push_str("exec 11<&-; ");
+    // Negative control: the directory walk itself occupies the first free fd.
+    let old =
+        "h=; for f in /dev/fd/*; do case ${f#/dev/fd/} in 11) h=1;; esac; done; [ -n \"$h\" ]";
+    let script = format!(
+        "{setup}{old} || exit 1; {} && exit 2; {} || exit 3; exit 0",
+        sh_held(11),
+        sh_held_any(&[11, 10]),
+    );
+    let status = crate::spawnfd::command(crate::os_path!("sh"))
+        .args(["-c", &script])
+        .status()
+        .expect("run the descriptor probe");
+    assert!(status.success(), "{status}");
+}
+
 #[cfg(unix)]
 #[test]
 fn descriptor_room_preserves_limits_and_reports_the_actual_result() {

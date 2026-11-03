@@ -176,6 +176,11 @@ fn a_grok_store_build_is_named_by_the_store() {
         "/p/store/muse/1/bin/grok",
         "/p/store/grok/1/bin/muse",
         "/p/store/grok//bin/grok",
+        "/p/store/grok/01/bin/grok",
+        "/p/store/grok/not-a-build/bin/grok",
+        "/p/store/grok/../bin/grok",
+        "/p/../store/grok/1/bin/grok",
+        "store/grok/1/bin/grok",
         "/p/agents/grok",
     ] {
         assert!(!store_build(Path::new(not)), "{not}");

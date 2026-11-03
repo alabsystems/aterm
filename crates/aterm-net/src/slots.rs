@@ -20,7 +20,7 @@ fn poll_timeout_millis_parts(as_millis: u128, subsec_nanos: u32) -> i32 {
 }
 
 #[cfg(any(unix, windows, test))]
-fn poll_timeout_millis(timeout: Duration) -> i32 {
+pub(crate) fn poll_timeout_millis(timeout: Duration) -> i32 {
     poll_timeout_millis_parts(timeout.as_millis(), timeout.subsec_nanos())
 }
 
@@ -841,7 +841,7 @@ pub(crate) mod tests {
 
     /// A listener on `[::]:0` that takes IPv4 too. A Unix IPv6 socket does by
     /// default (`IPV6_V6ONLY` off).
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn bind_dual_stack() -> io::Result<TcpListener> {
         TcpListener::bind("[::]:0")
     }
@@ -913,13 +913,31 @@ pub(crate) mod tests {
     /// one configured, which a listener on 127.0.0.1 cannot see (lo0 carries
     /// no other usable IPv4 address without an alias, which needs root).
     pub(crate) fn dual_stack_listener(test: &str) -> (TcpListener, u16) {
+        /// How many shadowed ports in a row are passed over; the next one is COULD NOT RUN.
+        const PASS_OVER: usize = 64;
         fn not_run(test: &str, why: &str) -> ! {
             aterm_spec::host::could_not_run(format!("{test}: no dual-stack loopback here ({why})"))
         }
-        let listener = match bind_dual_stack() {
-            Ok(listener) => listener,
-            Err(e) => not_run(test, &format!("binding [::]: {e}")),
+        // A shadowed port's socket is kept until a port is chosen, so the kernel hands out
+        // the next port, never the same one again.
+        let mut passed_over = Vec::new();
+        let listener = loop {
+            match draw_dual_stack() {
+                Ok(Drawn::Clear(listener)) => break listener,
+                Ok(Drawn::Shadowed(kept, _)) if passed_over.len() < PASS_OVER => {
+                    passed_over.push(kept);
+                }
+                Ok(Drawn::Shadowed(_, by)) => not_run(
+                    test,
+                    &format!(
+                        "{} ports in a row are shadowed on loopback, the last by {by}",
+                        PASS_OVER + 1
+                    ),
+                ),
+                Err(e) => not_run(test, &format!("drawing a dual-stack port: {e}")),
+            }
         };
+        drop(passed_over);
         let port = listener.local_addr().unwrap().port();
         let mut sources = Vec::new();
         for ip in [
@@ -930,8 +948,8 @@ pub(crate) mod tests {
                 Ok(probe) => probe,
                 Err(e) => not_run(test, &format!("{ip} cannot reach [::]: {e}")),
             };
-            let (accepted, peer) = listener.accept().unwrap();
-            drop((probe, accepted));
+            let peer = accept_probe(&listener, &probe);
+            drop(probe);
             sources.push(source_of(peer.ip()));
         }
         assert_ne!(
@@ -939,6 +957,137 @@ pub(crate) mod tests {
             "127.0.0.1 and ::1 are two addresses"
         );
         (listener, port)
+    }
+
+    /// What a draw of a dual-stack listener found.
+    enum Drawn {
+        /// A listener on `[::]` whose port no other socket takes a loopback connect on.
+        Clear(TcpListener),
+        /// A socket of the draw's, on a port the other socket bound at the address given
+        /// takes loopback connects on: kept until a port is chosen.
+        #[cfg_attr(
+            not(target_os = "macos"),
+            expect(dead_code, reason = "only macOS hands out a shadowed port")
+        )]
+        Shadowed(TcpListener, SocketAddr),
+    }
+
+    /// A listener on `[::]` that takes IPv4 too, on a port no other socket takes a loopback
+    /// connect on. A connect reaches the most specific socket on its port: one bound to
+    /// 127.0.0.1 or ::1 over a wildcard, an IPv4 wildcard over a dual-stack one. macOS's port
+    /// search for `[::]:0` passes over IPv4 sockets, and `SO_REUSEADDR` (std's) lets a bind sit
+    /// beside a wildcard: so the port is drawn on `0.0.0.0`, whose search passes over every
+    /// port an IPv4 or dual-stack wildcard holds; the listener binds `[::]` on it beside the
+    /// draw, which fails where an IPv6 wildcard holds the port; the draw closes, since it would
+    /// outrank the listener, and no IPv4 wildcard can bind there after it; and
+    /// [`held_on_loopback`] reads 127.0.0.1 and ::1. Measured on macOS 27.0, 2026-11-03: a
+    /// Claude Code held 127.0.0.1:49373 under a test's `[::]:49373` drawn on `[::]`, and the
+    /// test's probe went to it.
+    #[cfg(target_os = "macos")]
+    fn draw_dual_stack() -> io::Result<Drawn> {
+        let draw = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        let port = draw.local_addr()?.port();
+        let listener = match TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)) {
+            Ok(listener) => listener,
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                let by = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
+                return Ok(Drawn::Shadowed(draw, by));
+            }
+            Err(e) => return Err(e),
+        };
+        drop(draw);
+        Ok(match held_on_loopback(port) {
+            Some(by) => Drawn::Shadowed(listener, by),
+            None => Drawn::Clear(listener),
+        })
+    }
+
+    /// Linux refuses a bind beside a listening wildcard on its port, so its port search never
+    /// hands out a port another socket could take a loopback connect on. On Windows the
+    /// probe's bounded accept says what went wrong.
+    #[cfg(not(target_os = "macos"))]
+    fn draw_dual_stack() -> io::Result<Drawn> {
+        bind_dual_stack().map(Drawn::Clear)
+    }
+
+    /// Where another socket holds `port` on 127.0.0.1 or ::1: a bind there with `SO_REUSEADDR`
+    /// (std's) beside a wildcard fails only where another socket holds that very address
+    /// (measured on macOS 27.0, 2026-11-03).
+    #[cfg(target_os = "macos")]
+    fn held_on_loopback(port: u16) -> Option<SocketAddr> {
+        [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ]
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .find(|&at| matches!(TcpListener::bind(at), Err(e) if e.kind() == io::ErrorKind::AddrInUse))
+    }
+
+    /// The source of `probe`'s connection, accepted from `listener` within a minute: a probe
+    /// another socket took never arrives, and an unbounded accept would wait for it forever.
+    fn accept_probe(listener: &TcpListener, probe: &TcpStream) -> SocketAddr {
+        let sent_from = probe.local_addr().unwrap();
+        let on = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let started = Instant::now();
+        let peer = loop {
+            match listener.accept() {
+                Ok((accepted, peer)) => {
+                    drop(accepted);
+                    break peer;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        started.elapsed() < MUST_HAPPEN,
+                        "the connect from {sent_from} never reached the listener on {on} \
+                         (another socket on port {}, bound to {} or a wildcard, would take it)",
+                        on.port(),
+                        sent_from.ip(),
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("accepting on {on}: {e}"),
+            }
+        };
+        listener.set_nonblocking(false).unwrap();
+        assert_eq!(
+            (peer.ip().to_canonical(), peer.port()),
+            (sent_from.ip(), sent_from.port()),
+            "the listener on {on} accepted the probe's connection"
+        );
+        peer
+    }
+
+    /// THE SHADOWED PORT, live: beside a drawn listener on `[::]:Q`, macOS binds a listener on
+    /// 127.0.0.1:Q, a connect to 127.0.0.1:Q reaches it and never the wildcard, and the draw's
+    /// check reads the port as held; no IPv4 wildcard can bind Q beside the drawn listener.
+    /// NEGATIVE CONTROL (run): with the 127.0.0.1 listener closed, the port reads as free.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_port_another_socket_holds_on_loopback_is_passed_over() {
+        let test = "a_port_another_socket_holds_on_loopback_is_passed_over";
+        let (wildcard, port) = dual_stack_listener(test);
+        assert!(
+            matches!(
+                TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)),
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse
+            ),
+            "no IPv4 wildcard outranks the drawn listener once its draw closed"
+        );
+        let held = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let holder = TcpListener::bind(held).expect("macOS binds 127.0.0.1 beside [::]");
+        let probe = TcpStream::connect_timeout(&held, MUST_HAPPEN).unwrap();
+        // The more specific listener takes the connect: the wildcard would wait for it forever.
+        accept_probe(&holder, &probe);
+        assert_eq!(held_on_loopback(port), Some(held));
+        drop((probe, holder));
+        assert_eq!(
+            held_on_loopback(port),
+            None,
+            "only the wildcard holds the port now"
+        );
+        drop(wildcard);
     }
 
     #[test]

@@ -36,6 +36,11 @@ impl<'a> ProvisionalSetupWatchTest<'a> {
         })
     }
 
+    /// A person's press on this Mac asks for macOS's grants ([`crate::macos_doctor::note_person_asked_for_access`]).
+    pub fn person_asks_for_access(&self) -> Result<(), String> {
+        super::super::note_person_asked_at(self.root)
+    }
+
     pub fn widens(&self) -> Result<bool, String> {
         if self.upgrade.pending() {
             Ok(true)

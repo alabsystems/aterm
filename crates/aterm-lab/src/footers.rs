@@ -11,13 +11,18 @@ use crate::pyjson::{COMPACT, J};
 use crate::run::Run;
 use crate::{Fail, Res};
 
+/// The row under the composer that names the mode: the last row with a pill glyph.
+fn mode_row(screen: &str) -> Option<&str> {
+    screen
+        .lines()
+        .rev()
+        .find(|l| l.contains("⏵⏵ ") || l.contains("⏸ "))
+}
+
 /// Returns the mode word named by the row under the composer, if recognized.
 #[must_use]
 pub fn mode_word(screen: &str) -> Option<&'static str> {
-    let row = screen
-        .lines()
-        .rev()
-        .find(|l| l.contains("⏵⏵ ") || l.contains("⏸ "))?;
+    let row = mode_row(screen)?;
     [
         ("⏵⏵", "mode.bypass", "bypass"),
         ("⏵⏵", "mode.auto", "auto"),
@@ -31,14 +36,13 @@ pub fn mode_word(screen: &str) -> Option<&'static str> {
     .map(|(_, _, w)| w)
 }
 
-/// Returns the footer's last row as a pattern for `await gone`.
+/// Returns the mode row ([`mode_word`]'s row) as a pattern for `await gone`: never another row
+/// under it, such as Claude's effort hint wrapped onto a row of its own, which a press can leave
+/// standing while the mode changes.
 #[must_use]
-pub fn footer_row_pattern(screen: &str) -> Option<String> {
-    screen
-        .lines()
-        .rev()
+pub fn mode_row_pattern(screen: &str) -> Option<String> {
+    mode_row(screen)
         .map(str::trim)
-        .find(|l| !l.is_empty())
         .map(aterm_phase::anchors::guard_regex)
 }
 
@@ -121,6 +125,43 @@ impl Opts {
     }
 }
 
+/// Which cycle [`Rec::walk_cycle`] walks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cycle {
+    /// The launch mode's, under the lab's settings.
+    Launch,
+    /// A `--dangerously-skip-permissions` launch's, from bypass: how many presses a leave of
+    /// bypass takes to reach each mode (the mode light's click from `yolo` to `lame`).
+    FromBypass,
+}
+
+impl Cycle {
+    /// The capture's name for `mode`, reached at `press`: `footer-<mode>` for the launch's cycle,
+    /// `footer-bypass-then-<press>-<mode>` from bypass.
+    fn name(self, press: u32, mode: &str) -> String {
+        match self {
+            Cycle::Launch => format!("footer-{mode}"),
+            Cycle::FromBypass => format!("footer-bypass-then-{press}-{mode}"),
+        }
+    }
+
+    /// The capture's name for the mode the cycle comes back round to at `press`, its closing
+    /// edge: [`Self::name`] with `-again`.
+    fn again(self, press: u32, mode: &str) -> String {
+        format!("{}-again", self.name(press, mode))
+    }
+
+    /// What each capture of it is.
+    const fn what(self) -> &'static str {
+        match self {
+            Cycle::Launch => "after shift+tab: the next mode of the launch's cycle",
+            Cycle::FromBypass => {
+                "after shift+tab from bypass: the next mode of a --dangerously-skip-permissions launch's cycle, numbered by presses"
+            }
+        }
+    }
+}
+
 struct Rec<'a> {
     run: &'a Run,
     door: Door<'a>,
@@ -161,9 +202,38 @@ impl Rec<'_> {
         Ok(())
     }
 
+    /// Press shift+tab from `start` until the cycle comes back round (six presses at most), and
+    /// snap each mode it reaches ([`Cycle::name`]) and the one it comes back round to, its closing
+    /// edge ([`Cycle::again`]). Whether the walk came round: a press that left the mode row
+    /// unchanged, or six presses that never came round, stop it, said on stderr.
+    fn walk_cycle(&mut self, start: &str, cycle: Cycle) -> Result<bool, Fail> {
+        let mut seen = vec![start.to_owned()];
+        for press in 1..=6 {
+            if !self.shift_tab()? {
+                eprintln!(
+                    "footers: shift+tab {press} from {start} left the mode row unchanged; the walk stopped there"
+                );
+                return Ok(false);
+            }
+            let m = mode_word(&self.text()).map(str::to_string);
+            if let Some(m) = m.as_ref().filter(|m| seen.contains(m)) {
+                self.snap(&cycle.again(press, m), cycle.what())?;
+                return Ok(true);
+            }
+            let m = m.unwrap_or_else(|| {
+                self.unread += 1;
+                format!("unread-{}", self.unread)
+            });
+            self.snap(&cycle.name(press, &m), cycle.what())?;
+            seen.push(m);
+        }
+        eprintln!("footers: six presses from {start} never came back round; the walk stopped");
+        Ok(false)
+    }
+
     /// Press shift+tab and wait for the mode row to change; whether it did.
     fn shift_tab(&self) -> Result<bool, Fail> {
-        let before = footer_row_pattern(&self.text());
+        let before = mode_row_pattern(&self.text());
         let _ = self.door.ctl(&["send", "\u{1b}[Z"])?;
         let moved = match before {
             Some(p) => self.door.await_gone(&p, 10)?,
@@ -239,25 +309,7 @@ fn record(run: &Run, o: &Opts, out: PathBuf) -> Res {
     let _ = rec.door.ctl(&["key", "ctrl+u"])?;
     rec.door.await_gone("draft.text", 10)?;
     rec.settle()?;
-    let mut seen = vec![start.clone()];
-    for _ in 0..6 {
-        if !rec.shift_tab()? {
-            break;
-        }
-        let m = mode_word(&rec.text()).map(str::to_string);
-        if m.as_ref().is_some_and(|m| seen.contains(m)) {
-            break;
-        }
-        let m = m.unwrap_or_else(|| {
-            rec.unread += 1;
-            format!("unread-{}", rec.unread)
-        });
-        rec.snap(
-            &format!("footer-{m}"),
-            "after shift+tab: the next mode of the launch's cycle",
-        )?;
-        seen.push(m);
-    }
+    let mut whole = rec.walk_cycle(&start, Cycle::Launch)?;
     if o.turn {
         for _ in 0..6 {
             if mode_word(&rec.text()).map(str::to_string).as_ref() == Some(&start) {
@@ -297,14 +349,24 @@ fn record(run: &Run, o: &Opts, out: PathBuf) -> Res {
             "footer-bypass-idle",
             "bypass permissions (started with --dangerously-skip-permissions), idle",
         )?;
+        let start = rec.mode_or_unread();
+        whole &= rec.walk_cycle(&start, Cycle::FromBypass)?;
         quit(&rec.door)?;
     }
     println!();
-    println!(
-        "Recorded Claude Code {} into {}.",
-        run.claude_ver,
-        rec.out.display()
-    );
+    if whole {
+        println!(
+            "Recorded Claude Code {} into {}.",
+            run.claude_ver,
+            rec.out.display()
+        );
+    } else {
+        println!(
+            "Recorded part of Claude Code {} into {}: a cycle walk stopped before it came back round (said above), so its later modes are missing.",
+            run.claude_ver,
+            rec.out.display()
+        );
+    }
     if rec.unread > 0 {
         println!(
             "{} mode row(s) this verb could not name were saved as footer-unread-<n>: the canary will say whether aterm reads them.",
@@ -363,13 +425,42 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_row_is_the_last_row_with_text_as_a_literal_pattern() {
+    fn a_cycle_from_bypass_numbers_each_capture_by_its_press() {
+        assert_eq!(Cycle::Launch.name(2, "plan"), "footer-plan");
+        assert_eq!(
+            Cycle::FromBypass.name(1, "manual"),
+            "footer-bypass-then-1-manual"
+        );
+        assert_eq!(Cycle::Launch.again(5, "auto"), "footer-auto-again");
+        assert_eq!(
+            Cycle::FromBypass.again(5, "bypass"),
+            "footer-bypass-then-5-bypass-again"
+        );
+    }
+
+    /// The pattern a press waits on is the mode row's, as a literal, never the effort hint
+    /// Claude wraps onto a row of its own under it (2.1.316's bypass-idle screen at 80 columns),
+    /// which a press can leave standing while the mode changes.
+    #[test]
+    fn the_mode_row_is_the_pattern_a_press_waits_on() {
         let screen = "❯ \n──────\n  ⏸ manual mode on · ? for shortcuts · ← for agents\n\n   \n";
         assert_eq!(
-            footer_row_pattern(screen).as_deref(),
+            mode_row_pattern(screen).as_deref(),
             Some("⏸.manual.mode.on.·.\\?.for.shortcuts.·.←.for.agents")
         );
-        assert_eq!(footer_row_pattern("\n  \n"), None);
+        let wrapped = "❯ \n──────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n                                                              ◐ medium · /effort\n";
+        let pattern = mode_row_pattern(wrapped).expect("the mode row");
+        assert_eq!(
+            pattern,
+            "⏵⏵.bypass.permissions.on.\\(shift\\+tab.to.cycle\\).·.←.for.agents"
+        );
+        let re = aterm_regex::Regex::new(&pattern).unwrap();
+        assert!(!re.is_match("◐ medium · /effort"), "never the effort row");
+        assert!(
+            !re.is_match("  ⏵⏵ auto mode on (shift+tab to cycle)  ◐ medium · /effort"),
+            "gone once the mode changes, the hint kept"
+        );
+        assert_eq!(mode_row_pattern("\n  \n"), None);
     }
 
     #[test]

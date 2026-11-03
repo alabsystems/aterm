@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use astream_effects::EffectRecord;
 
-use crate::error::{Error, Replay, Result, Sub};
+use crate::error::{Error, Replay, Result};
 use crate::redact::Redactor;
 use crate::wire::Endpoints;
 
@@ -35,8 +35,7 @@ pub struct TapeHeader {
     pub api_version: String,
     /// `argv {tokens}`: the command line, less its tape flags.
     pub argv: Vec<String>,
-    /// `mode anonymous`, or `mode credentialed` (WP10's; `TapeHeader::parse` refuses it until
-    /// then).
+    /// `mode anonymous`, or `mode credentialed`.
     pub mode: TapeMode,
     /// `endpoints github.com`, or `endpoints loopback` for a test's agh-fake.
     pub endpoints: TapeEndpoints,
@@ -49,8 +48,7 @@ pub enum TapeMode {
     /// No credential.
     Anonymous,
     /// `mode credentialed`: a run that spoke as a profile, its decisions taped at the route
-    /// door and its credential never (WP10 records and replays one; until then `parse`
-    /// refuses the mode).
+    /// door and its credential never, so it replays with no agh.toml and no token.
     Credentialed,
 }
 
@@ -189,7 +187,7 @@ impl TapeHeader {
     /// Parse a header written by `render`.
     ///
     /// # Errors
-    /// `Replay::Format`: a line missing, out of order or unknown; an `api` other than `API_VERSION`; a `mode` other than `anonymous`; an endpoints value that is neither.
+    /// `Replay::Format`: a line missing, out of order or unknown; an `api` other than `API_VERSION`; a `mode` other than `anonymous` or `credentialed`; an endpoints value that is neither.
     pub fn parse(text: &str) -> Result<TapeHeader> {
         TapeHeader::parse_lines(&header_lines(text), 1)
     }
@@ -237,6 +235,7 @@ impl TapeHeader {
         };
         let mode = match line(3, "mode")? {
             "anonymous" => TapeMode::Anonymous,
+            "credentialed" => TapeMode::Credentialed,
             other => {
                 return Err(format_at(
                     first + 3,
@@ -494,13 +493,35 @@ struct SinkState {
     /// `finish` succeeded: the exit record is the tape's last, and a record after it is an
     /// error (a `Ctx` reused for another command line), never a line on the tape.
     finished: bool,
+    /// A credentialed tape's redactor (`with_redactor`): every record passes its `apply`, which
+    /// holds the credentials learned so far, where an anonymous tape's pass `Redactor::shapes`.
+    redactor: Option<Redactor>,
+    /// The header item `create` wrote (`MAGIC`, then the shaped header): `finish` reads it
+    /// again through the redactor, which may have learned a credential the command line names
+    /// after the header was written.
+    head: String,
+    /// The streamed bodies this sink made in `{tape}.d` (`store_body`): a tape that is removed
+    /// (`discard`, a refused `finish`) or left cut short (`finish` after a write error) removes
+    /// them, then `{tape}.d` once it is empty.
+    #[cfg(unix)]
+    sidecars: Vec<PathBuf>,
+}
+
+/// Remove the streamed bodies `state`'s sink made, then `{tape}.d` when nothing else is in it:
+/// its tape is gone or cut short, and a body beside no tape that replays serves nobody.
+#[cfg(unix)]
+fn drop_sidecars(state: &mut SinkState) {
+    for path in state.sidecars.drain(..) {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir(sidecar_dir(&state.path));
 }
 
 /// What a sink's latched failure leaves, and the `next` its `finish` names.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Remedy {
-    /// An I/O error: the partial file is kept, as far as the door the run reached, and the
-    /// next is `remove {path}, then record again`.
+    /// An I/O error: the partial file is kept, as far as the door the run reached, its streamed
+    /// bodies removed (it never replays), and the next is `remove {path}, then record again`.
     Kept,
     /// A refusal every run of this command line would meet again: `finish` removes the file,
     /// which holds no exit and could never replay, and the next is `run it without --record:
@@ -527,11 +548,10 @@ pub struct TapeSink {
 }
 
 fn not_written(path: &Path, e: &str) -> Error {
-    Error::could_not_run(format!(
+    Error::local(format!(
         "the tape {} could not be written: {e}",
         path.display()
     ))
-    .with_sub(Sub::Local)
 }
 
 fn path_word(path: &Path) -> String {
@@ -539,20 +559,10 @@ fn path_word(path: &Path) -> String {
 }
 
 fn in_the_way(path: &Path) -> String {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const O_NONBLOCK: i32 = 0o4000;
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-    const O_NONBLOCK: i32 = 0x0004;
-
     let magic = format!("{MAGIC}\n");
     let mut head = Vec::new();
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, O_NONBLOCK);
     let tape = std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
-        && options
-            .open(path)
+        && crate::download::open_nonblocking(path)
             .and_then(|file| {
                 if !file.metadata()?.is_file() {
                     return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
@@ -582,11 +592,10 @@ fn latched_error(path: &Path, why: &str, remedy: Remedy) -> Error {
         }
         Remedy::Whole => not_written(path, why).with_next(replay_it()),
         Remedy::Discarded => not_written(path, why),
-        Remedy::Unflushed => Error::could_not_run(format!(
+        Remedy::Unflushed => Error::local(format!(
             "the tape {} is whole, but its directory could not be flushed: {why}",
             path.display()
         ))
-        .with_sub(Sub::Local)
         .with_next(replay_it()),
     }
 }
@@ -596,7 +605,10 @@ impl TapeSink {
     /// credentials, where M1's passes `Redactor::shapes`: a credentialed tape's sink.
     #[must_use]
     pub fn with_redactor(self, redactor: crate::redact::Redactor) -> TapeSink {
-        let _ = redactor;
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .redactor = Some(redactor);
         self
     }
 
@@ -611,6 +623,30 @@ impl TapeSink {
         Self::open_within(path, header, TAPE_MAX)
     }
 
+    /// `create`, then `with_redactor(redactor)`: a credentialed tape's sink. Its header item
+    /// passes only `Redactor::shapes` when it is written, so it is first read through
+    /// `redactor.apply`, which holds the credentials learned so far (a vault token, once
+    /// adoption has settled), and `finish` reads it again for any learned later.
+    ///
+    /// # Errors
+    /// As `create`. A header item `redactor.apply` would change is CouldNotRun, `Sub::Local`,
+    /// why `the tape {path} was not made: its command line holds a credential this run used`,
+    /// next `record a command line that names no token`, before any file is made.
+    pub(crate) fn create_redacted(
+        path: &Path,
+        header: &TapeHeader,
+        redactor: Redactor,
+    ) -> Result<TapeSink> {
+        if head_holds_a_credential(&head_text(&shaped_header(header)), &redactor) {
+            return Err(Error::local(format!(
+                "the tape {} was not made: {HEAD_CREDENTIAL}",
+                path.display()
+            ))
+            .with_next("record a command line that names no token"));
+        }
+        Ok(Self::create(path, header)?.with_redactor(redactor))
+    }
+
     /// Create `path` with the file held to `max` bytes in place of `TAPE_MAX`.
     ///
     /// # Errors
@@ -622,12 +658,11 @@ impl TapeSink {
 
     fn open_within(path: &Path, header: &TapeHeader, max: u64) -> Result<TapeSink> {
         if head_redacts(header) {
-            return Err(Error::could_not_run(format!(
+            return Err(Error::local(format!(
                 "the tape {} was not made: its command line holds a token shape across its \
                  arguments, which a tape redacts",
                 path.display()
             ))
-            .with_sub(Sub::Local)
             .with_next("record a command line that names no token"));
         }
         let head = head_text(&shaped_header(header));
@@ -648,18 +683,16 @@ impl TapeSink {
         }
         let mut file = options.open(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
-                Error::could_not_run(format!(
+                Error::local(format!(
                     "the tape {} exists: --record never overwrites",
                     path.display()
                 ))
-                .with_sub(Sub::Local)
                 .with_next(in_the_way(path))
             } else {
-                Error::could_not_run(format!(
+                Error::local(format!(
                     "the tape {} could not be created: {e}",
                     path.display()
                 ))
-                .with_sub(Sub::Local)
             }
         })?;
         if let Err(e) = file.write_all(head.as_bytes()) {
@@ -677,6 +710,10 @@ impl TapeSink {
                 max,
                 discarded: false,
                 finished: false,
+                redactor: None,
+                head,
+                #[cfg(unix)]
+                sidecars: Vec::new(),
             })),
         })
     }
@@ -696,27 +733,42 @@ impl TapeSink {
     /// # Errors
     /// CouldNotRun, `Sub::Local`, why `the tape {path} could not be written: {e}`: the latched
     /// error, or the flush's own. A refusal every run would meet again (a record outside the
-    /// subset, a rendering the shapes would change, a tape over `TAPE_MAX`) first removes the
-    /// file, and its next is `run it without --record: a tape cannot hold this run` (a file it
-    /// cannot remove is kept, with a write error's next); a write error keeps the partial file,
-    /// next `remove {path}, then record again`. A directory that cannot be flushed after the
-    /// file was made durable is why `the tape {path} is whole, but its directory could not be
-    /// flushed: {e}`, next `replay it: agh --replay {path}`: the file is kept. In each next,
-    /// `{path}` is one POSIX shell word.
+    /// subset, a rendering the shapes would change, a tape over `TAPE_MAX`, or a header that a
+    /// credentialed sink's redactor would now change: a credential the command line names,
+    /// learned after the header was written) first removes the file, and its next is `run it
+    /// without --record: a tape cannot hold this run` (a file it cannot remove is kept, with a
+    /// write error's next); a write error keeps the partial file, next `remove {path}, then
+    /// record again`. A tape left that way or refused never replays, so the streamed bodies
+    /// this sink stored go with it (`drop_sidecars`). A directory that cannot be flushed after
+    /// the file was made durable is why `the tape {path} is whole, but its directory could not
+    /// be flushed: {e}`, next `replay it: agh --replay {path}`: the file and its bodies are
+    /// kept. In each next, `{path}` is one POSIX shell word.
     pub fn finish(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(e) = &state.failed {
-            if state.remedy == Remedy::Refused {
-                return match std::fs::remove_file(&state.path) {
+        let head_holds_one = state
+            .redactor
+            .as_ref()
+            .is_some_and(|redactor| head_holds_a_credential(&state.head, redactor));
+        if state.failed.is_none() && head_holds_one {
+            state.failed = Some(HEAD_CREDENTIAL.to_string());
+            state.remedy = Remedy::Refused;
+        }
+        if let Some(e) = state.failed.clone() {
+            let remedy = match state.remedy {
+                Remedy::Refused => match std::fs::remove_file(&state.path) {
                     Ok(()) => {
-                        let e = e.clone();
                         state.remedy = Remedy::Removed;
-                        Err(latched_error(&state.path, &e, Remedy::Removed))
+                        Remedy::Removed
                     }
-                    Err(_) => Err(latched_error(&state.path, e, Remedy::Kept)),
-                };
+                    Err(_) => Remedy::Kept,
+                },
+                remedy => remedy,
+            };
+            #[cfg(unix)]
+            if matches!(remedy, Remedy::Kept | Remedy::Removed) {
+                drop_sidecars(&mut state);
             }
-            return Err(latched_error(&state.path, e, state.remedy));
+            return Err(latched_error(&state.path, &e, remedy));
         }
         let done = state
             .file
@@ -725,6 +777,8 @@ impl TapeSink {
         if let Err(e) = done {
             let e = e.to_string();
             state.failed = Some(e.clone());
+            #[cfg(unix)]
+            drop_sidecars(&mut state);
             return Err(latched_error(&state.path, &e, Remedy::Kept));
         }
         let dir = state
@@ -742,13 +796,15 @@ impl TapeSink {
         Ok(())
     }
 
-    /// Remove the file this sink's `create` made, for a run whose tape can never replay (a rerecording that diverged): nobody's work is lost, because the old tape still holds it.
+    /// Remove the file this sink's `create` made, for a run whose tape can never replay (a rerecording that diverged): nobody's work is lost, because the old tape still holds it. The streamed bodies this sink stored go with it (`drop_sidecars`).
     pub(crate) fn discard(&self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.failed = Some("the tape was discarded".to_string());
         state.remedy = Remedy::Discarded;
         state.discarded = true;
         let _ = std::fs::remove_file(&state.path);
+        #[cfg(unix)]
+        drop_sidecars(&mut state);
     }
 
     /// Whether `discard` removed the file.
@@ -770,7 +826,7 @@ impl TapeSink {
             state.remedy = Remedy::Whole;
             return;
         }
-        let Some(text) = render_record(&shaped_record(record)) else {
+        let Some(text) = render_record(&redacted_record(record, state.redactor.as_ref())) else {
             state.failed = Some(format!(
                 "the seam made a {} record, which agh's tapes do not hold",
                 record.kind()
@@ -802,11 +858,336 @@ impl TapeSink {
     }
 }
 
+/// `{tape}.d`: the directory beside a credentialed tape that holds its streamed bodies, each
+/// named by its lowercase hex SHA-256.
+#[cfg(unix)]
+pub(crate) fn sidecar_dir(tape: &Path) -> PathBuf {
+    let mut name = tape.as_os_str().to_os_string();
+    name.push(".d");
+    PathBuf::from(name)
+}
+
+/// A streamed body stored beside its tape (`TapeSink::store_body`).
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct Stored {
+    /// Its lowercase hex SHA-256: the file's name in `{tape}.d`.
+    pub(crate) hex: String,
+    /// Its length.
+    pub(crate) len: u64,
+    /// The very file the bytes were written to, open at its start: the caller streams what
+    /// was hashed, whatever is at `{tape}.d/{hex}` later.
+    pub(crate) file: std::fs::File,
+}
+
+/// Why `TapeSink::store_body` stored nothing.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) enum StoreFault {
+    /// The body could not be read: the answer's own failure.
+    Read(std::io::Error),
+    /// The sidecar could not be written: could_not_run, `Sub::Local`, its next naming
+    /// `{tape}.d`.
+    Write(Error),
+    /// The body holds a credential the sink learned, or a token shape (`Redactor::apply`): a
+    /// tape never holds one, in a sidecar either.
+    Shaped,
+}
+
+/// The bytes of a stored body each scan looks at again, before the next chunk: more than any
+/// credential or shape `Redactor::apply` finds, so one split between two reads is still seen
+/// whole.
+#[cfg(unix)]
+const SCAN_OVERLAP: usize = 4096;
+
+/// The fewest word bytes (`[A-Za-z0-9_]`) after a token prefix that a streamed body's scan
+/// counts as a token GitHub could have issued: classic tokens carry 36, fine-grained ones 82.
+/// `Redactor::shapes` (rule 1) takes one, which binary data holds by chance: five bytes such as
+/// `ghs_7` turn up about once in 3.4 GB of random bytes, so one in four 1 GiB assets would
+/// never record, where a prefix and 20 such bytes turn up about once in 10^21 bytes.
+#[cfg(unix)]
+const TOKEN_TAIL_MIN: usize = 20;
+
+/// Whether a valid UTF-8 run of `bytes`, a streamed body, holds what its tape must not keep: a
+/// credential this run learned (its exact bytes or git's Basic form, `Redactor::learn`), a
+/// value under `Authorization:`, `bearer` or `basic` (`Redactor::shapes`' rules 2 to 4), or a
+/// token prefix followed by at least `TOKEN_TAIL_MIN` word bytes (rule 1, held to a length
+/// GitHub issues).
+#[cfg(unix)]
+fn holds_a_secret(bytes: &[u8], redactor: &Redactor) -> bool {
+    bytes
+        .utf8_chunks()
+        .any(|chunk| text_holds_a_secret(chunk.valid(), redactor))
+}
+
+/// `holds_a_secret` for one valid UTF-8 run.
+#[cfg(unix)]
+fn text_holds_a_secret(text: &str, redactor: &Redactor) -> bool {
+    // Nothing `apply` would change holds nothing: the common case, one pass.
+    if text.is_empty() || redactor.apply(text) == text {
+        return false;
+    }
+    let learned =
+        |text: &str| redactor.learned_and_tokens(text) != Redactor::new().learned_and_tokens(text);
+    // A learned credential anywhere. A redacted credential that is exactly one of rule 1's
+    // runs reads the same either way, and is caught word by word below.
+    if learned(text) {
+        return true;
+    }
+    // Rules 2 to 4 alone: every token prefix holds `_`, and `-` is no byte rules 2 to 4 read
+    // otherwise than `_` (neither is blank, a quote or base64), so no rule 1 run is left.
+    let masked = text.replace('_', "-");
+    if Redactor::shapes(&masked) != masked {
+        return true;
+    }
+    // Rule 1, word by word: a run starts at a word's first prefix and takes the rest of the
+    // word, so it has `TOKEN_TAIL_MIN` bytes after its prefix exactly when the word less its
+    // last `TOKEN_TAIL_MIN - 1` bytes still holds a prefix and one byte after it.
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|word| Redactor::shapes(word) != *word)
+        .any(|word| {
+            let head = word.get(..word.len().saturating_sub(TOKEN_TAIL_MIN - 1));
+            let long = head.is_some_and(|head| Redactor::shapes(head) != head);
+            // A short run that is a learned credential: one more word byte grows rule 1's
+            // run, never the credential, so the two redactions part.
+            long || ["Z", "0"]
+                .iter()
+                .any(|more| learned(&format!("{word}{more}")))
+        })
+}
+
+#[cfg(unix)]
+impl TapeSink {
+    /// Store at most `cap + 1` bytes of `body` beside this sink's tape: `{tape}.d/.partial-{n}`
+    /// (`{tape}.d` made 0700 by `create_private_dir`, the file 0600 and `create_new`, a partial
+    /// a killed recording left there removed first), hashed and scanned as it is written, made
+    /// durable, then renamed over `{tape}.d/{hex}`. `n` is the tape's count of streamed answers
+    /// so far, unique within the run. The scan is `holds_a_secret` with the sink's redactor
+    /// (one that learned nothing on a sink with none) over each valid UTF-8 run,
+    /// `SCAN_OVERLAP` bytes carried across reads. A body file this store made is the sink's:
+    /// `discard` removes it. The partial file is removed on every failure.
+    pub(crate) fn store_body(
+        &self,
+        n: u64,
+        body: &mut dyn std::io::Read,
+        cap: u64,
+    ) -> std::result::Result<Stored, StoreFault> {
+        use std::io::{Seek as _, SeekFrom};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let (dir, redactor) = {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            (
+                sidecar_dir(&state.path),
+                state.redactor.clone().unwrap_or_default(),
+            )
+        };
+        let fault = |what: &str, e: &dyn std::fmt::Display| {
+            StoreFault::Write(
+                Error::local(format!("{what} {}: {e}", dir.display())).with_next(format!(
+                    "make room in {}, or record to another path",
+                    path_word(&dir)
+                )),
+            )
+        };
+        aterm_uds::private_file::create_private_dir(&dir)
+            .map_err(|e| fault("the tape's body directory could not be made:", &e))?;
+        let partial = dir.join(format!(".partial-{n}"));
+        // A recording killed mid-store leaves its partial; `{tape}.d` is private, and the tape
+        // it served is gone or this one, which `create_new` made.
+        let _ = std::fs::remove_file(&partial);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&partial)
+            .map_err(|e| fault("a body file could not be made in", &e))?;
+        let gone = |fault: StoreFault| {
+            let _ = std::fs::remove_file(&partial);
+            fault
+        };
+        let mut hasher = aterm_digest::Sha256::new();
+        let mut len: u64 = 0;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut window: Vec<u8> = Vec::with_capacity(SCAN_OVERLAP + buf.len());
+        let mut body = body.take(cap.saturating_add(1));
+        loop {
+            let n = match body.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(gone(StoreFault::Read(e))),
+            };
+            let chunk = buf.get(..n).unwrap_or_default();
+            window.extend_from_slice(chunk);
+            if holds_a_secret(&window, &redactor) {
+                return Err(gone(StoreFault::Shaped));
+            }
+            window.drain(..window.len().saturating_sub(SCAN_OVERLAP));
+            hasher.update(chunk);
+            file.write_all(chunk)
+                .map_err(|e| gone(fault("a body file could not be written in", &e)))?;
+            len = len.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+        }
+        file.flush()
+            .and_then(|()| aterm_durable::durable(&file))
+            .map_err(|e| gone(fault("a body file could not be flushed in", &e)))?;
+        let hex = aterm_codec::hex::encode_lower(&hasher.finalize());
+        let path = dir.join(&hex);
+        let fresh = std::fs::symlink_metadata(&path).is_err();
+        std::fs::rename(&partial, &path)
+            .map_err(|e| gone(fault("a body file could not be named in", &e)))?;
+        if fresh {
+            self.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .sidecars
+                .push(path);
+        }
+        aterm_durable::durable_dir(&dir)
+            .map_err(|e| fault("the tape's body directory could not be flushed:", &e))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| fault("a body file could not be read back in", &e))?;
+        Ok(Stored { hex, len, file })
+    }
+}
+
+/// The next of a replay whose streamed body is missing or not the one taped.
+#[cfg(unix)]
+const STREAM_AGAIN: &str =
+    "record the tape again: agh --record NEW followed by the command line, then replay that one";
+
+/// `Replay::StreamDigest`: the sidecar `{dir}/{hex}` is missing, or holds other bytes.
+#[cfg(unix)]
+pub(crate) fn stream_digest(dir: &Path, hex: &str, what: &str) -> Error {
+    Error::replay(
+        Replay::StreamDigest,
+        format!("the tape's body file {} {what}", dir.join(hex).display()),
+    )
+    .with_next(STREAM_AGAIN)
+}
+
+/// A taped body as it replays: the sidecar's bytes, hashed as they are read, never more than
+/// the taped length. At their end (the file's, or the taped length when the file goes on), a
+/// digest or length that is not the taped one latches `Replay::StreamDigest` into `latch` and
+/// fails the read, so the run stops there and its exit is the replay's.
+#[cfg(unix)]
+pub(crate) struct DigestReader {
+    file: std::fs::File,
+    hasher: Option<aterm_digest::Sha256>,
+    dir: PathBuf,
+    hex: String,
+    len: u64,
+    seen: u64,
+    latch: Arc<Mutex<Option<Error>>>,
+}
+
+/// `path` opened to read when its entry is a regular file and the handle is that entry: the
+/// entry is judged unfollowed (`symlink_metadata`), the open does not wait (`O_NONBLOCK`), and
+/// the handle's device and inode must be the entry's, so an entry swapped between the two is
+/// refused too. `None` for anything else.
+#[cfg(unix)]
+fn open_regular(path: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let entry = std::fs::symlink_metadata(path).ok()?;
+    if !entry.is_file() {
+        return None;
+    }
+    let file = crate::download::open_nonblocking(path).ok()?;
+    let held = file.metadata().ok()?;
+    (held.is_file() && held.dev() == entry.dev() && held.ino() == entry.ino()).then_some(file)
+}
+
+#[cfg(unix)]
+impl DigestReader {
+    /// `{dir}/{hex}` opened to replay a body of `len` bytes: the entry itself must be a regular
+    /// file (a link is not followed, and a FIFO is opened without waiting, then refused), and
+    /// the open handle must be that very file.
+    ///
+    /// # Errors
+    ///
+    /// `Replay::StreamDigest` when the file is missing or is not a regular file.
+    pub(crate) fn open(
+        dir: &Path,
+        hex: &str,
+        len: u64,
+        latch: Arc<Mutex<Option<Error>>>,
+    ) -> Result<DigestReader> {
+        let file =
+            open_regular(&dir.join(hex)).ok_or_else(|| stream_digest(dir, hex, "is missing"))?;
+        Ok(DigestReader {
+            file,
+            hasher: Some(aterm_digest::Sha256::new()),
+            dir: dir.to_path_buf(),
+            hex: hex.to_string(),
+            len,
+            seen: 0,
+            latch,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl std::io::Read for DigestReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some(hasher) = self.hasher.as_mut() else {
+            return Ok(0);
+        };
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // At most the taped length is given; past it, one byte more is read to see whether the
+        // file ends there. So a longer file is judged at the taped length, before a reader that
+        // stops one byte past it (`client.rs`'s `Bounded`) refuses it as too large.
+        let left = usize::try_from(self.len.saturating_sub(self.seen)).unwrap_or(usize::MAX);
+        let mut more = [0u8; 1];
+        let into = if left == 0 {
+            more.as_mut_slice()
+        } else {
+            let end = left.min(buf.len());
+            buf.get_mut(..end).unwrap_or_default()
+        };
+        let n = self.file.read(into)?;
+        if n > 0 && left > 0 {
+            hasher.update(into.get(..n).unwrap_or_default());
+            self.seen = self
+                .seen
+                .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+            return Ok(n);
+        }
+        let Some(hasher) = self.hasher.take() else {
+            return Ok(0);
+        };
+        let hex = aterm_codec::hex::encode_lower(&hasher.finalize());
+        if n == 0 && hex == self.hex && self.seen == self.len {
+            return Ok(0);
+        }
+        let e = stream_digest(
+            &self.dir,
+            &self.hex,
+            "holds other bytes than the tape names",
+        );
+        let why = e.why.clone();
+        self.latch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(e);
+        Err(std::io::Error::other(why))
+    }
+}
+
 /// `bytes` through `Redactor::shapes`: each valid UTF-8 run shaped, each invalid byte kept as it is.
 pub(crate) fn shaped(bytes: &[u8]) -> Vec<u8> {
+    per_run(bytes, Redactor::shapes)
+}
+
+/// `bytes` with each valid UTF-8 run through `f` and each invalid byte kept as it is.
+fn per_run(bytes: &[u8], f: impl Fn(&str) -> String) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     for chunk in bytes.utf8_chunks() {
-        out.extend_from_slice(Redactor::shapes(chunk.valid()).as_bytes());
+        out.extend_from_slice(f(chunk.valid()).as_bytes());
         out.extend_from_slice(chunk.invalid());
     }
     out
@@ -829,7 +1210,26 @@ pub(crate) fn head_redacts(header: &TapeHeader) -> bool {
     Redactor::shapes(&head) != head
 }
 
-fn shaped_record(record: &EffectRecord) -> EffectRecord {
+/// Why a credentialed sink refuses its header item (`TapeSink::create_redacted`, `finish`).
+const HEAD_CREDENTIAL: &str = "its command line holds a credential this run used";
+
+/// Whether `head`, a header item as written, holds a credential `redactor` learned: one with no
+/// token shape (a legacy classic token is any long printable run) passes the shapes the header
+/// was written through.
+fn head_holds_a_credential(head: &str, redactor: &Redactor) -> bool {
+    redactor.apply(head) != head
+}
+
+/// `bytes` through `redactor.apply` (the learned credentials, then the shapes), each valid UTF-8
+/// run redacted and each invalid byte kept; with no redactor, `shaped`.
+fn redacted(bytes: &[u8], redactor: Option<&Redactor>) -> Vec<u8> {
+    match redactor {
+        Some(redactor) => per_run(bytes, |text| redactor.apply(text)),
+        None => shaped(bytes),
+    }
+}
+
+fn redacted_record(record: &EffectRecord, redactor: Option<&Redactor>) -> EffectRecord {
     match record {
         EffectRecord::Exchange {
             door,
@@ -837,12 +1237,12 @@ fn shaped_record(record: &EffectRecord) -> EffectRecord {
             reply,
         } => EffectRecord::Exchange {
             door: door.clone(),
-            request: shaped(request),
-            reply: shaped(reply),
+            request: redacted(request, redactor),
+            reply: redacted(reply, redactor),
         },
         EffectRecord::Emit { door, bytes } => EffectRecord::Emit {
             door: door.clone(),
-            bytes: shaped(bytes),
+            bytes: redacted(bytes, redactor),
         },
         other => other.clone(),
     }
@@ -888,5 +1288,39 @@ impl std::fmt::Debug for TapeSink {
 impl astream_effects::RecordSink for TapeSink {
     fn record(&mut self, record: &EffectRecord) {
         self.append(record);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::error::Sub;
+
+    #[test]
+    fn a_tape_cut_short_by_a_write_error_takes_its_bodies_with_it() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("agh-tape-")
+            .tempdir()
+            .expect("a scratch directory");
+        let path = dir.path().join("t.atape");
+        let argv = ["release".to_string(), "download".to_string()];
+        let header = TapeHeader::for_run(&argv, &crate::wire::Endpoints::github_com());
+        let sink = TapeSink::create(&path, &header).expect("a sink");
+        let stored = sink
+            .store_body(0, &mut &b"the bytes of a body"[..], 1 << 20)
+            .expect("stored");
+        let body = sidecar_dir(&path).join(&stored.hex);
+        assert!(body.exists());
+        // The tape's handle made read-only: the next append fails to write, as on a full disk.
+        sink.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .file = std::fs::File::open(&path).expect("the tape, read-only");
+        sink.append(&EffectRecord::Clock(1));
+        let refused = sink.finish().expect_err("a write error");
+        assert_eq!(refused.sub, Sub::Local);
+        assert!(path.exists(), "the partial tape is kept");
+        assert!(!body.exists(), "its body is removed");
+        assert!(!sidecar_dir(&path).exists());
     }
 }

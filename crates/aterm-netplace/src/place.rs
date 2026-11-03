@@ -431,6 +431,20 @@ pub struct Answer {
     /// The local address the route to it took when it was noted (`route_source_ipv4`), which
     /// says whether it came over this network's interface; `None` where unread.
     pub via: Option<Ipv4Addr>,
+    /// The interface that held [`Self::via`] when it was noted (`en0`); `None` where unread.
+    pub iface: Option<String>,
+    /// The network (strong id) it was heard on: the one this Mac's traffic left on both when the
+    /// round that reached it began and when it was noted ([`crate::heard::note_answer`]); `None`
+    /// where either was unread (the gateway's hardware address not read yet) or they differ (this
+    /// Mac moved under the round), and for a Commons contact. The stay alone cannot say it: a
+    /// stay continues across a network whose gateway's hardware address goes unread.
+    pub network: Option<NetworkId>,
+    /// The round that heard it ran under this Mac's vault's membership log, and so dialled only
+    /// the members that log and the vault's deny list let it: `false` for a round with neither
+    /// (an isolated job's, a test's, a lab's scratch state's or CI's, which reads no vault and
+    /// denies no one) and for a Commons contact. Only such an answer is evidence for the vault's
+    /// automatic admission, whatever state root it was noted under.
+    pub logged: bool,
     /// When the dial that reached it began (unix ms).
     pub began_ms: u64,
     /// When it answered (unix ms).

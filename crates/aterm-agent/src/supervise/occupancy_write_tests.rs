@@ -501,11 +501,13 @@ enum Step {
 const GONE: &str = "aterm-ctl: ERR exited";
 
 /// The door's policy under `occupancy`: the door alone, without Cruise's carry at a break
-/// (`continue_policy` off), which `cruise_carry_loop_tests` runs beside it.
+/// (`continue_policy` off), which `cruise_carry_loop_tests` runs beside it, and without the
+/// stuck fact at a break (`stuck_break_note` off), which `facts_loop_tests` runs.
 fn policy(occupancy: Occupancy) -> SupervisorConfig {
     SupervisorConfig {
         occupancy,
         continue_policy: false,
+        stuck_break_note: false,
         ..hosted(30).policy
     }
 }

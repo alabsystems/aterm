@@ -399,7 +399,8 @@ fn a_dead_runs_member_is_read_with_its_run_tie() {
     let rec = Record::parse(&format!(
         "run v=1 boot=b id=77-1792000000000077 uniqueid=2900 start=1 sid=-\n\
          root path=/wt\n\
-         group pgid=4000 leader_birth={leader_birth} leader_uniqueid=3000 stage=test\n"
+         group pgid=4000 leader_birth={leader_birth} leader_uniqueid=3000 stage=test\n\
+         dead_seen uniqueid=3001 at=1792000100000\n"
     ));
     let records = vec![(PathBuf::from("/r/77-1792000000000077.run"), rec)];
     let rows = rows(&k);
@@ -441,6 +442,39 @@ fn a_dead_runs_member_is_read_with_its_run_tie() {
         leader.runs[0].auto,
         "orphaned, under the roots, its thread ran: A1–A7 hold"
     );
+}
+
+#[test]
+fn an_unrecorded_dead_run_has_no_automatic_cleanup_authority() {
+    let mut k = world();
+    k.add(4000, 1, 4000, 3000).exe = Some(PathBuf::from("/wt/target/debug/aterm-link"));
+    let leader_birth = k.procs[&4000].lin.identity.birth.0;
+    let record = Record::parse(&format!(
+        "run v=1 boot=b id=77-1792000000000077 uniqueid=2900 start=1 sid=-\n\
+         root path=/wt\n\
+         group pgid=4000 leader_birth={leader_birth} leader_uniqueid=3000 stage=test\n"
+    ));
+    let mut records = vec![(PathBuf::from("/r/77-1792000000000077.run"), record)];
+    for recorded in [false, true] {
+        if recorded {
+            records[0].1.dead_seen = Some(3000);
+            records[0].1.dead_seen_ms = Some(1_792_000_100_000);
+        }
+        let known = Known {
+            self_pid: 100,
+            now_ms: 1_792_000_100_000,
+            boot: Some("b"),
+            records: &records,
+            held: &[],
+            waiting: &[],
+            shells: &[],
+        };
+        let reading = Reader::new().read(&k, &rows(&k), &known);
+        assert_eq!(facts_of(&reading, 4000).runs[0].auto, recorded);
+        let fresh = read_one(&k, 4000, &known).unwrap();
+        assert_eq!(fresh.runs[0].auto, recorded);
+        assert!(fresh.runs[0].tree, "the diagnostic tie remains available");
+    }
 }
 
 /// Facts read for `end` are read again, none kept and none bounded.
@@ -604,7 +638,8 @@ fn a_dead_runs_verdict_reads_nothing_of_its_own() {
     let rec = Record::parse(&format!(
         "run v=1 boot=b id=77-1792000000000077 uniqueid=2900 start=1 sid=-\n\
          root path=/wt\n\
-         group pgid=4000 leader_birth={leader_birth} leader_uniqueid=3000 stage=test\n"
+         group pgid=4000 leader_birth={leader_birth} leader_uniqueid=3000 stage=test\n\
+         dead_seen uniqueid=3000 at=1792000100000\n"
     ));
     let records = vec![(PathBuf::from("/r/77-1792000000000077.run"), rec)];
     let rows = rows(&k);

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! One session's catalog and native constructor policy. Production uses the shipping
-//! roster and disables constructors; only an explicit debug Rust factory supplies fixtures.
+//! roster and disables generic constructors. The sealed Codex renewal service is limited
+//! to its qualified host target; only an explicit debug Rust factory supplies fixtures.
 
 use aterm_agent::harness::contract::{self, Row, Words};
 #[cfg(all(unix, any(test, debug_assertions)))]
@@ -19,6 +20,60 @@ pub(crate) struct SessionPolicy {
 }
 
 impl SessionPolicy {
+    /// This call site follows the actual successful native SIGTERM syscall;
+    /// recorded/replayed RPC acknowledgements never emit another effect.
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    pub(crate) fn renewal_signal_effect(&self, process: &Process) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let Some(root) = self
+            .fixture
+            .as_ref()
+            .and_then(|fixture| fixture.renewal_fault_root.as_ref())
+        else {
+            return;
+        };
+        let event = aterm_json::json!({"schema":1,"kind":"native-signal-effect",
+            "pid":process.pid,"birth":process.birth,"group":process.group,"signal":libc::SIGTERM,
+            "monotonicUs":aterm_agent::harness::native_act::monotonic_us()});
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(root.join("native-signal-effects.jsonl"))
+            .expect("fixture actual signal effect trace");
+        let mut bytes = aterm_json::to_vec(&event).expect("fixture actual signal effect encoding");
+        bytes.push(b'\n');
+        file.write_all(&bytes)
+            .expect("fixture actual signal effect append");
+    }
+
+    /// Completed fixture observations contain only explicitly constructed fields.
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    pub(crate) fn renewal_control_observed(&self, event: &aterm_json::Value) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let Some(root) = self
+            .fixture
+            .as_ref()
+            .and_then(|fixture| fixture.renewal_fault_root.as_ref())
+        else {
+            return;
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(root.join("renewal-control-trace.jsonl"))
+            .expect("fixture completed control trace");
+        let mut bytes = aterm_json::to_vec(event).expect("fixture completed trace encoding");
+        bytes.push(b'\n');
+        file.write_all(&bytes)
+            .expect("fixture completed trace append");
+    }
+
     pub(crate) fn registered(&self) {
         #[cfg(all(unix, any(test, debug_assertions)))]
         self.registered.store(true, Ordering::Release);
@@ -47,6 +102,74 @@ impl SessionPolicy {
         }
         let _ = kind;
         false
+    }
+
+    /// Qualification gate for the sealed same-account service. Generic native
+    /// constructor availability remains independent and unchanged.
+    pub(crate) fn renewal_constructor_enabled(&self) -> bool {
+        #[cfg(all(unix, any(test, debug_assertions)))]
+        if let Some(fixture) = &self.fixture {
+            return fixture.constructors.enabled(Constructor::PrivateRestart);
+        }
+        // This sealed service's native host/provider pair is qualified on Apple Silicon macOS.
+        // Generic constructors remain independently disabled above.
+        cfg!(all(target_os = "macos", target_arch = "aarch64"))
+    }
+
+    pub(crate) fn renewal_before_signal(&self) {
+        #[cfg(all(unix, any(test, debug_assertions)))]
+        if let Some(root) = self
+            .fixture
+            .as_ref()
+            .and_then(|fixture| fixture.renewal_fault_root.as_ref())
+        {
+            if root.join("pause-before-signal").exists() {
+                aterm_uds::atomic_file::write(
+                    &root.join("before-signal.reached"),
+                    b"prepared\n",
+                    0o600,
+                )
+                .expect("fixture before Signal checkpoint");
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                while !root.join("before-signal.continue").exists() {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "fixture before Signal hang detector"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            if std::fs::rename(
+                root.join("panic-before-signal"),
+                root.join("panic-before-signal-fired"),
+            )
+            .is_ok()
+            {
+                panic!("native renewal fixture before Signal");
+            }
+        }
+    }
+
+    /// An explicit fixture records the actual coordinator exit, independently
+    /// of a later observation-triggered native terminal reconciliation.
+    pub(crate) fn renewal_coordinator_stopped(&self, id: &str, deadline_us: u64) {
+        #[cfg(all(unix, any(test, debug_assertions)))]
+        if let Some(root) = self
+            .fixture
+            .as_ref()
+            .and_then(|fixture| fixture.renewal_fault_root.as_ref())
+        {
+            let event = aterm_json::json!({"operation":id,"deadlineUs":deadline_us,
+                "monotonicUs":aterm_agent::harness::native_act::monotonic_us()});
+            let bytes = aterm_json::to_vec(&event).expect("fixture coordinator exit encoding");
+            aterm_uds::atomic_file::write(
+                &root.join(format!("renewal-worker-{id}-stopped.json")),
+                &bytes,
+                0o600,
+            )
+            .expect("fixture coordinator exit record");
+        }
+        let _ = (id, deadline_us);
     }
 
     /// A fixture's exact captured file identity, never a pathname-only permission.
@@ -148,6 +271,7 @@ pub struct FixturePolicy {
     images: Vec<FixtureImages>,
     config: Box<SupervisorConfig>,
     constructors: FixtureConstructors,
+    renewal_fault_root: Option<std::path::PathBuf>,
 }
 
 #[cfg(all(unix, any(test, debug_assertions)))]
@@ -194,7 +318,16 @@ impl FixturePolicy {
             images,
             config: Box::new(config),
             constructors,
+            renewal_fault_root: None,
         })
+    }
+
+    /// An explicit Rust fixture owns this fault directory; installed policy
+    /// never reads a path or environment switch for fault injection.
+    #[must_use]
+    pub fn with_renewal_fault_root(mut self, root: std::path::PathBuf) -> Self {
+        self.renewal_fault_root = Some(root);
+        self
     }
 
     /// A control handle to this session's constructor mask, independent of its fixed catalog.

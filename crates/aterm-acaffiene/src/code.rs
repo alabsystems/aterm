@@ -129,12 +129,11 @@ pub fn prepare_copy(origin: &Path, code_dir: &Path, label: &str) -> io::Result<O
     }
 }
 
-#[cfg(unix)]
-fn plain_name(label: &str) -> bool {
+pub(crate) fn plain_name(label: &str) -> bool {
     !label.is_empty()
         && label != "."
         && label != ".."
-        && !label.contains(['/', '\0'])
+        && !label.contains(['/', '\\', '\0'])
         && !label.ends_with(".partial")
 }
 
@@ -267,6 +266,11 @@ fn bundle_print(origin: &Path, bundle: &Path) -> io::Result<String> {
     ))
 }
 
+#[cfg(unix)]
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+}
+
 /// The copy for `label` under `code_dir` that a mug already ran from (its [`RAN`] marker) and
 /// whose [`SOURCE`] is `print`, with its executable at `inner`: macOS assessed its first exec
 /// when that mug ran, and the bundle has not changed since it was made.
@@ -283,8 +287,9 @@ fn ran_copy(code_dir: &Path, label: &str, print: &str, inner: &Path) -> Option<P
         .find(|home| {
             std::fs::symlink_metadata(home).is_ok_and(|meta| meta.file_type().is_dir())
                 && home.extension().is_none_or(|e| e != "partial")
-                && home.join(RAN).is_file()
-                && read_capped(&home.join(SOURCE)).is_some_and(|text| text == print.as_bytes())
+                && is_regular_file(&home.join(RAN))
+                && read_regular_capped(&home.join(SOURCE))
+                    .is_some_and(|text| text == print.as_bytes())
                 && home.join(inner).is_file()
         })
 }
@@ -294,6 +299,12 @@ fn private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::{
         DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
     };
+    if let Some(parent) = dir.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = crate::paths::existing_real_dir(parent)?;
+    }
+    let _ = crate::paths::existing_real_dir(dir)?;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -344,6 +355,12 @@ fn private_dir(dir: &Path) -> io::Result<()> {
 #[cfg(unix)]
 pub fn discard_copies(code_dir: &Path) -> io::Result<Kept> {
     use std::os::unix::fs::MetadataExt as _;
+    if let Some(parent) = code_dir.parent()
+        && !parent.as_os_str().is_empty()
+        && !crate::paths::existing_real_dir(parent)?
+    {
+        return Ok(Kept::default());
+    }
     let meta = match std::fs::symlink_metadata(code_dir) {
         Ok(meta) => meta,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Kept::default()),
@@ -519,7 +536,50 @@ pub fn bundle_identifier(bundle: &Path) -> Option<String> {
     plist_string(std::str::from_utf8(&bytes).ok()?, "CFBundleIdentifier")
 }
 
+fn strip_xml_comments(text: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !text.contains("<!--") {
+        return Some(std::borrow::Cow::Borrowed(text));
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut in_tag = false;
+    while let Some(pos) = rest.find('<') {
+        for b in rest[..pos].bytes() {
+            if b == b'>' {
+                in_tag = false;
+            }
+        }
+        out.push_str(&rest[..pos]);
+        if in_tag {
+            return None;
+        }
+        let after_lt = &rest[pos..];
+        if let Some(comment) = after_lt.strip_prefix("<!--") {
+            let end = comment.find("-->")?;
+            if comment[..end].contains("--") {
+                return None;
+            }
+            rest = &comment[end + "-->".len()..];
+        } else {
+            in_tag = true;
+            out.push('<');
+            rest = &after_lt[1..];
+        }
+    }
+    for b in rest.bytes() {
+        if b == b'>' {
+            in_tag = false;
+        }
+    }
+    if in_tag {
+        return None;
+    }
+    out.push_str(rest);
+    Some(std::borrow::Cow::Owned(out))
+}
+
 fn plist_string(text: &str, key: &str) -> Option<String> {
+    let text = strip_xml_comments(text)?;
     let tag = format!("<key>{key}</key>");
     let at = text.find(&tag)? + tag.len();
     let rest = text[at..].trim_start().strip_prefix("<string>")?;
@@ -534,6 +594,7 @@ fn plist_string(text: &str, key: &str) -> Option<String> {
 /// The `<string>` values of the `<array>` that is `key`'s value in a plist's text.
 #[must_use]
 pub(crate) fn plist_strings(text: &str, key: &str) -> Option<Vec<String>> {
+    let text = strip_xml_comments(text)?;
     let tag = format!("<key>{key}</key>");
     let at = text.find(&tag)? + tag.len();
     let mut rest = text[at..].trim_start().strip_prefix("<array>")?;
@@ -554,10 +615,10 @@ pub(crate) fn plist_strings(text: &str, key: &str) -> Option<Vec<String>> {
     }
 }
 
-/// The text of the plist at `path`, when it is UTF-8 and at most [`PLIST_CAP`] bytes.
+/// The text of the plist at `path`, when it is a regular UTF-8 file of at most [`PLIST_CAP`] bytes.
 #[must_use]
 pub(crate) fn read_plist(path: &Path) -> Option<String> {
-    String::from_utf8(read_capped(path)?).ok()
+    String::from_utf8(read_regular_capped(path)?).ok()
 }
 
 fn xml_unescape(text: &str) -> String {
@@ -569,13 +630,28 @@ fn xml_unescape(text: &str) -> String {
 }
 
 fn read_capped(path: &Path) -> Option<Vec<u8>> {
+    read_capped_inner(path, false)
+}
+
+fn read_regular_capped(path: &Path) -> Option<Vec<u8>> {
+    read_capped_inner(path, true)
+}
+
+fn read_capped_inner(path: &Path, nofollow: bool) -> Option<Vec<u8>> {
     use std::io::Read as _;
+    if nofollow && !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK);
+        let mut flags = libc::O_NONBLOCK;
+        if nofollow {
+            flags |= libc::O_NOFOLLOW;
+        }
+        options.custom_flags(flags);
     }
     let file = options.open(path).ok()?;
     if !file.metadata().ok()?.is_file() {
@@ -1159,9 +1235,31 @@ mod tests {
             "<key>A</key><array><string>x</string>",
             "<key>A</key><array><string>x<y/></string></array>",
             "<key>B</key><array><string>x</string></array>",
+            "<!-- unclosed <key>A</key><array><string>x</string></array>",
+            "<!-- bad -- comment --><key>A</key><array><string>x</string></array>",
+            "<key<!-- split -->>A</key><array><string>x</string></array>",
         ] {
             assert_eq!(plist_strings(bad, "A"), None, "{bad:?}");
         }
+        assert_eq!(
+            plist_string(
+                "<!-- <key>CFBundleIdentifier</key><string>spoof</string> -->\
+                 <key>CFBundleIdentifier</key><!-- note --><string>com.aterm.real</string>",
+                "CFBundleIdentifier",
+            )
+            .as_deref(),
+            Some("com.aterm.real"),
+            "XML comments must not shadow real plist keys"
+        );
+        assert_eq!(
+            plist_strings(
+                "<!-- <key>A</key><array><string>spoof</string></array> -->\
+                 <key>A</key><array><!-- first --><string>one</string><!-- second --><string>two</string></array>",
+                "A",
+            ),
+            Some(vec!["one".to_string(), "two".to_string()]),
+            "XML comments inside arrays must be skipped cleanly"
+        );
     }
 
     #[cfg(unix)]

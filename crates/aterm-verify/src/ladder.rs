@@ -386,10 +386,15 @@ mod tests {
             code: None,
             spawn_error: spawn.map(str::to_string),
         };
+        let noise = "ERROR logger: auxiliary checksum unavailable\n".repeat(32);
         let mut r = Report::new("test (--workspace)");
         r.decide_child(&run(true, "", None), "passed");
         r.decide_child(
-            &run(false, "error[E0308]: mismatched types", None),
+            &run(
+                false,
+                &format!("{noise}error[E0308]: mismatched types"),
+                None,
+            ),
             "a finding",
         );
         r.decide_child(
@@ -403,7 +408,9 @@ mod tests {
         r.fail_child(
             &run(
                 false,
-                "error: failed to write lib.rmeta: No space left on device (os error 28)",
+                &format!(
+                    "{noise}error: failed to write lib.rmeta: No space left on device (os error 28)"
+                ),
                 None,
             ),
             "starved",

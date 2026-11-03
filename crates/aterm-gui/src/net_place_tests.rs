@@ -39,27 +39,53 @@ fn privacy_rows(rows: &[StatusRow]) -> usize {
         .count()
 }
 
-/// The menu bar says where this Mac is on the network in the place's own summary, and away from
-/// the ALab LAN (a phone hotspot) it sends nobody to the Local Network privacy setting when every
-/// fleet dial found no route: being elsewhere explains that, a privacy setting does not. On the
-/// ALab LAN the same no-route read still points there.
-/// NEGATIVE CONTROL: passing `*no_route` to `degrade_rows` whatever the place (dropping
-/// `&& !away`) puts the privacy row under the hotspot's Network row, and this test fails at
-/// "no privacy blame away from the ALab LAN".
+/// The menu bar says where this Mac is on the network in the place's own summary, and sends the
+/// person to the Local Network privacy setting exactly when the fleet read judged a no-route
+/// this Mac's privacy (its on-link verdict, `aterm_netplace::words::on_link`), wherever this Mac
+/// is: on a phone hotspot a member on the same hotspot refused with none there answering is this
+/// Mac's setting too, and a read that judged no such refusal (members off this network, or one
+/// gone off the link) points nowhere, at home as away.
+/// NEGATIVE CONTROL: gating the privacy row on the place again (`*no_route && !away`, with `away`
+/// the place being elsewhere) hides it under the hotspot's Network row, and this test fails at
+/// "the read's verdict, away from the ALab LAN too".
 #[test]
-fn the_menu_says_the_place_and_blames_no_privacy_setting_away() {
+fn the_menu_says_the_place_and_blames_privacy_only_on_the_reads_on_link_verdict() {
     let now = SINCE_MS + 60_000;
+    let at = i64::try_from(now / 1000).unwrap_or(0);
     let away = menu_line_of(
         &aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS),
         &words_at(now),
     );
-    assert!(away.away);
-    let glance = Glance {
-        fleet: in_fleet_no_route(),
-        network: Some(away.clone()),
-        ..Glance::default()
+    let home = menu_line_of(&aterm_netplace::sample::home(SINCE_MS, 0), &words_at(now));
+    let menu = |network: &MenuLine, no_route: bool| {
+        let fleet = match in_fleet_no_route() {
+            FleetLine::InFleet {
+                read,
+                reading,
+                failed,
+                member_of,
+                unbound_issuer,
+                ..
+            } => FleetLine::InFleet {
+                read,
+                reading,
+                failed,
+                no_route,
+                member_of,
+                unbound_issuer,
+            },
+            other => other,
+        };
+        compose_status_menu(
+            &Glance {
+                fleet,
+                network: Some(network.clone()),
+                ..Glance::default()
+            },
+            at,
+        )
     };
-    let rows = compose_status_menu(&glance, i64::try_from(now / 1000).unwrap_or(0));
+    let rows = menu(&away, true);
     assert!(
         rows.iter()
             .any(|row| matches!(row, StatusRow::Info(label) if *label == away.label)),
@@ -67,21 +93,12 @@ fn the_menu_says_the_place_and_blames_no_privacy_setting_away() {
     );
     assert_eq!(
         privacy_rows(&rows),
-        0,
-        "no privacy blame away from the ALab LAN: {rows:?}"
+        1,
+        "the read's verdict, away from the ALab LAN too: {rows:?}"
     );
-
-    let home = menu_line_of(&aterm_netplace::sample::home(SINCE_MS, 0), &words_at(now));
-    assert!(!home.away);
-    let rows = compose_status_menu(
-        &Glance {
-            fleet: in_fleet_no_route(),
-            network: Some(home),
-            ..Glance::default()
-        },
-        i64::try_from(now / 1000).unwrap_or(0),
-    );
-    assert_eq!(privacy_rows(&rows), 1, "on the ALab LAN: {rows:?}");
+    assert_eq!(privacy_rows(&menu(&home, true)), 1, "on the ALab LAN");
+    assert_eq!(privacy_rows(&menu(&away, false)), 0, "no verdict, away");
+    assert_eq!(privacy_rows(&menu(&home, false)), 0, "no verdict, at home");
 }
 
 /// `sys`'s place is the place's own line and object, its unknown values `not_sampled` as every
@@ -158,6 +175,55 @@ fn the_network_band_leads_with_the_place_away_from_the_alab_lan() {
             "{at:?}: the observer's words stand"
         );
     }
+}
+
+/// PAINT READS THE CACHED PLACE AND ASKS FOR NO READ (the structural change c0ec13186b made, as
+/// behaviour): the place words a resource frame captures for the network deck
+/// (`network_deck::capture_place_caption`), the deck's paint of them on the render thread, and
+/// the stats lens's summary take the place as last read ([`cached`]), never [`latest`], which
+/// starts a read thread once the last read is stale; the hotspot's words in the paint and the
+/// summary show that they read the place all the same.
+/// NEGATIVE CONTROL: the frame's capture taking `crate::net_place::latest()` (as the paint did
+/// before c0ec13186b) asks for a read, and this test fails at "the frame's capture asks for no
+/// read".
+#[test]
+fn paint_reads_the_cached_place_and_asks_for_no_read() {
+    let snapshot = aterm_types::network_state::NetworkStateSnapshot::default();
+    let away = aterm_netplace::sample::hotspot(SINCE_MS, SINCE_MS);
+    let (long, short) = crate::network_deck::place_caption(Some(&away)).expect("away words");
+    hold(Some(away));
+    let g = crate::stats_deck::DeckGeom {
+        w: 700.0,
+        h: 200.0,
+        pad: 0.0,
+        scale: 1.0,
+        font_px: 14.0,
+    };
+    let inks = crate::stats_deck::cached_inks([20, 20, 20], [230, 230, 230], [100, 180, 200]);
+    let before = reads_asked();
+    let caption = crate::network_deck::capture_place_caption();
+    assert_eq!(
+        reads_asked(),
+        before,
+        "the frame's capture asks for no read"
+    );
+    let (prims, _) =
+        crate::network_deck::paint_with_inks(&g, 170.0, &snapshot, caption.as_ref(), &inks, false);
+    assert!(
+        prims.iter().any(|prim| matches!(prim,
+            crate::widget::DrawPrim::Text { s, .. } if *s == long || *s == short)),
+        "paint says the held place"
+    );
+    assert_eq!(reads_asked(), before, "paint asks for no read");
+    assert_eq!(crate::network_deck::summary(&snapshot), long);
+    assert_eq!(reads_asked(), before, "nor does the summary it paints");
+    let _ = latest();
+    assert_eq!(
+        reads_asked(),
+        before + 1,
+        "where a latest() is one read asked"
+    );
+    hold(None);
 }
 
 /// A harness's internet answer (a turn's real reply, an API probe's measure) is noted into the

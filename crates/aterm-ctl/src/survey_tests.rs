@@ -134,6 +134,7 @@ fn the_arguments_parse_and_a_stray_one_is_the_usage_line() {
         &["survey", "--host"],
         &["survey", "--fleet", "--host", "m7"],
         &["survey", "--fleet", "--timeout", "0"],
+        &["survey", "--fleet", "--timeout", "1e-300"],
         &["survey", "--fleet", "--timeout", "+2.5"],
         &["survey", "--fleet", "--timeout", "11"],
         &["survey", "--fleet", "--timeout", "soon"],
@@ -581,6 +582,38 @@ fn sessions_are_ordered_by_what_needs_reading() {
             ("agent_ms", "99999999")
         ])),
         Class::Done
+    );
+    assert_eq!(
+        class_of(&row(&[
+            ("agent", "idle"),
+            ("task", "failed"),
+            ("task_ms", "5000"),
+            ("agent_ms", "99999999")
+        ])),
+        Class::Failed,
+        "a failed task reads as failed, never as done or idle at a prompt"
+    );
+    for (conclusion, class) in [("failed", Class::Failed), ("finished", Class::Done)] {
+        assert_eq!(
+            class_of(&row(&[
+                ("agent", "-"),
+                ("task", "exited"),
+                ("task_conclusion", conclusion),
+                ("task_ms", "5000"),
+            ])),
+            class,
+            "an exit reads as how the task ended"
+        );
+    }
+    assert_eq!(
+        class_of(&row(&[
+            ("agent", "idle"),
+            ("task", "failed"),
+            ("task_ms", "99999999"),
+            ("agent_ms", "99999999")
+        ])),
+        Class::Agent,
+        "an old failure is no longer news"
     );
     assert_eq!(
         class_of(&row(&[("agent", "idle"), ("agent_ms", "60000")])),
@@ -1767,6 +1800,116 @@ fn one_cause_that_refused_every_peer_is_said_once() {
     assert_eq!(fleet_note(&[peer(NoRoute), answered]), None);
 }
 
+/// THE ON-LINK RULE IN A FLEET READ's NOTE, judged by each dial's address against this Mac's
+/// network and never by a network members were once on: a member on this phone hotspot refused
+/// with no route while none there answered is this Mac's Local Network privacy, not the away
+/// note; one refused while another there answered is that member's own (no note: its row says
+/// so), and so is one refused while another member's Mac there refused the connect (a host
+/// answered: privacy let this read onto the link); refusals off this network blame no privacy,
+/// at home and on a remembered network alike; a refusal with no address keeps the every-peer
+/// note.
+/// NEGATIVE CONTROLS: dropping `fleet_note_at`'s on-link privacy return gives the hotspot's
+/// on-link refusal the away note, and this test fails at "a member on this hotspot refused:
+/// this Mac's privacy"; `dial_of` reading a host that answered as `Dial::Other` fails at "another
+/// member's Mac there refused the connect: its own".
+#[test]
+fn a_fleet_reads_no_route_is_judged_on_the_link() {
+    let refused = |addr: &str| PeerSurvey {
+        label: format!("m at {addr}"),
+        answer: Err("no route".to_owned()),
+        fault: PeerFault::NoRoute,
+        unproven: false,
+        node: None,
+        addr: Some(addr.to_owned()),
+    };
+    let answered = |addr: &str| PeerSurvey {
+        answer: Ok(vec!["instance pid=1".to_owned()]),
+        fault: PeerFault::Other,
+        ..refused(addr)
+    };
+    fn utc(_: i64) -> Option<i64> {
+        Some(0)
+    }
+    let words = aterm_netplace::words::Words {
+        now_ms: 1_800_000_060_000,
+        zone: &utc,
+    };
+    let privacy = Some(aterm_netplace::words::ON_LINK_PRIVACY_NOTE.to_owned());
+    let hotspot = aterm_netplace::sample::hotspot(1_800_000_000_000, 1_800_000_000_000);
+    assert_eq!(
+        fleet_note_at(
+            &[refused("172.20.10.5"), refused("192.168.4.9")],
+            Some(&hotspot),
+            &words
+        ),
+        privacy,
+        "a member on this hotspot refused: this Mac's privacy"
+    );
+    assert_eq!(
+        fleet_note_at(
+            &[refused("172.20.10.5"), answered("172.20.10.6")],
+            Some(&hotspot),
+            &words
+        ),
+        None,
+        "another member there answered: its own"
+    );
+    let home = aterm_netplace::sample::home(1_800_000_000_000, 0);
+    assert_eq!(
+        fleet_note_at(
+            &[refused("10.9.9.9"), refused("10.9.9.8")],
+            Some(&home),
+            &words
+        ),
+        None,
+        "refusals off this network blame no privacy"
+    );
+    assert_eq!(
+        fleet_note_at(&[refused("192.168.5.20")], Some(&home), &words),
+        privacy,
+        "a member on the ALab LAN refused, none answering"
+    );
+    let host_answered = |addr: &str| PeerSurvey {
+        answer: Err("nothing listens there".to_owned()),
+        fault: PeerFault::HostAnswered,
+        ..refused(addr)
+    };
+    assert_eq!(
+        fleet_note_at(
+            &[refused("192.168.5.20"), host_answered("192.168.5.21")],
+            Some(&home),
+            &words
+        ),
+        None,
+        "another member's Mac there refused the connect: its own"
+    );
+    let once = aterm_netplace::Place {
+        once_alab: true,
+        at: aterm_netplace::Where::Remote(aterm_netplace::Kind::Lan),
+        kind: Some(aterm_netplace::Kind::Lan),
+        ..home.clone()
+    };
+    assert_eq!(
+        fleet_note_at(&[refused("10.9.9.9")], Some(&once), &words),
+        None,
+        "a network members were once on makes no refusal off it privacy's"
+    );
+    assert_eq!(
+        fleet_note_at(&[refused("192.168.5.20")], Some(&once), &words),
+        privacy,
+        "nor one on it anything else"
+    );
+    let unplaced = PeerSurvey {
+        addr: None,
+        ..refused("0.0.0.0")
+    };
+    assert_eq!(
+        fleet_note_at(&[unplaced], Some(&home), &words).as_deref(),
+        Some(NO_ROUTE_NOTE),
+        "no address to judge: every peer refused"
+    );
+}
+
 /// Away from the ALab LAN (a phone hotspot), a fleet read no dialled peer answered says where this
 /// Mac is, whether every dial found no route (no Local Network privacy blame) or timed out (no
 /// note before); a sandbox that refused every connect is still the sandbox, a read a peer answered
@@ -2246,6 +2389,15 @@ fn a_peers_typist_reads_in_its_own_words() {
                 "node bc104d9c over the fleet",
                 "node bc104d9c over the fleet",
             ),
+            // A head widened past eight where another node shares them, up to the whole id.
+            (
+                "127.0.0.1 (node c0ffee34a1) over the fleet",
+                "127.0.0.1 (node c0ffee34a1) over the fleet",
+            ),
+            (
+                "node c0ffee34a18b0000000000000000000a over the fleet",
+                "node c0ffee34a18b0000000000000000000a over the fleet",
+            ),
             ("the message bus", "the message bus"),
             ("lab-sweep", "lab-sweep"),
         ] {
@@ -2478,6 +2630,8 @@ fn an_instances_account_rows_parse_and_print_on_one_line() {
             ("id", "c"),
             ("condition", "limited"),
             ("enrolled", "1"),
+            ("pct7", "100"),
+            ("week_reset", "1793130000"),
             ("walled_until", "1793130000"),
         ]),
         account_row(&[
@@ -2639,6 +2793,13 @@ fn a_front_waiting_for_memory_says_so_before_its_build() {
         odd.contains(" waiting for memory to run targo (1 ahead)"),
         "{odd}"
     );
+    for malformed in [".", "...", ".5", "5.", "1.2.3", "123456789"] {
+        let row = waits(malformed, "1");
+        assert!(
+            row.contains(" waiting for memory to run targo (1 ahead)") && !row.contains("GiB"),
+            "{malformed}: {row}"
+        );
+    }
     for running in [line(&[("wait", "-")]), line(&[])] {
         assert!(running.contains(" running targo"), "{running}");
         assert!(!running.contains("waiting"), "{running}");

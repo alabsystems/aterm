@@ -62,7 +62,7 @@ fn recovered_page(mark: &std::path::Path) -> (App, WindowId) {
     app.workstation_setup.developer_tools_mark = Mark::at(mark.to_path_buf());
     app.access_steps.set_reach(dialog_reach());
     assert!(app.workstation_setup.developer_tools_mark.opened());
-    assert!(!app.developer_tools_install_due(true, false, false));
+    assert!(!app.developer_tools_install_due(false));
     assert!(!app.developer_tools_install_active());
     (app, wid)
 }
@@ -157,12 +157,9 @@ fn clt_recovery_an_adopted_live_installer_puts_the_shim_back_on_new_shells() {
     let (session, _read) = landed_child(&mark);
     let (mut recovered, _) = recovered_page(&mark);
     let shim = shim_in(&mut recovered, directory.path());
-    recovered
-        .workstation_setup
-        .developer_tools_shim
-        .reconcile(true);
+    recovered.workstation_setup.developer_tools_shim.reconcile();
     recovered.workstation_setup.developer_tools_unfinished = true;
-    assert!(!wanted(&shim));
+    assert!(!installing_said(&shim));
     let local = recovered.next_session_id + 30;
     let session = adopted(session, local);
     App::register_session(&recovered.store, &session, None);
@@ -170,12 +167,19 @@ fn clt_recovery_an_adopted_live_installer_puts_the_shim_back_on_new_shells() {
     assert!(recovered.developer_tools_install_active());
     assert_eq!(recovered.workstation_setup.developer_tools_want, Some(0));
     assert!(
-        wanted(&shim),
-        "the adopted install runs on: new shells get the shim"
+        installing_said(&shim),
+        "the adopted install runs on: the shim's line says so"
     );
     assert!(recovered.exit_session_logical(local).is_empty());
-    assert!(!wanted(&shim), "its end leaves nothing installing them");
-    assert!(shim.is_dir(), "the directory goes at the next launch");
+    assert!(
+        !installing_said(&shim),
+        "its end leaves nothing installing them"
+    );
+    assert!(wanted(&shim), "and the tools still missing");
+    assert!(
+        shim.is_dir(),
+        "the directory stays for the shells that have it"
+    );
 }
 
 #[test]
@@ -330,7 +334,7 @@ fn clt_recovery_receipt_before_command_bytes_restores_custody_without_starting_t
     }
     let directory = aterm_tempfile::tempdir().unwrap();
     let mark = directory.path().join("command-line-tools-tab");
-    std::fs::write(&mark, b"opened\n").unwrap();
+    this_builds_mark(&mark);
     let (mut child, read) = registered_piped_session(37);
     child.pid = CHILD_PID;
     child.shell_identity =

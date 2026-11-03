@@ -58,3 +58,22 @@ pub const PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits of fo
       - COST IS A DOMINATOR. `dom(C) = reach(root) \\ reach(root, block C)`.
         Subtree size double-counts shared dependencies and is never reported.
       - A BUILD CELL THAT CANNOT BUILD IS SKIPPED AND NAMED, never passed.";
+
+/// Maximum size in bytes for regular source or configuration files read by `aterm-forge` (64 MiB).
+pub const MAX_FORGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read a regular file up to [`MAX_FORGE_BYTES`] without following a final symlink or blocking on a FIFO.
+///
+/// # Errors
+/// Returns an error if `path` cannot be opened as a regular file or exceeds [`MAX_FORGE_BYTES`].
+pub fn read_regular(path: impl AsRef<std::path::Path>) -> std::io::Result<Vec<u8>> {
+    aterm_uds::atomic_file::read_regular(path.as_ref(), MAX_FORGE_BYTES).map(|(bytes, _)| bytes)
+}
+
+/// Read a UTF-8 regular file up to [`MAX_FORGE_BYTES`] without following a final symlink or blocking on a FIFO.
+///
+/// # Errors
+/// Returns an error if `path` cannot be opened as a regular UTF-8 file or exceeds [`MAX_FORGE_BYTES`].
+pub fn read_regular_text(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    aterm_uds::atomic_file::read_regular_text(path.as_ref(), MAX_FORGE_BYTES)
+}

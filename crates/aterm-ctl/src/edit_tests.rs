@@ -421,3 +421,49 @@ fn edit_and_await_edit_over_a_real_socket() {
     assert_eq!(heard[8], "@s-ab await edit ticket=9 timeout=600000\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// NEGATIVE CONTROL: `await_over` must reject unsendable keys or fallback URIs before dialing and
+/// must surface permanent server refusals (`ERR scope`, `ERR invalid uri`) immediately after a cut
+/// instead of spinning until `SUCCESSOR_BOUND` and misreporting `Replaced`.
+#[test]
+fn await_over_rejects_unsendable_uri_up_front_and_does_not_spin_on_post_cut_scope_refusal() {
+    for bad_uri in ["", "file:///tmp/a b", "file:///tmp/x\ny"] {
+        let mut wire =
+            Script::new(Vec::new()).resolving(vec![Err(io::ErrorKind::PermissionDenied.into())]);
+        let err = await_over(&mut wire, SID, AwaitKey::Ticket(Ticket(7)), bad_uri)
+            .expect_err("bad fallback uri");
+        assert!(
+            matches!(err, AwaitErr::Unsendable(_)),
+            "{bad_uri:?}: {err:?}"
+        );
+        assert_eq!(wire.resolves.len(), 1, "must not resolve before validation");
+        assert!(wire.sent.is_empty());
+
+        let mut wire =
+            Script::new(Vec::new()).resolving(vec![Err(io::ErrorKind::PermissionDenied.into())]);
+        let err = await_over(&mut wire, SID, AwaitKey::Uri(bad_uri.to_string()), URI)
+            .expect_err("bad initial uri");
+        assert!(
+            matches!(err, AwaitErr::Unsendable(_)),
+            "{bad_uri:?}: {err:?}"
+        );
+        assert_eq!(wire.resolves.len(), 1, "must not resolve before validation");
+        assert!(wire.sent.is_empty());
+    }
+
+    for permanent in ["ERR scope", "ERR invalid uri"] {
+        let mut wire = Script::new(vec![
+            Err(io::ErrorKind::UnexpectedEof.into()),
+            ok(permanent),
+        ])
+        .resolving(vec![ok("/run/a.sock"), ok("/run/b.sock")]);
+        let err = await_over(&mut wire, SID, AwaitKey::Ticket(Ticket(7)), URI)
+            .expect_err("permanent refusal after cut");
+        assert_eq!(err, AwaitErr::Refused(permanent.to_string()));
+        assert_eq!(
+            wire.paused, REDIAL_POLL,
+            "must stop on the successor's refusal"
+        );
+        assert_eq!(wire.sent.len(), 2);
+    }
+}

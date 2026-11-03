@@ -117,7 +117,10 @@ impl Failure {
         failure.http_status = Some(status);
         failure.phase = Some(aterm_http::Phase::Answered);
         failure.api_code = Some(code);
-        failure.retry_after_seconds = retry.and_then(|value| value.trim().parse().ok());
+        let retry = retry.map(str::trim).filter(|value| !value.is_empty());
+        failure.retry_after_seconds = retry
+            .filter(|value| value.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|value| value.parse().ok());
         failure.retry_after_unparsed = retry.is_some() && failure.retry_after_seconds.is_none();
         failure
     }
@@ -282,5 +285,13 @@ mod tests {
             Failure::response("/auth/v4", 429, 0, Some("Sun, 01 Nov 2026 12:00:00 GMT")).recovery(),
             Recovery::Stop
         );
+        assert_eq!(
+            Failure::response("/auth/v4", 429, 0, Some("+60")).recovery(),
+            Recovery::Stop
+        );
+        let blank_retry = Failure::response("/auth/v4", 429, 0, Some("   "));
+        assert_eq!(blank_retry.retry_after_seconds, None);
+        assert!(!blank_retry.retry_after_unparsed);
+        assert_eq!(blank_retry.recovery(), Recovery::RetryRead);
     }
 }

@@ -11,8 +11,10 @@
 //! answers took, with [`script_here`]; in a debug build outside this crate's tests,
 //! `ATERM_DEBUG_NETPLACE=<file>` ([`SEAM`]) names a [`parse_script`] file read again at every
 //! look, so the lab puts one Mac on a scripted phone hotspot and brings it home by rewriting the
-//! file. A release build never reads the variable (its read in [`scripted`] sits under
-//! `cfg(all(debug_assertions, not(test)))`), and a missing file scripts nothing.
+//! file. A release build never reads the variable (its read in `seam_file` sits under
+//! `cfg(all(debug_assertions, not(test)))`), and a missing file scripts nothing. The file never
+//! scripts a proof ([`here_now`], which the vault's admission reads): only a test's thread script
+//! does.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -168,6 +170,197 @@ pub fn route_via(addr: IpAddr) -> Option<Ipv4Addr> {
     }
 }
 
+/// The interface that holds this Mac's address `local` (`en0`): read from the kernel's interface
+/// list with no packet, or, where the facts are scripted, the scripted route's interface when
+/// `local` is its address. `None` where no interface holds it.
+#[must_use]
+pub fn interface_holding(local: Ipv4Addr) -> Option<String> {
+    if let Some(script) = scripted() {
+        return script
+            .facts
+            .route
+            .filter(|route| route.address == local)
+            .map(|route| route.interface);
+    }
+    aterm_uds::network::interfaces()
+        .ok()?
+        .into_iter()
+        .find(|address| address.address == IpAddr::V4(local))
+        .map(|address| address.name)
+}
+
+/// The network (strong id) traffic leaves this Mac on now ([`routes_now`],
+/// [`NetworkId::of`](crate::place::NetworkId::of)): its gateway's hardware address and its subnet,
+/// read with no packet. `None` with no IPv4 default route, or before ARP resolves the gateway.
+#[must_use]
+pub fn network_now() -> Option<crate::place::NetworkId> {
+    routes_now()
+        .0
+        .as_ref()
+        .and_then(crate::place::NetworkId::of)
+}
+
+/// `<net/if.h>`'s `IFF_POINTOPOINT` (the same on macOS and Linux).
+const IFF_POINTOPOINT: u32 = 0x10;
+
+/// What a caller that must not take memory for proof reads of this Mac now
+/// ([`crate::proof`]): the facts with the path read by this process, whether the route's
+/// interface is point to point, and every address this Mac holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Here {
+    /// The route, the tunnel over it and the path as this process read it now ([`path_once`];
+    /// `None`: not read).
+    pub facts: Facts,
+    /// The route's interface is point to point (`IFF_POINTOPOINT`).
+    pub point_to_point: bool,
+    /// Every address this Mac holds, on any interface.
+    pub own: Vec<IpAddr>,
+}
+
+/// [`Here`] now: the kernel's routes and interfaces, read once, and the path as [`path_once`]
+/// reads it; where a test scripts this thread's facts ([`script_here`]), the script's, the
+/// scripted route's address this Mac's one address. The seam file ([`SEAM`]) never scripts it: a
+/// proof ([`crate::proof`]) lets a Mac into the vault, and a debug build told by a file where it
+/// is must not let one in by it ([`Reader::Proof`]). It reads Network.framework's path, so never
+/// on a window's main thread.
+#[must_use]
+pub fn here_now() -> Here {
+    if let Some(script) = script_of(thread_script(), seam_file, Reader::Proof) {
+        let own = script
+            .facts
+            .route
+            .iter()
+            .map(|route| IpAddr::V4(route.address))
+            .collect();
+        return Here {
+            facts: script.facts,
+            point_to_point: false,
+            own,
+        };
+    }
+    let interfaces = aterm_uds::network::interfaces().unwrap_or_default();
+    let (route, tunnel) = compose(&aterm_uds::network::default_routes(), &interfaces);
+    let point_to_point = route.as_ref().is_some_and(|route| {
+        interfaces
+            .iter()
+            .any(|address| address.name == route.interface && address.flags & IFF_POINTOPOINT != 0)
+    });
+    let path = path_once(route.as_ref());
+    Here {
+        facts: Facts {
+            route,
+            tunnel,
+            path,
+        },
+        point_to_point,
+        own: interfaces
+            .into_iter()
+            .map(|address| address.address)
+            .collect(),
+    }
+}
+
+/// How long a [`path_once`] reading stands.
+#[cfg(target_os = "macos")]
+const PATH_KEPT: Duration = Duration::from_secs(30);
+
+/// How long [`path_once`] waits for Network.framework's first path update, which a Mac with a
+/// network hands over at once.
+#[cfg(target_os = "macos")]
+const PATH_PATIENCE: Duration = Duration::from_secs(2);
+
+/// What a [`path_once`] reading is kept against: the route it was read on (its interface, this
+/// Mac's address there, and its gateway's hardware address), `None` with no route.
+#[cfg(any(target_os = "macos", test))]
+type PathKey = Option<(String, Ipv4Addr, Option<Vec<u8>>)>;
+
+/// The [`PathKey`] of `route`.
+#[cfg(any(target_os = "macos", test))]
+fn path_key(route: Option<&RouteFacts>) -> PathKey {
+    route.map(|route| {
+        (
+            route.interface.clone(),
+            route.address,
+            route.gateway_hw.clone(),
+        )
+    })
+}
+
+/// The reading `held` keeps for the route `key` at `now`: only a satisfied reading (none is never
+/// kept) read on that very route within `kept_for`, so a move, or a gateway read since, reads the
+/// path again at once.
+#[cfg(any(target_os = "macos", test))]
+fn kept_path(
+    held: Option<&(Instant, PathKey, PathFacts)>,
+    key: &PathKey,
+    (now, kept_for): (Instant, Duration),
+) -> Option<PathFacts> {
+    held.filter(|(at, on, _)| on == key && now.saturating_duration_since(*at) < kept_for)
+        .map(|(_, _, read)| *read)
+}
+
+/// The path this Mac's traffic takes now as a Network.framework path monitor's first update reads
+/// it, for a process that runs no keeper's monitor, on `route` (the default route [`here_now`]
+/// read): kept for [`PATH_KEPT`] while the route stays the same ([`kept_path`]), waiting at most
+/// [`PATH_PATIENCE`]. Only a satisfied path is a reading, and only a reading is kept; `None` where
+/// none was read in time, the path is not satisfied, or off macOS. Never on a window's main
+/// thread: a member desk's lane and connection threads and the node's automatic admission worker
+/// call it, through [`crate::proof::read`] (`aterm_secrets::home_lan::home_net`).
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn path_once(route: Option<&RouteFacts>) -> Option<PathFacts> {
+    static KEPT: Mutex<Option<(Instant, PathKey, PathFacts)>> = Mutex::new(None);
+    let key = path_key(route);
+    if let Some(read) = kept_path(
+        KEPT.lock().unwrap_or_else(PoisonError::into_inner).as_ref(),
+        &key,
+        (Instant::now(), PATH_KEPT),
+    ) {
+        return Some(read);
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel::<aterm_objc::path_monitor::PathReading>(1);
+    let read =
+        aterm_objc::path_monitor::PathMonitor::start(c"aterm.netplace.path-once", move |reading| {
+            let _ = tx.try_send(reading);
+        })
+        .and_then(|monitor| {
+            let first = rx.recv_timeout(PATH_PATIENCE).ok();
+            drop(monitor);
+            first
+        })
+        .filter(|reading| reading.status == aterm_objc::path_monitor::PathStatus::Satisfied)
+        .map(|reading| PathFacts {
+            usable: Some(true),
+            expensive: reading.expensive,
+            constrained: reading.constrained,
+            link: link_of(reading.link),
+        });
+    if let Some(read) = read {
+        *KEPT.lock().unwrap_or_else(PoisonError::into_inner) = Some((Instant::now(), key, read));
+    }
+    read
+}
+
+/// No path reader off macOS.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub const fn path_once(_route: Option<&RouteFacts>) -> Option<PathFacts> {
+    None
+}
+
+/// The place's link for a path monitor's.
+#[cfg(target_os = "macos")]
+fn link_of(link: aterm_objc::path_monitor::PathLink) -> crate::place::Link {
+    use aterm_objc::path_monitor::PathLink;
+    match link {
+        PathLink::Wifi => crate::place::Link::Wifi,
+        PathLink::Wired => crate::place::Link::Wired,
+        PathLink::Cellular => crate::place::Link::Cellular,
+        PathLink::Loopback => crate::place::Link::Loopback,
+        PathLink::Other => crate::place::Link::Other,
+    }
+}
+
 /// The variable naming the scripted-facts file, read by a debug build alone (never a test build,
 /// whose tests script facts per thread with [`script_here`]).
 pub const SEAM: &str = "ATERM_DEBUG_NETPLACE";
@@ -276,18 +469,48 @@ pub fn script_here<R>(script: Script, f: impl FnOnce() -> R) -> R {
     ran
 }
 
-/// The scripted facts now: this thread's [`script_here`], else (a debug build outside this
-/// crate's tests) the file [`SEAM`] names, read now; `None` in a release build, or with neither.
-#[must_use]
-pub fn scripted() -> Option<Script> {
+/// Who reads the scripted facts ([`script_of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reader {
+    /// A report, the keeper, a lane's pacing, a heartbeat's notes: the seam file scripts them, so
+    /// the lab puts a Mac on a scripted network.
+    Report,
+    /// A proof ([`here_now`]): only a test's thread script, never the seam file.
+    Proof,
+}
+
+/// The script `reader` takes: this thread's (`thread`, a test's [`script_here`]), else, for a
+/// [`Reader::Report`] alone, the seam file's (`file`, read only then).
+fn script_of(
+    thread: Option<Script>,
+    file: impl FnOnce() -> Option<Script>,
+    reader: Reader,
+) -> Option<Script> {
+    thread.or_else(|| match reader {
+        Reader::Report => file(),
+        Reader::Proof => None,
+    })
+}
+
+/// This thread's [`script_here`]; `None` in a release build.
+fn thread_script() -> Option<Script> {
     #[cfg(any(test, debug_assertions))]
-    if let Some(script) = HERE.with(|here| here.borrow().clone()) {
-        return Some(script);
+    {
+        HERE.with(|here| here.borrow().clone())
     }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        None
+    }
+}
+
+/// The file [`SEAM`] names, read now, in a debug build outside this crate's tests; `None` in a
+/// release build, or with no file.
+fn seam_file() -> Option<Script> {
     #[cfg(all(debug_assertions, not(test)))]
     {
         let file = std::env::var_os(SEAM)?;
-        std::fs::read_to_string(file)
+        aterm_uds::atomic_file::read_regular_text(std::path::Path::new(&file), 1024 * 1024)
             .ok()
             .map(|text| parse_script(&text))
     }
@@ -295,6 +518,13 @@ pub fn scripted() -> Option<Script> {
     {
         None
     }
+}
+
+/// The scripted facts now: this thread's [`script_here`], else (a debug build outside this
+/// crate's tests) the file [`SEAM`] names, read now; `None` in a release build, or with neither.
+#[must_use]
+pub fn scripted() -> Option<Script> {
+    script_of(thread_script(), seam_file, Reader::Report)
 }
 
 /// The live facts: the kernel's tables, this process's route-change socket, and on macOS a path
@@ -328,7 +558,7 @@ impl Live {
         let monitor = {
             let path = Arc::clone(&path);
             aterm_objc::path_monitor::PathMonitor::start(c"aterm.netplace.path", move |reading| {
-                use aterm_objc::path_monitor::{PathLink, PathStatus};
+                use aterm_objc::path_monitor::PathStatus;
                 let facts = PathFacts {
                     usable: match reading.status {
                         PathStatus::Satisfied | PathStatus::Satisfiable => Some(true),
@@ -337,13 +567,7 @@ impl Live {
                     },
                     expensive: reading.expensive,
                     constrained: reading.constrained,
-                    link: match reading.link {
-                        PathLink::Wifi => crate::place::Link::Wifi,
-                        PathLink::Wired => crate::place::Link::Wired,
-                        PathLink::Cellular => crate::place::Link::Cellular,
-                        PathLink::Loopback => crate::place::Link::Loopback,
-                        PathLink::Other => crate::place::Link::Other,
-                    },
+                    link: link_of(reading.link),
                 };
                 let mut held = path.reading.lock().unwrap_or_else(PoisonError::into_inner);
                 if *held != Some(facts) {
@@ -527,6 +751,105 @@ mod tests {
         let elsewhere = std::thread::spawn(scripted).join().expect("another thread");
         assert_eq!(elsewhere, None, "another thread reads the Mac's own");
         assert_eq!(parse_script(""), Script::default());
+    }
+
+    /// The seam file scripts every reader but a proof: a report takes the file's script where the
+    /// thread has none, a proof (what the vault's admission reads, [`here_now`]) never does and
+    /// reads the Mac's own, and a test's thread script scripts both.
+    /// NEGATIVE CONTROL: `script_of` handing a proof the file's script too (its `Reader::Proof`
+    /// arm → `file()`) gives the proof the file's facts, and "a proof never takes the file's"
+    /// fails.
+    #[test]
+    fn the_seam_file_never_scripts_a_proof() {
+        let file = parse_script("route en0 192.168.1.20/24 via 192.168.1.1 hw 02:00:00:00:00:01\n");
+        let thread = parse_script("route en0 10.0.0.2/24 via 10.0.0.1\n");
+        let from_file = || Some(file.clone());
+        assert_eq!(
+            script_of(None, from_file, Reader::Report),
+            Some(file.clone()),
+            "a report takes the file's"
+        );
+        assert_eq!(
+            script_of(None, from_file, Reader::Proof),
+            None,
+            "a proof never takes the file's"
+        );
+        for reader in [Reader::Report, Reader::Proof] {
+            assert_eq!(
+                script_of(Some(thread.clone()), from_file, reader),
+                Some(thread.clone()),
+                "{reader:?}: a test's thread script"
+            );
+        }
+        let routed = script_here(thread.clone(), here_now);
+        assert_eq!(
+            routed.facts, thread.facts,
+            "here_now takes the thread's script"
+        );
+    }
+
+    /// A path reading is kept only on the route it was read on, and only while it stands: back on
+    /// the home LAN from a phone hotspot (another address, another gateway), or once the gateway's
+    /// hardware address is read, the path is read again at once, not after the hotspot's
+    /// "expensive" reading has run out; an unsatisfied reading (none) is never kept at all, since
+    /// [`path_once`] stores only a reading.
+    /// NEGATIVE CONTROL: `kept_path` keeping by time alone (its `on == key &&` dropped) hands the
+    /// hotspot's reading to the home route, and "a move reads the path again" fails.
+    #[test]
+    fn a_path_reading_is_kept_only_on_the_route_it_was_read_on() {
+        let route = |address: [u8; 4], hw: Option<u8>| RouteFacts {
+            interface: "en0".to_owned(),
+            address: Ipv4Addr::from(address),
+            prefix: 24,
+            gateway: None,
+            gateway_hw: hw.map(|hw| vec![0, 1, 2, 3, 4, hw]),
+        };
+        let hotspot = route([172, 20, 10, 2], Some(1));
+        let expensive = PathFacts {
+            usable: Some(true),
+            expensive: true,
+            constrained: false,
+            link: crate::place::Link::Wifi,
+        };
+        let at = Instant::now();
+        let held = (at, path_key(Some(&hotspot)), expensive);
+        let kept = Duration::from_secs(30);
+        let soon = at + Duration::from_secs(5);
+        assert_eq!(
+            kept_path(Some(&held), &path_key(Some(&hotspot)), (soon, kept)),
+            Some(expensive),
+            "the same route keeps its reading"
+        );
+        assert_eq!(
+            kept_path(
+                Some(&held),
+                &path_key(Some(&route([192, 168, 1, 20], Some(9)))),
+                (soon, kept)
+            ),
+            None,
+            "a move reads the path again"
+        );
+        let unread = route([192, 168, 1, 20], None);
+        let unread_held = (at, path_key(Some(&unread)), expensive);
+        assert_eq!(
+            kept_path(
+                Some(&unread_held),
+                &path_key(Some(&route([192, 168, 1, 20], Some(9)))),
+                (soon, kept)
+            ),
+            None,
+            "a gateway read since reads the path again"
+        );
+        assert_eq!(
+            kept_path(Some(&held), &path_key(Some(&hotspot)), (at + kept, kept)),
+            None,
+            "a reading past its time is read again"
+        );
+        assert_eq!(
+            kept_path(None, &path_key(None), (soon, kept)),
+            None,
+            "nothing held"
+        );
     }
 
     /// With a tunnel holding the primary default, the network is the scoped physical default

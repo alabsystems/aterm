@@ -520,6 +520,22 @@ impl AssetObject {
         }
     }
 
+    /// Whether the state is `uploaded`: `state() == AssetState::Uploaded`, allocating nothing
+    /// for another state.
+    #[must_use]
+    #[inline]
+    pub fn is_uploaded(&self) -> bool {
+        self.state == "uploaded"
+    }
+
+    /// Whether this asset is uploaded and holds `digest`. Its digest is read only when it is
+    /// uploaded.
+    /// # Errors
+    /// [`AssetObject::sha256`]'s, for an uploaded asset whose digest is malformed.
+    pub fn holds(&self, digest: Sha256Digest) -> Result<bool> {
+        Ok(self.is_uploaded() && self.sha256()? == Some(digest))
+    }
+
     /// `None` for a null digest (assets before June 2025).
     /// # Errors
     /// CouldNotRun, `Sub::Protocol`, why `asset {name}'s digest {digest} is not sha256:<64 hex>`.
@@ -551,6 +567,13 @@ impl Sha256Digest {
         let bytes = aterm_codec::hex::decode_vec(hex.as_bytes())?;
         let array: [u8; 32] = bytes.try_into().ok()?;
         Some(Sha256Digest(array))
+    }
+
+    /// The SHA-256 digest of `bytes`, hashed here; its `Display` is `sha256:{hex}`, the form
+    /// an intent's body digest and a tape's body line write.
+    #[must_use]
+    pub fn of(bytes: &[u8]) -> Sha256Digest {
+        Sha256Digest(aterm_digest::Sha256::digest(bytes))
     }
 
     /// These 32 bytes, already a SHA-256 digest (nothing is hashed).

@@ -11,7 +11,7 @@ use super::*;
 const CHROME: &str = r#"toolbar (none)
 toolbar-tabs count=2 selected=1 labels=["aterm", "land-a"] icons=[None, None] states=[[], ["selected", "busy", "attention"]] tooltips=[None, Some("land-a\nactivity: idle\nNeeds you: rotate the deploy key\ndriven by aterm (land)")]
 menu (none)
-autopilot sid=s-aa window=2 program=claude face=land drawn="⤓ land" spoken="Autopilot: land."
+autopilot sid=s-aa window=2 program=claude face=land drawn="⤓" spoken="Autopilot: land."
 autopilot sid=s-bb window=2 program=claude face=cruise drawn=- why=not-drawn spoken=-
 statusitem title=❯1 needs=1 stuck=0 exceptions=4 done=0 fleet=off
 statusmenu "Needs you (1)" enabled=no at=0
@@ -49,6 +49,8 @@ fn the_strip_is_read_tab_by_tab_through_its_quoted_lists() {
         "index=1 selected=1 states=selected,busy,attention"
     );
     assert_eq!(tabs[0].words(), "index=0 selected=0 states=-");
+    assert_eq!(tabs[0].control_number(), "1");
+    assert_eq!(tabs[1].control_number(), "2");
     let odd = r#"toolbar-tabs count=1 selected=0 labels=["a \"b\" ]c"] icons=[None] states=[["done"]] tooltips=[None]"#;
     let t = strip_tabs(odd);
     assert_eq!(t[0].label, "a \"b\" ]c");
@@ -266,12 +268,12 @@ fn a_chip_line_is_read_and_its_cells_held_to_its_face() {
     let a = chip_of(CHROME, "s-aa").unwrap();
     assert_eq!(
         a,
-        "window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"Autopilot: land.\""
+        "window=2 program=claude face=land drawn=\"⤓\" spoken=\"Autopilot: land.\""
     );
     let c = chip(&a);
     assert_eq!(
         (c.face.as_str(), c.drawn.as_deref(), c.why.as_deref()),
-        ("land", Some("⤓ land"), None)
+        ("land", Some("⤓"), None)
     );
     assert!(drawn_is_face(&c));
     let b = chip(&chip_of(CHROME, "s-bb").unwrap());
@@ -282,6 +284,15 @@ fn a_chip_line_is_read_and_its_cells_held_to_its_face() {
     assert!(!drawn_is_face(&b), "no cells are no face");
     assert_eq!(chip_of(CHROME, "s-a"), None, "a sid is read whole");
     assert!(!drawn_is_face(&chip("face=landed drawn=\"⤓ land\"")));
+    assert!(drawn_is_face(&chip("face=off drawn=\"○\"")), "Off at rest");
+    assert!(
+        !drawn_is_face(&chip("face=land drawn=\"⤓ land\"")),
+        "a lab never clicks: a name that stands, or the old worded rest, is a fault"
+    );
+    assert!(
+        !drawn_is_face(&chip("face=off drawn=\"○ off\"")),
+        "Off's old worded rest"
+    );
     assert!(drawn_is_face(&chip("face=cruise-until drawn=\"∞ ⤓18:00\"")));
     assert!(drawn_is_face(&chip("face=unhosted drawn=\"⊘ off\"")));
     assert!(!drawn_is_face(&chip("face=cruise drawn=\"∞ cruise\"")));
@@ -329,12 +340,12 @@ fn a_read_stands_from_before_its_span_and_settles_at_its_end() {
 fn the_windows_and_their_sessions_are_named_by_id() {
     let tabs = "app-inspection version=app/v1 revision=1 subject=tabs
 window id=0 focused=false tabs=1 active=1
-  tab id=1 index=0 kind=terminal title=\"alpha\" state=busy active=true
+  tab id=1 index=1 kind=terminal title=\"alpha\" state=busy active=true
     leaf path=/ view=1 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=terminal session=0
 window id=1 focused=true tabs=2 active=3
-  tab id=2 index=0 kind=terminal title=\"/p\" state=clean active=false
+  tab id=2 index=1 kind=terminal title=\"/p\" state=clean active=false
     leaf path=/ view=2 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=terminal session=1
-  tab id=3 index=1 kind=app title=\"Settings\" state=clean active=true
+  tab id=3 index=2 kind=app title=\"Settings\" state=clean active=true
     leaf path=/ view=3 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=app app=settings title=\"Settings\"";
     let (windows, page) = windows_of(tabs);
     assert_eq!(windows, ["0", "1"]);
@@ -362,9 +373,9 @@ fn the_persons_press_reads_the_local_id_and_a_settings_view() {
         Some("4")
     );
     let tabs = "window id=1 focused=true tabs=2 active=3
-  tab id=2 index=0 kind=terminal title=\"/p\" state=clean active=false
+  tab id=2 index=1 kind=terminal title=\"/p\" state=clean active=false
     leaf path=/ view=2 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=terminal session=1
-  tab id=3 index=1 kind=app title=\"Settings\" state=clean active=true
+  tab id=3 index=2 kind=app title=\"Settings\" state=clean active=true
     leaf path=/ view=5 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=app app=settings title=\"Settings\"";
     assert_eq!(settings_view(tabs).as_deref(), Some("5"));
     assert_eq!(
@@ -380,10 +391,10 @@ fn the_persons_press_reads_the_local_id_and_a_settings_view() {
 fn a_new_window_is_waited_for_until_it_is_made() {
     let one = "app-inspection version=app/v1 revision=1 subject=tabs
 window id=0 focused=true tabs=1 active=1
-  tab id=1 index=0 kind=app title=\"Settings\" state=clean active=true
+  tab id=1 index=1 kind=app title=\"Settings\" state=clean active=true
     leaf path=/ view=1 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=app app=settings title=\"Settings\"";
     let two = format!(
-        "{one}\nwindow id=1 focused=true tabs=1 active=2\n  tab id=2 index=0 kind=terminal title=\"/p\" state=clean active=true"
+        "{one}\nwindow id=1 focused=true tabs=1 active=2\n  tab id=2 index=1 kind=terminal title=\"/p\" state=clean active=true"
     );
     let before = vec!["0".to_string()];
     let mut reads = 0;
@@ -660,7 +671,7 @@ fn the_title_is_split_off_the_chip_line() {
     let _ = old.note(
         &Glance::of(
             7,
-            "autopilot sid=s-e window=2 program=claude face=off drawn=\"○ off\" spoken=\"x\"",
+            "autopilot sid=s-e window=2 program=claude face=off drawn=\"○\" spoken=\"x\"",
             "",
         ),
         "s-e",
@@ -822,8 +833,8 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
         "a spawned worker still needs its own mode's words"
     );
     let b = title_seen(
-        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(&land))),
-        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(held))),
+        Some(drawn_title("claude", "land", "\"⤓\"", &qt(&land))),
+        Some(drawn_title("claude", "land", "\"⤓\"", &qt(held))),
     );
     assert!(
         matches!(ok(&b, Chain::LandB, "claude"), Verdict::Pass(_)),
@@ -832,8 +843,8 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
     );
     let stop = stopped("land", HeldBy::SameReply);
     let s3a = title_seen(
-        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(&land))),
-        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(&stop))),
+        Some(drawn_title("claude", "land", "\"⤓\"", &qt(&land))),
+        Some(drawn_title("claude", "land", "\"⤓\"", &qt(&stop))),
     );
     assert!(
         matches!(ok(&s3a, Chain::LandB, "claude"), Verdict::Pass(_)),
@@ -842,7 +853,7 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
     );
     let cruise_stop = stopped("cruise", HeldBy::SameReply);
     let crossed = title_seen(
-        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(&land))),
+        Some(drawn_title("claude", "land", "\"⤓\"", &qt(&land))),
         Some(drawn_title("claude", "cruise", "\"∞\"", &qt(&cruise_stop))),
     );
     assert!(
@@ -850,7 +861,7 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
         "a cruise stop on a Land chain"
     );
     let stopped_early = title_seen(
-        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(&stop))),
+        Some(drawn_title("claude", "land", "\"⤓\"", &qt(&stop))),
         None,
     );
     assert!(
@@ -858,7 +869,7 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
         "a stop before its first prompt"
     );
     let early = title_seen(
-        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(held))),
+        Some(drawn_title("claude", "land", "\"⤓\"", &qt(held))),
         None,
     );
     assert!(
@@ -869,15 +880,12 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
         matches!(ok(&early, Chain::Worker, "claude"), Verdict::Pass(_)),
         "the spawn already supplied the worker's task"
     );
-    let blank = title_seen(Some(drawn_title("claude", "off", "\"○ off\"", "-")), None);
+    let blank = title_seen(Some(drawn_title("claude", "off", "\"○\"", "-")), None);
     assert!(
         matches!(ok(&blank, Chain::Off, "claude"), Verdict::Fail(_)),
         "a drawn chip with no title"
     );
-    let o = title_seen(
-        Some(drawn_title("claude", "off", "\"○ off\"", &qt(&off))),
-        None,
-    );
+    let o = title_seen(Some(drawn_title("claude", "off", "\"○\"", &qt(&off))), None);
     assert!(matches!(ok(&o, Chain::Off, "claude"), Verdict::Pass(_)));
     let not_yet =
         "window=2 program=claude face=land drawn=- why=not-drawn spoken=- description=- title=-";
@@ -892,14 +900,14 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
     );
     let later = title_seen(
         Some(not_yet.into()),
-        Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(&land))),
+        Some(drawn_title("claude", "land", "\"⤓\"", &qt(&land))),
     );
     let v = ok(&later, Chain::Worker, "claude");
     assert!(
         matches!(v, Verdict::Pass(ref w) if w.contains("not drawn yet")),
         "{v:?}"
     );
-    let drawn_blank = title_seen(Some(drawn_title("claude", "land", "\"⤓ land\"", "-")), None);
+    let drawn_blank = title_seen(Some(drawn_title("claude", "land", "\"⤓\"", "-")), None);
     assert!(
         matches!(ok(&drawn_blank, Chain::Worker, "claude"), Verdict::Fail(_)),
         "a drawn chip with no title still fails"
@@ -918,7 +926,7 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
         ok(&agy, Chain::Off, "agy")
     );
     let release = title_seen(
-        Some("window=2 program=claude face=off drawn=\"○ off\" spoken=\"x\" description=-".into()),
+        Some("window=2 program=claude face=off drawn=\"○\" spoken=\"x\" description=-".into()),
         None,
     );
     assert!(matches!(
@@ -1310,14 +1318,14 @@ fn the_opened_page_is_the_chains_windows_front_settings_tab() {
         format!(
             "app-inspection version=app/v1 revision=1 subject=tabs
 window id=1 focused=false tabs=2 active=3
-  tab id=2 index=0 kind=terminal title=\"proj\" state=clean active=false
+  tab id=2 index=1 kind=terminal title=\"proj\" state=clean active=false
     leaf path=/ view=2 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=terminal session=1
-  tab id=3 index=1 kind=app title=\"Settings\" state=clean active=true
+  tab id=3 index=2 kind=app title=\"Settings\" state=clean active=true
     leaf path=/ view=3 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=app app=settings title=\"Settings\"
 window id=2 focused=true tabs=2 active=9
-  tab id=4 index=0 kind=terminal title=\"land-a\" state=busy active={}
+  tab id=4 index=1 kind=terminal title=\"land-a\" state=busy active={}
     leaf path=/ view=4 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=terminal session=2
-  tab id=9 index=1 kind=app title=\"Settings\" state=clean active={}
+  tab id=9 index=2 kind=app title=\"Settings\" state=clean active={}
     leaf path=/ view=7 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=app app=settings title=\"Settings\"
 ",
             active == "terminal",
@@ -1344,7 +1352,7 @@ fn a_worker_is_read_in_front_once_its_strip_lists_its_title() {
         "no chip for that tab"
     );
     let unnamed = CHROME.replace(
-        "autopilot sid=s-aa window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"Autopilot: land.\"",
+        "autopilot sid=s-aa window=2 program=claude face=land drawn=\"⤓\" spoken=\"Autopilot: land.\"",
         "autopilot sid=s-aa window=2 program=claude face=- drawn=- why=not-drawn spoken=-",
     );
     assert_ne!(unnamed, CHROME);
@@ -1386,7 +1394,7 @@ fn only_a_chip_the_frame_left_undrawn_is_waited_on() {
         "autopilot sid=s-ww window=2 program=claude face=land drawn=- why=not-drawn spoken=- description=- title=-"
     ));
     for read in [
-        "autopilot sid=s-ww window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"Autopilot: land.\" description=- title=\"autopilot: land\"",
+        "autopilot sid=s-ww window=2 program=claude face=land drawn=\"⤓\" spoken=\"Autopilot: land.\" description=- title=\"autopilot: land\"",
         "autopilot sid=s-ww window=2 program=codex face=- drawn=- why=no-footer spoken=- description=- title=-",
         "autopilot sid=s-ww window=2 program=agy face=off drawn=- why=switch-only spoken=- description=- title=-",
     ] {
@@ -1546,7 +1554,7 @@ fn a_past_or_held_title_is_judged_against_its_own_chips_face() {
     let held = "autopilot: land \u{2014} not landed yet: no \u{201c}Nothing left:\u{201d} defense yet \u{b7} landing since 14:02";
     let at_end = |face: &str, drawn: &str, title: &str| {
         let s = title_seen(
-            Some(drawn_title("claude", "land", "\"⤓ land\"", &qt(&land))),
+            Some(drawn_title("claude", "land", "\"⤓\"", &qt(&land))),
             Some(drawn_title("claude", face, drawn, &qt(title))),
         );
         title_words(&s, &title_cx(Chain::LandB, "claude"))
@@ -1558,7 +1566,7 @@ fn a_past_or_held_title_is_judged_against_its_own_chips_face() {
     for (face, drawn, title) in [
         ("landed", "\"✓ landed\"", landed),
         ("theirs", "\"⤓ quiet\"", quiet),
-        ("land", "\"⤓ land\"", held),
+        ("land", "\"⤓\"", held),
     ] {
         let v = at_end(face, drawn, title);
         assert!(matches!(v, Verdict::Pass(_)), "{face}: {v:?}");
@@ -1568,8 +1576,8 @@ fn a_past_or_held_title_is_judged_against_its_own_chips_face() {
         assert!(matches!(v, Verdict::Fail(_)), "before prompt {face}: {v:?}");
     }
     for (face, drawn, title) in [
-        ("land", "\"⤓ land\"", landed),
-        ("land", "\"⤓ land\"", quiet),
+        ("land", "\"⤓\"", landed),
+        ("land", "\"⤓\"", quiet),
         ("theirs", "\"⤓ quiet\"", landed),
         ("landed", "\"✓ landed\"", quiet),
         ("landed", "\"✓ landed\"", held),
@@ -1585,4 +1593,37 @@ fn a_past_or_held_title_is_judged_against_its_own_chips_face() {
             "spawned {title:?} over face={face}: {v:?}"
         );
     }
+}
+
+#[test]
+fn the_parked_workers_keep_their_canonical_indices_after_the_strip() {
+    let chrome = "toolbar-tabs count=2 selected=1 labels=[\"shell\", \"Workers\"] icons=[None, \
+                  Some(\"workers\")] states=[[], [\"selected\"]] tooltips=[None, None]\n\
+                  toolbar-workers first=2 selected=3 summary=\"2 working\" labels=[\"a\", \"b\"] \
+                  states=[[], [\"selected\"]] tooltips=[None, Some(\"b's hover\")]\n";
+    let tabs = strip_tabs(chrome);
+    let read: Vec<_> = tabs
+        .iter()
+        .map(|tab| (tab.index, tab.label.as_str(), tab.selected))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            (0, "shell", false),
+            (1, "Workers", false),
+            (2, "a", false),
+            (3, "b", true),
+        ],
+        "a parked tab is what `tab 3` selects, and the only selected one while it shows"
+    );
+    assert_eq!(tabs[3].tip.as_deref(), Some("b's hover"));
+
+    // With the list on screen the chip is the selected one.
+    let listing = chrome.replace("selected=3", "selected=none");
+    let tabs = strip_tabs(&listing);
+    assert!(tabs[1].selected);
+    assert!(!tabs[3].selected);
+
+    // The hover read judges the strip's own line, not the merged list.
+    assert!(Glance::of(0, chrome, "").hover_read);
 }

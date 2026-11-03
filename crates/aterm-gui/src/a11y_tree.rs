@@ -2780,13 +2780,13 @@ mod tests {
             width: 4,
             toggled: None,
         };
+        let plan_title = format!(
+            "{} \u{b7} click: bypass or auto",
+            aterm_agent::harness::lights::Mode::Plan.gist()
+        );
         let chips = [
             at(HarnessChip::Mode, "Permission mode: plan.", 2),
-            at(
-                HarnessChip::Title,
-                "Permission mode: click for bypass or auto",
-                8,
-            ),
+            at(HarnessChip::Title, plan_title.as_str(), 8),
             at(
                 HarnessChip::Link(crate::claude_card::GlassLink::Notice),
                 "https://alab.systems",

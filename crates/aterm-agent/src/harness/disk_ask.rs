@@ -137,8 +137,9 @@ pub const COLD_HOLD_MS: i64 = 30 * 60_000;
 /// The least a projected episode's delivery or answer window is ([`window`]).
 pub const FLOOR_WINDOW_MS: i64 = 5 * 60_000;
 
-/// How long a disk worker runs from its start before it is over (`expired`): its host turns its
-/// Autopilot Off then, so nothing more is typed into it.
+/// How long a disk worker runs from its start before it is over (`expired`): its host marks a task
+/// still working `failed why=expired` and turns its Autopilot Off then, so nothing more is typed
+/// into it.
 pub const WORKER_MS: i64 = 40 * 60_000;
 
 /// How long a claimed worker's host has to say what its spawn did before the claim is `lost`.
@@ -412,20 +413,25 @@ pub struct Ahead<'a> {
     pub task: Option<&'a TaskRead<'a>>,
     /// What the spawn this host's last worker claim asked for did, until a step records it.
     pub spawned: Option<&'a Spawned>,
+    /// The free bytes a worker claimed at this look is told to reach ([`Brief::target`]), which
+    /// its end is judged against ([`Worker::target`]).
+    pub target: Option<u64>,
 }
 
 /// A host's read of its task records ([`Ahead::task`]): what one says of session `sid`.
 pub type TaskRead<'a> = dyn Fn(&str) -> Option<TaskSeen> + 'a;
 
-/// What a host's task record says of a worker's session ([`Ahead::task`]).
+/// What a host's task record says of a worker's session ([`Ahead::task`]). A STALL IS NO END: a
+/// worker stopped at a screen, a sign-in or an install may move on once someone acts, so it
+/// reads [`Self::Working`] and its run stays bounded by [`WORKER_MS`] alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskSeen {
-    /// It works on.
+    /// It works on, or stalled where it may move on.
     Working,
-    /// Its task is done or exited.
+    /// Its task finished: landed, or marked done, and its agent gone or not.
     Ended,
-    /// It stalled, at what (a sign-in, an install, a shell).
-    Stalled(String),
+    /// Its task ended unfinished, and why (`could-not-finish`, `exit`, `off`, `repeated`, ...).
+    Failed(String),
 }
 
 /// What a worker spawn did ([`Ahead::spawned`]).
@@ -868,6 +874,10 @@ pub struct Worker {
     /// `None` in a lease a build before this one wrote; that look's figure stands in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub free_at_claim: Option<u64>,
+    /// The free bytes it was told to reach ([`Ahead::target`]). `None` in a lease a build before
+    /// this one wrote: its end says nothing of a target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<u64>,
 }
 
 impl Worker {
@@ -905,13 +915,16 @@ pub enum WorkerState {
         free_at: u64,
         best_free: u64,
     },
-    /// It is over (`why`: `finished`, `stalled:<what>`, `gone`, `expired`, `lost`,
-    /// `spawn:<reason>`) since `at_ms`; free space rose `rose` while it ran.
+    /// It is over (`why`: `finished`, `failed:<what>`, `gone`, `expired`, `lost`,
+    /// `spawn:<reason>`) since `at_ms`; free space rose `rose` while it ran, whoever freed
+    /// it. `target_met`: whether the most free space read reached [`Worker::target`].
     Over {
         why: String,
         sid: Option<String>,
         at_ms: i64,
         rose: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_met: Option<bool>,
     },
 }
 
@@ -2486,12 +2499,14 @@ pub enum WorkerSaid {
     Claimed,
     /// The worker this host started runs as `sid`.
     Started { sid: String },
-    /// The worker is over (`why`, [`WorkerState::Over`]); free space rose `rose` while it ran.
+    /// The worker is over (`why`, [`WorkerState::Over`]); free space rose `rose` while it ran,
+    /// and `target_met` says whether that reached what it was told to reach.
     /// `here`: it was this host's, which turns its Autopilot Off at `expired`.
     Over {
         sid: Option<String>,
         why: String,
         rose: u64,
+        target_met: Option<bool>,
         here: bool,
     },
 }
@@ -2517,10 +2532,17 @@ impl WorkerSaid {
             WorkerSaid::Started { sid } => {
                 format!("aterm's disk worker runs as @{sid}; no session is asked while it works")
             }
-            WorkerSaid::Over { sid, why, rose, .. } => format!(
-                "aterm's disk worker{} is over ({why}); free space rose {} while it ran",
+            WorkerSaid::Over {
+                sid,
+                why,
+                rose,
+                target_met,
+                ..
+            } => format!(
+                "aterm's disk worker{} is over ({why}); free space rose {} while it ran{}",
                 sid.as_ref().map(|s| format!(" @{s}")).unwrap_or_default(),
-                human_bytes(*rose)
+                human_bytes(*rose),
+                target_words(*target_met)
             ),
         }
     }
@@ -2562,6 +2584,7 @@ pub fn worker_step(lease: &mut Lease, look: &Look<'_>) -> Option<WorkerSaid> {
         state: WorkerState::Claimed,
         orphan_ms: None,
         free_at_claim: Some(look.free),
+        target: look.ahead.target,
     });
     entry.last_worker_ms = Some(look.now_ms);
     entry.due_ms = None;
@@ -2672,7 +2695,7 @@ fn worker_moves(entry: &mut Entry, look: &Look<'_>) -> Option<WorkerSaid> {
             let seen = look.ahead.task.and_then(|task| task(sid));
             let why = match seen {
                 Some(TaskSeen::Ended) => Some("finished".to_owned()),
-                Some(TaskSeen::Stalled(what)) => Some(format!("stalled:{what}")),
+                Some(TaskSeen::Failed(what)) => Some(format!("failed:{what}")),
                 Some(TaskSeen::Working) | None => None,
             }
             .or_else(|| (!look.live.contains(sid)).then(|| "gone".to_owned()))
@@ -2687,28 +2710,67 @@ fn worker_moves(entry: &mut Entry, look: &Look<'_>) -> Option<WorkerSaid> {
 
 /// Worker `w` is over for `why` at `now`.
 fn worker_over(w: &mut Worker, now: i64, why: String, here: bool) -> WorkerSaid {
-    let (sid, rose) = match &w.state {
+    let (sid, rose, target_met) = match &w.state {
         WorkerState::Running {
             sid,
             free_at,
             best_free,
             ..
-        } => (Some(sid.clone()), best_free.saturating_sub(*free_at)),
-        _ => (None, 0),
+        } => (
+            Some(sid.clone()),
+            best_free.saturating_sub(*free_at),
+            w.target.map(|target| *best_free >= target),
+        ),
+        _ => (None, 0, w.target.map(|_| false)),
     };
     w.state = WorkerState::Over {
         why: why.clone(),
         sid: sid.clone(),
         at_ms: now,
         rose,
+        target_met,
     };
     w.orphan_ms = None;
     WorkerSaid::Over {
         sid,
         why,
         rose,
+        target_met,
         here,
     }
+}
+
+/// `; the volume reached its target` or its opposite, or nothing where no target is known
+/// ([`Worker::target`]).
+fn target_words(target_met: Option<bool>) -> &'static str {
+    match target_met {
+        Some(true) => "; the volume reached its target",
+        Some(false) => "; the volume did not reach its target",
+        None => "",
+    }
+}
+
+/// How a person reads a worker's end word ([`WorkerState::Over`]), and whether it finished.
+#[must_use]
+pub fn worker_end_words(why: &str) -> (bool, String) {
+    let words = match why.split_once(':') {
+        None if why == "finished" => return (true, "it finished its task".to_owned()),
+        None if why == "gone" => {
+            "its tab or the aterm running it ended before it finished".to_owned()
+        }
+        None if why == "expired" => "its time ran out".to_owned(),
+        None if why == "lost" => "it never started".to_owned(),
+        Some(("failed", "could-not-finish")) => "it said it could not finish".to_owned(),
+        Some(("failed", "exit")) => "it exited before finishing".to_owned(),
+        Some(("failed", "off")) => "a person turned its Autopilot off".to_owned(),
+        Some(("failed", "off-ctl")) => "a manager or a script turned its Autopilot off".to_owned(),
+        Some(("failed", "repeated")) => "it kept repeating the same reply".to_owned(),
+        Some(("failed", "expired")) => "its time ran out".to_owned(),
+        Some(("failed", what)) => format!("it ended unfinished ({what})"),
+        Some(("spawn", what)) => format!("it could not start ({what})"),
+        _ => format!("it ended unfinished ({why})"),
+    };
+    (false, words)
 }
 
 /// When the step in hand on `entry`'s volume ends at `now_ms`: a line owed or out (its answer
@@ -2864,9 +2926,10 @@ pub fn worker_task(b: &Brief<'_>) -> String {
          Desktop, Documents, Downloads, Movies, Music, Pictures, iCloud Drive, /Volumes or \
          another app's data: a look there can put a privacy dialog on the owner's screen. Free \
          only with `aterm harness disk free <path>...` (it refuses what does not regenerate, \
-         and says why); every other removal is declined. Never ask a question: when unsure, keep it and name it. Never commit, push, \
+         and says why); remove nothing any other way, whatever your permissions allow. Never ask a question: when unsure, keep it and name it. Never commit, push, \
          or remove a worktree, branch or stash. End with one reply starting `Nothing left:` \
-         that names each path you freed and its size, then a line `disk-free filling: <what \
+         that names each path you freed and its size, or, if you cannot reach the figure above, \
+         `Could not finish:` and why, naming the same; then a line `disk-free filling: <what \
          fills the volume>` and a line `disk-free owner-only: <what only the owner can free>`, \
          and no NEEDS YOU line: aterm tells the owner. (rule disk-free@v1 worker)",
     );
@@ -2891,9 +2954,18 @@ pub fn worker_row(now_s: i64, key: &str, said: &WorkerSaid, free: u64, host: &Ho
     o.insert("volume".to_owned(), Value::from(key.to_owned()));
     o.insert("free_bytes".to_owned(), Value::from(free));
     o.insert("host_pid".to_owned(), Value::from(host.pid));
-    if let WorkerSaid::Over { why, rose, .. } = said {
+    if let WorkerSaid::Over {
+        why,
+        rose,
+        target_met,
+        ..
+    } = said
+    {
         o.insert("why".to_owned(), Value::from(why.clone()));
         o.insert("rose_bytes".to_owned(), Value::from(*rose));
+        if let Some(met) = target_met {
+            o.insert("target_met".to_owned(), Value::from(*met));
+        }
     }
     o.insert(
         "text".to_owned(),
@@ -3464,9 +3536,11 @@ pub fn row_line(row: &str) -> Option<String> {
 
 /// What `aterm harness disk why` prints: one head line per volume the lease holds (the floor
 /// its episode is held to, its phase, what it waits on, its picks, lines and cooldown at
-/// `now_ms`), then `rows` (this rule's ledger rows, oldest first) as [`row_line`] says them.
+/// `now_ms`, and its worker, with what that worker removed itself counted over `ledger`, the
+/// ledger's tail as read, every kind's rows: its removals are `disk-free` rows, never this
+/// rule's), then `rows` (this rule's ledger rows, oldest first) as [`row_line`] says them.
 #[must_use]
-pub fn why_lines(lease: &Lease, rows: &[String], now_ms: i64) -> Vec<String> {
+pub fn why_lines(lease: &Lease, rows: &[String], ledger: &[String], now_ms: i64) -> Vec<String> {
     let at = |ms: i64| rfc3339_utc(ms / 1000);
     let mut out = Vec::new();
     if lease.volumes.is_empty() {
@@ -3678,12 +3752,23 @@ pub fn why_lines(lease: &Lease, rows: &[String], now_ms: i64) -> Vec<String> {
                     sid,
                     at_ms,
                     rose,
-                } => format!(
-                    "  worker: {}over at {} ({why}); free space rose {} while it ran",
-                    sid.as_ref().map(|s| format!("@{s} ")).unwrap_or_default(),
-                    at(*at_ms),
-                    human_bytes(*rose)
-                ),
+                    target_met,
+                } => {
+                    let (finished, words) = worker_end_words(why);
+                    let removed = sid
+                        .as_deref()
+                        .map_or(0, |sid| super::free::removed_by(ledger, sid));
+                    format!(
+                        "  worker: {}over at {} ({}: {words}); it removed {} itself; free space \
+                         rose {} while it ran, whoever freed it{}",
+                        sid.as_ref().map(|s| format!("@{s} ")).unwrap_or_default(),
+                        at(*at_ms),
+                        if finished { "finished" } else { "failed" },
+                        human_bytes(removed),
+                        human_bytes(*rose),
+                        target_words(*target_met)
+                    )
+                }
             });
         }
         if let Some(last) = e.last_worker_ms {

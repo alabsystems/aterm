@@ -88,7 +88,9 @@ pub(crate) fn build_dev(
 pub fn run(ctx: &Ctx, r: &mut Report) {
     let browser = match wasm_page::browser() {
         Ok(browser) => browser,
-        Err(Refused::Unavailable(why) | Refused::Failed(why)) => return could_not_run(r, &why),
+        Err(Refused::Unavailable(why) | Refused::Failed(why) | Refused::Timing(why)) => {
+            return could_not_run(r, &why);
+        }
     };
     let rustup = match crate::perf::wasm::build_tools(false) {
         Ok(rustup) => rustup,
@@ -131,7 +133,7 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
             r.raw(log);
             r.pass(LABEL);
         }
-        Ok((Err(Refused::Unavailable(why)), log)) => {
+        Ok((Err(Refused::Unavailable(why) | Refused::Timing(why)), log)) => {
             r.raw(log);
             could_not_run(r, &why);
         }

@@ -15,6 +15,148 @@ use super::{
 use crate::autopilot_menu::{MenuAct, MenuRow, PlotInk};
 use crate::claude_lights::Fact;
 
+#[test]
+fn typed_login_diagnostic_is_wrapped_spoken_once_and_preserved_in_copy() {
+    use aterm_agent::harness::{
+        account_progress::AccountProgress,
+        accounts::Row,
+        accounts_sync::LoginDiagnostic,
+        open_url::{Met, MetWord},
+    };
+    let row = Row {
+        label: "shared".into(),
+        ..Row::default()
+    };
+    let diagnostic = LoginDiagnostic::from_exit_for_test(
+        &row,
+        80,
+        1,
+        Some(Met::new(MetWord::BrowserControl, None)),
+    );
+    let words = diagnostic.words();
+    let mut progress = AccountProgress::unknown(100);
+    progress.login_diagnostics.push(diagnostic.clone());
+    let report = super::recovery_report(&progress);
+    assert!(report.contains(&words));
+    assert!(report.contains(&aterm_agent::harness::usage::rfc3339_utc(80)));
+    assert!(report.contains("shared"));
+    for room in [32, 44] {
+        let mut rows = Vec::new();
+        super::login_diagnostic_rows(&mut rows, &diagnostic, room);
+        assert!(rows.iter().all(|row| match row {
+            crate::autopilot_menu::MenuRow::Note { text, .. } =>
+                crate::tab_menu::display_cells(text) <= room,
+            _ => false,
+        }));
+        let spoken = rows
+            .iter()
+            .filter(|row| match row {
+                crate::autopilot_menu::MenuRow::Note { spoken, .. } => spoken == &words,
+                _ => false,
+            })
+            .count();
+        assert_eq!(spoken, 1);
+        let text = rows
+            .iter()
+            .filter_map(|row| match row {
+                crate::autopilot_menu::MenuRow::Note { text, .. }
+                    if !text.starts_with("Last local") && !text.starts_with("Finished") =>
+                {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(text, words);
+    }
+}
+
+#[test]
+fn the_newest_login_failure_remains_visible_in_a_short_account_menu() {
+    use aterm_agent::harness::{
+        account_progress::{AccountProgress, ProgressPhase},
+        accounts::Row,
+        accounts_sync::LoginDiagnostic,
+        open_url::{Met, MetWord},
+    };
+    let older = LoginDiagnostic::from_exit_for_test(
+        &Row {
+            label: "alpha".into(),
+            ..Row::default()
+        },
+        70,
+        1,
+        Some(Met::new(MetWord::Stall, None)),
+    );
+    let newest = LoginDiagnostic::from_exit_for_test(
+        &Row {
+            label: "zeta".into(),
+            ..Row::default()
+        },
+        90,
+        1,
+        Some(Met::new(MetWord::BrowserControl, None)),
+    );
+    let mut progress = AccountProgress::unknown(100);
+    progress.phase = ProgressPhase::Waiting;
+    progress.known = Some(2);
+    progress.eligible = Some(0);
+    progress.wall = Some("weekly".into());
+    progress.next_at = Some(160);
+    progress
+        .details
+        .push("No eligible alternate account".into());
+    progress.login_diagnostics = vec![older.clone(), newest.clone()];
+    let before = progress.clone();
+    let theme = aterm_render::Theme {
+        fg: 0x00E0_E0E0,
+        bg: 0x0018_1818,
+        cursor: 0x00FF_FFFF,
+        selection: 0x0044_4466,
+    };
+    for cols in [40, 60] {
+        let facts = FactMenuFacts {
+            account_progress: Some(progress.clone()),
+            title: "Accounts · tab 1".into(),
+            room: crate::autopilot_menu::content_room(cols),
+            ..Default::default()
+        };
+        let menu = rows(Fact::Account, &facts);
+        let rect = crate::autopilot_menu::place(&menu, (12, 0), (0..14, 0..cols), (cols, 14), 0)
+            .expect("short account menu");
+        let text = crate::autopilot_menu::paint(rect, &menu, None, theme)
+            .into_iter()
+            .map(|line| {
+                line.iter()
+                    .skip(1)
+                    .take(line.len().saturating_sub(2))
+                    .map(|cell| cell.ch)
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("Last local sign-in: zeta"), "{text}");
+        assert!(text.contains(&newest.words()), "{text}");
+        assert!(
+            text.contains(&aterm_agent::harness::usage::rfc3339_utc(90)),
+            "{text}"
+        );
+        assert!(!text.contains(&older.words()), "{text}");
+        let report = super::recovery_report(facts.account_progress.as_ref().unwrap());
+        for diagnostic in [&older, &newest] {
+            assert!(report.contains(diagnostic.label()));
+            assert!(report.contains(&diagnostic.words()));
+            assert!(report.contains(&aterm_agent::harness::usage::rfc3339_utc(
+                diagnostic.completed_at
+            )));
+        }
+        assert_eq!(facts.account_progress.as_ref(), Some(&before));
+    }
+}
+
 fn mask(kinds: &[FactKind]) -> FactMask {
     kinds
         .iter()

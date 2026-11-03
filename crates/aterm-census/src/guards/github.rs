@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! github-auth-door, gh-spawn and agh-fx: GitHub is reached through agh's doors.
+//! github-auth-door, gh-spawn and agh-fx: GitHub is reached through agh's doors. agh-fx's
+//! third clause keeps every child agh spawns in its child door, `crates/agh/src/fx/child.rs`.
 
 use std::path::Path;
 
@@ -33,7 +34,8 @@ pub(super) const AGH_FX: Rule = Rule {
     id: "agh-fx",
     why: "a clock, a sleep, a socket or a GitHub round trip in agh that skips its effect seam \
           (crates/agh/src/fx/), so a tape misses it and a replay answers it from the real \
-          world; or aterm-http's client outside crates/agh/src/wire/http.rs",
+          world; or aterm-http's client outside crates/agh/src/wire/http.rs; or a child process \
+          spawned outside crates/agh/src/fx/child.rs",
     scope: &["crates/agh/"],
     check: agh_fx,
 };
@@ -43,6 +45,23 @@ const AGH_DOOR: &str = "crates/agh/src/wire/door.rs";
 const AGH_SRC: &str = "crates/agh/src/";
 const AGH_FX_HOME: &str = "crates/agh/src/fx/";
 const AGH_HTTP: &str = "crates/agh/src/wire/http.rs";
+const AGH_CHILD: &str = "crates/agh/src/fx/child.rs";
+
+/// The `aterm_uds` modules that spawn a child, one row each: the module, the needle code
+/// naming it is found by, and the path an import of it is reported as. Each needle is the bare
+/// module name but `deadline::`, a path lead, because `deadline` is a common variable name.
+/// `spawnfd` and `deadline` hold the command builders, `pspawn` a `posix_spawn` of any program,
+/// and `fixture_git` a `git` command (in test and debug builds).
+const SPAWN_MODULES: &[(&str, &str, &str)] = &[
+    ("spawnfd", "spawnfd", "aterm_uds::spawnfd"),
+    ("deadline", "deadline::", "aterm_uds::deadline"),
+    ("pspawn", "pspawn", "aterm_uds::pspawn"),
+    ("fixture_git", "fixture_git", "aterm_uds::fixture_git"),
+];
+
+/// What else names a child process in agh's code: std's command. These and
+/// [`SPAWN_MODULES`]' needles are each a finding outside [`AGH_CHILD`].
+const STD_SPAWNS: &[&str] = &["std::process::Command", "Command::new"];
 
 const GITHUB_API_HOSTS: &[&str] = &["api.github.com", "uploads.github.com"];
 
@@ -279,12 +298,17 @@ fn agh_fx(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         }
         let doors = !file.rel.starts_with(AGH_FX_HOME);
         let client = file.rel != AGH_HTTP;
+        let child = file.rel != AGH_CHILD;
         let uses = use_statements(file);
         for line in file.shipped_lines() {
             let code = uses
                 .executable
                 .get(&line.no)
                 .map_or(line.code, String::as_str);
+            if child && let Some(needle) = names_a_spawn(code) {
+                out.push(file.finding(AGH_FX.id, line.no, spawns_outside(needle)));
+                continue;
+            }
             if doors && let Some((needle, what)) = first_hit(code, AGH_CLOCKS.iter(), |_| true) {
                 out.push(file.finding(
                     AGH_FX.id,
@@ -304,13 +328,50 @@ fn agh_fx(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         }
         for (no, stmt) in &uses.statements {
             let leaves = use_leaves(stmt);
-            if doors && let Some((needle, what)) = leaves.iter().find_map(agh_imported) {
+            if child && let Some(needle) = leaves.iter().find_map(imports_a_spawn) {
+                out.push(file.finding(AGH_FX.id, *no, spawns_outside(needle)));
+            } else if doors && let Some((needle, what)) = leaves.iter().find_map(agh_imported) {
                 out.push(file.finding(AGH_FX.id, *no, imported(needle, what)));
             } else if client && !names_http_client(stmt) && leaves.iter().any(renames_http) {
                 out.push(file.finding(AGH_FX.id, *no, HTTP_CLIENT.to_string()));
             }
         }
     }
+}
+
+fn spawns_outside(needle: &str) -> String {
+    format!("`{needle}`: spawns a child outside agh's child door (`{AGH_CHILD}`)")
+}
+
+/// The first of [`SPAWN_MODULES`]' needles and [`STD_SPAWNS`] `code` names, not inside a
+/// longer identifier (a needle that ends in `::` leads a path, so only its start is bounded).
+fn names_a_spawn(code: &str) -> Option<&'static str> {
+    let bytes = code.as_bytes();
+    let mut needles = SPAWN_MODULES
+        .iter()
+        .map(|(_, needle, _)| *needle)
+        .chain(STD_SPAWNS.iter().copied());
+    needles.find(|needle| {
+        hits(code, needle, Bound::Sub).any(|at| {
+            let starts = at == 0 || !is_word(bytes[at - 1]);
+            let ends =
+                needle.ends_with("::") || bytes.get(at + needle.len()).is_none_or(|&b| !is_word(b));
+            starts && ends
+        })
+    })
+}
+
+/// A `use` leaf that binds `std::process::Command`, or anything under one of
+/// [`SPAWN_MODULES`], the module itself and a glob of it included.
+fn imports_a_spawn(leaf: &UseLeaf<'_>) -> Option<&'static str> {
+    if leaf.path == ["std", "process", "Command"] && !leaf.glob {
+        return Some("std::process::Command");
+    }
+    SPAWN_MODULES.iter().find_map(|(module, _, named)| {
+        leaf.path
+            .starts_with(&["aterm_uds", *module])
+            .then_some(*named)
+    })
 }
 
 const HTTP_CLIENT: &str = "names aterm-http past `aterm_http::proxy` and `aterm_http::Error`: its \
@@ -673,6 +734,47 @@ mod tests {
                     "let e = aterm_http::Error::TooLarge;\n",
                 ),
                 ("crates/aterm-agent/src/supervise/fx.rs", clocks),
+            ],
+        );
+        assert_eq!(spots(&found), Vec::<String>::new());
+    }
+
+    const SPAWNS: &str = "use std::process::Command;\n\
+                          fn a() { let c = aterm_uds::spawnfd::command(\"git\"); }\n\
+                          fn b() { let c = Command::new(\"git\"); }\n\
+                          fn d(c: C, t: T) { let o = aterm_uds::deadline::output_until(c, t); }\n\
+                          fn e() { let p = aterm_uds::pspawn::spawn_cloexec_default(\"git\", &[]); }\n\
+                          fn f() { let c = aterm_uds::fixture_git::git(); }\n\
+                          use aterm_uds::pspawn::spawn_cloexec_default;\n\
+                          use aterm_uds::fixture_git;\n";
+
+    #[test]
+    fn a_spawn_in_agh_outside_its_child_door_is_found() {
+        let found = run(&AGH_FX, &[("crates/agh/src/x.rs", SPAWNS)]);
+        assert_eq!(
+            spots(&found),
+            [
+                "crates/agh/src/x.rs:1",
+                "crates/agh/src/x.rs:2",
+                "crates/agh/src/x.rs:3",
+                "crates/agh/src/x.rs:4",
+                "crates/agh/src/x.rs:5",
+                "crates/agh/src/x.rs:6",
+                "crates/agh/src/x.rs:7",
+                "crates/agh/src/x.rs:8"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_spawn_in_the_child_door_a_test_module_or_a_test_file_is_no_finding() {
+        let in_test_mod = format!("fn a() {{}}\n#[cfg(test)]\nmod tests {{\n{SPAWNS}}}\n");
+        let found = run(
+            &AGH_FX,
+            &[
+                ("crates/agh/src/fx/child.rs", SPAWNS),
+                ("crates/agh/src/x.rs", &in_test_mod),
+                ("crates/agh/tests/t.rs", SPAWNS),
             ],
         );
         assert_eq!(spots(&found), Vec::<String>::new());

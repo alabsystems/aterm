@@ -3,10 +3,13 @@
 
 //! Explicit Cargo caches created by aterm, at the caller's chosen location.
 //!
-//! A name or a Cargo tag is not ownership. A fresh private stage and durable identity receipt
-//! precede atomic target publication. Existing unrecorded targets stay unmanaged and keep
-//! their output paths. A producer requiring managed output refuses them. The index avoids
-//! searching the person's folders.
+//! A name or a cache tag is not ownership. A fresh private stage and durable identity receipt
+//! precede atomic target publication. An existing unrecorded target that proves cargo made it
+//! as its build directory (cargo's own tag, which cargo writes into a build directory only as
+//! it makes it, and the rustc facts a build keeps there) is recorded where it stands, its
+//! contents and identity kept (the `adoption` module); every other one stays unmanaged and
+//! keeps its output paths, and a producer requiring managed output refuses it.
+//! The index avoids searching the person's folders.
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +18,9 @@ pub mod package;
 
 #[path = "build_cache_create.rs"]
 mod creation;
+
+#[path = "build_cache_adopt.rs"]
+mod adoption;
 
 #[path = "build_cache_retain.rs"]
 pub(super) mod retention;
@@ -111,9 +117,14 @@ fn registry_stamp(home: &Path) -> Result<Option<IndexStamp>, String> {
 /// or unsupported receipt. Filesystem markers still require separate inspection.
 ///
 /// # Errors
-/// The index is uncertain, changes during the read, exceeds its bound, contains an invalid
-/// receipt, or any recorded custody overlaps the path.
+/// The path is relative, ambiguous or cannot be resolved; the index is uncertain, changes
+/// during the read, exceeds its bound, contains an invalid receipt, or any recorded custody
+/// overlaps the path.
 pub fn ordinary_clearance(home: &Path, path: &Path) -> Result<OrdinaryClearance, String> {
+    clearance(home, path, None)
+}
+
+fn resolve_clearance_path(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute()
         || path
             .components()
@@ -121,6 +132,44 @@ pub fn ordinary_clearance(home: &Path, path: &Path) -> Result<OrdinaryClearance,
     {
         return Err("ordinary cache assessment needs an absolute unambiguous path".into());
     }
+    let mut missing = Vec::new();
+    let mut cur = path;
+    loop {
+        match std::fs::symlink_metadata(cur) {
+            Ok(_) => {
+                let mut resolved = cur
+                    .canonicalize()
+                    .map_err(|_| "ordinary cache assessment path cannot be resolved".to_owned())?;
+                for name in missing.into_iter().rev() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = cur.file_name() else {
+                    return Err("ordinary cache assessment path cannot be resolved".into());
+                };
+                missing.push(name.to_os_string());
+                cur = cur.parent().ok_or_else(|| {
+                    "ordinary cache assessment path cannot be resolved".to_owned()
+                })?;
+            }
+            Err(_) => {
+                return Err("ordinary cache assessment path cannot be inspected".into());
+            }
+        }
+    }
+}
+
+/// [`ordinary_clearance`], the index's record named `except` left out of the overlap census:
+/// `path`'s own, which an adoption writes before its marker or replaces, and which its caller
+/// already holds to name `path`. Every other entry is read.
+fn clearance(
+    home: &Path,
+    path: &Path,
+    except: Option<&std::ffi::OsStr>,
+) -> Result<OrdinaryClearance, String> {
+    let path = resolve_clearance_path(path)?;
     let home = home
         .canonicalize()
         .map_err(|_| "registered-cache home cannot be resolved")?;
@@ -156,6 +205,9 @@ pub fn ordinary_clearance(home: &Path, path: &Path) -> Result<OrdinaryClearance,
             }
             let receipt = read(&record)
                 .ok_or("registered-cache index contains an unreadable or unsupported receipt")?;
+            if except.is_some_and(|own| own == entry.file_name()) {
+                continue;
+            }
             let held = std::iter::once(receipt.root.as_path())
                 .chain(
                     receipt
@@ -174,7 +226,7 @@ pub fn ordinary_clearance(home: &Path, path: &Path) -> Result<OrdinaryClearance,
                 if !scope(&home, held) {
                     return Err("registered-cache receipt has uncertain custody paths".into());
                 }
-                if path.starts_with(held) || held.starts_with(path) {
+                if path.starts_with(held) || held.starts_with(&path) {
                     return Err("registered-cache custody overlaps this path".into());
                 }
             }
@@ -656,23 +708,28 @@ fn already_recorded(home: &Path, root: &Path, workspace: &Path) -> bool {
 }
 
 /// A producer must not continue on a previously owned cache if it cannot be admitted.
-/// Unmanaged existing paths are a successful observation with `false`, never an adoption.
-/// A fresh staged creation and atomic publication are the only way to begin ownership;
-/// existing output never moves.
+/// Ownership begins by a fresh staged creation and atomic publication, or, for an existing
+/// target that proves cargo made it, unrecorded or recorded only for a folder no longer there,
+/// by recording it where it stands (the `adoption` module); existing output never moves. Any
+/// other unmanaged existing path is a successful observation with `false`.
 ///
 /// # Errors
 /// The registration gate was busy or an admitted cache's owner could not be published.
 #[cfg(unix)]
 pub fn create_checked(home: &Path, root: &Path, workspace: &Path) -> std::io::Result<bool> {
-    create_with_policy(home, root, workspace, None).map(|(recorded, _)| recorded)
+    create_with_policy(home, root, workspace, None, true).map(|(recorded, _)| recorded)
 }
 
+/// Admit `workspace`'s producer to the cache `root`, creating it when it is absent, and
+/// recording a cargo-made existing one where it stands when `adopt` ([`create_checked`]'s
+/// producers; a package target is only ever created fresh).
 #[cfg(unix)]
 fn create_with_policy(
     home: &Path,
     root: &Path,
     workspace: &Path,
     policy: Option<package::Policy>,
+    adopt: bool,
 ) -> std::io::Result<(bool, bool)> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut must_record = false;
@@ -779,10 +836,30 @@ fn create_with_policy(
                 creation::begin(home, &path, root, workspace, policy.clone())?
             }
             Ok(_) => {
-                let mut receipt = before.or_else(|| read(&path))?;
-                if receipt.root != root || !same(home, &receipt) {
-                    return None;
-                }
+                let mut receipt = match before.or_else(|| read(&path)) {
+                    Some(receipt) if receipt.root != root => return None,
+                    Some(receipt) if same(home, &receipt) => receipt,
+                    // Only an adoption puts its receipt on record before its marker binds it, and
+                    // an ordinary receipt of a folder no longer here binds nothing here.
+                    Some(receipt) if adopt && !declared => {
+                        let proven = adoption::proven(home, root, &path)?;
+                        if proven.resumes(&receipt) {
+                            must_record = true;
+                            adoption::finish(home, &receipt, &proven)?
+                        } else if proven.supersedes(&receipt) {
+                            must_record = true;
+                            adoption::begin(home, &path, workspace, &proven)?
+                        } else {
+                            return None;
+                        }
+                    }
+                    None if adopt && !declared => {
+                        let proven = adoption::proven(home, root, &path)?;
+                        must_record = true;
+                        adoption::begin(home, &path, workspace, &proven)?
+                    }
+                    Some(_) | None => return None,
+                };
                 if receipt.retained && policy.is_some() {
                     return None;
                 }
@@ -1222,7 +1299,8 @@ fn observe_on(
 /// An inherited directory can be resolved without granting its environment provenance:
 /// recompute this call's existing placement with only that variable hidden, stripping only
 /// a matching leading config value our producer can emit. Anything other than exact equality
-/// keeps the conservative unknown-owner path. Existing roots are still never adopted.
+/// keeps the conservative unknown-owner path. An existing root is admitted only as [`observe`]
+/// admits one typed with no inherited directory.
 fn equivalent_placement_args<'a>(
     args: &'a [String],
     tool: super::Tool,
@@ -1266,7 +1344,8 @@ fn equivalent_placement_args<'a>(
 
 /// Observe a real managed compiler invocation. This adds no flag and moves no output. The
 /// last explicit target overrides the environment; an explicit manifest owns the cache even
-/// when a launcher runs from another directory. Existing unknown caches remain unmanaged.
+/// when a launcher runs from another directory. An existing cache cargo did not make remains
+/// unmanaged (the `adoption` module).
 pub fn observe_command(
     args: &[String],
     tool: super::Tool,
@@ -2682,9 +2761,14 @@ mod tests {
     fn explicit_retirement_keeps_cargo_locks_and_unknown_or_live_processes_authoritative() {
         let world = World::new();
         world.build();
+        let deep = world
+            .target
+            .join("verify/.ubd/cells.noindex/linux/triple/debug");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join(".cargo-build-lock"), b"").unwrap();
         let clear = |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default());
         let held = crate::lock::Flock::try_lock(
-            std::fs::File::open(world.target.join("debug/.cargo-lock")).unwrap(),
+            std::fs::File::open(deep.join(".cargo-build-lock")).unwrap(),
         )
         .unwrap();
         assert!(
@@ -2725,6 +2809,20 @@ mod tests {
                 b"reusable output"
             );
         }
+        let removed = retire_on(
+            &world.home,
+            &world.target,
+            &mut |_, _| true,
+            &super::super::fence::Fence::new(&clear),
+        )
+        .unwrap();
+        assert!(
+            matches!(removed.as_slice(), [(root, super::super::Unused::Requested)] if root == &world.target)
+        );
+        assert!(
+            !world.target.exists(),
+            "the same deep inventory is reclaimable once clear"
+        );
     }
 
     #[test]
@@ -2897,6 +2995,43 @@ mod tests {
         assert!(ordinary_clearance(&world.home, &unrelated).is_err());
     }
 
+    /// SYMLINKED OR ALIASED ANCESTORS CANNOT BYPASS `ordinary_clearance`: resolving the deepest
+    /// existing ancestor of `path` catches a symlinked parent directory, a symlink naming the
+    /// registered target, a non-existent child reached through that symlink, and a dangling
+    /// symlink. NEGATIVE CONTROL: a real sibling directory outside the registered root still clears.
+    #[test]
+    fn ordinary_clearance_refuses_symlinked_ancestors_and_aliases_into_registered_custody() {
+        let world = World::new();
+        world.build();
+        let real_sibling = world.home.join("real-sibling.noindex");
+        assert!(ordinary_clearance(&world.home, &real_sibling).is_ok());
+
+        let parent_link = world.home.join("alias-home");
+        std::os::unix::fs::symlink(&world.home, &parent_link).unwrap();
+        let target_name = world.target.file_name().unwrap();
+        let aliased_target = parent_link.join(target_name);
+        let aliased_child = aliased_target.join("debug/deps/future-unit");
+        assert!(
+            ordinary_clearance(&world.home, &aliased_target).is_err(),
+            "registered target named through a symlinked ancestor must be refused"
+        );
+        assert!(
+            ordinary_clearance(&world.home, &aliased_child).is_err(),
+            "non-existent descendant reached through a symlinked ancestor must be refused"
+        );
+        assert!(
+            ordinary_clearance(&world.home, &parent_link).is_err(),
+            "symlinked directory whose target contains a registered root must be refused"
+        );
+
+        let dangling = world.home.join("dangling.noindex");
+        std::os::unix::fs::symlink(world.home.join("missing-target"), &dangling).unwrap();
+        assert!(
+            ordinary_clearance(&world.home, &dangling).is_err(),
+            "dangling symlink cannot receive ordinary clearance"
+        );
+    }
+
     #[test]
     fn an_unstarted_retirement_recovers_only_its_unchanged_empty_or_missing_stage() {
         #[derive(Clone, Copy, Debug)]
@@ -3007,7 +3142,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_creation_preserves_output_locations_and_never_adopts_an_existing_target() {
+    fn fresh_creation_preserves_output_locations_and_never_adopts_a_folder_cargo_did_not_make() {
         let world = World::new();
         world.build();
         assert!(world.target.join("debug/deps/keep").is_file());
@@ -4316,8 +4451,9 @@ mod tests {
         assert_eq!(std::fs::read(world.path()).unwrap(), recorded);
 
         // Model another producer by having Cargo itself recreate generated output and its
-        // standard tag, outside managed admission. Its tag grants no ownership, and the
-        // historical receipt must not acknowledge this unregistered replacement.
+        // standard tag, outside managed admission. The historical receipt binds nothing in
+        // this replacement; the next managed build adopts the folder Cargo made where it
+        // stands, as it adopts one never recorded, and keeps everything in it.
         let mut foreign = aterm_uds::spawnfd::command(driver);
         foreign
             .args(&build)
@@ -4339,9 +4475,12 @@ mod tests {
         assert!(!world.target.join(MARKER).exists());
         assert_eq!(std::fs::read(world.path()).unwrap(), recorded);
         std::fs::write(world.target.join("keep"), b"unknown replacement").unwrap();
-        let refused = through_clean_front(&world, Path::new("/bin/echo"), &build);
-        assert_eq!(refused.status.code(), Some(75), "{refused:?}");
-        assert!(!world.target.join(MARKER).exists());
+        let replacement = identity(&world.target).unwrap();
+        let adopted = through_clean_front(&world, Path::new("/bin/echo"), &build);
+        assert!(adopted.status.success(), "{adopted:?}");
+        let receipt = read(&world.path()).unwrap();
+        assert_eq!(receipt.identity, replacement);
+        assert!(same(&world.home, &receipt));
         assert_eq!(
             std::fs::read(world.target.join("CACHEDIR.TAG")).unwrap(),
             foreign_tag
@@ -4350,18 +4489,18 @@ mod tests {
             std::fs::read(world.target.join("keep")).unwrap(),
             b"unknown replacement"
         );
-        assert_eq!(std::fs::read(world.path()).unwrap(), recorded);
+        let recorded = std::fs::read(world.path()).unwrap();
         let out = through_clean_front(&world, driver, &["clean".into(), target]);
-        assert!(out.status.success(), "unregistered cleanup: {out:?}");
+        assert!(out.status.success(), "adopted cleanup: {out:?}");
         assert!(!world.target.exists());
         assert_eq!(std::fs::read(world.path()).unwrap(), recorded);
 
         let out = through_clean_front(&world, driver, &build);
         assert!(out.status.success(), "{out:?}");
         let after = read(&world.path()).unwrap();
-        assert_ne!(
-            after.nonce, before.nonce,
-            "a new creation, not the historical receipt"
+        assert!(
+            after.nonce != before.nonce && after.nonce != receipt.nonce,
+            "a new creation, not a historical receipt"
         );
         assert_eq!(after.identity, identity(&world.target).unwrap());
         assert_eq!(after.owners, [world.owner]);

@@ -60,6 +60,8 @@ pub enum PromptKind {
     McpServer,
     /// `Teach auto mode about your environment?` auto-mode setup offer.
     AutoModeSetup,
+    /// `Claude in Chrome` first-use intro, whose footer's Enter is its one input.
+    ChromeIntro,
     /// Unrecognized dialog box header.
     Other,
 }
@@ -94,6 +96,7 @@ impl PromptKind {
             PromptKind::AutocompactOffer => "autocompact-offer",
             PromptKind::McpServer => "mcp-server",
             PromptKind::AutoModeSetup => "auto-mode-setup",
+            PromptKind::ChromeIntro => "chrome-intro",
             PromptKind::Other => "other",
         }
     }
@@ -814,6 +817,18 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
         };
         return Some((v1, v2));
     }
+    // Claude Code's `Claude in Chrome` intro: no answers, so no reader below sees a box there.
+    // Read whole, or not at all.
+    if let Some(v2) = crate::chrome_intro::intro_box(rows) {
+        let v1 = Prompt {
+            kind: v2.kind,
+            command: v2.command.clone(),
+            description: v2.description.clone(),
+            notes: Vec::new(),
+            options: Vec::new(),
+        };
+        return Some((v1, v2));
+    }
     let rows = &*unwrapped(rows);
     let mut b = find_box(rows)?;
     let (title_end, title) = if b.head_off_screen || b.question.is_some() {
@@ -1521,8 +1536,9 @@ fn reads_as_prose(row: &str) -> bool {
 
 /// Returns the inclusive `(first_row, last_row)` span of the approval box on `rows`.
 pub fn prompt_box_span(rows: &[String]) -> Option<(usize, usize)> {
-    if let Some(offer) =
-        crate::autocompact::offer_box(rows).or_else(|| crate::auto_mode::offer_box(rows))
+    if let Some(offer) = crate::autocompact::offer_box(rows)
+        .or_else(|| crate::auto_mode::offer_box(rows))
+        .or_else(|| crate::chrome_intro::intro_box(rows))
     {
         return Some(offer.span);
     }
@@ -1539,8 +1555,9 @@ pub fn title_row<'a>(p: &PromptV2, rows: &'a [String]) -> Option<&'a str> {
 
 /// Returns the first screen row belonging to the approval box on `rows`.
 pub fn prompt_box_first_row(rows: &[String]) -> Option<usize> {
-    if let Some(offer) =
-        crate::autocompact::offer_box(rows).or_else(|| crate::auto_mode::offer_box(rows))
+    if let Some(offer) = crate::autocompact::offer_box(rows)
+        .or_else(|| crate::auto_mode::offer_box(rows))
+        .or_else(|| crate::chrome_intro::intro_box(rows))
     {
         return Some(offer.span.0);
     }
@@ -3132,6 +3149,8 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.301-idle-compacted.txt");
     pub const IDLE_COMPACTED_HINT_MEASURED: &str =
         include_str!("fixtures/claude-2.1.302-idle-compacted.txt");
+    pub const IDLE_COMPACTED_OVER_A_SHELL_2_1_312: &str =
+        include_str!("fixtures/claude-2.1.312-idle-compacted-over-a-shell.txt");
     pub const COMPACT_ERROR_500_MEASURED: &str =
         include_str!("fixtures/claude-2.1.286-compact-error-during-500.txt");
     pub const COMPACT_NOT_ENOUGH_MEASURED: &str =
@@ -4160,6 +4179,65 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen-17col.txt");
     pub const AUTO_MODE_SETUP_FULLSCREEN_16COL: &str =
         include_str!("fixtures/claude-2.1.310-auto-mode-setup-fullscreen-16col.txt");
+    /// The `Claude in Chrome` intro as the 2026-11-02 incident's worker drew it (124 columns).
+    pub const CHROME_INTRO: &str = include_str!("fixtures/claude-2.1.317-chrome-intro.txt");
+    // Measured in the real-Claude lab (crates/aterm-lab), 2026-11-03; each file's head says how.
+    /// The intro in the inline renderer, by pane width.
+    pub const CHROME_INTRO_INLINE: [(usize, &str); 5] = [
+        (
+            80,
+            include_str!("fixtures/claude-2.1.317-chrome-intro-80col.txt"),
+        ),
+        (
+            40,
+            include_str!("fixtures/claude-2.1.317-chrome-intro-40col.txt"),
+        ),
+        (
+            34,
+            include_str!("fixtures/claude-2.1.317-chrome-intro-34col.txt"),
+        ),
+        (
+            26,
+            include_str!("fixtures/claude-2.1.317-chrome-intro-26col.txt"),
+        ),
+        (
+            20,
+            include_str!("fixtures/claude-2.1.317-chrome-intro-20col.txt"),
+        ),
+    ];
+    /// The intro in the fullscreen renderer, drawn before the REPL as the inline one draws it.
+    pub const CHROME_INTRO_FULLSCREEN: [(usize, &str); 2] = [
+        (
+            80,
+            include_str!("fixtures/claude-2.1.317-chrome-intro-fullscreen-80col.txt"),
+        ),
+        (
+            40,
+            include_str!("fixtures/claude-2.1.317-chrome-intro-fullscreen-40col.txt"),
+        ),
+    ];
+    /// The intro once its extension check finds the extension.
+    pub const CHROME_INTRO_EXTENSION_FOUND: [(usize, &str); 2] = [
+        (
+            80,
+            include_str!("fixtures/claude-2.1.317-chrome-intro-extension-found-80col.txt"),
+        ),
+        (
+            34,
+            include_str!("fixtures/claude-2.1.317-chrome-intro-extension-found-34col.txt"),
+        ),
+    ];
+    /// The intro taller than its pane, its head scrolled off.
+    pub const CHROME_INTRO_HEAD_OFF: [(usize, &str); 2] = [
+        (
+            20,
+            include_str!("fixtures/claude-2.1.317-chrome-intro-20col-head-off.txt"),
+        ),
+        (
+            16,
+            include_str!("fixtures/claude-2.1.317-chrome-intro-16col-head-off.txt"),
+        ),
+    ];
     pub const MCP_SERVER_TWO: &str = include_str!("fixtures/claude-2.1.301-mcp-server-two.txt");
     pub const MCP_SERVER_NARROW: [&str; 24] = [
         include_str!("fixtures/claude-2.1.302-mcp-server-one-40col.txt"),

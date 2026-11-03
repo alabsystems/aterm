@@ -26,8 +26,10 @@ USAGE:
 
     start    Submit this build's keeper as a launchd job (`launchctl submit`:
              no plist; launchd restarts it whenever it exits, until `stop` or
-             logout) unless a job is loaded or a keeper answers. It runs
-             `serve --no-relaunch` and waits up to 10 s for it to answer.
+             logout) unless a job is loaded or a keeper answers, and wait up
+             to 10 s for it to answer. A window does the same at launch. The
+             installed app's job runs `serve`; any other build's and a test
+             label's `serve --no-relaunch`.
     stop     Remove the job, wait up to 60 s for its keeper to end (shells
              only it held hang up, as on a quit) and remove ended keepers'
              code copies.
@@ -53,13 +55,16 @@ OPTIONS (a verb ignores those its USAGE line leaves out):
     --no-relaunch        Never reopen a window; a crashed window's shells wait
                          for the next launch.
 
-macOS only. A window uses the keeper only with `[keeper] enabled = true` in
-aterm.toml (read at launch) and never starts one. Exit: 0 when this build's
+macOS only. Each window of an app bundle uses the keeper and starts it; turn
+that off with `[keeper] enabled = false` in aterm.toml (read at launch), then
+`stop` the one running. A bare build's window and a headless launch use one
+only under `[keeper] enabled = true`, and never start it. Exit: 0 when this build's
 keeper answers (start, status) or has ended (stop), 1 if not, 2 on bad usage.
 ";
 
 struct Args {
     verb: String,
+    help: bool,
     #[cfg_attr(not(unix), allow(dead_code))]
     sock: Option<PathBuf>,
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -73,13 +78,24 @@ struct Args {
 fn parse(args: &[OsString]) -> Result<Args, String> {
     let mut it = args.iter().map(|a| a.to_string_lossy().into_owned());
     let verb = it.next().ok_or_else(|| "missing verb".to_string())?;
+    if !matches!(verb.as_str(), "serve" | "status" | "start" | "stop") {
+        return Err(format!("unknown verb {verb:?}"));
+    }
+    let mut help = false;
     let mut sock = None;
     let mut identity = IdentityPolicy::Designated;
     let mut label = None;
     let mut no_relaunch = false;
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--sock" => sock = Some(PathBuf::from(it.next().ok_or("--sock needs a path")?)),
+            "-h" | "--help" => help = true,
+            "--sock" => {
+                sock = Some(PathBuf::from(
+                    it.next()
+                        .filter(|s| !s.is_empty())
+                        .ok_or("--sock needs a path")?,
+                ));
+            }
             "--identity" => {
                 identity = match it.next().as_deref() {
                     Some("designated") => IdentityPolicy::Designated,
@@ -97,6 +113,7 @@ fn parse(args: &[OsString]) -> Result<Args, String> {
     }
     Ok(Args {
         verb,
+        help,
         sock,
         identity,
         label,
@@ -124,11 +141,15 @@ pub fn main_entry(args: Vec<OsString>, version: &str) -> ExitCode {
             if first.is_none() { 2 } else { 0 },
         );
     }
+    let parsed = parse(&args);
+    if matches!(&parsed, Ok(p) if p.help) {
+        return aterm_uds::stdout::answer_exit("aterm keeper", USAGE, 0);
+    }
     if !cfg!(target_vendor = "apple") {
         eprintln!("{MACOS_ONLY}");
         return ExitCode::FAILURE;
     }
-    let parsed = match parse(&args) {
+    let parsed = match parsed {
         Ok(p) => p,
         Err(why) => {
             eprintln!("aterm keeper: {why}; run `aterm keeper --help`");
@@ -426,75 +447,122 @@ fn fresh_log(log: &std::path::Path) -> std::io::Result<()> {
         .map(drop)
 }
 
+/// The `serve` a job runs: it reopens the app after a crash only where `relaunch` says so.
+#[cfg(unix)]
+fn serve_argv<'a>(socket: &'a str, identity: &'a str, relaunch: bool) -> Vec<&'a str> {
+    let mut argv = vec!["keeper", "serve", "--sock", socket, "--identity", identity];
+    if !relaunch {
+        argv.push("--no-relaunch");
+    }
+    argv
+}
+
+/// Where [`ensure_job`] left the keeper.
+#[cfg(unix)]
+enum Ensured {
+    /// Nothing to submit: the line that says why, and whether a keeper of ours answers.
+    Settled(String, bool),
+    /// A job was submitted; its keeper has not answered yet.
+    Submitted {
+        socket: PathBuf,
+        log: PathBuf,
+        label: String,
+        own: Identity,
+    },
+}
+
+/// Submit this build's keeper job unless a job is loaded or a keeper answers. The installed app's
+/// own job reopens the app after a crash (under the brake); a dev build's or a test label's never
+/// does, so killing an instance on a desk brings nothing back.
+#[cfg(unix)]
+fn ensure_job(
+    label: String,
+    sock: Option<PathBuf>,
+    policy: IdentityPolicy,
+    version: &str,
+) -> Result<Ensured, String> {
+    let socket = sock
+        .or_else(default_socket)
+        .ok_or("no private directory for the socket")?;
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .ok_or("this executable's path cannot be read")?;
+    let job = crate::job::state(&label).map_err(|e| format!("launchctl: {e}"))?;
+    let own = Identity::for_self(policy)?;
+    let log = crate::job::log_path(&socket);
+    let answer = ask(&socket, &own, version);
+    let existing = log.exists().then_some(log.as_path());
+    let place = crate::job::own_place();
+    let own_place = label == place.label && default_socket().as_deref() == Some(socket.as_path());
+    if let Some((line, ok)) =
+        start_without_submit(&label, &socket, own_place, &job, &answer, existing)
+    {
+        return Ok(Ensured::Settled(line, ok));
+    }
+    fresh_log(&log).map_err(|e| format!("{}: {e}", log.display()))?;
+    let socket_arg = socket.to_string_lossy().into_owned();
+    let identity = match policy {
+        IdentityPolicy::Designated => "designated",
+        IdentityPolicy::SameUid => "uid",
+    };
+    let program = exe.to_string_lossy().into_owned();
+    let argv = serve_argv(&socket_arg, identity, own_place && place.installed);
+    crate::job::submit(&label, &program, &argv, &log).map_err(|e| e.to_string())?;
+    Ok(Ensured::Submitted {
+        socket,
+        log,
+        label,
+        own,
+    })
+}
+
+/// A window's start of this build's keeper (`label` is a test's): one submit at most and no wait,
+/// because the window's link registers its terminals once the keeper answers.
+///
+/// # Errors
+/// What kept the keeper from running: launchd or the code identity refusing, or a keeper at the
+/// socket that is not this build's.
+#[cfg(unix)]
+pub fn ensure_for_window(label: Option<String>, version: &str) -> Result<String, String> {
+    let label = label.unwrap_or_else(|| crate::job::own_place().label);
+    match ensure_job(label, None, IdentityPolicy::Designated, version)? {
+        Ensured::Settled(line, true) => Ok(line),
+        Ensured::Settled(line, false) => Err(line),
+        Ensured::Submitted { label, socket, .. } => Ok(format!(
+            "keeper=submitted label={label} socket={}",
+            socket.display()
+        )),
+    }
+}
+
 #[cfg(unix)]
 fn start(args: &Args, version: &str) -> ExitCode {
     let label = match chosen_label(args, "start") {
         Ok(label) => label,
         Err(code) => return code,
     };
-    let Some(socket) = args.sock.clone().or_else(default_socket) else {
-        eprintln!("aterm keeper start: no private directory for the socket");
-        return ExitCode::FAILURE;
-    };
-    let Some(exe) = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.canonicalize().ok())
-    else {
-        eprintln!("aterm keeper start: this executable's path cannot be read");
-        return ExitCode::FAILURE;
-    };
-    let job = match crate::job::state(&label) {
-        Ok(job) => job,
-        Err(e) => {
-            eprintln!("aterm keeper start: launchctl: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let own = match Identity::for_self(args.identity) {
-        Ok(i) => i,
-        Err(why) => {
-            eprintln!("aterm keeper start: {why}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let log = crate::job::log_path(&socket);
-    let answer = ask(&socket, &own, version);
-    let existing = log.exists().then_some(log.as_path());
-    let own_place = label == crate::job::own_place().label
-        && default_socket().as_deref() == Some(socket.as_path());
-    if let Some((line, ok)) =
-        start_without_submit(&label, &socket, own_place, &job, &answer, existing)
-    {
-        println!("{line}");
-        return if ok {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
+    let (socket, log, label, own) =
+        match ensure_job(label, args.sock.clone(), args.identity, version) {
+            Ok(Ensured::Settled(line, ok)) => {
+                println!("{line}");
+                return if ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                };
+            }
+            Ok(Ensured::Submitted {
+                socket,
+                log,
+                label,
+                own,
+            }) => (socket, log, label, own),
+            Err(why) => {
+                eprintln!("aterm keeper start: {why}");
+                return ExitCode::FAILURE;
+            }
         };
-    }
-    if let Err(e) = fresh_log(&log) {
-        eprintln!("aterm keeper start: {}: {e}", log.display());
-        return ExitCode::FAILURE;
-    }
-    let socket_arg = socket.to_string_lossy().into_owned();
-    let identity = match args.identity {
-        IdentityPolicy::Designated => "designated",
-        IdentityPolicy::SameUid => "uid",
-    };
-    let program = exe.to_string_lossy().into_owned();
-    let argv = [
-        "keeper",
-        "serve",
-        "--sock",
-        socket_arg.as_str(),
-        "--identity",
-        identity,
-        "--no-relaunch",
-    ];
-    if let Err(e) = crate::job::submit(&label, &program, &argv, &log) {
-        eprintln!("aterm keeper start: {e}");
-        return ExitCode::FAILURE;
-    }
     let started = std::time::Instant::now();
     while started.elapsed() < Duration::from_secs(10) {
         if ask(&socket, &own, version).is_ok() {
@@ -665,6 +733,42 @@ fn status(args: &Args, version: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_job_told_to_relaunch_may_reopen_the_app() {
+        assert_eq!(
+            serve_argv("/s", "designated", true),
+            [
+                "keeper",
+                "serve",
+                "--sock",
+                "/s",
+                "--identity",
+                "designated"
+            ]
+        );
+        assert_eq!(
+            serve_argv("/s", "uid", false),
+            [
+                "keeper",
+                "serve",
+                "--sock",
+                "/s",
+                "--identity",
+                "uid",
+                "--no-relaunch"
+            ]
+        );
+        let parsed = parse(
+            &serve_argv("/s", "uid", false)[1..]
+                .iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+        )
+        .expect("the verb reads its own argv");
+        assert!(parsed.no_relaunch);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -998,7 +1102,28 @@ mod tests {
             .iter()
             .map(OsString::from)
             .collect();
-        assert!(parse(&serve).expect("parse").no_relaunch);
+        let parsed_serve = parse(&serve).expect("parse");
+        assert!(parsed_serve.no_relaunch && !parsed_serve.help);
+
+        let help_after_verb: Vec<OsString> =
+            ["status", "--help"].iter().map(OsString::from).collect();
+        assert!(parse(&help_after_verb).expect("status --help").help);
+
+        let sock_help_value: Vec<OsString> = ["start", "--sock", "--help"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let parsed_sock = parse(&sock_help_value).expect("--sock consumes its value");
+        assert!(!parsed_sock.help);
+        assert_eq!(parsed_sock.sock, Some(PathBuf::from("--help")));
+
+        let empty_sock: Vec<OsString> =
+            ["start", "--sock", ""].iter().map(OsString::from).collect();
+        assert!(parse(&empty_sock).is_err());
+
+        let unknown_verb_help: Vec<OsString> =
+            ["bogus", "--help"].iter().map(OsString::from).collect();
+        assert!(parse(&unknown_verb_help).is_err());
     }
 
     #[cfg(unix)]

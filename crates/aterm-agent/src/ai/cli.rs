@@ -26,16 +26,19 @@ use super::store::Store;
 pub const USAGE: &str = "\
 aterm ai — this machine's AI CLIs (claude, codex, agy, muse, grok, kimi): health, sign-in, cross-AI reviews.
 
-  aterm ai [status] [--json]    one row per CLI, a health line naming what aterm fixes itself
+  aterm ai [status] [--json]    one row per CLI, a health line naming what aterm tries itself
                                 and a NEEDS YOU: line for a sign-in only a person makes (or
                                 what a person does first where one cannot start), read-only
-                                (exit 0)
+                                (exit 0); a CLI nobody asked for here (not preferred, not named
+                                in [ai], never used here) is a note with its fix, nothing more
   aterm ai doctor [--read-only] [--json] [--on <host>[:/abs/aterm],\u{2026} | --fleet]
-                                the same with fixes (not with --read-only or --json): aterm's
-                                own, at a terminal or none and under an agent too (installs,
-                                and sign-ins through accounts v2's or a pool's renewal), and a
-                                CLI's own sign-in only for a person at a terminal; exit 1 while
-                                one is signed out or not installed; --on / --fleet ([harness]
+                                the same with fixes tried (not with --read-only or --json):
+                                aterm's own, at a terminal or none and under an agent too
+                                (installs, and sign-ins through accounts v2's or a pool's
+                                renewal), and a CLI's own sign-in only for a person at a
+                                terminal; exit 1
+                                while one someone asked for is signed out or not installed;
+                                --on / --fleet ([harness]
                                 hosts): those machines too, over ssh, for a person at a terminal
                                 (else, or with --read-only or --json, a read of each machine
                                 that fixes nothing, this one included)
@@ -319,7 +322,14 @@ pub fn look(env: &Env) -> Look {
     }
     let mut rows: Vec<Row> = facts
         .iter()
-        .map(|f| state::assess(f, settings.wants(f.connector.id), env.now))
+        .map(|f| {
+            let row = state::assess(f, settings.wants(f.connector.id), env.now);
+            if state::asked(f, &settings) {
+                row
+            } else {
+                row.not_asked()
+            }
+        })
         .collect();
     let preferred = settings.preferred.0.id;
     rows.sort_by_key(|r| r.connector.id != preferred);
@@ -407,7 +417,7 @@ fn render_look(out: &mut dyn Write, look: &Look, fixes: bool, next: &str, needs_
             pad(row.state.word(), STATE_W)
         );
         if fixes
-            && row.mark >= Mark::Warn
+            && (row.mark >= Mark::Warn || row.state.needs_act(row.wanted))
             && let Some(fix) = row.fix.as_ref().or(row.mend.as_ref())
         {
             let _ = writeln!(out, "{}fix: {fix}", " ".repeat(LABEL_W));
@@ -568,6 +578,7 @@ pub fn render_json(look: &Look, now: i64, next: &str) -> String {
         o.insert("renew_by_rfc3339".to_string(), rfc(row.renew_by));
         o.insert("limited_until".to_string(), opt_int(row.limited_until));
         o.insert("limited_until_rfc3339".to_string(), rfc(row.limited_until));
+        o.insert("asked".to_string(), Value::Bool(row.asked));
         o.insert("fact".to_string(), Value::from(row.fact.as_str()));
         o.insert("fix".to_string(), text(&row.fix));
         o.insert("mend".to_string(), text(&row.mend));
@@ -769,16 +780,29 @@ fn done_line_of(id: &str, done: &Done) -> String {
 }
 
 /// The health line's next act over `look`'s rows ([`state::Health::next`]): what `aterm ai
-/// doctor` fixes itself, then the sign-ins only a person makes.
+/// doctor` tries itself, then the sign-ins only a person makes.
 fn next_act(look: &Look) -> String {
+    next_act_after(look, &[])
+}
+
+/// [`next_act`] after a doctor's run that tried `tried` itself ([`state::Health::next_after`]).
+fn next_act_after(look: &Look, tried: &[&str]) -> String {
     state::health(&look.rows)
-        .next()
+        .next_after(tried)
         .unwrap_or_else(|| "aterm ai doctor".to_string())
 }
 
+/// `aterm pkg install <id>` on this terminal, one step of `aterm ai doctor`'s or `aterm ai
+/// login`'s own work: [`atpkg::cli::NO_INIT_FLAG`] says no setup follows it, since the
+/// command that runs it decides what comes next (the sign-in, the next CLI).
 fn install(env: &Env, runner: &dyn Runner, id: &str) -> Result<(), String> {
     let exe = env.exe.clone().ok_or("this program's path is unknown")?;
-    let args = vec!["pkg".to_string(), "install".to_string(), id.to_string()];
+    let args = vec![
+        "pkg".to_string(),
+        "install".to_string(),
+        id.to_string(),
+        atpkg::cli::NO_INIT_FLAG.to_string(),
+    ];
     match runner.terminal(&exe, &args, &env.vars, None) {
         Ok(0) => Ok(()),
         Ok(code) => Err(format!("`aterm pkg install {id}` exited {code}")),
@@ -789,7 +813,9 @@ fn install(env: &Env, runner: &dyn Runner, id: &str) -> Result<(), String> {
 /// `aterm ai doctor` here: the look, then each fix it may make ([`may_fix`]): aterm's own
 /// (installs, and sign-ins through accounts v2's or a pool's ladder) at any run but
 /// `--read-only`'s or `--json`'s, under an agent and with no terminal too; a person's only where
-/// one is at this terminal, else said and not started. The look again after.
+/// one is at this terminal, else said and not started; and for a CLI nobody asked for
+/// ([`state::asked`]) a person's sign-in is said, never started, even with a person here. The look again after, which names what
+/// this run tried and did not finish rather than offering the same run again.
 fn doctor_here(
     env: &Env,
     runner: &dyn Runner,
@@ -839,6 +865,20 @@ fn doctor_here(
             })
         })
     };
+    // A sign-in only a person makes, of a CLI nobody asked for: on demand, by `aterm ai login`,
+    // whoever runs this. A bare doctor asks no one to approve a CLI nobody wanted.
+    let unasked = |row: &Row, out: &mut dyn Write| {
+        let hold = !row.asked && row.actor == Some(Actor::Person);
+        if hold {
+            let id = row.connector.id;
+            let _ = writeln!(
+                out,
+                "{id}: not started: nobody has asked for it here (`aterm ai login {id}` signs it in)"
+            );
+        }
+        hold
+    };
+    let mut tried: Vec<&'static str> = Vec::new();
     for i in needs {
         let row = &first.rows[i];
         let Some(f) = first
@@ -850,6 +890,7 @@ fn doctor_here(
         };
         let _ = writeln!(out, "\n── {} ──", row.connector.product);
         let _ = out.flush();
+        tried.push(row.connector.id);
         if matches!(row.state, State::NotInstalled) {
             if let Err(why) = install(env, runner, row.connector.id) {
                 let _ = writeln!(out, "{}: not installed: {why}", row.connector.id);
@@ -869,12 +910,18 @@ fn doctor_here(
                 continue;
             };
             if r.state.needs_act(r.wanted) {
+                if unasked(r, out) {
+                    continue;
+                }
                 let done =
                     held(f, r).unwrap_or_else(|| sign_in_one(env, runner, &store, f, r, out));
                 let _ = writeln!(out, "{}", done_line(f.connector, &done));
             } else {
                 let _ = writeln!(out, "{}: installed ({})", r.connector.id, r.fact);
             }
+            continue;
+        }
+        if unasked(row, out) {
             continue;
         }
         let done = held(f, row).unwrap_or_else(|| sign_in_one(env, runner, &store, f, row, out));
@@ -886,7 +933,7 @@ fn doctor_here(
     };
     let last = look(&after);
     let _ = writeln!(out);
-    render_text(out, &last, true, &next_act(&last));
+    render_text(out, &last, true, &next_act_after(&last, &tried));
     exit_of(&last.rows)
 }
 
@@ -947,6 +994,22 @@ fn remote_states(json: &str) -> Option<Vec<(String, String)>> {
     Some(out)
 }
 
+/// The CLIs a machine's `ai doctor --json` says someone asked for there ([`state::asked`]).
+fn remote_asked(json: &str) -> Vec<String> {
+    let v: Option<Value> = aterm_json::from_str(json).ok();
+    v.as_ref()
+        .and_then(|v| v.get("clis"))
+        .and_then(Value::as_array)
+        .map(|clis| {
+            clis.iter()
+                .filter(|cli| cli.get("asked").and_then(Value::as_bool) == Some(true))
+                .filter_map(|cli| cli.get("id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 type States = Vec<(String, String)>;
 
 const WORKING: &[&str] = &["ok", "idle", "limited", "due"];
@@ -970,6 +1033,12 @@ fn fleet_poll(
                 .collect(),
         ),
     )];
+    let mut asked: Vec<String> = here_look
+        .rows
+        .iter()
+        .filter(|r| r.asked)
+        .map(|r| r.connector.id.to_string())
+        .collect();
     for (host, aterm) in hosts {
         let args: Vec<String> = [
             "-T",
@@ -996,10 +1065,9 @@ fn fleet_poll(
             cwd: None,
             budget: Duration::from_secs(30),
         });
-        let states = ran
-            .ok()
-            .filter(|r| r.stdout.len() <= 64 * 1024)
-            .and_then(|r| remote_states(&r.stdout));
+        let answer = ran.ok().filter(|r| r.stdout.len() <= 64 * 1024);
+        asked.extend(answer.iter().flat_map(|r| remote_asked(&r.stdout)));
+        let states = answer.and_then(|r| remote_states(&r.stdout));
         machines.push((host.clone(), states));
     }
     let mut cover: Vec<(&'static str, usize, usize)> =
@@ -1018,7 +1086,7 @@ fn fleet_poll(
     }
     let none: Vec<&str> = cover
         .iter()
-        .filter(|(_, ok, of)| *of > 0 && *ok == 0)
+        .filter(|(id, ok, of)| *of > 0 && *ok == 0 && asked.iter().any(|a| a == id))
         .map(|(id, _, _)| *id)
         .collect();
     if json {

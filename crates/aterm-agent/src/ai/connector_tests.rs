@@ -530,6 +530,14 @@ fn a_login_file_is_where_a_connector_row_keeps_its_login() {
         ("~/.Codex/Auth.json", CODEX.product),
         ("~/.codex/auth.json.refreshed", CODEX.product),
         ("~/.kimi-code/credentials/kimi-code.json", KIMI.product),
+        (
+            "~/.kimi-code/credentials/kimi-code-env-0e4f99c69cc27850.json",
+            KIMI.product,
+        ),
+        (
+            "~/.kimi-code/credentials/kimi-code-env-0e4f99c69cc27850.json.refreshed",
+            KIMI.product,
+        ),
         ("~/.aterm/logins/grok/work/auth.json", GROK.product),
     ] {
         assert_eq!(login_file(name), Some(product), "{name}");
@@ -538,8 +546,36 @@ fn a_login_file_is_where_a_connector_row_keeps_its_login() {
         "~/.codex/config.toml",
         "~/.config/muse/settings.json",
         "~/.aterm/logins/codex",
+        "~/kimi-code-env-0e4f99c69cc27850.json",
+        "~/.codex/kimi-code-env-0e4f99c69cc27850.json",
         "auth.json",
     ] {
         assert_eq!(login_file(name), None, "{name}");
     }
+}
+
+#[test]
+fn kimi_environment_scoped_credentials_are_found_without_reading_them() {
+    let dir = aterm_tempfile::tempdir().expect("scratch Kimi home");
+    let home = dir.path();
+    let credentials = home.join("credentials");
+    std::fs::create_dir_all(&credentials).expect("credentials directory");
+    assert_eq!(stored_login_file(&KIMI, home), None);
+
+    for name in [
+        "kimi-code-env-not-hex.json",
+        "kimi-code-env-0e4f99c69cc27850.json.backup",
+        "kimi-code.json.backup",
+    ] {
+        std::fs::write(credentials.join(name), "not a credential").expect("negative fixture");
+        assert_eq!(stored_login_file(&KIMI, home), None, "{name}");
+    }
+
+    let scoped = credentials.join("kimi-code-env-0e4f99c69cc27850.json");
+    std::fs::write(&scoped, "opaque").expect("scoped credential");
+    assert_eq!(stored_login_file(&KIMI, home), Some(scoped));
+
+    let literal = credentials.join("kimi-code.json");
+    std::fs::write(&literal, "opaque").expect("literal credential");
+    assert_eq!(stored_login_file(&KIMI, home), Some(literal));
 }

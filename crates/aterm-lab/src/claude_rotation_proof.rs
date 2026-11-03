@@ -84,8 +84,8 @@ pub const EMAIL_A: &str = "nobody-a@example.test";
 pub const EMAIL_B: &str = "nobody-b@example.test";
 /// [`LABEL_C`]'s email.
 pub const EMAIL_C: &str = "nobody-c@example.test";
-/// The machine the fleet file lists the rows for (a sync finds it by the default login's
-/// address, so no `[fleet] machine` is written).
+/// The machine the fleet file lists the rows for, which the instance's `[fleet] machine` names
+/// ([`instance_toml`]): a sync never takes a machine from a login's address.
 pub const MACHINE: &str = "m9";
 /// The stub's label of [`LABEL_A`]'s credential ([`crate::stub::auth_label`]).
 pub const AUTH_A: &str = "oat:lab-a";
@@ -1897,6 +1897,52 @@ pub fn fleet_text() -> String {
     out
 }
 
+/// The instance's `aterm.toml` beside `lab` (`LAB_ATERM_TOML`): a `[fleet]` table whose
+/// `machine` is [`MACHINE`], which tells a sync which of the fleet file's machines this is (a
+/// sync never takes one from a login's address). Refused where `lab` has a `[fleet]` of its own,
+/// which would make the two tables no TOML document at all, or an `[ai] machine`, which a sync
+/// reads before `[fleet]`'s. What else the lab composes around it is judged on the file the
+/// instance reads ([`names_its_machine`]).
+///
+/// # Errors
+/// `lab` is no TOML document, or it has a `fleet` table or an `ai.machine`.
+pub fn instance_toml(lab: &str) -> Result<String, String> {
+    let doc = aterm_toml::from_str::<aterm_toml::Value>(lab)
+        .map_err(|e| format!("LAB_ATERM_TOML is no TOML document ({e})"))?;
+    if doc.get("fleet").is_some() || doc.get("ai").and_then(|ai| ai.get("machine")).is_some() {
+        return Err(format!(
+            "takes no LAB_ATERM_TOML with a [fleet] table or an [ai] machine: the proof's own \
+             [fleet] names its machine {MACHINE}"
+        ));
+    }
+    Ok(format!("{lab}\n[fleet]\nmachine = \"{MACHINE}\"\n"))
+}
+
+/// `None` where a sync reads the instance's `aterm.toml` at `config` as [`MACHINE`]; else what
+/// it reads instead. A file that does not parse (a `LAB_ATERM_TOML` table the lab names too)
+/// leaves the instance on defaults (updates and packages on) and gives a sync no config machine,
+/// so it falls back to this host's names: the file is judged a TOML document first, which a
+/// host named m9 would otherwise pass.
+#[must_use]
+pub fn names_its_machine(config: &Path) -> Option<String> {
+    let text = match fs::read_to_string(config) {
+        Ok(text) => text,
+        Err(e) => return Some(format!("unreadable ({e})")),
+    };
+    if let Err(e) = aterm_toml::from_str::<aterm_toml::Table>(&text) {
+        return Some(format!(
+            "no TOML document, so a sync reads no machine from it ({e})"
+        ));
+    }
+    match aterm_agent::harness::accounts_sync::detect_machine_id(None, Some(config)) {
+        Some(machine) if machine == MACHINE => None,
+        found => Some(format!(
+            "a sync reads it as machine {}, not {MACHINE}",
+            found.as_deref().unwrap_or("none")
+        )),
+    }
+}
+
 /// The headers each credential's answers carry: its five-hour figure `five` and the week's
 /// baseline, the windows resetting 2 h and 5 days ahead, all allowed.
 fn usage_blocks(five: &str) -> J {
@@ -2946,7 +2992,10 @@ pub fn cmd_claude_rotation_proof(args: &[String]) -> Res {
         from_env.instance_env,
         aterm_agent::harness::accounts_sync::UPKEEP_SEAM
     );
+    let aterm_toml = instance_toml(&from_env.aterm_toml)
+        .map_err(|e| Fail::usage(format!("claude-rotation-proof: {e}")))?;
     let o = UpOpts {
+        aterm_toml,
         trust: true,
         lifeline: !keep,
         instance_env: instance_env.trim().to_string(),
@@ -2988,6 +3037,9 @@ pub fn cmd_claude_rotation_proof(args: &[String]) -> Res {
     };
     let (mut watcher, mut claudes) = (None, None);
     let ran = world.and_then(|world| {
+        if let Some(why) = names_its_machine(&config) {
+            return Err(die(&config.display().to_string(), why));
+        }
         lay_world(&run, &world)?;
         watcher = Some(Watcher::start(&run));
         claudes = Some(ClaudeWatch::start(&run));

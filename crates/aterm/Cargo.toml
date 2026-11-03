@@ -63,7 +63,7 @@ aterm-pty = { workspace = true }
 # already in the graph through aterm-gui.
 aterm-types = { workspace = true }
 aterm-agent = { path = "../aterm-agent" } # `aterm fleet` / `aterm drive`
-# `aterm keeper start|stop|status|serve` — the PTY keeper (opt-in).
+# `aterm keeper start|stop|status|serve` — the PTY keeper.
 aterm-keeper = { path = "../aterm-keeper" }
 # `aterm acaffiene` — the menu-bar keep-awake mug, which every ordinary window keeps running
 # unless the person turned it off; the converge pass keeps it with no window too.
@@ -183,6 +183,11 @@ aterm-aos-pane = { workspace = true }
 [target.'cfg(unix)'.dev-dependencies]
 astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap"] }
 astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
+# The direct fleet mail suite (`tests/fleet_live_headless.rs`) writes and reads a session's
+# sealed mailbox as a handoff peer, through its own transaction. Both already in the graph
+# through aterm-gui.
+aterm-gui-fabric = { workspace = true }
+aterm-session = { workspace = true }
 
 [build-dependencies]
 # Windows only: compiles and links the icon, the side-by-side manifest and VS_VERSION_INFO into

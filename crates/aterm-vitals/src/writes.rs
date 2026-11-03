@@ -45,7 +45,8 @@ impl ProgramHour {
     /// ([`crate::model::RowFacts::writes_covered_s`]); `None` under [`MIN_COVERED_S`].
     #[must_use]
     pub fn per_hour(&self, covered_s: f64) -> Option<f64> {
-        (covered_s >= MIN_COVERED_S).then(|| self.bytes as f64 * 3600.0 / covered_s)
+        (covered_s.is_finite() && covered_s >= MIN_COVERED_S)
+            .then(|| self.bytes as f64 * 3600.0 / covered_s)
     }
 }
 
@@ -107,6 +108,7 @@ impl WriteHour {
     /// out of the hour goes, and a program with nothing left in it with it.
     pub fn at(&mut self, at_unix_ms: i64) -> i64 {
         let k = at_unix_ms.div_euclid(SLOT_MS);
+        let mut clamped_back = false;
         let open = match self.open_k {
             None => k,
             Some(open) if k > open => k,
@@ -126,9 +128,14 @@ impl WriteHour {
                 }
                 k
             }
-            Some(open) => open,
+            Some(open) => {
+                clamped_back = at_unix_ms < self.last_ms;
+                open
+            }
         };
-        self.last_ms = at_unix_ms;
+        if !clamped_back {
+            self.last_ms = at_unix_ms;
+        }
         if self.open_k != Some(open) {
             self.open_k = Some(open);
             let oldest = open - (HOUR_SLOTS - 1);
@@ -619,6 +626,38 @@ mod tests {
         assert_eq!(
             kept.iter().filter(|p| p.1 == ProcScope::Tab(3)).count(),
             TOP_WRITERS
+        );
+    }
+
+    /// NEGATIVE CONTROL: non-finite `covered_s` yields `None`, and repeated sub-clamp backward
+    /// steps eventually cross `CLAMP_BACK_S` relative to the open slot's newest timestamp.
+    #[test]
+    fn per_hour_rejects_infinite_coverage_and_repeated_backsteps_shift_the_hour() {
+        let row = ProgramHour {
+            name: "rustc".to_owned(),
+            scope: ProcScope::Aterm,
+            bytes: 3_600,
+            n_max: 1,
+        };
+        assert_eq!(row.per_hour(f64::INFINITY), None);
+        assert_eq!(row.per_hour(f64::NAN), None);
+        assert_eq!(row.per_hour(3_600.0), Some(3_600.0));
+
+        let mut h = WriteHour::new();
+        assert_eq!(
+            h.at(T0 + 2 * SLOT_MS),
+            (T0 + 2 * SLOT_MS).div_euclid(SLOT_MS)
+        );
+        // First 40 s step back is within CLAMP_BACK_S (60 s), so it clamps to open_k.
+        assert_eq!(
+            h.at(T0 + 2 * SLOT_MS - 40_000),
+            (T0 + 2 * SLOT_MS).div_euclid(SLOT_MS)
+        );
+        // A second 40 s step back sits 80 s behind the open slot's newest reading (> CLAMP_BACK_S),
+        // so it shifts the hour backward instead of staying pinned.
+        assert_eq!(
+            h.at(T0 + 2 * SLOT_MS - 80_000),
+            (T0 + 2 * SLOT_MS - 80_000).div_euclid(SLOT_MS)
         );
     }
 }

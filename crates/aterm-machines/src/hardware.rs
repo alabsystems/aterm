@@ -6,6 +6,28 @@
 use crate::model::HostFacts;
 use crate::port::Cmd;
 
+/// Extracts the string value of `"<key>" = "<value>"` in `ioreg` output.
+#[must_use]
+pub fn ioreg_value(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\" = \"");
+    text.lines().find_map(|line| {
+        let rest = line.trim_start().strip_prefix(&needle)?;
+        let value = rest.strip_suffix('"')?;
+        (!value.is_empty() && !value.contains('"')).then(|| value.to_owned())
+    })
+}
+
+/// Whether `s` has an IOPlatformUUID's shape: `8-4-4-4-12` hex digits.
+#[must_use]
+pub fn uuid_shaped(s: &str) -> bool {
+    let groups: Vec<&str> = s.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(g, n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// The placeholder the agent fills with [`describe`] (in a Local hostname, label form).
 pub const PLACEHOLDER: &str = "{hardware}";
 

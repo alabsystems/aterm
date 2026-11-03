@@ -420,6 +420,107 @@ fn a_guard_that_finds_the_state_ends_the_loop() {
     assert_eq!(methods(&fake), vec!["PATCH /repos/fixture-dev/app"]);
 }
 
+/// An error after a retry says at least what the earlier attempts may have done: a 502 may
+/// have landed, so a later 422, or a later guard read that fails, is not `none`; the control,
+/// a first-attempt 422, is.
+#[test]
+fn an_error_after_a_retry_keeps_the_strongest_side_effect() {
+    let root = scratch();
+    let fake = fake();
+    let gh = github(canonical(root.path()), &fake);
+    let permit = permit_for(&gh, &app_write());
+    fake.fault(
+        patches(),
+        answer(422, "{\"message\":\"Validation Failed\"}"),
+    );
+    let control = gh
+        .call_write_guarded(&patch(), &permit, &How::write(), &mut |_| Ok(None))
+        .expect_err("a 422");
+    assert_eq!(control.side_effect, SideEffect::None, "{control:?}");
+    fake.fault(patches(), answer(502, "{}"));
+    fake.fault(
+        patches(),
+        answer(422, "{\"message\":\"Validation Failed\"}"),
+    );
+    let refused = gh
+        .call_write_guarded(&patch(), &permit, &How::write(), &mut |_| Ok(None))
+        .expect_err("the second attempt's 422");
+    assert_eq!(refused.side_effect, SideEffect::Unknown, "{refused:?}");
+    fake.fault(patches(), answer(502, "{}"));
+    let guarded = gh
+        .call_write_guarded(&patch(), &permit, &How::write(), &mut |attempt| {
+            if attempt > 1 {
+                return Err(Error::could_not_run("the guard's read failed"));
+            }
+            Ok(None)
+        })
+        .expect_err("the second guard fails");
+    assert_eq!(guarded.side_effect, SideEffect::Unknown, "{guarded:?}");
+}
+
+/// A replay that diverges at the retry's sleep, after a 502 that may have landed, says that
+/// the write may have landed: the sleep's error is made at least the earlier attempt's.
+#[test]
+fn a_replay_that_diverges_at_the_retrys_sleep_keeps_the_side_effect() {
+    use crate::fx::tape::{TapeHeader, TapeMode};
+    use crate::fx::{DOOR_SLEEP, read_tape};
+    use astream_effects::EffectRecord;
+
+    let root = scratch();
+    let fake = fake();
+    let tape = root.path().join("t.atape");
+    let argv: Vec<String> = ["api", "-X", "PATCH", "repos/fixture-dev/app"]
+        .map(String::from)
+        .to_vec();
+    let header = TapeHeader {
+        mode: TapeMode::Credentialed,
+        ..TapeHeader::for_run(&argv, &endpoints(&fake))
+    };
+    let policy = RetryPolicy {
+        attempts: 2,
+        pauses: [Duration::from_millis(1); 2],
+        max_secondary_wait: Duration::ZERO,
+    };
+    let recording = Fx::record_with(&tape, &header, crate::redact::Redactor::new())
+        .expect("a recording")
+        .with_endpoints(&endpoints(&fake));
+    let gh = builder(
+        canonical(root.path()),
+        Arc::new(HttpTransport::direct(Arc::new(MapEnv::new()))),
+        endpoints(&fake),
+    )
+    .fx(Arc::new(recording))
+    .retry(policy)
+    .build();
+    let permit = permit_for(&gh, &app_write());
+    fake.fault(patches(), answer(502, "{}"));
+    fake.fault(patches(), answer(200, "{}"));
+    gh.call_write_guarded(&patch(), &permit, &How::write(), &mut |_| Ok(None))
+        .expect("the retry answers");
+    gh.fx().finish(0).expect("the tape is whole");
+
+    let (header, mut records) = read_tape(&tape).expect("the tape reads");
+    let sleep = records
+        .iter()
+        .position(|r| matches!(r, EffectRecord::Exchange { door, .. } if door == DOOR_SLEEP))
+        .expect("the retry's sleep is taped");
+    records.remove(sleep);
+    let replay = builder(
+        Router::empty(),
+        Arc::new(ScriptedTransport::new()),
+        endpoints(&fake),
+    )
+    .fx(Arc::new(Fx::replay_from(&header, records)))
+    .retry(policy)
+    .build();
+    let permit = permit_for(&replay, &app_write());
+    let error = replay
+        .call_write_guarded(&patch(), &permit, &How::write(), &mut |_| Ok(None))
+        .expect_err("the replay diverges at the sleep");
+    assert!(matches!(error.sub, Sub::Replay(_)), "{error:?}");
+    assert_eq!(error.side_effect, SideEffect::Unknown, "{error:?}");
+}
+
 #[test]
 fn a_401_gets_one_attempt() {
     let root = scratch();
@@ -677,12 +778,11 @@ fn a_502_whose_why_holds_a_token_settles_unknown_without_it() {
     assert!(!why.contains(&token), "the journal's why holds the token");
 }
 
-/// A recording whose tape cannot hold the write sends nothing, and its intent settles
-/// `NeverSent`. Until WP10's credentialed recording (§14) lands, `Fx::gh` refuses a
-/// write with a body before it leaves; WP10 turns this case into §7's recorded one-shot,
-/// whose answer the tape refuses after GitHub may have applied it, settled `Unknown`.
+/// A recorded one-shot whose answer the tape refuses (a loopback fake that echoes a token
+/// shape) settles `Unknown` (§7, §4.6.5 item 8): the credentialed recording (§14) sent the
+/// write, so GitHub may have applied it, and the tape could not hold what it answered.
 #[test]
-fn a_recording_that_cannot_hold_a_write_sends_nothing() {
+fn a_recorded_one_shot_whose_answer_the_tape_refuses_settles_unknown() {
     use crate::fx::tape::{TapeHeader, TapeMode};
 
     let root = scratch();
@@ -716,17 +816,25 @@ fn a_recording_that_cannot_hold_a_write_sends_nothing() {
     let outcome = gh
         .one_shot(&call, &permit, &draft, &intents, &created_of)
         .expect("an outcome");
-    let Outcome::NeverSent(error) = &outcome else {
-        panic!("a write the tape cannot hold is never sent: {outcome:?}");
+    let Outcome::Unknown { error, .. } = &outcome else {
+        panic!("a sent write whose answer the tape refuses is unknown: {outcome:?}");
     };
     assert_eq!(
         error.sub.slug().as_deref(),
-        Some("replay.stream_not_taped"),
+        Some("replay.body_not_taped"),
         "{error:?}"
     );
-    assert_eq!(intents.settled(), vec![Some(Settled::NeverSent)]);
-    assert!(
-        !methods(&fake).iter().any(|m| m.starts_with("POST")),
+    let settled = intents.settled();
+    let [Some(Settled::Unknown { why })] = settled.as_slice() else {
+        panic!("one Unknown settle: {settled:?}");
+    };
+    assert!(!why.contains(&token), "the journal's why holds the token");
+    assert_eq!(
+        methods(&fake)
+            .iter()
+            .filter(|m| m.starts_with("POST"))
+            .count(),
+        1,
         "{:?}",
         methods(&fake)
     );

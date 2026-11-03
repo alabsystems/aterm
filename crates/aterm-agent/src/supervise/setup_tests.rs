@@ -24,6 +24,7 @@ fn every_field_moved(dir: &Path) -> SessionSetup {
         types_under_hand: true,
         builtin_duties: true,
         confirms_agent: true,
+        host_awake: true,
         ledger_path: Some(dir.join("drive").join("s-odd.jsonl")),
         approval_env: ApprovalEnv {
             home: Some(dir.join("home")),
@@ -119,11 +120,13 @@ fn every_field_of_the_setup_comes_back_from_the_header() {
     );
 
     let shipped = SessionSetup::new(None);
-    // The private adapter's opt-ins and a scaled reset minute round-trip above, but their shipped
-    // values are deliberately omitted so pre-existing setup bytes stay unchanged.
+    // The private adapter's opt-ins, a test instance's awake host and a scaled reset minute
+    // round-trip above, but their shipped values are deliberately omitted so pre-existing setup
+    // bytes stay unchanged.
     let omitted = [
         "builtin_duties=",
         "confirms_agent=",
+        "host_awake=",
         "turn_end.reset_minute=",
     ];
     let ours: Vec<_> = setup_lines(&text)
@@ -194,6 +197,23 @@ fn the_setters_write_the_setup() {
     let mut ctl2 = NoCtl;
     let rebuilt = Session::from_setup(&mut ctl2, setup.clone());
     assert_eq!(rebuilt.setup(), &setup);
+}
+
+/// AN AWAKE HOST GOES WITH THE SETUP: a session told its host never sleeps
+/// ([`Session::set_host_awake`]) reads that host's clocks, whose power manager says a full wake,
+/// and so does a session rebuilt from its setup; one never told reads the system's, of which a
+/// test build's power manager says nothing.
+#[test]
+fn an_awake_host_goes_with_the_setup() {
+    let mut ctl = NoCtl;
+    let mut s = Session::new(&mut ctl, Some("@s-1".to_string()));
+    assert_eq!(s.fx.full_wake(), None, "the system's");
+    s.set_host_awake();
+    assert_eq!(s.fx.full_wake(), Some(true));
+    let setup = s.setup().clone();
+    let mut ctl2 = NoCtl;
+    let rebuilt = Session::from_setup(&mut ctl2, setup);
+    assert_eq!(rebuilt.fx.full_wake(), Some(true));
 }
 
 #[test]

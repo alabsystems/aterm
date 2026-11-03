@@ -68,11 +68,16 @@ pub fn file_uri_to_path(uri: &str) -> Result<PathBuf, UriError> {
 /// Strips the leading URI root slash from an RFC 8089 Windows drive path and rejects UNC shares.
 pub fn windows_drive_path_text(decoded: &str) -> Result<String, UriError> {
     let bytes = decoded.as_bytes();
-    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
-        return Ok(decoded[1..].to_string());
-    }
-    if decoded.starts_with("//") {
+    if matches!(bytes, [b'/' | b'\\', b'/' | b'\\', ..]) {
         return Err(UriError::RemoteAuthority);
+    }
+    if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+        && matches!(bytes.get(3), None | Some(b'/' | b'\\'))
+    {
+        return Ok(decoded[1..].to_string());
     }
     Ok(decoded.to_string())
 }
@@ -297,18 +302,38 @@ mod tests {
         );
     }
 
+    /// NEGATIVE CONTROL: percent-encoded backslash UNC prefixes (`file:///%5Cserver%5Cshare`)
+    /// decode to `"/\\server\\share"`, which Windows treats as a remote UNC path unless
+    /// [`windows_drive_path_text`] rejects mixed/backslash separator pairs, and `/C:relative` must
+    /// keep its leading slash so drive-relative paths are not rewritten as drive roots.
     #[test]
     fn windows_drive_text_loses_only_its_uri_root_slash() {
         assert_eq!(
             windows_drive_path_text("/C:/Users//Ada/My File.toml").unwrap(),
             "C:/Users//Ada/My File.toml"
         );
-        assert_eq!(windows_drive_path_text("/z:/").unwrap(), "z:/");
-        assert_eq!(windows_drive_path_text("/tmp/x").unwrap(), "/tmp/x");
         assert_eq!(
-            windows_drive_path_text("//server/share/aterm.toml"),
-            Err(UriError::RemoteAuthority)
+            windows_drive_path_text(r"/C:\Users\Ada\My File.toml").unwrap(),
+            r"C:\Users\Ada\My File.toml"
         );
+        assert_eq!(windows_drive_path_text("/z:/").unwrap(), "z:/");
+        assert_eq!(
+            windows_drive_path_text("/C:relative").unwrap(),
+            "/C:relative"
+        );
+        assert_eq!(windows_drive_path_text("/tmp/x").unwrap(), "/tmp/x");
+        for remote in [
+            "//server/share/aterm.toml",
+            r"/\server\share\aterm.toml",
+            r"\\server\share\aterm.toml",
+            r"\/server/share/aterm.toml",
+        ] {
+            assert_eq!(
+                windows_drive_path_text(remote),
+                Err(UriError::RemoteAuthority),
+                "{remote}"
+            );
+        }
     }
 
     #[cfg(windows)]

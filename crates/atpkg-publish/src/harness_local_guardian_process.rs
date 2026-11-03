@@ -335,7 +335,15 @@ fn memory(pid: i32) -> Option<Usage> {
 
 #[cfg(target_os = "linux")]
 fn memory(pid: i32) -> Option<Usage> {
-    let file = std::fs::File::open(format!("/proc/{pid}/status")).ok()?;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(format!("/proc/{pid}/status"))
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut text = String::new();
     file.take(64 << 10).read_to_string(&mut text).ok()?;
     let field = |name: &str| {

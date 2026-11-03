@@ -839,9 +839,11 @@ pub fn supervisor_cruise_model() -> Model {
 /// defense the reader reads open, then the land check's answers (`pending == 4` is the check
 /// awaited): 4 `LANDED`, which retracts no standing need (it lands over a clean repository, the
 /// need left standing beside it, and over a dirty one nothing lands), 5 the agent's list, 6 a
-/// need alone. The land check's mutants are `Buggy` 6 (a defense lands on its words), 7 (a
-/// defense checked twice), 8 (a check over a dirty repository), 9 (an act typed into a need's
-/// rest) and 10 (a `LANDED` takes the need down though nothing retracted it). The owed
+/// need alone. `said` 7 is a managed worker's `Could not finish: <why>`: `failed` stands until
+/// another turn runs, nothing is typed, and `Buggy` 11 types a nudge into it. The land check's
+/// mutants are `Buggy` 6 (a defense lands on its words), 7 (a defense checked twice), 8 (a check
+/// over a dirty repository), 9 (an act typed into a need's rest) and 10 (a `LANDED` takes the need
+/// down though nothing retracted it). The owed
 /// check (`owed`) waits no back-off, so no back-off falls due while it is owed, and a measured
 /// outage holds it as it holds the other acts, its cap counted from the owed check.
 #[must_use]
@@ -889,6 +891,10 @@ pub fn supervisor_land_model() -> Model {
             var down = 0;
             var capped = 0;
             var typed_down = 0;
+            // A managed worker's own `Could not finish: <why>` ended the work (`said` 7): nothing
+            // is typed until another turn runs, and it is no landing.
+            var failed = 0;
+            var typed_failed = 0;
 
             action NetDown when (down == 0) {
                 down = 1;
@@ -898,7 +904,7 @@ pub fn supervisor_land_model() -> Model {
             }
             action OutageCapDue when (
                 down == 1 && capped == 0 && pending == 0 && walled == 0 && other == 0 &&
-                quiet == 0 && held == 0 && (same <= 1 || Buggy == 3) &&
+                failed == 0 && quiet == 0 && held == 0 && (same <= 1 || Buggy == 3) &&
                 (backoff == 0 || owed == 1 || (typed == 0 && asked == 0))
             ) {
                 capped = 1;
@@ -906,7 +912,7 @@ pub fn supervisor_land_model() -> Model {
             action Instruction when (
                 pending == 0 && walled == 0 && asked == 0 && typed == 0 &&
                 (if Buggy == 4 { backoff } else { 0 }) == 0 && landed == 0 && other == 0 &&
-                quiet == 0 && held == 0 && (same <= 1 || Buggy == 3) &&
+                failed == 0 && quiet == 0 && held == 0 && (same <= 1 || Buggy == 3) &&
                 (down == 0 || down == 2 || capped == 1 || Buggy == 5)
             ) {
                 typed_same = if same == 2 { 1 } else { typed_same };
@@ -919,7 +925,7 @@ pub fn supervisor_land_model() -> Model {
             }
             action Check when (
                 pending == 0 && walled == 0 && (owed == 1 || (Buggy == 7 && audited == 1)) &&
-                landed == 0 && other == 0 && quiet == 0 && held == 0 && rest == 0 &&
+                failed == 0 && landed == 0 && other == 0 && quiet == 0 && held == 0 && rest == 0 &&
                 (same <= 1 || Buggy == 3) &&
                 (down == 0 || down == 2 || capped == 1 || Buggy == 5)
             ) {
@@ -936,7 +942,8 @@ pub fn supervisor_land_model() -> Model {
             }
             action Nudge when (
                 pending == 0 && walled == 0 && asked == 0 && typed == 1 && backoff == 0 &&
-                (landed == 0 || Buggy == 1) && other == 0 && quiet == 0 &&
+                (landed == 0 || Buggy == 1) && (failed == 0 || Buggy == 11) && other == 0 &&
+                quiet == 0 &&
                 held == 0 && owed == 0 && (rest == 0 || Buggy == 9) && (same <= 1 || Buggy == 3) &&
                 (down == 0 || down == 2 || capped == 1 || Buggy == 5)
             ) {
@@ -944,6 +951,9 @@ pub fn supervisor_land_model() -> Model {
                 typed_same = if same == 2 { 1 } else { typed_same };
                 typed_down = if down == 1 && capped == 0 { 1 } else { typed_down };
                 typed_in_rest = if rest == 1 { 1 } else { typed_in_rest };
+                typed_failed = if failed == 1 { 1 } else { typed_failed };
+                told = if failed == 1 { 0 } else { told };
+                failed = 0;
                 nudges = if Buggy == 1 && nudges <= 1 { nudges + 1 } else { nudges };
                 pending = 1;
                 relanded = 0;
@@ -953,7 +963,7 @@ pub fn supervisor_land_model() -> Model {
             }
             action Answer when (
                 pending == 0 && walled == 0 && asked == 1 && backoff == 0 && landed == 0 &&
-                other == 0 && quiet == 0 && held == 0 && (same <= 1 || Buggy == 3) &&
+                failed == 0 && other == 0 && quiet == 0 && held == 0 && (same <= 1 || Buggy == 3) &&
                 (down == 0 || down == 2 || capped == 1 || Buggy == 5)
             ) {
                 typed_same = if same == 2 { 1 } else { typed_same };
@@ -965,15 +975,16 @@ pub fn supervisor_land_model() -> Model {
                 hlegs = if typed == 0 { 0 } else { hlegs };
             }
             action WallAct when (
-                pending == 0 && walled == 1 && landed == 0 && (same <= 1 || Buggy == 3)
+                pending == 0 && walled == 1 && landed == 0 && failed == 0 &&
+                (same <= 1 || Buggy == 3)
             ) {
                 typed_same = if same == 2 { 1 } else { typed_same };
                 walled = 0;
                 pending = 3;
             }
             action BackoffDue when (
-                pending == 0 && walled == 0 && backoff == 1 && landed == 0 && other == 0 &&
-                owed == 0 && (rest == 0 || Buggy == 9) && (same <= 1 || Buggy == 3) &&
+                pending == 0 && walled == 0 && backoff == 1 && landed == 0 && failed == 0 &&
+                other == 0 && owed == 0 && (rest == 0 || Buggy == 9) && (same <= 1 || Buggy == 3) &&
                 (typed == 1 || asked == 1 || Buggy == 4)
             ) {
                 withheld = if typed == 0 && asked == 0 { 1 } else { withheld };
@@ -1297,6 +1308,27 @@ pub fn supervisor_land_model() -> Model {
                 };
                 same = 0;
             }
+            // The worker's answer to any act, the land check's among them: what the books owed a
+            // defense goes with it, and what held the landing no longer holds it.
+            action YieldCouldNotFinish when (pending > 0) {
+                failed = 1;
+                listed = 0;
+                said = 7;
+                dirty = 0;
+                asked = 0;
+                landed = 0;
+                told = 2;
+                cut = 0;
+                short = 0;
+                backoff = 0;
+                pending = 0;
+                owed = 0;
+                audited = 0;
+                judged = 0;
+                hold = if StaleHold == 1 || Buggy == 2 { hold } else { 0 };
+                hlegs = if StaleHold == 1 || Buggy == 2 { hlegs } else { 0 };
+                same = 0;
+            }
             action YieldLanded when (pending == 4) {
                 listed = 0;
                 said = 4;
@@ -1376,6 +1408,7 @@ pub fn supervisor_land_model() -> Model {
                 hlegs = 0;
             }
             action HumanWork when (pending == 0 && walled == 0) {
+                failed = 0;
                 listed = 0;
                 said = 0;
                 need = 0;
@@ -1396,6 +1429,7 @@ pub fn supervisor_land_model() -> Model {
                 rest = 0;
             }
             action OtherTurnDefense when (pending == 0 && walled == 0) {
+                failed = 0;
                 listed = 0;
                 said = 2;
                 need = 0;
@@ -1423,6 +1457,7 @@ pub fn supervisor_land_model() -> Model {
             // exchange that opens a session is theirs, and lies outside this model, whose walks
             // begin after a point.
             action PersonExchange when (pending == 0 && walled == 0 && (said > 0 || landed == 1)) {
+                failed = 0;
                 listed = 0;
                 said = 0;
                 need = 0;
@@ -1441,6 +1476,7 @@ pub fn supervisor_land_model() -> Model {
                 rest = 0;
             }
             action OtherTurnWall when (pending == 0 && walled == 0) {
+                failed = 0;
                 listed = 0;
                 said = 0;
                 dirty = 0;
@@ -1460,7 +1496,8 @@ pub fn supervisor_land_model() -> Model {
                 rest = 0;
             }
             action SeedLanded when (
-                pending == 0 && (walled == 0 || Buggy == 1) && need == 0 && other == 0
+                pending == 0 && (walled == 0 || Buggy == 1) && need == 0 && other == 0 &&
+                failed == 0
             ) {
                 landed = 1;
                 said = 4;
@@ -1492,6 +1529,7 @@ pub fn supervisor_land_model() -> Model {
             invariant ALandedKeepsItsNeed: dropped == 0;
             invariant ANeedNeverBlocks: held == 0;
             invariant NeverTypeIntoALandedTask: typed_landed == 0;
+            invariant NeverTypeIntoAFailedTask: typed_failed == 0;
             invariant AWallIsNeverLeftOnALandedTask: walled == 0 || landed == 0;
             invariant ANoWorkReplyGetsOneMoreActAtMost: typed_same == 0;
             invariant NoContinuationIsTypedIntoAMeasuredOutageBeforeItsCap: typed_down == 0;
@@ -1499,10 +1537,11 @@ pub fn supervisor_land_model() -> Model {
             invariant TheHostIsToldTheTasksFace:
                 (other == 1 && told == 0) ||
                 (other == 0 && landed == 1 && told == 1) ||
-                (other == 0 && landed == 0 && told == 0);
+                (other == 0 && landed == 0 && failed == 1 && told == 2) ||
+                (other == 0 && landed == 0 && failed == 0 && told == 0);
             invariant TheHostIsToldWhatHoldsTheLanding:
                 (hold == 0 && hlegs == 0 &&
-                    (typed == 0 || relanded == 1 || (other == 0 && landed == 1))) ||
+                    (typed == 0 || relanded == 1 || (other == 0 && (landed == 1 || failed == 1)))) ||
                 (typed == 1 && relanded == 0 && (other == 1 || landed == 0) &&
                     ((hold == 1 && judged == 0 && hlegs == 0) ||
                         (hold == 2 && judged == 1 &&
@@ -1515,8 +1554,8 @@ pub fn supervisor_land_model() -> Model {
     }
 }
 
-/// Liveness specification asserting Autopilot Land never rests short of landing, every act and
-/// the outage's cap weakly fair. A person's exchange adds nothing to the short streak (v6
+/// Liveness specification asserting Autopilot Land never rests short of landing or a managed
+/// worker's own failed conclusion, every act and the outage's cap weakly fair. A person's exchange adds nothing to the short streak (v6
 /// §14.17.5.7), so it re-arms only the back-off the agent's own short answers earned, and another
 /// comes only past the agent's reply, which an act of Land's or a turn of real work (no streak
 /// left) went before: no run of other turns leaves the nudge or the cap enabled again and again
@@ -1536,7 +1575,10 @@ pub fn supervisor_land_liveness() -> Liveness {
             ),
             or_(
                 or_(eq(var("landed"), int(1)), eq(var("rest"), int(1))),
-                or_(eq(var("other"), int(1)), eq(var("same"), int(2))),
+                or_(
+                    or_(eq(var("other"), int(1)), eq(var("same"), int(2))),
+                    eq(var("failed"), int(1)),
+                ),
             ),
         ),
         weak: vec![

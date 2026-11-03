@@ -7,7 +7,7 @@ use crate::{Endpoint, Security};
 use aterm_http::stream::{AlwaysAuthorized, Connect, Deadline, Stream, TcpConnector};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) const MAX_LINE: usize = 64 * 1024;
 pub(crate) const MAX_MESSAGE: usize = 32 * 1024 * 1024;
@@ -16,6 +16,7 @@ pub(crate) struct Wire {
     pub(crate) stream: BufReader<Stream>,
     endpoint: Endpoint,
     deadline: Deadline,
+    overall: Option<Instant>,
 }
 
 impl Wire {
@@ -30,16 +31,28 @@ impl Wire {
                 security: Security::Tls,
             },
             deadline,
+            overall: None,
         }
     }
     pub(crate) fn connect(endpoint: &Endpoint) -> Result<Self, String> {
+        Self::connect_until(endpoint, None)
+    }
+
+    pub(crate) fn connect_until(
+        endpoint: &Endpoint,
+        overall: Option<Instant>,
+    ) -> Result<Self, String> {
         if endpoint.host.is_empty()
             || endpoint.host.chars().any(char::is_control)
             || endpoint.port == 0
         {
             return Err("Invalid mail server address".into());
         }
-        let deadline = Deadline::after(Duration::from_secs(60)).with_idle(Duration::from_secs(20));
+        let within = overall.map_or(Duration::from_secs(60), |end| {
+            end.saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(60))
+        });
+        let deadline = Deadline::after(within).with_idle(Duration::from_secs(20));
         let tcp = TcpConnector
             .connect(&endpoint.host, endpoint.port, deadline)
             .map_err(|e| e.to_string())?;
@@ -58,6 +71,7 @@ impl Wire {
             stream: BufReader::new(stream),
             endpoint: endpoint.clone(),
             deadline,
+            overall,
         })
     }
     pub(crate) fn upgrade(self) -> Result<Self, String> {
@@ -81,8 +95,72 @@ impl Wire {
             stream: BufReader::new(stream),
             endpoint: self.endpoint,
             deadline: self.deadline,
+            overall: self.overall,
         })
     }
+    pub(crate) fn release_overall_deadline(&mut self) {
+        self.overall = None;
+        self.renew(Duration::from_secs(60));
+    }
+
+    pub(crate) fn limit_until(&mut self, end: Instant) -> Option<Instant> {
+        let previous = self.overall;
+        self.overall = Some(previous.map_or(end, |old| old.min(end)));
+        self.renew(Duration::from_secs(60));
+        previous
+    }
+
+    pub(crate) fn restore_limit(&mut self, previous: Option<Instant>) {
+        self.overall = previous;
+        self.renew(Duration::from_secs(60));
+    }
+
+    pub(crate) fn remaining(&self) -> Result<Option<Duration>, String> {
+        match self.overall {
+            Some(end) => end
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+                .map(Some)
+                .ok_or_else(|| "Mail operation timed out".into()),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn renew(&mut self, within: Duration) {
+        let within = self.overall.map_or(within, |end| {
+            within.min(end.saturating_duration_since(Instant::now()))
+        });
+        self.deadline = Deadline::after(within);
+        self.stream.get_mut().set_deadline(self.deadline);
+    }
+
+    /// An empty idle timeout leaves the protocol synchronized. A partial line does not.
+    pub(crate) fn idle_line(&mut self) -> Result<Option<Vec<u8>>, String> {
+        let mut bytes = Vec::new();
+        match self
+            .stream
+            .by_ref()
+            .take((MAX_LINE + 1) as u64)
+            .read_until(b'\n', &mut bytes)
+        {
+            Err(error)
+                if bytes.is_empty()
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.to_string()),
+            Ok(_) if bytes.is_empty() => Err("Mail server closed the connection".into()),
+            Ok(_) if bytes.len() > MAX_LINE || !bytes.ends_with(b"\r\n") => {
+                Err("Invalid IMAP notification line".into())
+            }
+            Ok(_) => Ok(Some(bytes)),
+        }
+    }
+
     pub(crate) fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.stream
             .get_mut()
@@ -136,6 +214,23 @@ pub(crate) fn quoted(value: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn renewing_a_command_cannot_extend_the_overall_mail_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let mut wire = Wire::for_test(client);
+        wire.overall = Some(Instant::now());
+        wire.renew(Duration::from_secs(60));
+        assert!(wire.deadline.remaining().is_none());
+        assert!(wire.write(b"a1 NOOP\r\n").is_err());
+        server.set_nonblocking(true).unwrap();
+        assert_eq!(
+            server.read(&mut [0; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
     #[test]
     fn bounded_lines_and_arguments_refuse_injection() {
         assert!(bounded_line(&mut &b"* OK\n"[..]).is_err());

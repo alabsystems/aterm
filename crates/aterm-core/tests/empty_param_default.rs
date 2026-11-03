@@ -89,21 +89,34 @@ fn a_trailing_empty_sgr_parameter_resets() {
     });
 }
 
+/// `head`, a separator and `tail`, in every chunking, with `;` and with `:`: an empty last element
+/// after either reaches a handler outside SGR as the same trailing 0.
+fn after_either_separator(
+    setup: &[u8],
+    head: &str,
+    tail: &str,
+    check: impl Fn(&Terminal) -> Result<(), String>,
+) {
+    for separator in [';', ':'] {
+        every_chunking(setup, format!("{head}{separator}{tail}").as_bytes(), &check);
+    }
+}
+
 #[test]
 fn count_dependent_handlers_read_a_trailing_empty_parameter_as_the_default() {
-    every_chunking(b"\x1b[>4;2m", b"\x1b[>4;m", |term| {
+    after_either_separator(b"\x1b[>4;2m", "\x1b[>4", "m", |term| {
         match term.xterm_keyboard().modify_other_keys() {
             Some(0) => Ok(()),
             other => Err(format!("modifyOtherKeys {other:?}, not reset to 0")),
         }
     });
-    every_chunking(b"\x1b[>4;1f", b"\x1b[>4;f", |term| {
+    after_either_separator(b"\x1b[>4;1f", "\x1b[>4", "f", |term| {
         match term.xterm_keyboard().format_other_keys() {
             0 => Ok(()),
             other => Err(format!("formatOtherKeys {other}, not reset to 0")),
         }
     });
-    every_chunking(b"", b"\x1b[5;r", |term| {
+    after_either_separator(b"", "\x1b[5", "r", |term| {
         let region = term.grid().scroll_region();
         if (region.top, region.bottom) == (4, 23) {
             Ok(())
@@ -111,7 +124,7 @@ fn count_dependent_handlers_read_a_trailing_empty_parameter_as_the_default() {
             Err(format!("scroll region {region:?}"))
         }
     });
-    every_chunking(b"\x1b[3;9H", b"\x1b[5;H", |term| {
+    after_either_separator(b"\x1b[3;9H", "\x1b[5", "H", |term| {
         let cursor = term.cursor();
         if (cursor.row, cursor.col) == (4, 0) {
             Ok(())
@@ -119,7 +132,7 @@ fn count_dependent_handlers_read_a_trailing_empty_parameter_as_the_default() {
             Err(format!("cursor at {cursor:?}"))
         }
     });
-    every_chunking(b"\x1b[?69h", b"\x1b[5;s", |term| {
+    after_either_separator(b"\x1b[?69h", "\x1b[5", "s", |term| {
         let margins = term.grid().horizontal_margins();
         if (margins.left, margins.right) == (4, 79) {
             Ok(())
@@ -127,17 +140,17 @@ fn count_dependent_handlers_read_a_trailing_empty_parameter_as_the_default() {
             Err(format!("margins {margins:?}"))
         }
     });
-    every_chunking(b"\x1b[=3u", b"\x1b[=5;u", |term| {
+    after_either_separator(b"\x1b[=3u", "\x1b[=5", "u", |term| {
         match term.kitty_keyboard_flags().bits() {
             5 => Ok(()),
             other => Err(format!("kitty flags {other:#b}, not set to 0b101")),
         }
     });
-    every_chunking(b"", b"\x1b[4; q", |term| match term.cursor_style() {
+    after_either_separator(b"", "\x1b[4", " q", |term| match term.cursor_style() {
         CursorStyle::SteadyUnderline => Ok(()),
         other => Err(format!("cursor style {other:?}")),
     });
-    every_chunking(b"\x1b[1mABC\x1b[m", b"\x1b[1;1;1;2;$r", |term| {
+    after_either_separator(b"\x1b[1mABC\x1b[m", "\x1b[1;1;1;2", "$r", |term| {
         let flags = [0, 1, 2].map(|col| flags_at(term, 0, col));
         if flags[0].is_empty() && flags[1].is_empty() && flags[2].contains(CellFlags::BOLD) {
             Ok(())
@@ -145,7 +158,7 @@ fn count_dependent_handlers_read_a_trailing_empty_parameter_as_the_default() {
             Err(format!("cells after DECCARA {flags:?}"))
         }
     });
-    every_chunking(b"\x1b[1;31m", b"\x1b[1;#{\x1b[22;32m\x1b[#}X", |term| {
+    after_either_separator(b"\x1b[1;31m", "\x1b[1", "#{\x1b[22;32m\x1b[#}X", |term| {
         let bold = flags_at(term, 0, 0).contains(CellFlags::BOLD);
         let fg = fg_at_origin(term);
         if bold && fg == fg_after(b"\x1b[1;32m") {

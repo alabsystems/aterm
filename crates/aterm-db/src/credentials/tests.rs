@@ -17,6 +17,39 @@ const C: Actor = [3; 48];
 const DAY_MS: u64 = 86_400_000;
 
 #[test]
+fn mailbox_component_contributions_accept_only_the_requested_field() {
+    use aterm_secrets::{
+        SecretBytes,
+        mailbox_component::{Component, Part},
+        need::transfer::Values,
+    };
+    let component = Component::for_mailbox(
+        "https://mail.example",
+        "owner@example",
+        Part::SecondPassword,
+    )
+    .unwrap();
+    let want = Want::MailboxComponent(component);
+    let valid = Values(vec![(
+        component.entry(),
+        SecretBytes::from(&b"fixture-second"[..]),
+    )]);
+    assert!(value::validate(&want, &valid).is_ok());
+    let wrong =
+        Component::for_mailbox("https://mail.example", "owner@example", Part::Password).unwrap();
+    let wrong = Values(vec![(
+        wrong.entry(),
+        SecretBytes::from(&b"fixture-login"[..]),
+    )]);
+    assert!(value::validate(&want, &wrong).is_err());
+    let extra = Values(vec![
+        (component.entry(), SecretBytes::from(&b"fixture-second"[..])),
+        ("other".into(), SecretBytes::from(&b"fixture-extra"[..])),
+    ]);
+    assert!(value::validate(&want, &extra).is_err());
+}
+
+#[test]
 fn peeking_without_local_state_does_not_create_a_ledger_or_table() {
     let root = aterm_tempfile::tempdir().unwrap();
     let home = root.path().join("unconfigured");
@@ -75,10 +108,19 @@ fn peeking_reads_remote_requests_beside_writers_without_posting_or_sweeping() {
     let before_table = std::fs::read(table_path.join("table.astream")).unwrap();
     let before_ledger = std::fs::read(&ledger).unwrap();
     let result = read(&lab.paths[0]);
+    assert_eq!(
+        result["table"]["observer"],
+        Value::String(hex::encode_lower(&session.actor()))
+    );
     let requests = result["table"]["requests"].as_array().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["want"].as_str(), Some("mailbox:m19-2"));
     assert_eq!(requests[0]["own"].as_bool(), Some(false));
+    assert_eq!(
+        requests[0]["requester"],
+        Value::String(hex::encode_lower(&observe(requester).unwrap().observer))
+    );
+    assert_eq!(requests[0]["delivery_origin"], Value::Null);
     assert_eq!(requests[0]["offers"].as_u64(), Some(0));
     assert_eq!(requests[0]["swept_current"].as_u64(), Some(0));
     assert_eq!(requests[0]["required_sweeps"].as_u64(), Some(1));
@@ -883,4 +925,47 @@ fn roster_denied_binding_excluded_from_credential_copy_and_sweep_quorum() {
     assert_eq!(reopened.seq(), roster_pub.seq);
     let m3 = Audience::Hosts(vec!["m3".into()]);
     assert!(reopened.doc.entry(&m3, "release-notary").is_none());
+}
+
+/// NEGATIVE CONTROL: symlinked or non-private (`0644`) holder files never post an unreadable
+/// offer, while a private (`0600`) mailbox password beside a blank `*_totp` file validates cleanly.
+#[test]
+fn unprivate_or_symlinked_holder_files_do_not_offer_and_blank_totp_is_ignored() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let lab = Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let want = Want::Mailbox("m29".into());
+    need::raise(&lab.paths[2], want.clone(), Purpose::HarnessSignIn).unwrap();
+    let now = 1_000_000_000;
+    assert_eq!(pass_at(&lab.paths[2], now).unwrap().posted, 1);
+    repair_commons(&lab, 3);
+
+    let secrets_dir = lab.paths[1].home.join(".secrets");
+    aterm_secrets::fsx::ensure_private_dir(&secrets_dir).unwrap();
+    let pw_path = secrets_dir.join("m29_password");
+    let target_file = lab.paths[1].home.join("outside-secret");
+    aterm_secrets::fsx::write_atomic(&target_file, b"fixture-password\n", 0o600).unwrap();
+    std::os::unix::fs::symlink(&target_file, &pw_path).unwrap();
+    assert!(!super::holds(&lab.paths[1], &want));
+    assert_eq!(pass_at(&lab.paths[1], now).unwrap().offered, 0);
+
+    std::fs::remove_file(&pw_path).unwrap();
+    std::fs::write(&pw_path, b"fixture-password\n").unwrap();
+    std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!super::holds(&lab.paths[1], &want));
+
+    std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let totp_path = secrets_dir.join("m29_totp");
+    aterm_secrets::fsx::write_atomic(&totp_path, b"   \n", 0o600).unwrap();
+    assert!(super::holds(&lab.paths[1], &want));
+
+    let seen = pass_at(&lab.paths[2], now).unwrap();
+    let thread = seen.threads.iter().find(|t| t.want == want).unwrap();
+    let values = super::source::read(&lab.paths[1], [9; 16], thread, now).unwrap();
+    assert_eq!(values.0.len(), 1);
+    assert_eq!(values.0[0].0, "m29_password");
+    assert_eq!(super::value::validate(&want, &values).unwrap(), None);
 }

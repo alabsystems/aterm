@@ -23,9 +23,9 @@ const SPACING: [Duration; ATTEMPTS as usize - 1] =
 /// itself, soon.
 const WORK_REPOLL: Duration = Duration::from_secs(2);
 
-/// How soon a renewal the person's live state holds looks again: unsaved native work, or
-/// no live terminal session to hand over (every pane's command exited under `--hold`, or
-/// only documents and Settings open).
+/// How soon a renewal the person's live state holds looks again: unsaved native work, or no
+/// live terminal session and windows the sessionless handoff cannot carry (only documents with
+/// no file behind them, say).
 const PERSON_STATE_REPOLL: Duration = Duration::from_secs(60);
 
 /// The facts [`decide`] reads, every one a memory read on the main thread: no filesystem probe and no codesign (the worker proves the installed bundle before it launches).
@@ -49,8 +49,6 @@ pub(crate) struct RenewalFacts {
     pub(crate) update_work: bool,
     /// Counted attempts so far.
     pub(crate) attempts: u8,
-    /// A terminal session with a live process is open (`App::handoff_live_sessions`).
-    pub(crate) live_terminal: bool,
 }
 
 /// What keeps an armed renewal waiting, booking nothing.
@@ -58,8 +56,6 @@ pub(crate) struct RenewalFacts {
 pub(crate) enum RenewalWait {
     /// Update work in flight may stage a build, whose own handoff renews the record.
     Work,
-    /// No live terminal session, so no overlap lane to hand over on.
-    Terminal,
 }
 
 impl RenewalWait {
@@ -67,7 +63,6 @@ impl RenewalWait {
     const fn repoll(self) -> Duration {
         match self {
             Self::Work => WORK_REPOLL,
-            Self::Terminal => PERSON_STATE_REPOLL,
         }
     }
 }
@@ -155,10 +150,33 @@ pub(crate) fn decide(facts: RenewalFacts) -> RenewalDecision {
             attempts: facts.attempts,
         });
     }
-    if !facts.live_terminal {
-        return RenewalDecision::Wait(RenewalWait::Terminal);
-    }
+    // With no live terminal session the renewal still hands over (its target is this very
+    // build, which reads a sessionless grant) whenever its windows can be carried; the
+    // admission says when they cannot ([`not_started`]).
     RenewalDecision::Renew
+}
+
+/// What an attempt that did not start does next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotStarted {
+    /// Terminal activity deferred it: the automatic lane's retry, uncounted.
+    Deferred,
+    /// The sessionless handoff cannot carry these windows (`App::sessionless_handoff_refused`):
+    /// the person's state holds it, uncounted, as unsaved work does.
+    PersonState,
+    /// Anything else spends one of the [`ATTEMPTS`].
+    Counted,
+}
+
+/// THE ATTEMPT RULE: an attempt the person's desk refused is a wait, never a spent attempt.
+const fn not_started(activity_deferred: bool, sessionless_refused: bool) -> NotStarted {
+    if activity_deferred {
+        NotStarted::Deferred
+    } else if sessionless_refused {
+        NotStarted::PersonState
+    } else {
+        NotStarted::Counted
+    }
 }
 
 /// The renewal's ladder phase, `since_armed` after its anchor: the automatic lane's, capped
@@ -309,7 +327,6 @@ impl crate::App {
                 || self.update_handoff_in_flight()
                 || self.person_apply_is_held(),
             attempts: self.launch_record_renewal.attempts,
-            live_terminal: !self.handoff_live_sessions().is_empty(),
         }
     }
 
@@ -411,18 +428,29 @@ impl crate::App {
                     ending: None,
                 };
             }
-            Err(error) if error.is_activity_deferred() => {
-                aterm_log::debug!("launch record: the renewal was deferred: {error}");
-                self.record_update_switch_stopped(true, &error.to_string());
-                self.launch_record_renewal.state =
-                    wait_until(crate::automatic_update_activity_retry_at(now));
-            }
-            Err(error) => {
-                aterm_log::warn!("launch record: attempt {k} of {ATTEMPTS} did not start: {error}");
-                self.record_update_switch_stopped(k < ATTEMPTS, &error.to_string());
-                self.launch_record_renewal.attempts = k;
-                self.launch_record_renewal.rearm_after_attempt(now);
-            }
+            Err(error) => match not_started(
+                error.is_activity_deferred(),
+                self.sessionless_handoff_refused.is_some(),
+            ) {
+                NotStarted::Deferred => {
+                    aterm_log::debug!("launch record: the renewal was deferred: {error}");
+                    self.record_update_switch_stopped(true, &error.to_string());
+                    self.launch_record_renewal.state =
+                        wait_until(crate::automatic_update_activity_retry_at(now));
+                }
+                NotStarted::PersonState => {
+                    aterm_log::debug!("launch record: the renewal waits for the desk: {error}");
+                    self.launch_record_renewal.state = wait_until(now + PERSON_STATE_REPOLL);
+                }
+                NotStarted::Counted => {
+                    aterm_log::warn!(
+                        "launch record: attempt {k} of {ATTEMPTS} did not start: {error}"
+                    );
+                    self.record_update_switch_stopped(k < ATTEMPTS, &error.to_string());
+                    self.launch_record_renewal.attempts = k;
+                    self.launch_record_renewal.rearm_after_attempt(now);
+                }
+            },
         }
     }
 
@@ -562,8 +590,21 @@ mod tests {
             current_build: 107,
             update_work: false,
             attempts: 0,
-            live_terminal: true,
         }
+    }
+
+    /// A renewal the sessionless handoff cannot carry waits for the desk, uncounted, as one
+    /// that unsaved work holds does: three such refusals never spend the renewal.
+    #[test]
+    fn a_desk_the_handoff_cannot_carry_never_spends_an_attempt() {
+        assert_eq!(not_started(true, false), NotStarted::Deferred);
+        assert_eq!(not_started(true, true), NotStarted::Deferred);
+        assert_eq!(not_started(false, true), NotStarted::PersonState);
+        assert_eq!(
+            not_started(false, false),
+            NotStarted::Counted,
+            "CONTROL: any other refusal spends one"
+        );
     }
 
     #[test]
@@ -581,7 +622,6 @@ mod tests {
             current_build: 107,
             update_work: true,
             attempts: ATTEMPTS,
-            live_terminal: false,
         };
         let rows = [
             (base, Renew),
@@ -643,13 +683,6 @@ mod tests {
             ),
             (
                 RenewalFacts {
-                    live_terminal: false,
-                    ..base
-                },
-                Wait(RenewalWait::Terminal),
-            ),
-            (
-                RenewalFacts {
                     renewed_from: Some(47362),
                     ..against
                 },
@@ -670,14 +703,6 @@ mod tests {
                     ..base
                 },
                 Wait(RenewalWait::Work),
-            ),
-            (
-                RenewalFacts {
-                    attempts: ATTEMPTS,
-                    live_terminal: false,
-                    ..base
-                },
-                Book(Spent { attempts: ATTEMPTS }),
             ),
             (
                 RenewalFacts {

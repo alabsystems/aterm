@@ -386,6 +386,54 @@ pub const ANCHORS: &[Anchor] = &[
     ),
     lit("automode.not_now", "Not now", "2.1.310"),
     lit("automode.never", "Don't show again", "2.1.310"),
+    // The `Claude in Chrome` intro ([`crate::chrome_intro`]), as 2.1.317 drew it on 2026-11-02
+    // and as its bundle's `ClaudeInChromeOnboarding` composes it: the title; the first paragraph;
+    // while the bundle's extension check has not found the extension, the `Requires…` words and
+    // the store link after one space; the permissions words, closed by `.`, or once the
+    // extension is found by one space, the permissions link in parentheses and `.`; and the
+    // last paragraph's words, the `/chrome` command, `or visit` and the docs link, one space
+    // between each. Each link and the command is a literal of its own in the bundle, which
+    // composes the paragraphs from them. The title's id does not end `.title`: the generic
+    // title joiner ([`crate::prompt`]'s `is_title`) would stop a wrapped `Claude in Chrome wants
+    // to …` box title at these three words.
+    lit("chrome.intro_heading", "Claude in Chrome", "2.1.317"),
+    lit(
+        "chrome.intro_body",
+        "Claude in Chrome works with the Chrome extension to let you control your browser \
+         directly from Claude Code. You can navigate websites, fill forms, capture screenshots, \
+         record GIFs, and debug with console logs and network requests.",
+        "2.1.317",
+    ),
+    lit(
+        "chrome.intro_requires",
+        "Requires the Chrome extension. Get started at",
+        "2.1.317",
+    ),
+    lit(
+        "chrome.intro_store_url",
+        "https://claude.ai/chrome",
+        "2.1.317",
+    ),
+    lit(
+        "chrome.intro_permissions",
+        "Site-level permissions are inherited from the Chrome extension. Manage permissions in \
+         the Chrome extension settings to control which sites Claude can browse, click, and type \
+         on",
+        "2.1.317",
+    ),
+    lit(
+        "chrome.intro_permissions_url",
+        "https://clau.de/chrome/permissions",
+        "2.1.317",
+    ),
+    lit("chrome.intro_more", "For more info, use", "2.1.317"),
+    lit("chrome.intro_command", "/chrome", "2.1.317"),
+    lit("chrome.intro_visit", "or visit", "2.1.317"),
+    lit(
+        "chrome.intro_docs_url",
+        "https://code.claude.com/docs/en/chrome",
+        "2.1.317",
+    ),
     lit("busy.interrupt", "esc to interrupt", "2.1.267"),
     // The window title's lead glyph (`crate::phase::title_runs`): one of two frames while the
     // REPL's status is busy (a turn loading, or a background agent, teammate or workflow
@@ -440,6 +488,14 @@ pub const ANCHORS: &[Anchor] = &[
         "Compacted while idle, before the prompt cache expired",
         "2.1.300",
     ),
+    lit("turn.task_status", "Task \"", "2.1.312"),
+    lit(
+        "turn.task_running",
+        "still running in background",
+        "2.1.312",
+    ),
+    lit("turn.task_completed", "completed in background", "2.1.312"),
+    lit("turn.task_stopped", "stopped", "2.1.312"),
     lit("turn.recap", "recap:", "2.1.301"),
     hint("turn.group.expand", "(ctrl+o to expand)", "2.1.284"),
     composed("turn.group.reading", "Reading", "2.1.284"),

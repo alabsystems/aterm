@@ -40,12 +40,7 @@ fn an_unknown_reply_never_reaches_the_refusal_diagnostic() {
 
 #[test]
 fn the_server_fixed_refusal_reasons_reach_the_diagnostic() {
-    for reason in [
-        "off",
-        "owner-only",
-        "debugger-as-root",
-        "command-unreadable",
-    ] {
+    for reason in ["off", "owner-only", "debugger-as-root"] {
         let line = format!("ERR askpass refused {reason}");
         assert_eq!(refusal_reply(line.as_bytes()), line);
     }
@@ -87,4 +82,33 @@ fn dedicated_reply_transport_accepts_a_complete_line_and_refuses_partial_eof() {
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
         }
     }
+}
+
+/// A plain sudo's refusal names the route that works, and the refusals an agent can act on
+/// stay distinct from the generic one. NEGATIVE CONTROL: another refusal's free text never passes.
+#[test]
+fn the_refusals_an_agent_can_act_on_say_what_to_do() {
+    let unreadable = refusal_reply(b"ERR askpass refused command-unreadable");
+    assert!(unreadable.starts_with("ERR askpass refused command-unreadable"));
+    assert!(unreadable.contains("aterm ctl sudo -- <command>"));
+    assert_eq!(
+        refusal_reply(b"ERR askpass refused not-frontmost; focus the tab and retry"),
+        "ERR askpass refused not-frontmost; focus the tab and retry"
+    );
+    assert!(
+        refusal_reply(b"ERR askpass refused unattributed")
+            .starts_with("ERR askpass refused unattributed: ")
+    );
+    assert!(
+        refusal_reply(b"ERR askpass refused headless")
+            .starts_with("ERR askpass refused headless: ")
+    );
+    assert!(
+        refusal_reply(b"ERR askpass refused no window hosts that session")
+            .starts_with("ERR askpass refused no window hosts that session")
+    );
+    assert_eq!(
+        refusal_reply(b"ERR askpass refused anything else"),
+        "ERR askpass refused"
+    );
 }

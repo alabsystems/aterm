@@ -21,7 +21,7 @@ use crate::model::ReleaseObject;
 use crate::policy::Access;
 use crate::slug::Slug;
 
-fn prerelease_filter(inv: &Invocation) -> Result<Option<bool>> {
+pub(super) fn prerelease_filter(inv: &Invocation) -> Result<Option<bool>> {
     match (inv.has("--prerelease"), inv.has("--no-prerelease")) {
         (true, true) => Err(inv.usage("--prerelease and --no-prerelease contradict each other")),
         (true, false) => Ok(Some(true)),

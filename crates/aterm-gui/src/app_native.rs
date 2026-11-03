@@ -3123,6 +3123,8 @@ impl App {
         }
         if kind == crate::native_app::AppKind::SystemState {
             self.drain_system_state_actions();
+        } else if kind == crate::native_app::AppKind::Workers {
+            self.drain_workers_actions(wid, instance);
         } else if kind == crate::native_app::AppKind::Settings {
             self.take_settings_pane_dialog(view);
         }
@@ -3363,6 +3365,12 @@ impl App {
             .native_runtime
             .app(instance)
             .is_some_and(|app| app.kind() == crate::native_app::AppKind::Markdown);
+        // A list whose rows the arrows move between, as Settings' controls.
+        let steps_focus = settings_active
+            || self
+                .native_runtime
+                .app(instance)
+                .is_some_and(|app| app.kind() == crate::native_app::AppKind::Workers);
         // System State, like Settings, is a scrolling list with text fields: a
         // page key moves the list a page of its room, and the field keys edit
         // the field with focus.
@@ -3747,10 +3755,10 @@ impl App {
                         Key::Named(NamedKey::Escape) => {
                             Some(AppEvent::TextInput(TextInputEvent::Cancel))
                         }
-                        Key::Named(NamedKey::ArrowUp) if settings_active => {
+                        Key::Named(NamedKey::ArrowUp) if steps_focus => {
                             Some(AppEvent::StepFocus(-1))
                         }
-                        Key::Named(NamedKey::ArrowDown) if settings_active => {
+                        Key::Named(NamedKey::ArrowDown) if steps_focus => {
                             Some(AppEvent::StepFocus(1))
                         }
                         Key::Named(NamedKey::ArrowUp) => Some(AppEvent::ScrollLines(-1)),
@@ -7363,6 +7371,7 @@ impl App {
                     )
                 });
                 let grant_chunks = passed.as_ref().is_ok_and(|facts| facts.grant_chunks);
+                let grant_empty = passed.as_ref().is_ok_and(|facts| facts.grant_empty);
                 *slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -7375,6 +7384,7 @@ impl App {
                         reason,
                         policy,
                         grant_chunks,
+                        grant_empty,
                     });
             });
         match spawned {
@@ -7430,7 +7440,7 @@ impl App {
         auto_apply_on
             && handoff_unavailable.is_none()
             && self.update_waits_on_person.is_none()
-            && !self.kept_image_waits_for_terminal()
+            && !self.kept_image_installs_at_next_launch()
     }
 
     /// The update row for a close-preflight refusal the person can clear.

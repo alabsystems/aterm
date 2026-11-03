@@ -75,6 +75,44 @@ pub(super) fn bounded_error(error: impl std::fmt::Display) -> String {
 }
 
 impl RepairRound {
+    /// A completed, authenticated round around `application`.
+    #[cfg(test)]
+    pub(crate) fn completed_with(application: crate::replica::Report) -> Self {
+        let mut round = Self::panicked(None);
+        round.actor = Some([1; 48]);
+        round.exchange_started = true;
+        round.control = Ok(Default::default());
+        round.application = Some(application);
+        round
+    }
+
+    /// The table this round left nothing to fetch of, from an authenticated peer that holds at
+    /// least one of its operations: no local or peer refusal, nothing deferred and nothing
+    /// received, so a read now misses nothing that peer had when the round read its inventory. A
+    /// round that received something may have left more for a later batch, and a receive-only
+    /// recovery round reads from a store this Mac's writer does not hold.
+    pub fn drained_table(&self) -> Option<astream_wire::sync::Digest> {
+        if self.cancelled
+            || !self.exchange_started
+            || self.actor.is_none()
+            || self.control.is_err()
+            || self.membership_error.is_some()
+            || self.application_error.is_some()
+            || self.application_interrupted.is_some()
+            || self.application_deferral.is_some()
+            || self.application_batch_deferral.is_some()
+        {
+            return None;
+        }
+        let report = self.application.as_ref()?;
+        let drained = !report.recovery
+            && report.deferred == 0
+            && report.received == 0
+            && report.conflicts_received == 0
+            && report.peer_known.is_some_and(|known| known.count > 0);
+        report.table.filter(|_| drained)
+    }
+
     /// A local diagnostic for this attempt's authenticated peer. Error strings,
     /// credentials and payloads never enter the published observation.
     pub(super) fn observation(
@@ -354,6 +392,49 @@ impl RepairRound {
             completed_at_ms: aterm_time::unix_millis().unwrap_or(0),
             dropped_before: 0,
         }
+    }
+}
+
+/// Only a clean round on a table some peer holds, with nothing left to fetch, is evidence: one
+/// failed, cancelled, deferred or recovery round is not, nor one that still received something,
+/// nor one with a peer that knows nothing of the table.
+/// NEGATIVE CONTROL: with `drained_table` not requiring `received == 0`, the `received` case below
+/// answers the table.
+#[cfg(test)]
+#[test]
+fn only_a_clean_round_that_left_nothing_to_fetch_is_evidence() {
+    use crate::replica::{InventorySummary, Report};
+    let table = [7; 32];
+    let clean = || {
+        RepairRound::completed_with(Report {
+            table: Some(table),
+            peer_known: Some(InventorySummary::of(&[[9; 32]].into_iter().collect())),
+            ..Default::default()
+        })
+    };
+    assert_eq!(clean().drained_table(), Some(table));
+    assert_eq!(RepairRound::panicked(None).drained_table(), None);
+    let edited: [fn(&mut RepairRound); 12] = [
+        |r| r.cancelled = true,
+        |r| r.exchange_started = false,
+        |r| r.actor = None,
+        |r| r.control = Err("no".into()),
+        |r| r.membership_error = Some("no".into()),
+        |r| r.application_error = Some("no".into()),
+        |r| r.application = None,
+        |r| r.application.as_mut().unwrap().received = 1,
+        |r| r.application.as_mut().unwrap().deferred = 1,
+        |r| r.application.as_mut().unwrap().recovery = true,
+        |r| r.application.as_mut().unwrap().table = None,
+        |r| {
+            r.application.as_mut().unwrap().peer_known =
+                Some(InventorySummary::of(&Default::default()));
+        },
+    ];
+    for (n, edit) in edited.iter().enumerate() {
+        let mut round = clean();
+        edit(&mut round);
+        assert_eq!(round.drained_table(), None, "case {n}");
     }
 }
 

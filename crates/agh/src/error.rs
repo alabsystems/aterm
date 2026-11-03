@@ -842,6 +842,13 @@ impl Error {
         Error::could_not_run(why).with_sub(Sub::Protocol)
     }
 
+    /// A CouldNotRun `Sub::Local` error: something on this machine (a file, a child, a
+    /// directory) failed.
+    #[inline]
+    pub(crate) fn local(why: impl Into<String>) -> Error {
+        Error::could_not_run(why).with_sub(Sub::Local)
+    }
+
     /// Recasts this error to `kind` and `why`, keeping exchange, identity, rate, and trace fields.
     #[must_use]
     pub(crate) fn recast(mut self, kind: Kind, why: impl Into<String>) -> Error {
@@ -857,12 +864,6 @@ impl Error {
             self.why = why();
         }
         self
-    }
-
-    /// A WP0 stub's refusal; WP14 deletes it once nothing calls it.
-    #[must_use]
-    pub fn not_yet(what: &str, package: &str) -> Error {
-        Error::could_not_run(format!("not yet: {what} lands in {package}")).with_sub(Sub::Local)
     }
 
     /// A replay's stop: `Sub::Replay(what)` with `why`.

@@ -13,7 +13,7 @@ use crate::wall::{Placement, Wall, WallKind, classify_wall};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 8, "0.8");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 9, "0.9");
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,13 +393,31 @@ pub fn done_row_drawn(rows: &[String]) -> bool {
     turn_over(rows)
 }
 
-/// The status row above the composer is a done row.
+/// The status row above the composer, or the one Claude Code's idle compaction left it under, is
+/// a done row.
 fn turn_over(rows: &[String]) -> bool {
-    composer_frame(rows).is_some_and(|f| {
-        status_block(rows, f.top)
-            .line(rows)
-            .is_some_and(|line| is_done_row(&line))
-    })
+    composer_frame(rows)
+        .is_some_and(|f| turn_end_line(rows, f.top).is_some_and(|line| is_done_row(&line)))
+}
+
+/// The status line that speaks for the turn: the one above the composer's top rule `top`, else,
+/// with none there, the one above the rows Claude Code's idle compaction drew
+/// ([`crate::turn::idle_compaction_from`]). That compaction is no turn and runs with the turn
+/// over, but its notice is a row of the transcript, which ends the live zone ([`status_block`]).
+/// A message under the row read there opened a turn that row did not end. Drawn long ago, that
+/// row says when the turn ended and nothing of now: what runs now is read off the live footer
+/// ([`busy_signal`]).
+fn turn_end_line(rows: &[String], top: usize) -> Option<Cow<'_, str>> {
+    let block = status_block(rows, top);
+    if block.status.is_some() {
+        return block.line(rows);
+    }
+    let from = crate::turn::idle_compaction_from(rows)?;
+    let block = status_block(rows, from);
+    if rows[block.from..from].iter().any(|r| r.starts_with('❯')) {
+        return None;
+    }
+    block.line(rows)
 }
 
 /// A message was submitted under the status row (`❯ …` between the status row and the composer).
@@ -552,16 +570,17 @@ pub const IN_PROCESS_RULES: [&str; 4] = [
 /// whatever rule [`busy_signal`] reads first. That reader stops at its first rule, and a footer's
 /// (a workflow's progress row, a shell count) comes ahead of the carried wait and the done row,
 /// as the status row's own shell rule comes ahead of the agents a done row lists with a shell:
-/// its one rule can hide this work, which a restart would end and no process row names. `None`
-/// with no composer frame or a message submitted under the status row ([`background_wait`]'s
-/// bounds).
+/// its one rule can hide this work, which a restart would end and no process row names. The
+/// status row is the one that speaks for the turn ([`turn_end_line`]), so a done row Claude Code's
+/// idle compaction drew its rows under still names the work it left. `None` with no composer
+/// frame or a message submitted under the status row ([`background_wait`]'s bounds).
 #[must_use]
 pub fn in_process_work(rows: &[String]) -> Option<&'static str> {
     let frame = composer_frame(rows)?;
     if turn_just_begun(rows) {
         return None;
     }
-    let Some(line) = status_block(rows, frame.top).line(rows) else {
+    let Some(line) = turn_end_line(rows, frame.top) else {
         return carried_wait(rows, frame.top).then_some(CARRIED.rule);
     };
     status_busy(&line)
@@ -607,6 +626,23 @@ const LEFT_RUNNING_RULES: &[&str] = &[
 #[must_use]
 pub fn turn_over_background(rows: &[String]) -> bool {
     turn_over(rows) && background_wait(rows).is_some_and(|rule| LEFT_RUNNING_RULES.contains(&rule))
+}
+
+/// THE WORK THE TURN LEFT RUNNING, AS THE SCREEN NAMES IT: the [`LEFT_RUNNING_RULES`] rule where
+/// the turn rests over the agent's own background work ([`background_rest`]), a done row ended
+/// it, and that row names no work of Claude Code's own process ([`left_in_process`]). The title
+/// rests over a shell or a monitor as it does over a screen no reader names, so these words are
+/// what tells the two apart. `None` elsewhere: the title runs while a background agent or a
+/// workflow does, its turn over; a footer's progress row outlives its workflow; and no done row,
+/// an active `/goal` or a wall says nothing of what the turn left.
+#[must_use]
+pub fn work_left(rows: &[String]) -> Option<&'static str> {
+    background_rest(rows)?;
+    let line = turn_end_line(rows, composer_frame(rows)?.top)?;
+    if !is_done_row(&line) || left_in_process(&line) {
+        return None;
+    }
+    background_wait(rows).filter(|rule| LEFT_RUNNING_RULES.contains(rule))
 }
 
 /// Who opened the turn drawn last, read up from the composer's top rule.
@@ -3901,6 +3937,217 @@ mod tests {
         ] {
             assert!(!turn_over_background(&waiter_capture(text)), "{name}");
         }
+    }
+
+    /// [`crate::prompt::fixtures::IDLE_COMPACTED_OVER_A_SHELL_2_1_312`] and the index of its row
+    /// that opens `head`.
+    fn compacted_over_a_shell(head: &str) -> (Vec<String>, usize) {
+        let measured = crate::prompt::fixtures::screen(
+            crate::prompt::fixtures::IDLE_COMPACTED_OVER_A_SHELL_2_1_312,
+        );
+        let at = measured
+            .iter()
+            .position(|r| r.starts_with(head))
+            .unwrap_or_else(|| panic!("{head}"));
+        (measured, at)
+    }
+
+    /// THE TURN A COMPACTION FOLLOWED STAYS OVER (2026-10-27): Claude Code compacted its idle
+    /// conversation under a done row with a shell still running, and the notice, a row of the
+    /// transcript, ended the status read, so the turn read as not over and the stall canary called
+    /// the screen one this build does not recognise. The notice still ends the live zone:
+    /// that frozen row says nothing of now, and the live footer alone says what runs.
+    #[test]
+    fn an_idle_compaction_leaves_the_turn_it_followed_over() {
+        let (measured, _) = compacted_over_a_shell("✻ Worked for 23s");
+        assert!(turn_over(&measured));
+        assert!(done_row_drawn(&measured));
+        assert!(turn_over_background(&measured));
+        assert_eq!(
+            busy_signal(&measured).map(|b| (b.zone, b.rule)),
+            Some((Zone::Footer, "a shell running"))
+        );
+        assert_eq!(shells_running(&measured), Some(1));
+        assert_eq!(worker_phase(&measured), Phase::Busy);
+        assert_eq!(background_rest(&measured), Some(Phase::Idle));
+        for fixture in [
+            crate::prompt::fixtures::IDLE_COMPACTED_MEASURED,
+            crate::prompt::fixtures::IDLE_COMPACTED_HINT_MEASURED,
+        ] {
+            let idle = crate::prompt::fixtures::screen(fixture);
+            assert!(turn_over(&idle));
+            assert!(!turn_over_background(&idle), "no work under it");
+        }
+
+        let inserted = |at: usize, row: &str| {
+            let mut r = measured.clone();
+            r.insert(at, row.to_string());
+            r
+        };
+        let (_, done) = compacted_over_a_shell("✻ Worked for 23s");
+        let (_, task) = compacted_over_a_shell("⏺ Task ");
+        let (_, notice) = compacted_over_a_shell("⏺ Compacted while idle");
+        let mut task_unread = measured.clone();
+        task_unread[task] = "⏺ The task is still going.".to_string();
+        for (name, rows) in [
+            (
+                "a person's message under the row",
+                inserted(done + 1, "❯ what is left?"),
+            ),
+            (
+                "a reply under the row",
+                inserted(done + 1, "⏺ Nothing is left."),
+            ),
+            ("a row of no known shape among them", task_unread),
+            (
+                "a reply under the notice",
+                inserted(notice + 1, "⏺ Nothing is left."),
+            ),
+            (
+                "a live spinner under the notice",
+                inserted(notice + 1, "✽ Baking… (3s)"),
+            ),
+        ] {
+            assert!(!turn_over(&rows), "{name}");
+            assert!(!turn_over_background(&rows), "{name}");
+        }
+    }
+
+    /// A COMPACTION UNDER ANOTHER IS NO TURN EITHER: a second idle compaction drawn under the first
+    /// (with or without its own restored task) leaves the done row above both the turn's end, the
+    /// shell it names the work the turn left, and the agent's reply its last words. The control:
+    /// a reply between the two notices is a turn, and the first notice no longer follows the done
+    /// row's.
+    #[test]
+    fn a_second_idle_compaction_leaves_the_same_turn_over() {
+        let (measured, notice) = compacted_over_a_shell("⏺ Compacted while idle");
+        let task =
+            "⏺ Task \"Run lint and cross cells on the landed tree\" still running in background";
+        let second = "⏺ Compacted while idle, before the prompt cache expired";
+        let under = |rows: &[&str]| {
+            let mut r = measured.clone();
+            let at = notice + 1;
+            r.splice(at..at, rows.iter().map(|row| (*row).to_string()));
+            r
+        };
+        for rows in [
+            under(&["", second]),
+            under(&[
+                "",
+                task,
+                "  ⎿  Skills restored (workflow-authoring)",
+                "",
+                second,
+            ]),
+        ] {
+            assert!(crate::turn::idle_compacted(&rows));
+            assert!(turn_over(&rows) && turn_over_background(&rows), "{rows:#?}");
+            assert_eq!(work_left(&rows), Some("a shell running"));
+            assert!(
+                crate::turn::said_tail(&rows)
+                    .is_some_and(|said| said.starts_with("Lint and the cross-OS")),
+                "{:?}",
+                crate::turn::said_tail(&rows)
+            );
+        }
+        let replied = under(&["", "⏺ Nothing is left.", "", second]);
+        assert!(!turn_over(&replied));
+        assert_eq!(work_left(&replied), None);
+    }
+
+    /// WHAT THE TURN LEFT IS NAMED ONLY WHERE THE SCREEN NAMES IT: a shell or a monitor under a
+    /// done row, drawn live or left above an idle compaction, whichever the composer holds.
+    /// Every other wait keeps its `None`, and with it the title as its witness: work of Claude
+    /// Code's own process (the title runs over it), a progress row that outlives its workflow,
+    /// no turn's end drawn, an active `/goal`'s check-ins, a wall, and a frozen row's claim the
+    /// live footer no longer backs. Work of Claude Code's own process a done row names above the
+    /// compaction is still read as that work ([`in_process_work`]), which a restart would end.
+    #[test]
+    fn the_work_a_turn_left_is_named_only_where_the_screen_names_it() {
+        let (measured, done) = compacted_over_a_shell("✻ Worked for 23s");
+        assert_eq!(work_left(&measured), Some("a shell running"));
+        let caret = composer_index(&measured).expect("the caret");
+        let mut empty = measured.clone();
+        empty[caret] = "❯".to_string();
+        assert_eq!(
+            work_left(&empty),
+            Some("a shell running"),
+            "no composer text"
+        );
+
+        assert_eq!(
+            in_process_work(&measured),
+            None,
+            "a shell is the process table's"
+        );
+        let row = "✻ Worked for 23s · done 4:57 PM · 1 shell, 2 agents still running";
+        let mut agents = measured.clone();
+        agents[done] = row.to_string();
+        assert!(turn_over_background(&agents));
+        assert_eq!(work_left(&agents), None, "agents left under a compaction");
+        assert_eq!(
+            in_process_work(&agents),
+            Some("background work still running"),
+            "a restart would end the agents the done row names"
+        );
+        let mut waited = measured.clone();
+        waited[done] = "✻ Waiting for 1 background agent to finish".to_string();
+        assert!(background_rest(&waited).is_some());
+        assert_eq!(work_left(&waited), None, "a wait left under a compaction");
+        let footer = measured
+            .iter()
+            .rposition(|r| r.contains("· 1 shell"))
+            .expect("the footer");
+        let mut ended = measured.clone();
+        ended[footer] = "  ⏵⏵ bypass permissions on".to_string();
+        assert!(turn_over(&ended));
+        assert_eq!(work_left(&ended), None, "the shell ended, the row frozen");
+        let mut goal = measured.clone();
+        goal[footer] = format!(
+            "{:<130}◎ /goal active (1d)",
+            "  ⏵⏵ bypass permissions on · 1 shell"
+        );
+        assert!(turn_over_background(&goal) && crate::turn::goal_active(&goal));
+        assert_eq!(
+            work_left(&goal),
+            None,
+            "a goal runs on by its own check-ins"
+        );
+
+        let shell = waiter_capture(include_str!("fixtures/wait_bg4.out"));
+        assert_eq!(work_left(&shell), background_wait(&shell));
+        assert!(work_left(&shell).is_some());
+        let done = "✻ Crunched for 9m 27s · done 11:07 AM · 1 shell still running";
+        let at = shell.iter().position(|r| r == done).expect("the done row");
+        let mut monitor = with_footer(shell.clone(), IDLE_AUTO_FOOTER);
+        monitor[at] = "✻ Crunched for 9m 27s · done 11:07 AM · 1 monitor still running".to_string();
+        assert_eq!(work_left(&monitor), Some("a monitor still running"));
+        let mut waiting = shell.clone();
+        waiting[at] = "✻ Waiting for 1 background agent to finish".to_string();
+        assert!(background_rest(&waiting).is_some());
+        assert_eq!(work_left(&waiting), None, "a wait with no done row");
+        let mut agents = shell.clone();
+        agents[at] =
+            "✻ Crunched for 9m 27s · done 11:07 AM · 1 shell, 1 agent still running".to_string();
+        assert!(background_rest(&agents).is_some());
+        assert_eq!(work_left(&agents), None, "work of its own process");
+        let mut bare = shell.clone();
+        bare[at] = String::new();
+        assert!(background_rest(&bare).is_some());
+        assert_eq!(work_left(&bare), None, "no turn's end drawn");
+        let workflow = waiter_capture(include_str!("fixtures/wait_bg.out"));
+        assert!(background_wait(&workflow).is_some());
+        assert_eq!(work_left(&workflow), None);
+        let outlived = crate::prompt::fixtures::screen(include_str!(
+            "fixtures/claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt"
+        ));
+        assert_eq!(background_wait(&outlived), Some("a workflow running"));
+        assert!(turn_over(&outlived));
+        assert_eq!(
+            work_left(&outlived),
+            None,
+            "a progress row outlives its work"
+        );
     }
 
     #[test]

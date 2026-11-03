@@ -92,6 +92,7 @@ impl Grid {
                     tab_stops: GridCursorState::default_tab_stops(cols),
                     tab_defaults_suppressed: false,
                     pending_wrap: false,
+                    follows_glyph: false,
                     cursor_template: Cell::EMPTY,
                     cursor_template_bg_rgb: None,
                     presentation: GridPresentationState {
@@ -188,6 +189,7 @@ impl Grid {
                     tab_stops: GridCursorState::default_tab_stops(cols),
                     tab_defaults_suppressed: false,
                     pending_wrap: false,
+                    follows_glyph: false,
                     cursor_template: Cell::EMPTY,
                     cursor_template_bg_rgb: None,
                     presentation: GridPresentationState {

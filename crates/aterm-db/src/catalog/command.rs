@@ -123,8 +123,9 @@ fn run_at(
     let bootstrap = observed_bootstrap(paths, deadline)?;
     let session = Session::observe_until(&bootstrap, deadline)?;
     let directory = Directory::new(paths, bootstrap.trust());
-    let snapshot = directory.observe_with_config(&session, config)?;
-    let rings = ring_tables(&session, &directory)?;
+    let policy = Policy::read(config)?;
+    let snapshot = directory.observe_with_policy(&session, &policy)?;
+    let rings = ring_tables(&session, &directory, &policy)?;
     let entries: Vec<_> = snapshot.entries.iter().map(|(id,entry)| {
         json!({"table":aterm_codec::hex::encode_lower(id),
             "uuid":aterm_codec::hex::encode_lower(entry.scope.table()),
@@ -153,38 +154,65 @@ fn custody_inspection(
     deadline: std::time::Instant,
 ) -> Result<Value> {
     let policy = Policy::read(config)?;
-    if !policy.enabled || policy.excluded.contains(&table) {
-        return Ok(json!({
+    let excluded = || {
+        json!({
             "kind": "commons-custody", "scope": "local-recovery-evidence",
             "table": aterm_codec::hex::encode_lower(&table),
             "claim": "not-inspected", "directory": null, "receipt_prefix": null,
             "reason": if policy.enabled { "excluded" } else { "sharing-disabled" },
             "application_authenticated": false, "can_resume_writer": false,
-        }));
+        })
+    };
+    if !policy.enabled || policy.excluded.contains(&table) {
+        return Ok(excluded());
     }
     let bootstrap = observed_bootstrap(paths, deadline)?;
+    let directory = Directory::new(paths, bootstrap.trust());
+    if !policy.includes(directory.catalog_scope().digest(), table) {
+        return Ok(excluded());
+    }
     let session = Session::observe_until(&bootstrap, deadline)?;
     Ok(crate::table::store::custody::inspect(&session, table)?.json())
 }
 
 /// Each ring's window tables, by period: their identity and how many operations this Mac retains
 /// of each (none where it holds no storage for it).
-fn ring_tables(session: &Session<'_>, directory: &Directory) -> Result<Vec<Value>> {
+/// A damaged state uses the clock's window, as repair readers do, without rebuilding the state.
+/// Excluded windows remain listed, without opening their storage.
+/// Recovery observations include authenticated primary data without restoring writer custody.
+fn ring_tables(
+    session: &Session<'_>,
+    directory: &Directory,
+    policy: &Policy,
+) -> Result<Vec<Value>> {
     let now = aterm_time::unix_millis()
         .map(|ms| ms / 1000)
         .ok_or_else(|| Error::new("system clock cannot place the ring tables"))?;
-    let ring = &ring::CLAIMS;
-    let state = directory.ring_state(session, ring)?;
     let mut tables = Vec::new();
-    for epoch in state.window(ring, now) {
-        let scope = ring.scope(directory.trust(), epoch)?;
-        let retained = Store::observe_if_exists(session, &directory.path(scope)?, scope)?
-            .map(|store| store.inventory(session).map(Iterator::count))
-            .transpose()?;
-        tables.push(
-            json!({"application":ring.application, "role":ring.role, "epoch":epoch,
-            "table":aterm_codec::hex::encode_lower(&scope.digest()), "retained":retained}),
-        );
+    for ring in ring::RINGS {
+        let state = directory.ring_view(session, ring);
+        for epoch in state.window(ring, now) {
+            let scope = ring.scope(directory.trust(), epoch)?;
+            let included = policy.includes(directory.catalog_scope().digest(), scope.digest());
+            let observation = if included {
+                directory
+                    .observe_table_if_exists(session, scope)?
+                    .map(|store| {
+                        store
+                            .inventory(session)
+                            .map(|records| (records.count(), store.is_recovery()))
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            tables.push(json!({"application":ring.application, "role":ring.role,
+                "period_s":ring.period_s, "epoch":epoch,
+                "state":if included { "subscribed" } else { "excluded" },
+                "table":aterm_codec::hex::encode_lower(&scope.digest()),
+                "retained":observation.map(|(count, _)| count),
+                "recovery_reader":observation.map(|(_, recovery)| recovery)}));
+        }
     }
     Ok(tables)
 }
@@ -292,7 +320,7 @@ fn retained_inventory_admitted(
     let directory = Directory::new(paths, bootstrap.trust());
     let catalog = directory.catalog_scope();
     let policy = Policy::read(config)?;
-    let (subscription, scope) = if !policy.enabled || policy.excluded.contains(&table) {
+    let (subscription, scope) = if !policy.includes(catalog.digest(), table) {
         ("excluded", None)
     } else if table == catalog.digest() {
         ("catalog", Some(catalog))
@@ -459,7 +487,8 @@ fn readiness(paths: &Paths, config: &Path, deadline: std::time::Instant) -> Resu
         use aterm_secrets::membership_log::{EpochAudience, NodeStanding};
         let actor = request.binding().actor();
         let recipient = request.binding().recipient();
-        let log_roster = aterm_secrets::client::local_swarm_roster_for_log(bootstrap.paths(), &log);
+        let log_roster = aterm_secrets::client::local_swarm_roster_for_log(bootstrap.paths(), &log)
+            .map_err(crate::table::failure)?;
         let membership = log.membership();
         let member = membership.get(&actor);
         let excluded_in_log = membership.removal(&actor).is_some()
@@ -1541,6 +1570,375 @@ mod tests {
         }
         assert!(!paths.dir.join("commons/tables").exists());
         assert_eq!(status(paths)["state"].as_str(), Some("ready"));
+    }
+
+    #[test]
+    fn table_listing_reports_recovery_and_journal_rings_without_writing() {
+        use aterm_secrets::commons::roster::Role;
+
+        let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+        let paths = &lab.paths[0];
+        let config = paths.home.join("config");
+        let bootstrap = lab.bootstrap(0);
+        let now = aterm_time::unix_millis().unwrap() / 1000;
+        let retained: Vec<_> = {
+            let session = Session::open(&bootstrap).unwrap();
+            let directory = Directory::new(paths, bootstrap.trust());
+            [&ring::RECOVERIES, &ring::JOURNAL]
+                .into_iter()
+                .map(|ring| {
+                    let epoch = ring.epoch_of(now);
+                    let scope = ring.scope(directory.trust(), epoch).unwrap();
+                    directory
+                        .enroll_ring(&session, ring, epoch, now)
+                        .unwrap()
+                        .commit_own(&session, b"private ring inventory fixture")
+                        .unwrap();
+                    (ring, epoch, aterm_codec::hex::encode_lower(&scope.digest()))
+                })
+                .collect()
+        };
+        let before = crate::tests::files(lab._home.path());
+        let listing = run_at("commons-tables", &mut BTreeMap::new(), paths, &config).unwrap();
+        let rings = listing["rings"].as_array().unwrap();
+        for (ring, epoch, table) in retained {
+            let entry = rings
+                .iter()
+                .find(|entry| entry["table"].as_str() == Some(table.as_str()))
+                .unwrap_or_else(|| panic!("{} / {} ring is absent", ring.application, ring.role));
+            assert_eq!(entry["application"], json!(ring.application));
+            assert_eq!(entry["role"], json!(ring.role));
+            assert_eq!(entry["period_s"], json!(ring.period_s));
+            assert_eq!(entry["epoch"], json!(epoch));
+            assert_eq!(entry["retained"], json!(1));
+        }
+        assert!(rings.iter().any(|entry| entry["retained"].is_null()));
+        assert!(
+            !listing
+                .to_string()
+                .contains("private ring inventory fixture")
+        );
+        assert!(crate::tests::files(lab._home.path()) == before);
+    }
+
+    #[test]
+    fn table_listing_tolerates_damaged_ring_state() {
+        check_ring_listing_with_bad_state(false);
+    }
+
+    #[test]
+    fn table_listing_tolerates_unreadable_ring_state() {
+        check_ring_listing_with_bad_state(true);
+    }
+
+    fn check_ring_listing_with_bad_state(state_is_directory: bool) {
+        use aterm_secrets::commons::roster::Role;
+
+        for ring in ring::RINGS {
+            let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+            let paths = &lab.paths[0];
+            let config = paths.home.join("config");
+            let bootstrap = lab.bootstrap(0);
+            let now = aterm_time::unix_millis().unwrap() / 1000;
+            let (table, epoch, state) = {
+                let session = Session::open(&bootstrap).unwrap();
+                let directory = Directory::new(paths, bootstrap.trust());
+                let epoch = ring.epoch_of(now);
+                let scope = ring.scope(directory.trust(), epoch).unwrap();
+                directory
+                    .enroll_ring(&session, ring, epoch, now)
+                    .unwrap()
+                    .commit_own(&session, b"private damaged-ring fixture")
+                    .unwrap();
+                let claims = crate::table::store::claim_dir(&session).unwrap();
+                let state = claims.join(ring.state_name());
+                if state_is_directory {
+                    std::fs::rename(&state, lab._home.path().join("original-ring-state")).unwrap();
+                    std::fs::create_dir(&state).unwrap();
+                } else {
+                    aterm_journal::write_private_durable(
+                        &claims,
+                        &ring.state_name(),
+                        b"not a ring state",
+                    )
+                    .unwrap();
+                }
+                (
+                    aterm_codec::hex::encode_lower(&scope.digest()),
+                    epoch,
+                    state,
+                )
+            };
+            let before = crate::tests::files(lab._home.path());
+            let inventory = run_at(
+                "commons-inventory",
+                &mut BTreeMap::from([("--table", table.as_str())]),
+                paths,
+                &config,
+            )
+            .unwrap();
+            assert_eq!(inventory["known"]["count"], json!(1));
+            let listing = run_at("commons-tables", &mut BTreeMap::new(), paths, &config)
+                .expect("a read-only listing must tolerate invalid local ring metadata");
+            let entry = listing["rings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["table"].as_str() == Some(table.as_str()))
+                .expect("the retained table must remain in the reader's window");
+            assert_eq!(entry["epoch"], json!(epoch));
+            assert_eq!(entry["retained"], json!(1));
+            assert!(!listing.to_string().contains("private damaged-ring fixture"));
+            assert_eq!(state.is_dir(), state_is_directory);
+            assert!(crate::tests::files(lab._home.path()) == before);
+        }
+    }
+
+    #[test]
+    fn table_listing_reports_ring_subscription_policy() {
+        use aterm_secrets::commons::roster::Role;
+
+        let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+        let paths = &lab.paths[0];
+        let config = paths.home.join("config");
+        let (table, _) = retained_ring_fixture(&lab, &ring::JOURNAL);
+        for (policy, expected, other_state) in [
+            (String::new(), "subscribed", "subscribed"),
+            ("[commons]\nenabled=false\n".into(), "excluded", "excluded"),
+            ("[swarm]\nenabled=false\n".into(), "excluded", "excluded"),
+            (
+                format!("[commons]\nexclude_tables=[\"{table}\"]\n"),
+                "excluded",
+                "subscribed",
+            ),
+        ] {
+            aterm_secrets::fsx::write_atomic(&config, policy.as_bytes(), 0o600).unwrap();
+            let before = crate::tests::files(lab._home.path());
+            let listing = run_at("commons-tables", &mut BTreeMap::new(), paths, &config).unwrap();
+            let entry = listing["rings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["table"].as_str() == Some(table.as_str()))
+                .unwrap();
+            assert_eq!(entry["state"], json!(expected));
+            for other in listing["rings"].as_array().unwrap() {
+                if other["table"].as_str() != Some(table.as_str()) {
+                    assert_eq!(other["state"], json!(other_state));
+                }
+            }
+            assert_eq!(
+                entry["retained"],
+                if expected == "subscribed" {
+                    json!(1)
+                } else {
+                    Value::Null
+                }
+            );
+            assert!(crate::tests::files(lab._home.path()) == before);
+        }
+    }
+
+    #[test]
+    fn table_listing_does_not_inspect_excluded_ring_storage() {
+        use aterm_secrets::commons::roster::Role;
+
+        for ring in ring::RINGS {
+            let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+            let paths = &lab.paths[0];
+            let config = paths.home.join("config");
+            let (table, log) = retained_ring_fixture(&lab, ring);
+            std::fs::write(&log, b"damaged excluded fixture").unwrap();
+            let catalog = {
+                let bootstrap = lab.bootstrap(0);
+                aterm_codec::hex::encode_lower(
+                    &Directory::new(paths, bootstrap.trust())
+                        .catalog_scope()
+                        .digest(),
+                )
+            };
+            for policy in [
+                "[commons]\nenabled=false\n".into(),
+                "[swarm]\nenabled=false\n".into(),
+                format!("[commons]\nexclude_tables=[\"{table}\"]\n"),
+                format!("[commons]\nexclude_tables=[\"{catalog}\"]\n"),
+            ] {
+                aterm_secrets::fsx::write_atomic(&config, policy.as_bytes(), 0o600).unwrap();
+                let before = crate::tests::files(lab._home.path());
+                let listing = run_at("commons-tables", &mut BTreeMap::new(), paths, &config)
+                    .expect("an excluded ring's storage must remain unobserved");
+                let entry = listing["rings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["table"].as_str() == Some(table.as_str()))
+                    .unwrap();
+                assert_eq!(entry["state"], json!("excluded"));
+                assert!(entry["retained"].is_null());
+                let inventory = run_at(
+                    "commons-inventory",
+                    &mut BTreeMap::from([("--table", table.as_str())]),
+                    paths,
+                    &config,
+                )
+                .unwrap();
+                assert_eq!(inventory["subscription"], json!("excluded"));
+                assert_eq!(inventory["storage"], json!("not-observed"));
+                assert!(inventory["known"].is_null());
+                let custody = run_at(
+                    "commons-custody",
+                    &mut BTreeMap::from([("--table", table.as_str())]),
+                    paths,
+                    &config,
+                )
+                .unwrap();
+                assert_eq!(custody["claim"], json!("not-inspected"));
+                assert!(custody["directory"].is_null());
+                assert!(crate::tests::files(lab._home.path()) == before);
+            }
+            aterm_secrets::fsx::write_atomic(&config, b"", 0o600).unwrap();
+            assert!(run_at("commons-tables", &mut BTreeMap::new(), paths, &config).is_err());
+        }
+    }
+
+    fn retained_ring_fixture(
+        lab: &crate::table::tests::Lab,
+        ring: &ring::Ring,
+    ) -> (String, std::path::PathBuf) {
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+        let now = aterm_time::unix_millis().unwrap() / 1000;
+        let epoch = ring.epoch_of(now);
+        let scope = ring.scope(directory.trust(), epoch).unwrap();
+        directory
+            .enroll_ring(&session, ring, epoch, now)
+            .unwrap()
+            .commit_own(&session, b"private ring policy fixture")
+            .unwrap();
+        (
+            aterm_codec::hex::encode_lower(&scope.digest()),
+            directory.path(scope).unwrap().join("table.astream"),
+        )
+    }
+
+    #[test]
+    fn table_listing_includes_recovery_only_ring_storage() {
+        check_recovery_ring_listing(false);
+    }
+
+    #[test]
+    fn table_listing_combines_primary_and_recovery_ring_storage() {
+        check_recovery_ring_listing(true);
+    }
+
+    fn check_recovery_ring_listing(keep_primary: bool) {
+        use aterm_secrets::commons::roster::Role;
+
+        for ring in ring::RINGS {
+            let lab = crate::table::tests::Lab::new(&[Role::Writer, Role::Writer]);
+            let paths = &lab.paths[0];
+            let config = paths.home.join("config");
+            let now = aterm_time::unix_millis().unwrap() / 1000;
+            let (scope, primary_wire) = recovery_listing_wire(&lab, 0, ring, now);
+            let table = aterm_codec::hex::encode_lower(&scope.digest());
+            let primary_listing =
+                run_at("commons-tables", &mut BTreeMap::new(), paths, &config).unwrap();
+            let recovered_wire = if keep_primary {
+                let (other_scope, wire) = recovery_listing_wire(&lab, 1, ring, now);
+                assert_eq!(other_scope, scope);
+                wire
+            } else {
+                primary_wire
+            };
+            let recovery_log = {
+                let bootstrap = lab.bootstrap(0);
+                let session = Session::open(&bootstrap).unwrap();
+                let directory = Directory::new(paths, bootstrap.trust());
+                if !keep_primary {
+                    std::fs::rename(
+                        directory.path(scope).unwrap(),
+                        lab._home.path().join("original-ring"),
+                    )
+                    .unwrap();
+                }
+                let recovery = directory.recovery();
+                recovery
+                    .enroll(&session, scope)
+                    .unwrap()
+                    .ingest(&session, &recovered_wire)
+                    .unwrap();
+                recovery.path(scope).unwrap().join("table.astream")
+            };
+            let before = crate::tests::files(lab._home.path());
+            let expected = if keep_primary { 2 } else { 1 };
+            let detailed = inspect_inventory(paths, &config, scope.digest()).unwrap();
+            assert_eq!(detailed["known"]["count"], json!(expected));
+            assert_eq!(detailed["recovery_reader"], json!(true));
+            assert_eq!(detailed["writer_resume_authorized"], json!(false));
+            let listing = run_at("commons-tables", &mut BTreeMap::new(), paths, &config).unwrap();
+            let entry = listing["rings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["table"].as_str() == Some(table.as_str()))
+                .unwrap();
+            assert_eq!(entry["retained"], detailed["known"]["count"]);
+            assert_eq!(entry["recovery_reader"], json!(true));
+            let primary_entry = primary_listing["rings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["table"].as_str() == Some(table.as_str()))
+                .unwrap();
+            assert_eq!(primary_entry["retained"], json!(1));
+            assert_eq!(primary_entry["recovery_reader"], json!(false));
+            assert!(
+                !listing
+                    .to_string()
+                    .contains("private recovery inventory fixture")
+            );
+            assert!(crate::tests::files(lab._home.path()) == before);
+
+            aterm_secrets::fsx::write_atomic(&config, b"[commons]\nenabled=false\n", 0o600)
+                .unwrap();
+            std::fs::write(&recovery_log, b"damaged excluded recovery fixture").unwrap();
+            let before = crate::tests::files(lab._home.path());
+            let excluded = run_at("commons-tables", &mut BTreeMap::new(), paths, &config).unwrap();
+            let entry = excluded["rings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["table"].as_str() == Some(table.as_str()))
+                .unwrap();
+            assert_eq!(entry["state"], json!("excluded"));
+            assert!(entry["retained"].is_null());
+            assert!(entry["recovery_reader"].is_null());
+            assert!(crate::tests::files(lab._home.path()) == before);
+            aterm_secrets::fsx::write_atomic(&config, b"", 0o600).unwrap();
+            let before = crate::tests::files(lab._home.path());
+            assert!(run_at("commons-tables", &mut BTreeMap::new(), paths, &config).is_err());
+            assert!(crate::tests::files(lab._home.path()) == before);
+        }
+    }
+
+    fn recovery_listing_wire(
+        lab: &crate::table::tests::Lab,
+        actor: usize,
+        ring: &ring::Ring,
+        now: u64,
+    ) -> (Scope, Vec<u8>) {
+        let bootstrap = lab.bootstrap(actor);
+        let session = Session::open(&bootstrap).unwrap();
+        let directory = Directory::new(&lab.paths[actor], bootstrap.trust());
+        let epoch = ring.epoch_of(now);
+        let scope = ring.scope(directory.trust(), epoch).unwrap();
+        let mut store = directory.enroll_ring(&session, ring, epoch, now).unwrap();
+        let receipt = store
+            .commit_own(&session, b"private recovery inventory fixture")
+            .unwrap();
+        let wire = store.wire(&session, &receipt.id).unwrap().unwrap().to_vec();
+        (scope, wire)
     }
 
     #[test]

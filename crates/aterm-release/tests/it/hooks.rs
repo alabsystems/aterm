@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::hook::{
     Asked, PrePromote, Transforms, cutter_command, handed, pre_promote, running_cutter_command,
-    source_differs, transforms,
+    transforms,
 };
 use crate::transforms::{Inputs, run};
 
@@ -914,6 +914,7 @@ fn cutter_history(root: &Path, git: &Git) -> (PathBuf, [String; 3]) {
     git.init(&repo);
     std::fs::write(repo.join("README.md"), "readme\n").unwrap();
     std::fs::write(repo.join("Cargo.lock"), "# lock\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "target/\npublish/.out/\n").unwrap();
     let c0 = git.commit_all(&repo, "no cutter yet");
     let rules = repo.join("crates/aterm-release/src");
     std::fs::create_dir_all(&rules).unwrap();
@@ -986,7 +987,7 @@ fn dispatch(facts: &Transforms) -> (i32, Ran, String) {
 }
 
 #[test]
-fn the_transforms_run_as_the_captured_commits_own_code() {
+fn transforms_reuse_only_the_exact_proved_running_build_even_with_ignored_outputs() {
     let (_dir, root, git) = scratch();
     let (repo, [_, c1, c2]) = cutter_history(&root, &git);
     let facts = |captured: &str| Transforms {
@@ -995,13 +996,12 @@ fn the_transforms_run_as_the_captured_commits_own_code() {
             export: root.join("export"),
             captured: captured.to_string(),
         },
-        source: repo.join("crates/aterm-release"),
         target: Some(PathBuf::from("build/shared")),
         delegated: None,
         handed: None,
+        running: Ok(c2.clone()),
         git_env: git.env.clone(),
     };
-    let rules = repo.join("crates/aterm-release/src/transforms.rs");
     let there = |rules: &str, full: &str| Ran::There {
         rules: rules.into(),
         full: full.into(),
@@ -1011,58 +1011,55 @@ fn the_transforms_run_as_the_captured_commits_own_code() {
     let (code, ran, said) = dispatch(&facts("HEAD"));
     assert_eq!((code, ran), (0, Ran::Here(c2.clone())), "{said}");
     assert!(said.contains("== rewritten"), "{said}");
-    std::fs::write(repo.join("README.md"), "edited\n").unwrap();
-    assert_eq!(dispatch(&facts(&c2)).1, there("// TWO\n", &c2));
-    std::fs::write(repo.join("README.md"), "readme\n").unwrap();
-
-    for (edit, undo) in [
-        (
-            Box::new(|| std::fs::write(&rules, "// WIP\n").unwrap()) as Box<dyn Fn()>,
-            Box::new(|| std::fs::write(&rules, "// TWO\n").unwrap()) as Box<dyn Fn()>,
-        ),
-        (
-            Box::new(|| std::fs::write(rules.with_file_name("new.rs"), "\n").unwrap()),
-            Box::new(|| std::fs::remove_file(rules.with_file_name("new.rs")).unwrap()),
-        ),
-        (
-            Box::new(|| std::fs::write(repo.join("Cargo.lock"), "# moved\n").unwrap()),
-            Box::new(|| std::fs::write(repo.join("Cargo.lock"), "# lock\n").unwrap()),
-        ),
+    assert_eq!(git.ok(&repo, &["status", "--porcelain"]), "");
+    for stamp in [
+        Ok(c1.clone()),
+        Ok(c2[..12].to_owned()),
+        Err("missing or stale startup proof".into()),
     ] {
-        edit();
-        let (code, ran, said) = dispatch(&facts(&c2));
+        let mut unproved = facts(&c2);
+        unproved.running = stamp;
+        let (code, ran, said) = dispatch(&unproved);
         assert_eq!((code, ran), (0, there("// TWO\n", &c2)), "{said}");
-        assert!(
-            said.contains(&format!(
-                "running {}'s own `ship hook transforms`",
-                &c2[..12]
-            )),
-            "{said}"
-        );
-        undo();
+        assert!(!said.contains("nothing built"));
+        unproved.delegated = Some(c2.clone());
+        assert_eq!(dispatch(&unproved).0, 1);
     }
-    assert_eq!(source_differs(&repo, &git.env, &c2), None);
+
+    for path in ["target/linked-helper", "publish/.out/export/created"] {
+        let path = repo.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "output\n").unwrap();
+    }
+    let (code, ran, said) = dispatch(&facts(&c2));
+    assert_eq!((code, ran), (0, Ran::Here(c2.clone())), "{said}");
+    assert!(said.contains("this running cutter's verified build"));
+    assert!(!said.contains("handed to the engine"));
+    assert_eq!(git.ok(&repo, &["status", "--porcelain"]), "");
 
     let (code, ran, said) = dispatch(&facts(&c1[..10]));
     assert_eq!((code, ran), (0, there("// ONE\n", &c1)), "{said}");
     assert_eq!(worktrees(&git, &repo), 1);
-    assert_eq!(std::fs::read_to_string(&rules).unwrap(), "// TWO\n");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("crates/aterm-release/src/transforms.rs")).unwrap(),
+        "// TWO\n"
+    );
 }
 
 #[test]
 fn the_transforms_refuse_rather_than_run_other_rules() {
     let (_dir, root, git) = scratch();
-    let (repo, [c0, c1, _]) = cutter_history(&root, &git);
+    let (repo, [c0, c1, c2]) = cutter_history(&root, &git);
     let facts = |captured: &str, delegated: Option<&str>| Transforms {
         inputs: Inputs {
             root: repo.clone(),
             export: root.join("export"),
             captured: captured.to_string(),
         },
-        source: repo.join("crates/aterm-release"),
         target: None,
         delegated: delegated.map(str::to_string),
         handed: None,
+        running: Ok(c2.clone()),
         git_env: git.env.clone(),
     };
     for (facts, words) in [
@@ -1073,7 +1070,7 @@ fn the_transforms_refuse_rather_than_run_other_rules() {
         ),
         (
             facts(&c1, Some(&c1)),
-            "own cutter does not find its source to be",
+            "own cutter cannot prove its build is",
         ),
     ] {
         let (code, ran, said) = dispatch(&facts);
@@ -1099,10 +1096,10 @@ fn a_handed_cutter_runs_the_transforms_only_as_the_captured_commits_build() {
             export: root.join("export"),
             captured: c2.clone(),
         },
-        source: repo.join("crates/aterm-release"),
         target: None,
         delegated: None,
         handed,
+        running: Err("not judged at startup".into()),
         git_env: git.env.clone(),
     };
     let own = || Ran::There {
@@ -1120,10 +1117,10 @@ fn a_handed_cutter_runs_the_transforms_only_as_the_captured_commits_build() {
         )),
         "{said}"
     );
-    // Negative control: judged by its checkout, as a cutter targo built is, it is not c2's.
+    // A clean-looking source tree cannot substitute for an actual startup judgment.
     let (code, ran, said) = dispatch(&facts(None));
     assert_eq!((code, ran), (0, own()), "{said}");
-    assert!(said.contains("holds files"), "{said}");
+    assert!(said.contains("not judged at startup"), "{said}");
 
     let dirty = "its checkout has uncommitted cutter sources (Cargo.lock)".to_string();
     for (handed, words) in [
@@ -1146,7 +1143,7 @@ fn a_handed_cutter_runs_the_transforms_only_as_the_captured_commits_build() {
 
 /// A cutter is handed to the engine only when `ATERM_RELEASE_CUTTER` names its own executable,
 /// spelled through a link or not; one `targo` built that inherited the variable naming another
-/// cutter, or a path that names nothing, keeps its whole-checkout rule, and so does a cutter
+/// cutter, or a path that names nothing, requires its separate running build proof, as does one
 /// that cannot name its own executable. NEGATIVE CONTROL: take any variable that is set, and
 /// another cutter's path hands this one.
 #[test]
@@ -1239,153 +1236,4 @@ fn the_transforms_stub_runs_a_handed_cutter_and_builds_one_only_without() {
     );
     assert_eq!(sourced(None), built);
     assert_eq!(sourced(Some(Path::new(""))), built);
-}
-
-#[test]
-fn export_cutter_attests_dependency_sources_and_workspace_inputs() {
-    let (_dir, root, git) = scratch();
-    let (repo, _) = cutter_history(&root, &git);
-    let tracked = [
-        "crates/aterm-toml/src/lib.rs",
-        "crates/aterm-json/src/lib.rs",
-        "crates/aterm-uds/src/lib.rs",
-        "crates/aterm-toml/build.rs",
-        "Cargo.toml",
-        "rust-toolchain.toml",
-        ".cargo/config.toml",
-    ];
-    for path in tracked {
-        let path = repo.join(path);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, "# captured input\n").unwrap();
-    }
-    std::fs::write(
-        repo.join(".gitignore"),
-        ".cargo/local.toml\ncrates/aterm-toml/src/local.rs\ntarget/\n",
-    )
-    .unwrap();
-    let captured = git.commit_all(&repo, "the cutter's effective source inputs");
-    let facts = Transforms {
-        inputs: Inputs {
-            root: repo.clone(),
-            export: root.join("export"),
-            captured: captured.clone(),
-        },
-        source: repo.join("crates/aterm-release"),
-        target: Some(root.join("shared-target")),
-        delegated: None,
-        handed: None,
-        git_env: git.env.clone(),
-    };
-    assert_eq!(dispatch(&facts).1, Ran::Here(captured.clone()));
-    let differs = || source_differs(&facts.source, &git.env, &captured);
-    let mut wrong = Vec::new();
-    for path in tracked {
-        let file = repo.join(path);
-        std::fs::write(&file, "# local code or build setting\n").unwrap();
-        if differs().is_none() {
-            wrong.push(format!("tracked {path}"));
-        }
-        std::fs::write(file, "# captured input\n").unwrap();
-        assert_eq!(differs(), None, "restored {path}");
-    }
-    let extras = [
-        "crates/aterm-json/src/new.rs",
-        "crates/aterm-toml/src/local.rs",
-        ".cargo/local.toml",
-        "target/ignored-build-artifact",
-    ];
-    for path in extras {
-        let file = repo.join(path);
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, "local input\n").unwrap();
-        if differs().is_none() {
-            wrong.push(format!("extra {path}"));
-        }
-        std::fs::remove_file(file).unwrap();
-        assert_eq!(differs(), None, "removed {path}");
-    }
-    assert!(
-        wrong.is_empty(),
-        "local inputs read as the captured source: {wrong:#?}"
-    );
-    let expected = Ran::There {
-        rules: "// TWO\n".to_owned(),
-        full: captured.clone(),
-        target: root.join("shared-target/pre-promote.noindex"),
-    };
-    for (path, captured_body) in [
-        ("crates/aterm-json/src/lib.rs", Some("# captured input\n")),
-        ("target/ignored-build-artifact", None),
-    ] {
-        let file = repo.join(path);
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, "# local code or build setting\n").unwrap();
-        let (code, ran, said) = dispatch(&facts);
-        assert_eq!((code, &ran), (0, &expected), "{path}: {said}");
-        match captured_body {
-            Some(body) => std::fs::write(file, body).unwrap(),
-            None => std::fs::remove_file(file).unwrap(),
-        }
-        assert_eq!(dispatch(&facts).1, Ran::Here(captured.clone()), "{path}");
-    }
-    assert_eq!(worktrees(&git, &repo), 1, "delegated trees were removed");
-}
-
-#[test]
-fn export_cutter_attests_submodule_working_sources() {
-    let (_dir, root, git) = scratch();
-    let sub = root.join("dependency");
-    git.init(&sub);
-    std::fs::write(sub.join("lib.rs"), "// captured dependency\n").unwrap();
-    std::fs::write(sub.join(".gitignore"), "local.rs\n").unwrap();
-    git.commit_all(&sub, "dependency");
-    let (repo, _) = cutter_history(&root, &git);
-    git.ok(
-        &repo,
-        &[
-            "submodule",
-            "add",
-            "-q",
-            &sub.to_string_lossy(),
-            "vendor/dependency",
-        ],
-    );
-    let captured = git.commit_all(&repo, "the cutter's gitlink");
-    let facts = Transforms {
-        inputs: Inputs {
-            root: repo.clone(),
-            export: root.join("export"),
-            captured: captured.clone(),
-        },
-        source: repo.join("crates/aterm-release"),
-        target: Some(root.join("shared-target")),
-        delegated: None,
-        handed: None,
-        git_env: git.env.clone(),
-    };
-    assert_eq!(dispatch(&facts).1, Ran::Here(captured.clone()));
-    let dependency = repo.join("vendor/dependency");
-    let mut wrong = Vec::new();
-    for (path, original) in [
-        ("lib.rs", Some("// captured dependency\n")),
-        ("local.rs", None),
-    ] {
-        std::fs::write(dependency.join(path), "// local dependency code\n").unwrap();
-        let (code, ran, said) = dispatch(&facts);
-        if code != 0 || !matches!(ran, Ran::There { ref full, .. } if *full == captured) {
-            wrong.push(format!("submodule {path}: {code}, {ran:?}, {said}"));
-        }
-        if let Some(original) = original {
-            std::fs::write(dependency.join(path), original).unwrap();
-        } else {
-            std::fs::remove_file(dependency.join(path)).unwrap();
-        }
-        assert_eq!(dispatch(&facts).1, Ran::Here(captured.clone()));
-    }
-    assert_eq!(worktrees(&git, &repo), 1);
-    assert!(
-        wrong.is_empty(),
-        "local submodule code ran as attested: {wrong:#?}"
-    );
 }

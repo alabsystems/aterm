@@ -121,7 +121,11 @@ impl TerminalHandler<'_> {
     #[inline]
     pub(super) fn write_char(&mut self, c: char) {
         let origin = self.grid.output_damage_origin();
+        let left_of_margin = self.grid.cursor_left_of_margin();
         self.write_char_body(c);
+        if left_of_margin {
+            self.grid.note_print_from_left_of_margin();
+        }
         self.grid.damage_selection_output(origin);
     }
 
@@ -186,8 +190,9 @@ impl TerminalHandler<'_> {
         // addressing never reaches here (`print_unicode_bulk` routes it per
         // character). U+00A0-U+00FF may need GR-mapped translation when a
         // non-ASCII charset is designated on the GR G-set, so fall back then,
-        // and on a screen one column wide, where `write_char` prints a wide
-        // glyph as a narrow space.
+        // on a screen one column wide, where `write_char` prints a wide
+        // glyph as a narrow space, and outside the margins, where a print can
+        // step onto the left one.
         if self.modes.insert_mode
             || !self.modes.auto_wrap
             || self.transient.has_transient_extras
@@ -195,6 +200,7 @@ impl TerminalHandler<'_> {
             || self.transient.last_combining_was_zwj
             || !self.charset.gr_is_passthrough()
             || self.grid.cols() < 2
+            || self.grid.cursor_outside_margin_span()
         {
             for &c in chars {
                 self.write_char(c);
@@ -555,28 +561,39 @@ impl TerminalHandler<'_> {
     }
 
     /// The glyph a zero-width mark continues: the parked one under a pending wrap, else the one
-    /// left of the cursor, and a wide glyph's lead rather than its spacer. Column 0 and the left
-    /// margin have none, on a row that continues the one above too, and no mark reaches across
-    /// a left margin (xterm's `char_was_written` cleared by CR or a motion gives the cursor's
-    /// own cell there, as Alacritty's zero-width push does).
+    /// left of the cursor, and a wide glyph's lead rather than its spacer.
+    ///
+    /// A cursor a CR or a motion put on column 0 or the left margin has none, on a row that
+    /// continues the one above too (xterm's `char_was_written` cleared gives the cursor's own cell
+    /// there, as Alacritty's zero-width push does). One a print or a rewrap left there still follows
+    /// its glyph ([`aterm_grid::Grid::cursor_follows_glyph`]): the one just left of the margin, or
+    /// the last on the row above.
     fn preceding_cell(&self) -> Option<(u16, u16)> {
         let row = self.grid.cursor_row();
         let col = self.grid.cursor_col();
-        let at_left_margin =
-            self.grid.has_horizontal_margins() && col == self.grid.horizontal_margins().left;
 
-        let target_col = if self.grid.pending_wrap() {
-            col
-        } else if col > 0 && !at_left_margin {
-            col - 1
+        let (target_row, target_col) = if self.grid.pending_wrap() {
+            (row, col)
+        } else if self.grid.cursor_starts_its_span() && !self.grid.cursor_follows_glyph() {
+            return None;
+        } else if col > 0 {
+            (row, col - 1)
+        } else if self.grid.row(row).is_some_and(aterm_grid::Row::is_wrapped) {
+            let above = row.checked_sub(1)?;
+            let end = self
+                .grid
+                .row(above)?
+                .len()
+                .min(self.grid.effective_cols_for_row(above));
+            (above, end.checked_sub(1)?)
         } else {
             return None;
         };
 
-        if target_col > 0 && self.grid.is_wide_continuation_at(row, target_col) {
-            Some((row, target_col - 1))
+        if target_col > 0 && self.grid.is_wide_continuation_at(target_row, target_col) {
+            Some((target_row, target_col - 1))
         } else {
-            Some((row, target_col))
+            Some((target_row, target_col))
         }
     }
 
@@ -608,13 +625,14 @@ impl TerminalHandler<'_> {
 
     /// Where a selector's change of width has to stop for the glyph at `(row, col)`, one past the
     /// last column it may use: the right margin of a glyph inside it, as a wide glyph's own write
-    /// stops there, else the row's end.
+    /// stops there, else the row's end, which a double-width row keeps at its usable half.
     fn cluster_line_end(&self, row: u16, col: u16) -> u16 {
+        let line_end = self.grid.effective_cols_for_row(row);
         let right = self.grid.horizontal_margins().right;
         if self.grid.has_horizontal_margins() && col <= right {
-            right.saturating_add(1)
+            right.saturating_add(1).min(line_end)
         } else {
-            self.grid.effective_cols_for_row(row)
+            line_end
         }
     }
 
@@ -622,6 +640,10 @@ impl TerminalHandler<'_> {
         let Some((row, col)) = self.preceding_cell() else {
             return;
         };
+        // The cursor's advance past the spacer has no meaning from a row a rewrap left above it.
+        if row != self.grid.cursor_row() {
+            return;
+        }
 
         let Some(cell) = self.grid.cell(row, col) else {
             return;
@@ -1026,6 +1048,203 @@ mod tests {
         );
     }
 
+    /// `text` printed from column `at` (0-based), left of a 3;6 margin on a row ten wide: whole,
+    /// and a code point to a chunk, so neither the bulk lane nor a chunk boundary changes it.
+    fn printed_from_left_of_the_margin(at: u16, text: &str) -> [Terminal; 2] {
+        let setup = format!("\x1b[?69h\x1b[3;6s\x1b[1;{}H", at + 1);
+        let mut whole = Terminal::new(2, 10);
+        whole.process(setup.as_bytes());
+        whole.process(text.as_bytes());
+        let mut fragmented = Terminal::new(2, 10);
+        fragmented.process(setup.as_bytes());
+        let mut buf = [0u8; 4];
+        for c in text.chars() {
+            fragmented.process(c.encode_utf8(&mut buf).as_bytes());
+        }
+        [whole, fragmented]
+    }
+
+    #[test]
+    fn a_cluster_continues_the_glyph_printed_up_to_a_left_margin() {
+        for (at, text, base, x_col) in [
+            (1, "e\u{301}X", "e\u{301}", 2u16),
+            (1, "\u{E9}\u{301}X", "\u{E9}\u{301}", 2),
+            (1, "\u{2600}\u{FE0F}X", "\u{2600}\u{FE0F}", 3),
+            (
+                0,
+                "\u{1F468}\u{200D}\u{1F4BB}X",
+                "\u{1F468}\u{200D}\u{1F4BB}",
+                2,
+            ),
+            (0, "\u{1F44D}\u{1F3FD}X", "\u{1F44D}\u{1F3FD}", 2),
+            (0, "\u{1F1FA}\u{1F1F8}X", "\u{1F1FA}\u{1F1F8}", 2),
+        ] {
+            for term in printed_from_left_of_the_margin(at, text) {
+                assert_eq!(
+                    term.cell_grapheme(0, usize::from(at)).as_deref(),
+                    Some(base),
+                    "{text:?}"
+                );
+                assert_eq!(
+                    term.grid().cell(0, x_col).map(|c| c.char()),
+                    Some('X'),
+                    "{text:?}"
+                );
+                assert_eq!(term.cursor().col, x_col + 1, "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_motion_onto_a_left_margin_ends_the_cluster_a_print_there_left_open() {
+        for between in [
+            "\r",
+            "\x08",
+            "\x1b[D",
+            "\x1b[1;3H",
+            "\x1b[3G",
+            "\x1b[3`",
+            "\x1b7\x1b8",
+            "\x1b[I\x1b[Z\x1b[3G",
+            "\x1b[K",
+        ] {
+            let mut term = Terminal::new(2, 10);
+            term.process(format!("\x1b[?69h\x1b[3;6s\x1b[1;2He{between}\u{301}").as_bytes());
+            assert_eq!(term.cursor().col, 2, "{between:?}: on the margin");
+            assert_eq!(
+                term.cell_grapheme(0, 1).as_deref(),
+                Some("e"),
+                "{between:?}"
+            );
+            assert_eq!(
+                term.grid().cell_extra(0, 2).map(|e| e.combining()),
+                Some(['\u{301}'].as_slice()),
+                "{between:?}: the cursor's own cell takes it"
+            );
+        }
+        // A rendition change moves nothing, so the glyph is still the one before the cursor.
+        let mut term = Terminal::new(2, 10);
+        term.process("\x1b[?69h\x1b[3;6s\x1b[1;2He\x1b[31m\u{301}".as_bytes());
+        assert_eq!(term.cell_grapheme(0, 1).as_deref(), Some("e\u{301}"));
+    }
+
+    #[test]
+    fn a_rewrap_keeps_the_glyph_before_the_cursor_across_the_row_it_opened() {
+        let rewrapped = |before: &str, cols: u16| {
+            let mut term = Terminal::new(3, 8);
+            term.process(before.as_bytes());
+            term.resize(3, cols);
+            assert_eq!(term.cursor().col, 0, "{before:?}: on column 0");
+            assert!(
+                term.grid().row(1).is_some_and(aterm_grid::Row::is_wrapped),
+                "{before:?}: of a row that continues the one above"
+            );
+            term
+        };
+        let mut term = rewrapped("abcd", 4);
+        term.process("\u{301}".as_bytes());
+        assert_eq!(term.cell_grapheme(0, 3).as_deref(), Some("d\u{301}"));
+        assert!(term.grid().cell_extra(1, 0).is_none());
+
+        for (before, after, joined) in [
+            ("\u{1F44D}", "\u{1F3FD}", "\u{1F44D}\u{1F3FD}"),
+            (
+                "\u{1F468}\u{200D}",
+                "\u{1F4BB}",
+                "\u{1F468}\u{200D}\u{1F4BB}",
+            ),
+            ("\u{1F1FA}", "\u{1F1F8}", "\u{1F1FA}\u{1F1F8}"),
+        ] {
+            let mut term = rewrapped(before, 2);
+            term.process(after.as_bytes());
+            assert_eq!(
+                term.cell_grapheme(0, 0).as_deref(),
+                Some(joined),
+                "{before:?}"
+            );
+            assert_eq!(term.cursor().col, 0, "{before:?}: and the cursor stays");
+        }
+
+        // A wide glyph that would not fit moved down and left a hole on the row above: the glyph
+        // before the cursor is the last one on that row, not the hole.
+        let mut term = Terminal::new(3, 8);
+        term.process("abc\u{4E2D}\x1b[1;4H".as_bytes());
+        term.resize(3, 4);
+        assert_eq!((term.cursor().row, term.cursor().col), (1, 0));
+        term.process("\u{301}".as_bytes());
+        assert_eq!(term.cell_grapheme(0, 2).as_deref(), Some("c\u{301}"));
+        assert!(term.grid().cell_extra(0, 3).is_none());
+
+        // A selector can't widen a glyph on the row above, and leaves the cursor where it is.
+        let mut term = Terminal::new(3, 8);
+        term.process("abc\u{2600}".as_bytes());
+        term.resize(3, 4);
+        assert_eq!((term.cursor().row, term.cursor().col), (1, 0));
+        term.process("\u{FE0F}".as_bytes());
+        assert!(!term.grid().cell(0, 3).is_some_and(|c| c.is_wide()));
+        assert_eq!((term.cursor().row, term.cursor().col), (1, 0));
+        assert_eq!(
+            term.cell_grapheme(0, 3).as_deref(),
+            Some("\u{2600}\u{FE0F}")
+        );
+
+        // A CR there is a motion: it is the column-0 rule again, and so is a cursor a CR had put
+        // on a continued column 0 before the rewrap.
+        let mut term = rewrapped("abcd", 4);
+        term.process("\r\u{301}".as_bytes());
+        assert!(term.grid().cell_extra(0, 3).is_none());
+        assert_eq!(
+            term.grid().cell_extra(1, 0).map(|e| e.combining()),
+            Some(['\u{301}'].as_slice())
+        );
+        let mut term = Terminal::new(4, 4);
+        term.process("abcdefgh\r".as_bytes());
+        term.resize(4, 2);
+        term.process("\u{301}".as_bytes());
+        assert_eq!(term.cursor().col, 0);
+        assert!(
+            term.grid().cell_extra(term.cursor().row - 1, 1).is_none(),
+            "no glyph precedes a cursor a CR placed"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_keeps_the_glyph_before_the_cursor() {
+        let restored = |term: &Terminal| {
+            let cp = term.checkpoint();
+            let mut back = Terminal::new(2, 10);
+            back.restore_checkpoint(&cp);
+            back
+        };
+        let mut term = Terminal::new(2, 10);
+        term.process("\x1b[?69h\x1b[3;6s\x1b[1;2He".as_bytes());
+        let mut back = restored(&term);
+        back.process("\u{301}".as_bytes());
+        assert_eq!(back.cell_grapheme(0, 1).as_deref(), Some("e\u{301}"));
+        // Negative control: the same cursor after a CR is a cursor a motion placed.
+        term.process(b"\r");
+        let mut back = restored(&term);
+        back.process("\u{301}".as_bytes());
+        assert_eq!(back.cell_grapheme(0, 1).as_deref(), Some("e"));
+    }
+
+    #[test]
+    fn a_selector_stays_inside_a_double_width_row() {
+        let mut term = Terminal::new(2, 20);
+        term.process("\x1b#6\x1b[?69h\x1b[1;15s\x1b[1;10H\u{2600}\u{FE0F}".as_bytes());
+        let grid = term.grid();
+        assert_eq!(grid.effective_cols_for_row(0), 10);
+        assert!(
+            !grid.cell(0, 9).is_some_and(|c| c.is_wide()),
+            "no room for a spacer on the row's usable last column"
+        );
+        assert_eq!(grid.cell(0, 10).map(|c| c.char()), Some(' '));
+        assert!(!grid.cell(0, 10).is_some_and(|c| c.is_wide_continuation()));
+    }
+
+    /// A motion onto a spacer at a left margin has no glyph before it, and the cursor's own cell is
+    /// half of one, so the lead takes the mark though it lies outside the margin: nothing reads a
+    /// spacer's marks.
     #[test]
     fn a_mark_on_a_spacer_at_a_left_margin_rides_the_lead() {
         let mut term = Terminal::new(1, 10);

@@ -699,6 +699,8 @@ pub struct StateDir {
     #[cfg(test)]
     adopt_without_the_attach: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    keep_earlier_boot_reservations: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     proof_rule: std::sync::Mutex<ProofRule>,
 }
 
@@ -1522,6 +1524,8 @@ impl StateDir {
             #[cfg(test)]
             adopt_without_the_attach: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            keep_earlier_boot_reservations: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             proof_rule: std::sync::Mutex::default(),
         }
     }
@@ -1561,6 +1565,14 @@ impl StateDir {
     #[cfg(test)]
     pub(crate) fn adopt_without_the_attach(&self, on: bool) {
         self.adopt_without_the_attach
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of the sweep of an earlier boot's sessions that retires none of
+    /// their post reservations ([`crate::sim::world::Mutant::KeepEarlierBootReservations`]).
+    #[cfg(test)]
+    pub(crate) fn keep_earlier_boot_reservations(&self, on: bool) {
+        self.keep_earlier_boot_reservations
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -3647,7 +3659,13 @@ impl StateDir {
     /// in-flight record names. A departed session's subjects are given back to the subject
     /// budget only once none of this names them (`Bridge::reclaim_subjects`). A reservation that
     /// does not parse (a receipt's, or an older build's `sent/<sid>.<id>` the journal held where
-    /// it is) still names its session.
+    /// it is) still names its session. What a session of an earlier boot left reserved, which no
+    /// drain retires, goes at the first start of a later boot that finds the last bridge ran in
+    /// an earlier one ([`StateDir::sweep_sessions_of_an_earlier_boot`]): the next boot's, but
+    /// a reservation whose sequence a record in flight still holds there waits for a later
+    /// boot's sweep, and a start whose first roster does not read, or that comes after an
+    /// attach of its own boot, leaves it to a later boot's too. A dir off the boot volume never
+    /// finds an earlier boot, and there it stays.
     ///
     /// # Errors
     /// A directory or an entry that cannot be read, the journal damaged, or an older build's
@@ -3882,35 +3900,72 @@ impl StateDir {
         earlier(then) && lease.is_none_or(|lease| earlier(lease.boot))
     }
 
-    /// AN EARLIER BOOT'S SESSIONS' FILES GO: every `keys/<sid>`, `acks/<sid>.<rid>`,
-    /// `unhandled/<sid>`, `seen/<sid>` and `topics/<sid>` of a sid `live` does not name is
-    /// unlinked, and how many returned. aterm mints a new sid at every launch, a restore reopens
-    /// a tab under a new one, and no successor keeps a sid across a reboot, so nothing reads them
-    /// again; left, each is a file a later stop flushes and a replaced log's
-    /// ([`StateDir::forget_log_offsets`]) rewrites, and a receipt's reservation holds its
-    /// session's subjects back from the budget ([`StateDir::owed_publications`]). `live` is the
-    /// roster aterm answered at the start: a bridge of this boot whose run record could not be
-    /// written may have left files of the sessions that still run. A file of a [`TornKind`] that
-    /// does not read whole stays where it is, for the sweep of torn files or a person. Nothing of
-    /// `inflight/`, `sent/` or the post journal is touched: an earlier boot's posts follow their
-    /// own rules ([`StateDir::retire_in_flight_of_an_earlier_boot`]). The unlinks are not
-    /// flushed: a file a power cut brings back is whole and no session reads it, and the next
-    /// boot's sweep unlinks it again. The bridge sweeps once, at its start's first roster where
-    /// that reads, and where [`StateDir::last_ran_in_an_earlier_boot`] said so before the run
-    /// record named this boot; no later roster sweeps.
+    /// AN EARLIER BOOT'S SESSIONS' FILES AND RESERVATIONS GO: every `keys/<sid>`,
+    /// `acks/<sid>.<rid>`, `unhandled/<sid>`, `seen/<sid>` and `topics/<sid>` of a sid `live`
+    /// does not name is unlinked, then each post reservation the journal holds for such a sid
+    /// is retired ([`journal::Frame::Retire`]), and how many of both returned. aterm mints a
+    /// new sid at every launch, a restore reopens a tab under a new one, and no successor keeps
+    /// a sid across a reboot, so nothing reads the files again and no drain retires the posts
+    /// (only aterm's `outbox sent` did, [`StateDir::clear_post_seq`]); left, each file is one a
+    /// later stop flushes and a replaced log's ([`StateDir::forget_log_offsets`]) rewrites, and
+    /// a receipt's reservation or a post's holds its session and the subjects it names back
+    /// from the budget ([`StateDir::owed_publications`]), boot after boot, the producer id
+    /// being the node's. `live` is the roster aterm answered at the start: a bridge of this
+    /// boot whose run record could not be written may have left files and reservations of the
+    /// sessions that still run. A file of a [`TornKind`] that does not read whole stays where
+    /// it is, for the sweep of torn files or a person. A reservation whose sequence a record in
+    /// flight holds stays too: an entry carries no sid and is tied to its post's reservation by
+    /// its pin's sequence alone, the attach publishes it again at that pin
+    /// (`Bridge::settle_in_flight`), and the next boot's sweep retires the reservation once it
+    /// settled. Nothing of `inflight/` or `sent/` is touched (an older build's reservation the
+    /// journal could not take in is left for a person, [`Posts::held_sent`]), nor any record in
+    /// flight: an earlier boot's records in flight follow their own rules
+    /// ([`StateDir::retire_in_flight_of_an_earlier_boot`]). Neither the unlinks nor the
+    /// retires are flushed: a file or a reservation a power cut brings back is whole and no
+    /// session reads or retires it, and the next boot's sweep takes it again. A retire whose
+    /// record the disk refuses is still forgotten by the open, and the journal is rewritten
+    /// without it before its next record ([`StateDir::append_post_frame`]). The bridge sweeps
+    /// once, at its start's first roster where that reads, and where
+    /// [`StateDir::last_ran_in_an_earlier_boot`] said so before the run record named this boot;
+    /// no later roster sweeps. So a dir off the boot volume, whose every lease names no boot,
+    /// is never swept: there an earlier boot's sessions' files and reservations stay, and the
+    /// subjects those reservations name stay charged to the node.
     ///
     /// # Errors
-    /// A directory that does not list, a file that does not read, or an unlink: what is left
-    /// stays until the next boot's sweep.
+    /// A directory that does not list, a file that does not read, an unlink, the post journal
+    /// unreadable or damaged, or a retire's record the disk refused. None stops the rest of the
+    /// sweep: every other file and reservation still goes, and the first error is returned.
+    /// What it left stays until a later boot's sweep, and for good where the error repeats.
     pub(crate) fn sweep_sessions_of_an_earlier_boot(
         &self,
         live: &BTreeSet<String>,
     ) -> io::Result<u64> {
+        let mut refused = None;
+        let removed = self.sweep_files_of_an_earlier_boot(live, &mut refused);
+        let retired = self.retire_reservations_of_an_earlier_boot(live, &mut refused);
+        refused.map_or(Ok(removed + retired), Err)
+    }
+
+    /// The files' part of [`StateDir::sweep_sessions_of_an_earlier_boot`]: how many it unlinked.
+    /// A place that does not list, a file that does not read and an unlink refused each stop
+    /// nothing else of the sweep; the first such error is kept in `refused`.
+    fn sweep_files_of_an_earlier_boot(
+        &self,
+        live: &BTreeSet<String>,
+        refused: &mut Option<io::Error>,
+    ) -> u64 {
         let mut removed = 0;
         for (place, kind) in SESSION_PLACES {
-            for (name, rel) in self.files_in(place, |name| {
+            let files = match self.files_in(place, |name| {
                 !name.is_empty() && !name.contains('/') && !name.starts_with('.')
-            })? {
+            }) {
+                Ok(files) => files,
+                Err(e) => {
+                    refused.get_or_insert(e);
+                    continue;
+                }
+            };
+            for (name, rel) in files {
                 let sid = match kind {
                     Some(TornKind::Acks) => name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s),
                     _ => name.as_str(),
@@ -3918,26 +3973,91 @@ impl StateDir {
                 if live.contains(sid) {
                     continue;
                 }
-                let path = self.path(&rel);
-                if let Some(kind) = kind {
-                    let whole = match std::fs::read(&path) {
-                        Ok(bytes) => std::str::from_utf8(&bytes)
-                            .is_ok_and(|text| kind.whole(&path, &name, text)),
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                        Err(e) => return Err(e),
-                    };
-                    if !whole {
-                        continue;
+                match self.sweep_session_file(kind, &name, &rel) {
+                    Ok(true) => removed += 1,
+                    Ok(false) => {}
+                    Err(e) => {
+                        refused.get_or_insert(e);
                     }
-                }
-                match self.remove_path(&path) {
-                    Ok(()) => removed += 1,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
                 }
             }
         }
-        Ok(removed)
+        removed
+    }
+
+    /// One file of an earlier boot's session unlinked, where it is there and, for a file of a
+    /// [`TornKind`], reads whole: whether it was.
+    fn sweep_session_file(
+        &self,
+        kind: Option<TornKind>,
+        name: &str,
+        rel: &str,
+    ) -> io::Result<bool> {
+        let path = self.path(rel);
+        if let Some(kind) = kind {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    if !std::str::from_utf8(&bytes).is_ok_and(|text| kind.whole(&path, name, text))
+                    {
+                        return Ok(false);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        match self.remove_path(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The reservations' part of [`StateDir::sweep_sessions_of_an_earlier_boot`]: every post
+    /// reservation of a sid `live` does not name whose sequence no record in flight holds,
+    /// retired, and how many. Each is retired in the open even where its record is refused
+    /// ([`journal::Frame::holds_unwritten`]), so a refusal stops none of the others; the first
+    /// error, a journal that does not read included, is kept in `refused` where none is.
+    fn retire_reservations_of_an_earlier_boot(
+        &self,
+        live: &BTreeSet<String>,
+        refused: &mut Option<io::Error>,
+    ) -> u64 {
+        #[cfg(test)]
+        if self
+            .keep_earlier_boot_reservations
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return 0;
+        }
+        let mut posts = match self.posts() {
+            Ok(posts) => posts,
+            Err(e) => {
+                refused.get_or_insert(e);
+                return 0;
+            }
+        };
+        let leftover: Vec<(String, u64)> = {
+            let index = posts.index();
+            // The records in flight are keyed by their pin's sequence (`journal::Index::apply`).
+            index
+                .pins()
+                .filter(|(sid, _, pin)| {
+                    !live.contains(*sid) && !index.in_flight.contains_key(&pin.seq)
+                })
+                .map(|(sid, id, _)| (sid.to_string(), id))
+                .collect()
+        };
+        let mut retired = 0;
+        for (sid, id) in leftover {
+            match self.append_post_frame(&mut posts, journal::Frame::Retire { sid, id }) {
+                Ok(()) => retired += 1,
+                Err(e) => {
+                    refused.get_or_insert(e);
+                }
+            }
+        }
+        retired
     }
 
     fn attached_in_this_boot(&self) -> bool {
@@ -6458,16 +6578,22 @@ mod tests {
         );
     }
 
-    /// **AN EARLIER BOOT'S SESSIONS' FILES GO, AND THIS BOOT'S STAY** (B20): a run writes every
-    /// per-session file for a session and a post that stays in the journal and in flight, then
-    /// stops cleanly or not. A start in the next boot, judged before its run record names that
-    /// boot, finds an earlier boot, and the sweep unlinks every such file of a sid the roster
-    /// does not name, keeping a live sid's, one that does not read whole, `inflight/`,
-    /// `sent/` and the journal; a start in the same boot finds no earlier boot. A dir with no
-    /// run record is judged by its lease's boot. AN ATTACH OF THIS BOOT WINS OVER THE RECORD: an
-    /// older build attaches without writing `run`, so a lease that names this boot says its
-    /// sessions may still run, and a dir off the boot volume, whose leases name no boot, cannot
-    /// rule one out; neither is an earlier boot, and the older build's session keeps its file.
+    /// **AN EARLIER BOOT'S SESSIONS' FILES AND RESERVATIONS GO, AND THIS BOOT'S STAY** (B20,
+    /// item C14): a run writes every per-session file for two sessions, reserves a post of each
+    /// and of a third whose record stays in flight, then stops cleanly or not. A start in the
+    /// next boot, judged before its run record names that boot, finds an earlier boot, and the
+    /// sweep unlinks every such file of a sid the roster does not name and retires each post
+    /// reservation of such a sid, so that session is owed no longer
+    /// ([`StateDir::owed_publications`]); it keeps a live sid's files and reservation, a file
+    /// that does not read whole, and a reservation whose sequence a record in flight still
+    /// holds (after a clean stop; an unclean one retired that record first), and it touches no
+    /// record in flight. A start in the same boot finds no earlier boot and keeps all three. A
+    /// dir with no run record is judged by its lease's boot. AN ATTACH OF THIS BOOT WINS OVER THE
+    /// RECORD: an older build attaches without writing `run`, so a lease that names this boot
+    /// says its sessions may still run, and a dir off the boot volume, whose leases name no
+    /// boot, cannot rule one out; neither is an earlier boot, and the older build's session keeps
+    /// its file. CONTROL (`keep_earlier_boot_reservations`): a sweep that retires no reservation
+    /// leaves the ended session owed, its files gone.
     #[test]
     fn an_earlier_boots_sessions_files_are_swept_and_this_boots_kept() {
         let session_files = |sid: &str| {
@@ -6489,7 +6615,12 @@ mod tests {
             // and keyed a post of its session.
             OlderAttach,
         }
-        for (case, clean, then, off_volume, next_boot, want) in [
+        // Whether the record in flight still held the third reservation, at each sweep that
+        // retires.
+        let mut met: BTreeSet<bool> = BTreeSet::new();
+        // (case, a clean stop, then, off the boot volume, the next start's boot, an earlier
+        // boot, the sweep keeps every reservation: the control)
+        for (case, clean, then, off_volume, next_boot, want, keep) in [
             (
                 "a clean stop, then a reboot",
                 true,
@@ -6497,6 +6628,7 @@ mod tests {
                 false,
                 2,
                 true,
+                false,
             ),
             (
                 "an unclean stop, then a reboot",
@@ -6505,6 +6637,7 @@ mod tests {
                 false,
                 2,
                 true,
+                false,
             ),
             (
                 "no run record, then a reboot",
@@ -6513,6 +6646,7 @@ mod tests {
                 false,
                 2,
                 true,
+                false,
             ),
             (
                 "a clean stop, then a start in the same boot",
@@ -6520,6 +6654,7 @@ mod tests {
                 Then::Nothing,
                 false,
                 1,
+                false,
                 false,
             ),
             (
@@ -6529,6 +6664,7 @@ mod tests {
                 false,
                 1,
                 false,
+                false,
             ),
             (
                 "a clean stop, then a reboot and an older build's attach before the start",
@@ -6536,6 +6672,7 @@ mod tests {
                 Then::OlderAttach,
                 false,
                 2,
+                false,
                 false,
             ),
             (
@@ -6545,6 +6682,16 @@ mod tests {
                 true,
                 2,
                 false,
+                false,
+            ),
+            (
+                "CONTROL: an unclean stop, then a reboot, and a sweep that keeps every reservation",
+                false,
+                Then::Nothing,
+                false,
+                2,
+                true,
+                true,
             ),
         ] {
             let seam = |boot| IncSeam {
@@ -6574,8 +6721,14 @@ mod tests {
             }
             st.set_receipt_seq("s-torn", 1, 11).expect("a receipt's");
             std::fs::write(root.join("acks/s-torn.1"), b"1").expect("tear it");
+            // A post of a session that boot ended, one of a live session, and one of an ended
+            // session whose record is in flight, tied to it by its pin's sequence alone.
             let entry = in_flight_entry(12);
-            st.set_post_pin("s-gone", 1, &entry.pin)
+            for (sid, seq) in [("s-gone", 14), ("s-live", 15)] {
+                st.set_post_pin(sid, 1, &in_flight_entry(seq).pin)
+                    .expect("a reservation");
+            }
+            st.set_post_pin("s-held", 1, &entry.pin)
                 .expect("a reservation");
             st.set_in_flight(&entry).expect("in flight");
             if clean {
@@ -6609,25 +6762,40 @@ mod tests {
                 "{case}: once the record names this boot, never an earlier one"
             );
             let torn_left = root.join("acks/s-torn.1").exists();
-            let posts = |st: &StateDir| {
-                (
-                    st.post_seq("s-gone", 1),
-                    st.in_flight().expect("the records in flight"),
-                    std::fs::read(root.join(journal::FILE)).ok(),
-                )
+            let reserved = |st: &StateDir| {
+                ["s-gone", "s-live", "s-held"].map(|sid| st.post_seq(sid, 1).map(|(seq, _)| seq))
             };
-            let posts_before = posts(&next);
             assert_eq!(
-                posts_before.0,
-                Some((12, false)),
-                "{case}: the post's reservation"
+                reserved(&next),
+                [Some(14), Some(15), Some(12)],
+                "{case}: the three reservations"
             );
+            let in_flight = next.in_flight().expect("the records in flight");
+            // An unclean stop in an earlier boot retired the record in flight before the sweep.
+            let held = in_flight.iter().any(|(seq, _)| *seq == 12);
+            let owed_before = next.owed_publications().expect("what is owed").sids;
+            assert!(
+                ["s-gone", "s-live", "s-held"]
+                    .iter()
+                    .all(|sid| owed_before.contains(*sid)),
+                "{case}: every reserved session is owed: {owed_before:?}"
+            );
+            next.keep_earlier_boot_reservations(keep);
             let removed = if earlier {
                 next.sweep_sessions_of_an_earlier_boot(&BTreeSet::from(["s-live".to_string()]))
                     .expect("the sweep")
             } else {
                 0
             };
+            let swept = earlier && !keep;
+            if swept {
+                met.insert(held);
+            }
+            let retired: BTreeSet<String> = [("s-gone", swept), ("s-held", swept && !held)]
+                .into_iter()
+                .filter(|(_, gone)| *gone)
+                .map(|(sid, _)| sid.to_string())
+                .collect();
             for rel in session_files("s-gone") {
                 assert_eq!(
                     root.join(&rel).exists(),
@@ -6647,16 +6815,127 @@ mod tests {
                 then == Then::OlderAttach,
                 "{case}: the older build's session keeps its key"
             );
-            assert_eq!(removed, if earlier { 5 } else { 0 }, "{case}");
+            assert_eq!(
+                removed,
+                (if earlier { 5 } else { 0 }) + retired.len() as u64,
+                "{case}"
+            );
             assert_eq!(
                 root.join("acks/s-torn.1").exists(),
                 torn_left,
                 "{case}: a file that does not read whole is left to the sweep of torn files"
             );
             assert_eq!(
-                posts(&next),
-                posts_before,
-                "{case}: the post journal and what it holds are not the sweep's"
+                reserved(&next),
+                [
+                    (!swept).then_some(14),
+                    Some(15),
+                    (!retired.contains("s-held")).then_some(12)
+                ],
+                "{case}: an ended session's reservation retired, a live one's and one a record \
+                 in flight holds kept"
+            );
+            assert_eq!(
+                next.in_flight().expect("the records in flight"),
+                in_flight,
+                "{case}: no record in flight is the sweep's"
+            );
+            let owed_after = next.owed_publications().expect("what is owed").sids;
+            assert_eq!(
+                owed_after,
+                owed_before
+                    .difference(&retired)
+                    .cloned()
+                    .collect::<BTreeSet<String>>(),
+                "{case}: only the sessions whose every reservation the sweep retired are owed \
+                 no longer"
+            );
+            if keep {
+                assert!(
+                    owed_after.contains("s-gone") && !root.join("acks/s-gone.3").exists(),
+                    "CONTROL: without the retire the ended session stays owed, its files gone"
+                );
+            }
+            let reread = StateDir::peek(root);
+            reread.set_inc_seam(seam(next_boot));
+            assert_eq!(
+                reserved(&reread),
+                reserved(&next),
+                "{case}: the retires are in the journal"
+            );
+        }
+        assert_eq!(
+            met,
+            BTreeSet::from([false, true]),
+            "the sweep met the third reservation both with its record in flight and with it retired"
+        );
+    }
+
+    /// **ONE REFUSAL STOPS NONE OF THE REST OF AN EARLIER BOOT'S SWEEP**: a place the sweep
+    /// cannot list (`seen` a file where its directory should be, listed before `topics`) is
+    /// the error the sweep returns, and the ended session's files in every other place are
+    /// unlinked and its post reservation retired all the same, so it is owed no longer. A
+    /// sweep that stopped at the refusal would leave its reservation charged at every boot
+    /// the refusal repeats. CONTROL: with `seen` a directory, the same sweep returns the count.
+    #[test]
+    fn one_refusal_stops_none_of_the_rest_of_an_earlier_boots_sweep() {
+        for refuse in [true, false] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("earlier-boot-refused")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let root = dir.path();
+            let st = StateDir::open(root).expect("open");
+            st.set_inc_seam(in_boot(1));
+            st.begin_run().expect("boot 1's run");
+            st.take_incarnation(0).expect("boot 1's lease");
+            st.set_key_seq("s-gone", "k", 9).expect("a key");
+            st.set_receipt_seq("s-gone", 3, 10).expect("a receipt's");
+            st.set_topics(
+                "s-gone",
+                &BTreeMap::from([("t".to_string(), TopicCursor { next: 6 })]),
+            )
+            .expect("a cursor");
+            st.set_post_pin("s-gone", 1, &in_flight_entry(14).pin)
+                .expect("a reservation");
+            st.end_run_clean().expect("its clean stop");
+            drop(st);
+            let next = StateDir::open(root).expect("the next start");
+            next.set_inc_seam(in_boot(2));
+            assert!(next.last_ran_in_an_earlier_boot(), "an earlier boot");
+            next.begin_run().expect("the next run");
+            if refuse {
+                // The open made `seen/`; what replaced it since does not list.
+                let seen = root.join("seen");
+                std::fs::remove_dir(&seen).expect("an empty seen/");
+                std::fs::write(&seen, b"").expect("a file where seen/ should be");
+            }
+            let swept = next.sweep_sessions_of_an_earlier_boot(&BTreeSet::new());
+            if refuse {
+                let e = swept.expect_err("the place that does not list");
+                assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+            } else {
+                assert_eq!(
+                    swept.expect("CONTROL: the sweep"),
+                    4,
+                    "three files, one post"
+                );
+            }
+            for rel in ["keys/s-gone", "acks/s-gone.3", "topics/s-gone"] {
+                assert!(!root.join(rel).exists(), "refused={refuse}: {rel} unlinked");
+            }
+            assert_eq!(
+                next.post_seq("s-gone", 1),
+                None,
+                "refused={refuse}: the reservation retired"
+            );
+            assert!(
+                !next
+                    .owed_publications()
+                    .expect("what is owed")
+                    .sids
+                    .contains("s-gone"),
+                "refused={refuse}: the ended session is owed no longer"
             );
         }
     }

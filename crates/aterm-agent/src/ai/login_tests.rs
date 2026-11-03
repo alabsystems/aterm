@@ -41,6 +41,7 @@ fn row(c: &'static Connector, state: State) -> Row {
     Row {
         connector: c,
         wanted: true,
+        asked: true,
         state,
         mark: Mark::Fail,
         fact: String::new(),

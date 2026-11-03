@@ -83,7 +83,15 @@ impl Authentication {
     pub(crate) fn plain(&self) -> Option<String> {
         match self {
             Self::Password { username, password } => {
-                Some(format!("\0{username}\0{}", password.expose()))
+                let secret = password.expose();
+                if username.is_empty()
+                    || secret.is_empty()
+                    || username.chars().any(char::is_control)
+                    || secret.chars().any(char::is_control)
+                {
+                    return None;
+                }
+                Some(format!("\0{username}\0{secret}"))
             }
             Self::OAuth { .. } => None,
         }
@@ -93,13 +101,27 @@ impl Authentication {
             Self::OAuth {
                 username,
                 access_token,
-            } => Some(format!(
-                "user={username}\x01auth=Bearer {}\x01\x01",
-                access_token.expose()
-            )),
+            } => {
+                let token = access_token.expose();
+                if username.is_empty()
+                    || token.is_empty()
+                    || username.chars().any(char::is_control)
+                    || token.chars().any(char::is_control)
+                {
+                    return None;
+                }
+                Some(format!("user={username}\x01auth=Bearer {token}\x01\x01"))
+            }
             Self::Password { .. } => None,
         }
     }
+}
+
+fn strip_scheme_ci<'a>(server: &'a str, prefix: &str) -> Option<&'a str> {
+    server
+        .get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &server[prefix.len()..])
 }
 
 /// TLS is mandatory; STARTTLS never silently falls back to a plaintext session.
@@ -121,15 +143,19 @@ impl Endpoint {
     /// Standard submission/IMAP upgrade ports require STARTTLS automatically.
     pub fn parse(server: &str, default_port: u16) -> Result<Self, String> {
         let server = server.trim();
-        let (server, mode) = if let Some(host) = server.strip_prefix("starttls://") {
+        let (server, mode) = if let Some(host) = strip_scheme_ci(server, "starttls://") {
             (host, Some(Security::StartTls))
-        } else if let Some(host) = server.strip_prefix("tls://") {
+        } else if let Some(host) = strip_scheme_ci(server, "tls://") {
             (host, Some(Security::Tls))
         } else {
             (server, None)
         };
         let (host, port) = if server.starts_with('[') {
             let (host, suffix) = server.split_once(']').ok_or("Invalid server address")?;
+            let ipv6 = &host[1..];
+            if ipv6.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err("Invalid server address".into());
+            }
             let port = if suffix.is_empty() {
                 default_port
             } else {
@@ -139,23 +165,31 @@ impl Endpoint {
                     .parse::<u16>()
                     .map_err(|_| "Invalid server port")?
             };
-            (&host[1..], port)
-        } else if let Some((host, port)) = server.rsplit_once(':') {
-            (
-                host,
-                port.parse::<u16>().map_err(|_| "Invalid server port")?,
-            )
+            if port == 0 {
+                return Err("Enter a mail server name and optional port".into());
+            }
+            (ipv6, port)
         } else {
-            (server, default_port)
+            let (host, port) = if let Some((host, port)) = server.rsplit_once(':') {
+                (
+                    host,
+                    port.parse::<u16>().map_err(|_| "Invalid server port")?,
+                )
+            } else {
+                (server, default_port)
+            };
+            if host.is_empty()
+                || port == 0
+                || host.chars().any(|c| {
+                    c.is_control()
+                        || c.is_whitespace()
+                        || matches!(c, '/' | '?' | '#' | '@' | ':' | '[' | ']')
+                })
+            {
+                return Err("Enter a mail server name and optional port".into());
+            }
+            (host, port)
         };
-        if host.is_empty()
-            || port == 0
-            || host
-                .chars()
-                .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '/' | '?' | '#' | '@'))
-        {
-            return Err("Enter a mail server name and optional port".into());
-        }
         Ok(Self {
             host: host.into(),
             port,
@@ -191,9 +225,66 @@ mod endpoint_tests {
                 .security,
             Security::Tls
         );
+        assert_eq!(
+            Endpoint::parse("TLS://mail.example:587", 465)
+                .unwrap()
+                .security,
+            Security::Tls
+        );
+        assert_eq!(
+            Endpoint::parse("STARTTLS://mail.example:993", 993)
+                .unwrap()
+                .security,
+            Security::StartTls
+        );
         assert_eq!(Endpoint::parse("[::1]:993", 993).unwrap().host, "::1");
         for invalid in ["", "host:0", "host:65536", "user@host", "host/path", "[::1"] {
             assert!(Endpoint::parse(invalid, 993).is_err(), "{invalid}");
+        }
+    }
+
+    /// NEGATIVE CONTROL: without rejecting `:` in unbracketed hosts, `2001:db8::587` splits at its
+    /// final `:` into host `"2001:db8:"` on port `587` (`StartTls`), and without control-character
+    /// checks in `Authentication::{plain, xoauth2}`, `\0` or `\x01` splits SASL credential frames.
+    #[test]
+    fn unbracketed_ipv6_non_ipv6_brackets_and_sasl_control_delimiters_fail_closed() {
+        for invalid in [
+            "::1",
+            "2001:db8::587",
+            "[not-ipv6]:993",
+            "[::1]:0",
+            "smtp://mail.example:587",
+            "host]name:993",
+        ] {
+            assert!(Endpoint::parse(invalid, 993).is_err(), "{invalid}");
+        }
+
+        for (user, secret) in [
+            ("", "pw"),
+            ("me@example.test", ""),
+            ("admin\0me@example.test", "pw"),
+            ("me@example.test", "pw\0extra"),
+            ("me@example.test\r\n", "pw"),
+        ] {
+            let pw = Authentication::Password {
+                username: user.into(),
+                password: Secret::new(secret.into()),
+            };
+            assert!(pw.plain().is_none(), "{user:?} / {secret:?}");
+        }
+
+        for (user, token) in [
+            ("", "tok"),
+            ("me@example.test", ""),
+            ("me@example.test\x01auth=Bearer other", "tok"),
+            ("me@example.test", "tok\x01extra"),
+            ("me@example.test", "tok\r\n"),
+        ] {
+            let oauth = Authentication::OAuth {
+                username: user.into(),
+                access_token: Secret::new(token.into()),
+            };
+            assert!(oauth.xoauth2().is_none(), "{user:?}");
         }
     }
 }

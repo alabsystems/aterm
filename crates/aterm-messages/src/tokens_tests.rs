@@ -320,3 +320,37 @@ fn status_hues_come_from_the_palette() {
     let t = tokens(theme, Some(grey), AuthoredChrome::NONE);
     assert_eq!((t.danger_hue, t.success_hue), (None, None));
 }
+
+#[test]
+fn the_theme_tint_is_the_themes_whatever_the_system_accent() {
+    let seeds = |cursor, system_accent, accent| ChromeSeeds {
+        bg: [0x20, 0x20, 0x28],
+        fg: [0xd0, 0xd0, 0xd8],
+        cursor,
+        ansi: None,
+        authored: AuthoredChrome {
+            accent,
+            ..AuthoredChrome::NONE
+        },
+        system_accent,
+        base: BarBase::Blend,
+    };
+    let pink = [0xf0, 0x40, 0xa0];
+    let blue = [0x00, 0x60, 0xff];
+    let of = |s: &ChromeSeeds| ChromeTokens::derive(s);
+    let with = of(&seeds(pink, Some(blue), None));
+    assert_eq!(with.accent, blue, "the accent follows the system");
+    assert_eq!(with.theme_tint, pink, "the tint stays the theme's");
+    assert_eq!(with.theme_tint, of(&seeds(pink, None, None)).theme_tint);
+    let grey = [0x90, 0x90, 0x90];
+    assert_eq!(
+        of(&seeds(grey, Some(blue), None)).theme_tint,
+        [0xd0, 0xd0, 0xd8],
+        "nothing to borrow: the foreground"
+    );
+    assert_eq!(
+        of(&seeds(grey, Some(blue), Some(pink))).theme_tint,
+        pink,
+        "an authored accent is the theme's"
+    );
+}

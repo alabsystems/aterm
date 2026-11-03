@@ -28,6 +28,8 @@ aterm-spec-anchor = { workspace = true }
 libc = { workspace = true }
 # The child's inheritance strip (`spawnfd::InheritStrip`).
 aterm-uds = { workspace = true }
+# Debug/test PTY fixture admission shares the same quiet temporary root as the runners.
+aterm-tempfile = { workspace = true }
 
 # Tests mint a root `Authority`; `launcher-mint` makes it nameable in this crate's test
 # build only. The production seam receives its `Cap`s by argument.
@@ -38,8 +40,6 @@ aterm-cap = { workspace = true, features = ["launcher-mint"] }
 aterm-spec = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
-# Exclusive ownership of shell resolver fixture directories.
-aterm-tempfile = { workspace = true }
 # The sandbox-wrap enforcement tests reuse the policy crate's base profile.
 aterm-containment = { workspace = true }
 # `spawn_locale_model` conformance check (`unix_tests::spawn_locale_conformance_child_always_utf8_ctype`).

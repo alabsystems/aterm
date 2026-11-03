@@ -5461,6 +5461,34 @@ pub(crate) fn own_policy_for_test(
     Restore(OWN_POLICY_FOR_TEST.with(|cell| cell.replace(policy)))
 }
 
+/// How a booting process stands to the handoff that started it (`main_entry_with_network`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SuccessorBoot {
+    /// It is a handoff's successor, with sessions or with its windows alone: it never reads the
+    /// quit layout or a crash journal its parent still owns.
+    pub(crate) handed_over: bool,
+    /// It restores the handed layout rather than the quit layout.
+    pub(crate) takes_handed_layout: bool,
+    /// It holds its freeze until the parent's Commit.
+    pub(crate) incoming_handoff_pending: bool,
+}
+
+/// THE SUCCESSOR'S BOOT: an admitted overlap is a handoff whether or not it carried a session.
+#[must_use]
+pub(crate) const fn successor_boot(
+    headless: bool,
+    overlap_admitted: bool,
+    adopted_sessions: bool,
+    overlap_channels_present: bool,
+) -> SuccessorBoot {
+    let handed_over = adopted_sessions || overlap_admitted;
+    SuccessorBoot {
+        handed_over,
+        takes_handed_layout: !headless && handed_over,
+        incoming_handoff_pending: overlap_channels_present && handed_over,
+    }
+}
+
 fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> IncomingHandoff {
     let ready_env_present = env.present(ENV_READY_FD);
     let commit_env_present = env.present(ENV_COMMIT_FD);
@@ -5590,6 +5618,18 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
             "its layout sidecar is missing, misplaced, over the size cap or not UTF-8",
         );
     };
+    // A handoff with no terminal session carries only its windows: with no layout to place
+    // there is nothing to take over, so this process exits before it opens one.
+    if expected_ids.is_empty()
+        && layout
+            .as_ref()
+            .is_none_or(crate::restore::RestoreManifest::is_empty)
+    {
+        return refused_whole(
+            WholeRefusal::Producer,
+            "it hands over no terminal session and no window layout this build can place",
+        );
+    }
     let manifest_path = std::path::Path::new(&path);
     let Some(manifest_stem) = manifest_path.file_stem().and_then(|stem| stem.to_str()) else {
         return refused_whole(

@@ -422,7 +422,7 @@ fn the_host_exit_loop_retries_a_blocked_account_fallback() {
     let counted = Arc::clone(&relaunched);
     let world = Arc::clone(&a);
     let writer = Arc::clone(&held);
-    hooks.acts.relaunch = Arc::new(move |sid, _, snap, _, _, _| {
+    hooks.acts.relaunch = Arc::new(move |sid, _, snap, _, _, _, _| {
         assert!(writer.lock().unwrap().is_none());
         assert!(
             snap.login.is_none(),

@@ -1847,12 +1847,17 @@ impl CursorGlow {
         if to > self.row_cur.len() {
             return;
         }
+        let max_prefix = to.min(self.row_prev.len());
+        let mut lcp = 0usize;
+        while lcp < max_prefix && self.row_prev[lcp] == self.row_cur[lcp] {
+            lcp += 1;
+        }
         for from in usize::from(previous.caret)..to {
+            if from > lcp {
+                break;
+            }
             let width = to - from;
-            if width > EXACT_COALESCED_PREFIX_MAX
-                || from > self.row_prev.len()
-                || self.row_prev[..from] != self.row_cur[..from]
-            {
+            if width > EXACT_COALESCED_PREFIX_MAX {
                 continue;
             }
             let tail = self

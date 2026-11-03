@@ -120,7 +120,9 @@ pub(super) fn write_fresh_token(path: &Path, token: &str) -> Option<()> {
 /// Tighten the bound socket file to mode `0600` so only the owner can connect even if it somehow
 /// lands in a shared directory.
 pub(crate) fn lock_socket_file(path: &str) {
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 /// The connecting peer's effective uid (`getpeereid(2)` on macOS/BSD, `SO_PEERCRED` on Linux) via

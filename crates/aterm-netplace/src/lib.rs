@@ -11,9 +11,13 @@
 //! memory; [`heard`] is the evidence every process notes into; [`facts`] reads the Mac;
 //! [`keeper`] is the one writer and [`keeper::read`] what every reader calls; [`moves`] tells a
 //! settled place as a network move, and [`routes`] says which member addresses an automatic LAN
-//! lane dials while away (the seam a future internet path plugs in at).
+//! lane dials while away (the seam a future internet path plugs in at). [`proof`] is what a
+//! caller that must not take memory for proof reads (the vault's automatic ALab LAN admission):
+//! the facts now, the current stay and the members' answers, from the same files and the same
+//! Mac as the place, so this Mac has one answer to where it is.
 //!
-//! Being away changes words only here: it gates no secret, no admission and no vault serving.
+//! Being away changes words only here: it gates no secret and no vault serving. The automatic
+//! ALab LAN admission reads [`proof`], never the place's word: a remembered network is no proof.
 
 pub mod place;
 
@@ -32,6 +36,8 @@ pub mod heard;
 #[cfg(unix)]
 pub mod keeper;
 pub mod moves;
+#[cfg(unix)]
+pub mod proof;
 #[cfg(unix)]
 pub mod record;
 pub mod routes;

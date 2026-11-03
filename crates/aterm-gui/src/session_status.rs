@@ -8,6 +8,93 @@ use std::time::{Duration, Instant};
 #[path = "session_program.rs"]
 pub(crate) mod program;
 
+/// Native claim fields shared by the full App record and the display-free
+/// host. They describe the currently admitted claim, never fixture assertions.
+pub(crate) fn native_supervisor_fields(
+    meta: &crate::session_timeline::SessionMeta,
+    now: u64,
+) -> (String, String) {
+    let live = meta.live_supervisor(now);
+    let (version, vendor) = crate::harness_claim::wire_versions(meta.live_scoped(now));
+    (
+        format!(
+            "{} supervisor_proven={} supervisor_version={version} supervisor_vendor={vendor}",
+            live.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode),
+            u8::from(meta.claim_proven(now))
+        ),
+        meta.supervisor_authority(now).wire_fields(),
+    )
+}
+
+/// The native portion of a status record for a host without a window. Omitted
+/// UI observations are not invented: phase remains explicitly unobserved.
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub(crate) fn native_control_status(
+    ctx: &crate::SessionCtx,
+    term: &std::sync::Mutex<aterm_core::terminal::Terminal>,
+    master: i32,
+    session: u64,
+) -> Result<String, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let now = crate::metrics::now_us();
+    let (supervisor, authority) = {
+        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        native_supervisor_fields(&meta, now)
+    };
+    let hand = {
+        let lease = ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
+        match lease.as_ref() {
+            Some(crate::Lease::Turn { id, driver, .. }) => crate::presence::Hand::DrivenTurn {
+                id: *id,
+                holder: driver.as_ref().map(|sid| sid.as_str().to_owned()),
+            },
+            Some(crate::Lease::Drive {
+                holder,
+                expires_us,
+                holder_pid,
+                ..
+            }) if *expires_us > now => crate::presence::Hand::DrivenLease {
+                holder: holder.clone(),
+                pid: *holder_pid,
+            },
+            _ => crate::presence::Hand::None,
+        }
+    };
+    let program = u32::try_from(crate::quit_safety::foreground_pgrp(master))
+        .ok()
+        .and_then(aterm_agent::harness::native_act::Process::observe)
+        .and_then(|process| {
+            std::path::Path::new(std::ffi::OsStr::from_bytes(&process.image.path))
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .map_or_else(
+            || "-".to_string(),
+            |word| aterm_control::wire::pct_encode(&word),
+        );
+    let mut look = ctx.frame.look_frame();
+    let term = term
+        .try_lock()
+        .map_err(|_| "native status frame busy".to_owned())?;
+    let generation = crate::control::screen_gen(&term);
+    let seq = term.content_seq();
+    let hash = look.text(&term).fnv();
+    drop(term);
+    let input = crate::input_stall::status_input(&ctx.sink, None, false);
+    Ok(format!(
+        "schema=1 sid={session} observed=false phase=unknown hold={} hand={} hand_pid={} \
+        {input} {authority} supervisor={supervisor} program={program} human_ms={} human_typed_ms={} \
+        human_seq={} gen={generation} seq={seq} hash={hash:016x}",
+        u8::from(ctx.fabric.hold().is_some()),
+        hand.wire::<crate::presence::Native>(),
+        hand.pid_wire(),
+        ctx.human_input.wire(now),
+        ctx.human_input.typed_wire(now),
+        ctx.human_input.seq()
+    ))
+}
+
 pub(crate) const AGENT_MIN_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Computes the whole-screen FNV-1a hash and extracts the final `tail_rows` of published screen text.
@@ -4370,15 +4457,10 @@ impl crate::App {
             let now = crate::metrics::now_us();
             let live = meta.live_supervisor(now);
             let proven = meta.supervisor_proven(now);
-            let (version, vendor) = crate::harness_claim::wire_versions(meta.live_scoped(now));
+            let (supervisor, authority) = native_supervisor_fields(&meta, now);
             (
-                format!(
-                    "{} supervisor_proven={} supervisor_version={version} \
-                     supervisor_vendor={vendor}",
-                    live.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode),
-                    u8::from(meta.claim_proven(now)),
-                ),
-                meta.supervisor_authority(now).wire_fields(),
+                supervisor,
+                authority,
                 meta.autopilot_word(),
                 meta.land_at,
                 live == Some(crate::autopilot::own_holder()),
@@ -4631,7 +4713,7 @@ pub(crate) fn goal_field(goal: Option<&str>) -> String {
 /// item 3, §14.3.3): Land's hold of whoever drives the session ([`crate::App::shown_hold`]: aterm
 /// while it claims it, a codex-alab under its own proven claim), its legs once a yield was read,
 /// its nudges and the second its land act began; `-` for each where no hold stands and where its
-/// chip's face is no `⤓ land` (landed, quiet, another mode), as every other surface of the hold
+/// chip's face is no Land `⤓` (landed, quiet, another mode), as every other surface of the hold
 /// reads it.
 pub(crate) fn land_fields(held: Option<aterm_agent::harness::acts::LandHeld>) -> String {
     let Some(held) = held else {

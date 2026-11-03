@@ -71,6 +71,35 @@ pub const FROZEN: &str = "FROZEN";
 /// fields after it say whether it has read it.
 pub const TEXT_HELD: &str = "the program has drawn nothing of the text written to it";
 
+/// The words of the records of a line this loop wrote and gave up on undrawn, held in custody
+/// (`turn_end_loop.rs`'s `Custody`): `SKIPPED seq=<n> rule=<r> typed, not submitted (<why>):
+/// <text>; held until the worker draws it (input=<w>)` where it is taken in, and
+/// `SKIPPED seq=<n> rule=<r> held until the worker draws it: <text> (input=<w>…); nothing
+/// written` once at each change of what holds a write, the text in backticks in both. Records,
+/// never a badge or an ask.
+pub const LINE_HELD: &str = "held until the worker draws it";
+
+/// `NOTE seq=<n> rule=<r> the worker read the line and has drawn none of it <s> s on (input=clear,
+/// at rest): restarting it in place`, before a restart in place for a line held in custody; and
+/// the head of the `WAITING` line where none can be made.
+pub const LINE_READ_UNDRAWN: &str = "the worker read the line and has drawn none of it";
+
+/// Where the host did not make the restart in place asked for a line held in custody (refused, or
+/// no answer): the words the `WAITING` records of its wait carry after [`LINE_READ_UNDRAWN`],
+/// with the host's step from the next due on. The host is asked once, never again at each due.
+pub const LINE_RESTART_UNMADE: &str = "the restart in place could not be made";
+
+/// `NOTE seq=<n> rule=<r> the line held <how>: <text>`, the text in backticks: how a line held in
+/// custody settled (`is drawn`, `is under a person's keys`, `went with a turn` or `ended with its
+/// program`).
+pub const LINE_SETTLED: &str = "the line held";
+
+/// The head of the `WAITING` line of a line held in custody that the worker read and drew none of
+/// after a restart in place was already made since the last act submitted: a second loss waits,
+/// it is never restarted again.
+pub const LINE_LOST_AGAIN: &str =
+    "the worker read the line and has drawn none of it again since a restart in place";
+
 /// How the line of a turn the Mac slept through in the vendor's API retry, Escaped once the API
 /// was back, begins (`supervise::run::woken_turn`).
 pub const UNSTUCK: &str = "UNSTUCK";
@@ -230,6 +259,7 @@ impl Word {
 pub enum Noted {
     Done,
     Left,
+    Failed,
     Parked,
     Unparked,
     Halted,
@@ -267,9 +297,10 @@ pub enum Noted {
 
 impl Noted {
     /// Every word, in declaration order.
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 36] = [
         Self::Done,
         Self::Left,
+        Self::Failed,
         Self::Parked,
         Self::Unparked,
         Self::Halted,
@@ -311,6 +342,7 @@ impl Noted {
         match self {
             Self::Done => "DONE",
             Self::Left => "LEFT",
+            Self::Failed => "FAILED",
             Self::Parked => "PARKED",
             Self::Unparked => "UNPARKED",
             Self::Halted => "HALTED",
@@ -353,6 +385,7 @@ impl Noted {
         match self {
             Self::Done => "done",
             Self::Left => "left",
+            Self::Failed => "failed",
             Self::Parked => "parked",
             Self::Unparked => "unparked",
             Self::Halted => "halted",

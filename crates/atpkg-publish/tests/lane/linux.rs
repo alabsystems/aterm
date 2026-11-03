@@ -492,6 +492,32 @@ fn a_keyed_box_with_no_channel_token_signs_nothing() {
 }
 
 #[test]
+fn owed_uploads_with_no_channel_token_say_why_in_ready_md() {
+    // The default `Gh` host (§1 rule 16's third exception): READY.md's keyed, nothing-ready
+    // arm names the refusal that stopped the follow-up index.
+    let w = World::new("linux-no-token-owed");
+    w.fx.indexer.fail.store(true, Ordering::SeqCst);
+    let _ = w.run(false);
+    w.fx.indexer.fail.store(false, Ordering::SeqCst);
+    std::fs::remove_file(&w.fx.ctx.tokens.channel).expect("rm token");
+    let (r, tx) = w.run(false);
+    let e = r.expect_err("no channel token for the owed uploads");
+    assert_eq!(e.exit_code(), 1, "{e}\n{}", tx.text());
+    let ready = w.ready();
+    assert!(
+        ready.contains("Signed and uploaded by an earlier run: ay clean.")
+            && ready.contains("READY (sign + publish now): <none>"),
+        "{ready}"
+    );
+    assert!(
+        ready.contains(
+            "the channel token at ~/.secrets/gh_access_token_alabsystems is missing or empty"
+        ),
+        "{ready}"
+    );
+}
+
+#[test]
 fn a_staged_merge_that_no_longer_extends_the_published_bytes_takes_the_ceremony_with_it() {
     let w = World::after_staging("linux-prefix", false);
     let m = linux::staged_manifest(&w.staged(), "clean", 20);
@@ -1006,4 +1032,317 @@ fn a_pinned_harness_is_apple_only_and_the_linux_lane_builds_and_fetches_nothing_
         touched.is_empty(),
         "its staging manifest is never fetched nor its repo cloned: {touched:?}"
     );
+}
+
+/// WP12's Linux tests (plan §16): the pre-claim checks 6 and 7 and READY.md's spellings under
+/// each host choice. Each world is built by `World::new`, never `World::after_staging`, whose
+/// staging run was made once under `Gh`.
+mod host_choice {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use atpkg_publish::ctx::HostChoice;
+    use atpkg_publish::host::fake::{FakeFail, FakeHost, FakeOp};
+    use atpkg_publish::host::{HostError, Probe, Release, ReleaseHost, Replace, Slug};
+
+    use super::{World, ok};
+
+    /// A `FakeHost` whose `write_preflight` refuses each slug `refused` names (`owner/repo`),
+    /// and delegates every other call.
+    struct RefusesOwner {
+        inner: Arc<FakeHost>,
+        refused: Vec<String>,
+    }
+
+    impl ReleaseHost for RefusesOwner {
+        fn releases(&self, slug: &Slug) -> Result<Vec<Release>, HostError> {
+            self.inner.releases(slug)
+        }
+        fn release(&self, slug: &Slug, tag: &str) -> Result<Release, HostError> {
+            self.inner.release(slug, tag)
+        }
+        fn download(
+            &self,
+            slug: &Slug,
+            tag: &str,
+            assets: &[&str],
+            dir: &Path,
+        ) -> Result<(), HostError> {
+            self.inner.download(slug, tag, assets, dir)
+        }
+        fn create(
+            &self,
+            slug: &Slug,
+            tag: &str,
+            title: &str,
+            notes: &str,
+            files: &[PathBuf],
+        ) -> Result<(), HostError> {
+            self.inner.create(slug, tag, title, notes, files)
+        }
+        fn upload(
+            &self,
+            slug: &Slug,
+            tag: &str,
+            files: &[PathBuf],
+            replace: Replace,
+        ) -> Result<(), HostError> {
+            self.inner.upload(slug, tag, files, replace)
+        }
+        fn publish_draft(&self, slug: &Slug, tag: &str) -> Result<(), HostError> {
+            self.inner.publish_draft(slug, tag)
+        }
+        fn write_preflight(&self, slug: &Slug) -> Result<(), HostError> {
+            let named = slug.to_string();
+            if self.refused.iter().any(|r| r.eq_ignore_ascii_case(&named)) {
+                Err(HostError::Refused("refused by the test".into()))
+            } else {
+                self.inner.write_preflight(slug)
+            }
+        }
+        fn probe_public(&self, slug: &Slug, tag: &str, asset: &str) -> Probe {
+            self.inner.probe_public(slug, tag, asset)
+        }
+        fn fetch_public(
+            &self,
+            slug: &Slug,
+            tag: &str,
+            asset: &str,
+            dest: &Path,
+            cap: u64,
+        ) -> Probe {
+            self.inner.fetch_public(slug, tag, asset, dest, cap)
+        }
+        fn clone_repo(&self, slug: &Slug, dest: &Path) -> Result<(), HostError> {
+            self.inner.clone_repo(slug, dest)
+        }
+        fn fetch_repo(&self, slug: &Slug, dir: &Path) -> Result<(), HostError> {
+            self.inner.fetch_repo(slug, dir)
+        }
+        fn fetch_main(&self, slug: &Slug, dir: &Path, into: &str) -> Result<(), HostError> {
+            self.inner.fetch_main(slug, dir, into)
+        }
+        fn repo_seen(&self, slug: &Slug) -> Result<bool, HostError> {
+            self.inner.repo_seen(slug)
+        }
+        fn published_releases(&self, slug: &Slug) -> Result<Vec<Release>, HostError> {
+            self.inner.published_releases(slug)
+        }
+        fn published_by_tag(&self, slug: &Slug, tag: &str) -> Result<Release, HostError> {
+            self.inner.published_by_tag(slug, tag)
+        }
+        fn retry_pause(&self) -> std::time::Duration {
+            self.inner.retry_pause()
+        }
+        fn reads_anonymously(&self) -> bool {
+            self.inner.reads_anonymously()
+        }
+    }
+
+    /// A fresh world whose context is built for `choice`, with neither token file.
+    fn world(label: &str, choice: HostChoice) -> World {
+        let mut w = World::new(label);
+        w.fx.ctx = w.fx.ctx.clone().with_host_choice(choice);
+        for token in [&w.fx.ctx.tokens.staging, &w.fx.ctx.tokens.channel] {
+            std::fs::remove_file(token).expect("rm token");
+        }
+        w
+    }
+
+    #[test]
+    fn linux_preflights_ask_the_host_under_agh() {
+        // Check 6: the staging writer is asked before any clone or latch.
+        let w = world("linux-agh-check6", HostChoice::Agh);
+        let staging = w.fx.ctx.staging_slug("aterm");
+        w.fx.host.fail_next(FakeOp::Preflight, FakeFail::Refuse);
+        let (r, _) = w.run(false);
+        let e = r.expect_err("no staging writer");
+        assert_eq!(e.exit_code(), 3, "{e}");
+        let why = e.to_string();
+        assert!(
+            why.contains(&format!("staging writer unavailable on {staging}")),
+            "{why}"
+        );
+        assert!(why.contains("refused by the test"), "{why}");
+        assert!(w.fx.calls("clone ").is_empty(), "nothing cloned or latched");
+        assert!(!w.staged().exists());
+        let asked = w.fx.calls("preflight ").len();
+        ok(w.run(true));
+        assert_eq!(
+            w.fx.calls("preflight ").len(),
+            asked,
+            "a dry run asks no writer"
+        );
+
+        // Unarmed: a keyed run signs and publishes with no token file present. Each staging
+        // repository the uploads write is asked before the public ones.
+        let w = world("linux-agh-keyed", HostChoice::Agh);
+        let (o, tx) = ok(w.run(false));
+        assert_eq!(o.signed, ["ay", "clean"], "{}", tx.text());
+        assert_eq!(o.published, Some(8));
+        let public = w.fx.ctx.accounts.public.clone();
+        let staging = |repo: &str| w.fx.ctx.staging_slug(repo).to_string();
+        assert_eq!(
+            w.fx.calls("preflight "),
+            [
+                format!("preflight {}", staging("aterm")),
+                format!("preflight {}", staging("ay")),
+                format!("preflight {}", staging("clean")),
+                format!("preflight {public}/aterm"),
+                format!("preflight {public}/ay"),
+                format!("preflight {public}/clean"),
+            ]
+        );
+
+        // Check 6 per program: one staging repository the uploads write refused, nothing
+        // signed, and READY.md says why.
+        let mut w = world("linux-agh-check6-programs", HostChoice::Agh);
+        let clean = w.fx.ctx.staging_slug("clean").to_string();
+        w.fx.ctx.hosts.staging = Arc::new(RefusesOwner {
+            inner: w.fx.host.clone(),
+            refused: vec![clean.clone()],
+        });
+        let (r, _) = w.run(false);
+        let e = r.expect_err("no staging writer on one program");
+        assert_eq!(e.exit_code(), 1, "{e}");
+        let why = e.to_string();
+        assert!(
+            why.contains(&format!("staging writer unavailable on {clean}")),
+            "{why}"
+        );
+        assert!(why.contains("nothing signed"), "{why}");
+        let ready = w.ready();
+        assert!(
+            ready.contains(&format!("the staging writer on {clean} is unavailable")),
+            "{ready}"
+        );
+        assert!(
+            !super::linux::staged_manifest(&w.staged(), "clean", 20)
+                .with_extension("toml.sig")
+                .exists()
+        );
+
+        // Check 7: the public writer refused, nothing signed.
+        let mut w = world("linux-agh-check7", HostChoice::Agh);
+        w.fx.ctx.hosts.channel = Arc::new(RefusesOwner {
+            inner: w.fx.host.clone(),
+            refused: vec![format!("{public}/aterm")],
+        });
+        let (r, _) = w.run(false);
+        let e = r.expect_err("no public writer");
+        assert_eq!(e.exit_code(), 1, "{e}");
+        let why = e.to_string();
+        assert!(
+            why.contains(&format!("public writer unavailable on {public}/aterm")),
+            "{why}"
+        );
+        assert!(why.contains("refused by the test"), "{why}");
+        assert!(why.contains("nothing signed"), "{why}");
+        let ready = w.ready();
+        assert!(
+            ready.contains(&format!(
+                "the public writer on {public}/aterm is unavailable"
+            )),
+            "{ready}"
+        );
+        assert!(
+            !super::linux::staged_manifest(&w.staged(), "clean", 20)
+                .with_extension("toml.sig")
+                .exists()
+        );
+
+        // Check 7 with only the uploads an earlier run signed owed: READY.md says why the
+        // follow-up index is not published.
+        let mut w = world("linux-agh-check7-earlier", HostChoice::Agh);
+        w.fx.indexer.fail.store(true, Ordering::SeqCst);
+        let _ = w.run(false);
+        w.fx.indexer.fail.store(false, Ordering::SeqCst);
+        w.fx.ctx.hosts.channel = Arc::new(RefusesOwner {
+            inner: w.fx.host.clone(),
+            refused: vec![format!("{public}/aterm")],
+        });
+        let (r, tx) = w.run(false);
+        let e = r.expect_err("no public writer for the owed uploads");
+        assert_eq!(e.exit_code(), 1, "{e}\n{}", tx.text());
+        let ready = w.ready();
+        assert!(
+            ready.contains("Signed and uploaded by an earlier run: ay clean.")
+                && ready.contains("READY (sign + publish now): <none>"),
+            "{ready}"
+        );
+        assert!(
+            ready.contains(&format!(
+                "the public writer on {public}/aterm is unavailable"
+            )),
+            "{ready}"
+        );
+    }
+
+    #[test]
+    fn ready_md_spells_each_owner_by_its_host() {
+        // READY.md, and the world's owners, read at run time so no owner is written here.
+        let ceremony = |choice: HostChoice| {
+            let label = format!("linux-ready-{}", choice.as_str());
+            // The default reads its token files, as M1 did; the agh choices read none.
+            let w = if choice == HostChoice::Gh {
+                World::new(&label)
+            } else {
+                world(&label, choice)
+            };
+            w.keyless();
+            ok(w.run(false));
+            (w.ready(), w.fx.ctx.accounts.clone())
+        };
+        let channel = "~/.secrets/gh_access_token_alabsystems";
+
+        let (gh, _) = ceremony(HostChoice::Gh);
+        assert!(
+            gh.contains("```sh\natpkg-publish lane run linux --sha256 "),
+            "{gh}"
+        );
+        assert!(
+            gh.contains(&format!("and owner tokens including {channel}.")),
+            "{gh}"
+        );
+        assert!(gh.contains("`atpkg-publish index --upload`"), "{gh}");
+
+        let (staging, accounts) = ceremony(HostChoice::AghStaging);
+        assert!(
+            staging.contains("```sh\natpkg-publish --host agh-staging lane run linux --sha256 "),
+            "{staging}"
+        );
+        assert!(
+            staging.contains(&format!(
+                "and agh.toml's writer for {} and the channel token {channel}.",
+                accounts.staging
+            )),
+            "{staging}"
+        );
+        assert!(
+            staging.contains("`atpkg-publish index --upload`"),
+            "{staging}"
+        );
+
+        let (agh, accounts) = ceremony(HostChoice::Agh);
+        assert!(
+            agh.contains("```sh\natpkg-publish --host agh lane run linux --sha256 "),
+            "{agh}"
+        );
+        let writers = if accounts.staging.eq_ignore_ascii_case(&accounts.public) {
+            format!("and agh.toml's writer for {}.", accounts.public)
+        } else {
+            format!(
+                "and agh.toml's writers for {} and {}.",
+                accounts.staging, accounts.public
+            )
+        };
+        assert!(agh.contains(&writers), "{agh}");
+        assert!(
+            agh.contains("`atpkg-publish --host agh index --upload`"),
+            "{agh}"
+        );
+        assert!(!agh.contains("gh_access_token"), "{agh}");
+        assert!(!agh.lines().any(|l| l.starts_with("gh ")), "{agh}");
+    }
 }

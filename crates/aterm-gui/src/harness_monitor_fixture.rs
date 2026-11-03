@@ -72,7 +72,7 @@ fn project(raw: &str) -> Option<(Vec<TabComputer>, Vec<TabSpreadsheetRow>)> {
                 text("uuid")?.to_owned(),
                 text("display_name").or_else(|| text("name"))?.to_owned(),
                 text("address")?.to_owned(),
-                row.get("state"),
+                super::CachedMachineState::from_json(row.get("state")),
             );
             super::merge_cached_computer(
                 &mut computers,

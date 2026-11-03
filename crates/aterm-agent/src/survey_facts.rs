@@ -317,6 +317,16 @@ impl SwarmSurveyFacts {
 
         let header =
             instance.ok_or_else(|| "missing instance header in survey reply".to_owned())?;
+        if let Some(raw_accounts) = field_raw(&header, "accounts") {
+            let expected = crate::parse_uint::<usize>(raw_accounts)
+                .ok_or_else(|| "invalid accounts field in instance header".to_owned())?;
+            if expected != accounts.len() {
+                return Err(format!(
+                    "survey reply account count mismatch: header says {expected}, body has {}",
+                    accounts.len()
+                ));
+            }
+        }
         let version = required_nonempty(&header, "version")?;
         let sessions = crate::parse_uint::<usize>(required_raw(&header, "sessions")?)
             .ok_or_else(|| "invalid sessions field in instance header".to_owned())?;
@@ -813,6 +823,18 @@ mod tests {
         }
         let plus_time = wire.replacen(" last_used=1793159900", " last_used=+1793159900", 1);
         assert!(SwarmSurveyFacts::from_survey_reply(&plus_time).is_err());
+
+        // Truncated survey replies whose body holds fewer `account` lines than `accounts=` on
+        // `instance` declares must be rejected rather than publishing partial swarm facts.
+        let truncated = wire
+            .lines()
+            .filter(|line| !line.starts_with("account pool=codex "))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert!(SwarmSurveyFacts::from_survey_reply(&truncated).is_err());
+        let signed_accounts = wire.replacen(" accounts=3 ", " accounts=+3 ", 1);
+        assert!(SwarmSurveyFacts::from_survey_reply(&signed_accounts).is_err());
     }
 
     /// The header counts the account lines and names the pools that could not be read, which an
@@ -1001,6 +1023,7 @@ mod tests {
                 label: "m22".to_owned(),
                 aliases: Vec::new(),
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 1,
                 claimed_label: None,
                 claimed_at_ms: None,
@@ -1044,6 +1067,7 @@ mod tests {
                 label: "m100".to_owned(),
                 aliases: Vec::new(),
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 1,
                 claimed_label: None,
                 claimed_at_ms: None,

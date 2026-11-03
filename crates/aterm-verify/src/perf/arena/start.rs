@@ -833,7 +833,7 @@ const fn trim_ascii(b: &[u8]) -> &[u8] {
 }
 
 fn tail(path: &Path) -> String {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let text = crate::read_regular_text(path).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(30)..].join("\n")
 }

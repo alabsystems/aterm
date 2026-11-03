@@ -204,6 +204,7 @@ fn check(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str
             .map(drop)
             .ok_or("this column holds a whole number"),
         Ty::Text(max) => guard::text(text()?, *max).map_err(guard::Refusal::rule),
+        Ty::AccountLabel(max) => guard::account_label(text()?, *max).map_err(guard::Refusal::rule),
         Ty::Enum(words) => {
             let word = text()?;
             if words.contains(&word) {
@@ -257,21 +258,27 @@ fn check(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str
                     .and_then(Value::as_str)
                     .is_some_and(crate::crypto::name)
             };
-            if object
+            if !object
                 .keys()
                 .all(|key| matches!(key.as_str(), "vault" | "entry" | "item"))
-                && names("vault")
-                && names("entry")
-                && (!object.contains_key("item") || names("item"))
+                || !names("vault")
+                || !names("entry")
+                || (object.contains_key("item") && !names("item"))
             {
-                Ok(())
-            } else {
-                Err("a vault reference holds only vault, entry and item names")
+                return Err("a vault reference holds only vault, entry and item names");
             }
+            object
+                .values()
+                .filter_map(Value::as_str)
+                .try_for_each(|name| guard::word(name).map_err(guard::Refusal::rule))
         }
-        Ty::Ref(_) => pk_grammar(text()?)
-            .then_some(())
-            .ok_or("a reference is a key"),
+        Ty::Ref(_) => {
+            let target = text()?;
+            if !pk_grammar(target) {
+                return Err("a reference is a key");
+            }
+            guard::word(target).map_err(guard::Refusal::rule)
+        }
         Ty::Set(_) => Err("a set is written one element at a time"),
         Ty::List(inner, max) => {
             let items = x.as_array().ok_or("this column holds a list")?;
@@ -312,6 +319,10 @@ fn check(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str
                 Err("a source coordinate is {source, row, col}, never a value")
             }
         }
+        Ty::Sealed(max) => aterm_secrets::b64::decode_padded(text()?)
+            .filter(|wire| !wire.is_empty() && wire.len() <= *max)
+            .map(drop)
+            .ok_or("this column holds one sealed record within its size"),
         Ty::Json(max) => {
             let size = aterm_json::to_vec(x).map_or(usize::MAX, |bytes| bytes.len());
             if size > *max {
@@ -352,8 +363,9 @@ fn check_elem(column: &Column, elem: &str) -> std::result::Result<(), &'static s
     match inner {
         Ty::Enum(words) if !words.contains(&elem) => Err("this word is not one the column knows"),
         Ty::Label if !keys::is_label(elem) => Err("a machine label is m<N> or m<N>-xxxx"),
-        _ if pk_grammar(elem) => Ok(()),
-        _ => Err("a set element breaks the key grammar"),
+        _ if !pk_grammar(elem) => Err("a set element breaks the key grammar"),
+        Ty::Enum(_) | Ty::Label => guard::word(elem).map_err(guard::Refusal::rule),
+        _ => check(inner, &Value::String(elem.to_owned()), false),
     }
 }
 
@@ -384,10 +396,35 @@ pub fn validate(collection: &Collection, column: &Column, x: &Value) -> Result<(
 /// # Errors
 /// The collection is not cells, the key or value breaks a rule, or the column is unknown or
 /// retired.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "NewRegion",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "OldEdit",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "NewEdit",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
 pub fn change(collection: &Collection, key: CellKey<'_>, value: &CellValue) -> Result<Change> {
     if collection.kind != Kind::Cells {
         return Err(refuse(collection, key.col, "this collection is not cells"));
     }
+    guard::word(key.pk).map_err(|r| refuse(collection, key.col, r.rule()))?;
     let column = collection
         .column(key.col)
         .filter(|column| column.live_at(collection.version))
@@ -566,7 +603,141 @@ fn field(rule: OnConflict, mut candidates: Vec<Candidate>) -> Option<Field> {
     }
 }
 
+/// The most candidates one carried register holds.
+pub const MAX_CARRIED: usize = 16;
+
+/// The candidates a table roll carried into one register (design §3.8): a roll restates a
+/// register of the generation before as one value, `{"k": [{"o": <hex operation>, "v": <its
+/// value>}, …]}`, each item a candidate the register held there, in operation order, with the
+/// operation that wrote it. One writer's records are causally ordered, so a roll cannot write
+/// concurrent candidates; the list is how an open conflict stays open across generations, and
+/// `o` is how the next roll tells a candidate it carried from one it has not seen. `None` for
+/// any value that is not exactly that shape.
+pub fn carried(value: &Value) -> Option<Vec<(Digest, Value)>> {
+    let object = value.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    let items = object.get("k")?.as_array()?;
+    if items.is_empty() || items.len() > MAX_CARRIED {
+        return None;
+    }
+    let mut out: Vec<(Digest, Value)> = Vec::with_capacity(items.len());
+    for item in items {
+        let item = item.as_object()?;
+        if item.len() != 2 {
+            return None;
+        }
+        let mut operation = [0; 32];
+        let hex = item.get("o")?.as_str()?;
+        if !aterm_codec::hex::is_lower(hex, 64)
+            || !aterm_codec::hex::decode_into(hex.as_bytes(), &mut operation)
+        {
+            return None;
+        }
+        let inner = item.get("v")?;
+        if carried(inner).is_some() || out.last().is_some_and(|(last, _)| *last >= operation) {
+            return None;
+        }
+        out.push((operation, inner.clone()));
+    }
+    Some(out)
+}
+
+/// The carried value of `candidates` ([`carried`]), sorted by operation with each operation
+/// once. `None` when there are none or more than [`MAX_CARRIED`].
+pub fn carry(candidates: &BTreeMap<Digest, Value>) -> Option<Value> {
+    if candidates.is_empty() || candidates.len() > MAX_CARRIED {
+        return None;
+    }
+    let items: Vec<Value> = candidates
+        .iter()
+        .map(|(operation, value)| {
+            let mut item = Map::new();
+            item.insert(
+                "o".into(),
+                Value::String(aterm_codec::hex::encode_lower(operation)),
+            );
+            item.insert("v".into(), value.clone());
+            Value::Object(item)
+        })
+        .collect();
+    let mut object = Map::new();
+    object.insert("k".into(), Value::Array(items));
+    Some(Value::Object(object))
+}
+
+/// A register's candidates with the operation each came from: a carried value ([`carried`])
+/// stands for the candidates it lists, each at its own operation; any other value is its own
+/// record's.
+pub fn origins(cell: &Cell) -> Vec<(Digest, Value)> {
+    let mut out = Vec::new();
+    for candidate in &cell.candidates {
+        match carried(&candidate.value) {
+            Some(items) => out.extend(items),
+            None => out.push((candidate.operation, candidate.value.clone())),
+        }
+    }
+    out
+}
+
 /// Read one cells collection out of a table's projected cells.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "WriteA1",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "WriteA2",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "WriteB1",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "WriteB2",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "NewRegion",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "OldEdit",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AlabCells",
+        action = "NewEdit",
+        project = "aterm_db::typed::model_tests::cells_transition"
+    )
+)]
 pub fn project(collection: &Collection, cells: &Cells) -> Projection {
     let mut projection = Projection::default();
     for ((name, key), cell) in cells {
@@ -583,20 +754,17 @@ pub fn project(collection: &Collection, cells: &Cells) -> Projection {
         }
         let mut candidates = Vec::new();
         let mut unreadable = false;
-        for candidate in &cell.candidates {
+        for (operation, value) in origins(cell) {
             // A revert that restores absence leaves a bare null: the cell reads as empty.
-            let value = if candidate.value.is_null() {
+            let value = if value.is_null() {
                 CellValue::owner(0, Value::Null)
-            } else if let Ok(value) = CellValue::decode(&candidate.value) {
+            } else if let Ok(value) = CellValue::decode(&value) {
                 value
             } else {
                 unreadable = true;
                 continue;
             };
-            candidates.push(Candidate {
-                operation: candidate.operation,
-                value,
-            });
+            candidates.push(Candidate { operation, value });
         }
         let row = projection.rows.entry(parsed.pk.to_owned()).or_default();
         let column = collection.column(parsed.col);

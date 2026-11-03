@@ -77,13 +77,13 @@ pub fn place(base: &Base, problem: &Problem) -> String {
 }
 
 fn read_back(path: &Path) -> Result<String> {
-    let unreadable = || Error::new("the grid file could not be read back");
-    let size = std::fs::metadata(path).map_err(|_| unreadable())?.len();
-    if size > grid::MAX_BYTES as u64 {
-        return Err(Error::new("the grid file is larger than the grid reads"));
-    }
-    String::from_utf8(std::fs::read(path).map_err(|_| unreadable())?)
-        .map_err(|_| Error::new("the grid file is not UTF-8"))
+    super::read_regular_utf8(
+        path,
+        grid::MAX_BYTES,
+        "the grid file could not be read back",
+        "the grid file is larger than the grid reads",
+        "the grid file is not UTF-8",
+    )
 }
 
 /// Edit `collection` of `handle`'s table in the grid: the rows every filter matches,
@@ -158,17 +158,31 @@ pub fn edit(
                     report(&format!(
                         "row {}, column {}: changed since the export; it shows both values, \
                          yours first",
-                        item.pk, item.column
+                        super::command::safe_key(&item.pk),
+                        super::command::safe_key(&item.column),
                     ));
                 }
-                let fresh = grid::export(
-                    compiled.table,
-                    collection,
-                    &handle.view()?.cells,
-                    filters,
-                    reveal,
-                )?;
-                let base = grid::reopen(fresh.base, &stale);
+                let cells = handle.view()?.cells;
+                let fresh = if filters.is_empty() {
+                    grid::export(compiled.table, collection, &cells, &[], reveal)?.base
+                } else {
+                    let matching =
+                        grid::export(compiled.table, collection, &cells, filters, reveal)?;
+                    let mut keep: std::collections::BTreeSet<&str> = matching
+                        .base
+                        .rows
+                        .iter()
+                        .map(|(pk, _)| pk.as_str())
+                        .collect();
+                    keep.extend(export.base.rows.iter().map(|(pk, _)| pk.as_str()));
+                    keep.extend(plan.born.iter().map(String::as_str));
+                    keep.extend(stale.iter().map(|item| item.pk.as_str()));
+                    let mut all =
+                        grid::export(compiled.table, collection, &cells, &[], reveal)?.base;
+                    all.rows.retain(|(pk, _)| keep.contains(pk.as_str()));
+                    all
+                };
+                let base = grid::reopen(fresh, &stale);
                 let text = grid::render(&base);
                 line = grid::stale_line(&text, &base, &stale);
                 presented = text.clone();

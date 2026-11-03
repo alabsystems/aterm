@@ -193,7 +193,7 @@ fn exercise(manual_at: ManualAt) {
     let snapshot = host.setup.snapshot().unwrap();
     assert_eq!(snapshot.revision, revision);
     if host.manual_sent.is_some() {
-        assert!(!snapshot.finished && snapshot.permissions_allowed);
+        assert!(!snapshot.finished && snapshot.run_allowed);
         assert_eq!(host.setup.recover().unwrap(), revision);
     } else {
         assert!(snapshot.finished && !snapshot.permissions_allowed);

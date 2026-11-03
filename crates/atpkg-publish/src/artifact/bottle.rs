@@ -332,8 +332,8 @@ pub fn rewrite_bottle_text(stage: &Path) -> Result<()> {
         {
             continue;
         }
-        let bytes =
-            std::fs::read(&path).map_err(|e| Error::io(format!("read {}", path.display()), &e))?;
+        let bytes = crate::identity::read_regular_bytes(&path, 64 * 1024 * 1024)
+            .map_err(|e| Error::io(format!("read {}", path.display()), &e))?;
         if bytes.contains(&0) || !bytes.windows(10).any(|w| w == b"@@HOMEBREW") {
             continue;
         }
@@ -653,7 +653,7 @@ fn check_stage_tree(
     let mut objects = Vec::new();
     for rel in files {
         let path = stage.join(&rel);
-        if let Ok(bytes) = std::fs::read(&path)
+        if let Ok(bytes) = crate::identity::read_regular_bytes(&path, 64 * 1024 * 1024)
             && !bytes.contains(&0)
             && bytes.windows(10).any(|w| w == b"@@HOMEBREW")
         {
@@ -715,7 +715,10 @@ pub fn pack_bottle_with(
     let base = request
         .merge_from
         .as_ref()
-        .map(|p| std::fs::read(p).map_err(|e| Error::io(format!("read {}", ctx.shown(p)), &e)))
+        .map(|p| {
+            crate::identity::read_regular_bytes(p, crate::identity::MAX_META_BYTES)
+                .map_err(|e| Error::io(format!("read {}", ctx.shown(p)), &e))
+        })
         .transpose()?;
 
     let mut ctx = ctx.clone();
@@ -842,9 +845,12 @@ pub fn pack_bottle_with(
 
     // Client self-check: parse (and signature-verify when signed) and stage through verify_and_stage.
     let manifest_bytes =
-        std::fs::read(&manifest).map_err(|e| Error::io(ctx.shown(&manifest), &e))?;
+        crate::identity::read_regular_bytes(&manifest, crate::identity::MAX_META_BYTES)
+            .map_err(|e| Error::io(ctx.shown(&manifest), &e))?;
     let parsed = if let (Some(s), Some(sig_path)) = (&signer, &signature) {
-        let sig_bytes = std::fs::read(sig_path).map_err(|e| Error::io(ctx.shown(sig_path), &e))?;
+        let sig_bytes =
+            crate::identity::read_regular_bytes(sig_path, crate::identity::MAX_META_BYTES)
+                .map_err(|e| Error::io(ctx.shown(sig_path), &e))?;
         s.authority().verify_pkg(&manifest_bytes, &sig_bytes)?
     } else {
         let text = std::str::from_utf8(&manifest_bytes)
@@ -1025,7 +1031,7 @@ pub fn parse_args(ctx: &Ctx, args: &[String]) -> Result<BottleRequest> {
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let request = parse_args(ctx, args)?;
     if request.upload {
-        upload::token_preflight(ctx)?;
+        upload::program_preflight(ctx, &request.program)?;
     }
     let backend = relocate::backend_for_host().map_err(Error::cannot_run)?;
     let outcome = pack_bottle_with(ctx, &request, backend.as_ref(), &tarwrite::Zstd)?;

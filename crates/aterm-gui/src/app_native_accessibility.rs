@@ -1046,9 +1046,7 @@ mod tests {
             .expect("the page answers at its first tick");
         assert_eq!(
             answer.decision,
-            WorkstationSetupDecision::Begin(crate::workstation_setup::automatic_plan_for_test(
-                Plan::default()
-            ))
+            WorkstationSetupDecision::Begin(Plan::default())
         );
         assert_eq!(
             answer.receipt.as_ref().unwrap().admission(),

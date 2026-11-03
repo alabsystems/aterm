@@ -392,3 +392,52 @@ fn explicit_email_secrets_do_not_create_credentials_for_other_mailboxes() {
         assert!(!model.successors("Resolve", &before).contains(&mutant));
     }
 }
+
+/// A row the lab renamed (`m22-2` to `claude-bbbbbb`) keeps the sign-in secrets its old label
+/// names: the lab's legacy label maps them to the account's address. With no lab held the old
+/// label maps nothing, as before the rename.
+/// NEGATIVE CONTROL: with `mailbox_aliases` not reading `alab_roster::legacy_labels`, the
+/// password is not found under the lab (`left: None right: Some("fixture-pw")`).
+#[test]
+fn a_renamed_rows_old_label_still_names_its_secrets() {
+    use super::super::accounts::{Cli, Vendor};
+    use super::super::alab_roster::{Lab, LabAccount, with_lab};
+    let home = aterm_tempfile::tempdir().unwrap();
+    for (name, text) in [
+        (
+            ".secrets/ai-mailbox.toml",
+            "[passwords]\nm22-2 = \"fixture-pw\"\n",
+        ),
+        (
+            ".config/aterm/accounts.toml",
+            "[[account]]\nlabel = \"claude-bbbbbb\"\nclass = \"dedicated\"\n\
+             email = \"bob@example.test\"\n",
+        ),
+    ] {
+        let path = home.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let read = || {
+        discover_mailbox_config_files_raw(Some(home.path()), None, None)
+            .password_for(Some("bob@example.test"))
+    };
+    assert_eq!(read(), None);
+    let lab = Lab {
+        me: Some("m22".into()),
+        accounts: vec![LabAccount {
+            pk: "ac-0000000000000001".into(),
+            cli: Cli::Claude,
+            vendor: Vendor::default(),
+            label: "claude-bbbbbb".into(),
+            legacy_label: Some("m22-2".into()),
+            email: "bob@example.test".into(),
+            identity: None,
+            browser: None,
+            joinable: true,
+            preferred: vec![("m22".into(), Some(1))],
+        }],
+        ..Lab::default()
+    };
+    assert_eq!(with_lab(lab, read).as_deref(), Some("fixture-pw"));
+}

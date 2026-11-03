@@ -63,8 +63,12 @@ pub enum Family {
     /// (`secrets.need.<want>.awaiting-person`, docs/DESIGN-credential-requests-2026-10-27.md
     /// §10): the whole answer of the need ledger, every look.
     Secrets,
+    /// agh's needs (`agh.<subject>.<cause>`): facts for a person that agh and atpkg-publish
+    /// leave as files under `<state>/agh/needs`. A level family: the window states its whole
+    /// answer at each look, so a need whose file is gone ends.
+    Agh,
     /// The Macs asking to join that nothing let in (`members.join.<code>.asking`,
-    /// docs/DESIGN-automatic-alab-lan-admission-2026-10-29.md): a fact for later, never an alert
+    /// docs/DESIGN-automatic-lan-admission-2026-11-02.md): a fact for later, never an alert
     /// on screen; the member desk's whole answer and the admin approver's, every look.
     Join,
     /// This Mac away from the `ALab` LAN (`network.place.away`,
@@ -101,6 +105,7 @@ impl Family {
             Self::Occupancy => "harness.occupancy",
             Self::Setup => "setup",
             Self::Secrets => "secrets.need",
+            Self::Agh => "agh",
             Self::Join => "members.join",
             Self::NetworkPlace => "network.place",
         }
@@ -126,6 +131,7 @@ impl Family {
             | Self::HugeDir
             | Self::ServiceMemory
             | Self::Secrets
+            | Self::Agh
             | Self::Join
             | Self::NetworkPlace => Mode::Level,
             Self::Privacy
@@ -145,7 +151,7 @@ impl Family {
     }
 
     /// Every family, in digest order.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::Privacy,
         Self::Update,
         Self::Upgrade,
@@ -168,6 +174,7 @@ impl Family {
         Self::Occupancy,
         Self::Setup,
         Self::Secrets,
+        Self::Agh,
         Self::Join,
         Self::NetworkPlace,
     ];
@@ -195,6 +202,7 @@ impl Family {
             | Self::ServiceMemory
             | Self::Setup
             | Self::Secrets
+            | Self::Agh
             | Self::NetworkPlace => tags::SYSTEM,
             Self::Render => tags::RENDER,
             Self::Terminal | Self::Removed => tags::CONFIG,

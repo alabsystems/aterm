@@ -131,6 +131,12 @@ impl Drop for Proc {
 /// A new world in a directory made for it (`/tmp/.ubd/atkr-<tag>-…`), never one an earlier run
 /// kept ([`World`]) and never removed to make room.
 pub fn world(tag: &str) -> World {
+    world_saying(tag, "[keeper]\nenabled = true\n")
+}
+
+/// A new world ([`world`]) whose config says `keeper` about the keeper, and nothing when it is
+/// empty: what a new Mac's config says.
+pub fn world_saying(tag: &str, keeper: &str) -> World {
     let made = aterm_tempfile::Builder::new()
         .prefix(&format!("atkr-{tag}-"))
         .tempdir_in("/tmp");
@@ -146,8 +152,8 @@ pub fn world(tag: &str) -> World {
     }
     let config = root.join("cfg/aterm/aterm.toml");
     let mut text = std::fs::read_to_string(&config).expect("the scratch config");
-    text.push_str("[keeper]\nenabled = true\n");
-    std::fs::write(&config, text).expect("turn the keeper on");
+    text.push_str(keeper);
+    std::fs::write(&config, text).expect("say the world's keeper setting");
     world
 }
 

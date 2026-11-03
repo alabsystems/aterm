@@ -34,6 +34,8 @@ pub struct Args {
     pub no_windows: bool,
     /// Only the GUI cursor-pacing burst, with no release-only AOS assertion.
     pub cursor_pacing: bool,
+    /// Compile selected tests without executing them or qualifying a release.
+    pub compile_only: bool,
     /// `--admit now|wait`: whether the run waits for room for the disk it will write, each stage
     /// for room for its memory, and its timed stages for a quiet machine (the default), or starts
     /// at once, saying what it lacks. Neither lifts the run's own memory budget
@@ -121,6 +123,7 @@ where
             "--cell" => a.cells.push(value("--cell")?),
             "--no-windows" => a.no_windows = true,
             "--cursor-pacing" => a.cursor_pacing = true,
+            "--compile-only" => a.compile_only = true,
             "--admit" => {
                 let v = value("--admit")?;
                 match aterm_capacity::Admit::parse(&v) {
@@ -198,6 +201,17 @@ where
     }
     if a.base.is_some() && (a.all || !a.packages.is_empty()) {
         return usage("--base picks the change cone's base; -p and --all replace the cone".into());
+    }
+    if a.compile_only
+        && (a.release
+            || a.checks.is_empty()
+            || a.checks
+                .iter()
+                .any(|c| !matches!(c, Check::Test | Check::Checkers)))
+    {
+        return usage(
+            "--compile-only requires test or checkers; it cannot qualify a release".into(),
+        );
     }
     if a.cursor_pacing && (a.release || a.checks != [Check::Measure] || a.app.is_none()) {
         return usage(
@@ -309,6 +323,7 @@ Options:
       --app <APP>         the release bundle `measure` judges
       --fix               with fmt alone: rewrite the files it finds unformatted
       --cell <name>       the forge cell `cells` checks (repeatable; any cell)
+      --compile-only      with test/checkers: compile tests without executing them
       --cursor-pacing     with measure --app: run only the GUI pacing burst
       --no-windows        skip each stage that opens a window (a named skip)
       --admit <wait|now>  wait for room for the disk the run will write, for
@@ -473,6 +488,27 @@ mod tests {
 
 #[cfg(test)]
 mod cursor_pacing_tests {
+    #[test]
+    fn compilation_only_cannot_replace_test_execution_or_release_qualification() {
+        assert!(
+            super::parse(["test", "--all", "--compile-only"])
+                .unwrap()
+                .compile_only
+        );
+        for checks in [vec!["checkers"], vec!["test", "checkers"]] {
+            let mut args = checks;
+            args.extend(["--all", "--compile-only"]);
+            assert!(super::parse(args).unwrap().compile_only);
+        }
+        for args in [
+            vec!["release", "--app", "/test.app", "--compile-only"],
+            vec!["test", "lint", "--compile-only"],
+            vec!["--compile-only"],
+        ] {
+            assert!(super::parse(args).is_err());
+        }
+    }
+
     #[test]
     fn focused_measurement_cannot_replace_release_qualification() {
         let good = super::parse(["measure", "--app", "/test.app", "--cursor-pacing"]).unwrap();

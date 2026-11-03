@@ -42,6 +42,13 @@ pub const fn backlog_max(populations: usize) -> usize {
 /// cap (`aterm_link::state::ASKED_KEEP`), which the ask world's tests hold it to.
 pub const ASKED_PREFILL_MAX: usize = 1024;
 
+/// The most paced notes a run takes: ten minutes of them at [`NOTE_PACE`].
+pub const PACED_NOTES_MAX: usize = 545;
+
+/// How far apart the paced notes go: past the mirror's one snapshot of a moved mail count a
+/// second (`aterm_slog::MAIL_SNAP_GAP_MS`, 1,000 ms), so every delivery owes one.
+pub const NOTE_PACE: std::time::Duration = std::time::Duration::from_millis(1_100);
+
 /// One run's knobs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spec {
@@ -95,6 +102,11 @@ pub struct Spec {
     /// and taken in by a restarted bridge, as a node that upgraded with a full
     /// table holds it. 0 (the default) is none; at most [`ASKED_PREFILL_MAX`].
     pub asked_prefill: usize,
+    /// The messaging world's paced notes (C13): one-way notes from A to B, [`NOTE_PACE`]
+    /// apart, none answered, after the burst, so each delivery owes the bus mirror the
+    /// session's snapshot, as an agent's delivery does. 0 (the default) is none; at most
+    /// [`PACED_NOTES_MAX`].
+    pub paced_notes: usize,
 }
 
 /// The scenarios measured in one run.
@@ -279,6 +291,9 @@ impl Spec {
         if self.asked_prefill > 0 {
             words.push_str(&format!(" asked_prefill={}", self.asked_prefill));
         }
+        if self.paced_notes > 0 {
+            words.push_str(&format!(" paced_notes={}", self.paced_notes));
+        }
         if self.scenario != Scenario::All {
             words.push_str(&format!(" scenario={}", self.scenario.word()));
         }
@@ -294,13 +309,14 @@ impl Spec {
 ///
 /// # Errors
 /// A word or value it does not know, a count that is not a positive integer
-/// (`warmup`, `bystanders`, `paced`, `backlog` and `horizon_ms` may be 0), a durability
+/// (`warmup`, `bystanders`, `paced`, `backlog`, `paced_notes` and `horizon_ms` may be 0), a durability
 /// that is not a [`Tier`], a horizon for a tier that is not ordered, a
 /// retention interval on a broker that does not retain, a burst past
 /// [`BURST_MAX`], an attach list that does not rise or passes [`ATTACH_MAX`],
 /// a bystander count past [`ATTACH_MAX`], a backlog past [`backlog_max`] for
 /// its attach sizes or on a run that measures no attach, an asked prefill past
-/// [`ASKED_PREFILL_MAX`] or on a run that measures no ask, or no `out=`.
+/// [`ASKED_PREFILL_MAX`] or on a run that measures no ask, paced notes past
+/// [`PACED_NOTES_MAX`] or on a run that measures no messaging, or no `out=`.
 pub fn parse(raw: &str) -> Result<Spec, String> {
     let mut out = None;
     let mut spec = Spec {
@@ -324,6 +340,7 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
         mix_every: DEFAULT_MIX_EVERY,
         backlog: 0,
         asked_prefill: 0,
+        paced_notes: 0,
     };
     let count = |key: &str, v: &str, zero_ok: bool| -> Result<usize, String> {
         match v.parse::<usize>() {
@@ -352,6 +369,7 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
             "mix_every" => spec.mix_every = count(key, v, false)?,
             "backlog" => spec.backlog = count(key, v, true)?,
             "asked_prefill" => spec.asked_prefill = count(key, v, true)?,
+            "paced_notes" => spec.paced_notes = count(key, v, true)?,
             "durability" => spec.durability = Tier::parse(v)?,
             "retention" => spec.retention = on_off(v)?,
             "at_rest" => spec.at_rest = on_off(v)?,
@@ -427,6 +445,17 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
     if spec.asked_prefill > ASKED_PREFILL_MAX {
         return Err(format!(
             "{ENV}: asked_prefill= tops out at the asked table's {ASKED_PREFILL_MAX} rows"
+        ));
+    }
+    if spec.paced_notes > PACED_NOTES_MAX {
+        return Err(format!(
+            "{ENV}: paced_notes= tops out at {PACED_NOTES_MAX}, ten minutes of notes"
+        ));
+    }
+    if spec.paced_notes > 0 && !matches!(spec.scenario, Scenario::All | Scenario::Messaging) {
+        return Err(format!(
+            "{ENV}: paced_notes= is the messaging world's, and this run measures {}",
+            spec.scenario.word()
         ));
     }
     if spec.asked_prefill > 0 && !matches!(spec.scenario, Scenario::All | Scenario::Ask) {

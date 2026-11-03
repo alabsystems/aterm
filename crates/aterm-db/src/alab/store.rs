@@ -6,22 +6,184 @@
 //! schema rows by an owner verb only.
 
 use super::{
-    registry::{APPLICATION, REGISTRY, ROLE, VERSION},
+    checks::Finding,
+    discover::{self, Listing},
+    register::{self, Input, Me, Outcome, Probe, Registered},
+    registry::{APPLICATION, MACHINE_FACTS, MAILBOX_OBS, REGISTRY},
     seeds,
+    view::LabView,
 };
 use crate::{
     Error, Result,
-    att::{View, decode, pack},
+    att::{Compiled, View, decode, pack},
     catalog::Descriptor,
     database::Command,
     documents::{application, log::Log},
-    table::Scope,
-    typed,
+    machines::Label,
+    table::{Scope, Session},
+    typed::{self, keys},
 };
+use astream_wire::sync::Digest;
 use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
+use std::{collections::BTreeSet, path::Path};
 
-fn descriptor(bootstrap: &Bootstrap) -> Result<Descriptor> {
-    Descriptor::application(bootstrap.trust(), APPLICATION, ROLE, VERSION)
+/// The SHA-256 fingerprint of the registry operations a [`LabView`] was projected from
+/// (`replica::InventorySummary`'s encoding), so a cache can tell whether anything arrived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Inventory(pub Digest);
+
+/// What [`Registry::lab`] read.
+#[derive(Clone, Debug)]
+pub enum LabRead {
+    /// The registry's operations are the ones the caller's view was projected from: nothing is
+    /// projected again.
+    Unchanged,
+    /// The view of the registry as it is now, and the inventory it was projected from.
+    Projected(LabView, Inventory),
+}
+
+/// The declaration of the registry generation `compiled`.
+fn descriptor(
+    compiled: &'static Compiled,
+) -> impl FnOnce(&Bootstrap) -> Result<Descriptor> + use<> {
+    move |bootstrap| compiled.descriptor(bootstrap.trust())
+}
+
+/// Whether this Mac's quota of automatic records, less `reserve` records kept for another writer
+/// path, can take one more record and the causal joins it may need, joins an interrupted append
+/// left included (design §3.9).
+fn quota_room(session: &Session<'_>, log: &Log, view: &View, reserve: usize) -> bool {
+    let actor = session.actor();
+    let spent = view.quota.spent.get(&actor).copied().unwrap_or(0);
+    let last_business = view
+        .ops
+        .iter()
+        .filter(|op| op.actor == actor)
+        .map(|op| op.sequence)
+        .max()
+        .unwrap_or(0);
+    let pending = log
+        .eligible_and_merges()
+        .1
+        .iter()
+        .filter(|(writer, sequence)| *writer == actor && *sequence > last_business)
+        .count();
+    log.append_records_bound().saturating_add(pending)
+        <= REGISTRY
+            .self_quota
+            .saturating_sub(reserve)
+            .saturating_sub(spent)
+}
+
+/// The Commons uuids of the current members.
+fn live_uuids(session: &Session<'_>) -> BTreeSet<String> {
+    session
+        .members()
+        .iter()
+        .map(|binding| keys::uuid32(binding.machine()))
+        .collect()
+}
+
+/// The label a row of this Mac carries: the membership log's, else the vault roster's row for this
+/// Mac's own recipient, the first that is a label. Nothing else names a Mac here: a host name is
+/// not an identity, however it reads.
+pub(super) fn chosen_label(logged: Option<String>, roster: Option<String>) -> Option<String> {
+    [logged, roster]
+        .into_iter()
+        .flatten()
+        .find_map(|label| Label::parse(&label).ok())
+        .map(|label| label.canonical())
+}
+
+/// The non-denied roster label and positive admission timestamp of `recipient`, when `roster`
+/// holds one.
+pub(super) fn roster_identity(
+    roster: Option<&aterm_secrets::swarm_roster::SwarmRoster>,
+    recipient: &str,
+) -> (Option<String>, Option<u64>) {
+    let Some(member) = roster.and_then(|r| {
+        r.member_by_recipient(recipient)
+            .filter(|m| !r.is_member_denied(m))
+    }) else {
+        return (None, None);
+    };
+    (
+        Some(member.label.clone()),
+        Some(member.admitted_ms).filter(|ms| *ms > 0),
+    )
+}
+
+/// Who this enrollment is: its uuid from its binding, its label ([`chosen_label`]), and when the
+/// roster says it was admitted. Never `machine.toml`.
+fn me(
+    session: &Session<'_>,
+    trust: aterm_secrets::commons::journal::Trust,
+    probe: &Probe,
+) -> Result<Me> {
+    let members = session.members();
+    let actor = session.actor();
+    let binding = members
+        .iter()
+        .find(|binding| binding.actor() == actor)
+        .ok_or_else(|| Error::new("this Mac is not in its own Commons roster"))?;
+    let paths = session.paths();
+    let logged = aterm_secrets::client::trusted_commons_log(paths, trust)
+        .ok()
+        .flatten()
+        .and_then(|(log, _)| log.membership().label(&actor).map(str::to_owned));
+    let recipient = binding.recipient().to_bech32();
+    let roster = aterm_secrets::client::swarm_roster(paths).ok().flatten();
+    let (rostered, enrolled_ms) = roster_identity(roster.as_ref(), &recipient);
+    Ok(Me {
+        uuid: keys::uuid32(binding.machine()),
+        label: chosen_label(logged, rostered),
+        hw_hint: keys::hw_hint(&trust.network, &probe.platform_uuid),
+        enrolled_ms,
+    })
+}
+
+fn quiet(outcome: Outcome) -> Registered {
+    Registered {
+        outcome,
+        findings: Vec::new(),
+        records: 0,
+    }
+}
+
+/// The plan for this Mac over a complete read of the registry.
+fn planned(
+    session: &Session<'_>,
+    trust: aterm_secrets::commons::journal::Trust,
+    view: &View,
+    probe: &Probe,
+    heard: bool,
+    now_ms: u64,
+) -> Result<register::Plan> {
+    let me = me(session, trust, probe)?;
+    let live = live_uuids(session);
+    let input = Input {
+        me: &me,
+        probe,
+        live: &live,
+        heard,
+        now_ms,
+    };
+    let facts = view
+        .owned
+        .get(MACHINE_FACTS.name)
+        .cloned()
+        .unwrap_or_default();
+    register::plan(&input, &view.cells, &facts)
+}
+
+/// What one discovery pass decided and wrote.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Discovered {
+    pub outcome: discover::Outcome,
+    /// By key, never by value.
+    pub findings: Vec<Finding>,
+    /// Records appended: 0 or 1.
+    pub records: usize,
 }
 
 /// What a seed pass wrote.
@@ -43,13 +205,27 @@ impl Registry {
         Self { paths }
     }
 
+    /// This Mac's vault paths.
+    pub(crate) const fn paths(&self) -> &Paths {
+        &self.paths
+    }
+
+    /// The registry generation this Mac reads and writes now (`att::current`): `alab/registry`
+    /// until a roll seals it, then `alab/registry.2`.
+    pub fn generation(&self) -> &'static Compiled {
+        crate::att::current(&self.paths, &crate::att::REGISTRY)
+    }
+
     /// Declare the registry, whose catalog slot is reserved, and enroll it under this Mac's
     /// writer. Reopening coalesces with an existing declaration.
     ///
     /// # Errors
     /// No Commons writer, no storage room at all, or an incompatible declaration.
     pub fn open(&self) -> Result<Scope> {
-        application::with_store(&self.paths, true, descriptor, |_, _, scope| Ok(scope))
+        let compiled = self.generation();
+        application::with_store(&self.paths, true, descriptor(compiled), |_, _, scope| {
+            Ok(scope)
+        })
     }
 
     /// Read the registry this Mac holds, without enrolling it.
@@ -67,42 +243,358 @@ impl Registry {
     /// nothing and a retry returns its first receipt.
     ///
     /// # Errors
-    /// No Commons writer; this Mac's history of the registry is incomplete (withheld,
-    /// unavailable or refused operations), so a scan could miss a held cell; or this Mac's
-    /// automatic records are spent.
+    /// No Commons writer; the registry cannot be read or written; retained history could still
+    /// reveal a held cell; or the next seed and its causal joins exceed this Mac's remaining
+    /// automatic-record quota.
     pub fn seed(&self) -> Result<Seeded> {
-        application::with_store(&self.paths, true, descriptor, |session, store, scope| {
-            session.writer()?;
-            let mut seeded = Seeded::default();
-            let mut log = Log::read_with(session, store, scope, decode)?;
-            log.writable(session.actor())?;
-            let view = View::read(&REGISTRY, session, &log);
-            if !view.complete {
-                return Err(Error::new(
-                    "the registry's history here is incomplete; seeds wait for a complete scan",
-                ));
-            }
-            let mut spent = view.quota.spent.get(&session.actor()).copied().unwrap_or(0);
-            for changes in pack(seeds::rows_for(&view.cells)?)? {
-                let request = typed::request_id(APPLICATION, ROLE, &changes)?;
-                let command = Command::Write { request, changes };
-                if log.retry(session.actor(), &command)?.is_some() {
-                    seeded.retried += 1;
-                    continue;
-                }
-                if spent >= REGISTRY.self_quota {
+        let compiled = self.generation();
+        application::with_store(
+            &self.paths,
+            true,
+            descriptor(compiled),
+            |session, store, scope| {
+                session.writer()?;
+                let mut seeded = Seeded::default();
+                let mut log = Log::read_with(session, store, scope, decode)?;
+                log.writable(session.actor())?;
+                let mut view = View::read(compiled.table, session, &log);
+                if !view.complete {
                     return Err(Error::new(
-                        "this Mac's automatic records in the registry are spent",
+                        "the registry's history here is incomplete; seeds wait for a complete scan",
                     ));
                 }
-                application::append(session, store, &command.encode()?)?;
-                spent += 1;
-                seeded.records += 1;
-                // Re-read before admitting another append (`Log::append_records_bound`).
-                log = Log::read_with(session, store, scope, decode)?;
-            }
-            Ok(seeded)
+                for changes in pack(seeds::rows_for(&view.cells)?)? {
+                    let request = typed::request_id(APPLICATION, compiled.table.role, &changes)?;
+                    let command = Command::Write { request, changes };
+                    if log.retry(session.actor(), &command)?.is_some() {
+                        seeded.retried += 1;
+                        continue;
+                    }
+                    if !quota_room(session, &log, &view, 0) {
+                        return Err(Error::new(
+                            "this Mac's remaining automatic quota cannot fit the next registry seed \
+                         and its causal joins",
+                        ));
+                    }
+                    application::append(session, store, &command.encode()?)?;
+                    seeded.records += 1;
+                    // Re-read before admitting another append (`Log::append_records_bound`).
+                    log = Log::read_with(session, store, scope, decode)?;
+                    view = View::read(compiled.table, session, &log);
+                }
+                Ok(seeded)
+            },
+        )
+    }
+
+    /// The registry's table id here: what a repair round and `[commons] exclude_tables` name it
+    /// by. `None` with no Commons at all.
+    ///
+    /// # Errors
+    /// This Mac's custody cannot be read.
+    pub fn table(&self) -> Result<Option<Digest>> {
+        let compiled = self.generation();
+        let Some(bootstrap) = Bootstrap::cached(&self.paths).map_err(crate::table::failure)? else {
+            return Ok(None);
+        };
+        Ok(Some(compiled.descriptor(bootstrap.trust())?.scope.digest()))
+    }
+
+    /// The Commons uuids of the current members, what `check` calls live.
+    ///
+    /// # Errors
+    /// As [`Self::view`].
+    pub fn live_uuids(&self) -> Result<BTreeSet<String>> {
+        let compiled = self.generation();
+        application::observe_store(&self.paths, descriptor(compiled), |session, _, _| {
+            Ok(live_uuids(session))
         })
+    }
+
+    /// One self-registration pass (design §6): write this Mac's facts row, and the machine and
+    /// model rows it needs in the same record, only on a change or an old `seen`, within this
+    /// Mac's quota. It reads `config` first and writes nothing when `[commons]` turns sharing off or
+    /// excludes the registry or the catalog, and it never declares the registry, which an owner's
+    /// import does and a repair round brings. `heard` is that a repair round left nothing to fetch
+    /// from a peer holding the registry ([`crate::runtime::RepairRound::drained_table`]).
+    ///
+    /// # Errors
+    /// `config` is not a valid file; this Mac holds no catalog yet or is no Writer; the registry
+    /// cannot be read or written; or a reading breaks its column's rules.
+    pub fn register(
+        &self,
+        config: &Path,
+        probe: &Probe,
+        heard: bool,
+        now_ms: u64,
+    ) -> Result<Registered> {
+        let compiled = self.generation();
+        let trust = match self.admitted(config)? {
+            Ok(trust) => trust,
+            Err(outcome) => return Ok(quiet(outcome)),
+        };
+        application::with_store(
+            &self.paths,
+            false,
+            descriptor(compiled),
+            |session, store, scope| {
+                session.writer()?;
+                let log = Log::read_with(session, store, scope, decode)?;
+                log.writable(session.actor())?;
+                let view = View::read(compiled.table, session, &log);
+                if !view.complete {
+                    return Ok(quiet(Outcome::Incomplete));
+                }
+                let plan = planned(session, trust, &view, probe, heard, now_ms)?;
+                if plan.changes.is_empty() {
+                    return Ok(Registered {
+                        outcome: plan.outcome,
+                        findings: plan.findings,
+                        records: 0,
+                    });
+                }
+                let request = typed::request_id(APPLICATION, compiled.table.role, &plan.changes)?;
+                let command = Command::Write {
+                    request,
+                    changes: plan.changes,
+                };
+                if log.retry(session.actor(), &command)?.is_some() {
+                    return Ok(Registered {
+                        outcome: plan.outcome,
+                        findings: plan.findings,
+                        records: 0,
+                    });
+                }
+                if !quota_room(session, &log, &view, 0) {
+                    return Ok(Registered {
+                        outcome: Outcome::QuotaSpent,
+                        findings: plan.findings,
+                        records: 0,
+                    });
+                }
+                application::append(session, store, &command.encode()?)?;
+                Ok(Registered {
+                    outcome: plan.outcome,
+                    findings: plan.findings,
+                    records: 1,
+                })
+            },
+        )
+    }
+
+    /// One discovery pass over an open mailbox's address list (design §4.10, step 10): this Mac's
+    /// `mailbox-obs` row and the birth of the address being signed in, in one record within
+    /// discovery's share of this Mac's quota ([`discover::REGISTRATION_RESERVE`]), only where the
+    /// row's content changed ([`discover::plan`]). It reads `[commons]` first, as a registration pass does, and never
+    /// declares the registry. The mailbox is this Mac's mailbox key for the login
+    /// ([`super::command::MAILBOX_KEYS`]) where the importer left one here.
+    ///
+    /// # Errors
+    /// `config` is not a valid file; this Mac holds no catalog yet or is no Writer; the registry
+    /// or this Mac's mailbox keys cannot be read; or the registry cannot be written.
+    pub fn observe_mailbox(
+        &self,
+        config: &Path,
+        listing: &Listing,
+        now_ms: u64,
+    ) -> Result<Discovered> {
+        let compiled = self.generation();
+        let quiet = |outcome| Discovered {
+            outcome,
+            findings: Vec::new(),
+            records: 0,
+        };
+        if let Err(outcome) = self.admitted(config)? {
+            return Ok(quiet(match outcome {
+                Outcome::Excluded => discover::Outcome::Excluded,
+                _ => discover::Outcome::NotHeld,
+            }));
+        }
+        let mailbox_keys = super::command::read_keys(&self.paths)?;
+        let keyed = mailbox_keys.pk_of(&listing.login).or_else(|| {
+            let own: std::collections::BTreeSet<&str> = listing
+                .listed
+                .iter()
+                .filter(|listed| listed.own)
+                .filter_map(|listed| mailbox_keys.pk_of(&listed.addr))
+                .collect();
+            if own.len() == 1 {
+                own.into_iter().next()
+            } else {
+                None
+            }
+        });
+        application::with_store(
+            &self.paths,
+            false,
+            descriptor(compiled),
+            |session, store, scope| {
+                session.writer()?;
+                let log = Log::read_with(session, store, scope, decode)?;
+                log.writable(session.actor())?;
+                let view = View::read(compiled.table, session, &log);
+                if !view.complete {
+                    return Ok(quiet(discover::Outcome::Incomplete));
+                }
+                let actor = session.actor();
+                let uuid = session
+                    .members()
+                    .iter()
+                    .find(|binding| binding.actor() == actor)
+                    .map(|binding| keys::uuid32(binding.machine()))
+                    .ok_or_else(|| Error::new("this Mac is not in its own Commons roster"))?;
+                let obs = view
+                    .owned
+                    .get(MAILBOX_OBS.name)
+                    .cloned()
+                    .unwrap_or_default();
+                let input = discover::Input {
+                    uuid: &uuid,
+                    listing,
+                    keyed,
+                    now_ms,
+                };
+                let plan = discover::plan(&input, &view.cells, &obs)?;
+                let done = |records| Discovered {
+                    outcome: plan.outcome.clone(),
+                    findings: plan.findings.clone(),
+                    records,
+                };
+                if plan.changes.is_empty() {
+                    return Ok(done(0));
+                }
+                let request = typed::request_id(APPLICATION, compiled.table.role, &plan.changes)?;
+                let command = Command::Write {
+                    request,
+                    changes: plan.changes.clone(),
+                };
+                if log.retry(session.actor(), &command)?.is_some() {
+                    return Ok(done(0));
+                }
+                if !quota_room(session, &log, &view, discover::REGISTRATION_RESERVE) {
+                    return Ok(Discovered {
+                        outcome: discover::Outcome::QuotaSpent,
+                        findings: plan.findings.clone(),
+                        records: 0,
+                    });
+                }
+                application::append(session, store, &command.encode()?)?;
+                Ok(done(1))
+            },
+        )
+    }
+
+    /// What a pass that has heard a repair round would decide now, writing nothing: how
+    /// `aterm db alab check` answers why this Mac has no row, which a held Mac's registry cannot
+    /// show because there is no row to read. It reads as an observer, which cannot test a writer's
+    /// standing, so a Mac that is no Writer reads what it would decide; the pass's own refusal is
+    /// in its log line.
+    ///
+    /// # Errors
+    /// As [`Self::register`], but for being no Writer.
+    pub fn preview(&self, config: &Path, probe: &Probe, now_ms: u64) -> Result<Registered> {
+        let compiled = self.generation();
+        let trust = match self.admitted(config)? {
+            Ok(trust) => trust,
+            Err(outcome) => return Ok(quiet(outcome)),
+        };
+        let seen = application::observe_store_if_declared(
+            &self.paths,
+            descriptor(compiled),
+            |session, store, scope| {
+                let log = Log::read_with(session, store, scope, decode)?;
+                let view = View::read(compiled.table, session, &log);
+                if !view.complete {
+                    return Ok(quiet(Outcome::Incomplete));
+                }
+                let plan = planned(session, trust, &view, probe, true, now_ms)?;
+                Ok(Registered {
+                    outcome: plan.outcome,
+                    findings: plan.findings,
+                    records: 0,
+                })
+            },
+        )?;
+        Ok(seen.unwrap_or_else(|| quiet(Outcome::NotHeld)))
+    }
+
+    /// The registry as the harness reads it ([`LabView`]), with the inventory it was projected
+    /// from, as an observer that writes nothing: `None` where there is no Commons, `[commons]`
+    /// excludes the registry or the catalog, the registry is not declared here, or this Mac's
+    /// history of it still waits on a record (a partial history reads as rows that are not there
+    /// yet). Where the registry's inventory is still `held`, the one the caller's view was
+    /// projected from, it reads the log and its view to learn so and projects nothing
+    /// ([`LabRead::Unchanged`]).
+    ///
+    /// # Errors
+    /// This Mac's custody, its `[commons]` policy or the registry's storage cannot be read.
+    pub fn lab(&self, config: &Path, held: Option<Inventory>) -> Result<Option<LabRead>> {
+        let compiled = self.generation();
+        if self.admitted(config)?.is_err() {
+            return Ok(None);
+        }
+        let seen = application::observe_store_if_declared(
+            &self.paths,
+            descriptor(compiled),
+            |session, store, scope| {
+                let log = Log::read_with(session, store, scope, decode)?;
+                let view = View::read(compiled.table, session, &log);
+                if !view.complete {
+                    return Ok(None);
+                }
+                let ids: BTreeSet<Digest> = view.ops.iter().map(|op| op.id).collect();
+                let inventory = Inventory(crate::replica::InventorySummary::of(&ids).fingerprint);
+                if held == Some(inventory) {
+                    return Ok(Some(LabRead::Unchanged));
+                }
+                let actor = session.actor();
+                let uuid = session
+                    .members()
+                    .iter()
+                    .find(|binding| binding.actor() == actor)
+                    .map(|binding| keys::uuid32(binding.machine()));
+                let owned = |name: &str| view.owned.get(name).cloned().unwrap_or_default();
+                let lab = LabView::read(
+                    &view.cells,
+                    &owned(MACHINE_FACTS.name),
+                    &owned(MAILBOX_OBS.name),
+                    uuid.as_deref(),
+                );
+                Ok(Some(LabRead::Projected(lab, inventory)))
+            },
+        )?;
+        Ok(seen.flatten())
+    }
+
+    /// What every pass reads first: this Mac's trust, or the outcome that ends the pass, when
+    /// there is no Commons, `[commons]` turns sharing off or excludes the registry or the catalog,
+    /// or the registry is not declared here.
+    fn admitted(
+        &self,
+        config: &Path,
+    ) -> Result<std::result::Result<aterm_secrets::commons::journal::Trust, Outcome>> {
+        let compiled = self.generation();
+        let Some(bootstrap) = Bootstrap::cached(&self.paths).map_err(crate::table::failure)? else {
+            return Ok(Err(Outcome::NotHeld));
+        };
+        let trust = bootstrap.trust();
+        let table = compiled.descriptor(bootstrap.trust())?.scope.digest();
+        let catalog = crate::catalog::Directory::new(&self.paths, trust)
+            .catalog_scope()
+            .digest();
+        let policy = crate::catalog::policy::Policy::read(config)?;
+        if !policy.enabled || policy.excluded.contains(&table) || policy.excluded.contains(&catalog)
+        {
+            return Ok(Err(Outcome::Excluded));
+        }
+        if application::observe_store_if_declared(&self.paths, descriptor(compiled), |_, _, _| {
+            Ok(())
+        })?
+        .is_none()
+        {
+            return Ok(Err(Outcome::NotHeld));
+        }
+        Ok(Ok(trust))
     }
 
     /// Publish the compiled schema rows (design §3.5), an owner verb: only where the stored
@@ -115,19 +607,26 @@ impl Registry {
     }
 
     /// Append `records` as this Mac, one record each (tests drive owner edits, births and
-    /// owned rows with it).
-    #[cfg(test)]
-    pub(crate) fn write(&self, records: Vec<Vec<crate::database::Change>>) -> Result<()> {
-        application::with_store(&self.paths, true, descriptor, |session, store, _| {
-            session.writer()?;
-            for changes in records {
-                let command = Command::Write {
-                    request: crate::crypto::random()?,
-                    changes,
-                };
-                application::append(session, store, &command.encode()?)?;
-            }
-            Ok(())
-        })
+    /// owned rows with it, and `lab alab-roll` on its scratch custodies). Absent from release builds.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn write(&self, records: Vec<Vec<crate::database::Change>>) -> Result<()> {
+        let compiled = self.generation();
+        application::with_store(
+            &self.paths,
+            true,
+            descriptor(compiled),
+            |session, store, _| {
+                session.writer()?;
+                for changes in records {
+                    let command = Command::Write {
+                        request: crate::crypto::random()?,
+                        changes,
+                    };
+                    application::append(session, store, &command.encode()?)?;
+                }
+                Ok(())
+            },
+        )
     }
 }

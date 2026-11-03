@@ -449,6 +449,7 @@ fn natural_cut<R: Planned>(rules: &Retention, v: &View<'_, R>, w: &Walk, limit: 
 /// a record below the cut that a hold rule carries. A record that cannot be loaded cannot
 /// be carried, so the planning changes nothing (the cut stays at the base) rather than
 /// cut away a record its rule still holds.
+#[cfg(any(test, debug_assertions))]
 pub fn plan_with<R: Planned>(
     rules: &Retention,
     v: &View<'_, R>,

@@ -729,6 +729,7 @@ mod tests {
         };
         let proc = |pid: u32, name: &str, scope: RowScope, cores: f32| ProcView {
             scheduling: None,
+            cpu_accounting: crate::model::CpuAccounting::default(),
             pid,
             ppid: 1,
             pgid: pid,

@@ -3,6 +3,7 @@
 
 //! Pure state and health classification for each AI CLI from its [`Facts`].
 
+use super::config::{From, Settings};
 use super::connector::Connector;
 use super::facts::{Facts, Kept};
 use super::store::Ended;
@@ -286,6 +287,9 @@ pub struct Row {
     pub connector: &'static Connector,
     /// Whether it is wanted here.
     pub wanted: bool,
+    /// Whether someone asked for it here ([`asked`]): a row nobody asked for is a note, whatever
+    /// its state, and its fix stays on demand.
+    pub asked: bool,
     /// Its state.
     pub state: State,
     /// How much it matters.
@@ -313,6 +317,59 @@ pub struct Row {
     pub renew_by: Option<i64>,
     /// When the usage limit lifts.
     pub limited_until: Option<i64>,
+}
+
+impl Row {
+    /// This row as one nobody asked for ([`asked`]): at most a note, so it reaches no alert, no
+    /// `NEEDS YOU:` line, no FAIL and no exit code. Its state and its fix stay, on demand.
+    #[must_use]
+    pub fn not_asked(mut self) -> Self {
+        self.asked = false;
+        if self.mark > Mark::Note {
+            self.mark = Mark::Note;
+        }
+        if self.state.needs_act(self.wanted) {
+            self.fact.push_str(" \u{b7} nobody has asked for it here");
+        }
+        self
+    }
+}
+
+/// Whether someone asked for `f`'s CLI on this machine, so that its trouble is reported: it is the
+/// preferred CLI aterm launches; a person or the fleet document named it (`[ai.<id>] use = true`,
+/// an `[ai] reviewers` list); a person pinned a row of its pool; or something actually used it
+/// here (this layer's record of a review or a finished sign-in, a launch its accounts served, a
+/// login in its default home, which aterm's own sign-ins do not write to).
+///
+/// A roster row is no ask: the vault's account sheet syncs rows for every CLI onto a new Mac, and
+/// aterm's own sign-in ladder works them with nobody asking. Neither is an install, a CLI's home
+/// directory, or `[ai.<id>] use` left at its default of true.
+#[must_use]
+pub fn asked(f: &Facts, settings: &Settings) -> bool {
+    let named = named(f.connector.id, settings);
+    let record = &f.record;
+    let used =
+        record.used_at.is_some() || record.ended_at.is_some() || record.limited_until.is_some();
+    let pool = f.login_pool();
+    let served = f.accounts.as_ref().and_then(|a| a.served_at).is_some()
+        || pool.is_some_and(|p| p.served_at.is_some() || p.pinned.is_some());
+    let own_login = f.profile_signed_in
+        || (f.login_file.is_some() && pool.is_none_or(|p| p.serving_login.is_none()));
+    named || used || served || own_login
+}
+
+/// Whether `settings` name the CLI `id`, the part of [`asked`] that config alone answers: it is
+/// the preferred CLI, `[ai.<id>] use = true` is set rather than left at its default, or an
+/// `[ai] reviewers` list set in config or the fleet document names it.
+#[must_use]
+pub fn named(id: &str, settings: &Settings) -> bool {
+    settings.preferred.0.id == id
+        || settings
+            .uses
+            .iter()
+            .any(|(c, on, from)| c.id == id && *on && *from != From::Default)
+        || (settings.reviewers.1 != From::Default
+            && settings.reviewers.0.iter().any(|c| c.id == id))
 }
 
 /// `n` seconds as a short span: `35 min`, `5 h`, `3 d`.
@@ -392,6 +449,7 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
     let mut row = Row {
         connector: c,
         wanted,
+        asked: true,
         state: State::Off,
         mark: Mark::Note,
         fact: String::new(),
@@ -1004,19 +1062,31 @@ fn and_list(ids: &[&str]) -> String {
 
 impl Health {
     /// What comes next for the rows that need an act, never a command handed to a person that
-    /// aterm runs itself: `aterm ai doctor`, which makes aterm's own fixes itself, at a terminal or
+    /// aterm runs itself: `aterm ai doctor`, which tries aterm's own fixes, at a terminal or
     /// none and under an agent too (its installs, and its sign-ins through accounts v2's or a
-    /// pool's ladder), then the sign-ins no route of aterm's makes, each with the verb a person
+    /// pool's ladder), and promises none of them, since a vendor's page or the network can stop
+    /// any; then the sign-ins no route of aterm's makes, each with the verb a person
     /// starts it by, then what a person does where a sign-in starts nothing until then
     /// ([`Health::mends`]); `None` where no row needs an act.
     #[must_use]
     pub fn next(&self) -> Option<String> {
-        let aterm = (!self.by_aterm.is_empty()).then(|| {
+        self.next_after(&[])
+    }
+
+    /// [`Health::next`] after a doctor's run that tried `tried` itself: a fix it tried and that
+    /// did not take is said as such, never offered again as what that same doctor does.
+    #[must_use]
+    pub fn next_after(&self, tried: &[&str]) -> Option<String> {
+        let (failed, untried): (Vec<&str>, Vec<&str>) =
+            self.by_aterm.iter().partition(|id| tried.contains(*id));
+        let failed = (!failed.is_empty()).then(|| {
             format!(
-                "`aterm ai doctor` fixes {} itself",
-                and_list(&self.by_aterm)
+                "this run did not finish {}: each line above says why",
+                and_list(&failed)
             )
         });
+        let aterm = (!untried.is_empty())
+            .then(|| format!("`aterm ai doctor` tries {} itself", and_list(&untried)));
         let person = (!self.by_person.is_empty()).then(|| {
             format!(
                 "a person signs {} in once at this Mac ({}): no route of aterm's does",
@@ -1026,7 +1096,10 @@ impl Health {
         });
         let mends = (!self.mends.is_empty())
             .then(|| format!("a person at this Mac: {}", self.mends.join("; ")));
-        let acts: Vec<String> = [aterm, person, mends].into_iter().flatten().collect();
+        let acts: Vec<String> = [failed, aterm, person, mends]
+            .into_iter()
+            .flatten()
+            .collect();
         (!acts.is_empty()).then(|| acts.join("; "))
     }
 

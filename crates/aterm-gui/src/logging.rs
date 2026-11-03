@@ -298,6 +298,34 @@ pub(crate) struct ReportHead {
     pub(crate) run: Option<u128>,
 }
 
+#[cfg(unix)]
+pub(crate) fn open_regular_nonblock(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_regular_nonblock(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 /// The [`ReportHead`] of the panic report at `path`.
 #[cfg_attr(
     not(unix),
@@ -308,7 +336,7 @@ pub(crate) struct ReportHead {
 )]
 pub(crate) fn panic_report_head(path: &Path) -> ReportHead {
     use std::io::{BufRead as _, BufReader, Read as _};
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(file) = open_regular_nonblock(path) else {
         return ReportHead::default();
     };
     let mut first = String::new();
@@ -363,7 +391,7 @@ pub(crate) const CRASH_HEAD_BYTES: u64 = 1536;
 
 fn crash_head(path: &Path) -> Vec<String> {
     use std::io::Read as _;
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(file) = open_regular_nonblock(path) else {
         return Vec::new();
     };
     let mut buf = Vec::new();

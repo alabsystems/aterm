@@ -38,6 +38,14 @@ fn configured(paths: &Paths) -> Config {
 /// and profile) alongside a separate host-owned `~/.aterm/machine.toml`, and a roster that names
 /// `listed` and revokes `revoked`.
 fn ring(paths: &Paths, listed: &[&str], revoked: &[&str]) {
+    let _ = ring_with_master(paths, listed, revoked);
+}
+
+fn ring_with_master(
+    paths: &Paths,
+    listed: &[&str],
+    revoked: &[&str],
+) -> ring::signature::Ed25519KeyPair {
     use aterm_update_core::roster::{Machine, Roster, SUPPORTED_SCHEMA};
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
@@ -101,6 +109,59 @@ fn ring(paths: &Paths, listed: &[&str], revoked: &[&str]) {
         0o644,
     )
     .unwrap();
+    master
+}
+
+#[test]
+fn the_newest_signed_roster_wins_over_path_order_and_old_grants() {
+    use aterm_update_core::roster::{Roster, verify_roster};
+    let (_root, paths) = lab(&[]);
+    let master = ring_with_master(&paths, &["m22"], &[]);
+    let canonical = paths.home.join(VAULT_ROSTER);
+    let legacy = paths.home.join(LEGACY_VAULT_ROSTER);
+    let raw = std::fs::read(&canonical).unwrap();
+    let signature = std::fs::read(canonical.with_extension("toml.sig")).unwrap();
+    fsx::ensure_private_dir(legacy.parent().unwrap()).unwrap();
+    fsx::write_atomic(&legacy, &raw, 0o600).unwrap();
+    fsx::write_atomic(&legacy.with_extension("toml.sig"), &signature, 0o600).unwrap();
+    let profile = std::fs::read_to_string(paths.home.join(RELEASE_PROFILE))
+        .unwrap()
+        .replace(".aterm/release-ring/roster", ".aterm/roster");
+    fsx::write_atomic(&paths.home.join(RELEASE_PROFILE), profile.as_bytes(), 0o600).unwrap();
+    let anchor = std::fs::read_to_string(paths.home.join(".aterm/test-master")).unwrap();
+    let verified = verify_roster(&[&anchor], raw, &signature).unwrap();
+    let mut roster = Roster::parse(&verified).unwrap();
+    let write = |path: &Path, roster: &Roster| {
+        let raw = roster.to_toml().unwrap();
+        fsx::write_atomic(path, raw.as_bytes(), 0o600).unwrap();
+        fsx::write_atomic(
+            &path.with_extension("toml.sig"),
+            master.sign(raw.as_bytes()).as_ref(),
+            0o600,
+        )
+        .unwrap();
+    };
+    roster.roster_seq = 2;
+    write(&canonical, &roster);
+    fsx::write_atomic(&paths.dir.join("release-ring-roster-floor"), b"2\n", 0o600).unwrap();
+    assert!(
+        test_authorized_ring(&paths),
+        "the named old roster must not mask the current canonical authority"
+    );
+    roster.roster_seq = 3;
+    roster.revoked.push("m22".into());
+    write(&legacy, &roster);
+    assert!(
+        !test_authorized_ring(&paths),
+        "a newer signed revocation must not fall back to the canonical old grant"
+    );
+    roster.revoked.clear();
+    roster.valid_until = "1970-01-01T00:00:01Z".into();
+    write(&legacy, &roster);
+    assert!(
+        !test_authorized_ring(&paths),
+        "a newer signed expiry must not fall back to an old grant"
+    );
 }
 
 fn test_authorized_ring(paths: &Paths) -> bool {
@@ -425,6 +486,26 @@ fn the_roster_is_the_one_the_profile_names_else_the_vaults() {
     );
     assert_eq!(named_roster("machine_rosterx = \"/a\"\n", home), None);
     assert_eq!(named_roster("signing_key = \"x\"\n", home), None);
+    assert_eq!(
+        named_roster(
+            "signing_key = \"x\"\nmachine_roster = '~/r/m.toml' # inline comment\n[other]\nmachine_roster = \"/wrong.toml\"\n",
+            home
+        ),
+        Some(home.join("r/m.toml"))
+    );
+    assert_eq!(
+        named_roster("[other]\nmachine_roster = \"/wrong.toml\"\n", home),
+        None
+    );
+    for bad in [
+        "machine_roster = \"\"\n",
+        "machine_roster = \"~/\"\n",
+        "machine_roster = \"relative/m.toml\"\n",
+        "machine_roster = 42\n",
+        "machine_roster = \"/a\"\nmachine_roster = \"/b\"\n",
+    ] {
+        assert!(parse_named_roster(bad, home).is_err(), "{bad}");
+    }
 
     let (_root, paths) = lab(&[]);
     ring(&paths, &["m22"], &[]);
@@ -461,6 +542,53 @@ fn the_roster_is_the_one_the_profile_names_else_the_vaults() {
     assert!(
         !test_authorized_ring(&paths),
         "no fallback from an invalid named roster"
+    );
+
+    let commented = original
+        .lines()
+        .map(|line| {
+            if line.starts_with("machine_roster") {
+                format!(
+                    "machine_roster = '{}' # inline comment",
+                    elsewhere.join("aterm-machines.toml").display()
+                )
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fsx::write_atomic(
+        &paths.home.join(RELEASE_PROFILE),
+        commented.as_bytes(),
+        0o600,
+    )
+    .unwrap();
+    assert!(
+        !test_authorized_ring(&paths),
+        "single-quoted or commented machine_roster must not drop the invalid named roster"
+    );
+
+    let relative = original
+        .lines()
+        .map(|line| {
+            if line.starts_with("machine_roster") {
+                "machine_roster = \"relative/aterm-machines.toml\"".to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fsx::write_atomic(
+        &paths.home.join(RELEASE_PROFILE),
+        relative.as_bytes(),
+        0o600,
+    )
+    .unwrap();
+    assert!(
+        !test_authorized_ring(&paths),
+        "relative machine_roster fails closed instead of falling back to canonical roster"
     );
 }
 

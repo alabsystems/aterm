@@ -129,6 +129,83 @@ pub const fn dir_safe_for_private_write(uid: u32, owner_uid: u32, mode: u32) -> 
     owner_uid == uid && mode & 0o022 == 0
 }
 
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "riscv64",
+        target_arch = "aarch64",
+        target_arch = "arm",
+    ),
+))]
+const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0800;
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0004;
+
+/// Open `path` without blocking on FIFOs and verify the opened descriptor is a regular file.
+pub(crate) fn open_regular_nonblock(path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(any(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "riscv64",
+                target_arch = "aarch64",
+                target_arch = "arm",
+            ),
+        ),
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(NONBLOCK_OPEN_FLAG)
+            .open(path)?
+    };
+    #[cfg(not(any(
+        all(
+            any(target_os = "linux", target_os = "android"),
+            any(
+                target_arch = "x86",
+                target_arch = "x86_64",
+                target_arch = "riscv64",
+                target_arch = "aarch64",
+                target_arch = "arm",
+            ),
+        ),
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    )))]
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

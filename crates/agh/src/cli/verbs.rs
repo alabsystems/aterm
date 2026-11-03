@@ -526,7 +526,7 @@ pub static VERBS: &[Verb] = &[
     Verb {
         path: &["release", "wait"],
         class: Class::Read,
-        usage: "agh release wait REPO TAG COND... [--include-drafts] [--timeout DUR]",
+        usage: "agh release wait REPO TAG COND... [--include-drafts] [--timeout DUR] [--notify]",
         summary: "wait until every COND holds on a release: 30m unless --timeout",
         example: "agh release wait alabsystems/aterm <tag> published --timeout 30s",
         noun: Noun::Wait,

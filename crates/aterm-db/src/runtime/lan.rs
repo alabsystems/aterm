@@ -170,11 +170,11 @@ impl LanGate {
             return None;
         }
         match super::enabled(config) {
-            Err(_) => {
+            Err(error) => {
                 return Some((
                     Visibility::Unavailable,
                     "Network observation unavailable",
-                    Status::Refused("configuration"),
+                    Status::Refused(super::Refusal::new("configuration", &error)),
                 ));
             }
             Ok(false) => {

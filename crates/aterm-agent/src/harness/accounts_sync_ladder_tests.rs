@@ -66,7 +66,6 @@ impl Bench {
         UpkeepEffects {
             fetch: &|_: &Env, source: &str| Err(format!("no fetch in a test: {source}")),
             spawn_renewal: &inline,
-            quota_refresh: &|_, _, _, _| {},
             sync_cooldown: &self.cooldown,
             rediscovery: &self.rediscovery,
             renew_guard: &self.guard,

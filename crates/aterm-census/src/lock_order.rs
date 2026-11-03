@@ -4373,6 +4373,27 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_standalone_tests_module_does_not_hide_production_unknowns() {
+        let out = run_synth_files(
+            "standalone-tests",
+            "#[cfg(test)]\nmod tests;\n\
+             fn shipped() {\n    let g = m.lock().unwrap();\n}\n",
+            &[(
+                "crates/aterm-gui/src/tests.rs",
+                "fn test_only() {\n    let g = factory(42).lock().unwrap();\n}\n",
+            )],
+        );
+        assert!(out.ok, "an UNKNOWN cannot cycle:\n{}", out.log);
+        assert!(
+            out.log.contains("1 UNKNOWN-identity site(s)"),
+            "only the production UNKNOWN must be counted:\n{}",
+            out.log
+        );
+        assert!(out.log.contains("fn `shipped`"), "{}", out.log);
+        assert!(!out.log.contains("fn `test_only`"), "{}", out.log);
+    }
+
+    #[test]
     fn synthetic_empty_tree_fails_closed() {
         let mut files = crate::scan_set::test_fixtures::workspace_manifests(&[]);
         files.push((

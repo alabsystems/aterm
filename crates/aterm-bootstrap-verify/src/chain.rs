@@ -174,11 +174,27 @@ pub(crate) fn read_bounded_file(
 
 /// `open(path, "rb")`: a directory is refused as Python's `open` refuses it.
 pub(crate) fn open_file(path: &std::path::Path) -> Verdict<std::fs::File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| os_error(&e, path))?
+    };
+    #[cfg(not(unix))]
     let file = std::fs::File::open(path).map_err(|e| os_error(&e, path))?;
     let meta = file.metadata().map_err(|e| os_error(&e, path))?;
     if meta.is_dir() {
         return Err(os_error(
             &std::io::Error::from_raw_os_error(libc::EISDIR),
+            path,
+        ));
+    }
+    if !meta.is_file() {
+        return Err(os_error(
+            &std::io::Error::from_raw_os_error(libc::EINVAL),
             path,
         ));
     }
@@ -298,10 +314,12 @@ fn canonical_tag(tag: &str) -> bool {
         })
 }
 
-/// `[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+`.
+/// `[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+`, neither segment `.` or `..`.
 fn repository(slug: &str) -> bool {
     let word = |w: &str| {
         !w.is_empty()
+            && w != "."
+            && w != ".."
             && w.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
     };
@@ -706,7 +724,32 @@ mod tests {
             assert!(!canonical_tag(refused), "{refused}");
         }
         assert!(repository("example/aterm") && repository("a.b_c-d/e"));
-        assert!(!repository("example/aterm/x") && !repository("/aterm") && !repository("a b/c"));
+        assert!(
+            !repository("example/aterm/x")
+                && !repository("/aterm")
+                && !repository("a b/c")
+                && !repository("./aterm")
+                && !repository("../aterm")
+                && !repository("example/.")
+                && !repository("example/..")
+        );
+    }
+
+    /// `read_bounded` refuses non-regular files (such as character devices or FIFOs) without
+    /// blocking on `open`.
+    /// NEGATIVE CONTROL: omitting `meta.is_file()` in `open_file` reads `/dev/null` as an empty
+    /// regular proof file instead of refusing it with `EINVAL`.
+    #[cfg(unix)]
+    #[test]
+    fn read_bounded_refuses_non_regular_files() {
+        let dev_null = PyPath::new(std::ffi::OsStr::new("/dev/null"));
+        let err = read_bounded(&dev_null, 64)
+            .expect_err("device file refused")
+            .0;
+        assert!(
+            err.contains("[Errno 22]") && err.contains("/dev/null"),
+            "{err}"
+        );
     }
 
     /// A parse error is one line, saying where, as tomllib's is: install.sh reads one.

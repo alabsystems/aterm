@@ -5115,12 +5115,15 @@ secrets_aterm() { # <bin-dir> <store-dir> <app-dir>...
 }
 
 # Lanes with no window (--no-open, SSH, piped stdout, --no-app, Linux, or an
-# `open` that failed) run `aterm members join --no-wait`: it asks every ALab
-# member on this network and returns, leaving a request a person allows on any
-# member, then types the phrase that member shows into `aterm members join`
-# here (docs/DESIGN-fluid-swarm-2026-10-28.md §3.3.3). It also joins the ALab
-# vault without waiting and starts this Mac's vault subscriber, which asks the
-# members again while the Mac waits (after 1, 2, 4 and 8 minutes, then every
+# `open` that failed) run `aterm members join --no-wait`: it proves this Mac
+# to the ALab members on this network first, and a member on the home ALab LAN
+# lets it in at once (docs/DESIGN-automatic-lan-admission-2026-11-02.md).
+# Where none did, it asks every member and returns, leaving a request a person
+# allows on any member, then types the phrase that member shows into
+# `aterm members join` here (docs/DESIGN-fluid-swarm-2026-10-28.md §3.3.3). It
+# also joins the ALab vault without waiting and starts this Mac's vault
+# subscriber, which proves and asks again while the Mac waits (about half a
+# minute after the first ask, then after 1, 2, 4 and 8 minutes, then every
 # 15), so a member away when this ran shows the request too. An aterm older than the members verb, or an
 # ATERM_INSTALL_VAULT_URL, runs `aterm secrets join --no-wait` instead
 # (docs/DESIGN-alab-swarm-2026-10-27.md §5.3, C6). Best effort and silent when
@@ -6989,9 +6992,16 @@ install_toolchain() {
 	# Bring the seeded builds current now: the GUI does so on its own loop, which
 	# never runs for someone who installed from a terminal and never opens the
 	# app. Only what drifted is fetched; an offline machine keeps what it has.
+	# Its input is /dev/null, as when this script is piped to sh, so the update
+	# is never read as one a person typed: such an update ends with `aterm init`,
+	# and this script's halves are the ones its header lists (setup is the app's
+	# first launch on a Mac, else the person's own `aterm init`). A word for that
+	# (`--no-init`) would be refused by an older installed aterm this drives. A
+	# contended store therefore stands aside at once (exit 75, said below) rather
+	# than waiting for the other pass.
 	echo "install.sh: updating the ALab toolset (aterm pkg update)"
 	rc=0
-	"$aterm_bin" pkg update || rc=$?
+	"$aterm_bin" pkg update </dev/null || rc=$?
 	if [[ $rc -eq $ATPKG_CONTENDED_EXIT ]]; then
 		# Stood aside, as for the seed above: no holder is named.
 		echo "install.sh: another aterm pkg run is using the ALab toolset — rerun later: $aterm_bin pkg update" >&2

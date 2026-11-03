@@ -13,46 +13,33 @@ const TRUST: Trust = Trust {
     genesis: [3; 32],
 };
 
-/// A request from this member's home ALab LAN on the default ALab vault files no entry: the
-/// vault's own admission takes it, and `aterm members requests` reads it as joining. One heard
-/// from another network keeps its entry, however private its address (D1).
+/// A plain ask from this member's home ALab LAN on the default ALab vault files its entry like
+/// any other and reads as asking: a plain ask waits for a person's Allow from every network, and
+/// a Mac on the home ALab LAN gets in with nobody's Allow only by proving itself to the desk
+/// (`docs/DESIGN-automatic-lan-admission-2026-11-02.md`).
 ///
-/// NEGATIVE CONTROLS: `join_entries::desk_askers` without its `row.automatic` filter keeps the
-/// entry once the row is automatic ("files no entry"); `Local::automatically_admits` ignoring the
-/// member's home network ends the entry of `10.0.0.9` while the member's home is
-/// `192.168.1.0/24` ("another network still needs a person").
+/// NEGATIVE CONTROL: have `Snapshot::of` drop the rows whose source `Local::automatically_admits`
+/// (as the forwarding path filed none): the entry goes once the member's home holds `10.0.0.9`.
 #[test]
-fn automatic_lan_admission_files_no_entry() {
+fn a_plain_ask_from_the_home_lan_files_an_entry_for_a_person() {
     let root = aterm_tempfile::tempdir().unwrap();
     let (desk, request) = heard(root.path(), true);
-    let now = aterm_time::Instant::now();
     let mut app = app_with(Arc::clone(&desk));
     let key = entry_of(&app, request).key;
-    let member = || {
-        Local::with(device(root.path(), "m1"), TRUST, true, "m1")
-            .unwrap()
-            .with_automatic_lan([])
-    };
-    desk.lock().unwrap().refresh(member());
-    app.refresh_member_rows();
-    assert_eq!(
-        join_keys(&app),
-        std::slice::from_ref(&key),
-        "another network still needs a person"
-    );
     let home = aterm_secrets::home_lan::HomeNet::at(
         std::net::Ipv4Addr::new(10, 0, 0, 20),
         std::net::Ipv4Addr::new(255, 255, 255, 0),
     );
-    desk.lock().unwrap().refresh(member().with_home(Some(home)));
+    let member = Local::with(device(root.path(), "m1"), TRUST, true, "m1")
+        .unwrap()
+        .with_automatic_lan([])
+        .with_home(Some(home));
+    assert!(member.automatically_admits([10, 0, 0, 9].into()));
+    desk.lock().unwrap().refresh(member);
     app.refresh_member_rows();
-    assert_eq!(desk.lock().unwrap().rows(now).len(), 1);
-    assert!(
-        join_keys(&app).is_empty(),
-        "files no entry: {:?}",
-        join_keys(&app)
-    );
-    assert!(app.take_members(&Asked::Requests).contains("state=joining"));
+    assert_eq!(join_keys(&app), std::slice::from_ref(&key));
+    let listed = app.take_members(&Asked::Requests);
+    assert!(listed.contains("state=asking"), "{listed}");
 }
 
 fn device(root: &std::path::Path, name: &str) -> Device {

@@ -1609,6 +1609,27 @@ impl PaneFooter {
         &self.top
     }
 
+    /// Whether the rule of `room` cells spares the cells `block`'s mode name takes
+    /// ([`crate::claude_lights::Block::word`]): with the name it lays every fact it lays without
+    /// it, and a title where it lays one, a narrower form of it at most (the title gives way
+    /// first, `footer::fit_rule`).
+    fn spares(&self, room: usize, block: &crate::claude_lights::Block) -> bool {
+        let widths = |chips: usize| footer::LightsWidth {
+            chips,
+            title: block.title.len(),
+            lean: block.lean.each_ref().map(Vec::len),
+            short: block.short_title.len(),
+            reason: block.reason,
+        };
+        let rest = block.holds.saturating_sub(block.word);
+        let without = footer::fit_rule(&self.shown, room, Some(widths(rest)));
+        let with = footer::fit_rule(&self.shown, room, Some(widths(block.holds)));
+        without.chips
+            && with.chips
+            && with.segments == without.segments
+            && (with.title != footer::TitleFit::None || without.title == footer::TitleFit::None)
+    }
+
     /// The rule's composition in `room` cells with the chips' `block` ([`compose_rule_spans`]).
     fn compose(
         &mut self,
@@ -5790,15 +5811,40 @@ impl App {
                 continue;
             };
             self.note_claude_footer_row(wid, pane.session, chips_room);
-            self.note_claude_autopilot(wid, pane.session, pane.autopilot, pane.row_rewritten);
+            self.note_claude_autopilot(
+                wid,
+                pane.session,
+                pane.autopilot,
+                (pane.row_rewritten, pane.rule.fg),
+            );
             self.note_claude_team(wid, pane.session);
-            let block = self.claude_lights_block(
+            let mut block = self.claude_lights_block(
                 wid,
                 pane.session,
                 pane.leaf_index,
                 pane.blank,
-                chips_room,
+                (chips_room, true),
             );
+            // The mode's name a click brought up takes only cells the rule spares: where it would
+            // move or drop a fact or drop the title, the block is laid again without it.
+            if let Some(laid) = block.take_if(|b| {
+                b.word > 0
+                    && !self.windows.get(&wid).is_some_and(|ws| {
+                        ws.claude_footer_texts
+                            .borrow_mut()
+                            .footer_mut(pane.leaf_index)
+                            .is_some_and(|footer| footer.spares(room, b))
+                    })
+            }) {
+                self.recycle_claude_lights_block(wid, laid);
+                block = self.claude_lights_block(
+                    wid,
+                    pane.session,
+                    pane.leaf_index,
+                    pane.blank,
+                    (chips_room, false),
+                );
+            }
             let composed = self.windows.get(&wid).and_then(|ws| {
                 let lit = ws.claude_lights.lit_fact(pane.session);
                 let mut texts = ws.claude_footer_texts.borrow_mut();
@@ -11311,11 +11357,16 @@ mod tests {
             "autopilot: cruise \u{2014} {} \u{b7} click: land  ",
             crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Cruise).chip
         );
+        let plan = aterm_agent::harness::lights::Mode::Plan.gist();
+        let (plan_title, plan_short) = (
+            format!("{plan} \u{b7} click: bypass or auto  "),
+            format!("{plan}  "),
+        );
         for facts in [facts(), facts_with_usage(), FooterFacts::default()] {
             for chips in [1usize, 3, 6, 8, 10, 14] {
                 for (title, short) in [
                     ("", ""),
-                    ("Permission mode: plan  ", "plan  "),
+                    (plan_title.as_str(), plan_short.as_str()),
                     (cruise.as_str(), "autopilot: cruise  "),
                 ] {
                     let block = crate::claude_lights::Block::of_chips(
@@ -17146,7 +17197,7 @@ mod tests {
             let card_off = text_of(&app.windows[&wid].input_scratch.cells[strip + card_row]);
             let line_off = chip_line(&app);
             assert!(
-                line_off.contains(" face=off drawn=\"\u{25CB} off\" "),
+                line_off.contains(" face=off drawn=\"\u{25CB}\" "),
                 "{prog}: the off chip is drawn: {line_off}"
             );
             assert!(

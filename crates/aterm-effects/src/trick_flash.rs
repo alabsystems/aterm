@@ -762,31 +762,22 @@ const fn legible_strength_with(
             table.blue[mix_byte(fb, hi, t)],
             table.blue[mix_byte(fb, lo, t)],
         );
-        let corner_lums = [
-            (lr_hi + lg_lo) + lb_lo,
-            (lr_hi + lg_hi) + lb_lo,
-            (lr_lo + lg_hi) + lb_lo,
-            (lr_lo + lg_hi) + lb_hi,
-            (lr_lo + lg_lo) + lb_hi,
-            (lr_hi + lg_lo) + lb_hi,
-        ];
-        let mut idx = 0;
-        while idx < corner_lums.len() {
-            let lum = corner_lums[idx];
-            if (lum >= lum_bg) != text_is_lighter {
-                strength = (strength - step).max(0.0);
-                continue 'guard;
-            }
-            let (hi_lum, lo_lum) = if text_is_lighter {
-                (lum + 0.05, bg_plus)
-            } else {
-                (bg_plus, lum + 0.05)
-            };
-            if hi_lum / lo_lum < floor {
-                strength = (strength - step).max(0.0);
-                continue 'guard;
-            }
-            idx += 1;
+        let c0 = (lr_hi + lg_lo) + lb_lo;
+        let c1 = (lr_hi + lg_hi) + lb_lo;
+        let c2 = (lr_lo + lg_hi) + lb_lo;
+        let c3 = (lr_lo + lg_hi) + lb_hi;
+        let c4 = (lr_lo + lg_lo) + lb_hi;
+        let c5 = (lr_hi + lg_lo) + lb_hi;
+        let fails = if text_is_lighter {
+            let min_lum = c0.min(c1).min(c2).min(c3).min(c4).min(c5);
+            min_lum < lum_bg || (min_lum + 0.05) / bg_plus < floor
+        } else {
+            let max_lum = c0.max(c1).max(c2).max(c3).max(c4).max(c5);
+            max_lum >= lum_bg || bg_plus / (max_lum + 0.05) < floor
+        };
+        if fails {
+            strength = (strength - step).max(0.0);
+            continue 'guard;
         }
         break;
     }

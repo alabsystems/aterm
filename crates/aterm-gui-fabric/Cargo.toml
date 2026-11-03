@@ -39,6 +39,9 @@ aterm-toml = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 aterm-uds = { workspace = true }
+# Direct fleet mail sealed at rest (`fleet_mail`): astream's seal and open alone, without its
+# sealed stream, as aterm-link's `at-rest` takes it; its ring and zeroize are in the graph already.
+astream-aead = { path = "../../vendor/astream/crates/astream-aead", default-features = false }
 
 [dev-dependencies]
 # The hang detector, the environment refusal, and the link's bind to its

@@ -65,11 +65,21 @@ pub fn screen(
     input: impl Read + Send + 'static,
     out: &mut dyn Write,
 ) -> ExitCode {
+    screen_with_connect(sys, port, input, out, TcpStream::connect_timeout)
+}
+
+fn screen_with_connect(
+    sys: &dyn System,
+    port: u16,
+    input: impl Read + Send + 'static,
+    out: &mut dyn Write,
+    connect: impl FnOnce(&SocketAddr, Duration) -> io::Result<TcpStream>,
+) -> ExitCode {
     if let Err(why) = launchd_holds_the_port(sys) {
         return super::refuse(out, &format!("screen: {why}"));
     }
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let socket = match TcpStream::connect_timeout(&addr, CONNECT_BUDGET) {
+    let socket = match connect(&addr, CONNECT_BUDGET) {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
             return super::refuse(
@@ -233,11 +243,24 @@ mod tests {
 
     #[test]
     fn nothing_listening_is_refused_before_any_byte_flows() {
-        let (l, port) = stand_in();
-        drop(l);
+        // Dropping a listener does not reserve its port against another test's bind.
+        // Exercise the actual refusal path with the dial's explicit OS error instead.
+        let port = SCREEN_SHARING_PORT;
+        let mut dialed = false;
         let read = Arc::new(AtomicBool::new(false));
         let mut out = Vec::new();
-        let code = screen(&enabled(), port, Watched(Arc::clone(&read)), &mut out);
+        let code = screen_with_connect(
+            &enabled(),
+            port,
+            Watched(Arc::clone(&read)),
+            &mut out,
+            |addr, _| {
+                assert_eq!(*addr, SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+                dialed = true;
+                Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+            },
+        );
+        assert!(dialed, "the enabled policy reached the dial");
         assert_eq!(code, ExitCode::from(super::super::REFUSED));
         let out = String::from_utf8(out).unwrap();
         assert!(

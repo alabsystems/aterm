@@ -24,6 +24,10 @@ aterm-uds = { workspace = true }
 aterm-digest = { workspace = true }
 # The workspace's one hex codec: a proof's tag and the certificate fingerprint.
 aterm-codec = { workspace = true }
+# Portable fleet-name vocabulary is shared with census readers on every platform;
+# on Unix, whether this process is a private aterm (`not_own_account`, its state
+# root), which reaches no fleet default port (loopback.rs).
+aterm-types = { workspace = true }
 rustls = { workspace = true }
 # Each node's own key (fleet.rs, the module doc's Nodes): Ed25519 signing and
 # verification. ring is already rustls's provider here (the workspace row's

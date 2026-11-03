@@ -2502,6 +2502,7 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             autopilot_by: a_autopilot_by,
             theme: a_theme,
             lost: a_lost,
+            task: a_task,
         } = a;
         let TerminalLeafRestore {
             cwd: b_cwd,
@@ -2529,8 +2530,10 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             autopilot_by: b_autopilot_by,
             theme: b_theme,
             lost: b_lost,
+            task: b_task,
         } = b;
         a_cwd == b_cwd
+            && a_task == b_task
             && a_profile == b_profile
             && a_local_id == b_local_id
             && a_user_title == b_user_title
@@ -2623,13 +2626,15 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             root: ra,
             focused_path: fa,
             zoomed: za,
+            parked: pa,
         } = a;
         let RestoredTab {
             root: rb,
             focused_path: fb,
             zoomed: zb,
+            parked: pb,
         } = b;
-        za == zb && fa == fb && same_tree(ra, rb)
+        za == zb && pa == pb && fa == fb && same_tree(ra, rb)
     }
     fn same_window(a: &WindowLayout, b: &WindowLayout) -> bool {
         let WindowLayout {
@@ -2646,6 +2651,7 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             native_tabs: nta,
             tab_order: toa,
             active_item: aia,
+            workers_in_front: wfa,
             restored_tabs: rta,
         } = a;
         let WindowLayout {
@@ -2662,6 +2668,7 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             native_tabs: ntb,
             tab_order: tob,
             active_item: aib,
+            workers_in_front: wfb,
             restored_tabs: rtb,
         } = b;
         ra == rb
@@ -2674,6 +2681,7 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             && pra == prb
             && sa == sb
             && aia == aib
+            && wfa == wfb
             && toa == tob
             && nta == ntb
             && ta.len() == tb.len()
@@ -3060,6 +3068,7 @@ pub(crate) mod fixtures {
                 claim_ended: false,
                 not_claim_worker: false,
                 claim_worker: None,
+                task: None,
             },
         ))
     }
@@ -3079,6 +3088,7 @@ pub(crate) mod fixtures {
             native_tabs: Vec::new(),
             tab_order: Vec::new(),
             active_item: Some(0),
+            workers_in_front: false,
             restored_tabs: tabs
                 .iter()
                 .enumerate()
@@ -3086,6 +3096,7 @@ pub(crate) mod fixtures {
                     root: leaf(index as u64, Some(cwd), title),
                     focused_path: Vec::new(),
                     zoomed: false,
+                    parked: false,
                 })
                 .collect(),
         }])

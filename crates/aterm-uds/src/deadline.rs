@@ -56,7 +56,7 @@ pub fn try_stamp_exec(home: &std::path::Path) -> std::io::Result<()> {
 /// missing, unreadable or blank.
 #[must_use]
 pub fn exec_stamp(home: &std::path::Path) -> Option<u64> {
-    std::fs::read_to_string(home.join(EXEC_STAMP))
+    crate::atomic_file::read_regular_text(&home.join(EXEC_STAMP), 64)
         .ok()
         .and_then(|text| {
             let s = text.trim();

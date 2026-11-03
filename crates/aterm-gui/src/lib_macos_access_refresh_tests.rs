@@ -1518,9 +1518,7 @@ fn window_resumes(app: &mut App, revision: u64) -> bool {
     };
     assert_eq!(
         answer.decision,
-        WorkstationSetupDecision::Begin(crate::workstation_setup::automatic_plan_for_test(
-            Plan::from(Selection::all())
-        )),
+        WorkstationSetupDecision::Begin(Plan::from(Selection::all())),
         "the plan as offered"
     );
     assert!(!answer.chosen && !answer.vault_typed && answer.changed.is_none());

@@ -48,9 +48,7 @@ pub(super) struct Move {
 /// A store build's version as its record names it, only where the record
 /// and the build's directory agree ([`live::build_version`]).
 fn build_record(exe: &Path) -> Option<String> {
-    let version = store_version(exe)?;
-    let dir = exe.parent()?.parent()?.file_name()?.to_str()?;
-    live::build_version(&version, Some(dir)).map(|_| version)
+    mz::store_build(exe).then(|| store_version(exe)).flatten()
 }
 
 /// THE MOVE `exe` (the running Muse Code's mapped executable) IS OWED onto the build the managed twin `twin` execs: `Ok(Some)` where the twin's build is strictly newer by atpkg's revision-aware order of their store records; `Ok(None)` for a process run from no store build (another install: nothing managed moves it), no twin, or a build not newer; `Err(word)` where a record cannot be read (`no-version`).
@@ -380,10 +378,20 @@ pub(super) fn upgrade_visit(
     let Some(mut st) = claim_record(&snap, &mv, opts.human_grace_s, now) else {
         return Some(said(r, "wait:no-session"));
     };
+    if let Some(prior) = prior.as_ref() {
+        prior.retried_by(&mut st);
+    }
     match plan(opts, &st, k) {
         Ok(_) => {}
         Err(super::NoPlan::Wait(why)) => return Some(said(r, format!("wait:{why}"))),
         Err(super::NoPlan::Refused { why, .. }) => return Some(said(r, format!("skip:{why}"))),
+    }
+    if super::super::super::relaunch::running_cmdline(&mut c, &tab)
+        .as_deref()
+        .and_then(live::inline_env)
+        .is_some()
+    {
+        return Some(said(r, "skip:env-not-carried"));
     }
     if let Err(why) = build_start::proved_named(opts, &r, &mv.twin, &mv.target, SOURCE, now) {
         return Some(said(r, format!("wait:{why}")));

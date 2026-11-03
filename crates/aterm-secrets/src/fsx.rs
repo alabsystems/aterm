@@ -37,8 +37,36 @@ pub fn ensure_private_dir(dir: &Path) -> crate::Result<()> {
             return Err(Error::new(format!("{}: not a directory", dir.display())));
         }
     }
+    if let Ok(dir_fd) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)
+    {
+        let meta = dir_fd
+            .metadata()
+            .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
+        if !meta.is_dir() {
+            return Err(Error::new(format!("{}: not a directory", dir.display())));
+        }
+        if meta.uid() != euid() {
+            return Err(Error::new(format!(
+                "{}: owned by uid {}, not this user",
+                dir.display(),
+                meta.uid()
+            )));
+        }
+        if meta.mode() & 0o7777 != 0o700 {
+            dir_fd
+                .set_permissions(std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
+        }
+        return Ok(());
+    }
     let meta = std::fs::symlink_metadata(dir)
         .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
+    if !meta.is_dir() {
+        return Err(Error::new(format!("{}: not a directory", dir.display())));
+    }
     if meta.uid() != euid() {
         return Err(Error::new(format!(
             "{}: owned by uid {}, not this user",
@@ -145,6 +173,31 @@ fn read_opened_stamped(
     past: Past,
     links: Links,
 ) -> Result<Option<(FileStamp, Vec<u8>)>, Unread> {
+    let Some((file, meta)) = open_admitted(path, admit, links)? else {
+        return Ok(None);
+    };
+    let refused = |why: String| Unread::Refused(Error::new(format!("{}: {why}", path.display())));
+    let failed = |e: io::Error| Unread::Failed(Error::new(format!("{}: {e}", path.display())));
+    let mut bytes = read_buffer(meta.len(), max);
+    let limit = u64::try_from(max).unwrap_or(u64::MAX);
+    let limit = if past == Past::Head {
+        limit
+    } else {
+        limit.saturating_add(1)
+    };
+    crate::secret::read_to_end_wiping_on_error(file.take(limit), &mut bytes).map_err(failed)?;
+    if bytes.len() > max {
+        zeroize::Zeroize::zeroize(&mut bytes);
+        return Err(refused(format!("larger than {max} bytes")));
+    }
+    Ok(Some((FileStamp::of(&meta), bytes)))
+}
+
+fn open_admitted(
+    path: &Path,
+    admit: Admit,
+    links: Links,
+) -> Result<Option<(File, std::fs::Metadata)>, Unread> {
     let nofollow = if links == Links::Refuse {
         libc::O_NOFOLLOW
     } else {
@@ -206,19 +259,65 @@ fn read_opened_stamped(
             }
         }
     }
-    let mut bytes = read_buffer(meta.len(), max);
-    let limit = u64::try_from(max).unwrap_or(u64::MAX);
-    let limit = if past == Past::Head {
-        limit
-    } else {
-        limit.saturating_add(1)
-    };
-    crate::secret::read_to_end_wiping_on_error(file.take(limit), &mut bytes).map_err(failed)?;
-    if bytes.len() > max {
-        zeroize::Zeroize::zeroize(&mut bytes);
-        return Err(refused(format!("larger than {max} bytes")));
+    Ok(Some((file, meta)))
+}
+
+/// One admitted owned file. Its descriptor does not make in-place writes immutable.
+pub(crate) struct OwnedReader {
+    file: File,
+    path: std::path::PathBuf,
+    stamp: FileStamp,
+}
+
+impl OwnedReader {
+    pub(crate) fn file(&mut self) -> &mut File {
+        &mut self.file
     }
-    Ok(Some((FileStamp::of(&meta), bytes)))
+
+    pub(crate) const fn len(&self) -> u64 {
+        self.stamp.len
+    }
+
+    pub(crate) const fn stamp(&self) -> FileStamp {
+        self.stamp
+    }
+
+    /// Refuse an observation when the opened file changed while it was being read.
+    pub(crate) fn check_unchanged(&self) -> crate::Result<()> {
+        self.check_unchanged_classified()
+            .map_err(Unread::into_error)
+    }
+
+    /// A changed descriptor is an interrupted observation, not a stable refusal.
+    pub(crate) fn check_unchanged_classified(&self) -> Result<(), Unread> {
+        let metadata = self
+            .file
+            .metadata()
+            .map_err(|e| Unread::Failed(Error::new(format!("{}: {e}", self.path.display()))))?;
+        if FileStamp::of(&metadata) != self.stamp {
+            return Err(Unread::Failed(Error::new(format!(
+                "{}: changed while reading membership records",
+                self.path.display()
+            ))));
+        }
+        Ok(())
+    }
+}
+
+/// Open the same descriptor that passes [`read_owned`]'s admission checks.
+pub(crate) fn open_owned_reader(path: &Path) -> crate::Result<Option<OwnedReader>> {
+    open_owned_reader_classified(path).map_err(Unread::into_error)
+}
+
+/// Admit the same owned descriptor while preserving stable refusal versus retryable failure.
+pub(crate) fn open_owned_reader_classified(path: &Path) -> Result<Option<OwnedReader>, Unread> {
+    Ok(
+        open_admitted(path, Admit::Owned, Links::Refuse)?.map(|(file, metadata)| OwnedReader {
+            file,
+            path: path.to_path_buf(),
+            stamp: FileStamp::of(&metadata),
+        }),
+    )
 }
 
 /// A buffer sized once for reading a file of `len` bytes (its `fstat` size) under a cap of
@@ -229,6 +328,20 @@ fn read_opened_stamped(
 fn read_buffer(len: u64, max: usize) -> Vec<u8> {
     let len = usize::try_from(len).unwrap_or(usize::MAX).min(max);
     Vec::with_capacity(len.saturating_add(1))
+}
+
+/// Metadata-only check whether `path` is a non-empty regular file [`read_private`] admits
+/// (not a symlink, owned by this user, no group/other or setuid/setgid bits, at most `max` bytes).
+#[must_use]
+pub fn has_private_nonempty(path: &Path, max: usize) -> bool {
+    let limit = u64::try_from(max).unwrap_or(u64::MAX);
+    std::fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.file_type().is_file()
+            && meta.uid() == euid()
+            && meta.mode() & 0o6077 == 0
+            && meta.len() > 0
+            && meta.len() <= limit
+    })
 }
 
 /// Reads a regular file owned by this user with no group/other bits, up to `max` bytes.

@@ -97,14 +97,18 @@ pub fn verify_dir_with(ctx: &Ctx, dir: &Path, freshness: Freshness) -> Result<Ve
     let mut bytes = Vec::with_capacity(QUAD_FILES.len());
     for name in QUAD_FILES {
         let path = dir.join(name);
-        bytes.push(std::fs::read(&path).map_err(|e| {
-            Error::refused(format!(
-                "{} is missing {name} ({e}) — a client builds ONE candidate from index.toml, \
-                 its .sig and the roster pair; a release missing any of the four authorizes \
-                 nothing",
-                ctx.shown(dir)
-            ))
-        })?);
+        bytes.push(
+            crate::identity::read_regular_bytes(&path, crate::identity::MAX_META_BYTES).map_err(
+                |e| {
+                    Error::refused(format!(
+                        "{} is missing {name} ({e}) — a client builds ONE candidate from \
+                         index.toml, its .sig and the roster pair; a release missing any of the \
+                         four authorizes nothing",
+                        ctx.shown(dir)
+                    ))
+                },
+            )?,
+        );
     }
     let [index, index_sig, roster, roster_sig]: [Vec<u8>; 4] = bytes
         .try_into()
@@ -185,7 +189,9 @@ pub fn head_number(releases: &[crate::host::Release]) -> Option<u64> {
 pub fn head_build(ctx: &Ctx, slug: &Slug) -> std::result::Result<Option<u64>, HostError> {
     let host = &ctx.hosts.channel;
     if !host.reads_anonymously() {
-        return host.releases(slug).map(|releases| head_number(&releases));
+        return host
+            .published_releases(slug)
+            .map(|releases| head_number(&releases));
     }
     let mut said: Option<String> = None;
     let walked = atpkg::net::newest_index(0, &mut |n| match host.probe_public(

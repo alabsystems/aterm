@@ -11,11 +11,12 @@
 //!
 //! **The deck clock.** A window's clock runs while its needle has a frame due
 //! ([`crate::stats_live::LiveFacts::needle_due`]: the needle's own whole-pixel law, unchanged).
-//! Its ticks come from the window's display link where it has one
+//! Adjacent panel frames come from the window's display link where it has one
 //! (`aterm_window::Window::set_frame_clock`, `WindowEvent::FrameTick`, macOS 14 and later),
-//! asked through an injected port whose test arm is inert, and otherwise from a synthetic vsync
-//! grid the loop's own deadline drives (`DeadlineOwner::DeckClock`): a window without a link,
-//! and every headless window, whose panel is 60 Hz or the dev seam `ATERM_DEV_PANEL_HZ`. A tick
+//! asked through an injected port whose test arm is inert. Isolated pixel steps and windows
+//! without a running link use a synthetic vsync grid driven by the loop's deadline
+//! (`DeadlineOwner::DeckClock`); a headless window's panel is 60 Hz or the dev seam
+//! `ATERM_DEV_PANEL_HZ`. A tick
 //! samples the needle at the vsync it targets and asks a frame only where that draws the needle
 //! elsewhere; every frame samples it at the vsync it will reach ([`DeckClock::sample_at`]). The
 //! link is paused across a gap longer than [`LINK_LEAD`] periods and from the vsync the needle
@@ -43,6 +44,11 @@ use crate::{App, WindowId, WindowState, metrics};
 /// targets the next vsync; one period covers that startup without waking for earlier frames
 /// on which the needle cannot move a pixel.
 pub(crate) const LINK_LEAD: u32 = 1;
+
+/// The largest gap between adjacent frames in base panel intervals (including the minimum
+/// tick floor). This admits the doubled interval used for a parked drawable or Low Power Mode.
+/// Longer gaps are isolated steps on the timer grid.
+const LINK_DENSE_PERIODS: u32 = 2;
 
 /// How long past a frame due a running link may stay silent before the loop draws the frame
 /// itself, in its periods: a link whose window left every screen never strands the needle.
@@ -196,6 +202,17 @@ impl Default for DeckClock {
 }
 
 impl DeckClock {
+    /// Use the display link for adjacent panel frames. Isolated pixel steps stay on the
+    /// timer grid: repeatedly starting a native link costs wakes beyond the ticks it sends.
+    /// A timer-requested frame must be served before it can start a link for the next step.
+    fn link_for_due(&self, due: Instant, period: Duration) -> bool {
+        (self.running || self.asked.is_none())
+            && self.last.is_none_or(|(last, _)| {
+                due.saturating_duration_since(last)
+                    <= deck_frame_interval(period, false, false) * LINK_DENSE_PERIODS
+            })
+    }
+
     /// Asks the port whether the window has a display link, while that is not known: the answer
     /// is kept only from a window that can make a link or from an OS window, so a window not yet
     /// given its OS window (which answers for none) is asked again on its next sync.
@@ -320,16 +337,16 @@ impl DeckClock {
     }
 
     /// Where a frame of this window drawn at `now` samples the needle: the vsync of the tick
-    /// that asked it, while unshown; on a display link, the next vsync it predicts from its last
-    /// tick (`now` before its first); on the synthetic grid (`period`, also while it is not known
-    /// whether the window has a link, and while its link is silent), the grid's vsync at or
+    /// that asked it, while unshown; on a running display link, the next vsync it predicts from
+    /// its last tick (`now` before its first); on the synthetic grid (`period`, also while the
+    /// link is paused, unknown or silent), the grid's vsync at or
     /// before `now`, so its frames change only on its ticks.
     pub(crate) fn sample_at(&self, now: Instant, period: Duration) -> Instant {
         if let Some((target, _)) = self.asked_at(now, period) {
             return target;
         }
-        match (self.timing_link(), self.last) {
-            (Some(true), Some((target, period))) => {
+        match (self.timing_link(), self.last, self.running) {
+            (Some(true), Some((target, period)), true) => {
                 if now <= target || period.is_zero() {
                     return target.max(now);
                 }
@@ -337,8 +354,8 @@ impl DeckClock {
                 let k = now.saturating_duration_since(target).as_nanos().div_ceil(p);
                 target + Duration::from_nanos(u64::try_from(k * p).unwrap_or(u64::MAX))
             }
-            (Some(true), None) => now,
-            (Some(false) | None, _) => grid_floor(now, period),
+            (Some(true), None, true) => now,
+            _ => grid_floor(now, period),
         }
     }
 
@@ -427,7 +444,8 @@ impl App {
 
     /// Runs or pauses each window's display link for its needle, and books each run's length:
     /// the link runs from [`LINK_LEAD`] periods before a frame due, and pauses across a longer
-    /// gap and once the needle rests. A window whose port says it has no link keeps the
+    /// gap and once the needle rests. Isolated steps use the timer grid without starting the
+    /// link. A window whose port says it has no link keeps the
     /// synthetic grid, as does one whose link fell silent ([`DeckClock::watch_link`]), whose
     /// link is still run and paused so that its next tick resumes it.
     pub(crate) fn sync_deck_clocks(&mut self, now: Instant) {
@@ -461,7 +479,8 @@ impl App {
                 _ => {}
             }
             clock.ask_link(window);
-            let want = due.is_some_and(|d| d <= now + period * LINK_LEAD);
+            let want =
+                due.is_some_and(|d| clock.link_for_due(d, period) && d <= now + period * LINK_LEAD);
             clock.steer(window, want, now);
             let _ = clock.watch_link(now);
         }
@@ -472,7 +491,8 @@ impl App {
     /// tick and not before the needle's episode began, so it ticks at most once a period whatever
     /// a frame draws, and a reading never ticks it for a vsync that passed before the reading
     /// landed (its frames sample the grid's last vsync, at which the new episode's start would
-    /// read as a frame due); for a paused link,
+    /// read as a frame due). Isolated steps take this path even with a native link. For a
+    /// paused link whose frames are adjacent,
     /// its resume, [`LINK_LEAD`] periods before the frame due (no tick: the sync runs it); for a
     /// running link, [`LINK_GRACE`] periods after it was last heard from, or its hang detector's
     /// deadline ([`DeckClock::silence_deadline`]) if sooner. A silent link's window is on the
@@ -482,31 +502,36 @@ impl App {
         let ws = self.windows.get(&wid)?;
         let period = self.deck_clock_period(ws);
         let clock = &ws.deck_clock;
-        Some(match (clock.on_link(), clock.running) {
-            (true, true) => {
-                let grace = clock.heard.unwrap_or(now) + period * LINK_GRACE;
-                (
-                    clock
-                        .silence_deadline()
-                        .map_or(grace, |silence| silence.min(grace)),
-                    Some(period),
-                )
-            }
-            (true, false) => (
-                due.checked_sub(period * LINK_LEAD)
-                    .unwrap_or(due)
-                    .max(now + Duration::from_millis(1)),
-                None,
-            ),
-            _ => {
-                let began = self.vitals.needle.get().map_or(due, |n| n.t0);
-                let after = clock
-                    .last
-                    .map_or(due, |(target, _)| due.max(target + Duration::from_nanos(1)))
-                    .max(began);
-                (grid_ceil(after, period), Some(period))
-            }
-        })
+        Some(
+            match (
+                clock.on_link() && clock.link_for_due(due, period),
+                clock.running,
+            ) {
+                (true, true) => {
+                    let grace = clock.heard.unwrap_or(now) + period * LINK_GRACE;
+                    (
+                        clock
+                            .silence_deadline()
+                            .map_or(grace, |silence| silence.min(grace)),
+                        Some(period),
+                    )
+                }
+                (true, false) => (
+                    due.checked_sub(period * LINK_LEAD)
+                        .unwrap_or(due)
+                        .max(now + Duration::from_millis(1)),
+                    None,
+                ),
+                _ => {
+                    let began = self.vitals.needle.get().map_or(due, |n| n.t0);
+                    let after = clock
+                        .last
+                        .map_or(due, |(target, _)| due.max(target + Duration::from_nanos(1)))
+                        .max(began);
+                    (grid_ceil(after, period), Some(period))
+                }
+            },
+        )
     }
 
     /// The loop's deadline for the deck clocks (`DeadlineOwner::DeckClock`,
@@ -530,7 +555,7 @@ impl App {
                 if now < at {
                     return None;
                 }
-                let target = if ws.deck_clock.on_link() {
+                let target = if ws.deck_clock.on_link() && ws.deck_clock.running {
                     now
                 } else {
                     grid_floor(now, period)
@@ -812,9 +837,42 @@ mod tests {
         app.windows[&wid].redraw_requests_for_test.get()
     }
 
-    /// A sweep on a display link, driven as the loop drives it (the link's ticks while it runs,
-    /// the loop's deadline while it is paused): the link runs from a few periods before each
-    /// frame due and costs a few ticks a frame, and on the vsync the needle comes to rest the
+    #[cfg(unix)]
+    #[test]
+    fn isolated_steps_draw_without_restarting_the_native_link() {
+        let _attached = crate::stats_deck::tests::attach_stats();
+        let (mut app, wid, t1) = sweeping();
+        let period = Duration::from_micros(8_333);
+        let clock = &mut app.windows.get_mut(&wid).unwrap().deck_clock;
+        clock.port = inert_link;
+        clock.last = Some((t1 - Duration::from_secs(1), period));
+        app.sync_deck_clocks(t1);
+        assert!(!app.windows[&wid].deck_clock.link_running());
+        let at = app.deck_clock_deadline(t1).expect("the step is still owed");
+        let before = redraws(&app, wid);
+        app.service_deck_clocks(at);
+        assert!(redraws(&app, wid) > before, "the timer draws the step");
+        app.sync_deck_clocks(at);
+        assert!(
+            !app.windows[&wid].deck_clock.link_running(),
+            "an unserved timer frame cannot start the native link"
+        );
+        present(&mut app, wid, at);
+
+        let (mut dense, wid, t1) = sweeping();
+        let clock = &mut dense.windows.get_mut(&wid).unwrap().deck_clock;
+        clock.port = inert_link;
+        clock.last = Some((t1, period));
+        dense.sync_deck_clocks(t1);
+        assert!(
+            dense.windows[&wid].deck_clock.link_running(),
+            "CONTROL: adjacent panel frames still run the native link"
+        );
+    }
+
+    /// A sweep driven as the loop drives it: native ticks for adjacent panel frames and the
+    /// timer grid for isolated steps. The link costs a few ticks per native frame, and when
+    /// the needle comes to rest the
     /// clock pauses, asks no deadline, and a tick then asks nothing. A clock that never paused
     /// (the CONTROL's mutant) would leave its last ask `true`.
     #[cfg(unix)]
@@ -830,6 +888,12 @@ mod tests {
         let period = Duration::from_micros(8_333);
         let (mut now, mut ticks, mut frames, mut runs) = (t1, 0_usize, 0_usize, 0_usize);
         for _ in 0..100_000 {
+            let before = redraws(&app, wid);
+            app.service_deck_clocks(now);
+            if redraws(&app, wid) > before {
+                frames += 1;
+                present(&mut app, wid, now);
+            }
             app.sync_deck_clocks(now);
             if app.windows[&wid].deck_clock.link_running() {
                 let before = redraws(&app, wid);
@@ -934,6 +998,8 @@ mod tests {
         let period = Duration::from_micros(16_667);
         // Draw the sweep's first frame, then tick just before its next step, for a vsync just
         // after it.
+        app.sync_deck_clocks(t1);
+        assert!(app.windows[&wid].deck_clock.link_running());
         app.on_deck_frame_tick(wid, t1, period, t1);
         present(&mut app, wid, t1);
         let facts = app.live_facts(wid).expect("the deck draws");
@@ -1103,7 +1169,7 @@ mod tests {
 
     /// Drives `wid`'s sweep from `from` as the loop drives it (its deadline, the redraws it asks
     /// presented), with the link ticking each `period` while it runs where `ticks` and never
-    /// where not, until the clock falls silent or the needle rests.
+    /// where not, until the needle rests, continuing on the grid if the link falls silent.
     #[cfg(unix)]
     fn drive_link(
         app: &mut crate::App,
@@ -1123,8 +1189,7 @@ mod tests {
             app.sync_deck_clocks(now);
             let clock = &app.windows[&wid].deck_clock;
             if clock.silent() {
-                d.fell = Some(now);
-                break;
+                d.fell.get_or_insert(now);
             }
             let running = clock.link_running();
             let before = redraws(app, wid);
@@ -1151,16 +1216,32 @@ mod tests {
         d
     }
 
-    /// The display link's hang detector: a link asked to run that never ticks (the inert port,
-    /// which says the window has one, and no tick) falls silent once it has run
-    /// [`LINK_SILENCE`] unheard, never sooner, at a wake the loop's deadline armed for it, and
-    /// with at most one wake a period on the way. Then the window's clock keeps the loop's timer,
+    #[cfg(unix)]
+    #[test]
+    fn a_finite_sweep_finishes_even_when_the_native_link_never_ticks() {
+        let _attached = crate::stats_deck::tests::attach_stats();
+        let (mut app, wid, t1) = sweeping();
+        app.windows.get_mut(&wid).unwrap().deck_clock.port = inert_link;
+        let period = app.deck_clock_period(&app.windows[&wid]);
+        let d = drive_link(&mut app, wid, t1, period, false);
+        assert!(redraws(&app, wid) > 5, "CONTROL: the sweep drew frames");
+        let most = u32::try_from(d.now.duration_since(t1).as_nanos() / period.as_nanos())
+            .expect("a short sweep")
+            + 2;
+        assert!(d.wakes <= most, "the timer wakes at most once a period");
+        assert!(!app.windows[&wid].deck_clock.link_running());
+        assert_eq!(app.deck_clock_deadline(d.now), None, "the sweep settled");
+    }
+
+    /// A link kept running without ticks falls silent at [`LINK_SILENCE`], never sooner.
+    /// Unlike a finite sparse sweep, this fixture actually asks it to run for that duration.
+    /// Then the window's clock keeps the loop's timer,
     /// as a window with no link does (the synthetic grid, and a windowed deck the effect lane's
     /// interval), it arms no further detector wake, and the link's first tick puts it back on
     /// the link.
     #[cfg(unix)]
     #[test]
-    fn a_link_that_never_ticks_falls_back_to_the_timer() {
+    fn a_link_kept_running_without_ticks_falls_back_to_the_timer() {
         let _attached = crate::stats_deck::tests::attach_stats();
         let (mut app, wid, t1) = sweeping();
         app.windows
@@ -1169,20 +1250,13 @@ mod tests {
             .deck_clock
             .port = inert_link;
         let period = app.deck_clock_period(&app.windows[&wid]);
-        let d = drive_link(&mut app, wid, t1, period, false);
-        let fell = d.fell.expect("a link that never ticks falls silent");
-        assert!(
-            d.ran >= LINK_SILENCE && d.ran <= LINK_SILENCE + Duration::from_millis(1),
-            "it fell silent {:?} into its runs",
-            d.ran
-        );
-        let span = fell.saturating_duration_since(t1);
-        let most = u32::try_from(span.as_nanos() / period.as_nanos()).expect("a short span") + 2;
-        assert!(
-            d.wakes <= most,
-            "{} wakes in {span:?}: at most one a period ({most})",
-            d.wakes
-        );
+        let clock = &mut app.windows.get_mut(&wid).unwrap().deck_clock;
+        clock.ask_link(None);
+        clock.steer(None, true, t1);
+        let fell = clock.silence_deadline().expect("a running link is watched");
+        assert_eq!(fell, t1 + LINK_SILENCE);
+        assert!(!clock.watch_link(fell - Duration::from_nanos(1)));
+        assert!(clock.watch_link(fell), "a link kept running falls silent");
         let clock = &app.windows[&wid].deck_clock;
         assert_eq!(
             clock.timing_link(),
@@ -1196,7 +1270,7 @@ mod tests {
         );
         assert_eq!(clock.silence_deadline(), None, "no further detector wake");
         // On the grid now: a new reading's sweep wakes on its vsyncs, one after another.
-        let mut now = d.now + Duration::from_secs(1);
+        let mut now = fell + Duration::from_secs(1);
         let _ = crate::stats_live::tests::busier(&mut app, 0.2, now);
         for _ in 0..4 {
             app.sync_deck_clocks(now);

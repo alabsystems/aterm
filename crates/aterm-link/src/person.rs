@@ -793,24 +793,27 @@ fn write_cap(path: &Path, lines: &str, secret: &Path) -> Result<PathBuf, String>
             path.display()
         ));
     }
-    match read_existing_cap(path, lines.len()) {
-        Ok(Some((file, old))) if old == lines.as_bytes() => match private_mode(&file) {
-            Ok(None) => {}
-            Ok(Some(was)) if (was & 0o077) == 0 => eprintln!(
-                "aterm fabric mint-for: {} held this cap at mode {was:03o}; now 0600",
-                path.display()
-            ),
-            Ok(Some(was)) => eprintln!(
-                "aterm fabric mint-for: {} held this cap at mode {was:03o}, readable by other \
-                 users; now 0600. A copy of it works until its grants expire (a cap minted \
-                 with --expires lapses on its own) or the mint secret is replaced: move {} \
-                 aside and run `aterm fabric on` again, which re-mints the node's cap; every \
-                 person's cap minted under the old secret stops verifying, so mint each again",
-                path.display(),
-                secret.display()
-            ),
-            Err(e) => return Err(format!("{}: {e}", path.display())),
-        },
+    let wrote = match read_existing_cap(path, lines.len()) {
+        Ok(Some((file, old))) if old == lines.as_bytes() => {
+            match private_mode(&file) {
+                Ok(None) => {}
+                Ok(Some(was)) if (was & 0o077) == 0 => eprintln!(
+                    "aterm fabric mint-for: {} held this cap at mode {was:03o}; now 0600",
+                    path.display()
+                ),
+                Ok(Some(was)) => eprintln!(
+                    "aterm fabric mint-for: {} held this cap at mode {was:03o}, readable by other \
+                     users; now 0600. A copy of it works until its grants expire (a cap minted \
+                     with --expires lapses on its own) or the mint secret is replaced: move {} \
+                     aside and run `aterm fabric on` again, which re-mints the node's cap; every \
+                     person's cap minted under the old secret stops verifying, so mint each again",
+                    path.display(),
+                    secret.display()
+                ),
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            }
+            false
+        }
         Ok(Some(_)) => {
             return Err(format!(
                 "{} exists and holds a different cap; remove it or choose another --out",
@@ -820,8 +823,36 @@ fn write_cap(path: &Path, lines: &str, secret: &Path) -> Result<PathBuf, String>
         Ok(None) => {
             write_atomic(path, lines.as_bytes(), 0o600)
                 .map_err(|e| format!("{}: {e}", path.display()))?;
+            true
         }
         Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    // WHAT THE CALLER IS ABOUT TO SAY OF THE FILE IS WHAT THE READERS JUDGE: its mode can be 0600
+    // and an access list still let others in, one a folder's inheriting entry gave it.
+    if let Err(e) = crate::bridge::read_cap_file(&path.to_string_lossy()) {
+        let carries_an_entry = matches!(
+            astream_cap::capfile::refusal_of(&e),
+            Some(astream_cap::capfile::Refusal::File(
+                astream_sys::NotPrivate::Acl
+            ))
+        );
+        if !wrote || !carries_an_entry {
+            return Err(e.to_string());
+        }
+        // What this run wrote is gone again, so nobody else can read it from here on. The entry is
+        // the folder's, a choice of its owner's, so aterm does not clear it from the file it gave
+        // nor from the folder: `--out` names the place, and a person can name another.
+        let gone = std::fs::remove_file(path)
+            .err()
+            .map_or_else(String::new, |rm| {
+                format!(" ({} could not be removed: {rm})", path.display())
+            });
+        return Err(format!(
+            "the access list of {}'s folder lets other users into every new file there, so no \
+             cap is kept there{gone}: choose another --out, or clear the folder's with `chmod -N`, \
+             and mint again ({e})",
+            path.display()
+        ));
     }
     Ok(path.to_path_buf())
 }
@@ -845,7 +876,8 @@ fn person_guidance(person: &str, fleet: &str, broker: &str, cap: &str) -> String
         )
     };
     format!(
-        "with it, {person} uses the fleet (keep the cap 0600; it IS {person}):\n\
+        "with it, {person} uses the fleet (it IS {person}: keep it 0600, and aterm refuses one \
+         others can read):\n\
          {halt}  \
          aterm fabric inbox --cap-file {cap}            read what agents posted to={person}\n  \
          aterm fabric post --cap-file {cap} to=@<sid>@<node> kind=answer re=<off> <text>\n  \
@@ -1092,7 +1124,7 @@ mod tests {
                 )
             })
             .collect();
-        std::fs::write(&cap_path, caps).unwrap();
+        crate::bridge::write_owner_only(&cap_path, caps);
         let cfg = unix_cfg(dir.path(), &socket);
         let cmd = PersonCmd {
             act: Act::Halt(Some("stop".to_string())),
@@ -1705,7 +1737,7 @@ mod tests {
                 .iter()
                 .map(|g| format!("{g} {}\n", "ab".repeat(32)))
                 .collect();
-            std::fs::write(&path, lines).unwrap();
+            crate::bridge::write_owner_only(&path, lines);
             path.to_string_lossy().into_owned()
         };
         let person = write("h.cap", &crate::enable::person_grants("f1", "h-andrew"));

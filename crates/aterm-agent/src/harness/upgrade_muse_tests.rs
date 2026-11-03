@@ -383,6 +383,8 @@ fn a_lock_names_its_holders_pid() {
     assert_eq!(lock_pid(""), None);
     assert_eq!(lock_pid("host=x\n"), None);
     assert_eq!(lock_pid("pid=0\n"), None);
+    assert_eq!(lock_pid("pid=1\n"), None);
+    assert_eq!(lock_pid("pid=016390\n"), None);
     assert_eq!(lock_pid("pid=abc\n"), None);
 }
 
@@ -496,6 +498,13 @@ fn a_store_build_is_told_from_the_twin() {
     )));
     assert!(!store_build(Path::new("/opt/homebrew/bin/muse")));
     assert!(!store_build(Path::new("/p/store/codex/1/bin/muse")));
+    assert!(!store_build(Path::new("/p/store/muse/01/bin/muse")));
+    assert!(!store_build(Path::new(
+        "/p/store/muse/not-a-build/bin/muse"
+    )));
+    assert!(!store_build(Path::new("/p/store/muse/../bin/muse")));
+    assert!(!store_build(Path::new("/p/../store/muse/1/bin/muse")));
+    assert!(!store_build(Path::new("store/muse/1/bin/muse")));
 }
 
 #[test]
@@ -636,4 +645,145 @@ fn launch_endpoint_guards_mtls_auth_and_custom_ca_env_vars() {
             "plain http lab stub stays probeable even when {ca_var} is set in env"
         );
     }
+}
+
+#[test]
+fn launch_endpoint_guards_presets_partial_transport_merges_and_provider_precedence() {
+    // `--preset` and non-empty `-c preset=...` select external profile transport settings.
+    for preset_argv in [
+        argv(&[
+            STORE,
+            "--preset",
+            "corp-mtls",
+            "--base-url",
+            "https://muse.internal/v1",
+        ]),
+        argv(&[
+            STORE,
+            "-c",
+            "preset=\"corp-mtls\"",
+            "--base-url",
+            "https://muse.internal/v1",
+        ]),
+    ] {
+        let got = launch_endpoint(&preset_argv, &[]);
+        assert!(
+            matches!(got, LaunchEndpoint::Gap(ref why) if why.contains("preset")),
+            "expected preset gap for {preset_argv:?}, got {got:?}"
+        );
+    }
+
+    // `-c preset=null` clears an earlier `-c preset=...`.
+    assert_eq!(
+        launch_endpoint(
+            &argv(&[
+                STORE,
+                "-c",
+                "preset=\"corp\"",
+                "-c",
+                "preset=null",
+                "--base-url",
+                "https://muse.internal/v1",
+            ]),
+            &[],
+        ),
+        LaunchEndpoint::BaseUrl {
+            url: "https://muse.internal/v1".to_string(),
+            source: "Muse Code's --base-url",
+        }
+    );
+
+    // A partial `-c endpoint_transport={...}` object preserves earlier proxy/CA/auth/base_url keys
+    // unless `endpoint_transport=null` clears the whole object.
+    let partial_after_proxy = launch_endpoint(
+        &argv(&[
+            STORE,
+            "-c",
+            "endpoint_transport.proxy=\"http://127.0.0.1:9\"",
+            "-c",
+            "endpoint_transport={\"base_url\":\"https://muse.internal/v1\"}",
+        ]),
+        &[],
+    );
+    assert!(
+        matches!(partial_after_proxy, LaunchEndpoint::Gap(ref why) if why.contains("proxy")),
+        "partial endpoint_transport object must not erase earlier proxy: {partial_after_proxy:?}"
+    );
+    assert_eq!(
+        launch_endpoint(
+            &argv(&[
+                STORE,
+                "-c",
+                "endpoint_transport.base_url=\"https://muse.internal/v1\"",
+                "-c",
+                "endpoint_transport={\"auth\":{\"type\":\"bearer\"}}",
+            ]),
+            &[],
+        ),
+        LaunchEndpoint::BaseUrl {
+            url: "https://muse.internal/v1".to_string(),
+            source: "Muse Code's -c endpoint_transport.base_url",
+        },
+        "partial endpoint_transport object must preserve earlier base_url"
+    );
+
+    // `${VAR}` resolution in `endpoint_transport.proxy` / `ca_bundle`, and `--provider` outranking `-c provider`.
+    let unset_proxy = launch_endpoint(
+        &argv(&[
+            STORE,
+            "--base-url",
+            "https://muse.internal/v1",
+            "-c",
+            "endpoint_transport.proxy=\"${UNSET_PROXY}\"",
+        ]),
+        &[],
+    );
+    assert!(
+        matches!(unset_proxy, LaunchEndpoint::Gap(ref why) if why.contains("unset environment variable")),
+        "unset proxy env var must report gap: {unset_proxy:?}"
+    );
+    let cleared_first = launch_endpoint(
+        &argv(&[STORE, "-c", "endpoint_transport.base_url=\"${MUSE_STUB}\""]),
+        &[
+            "MUSE_STUB=".to_string(),
+            "MUSE_STUB=http://127.0.0.1:4102".to_string(),
+        ],
+    );
+    assert!(
+        matches!(cleared_first, LaunchEndpoint::Gap(ref why) if why.contains("unset environment variable")),
+        "empty first env entry must shadow duplicate trailing entries like POSIX getenv: {cleared_first:?}"
+    );
+    assert_eq!(
+        launch_endpoint(
+            &argv(&[STORE, "-c", "endpoint_transport.base_url=\"${MUSE_STUB}\""]),
+            &[
+                "MUSE_STUB=http://127.0.0.1:4102".to_string(),
+                "MUSE_STUB=http://127.0.0.1:9999".to_string(),
+            ],
+        ),
+        LaunchEndpoint::BaseUrl {
+            url: "http://127.0.0.1:4102".to_string(),
+            source: "Muse Code's -c endpoint_transport.base_url",
+        },
+        "first matching env entry wins like POSIX getenv"
+    );
+    assert_eq!(
+        launch_endpoint(
+            &argv(&[
+                STORE,
+                "--provider",
+                "local",
+                "-c",
+                "provider=\"echo\"",
+                "--base-url",
+                "http://127.0.0.1:18080/v1",
+            ]),
+            &[],
+        ),
+        LaunchEndpoint::BaseUrl {
+            url: "http://127.0.0.1:18080/v1".to_string(),
+            source: "Muse Code's --base-url",
+        },
+        "--provider outranks -c provider regardless of order"
+    );
 }

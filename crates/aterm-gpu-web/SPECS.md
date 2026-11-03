@@ -246,6 +246,8 @@ tests/cpu_gpu_parity.rs	web_cpu_gpu_rgba8_parity	cpu-gpu-parity
 5. **`webgl-present-result`**, its `is_ok` clause (an enum carrier only). The message clause waits
    for the `String` model.
 
+## 5. Open findings
+
 1. **No test samples `swapchain-sized-to-surface-rows`.** The spec is blocked on a
    GPU-surface model (gap 8), and no source-text count of `.frame_size(` lines stands in for
    it: such a count breaks on harmless refactors and passes a semantic bug spelled the same
@@ -263,12 +265,9 @@ tests/cpu_gpu_parity.rs	web_cpu_gpu_rgba8_parity	cpu-gpu-parity
    `predict-facade-gates` is not yet about a pure function: the state-machine claims belong in
    aterm-predict with an injected clock, and the facade should take its clock through an
    injected field.
-4. **The messages glue is copy-pasted between the two web crates.** The `messages_api.rs` twin
-   tests (`the_gpu_band_has_the_twins_exports`, `the_gpu_page_is_the_twins_page`,
-   `the_gpu_page_offers_what_the_twin_offers`, `a_still_pointers_chip_never_lights_the_echo`,
-   `the_restore_moves_the_pages_rev`) are self-described abridged copies of aterm-wasm's tests
-   over a copied module. The general fix is one shared glue implementation; these tests then
-   become duplicates (delete) and `messages-twin-equivalence` becomes definitional.
+4. **Resolved — shared `messages_api.rs` glue.** Both web crates compile `crates/aterm-wasm/src/messages_api.rs`,
+   so the string-reply clause of `messages-twin-equivalence` holds by construction while its band-row
+   clause compares the two hosts' `RenderInput`s.
 5. **A magic drain bound.** `spill_exports_surface_band_content_on_the_cpu_face` asserts the
    aurora drains within `DRAIN_FRAMES = 125` frames (2 s of injected dt), against a commented
    "~740 ms" envelope, and the bound is unrelated to the configured `duration_ms = 400`. The spec
@@ -285,23 +284,3 @@ tests/cpu_gpu_parity.rs	web_cpu_gpu_rgba8_parity	cpu-gpu-parity
 8. **Resolved — vacuous passes replaced with `could_not_run`.** `system_font_terminal`,
    `messages_api_tests` and `tests/cpu_gpu_parity.rs` now call `aterm_spec::host::could_not_run`
    when no system monospace font or GPU adapter is available rather than returning silently.
-
-## 5. Open findings
-
-1. **`needs_frame` skips `open_frame`'s pumps.** Its doc says "Whether the next `render` would
-   draw", but `open_frame` first runs `drain_compress_backlog_on_render`, which applies a pending
-   budget share and trickles staged lines. If that advances `damage_epoch`, a `false` is followed
-   by a drawn frame. Prove it never does (and state it in `frame-gate`), or weaken the doc.
-2. **The predict clock is a thread-local test pin, not an injected field.** Every export reads
-   `predict_api::clock`, which the predict tests pin through `pin_clock`; production reads the
-   real clock, so `predict-facade-gates` is not about a pure function. The state-machine claims
-   belong in aterm-predict with an injected clock.
-3. **A magic drain bound.** `spill_exports_surface_band_content_on_the_cpu_face` asserts the
-   aurora drains within `DRAIN_FRAMES = 125` frames. The spec states the bound as a function of
-   the glow config.
-4. **The messages glue is shared.** Both web crates compile `crates/aterm-wasm/src/messages_api.rs`,
-   so the string-reply clause of `messages-twin-equivalence` holds by construction. Its band-row
-   clause still compares the two hosts' `RenderInput`s.
-5. **Coverage witnesses are not spec.** The `build_frame_*` tests read the `#[cfg(test)]` field
-   `last_refill`, a real production return value, but their `scoped >= 5` / `full >= 2` counts
-   witness the chosen stream and are not part of `scoped-refill-equals-full`.

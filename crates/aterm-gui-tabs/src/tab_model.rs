@@ -1346,12 +1346,51 @@ pub enum TabIconKind {
     Codex,
     About,
     Settings,
+    SystemState,
     Markdown,
     Editor,
     Recovery,
+    Workers,
+}
+
+/// What kind of surface a tab's icon stands for: its session's terminal, or an application of aterm's own.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum TabSurface {
+    Terminal,
+    App,
 }
 
 impl TabIconKind {
+    /// Every kind, for the sweeps that must cover them all.
+    pub const ALL: [Self; 9] = [
+        Self::Mail,
+        Self::Codex,
+        Self::About,
+        Self::Settings,
+        Self::SystemState,
+        Self::Markdown,
+        Self::Editor,
+        Self::Recovery,
+        Self::Workers,
+    ];
+
+    /// The surface this icon stands for. `Codex` names a program in a terminal, so an icon's presence never means an application: a new kind answers here.
+    #[must_use]
+    #[inline]
+    pub const fn surface(self) -> TabSurface {
+        match self {
+            Self::Codex => TabSurface::Terminal,
+            Self::Mail
+            | Self::About
+            | Self::Settings
+            | Self::SystemState
+            | Self::Markdown
+            | Self::Editor
+            | Self::Recovery
+            | Self::Workers => TabSurface::App,
+        }
+    }
+
     /// Stable semantic name used by chrome inspection (`toolbar-tabs icons=`).
     #[must_use]
     #[inline]
@@ -1361,9 +1400,11 @@ impl TabIconKind {
             Self::Codex => "codex",
             Self::About => "about",
             Self::Settings => "settings",
+            Self::SystemState => "system-state",
             Self::Markdown => "markdown",
             Self::Editor => "editor",
             Self::Recovery => "recovery",
+            Self::Workers => "workers",
         }
     }
 
@@ -1376,9 +1417,11 @@ impl TabIconKind {
             Self::Codex => "Codex",
             Self::About => "About aterm",
             Self::Settings => "Settings",
+            Self::SystemState => "System State",
             Self::Markdown => "Markdown viewer",
             Self::Editor => "Editor",
             Self::Recovery => "Recovery",
+            Self::Workers => "Workers",
         }
     }
 }
@@ -1516,6 +1559,10 @@ pub struct Tab {
     pub focus: ViewId,
     pub zoomed: bool,
     pub presentation: TabPresentation,
+    /// A worker's tab: not on the strip, reached through the window's Workers tab. Parked tabs
+    /// are a suffix of their [`TabSet`], which keeps that across every change; write this only
+    /// before a [`TabSet::push`].
+    pub parked: bool,
 }
 
 impl Tab {
@@ -1527,6 +1574,7 @@ impl Tab {
             focus: view,
             zoomed: false,
             presentation,
+            parked: false,
         }
     }
 
@@ -1544,6 +1592,7 @@ impl Tab {
             focus,
             zoomed,
             presentation,
+            parked: false,
         }
     }
 
@@ -1721,10 +1770,16 @@ impl Tab {
 }
 
 /// Ordered stable tabs with active identity.
+///
+/// `tabs[..shown_len()]` is what the strip draws and `tabs[shown_len()..]` are the parked tabs, so
+/// a canonical index is a strip index for every visible tab. Any tab may be active, parked or not.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct TabSet {
     active: Option<TabId>,
     tabs: Vec<Tab>,
+    /// The shown tab that stands for the parked ones: the strip selects it while a parked tab is
+    /// active, and closing that parked tab lands on it.
+    home: Option<TabId>,
 }
 
 impl TabSet {
@@ -1734,6 +1789,7 @@ impl TabSet {
         Self {
             active: Some(first.id),
             tabs: vec![first],
+            home: None,
         }
     }
 
@@ -1797,15 +1853,104 @@ impl TabSet {
         &self.tabs
     }
 
-    /// Append a tab and focus it.
+    /// How many leading tabs the strip draws; the rest are parked.
+    #[must_use]
+    #[inline]
+    pub fn shown_len(&self) -> usize {
+        self.tabs.partition_point(|tab| !tab.parked)
+    }
+
+    /// The tabs the strip draws, in order.
+    #[must_use]
+    #[inline]
+    pub fn shown(&self) -> &[Tab] {
+        &self.tabs[..self.shown_len()]
+    }
+
+    /// The parked tabs, in order; the first sits at canonical index [`Self::shown_len`].
+    #[must_use]
+    #[inline]
+    pub fn parked(&self) -> &[Tab] {
+        &self.tabs[self.shown_len()..]
+    }
+
+    /// The shown tab that stands for the parked ones, when the window has one.
+    #[must_use]
+    #[inline]
+    pub const fn home(&self) -> Option<TabId> {
+        self.home
+    }
+
+    /// Name the shown tab that stands for the parked ones. A parked or absent tab is refused.
+    pub fn set_home(&mut self, home: Option<TabId>) -> bool {
+        if let Some(id) = home
+            && !self.get(id).is_some_and(|tab| !tab.parked)
+        {
+            return false;
+        }
+        self.home = home;
+        true
+    }
+
+    /// Whether the active tab is parked.
+    #[must_use]
+    #[inline]
+    pub fn active_is_parked(&self) -> bool {
+        self.active().is_some_and(|tab| tab.parked)
+    }
+
+    /// The canonical index the strip selects: the active tab's, or while a parked tab is active
+    /// the home tab's, else the last shown tab's. `None` when nothing is shown.
+    #[must_use]
+    pub fn strip_active(&self) -> Option<usize> {
+        let index = self.active_index()?;
+        let shown = self.shown_len();
+        if index < shown {
+            return Some(index);
+        }
+        self.home_index().or_else(|| shown.checked_sub(1))
+    }
+
+    /// The shown tab whose chip stands for tab `id`: itself, or for a parked tab the home tab.
+    #[must_use]
+    pub fn chip_of(&self, id: TabId) -> Option<TabId> {
+        let tab = self.get(id)?;
+        if tab.parked { self.home } else { Some(id) }
+    }
+
+    fn home_index(&self) -> Option<usize> {
+        let home = self.home?;
+        self.shown().iter().position(|tab| tab.id == home)
+    }
+
+    /// Append a tab and focus it: a shown tab at the end of the shown ones, a parked tab last.
     pub fn push(&mut self, tab: Tab) -> Result<usize, DuplicateTabId> {
         if self.get(tab.id).is_some() {
             return Err(DuplicateTabId);
         }
         let id = tab.id;
-        self.tabs.push(tab);
+        let at = if tab.parked {
+            self.tabs.len()
+        } else {
+            self.shown_len()
+        };
+        self.tabs.insert(at, tab);
         self.active = Some(id);
-        Ok(self.tabs.len() - 1)
+        Ok(at)
+    }
+
+    /// Take a tab off the suffix: it becomes the last shown tab, keeping which tab is active.
+    /// Its new canonical index, or `None` when it is absent or not parked.
+    pub fn unpark(&mut self, id: TabId) -> Option<usize> {
+        let from = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == id && tab.parked)?;
+        let mut tab = self.tabs.remove(from);
+        tab.parked = false;
+        let to = self.shown_len();
+        self.tabs.insert(to, tab);
+        Some(to)
     }
 
     pub fn switch_to(&mut self, id: TabId) -> bool {
@@ -1843,20 +1988,55 @@ impl TabSet {
         Some(id)
     }
 
-    /// Remove a tab and update the active tab selection.
+    /// Next or previous among the tabs the strip draws, wrapping, from the one it selects: a
+    /// parked active tab steps from its home. With one shown tab, a parked active tab goes home
+    /// and a shown one stays. `None` when nothing is shown.
+    pub fn cycle_shown(&mut self, forward: bool) -> Option<TabId> {
+        let count = self.shown_len();
+        if count == 0 {
+            return None;
+        }
+        let current = self.strip_active()?;
+        let next = if self.active_is_parked() && count == 1 {
+            current
+        } else if forward {
+            (current + 1) % count
+        } else {
+            (current + count - 1) % count
+        };
+        let id = self.tabs[next].id;
+        self.active = Some(id);
+        Some(id)
+    }
+
+    /// Remove a tab and update the active tab selection. A closing tab never hands the front to a
+    /// parked one while a shown tab stands: a parked active tab lands on its home, else the last
+    /// shown tab, and a shown one on the shown tab in its place, else the one before it.
     pub fn remove(&mut self, id: TabId) -> Option<Tab> {
         let index = self.tabs.iter().position(|tab| tab.id == id)?;
         let was_active = self.active == Some(id);
         let removed = self.tabs.remove(index);
+        if self.home == Some(id) {
+            self.home = None;
+        }
         if self.tabs.is_empty() {
             self.active = None;
         } else if was_active {
-            self.active = Some(self.tabs[index.min(self.tabs.len() - 1)].id);
+            let shown = self.shown_len();
+            let landing = if shown == 0 {
+                index.min(self.tabs.len() - 1)
+            } else if removed.parked {
+                self.home_index().unwrap_or(shown - 1)
+            } else {
+                index.min(shown - 1)
+            };
+            self.active = Some(self.tabs[landing].id);
         }
         Some(removed)
     }
 
-    /// Move a stable tab to a chrome index without changing which tab is active.
+    /// Move a stable tab to a chrome index without changing which tab is active. A move that
+    /// would carry a tab across the boundary between the shown and parked tabs is refused.
     pub fn reorder(&mut self, id: TabId, to: usize) -> bool {
         let Some(from) = self.tabs.iter().position(|tab| tab.id == id) else {
             return false;
@@ -1864,9 +2044,28 @@ impl TabSet {
         if to >= self.tabs.len() || from == to {
             return to < self.tabs.len();
         }
+        let shown = self.shown_len();
+        if (from < shown) != (to < shown) {
+            return false;
+        }
         let tab = self.tabs.remove(from);
         self.tabs.insert(to, tab);
         true
+    }
+
+    /// Move a tab as near canonical index `to` as its own side of the boundary allows, keeping
+    /// which tab is active. Its index now, or `None` when it is absent.
+    pub fn place(&mut self, id: TabId, to: usize) -> Option<usize> {
+        let tab = self.get(id)?;
+        let (shown, len) = (self.shown_len(), self.tabs.len());
+        let to = if tab.parked {
+            to.clamp(shown, len - 1)
+        } else {
+            to.min(shown - 1)
+        };
+        let moved = self.reorder(id, to);
+        debug_assert!(moved);
+        Some(to)
     }
 
     #[must_use]
@@ -1878,12 +2077,25 @@ impl TabSet {
             return false;
         };
         self.tabs.iter().filter(|tab| tab.id == active).count() == 1
+            && self.parked_is_suffix()
+            && self
+                .home
+                .is_none_or(|home| self.shown().iter().any(|tab| tab.id == home))
             && self.tabs.iter().all(|tab| tab.invariant_holds(views))
             && self.tabs.iter().enumerate().all(|(index, tab)| {
                 self.tabs[..index]
                     .iter()
                     .all(|earlier| earlier.id != tab.id)
             })
+    }
+
+    /// No shown tab follows a parked one.
+    #[must_use]
+    pub fn parked_is_suffix(&self) -> bool {
+        self.tabs
+            .iter()
+            .skip_while(|tab| !tab.parked)
+            .all(|tab| tab.parked)
     }
 }
 
@@ -1904,6 +2116,215 @@ mod tests {
             })
             .collect();
         (store, ids)
+    }
+
+    fn parked_set(shown: usize, parked: usize) -> (TabSet, ViewStore, Vec<TabId>) {
+        let (store, views) = view_store_with(shown + parked);
+        let mut ids = IdAllocator::<TabId>::default();
+        let mut set = TabSet::default();
+        let mut tabs = Vec::new();
+        for (index, view) in views.into_iter().enumerate() {
+            let id = ids.allocate().expect("finite test id space");
+            let mut tab = Tab::new(id, view, TabPresentation::terminal(format!("t{index}")));
+            tab.parked = index >= shown;
+            assert_eq!(set.push(tab).expect("fresh id"), index);
+            tabs.push(id);
+        }
+        (set, store, tabs)
+    }
+
+    #[test]
+    fn a_shown_tab_lands_before_the_parked_suffix_and_a_parked_one_after_it() {
+        let (mut set, store, tabs) = parked_set(2, 2);
+        assert_eq!(set.shown_len(), 2);
+        assert_eq!(set.shown().len() + set.parked().len(), 4);
+
+        let view = set.tabs()[0].focus;
+        let mut ids = IdAllocator::<TabId>::default();
+        for _ in 0..tabs.len() {
+            ids.allocate().expect("finite test id space");
+        }
+        let shown = Tab::new(
+            ids.allocate().expect("finite test id space"),
+            view,
+            TabPresentation::terminal("new"),
+        );
+        let shown_id = shown.id;
+        assert_eq!(set.push(shown).expect("fresh id"), 2, "at the boundary");
+        assert_eq!(set.active_id(), Some(shown_id));
+        assert_eq!(set.shown_len(), 3);
+        assert!(set.invariant_holds(&store));
+
+        let mut parked = Tab::new(
+            ids.allocate().expect("finite test id space"),
+            view,
+            TabPresentation::terminal("worker"),
+        );
+        parked.parked = true;
+        let parked_id = parked.id;
+        assert_eq!(set.push(parked).expect("fresh id"), 5, "last of all");
+        assert_eq!(set.tabs()[5].id, parked_id);
+        assert_eq!(set.shown_len(), 3);
+        assert!(set.invariant_holds(&store));
+    }
+
+    #[test]
+    fn a_broken_suffix_fails_the_invariant() {
+        let (mut set, store, _) = parked_set(2, 1);
+        assert!(set.invariant_holds(&store));
+        // The negative control: a shown tab behind a parked one is the state nothing may build.
+        set.tab_at_mut(0).expect("a tab").parked = true;
+        assert!(!set.parked_is_suffix());
+        assert!(!set.invariant_holds(&store));
+    }
+
+    #[test]
+    fn home_must_stand_among_the_shown_tabs() {
+        let (mut set, store, tabs) = parked_set(2, 1);
+        assert!(!set.set_home(Some(tabs[2])), "a parked tab is no home");
+        assert_eq!(set.home(), None);
+        assert!(set.set_home(Some(tabs[1])));
+        assert!(set.invariant_holds(&store));
+        // A home that became parked behind the model's back fails the invariant.
+        set.tab_at_mut(1).expect("a tab").parked = true;
+        assert!(!set.invariant_holds(&store));
+    }
+
+    #[test]
+    fn the_strip_selects_home_while_a_parked_tab_is_active() {
+        let (mut set, _store, tabs) = parked_set(3, 2);
+        assert!(set.set_home(Some(tabs[1])));
+        assert!(set.switch_to(tabs[0]));
+        assert_eq!(set.strip_active(), Some(0), "a shown tab is its own");
+        assert!(!set.active_is_parked());
+        assert!(set.switch_to(tabs[4]));
+        assert!(set.active_is_parked());
+        assert_eq!(set.active_index(), Some(4), "canonical stays canonical");
+        assert_eq!(set.strip_active(), Some(1), "the chip stands for it");
+        assert!(set.set_home(None));
+        assert_eq!(set.strip_active(), Some(2), "no home: the last shown");
+    }
+
+    #[test]
+    fn next_and_previous_walk_only_the_shown_tabs() {
+        let (mut set, store, tabs) = parked_set(3, 2);
+        assert!(set.set_home(Some(tabs[2])));
+        assert!(set.switch_to(tabs[0]));
+        assert_eq!(
+            set.cycle_shown(false),
+            Some(tabs[2]),
+            "wraps past the suffix"
+        );
+        assert_eq!(
+            set.cycle_shown(true),
+            Some(tabs[0]),
+            "wraps past the suffix"
+        );
+        assert_eq!(set.cycle_shown(true), Some(tabs[1]));
+        assert!(set.switch_to(tabs[3]));
+        assert_eq!(set.cycle_shown(true), Some(tabs[0]), "steps from home");
+        assert!(set.switch_to(tabs[4]));
+        assert_eq!(set.cycle_shown(false), Some(tabs[1]), "steps from home");
+        assert!(set.invariant_holds(&store));
+
+        let (mut one, _, only) = parked_set(1, 1);
+        assert!(one.set_home(Some(only[0])));
+        assert_eq!(
+            one.cycle_shown(true),
+            Some(only[0]),
+            "a parked tab goes home"
+        );
+        assert_eq!(one.cycle_shown(true), Some(only[0]), "and home stays");
+    }
+
+    #[test]
+    fn closing_never_hands_the_front_to_a_parked_tab_while_a_shown_one_stands() {
+        // The last shown tab closes: what follows it is parked, so the one before it takes over.
+        let (mut set, store, tabs) = parked_set(2, 2);
+        assert!(set.switch_to(tabs[1]));
+        assert!(set.remove(tabs[1]).is_some());
+        assert_eq!(set.active_id(), Some(tabs[0]));
+        assert!(set.invariant_holds(&store));
+
+        // A parked active tab closes: it lands on home, not its next sibling.
+        let (mut set, store, tabs) = parked_set(3, 3);
+        assert!(set.set_home(Some(tabs[1])));
+        assert!(set.switch_to(tabs[3]));
+        assert!(set.remove(tabs[3]).is_some());
+        assert_eq!(set.active_id(), Some(tabs[1]));
+        assert!(set.invariant_holds(&store));
+
+        // A parked tab closes behind the front: the front stays.
+        assert!(set.switch_to(tabs[0]));
+        assert!(set.remove(tabs[5]).is_some());
+        assert_eq!(set.active_id(), Some(tabs[0]));
+
+        // With no home the last shown tab takes it.
+        let (mut set, _store, tabs) = parked_set(2, 2);
+        assert!(set.switch_to(tabs[2]));
+        assert!(set.remove(tabs[2]).is_some());
+        assert_eq!(set.active_id(), Some(tabs[1]));
+
+        // Removing the home clears it, so no stale identity outlives the tab.
+        let (mut set, store, tabs) = parked_set(2, 1);
+        assert!(set.set_home(Some(tabs[1])));
+        assert!(set.remove(tabs[1]).is_some());
+        assert_eq!(set.home(), None);
+        assert!(set.invariant_holds(&store));
+
+        // Only parked tabs remain: one of them still takes the front, never nothing.
+        let (mut set, store, tabs) = parked_set(1, 2);
+        assert!(set.remove(tabs[0]).is_some());
+        assert!(set.active_is_parked());
+        assert!(set.invariant_holds(&store));
+    }
+
+    #[test]
+    fn a_move_never_crosses_the_boundary() {
+        let (mut set, store, tabs) = parked_set(3, 2);
+        assert!(!set.reorder(tabs[0], 3), "a shown tab stays shown");
+        assert!(!set.reorder(tabs[4], 2), "a parked tab stays parked");
+        assert_eq!(set.tabs()[0].id, tabs[0]);
+        assert!(set.reorder(tabs[0], 2), "within the shown tabs");
+        assert!(set.reorder(tabs[4], 3), "within the parked tabs");
+        assert!(set.invariant_holds(&store));
+        assert_eq!(set.shown_len(), 3);
+    }
+
+    #[test]
+    fn placing_a_tab_stops_at_the_boundary() {
+        let (mut set, store, tabs) = parked_set(3, 2);
+        assert_eq!(set.place(tabs[0], 4), Some(2), "a shown tab stays shown");
+        assert_eq!(set.tabs()[2].id, tabs[0]);
+        assert_eq!(set.place(tabs[4], 0), Some(3), "a parked tab stays parked");
+        assert_eq!(set.tabs()[3].id, tabs[4]);
+        assert!(set.invariant_holds(&store));
+    }
+
+    #[test]
+    fn unparking_makes_the_worker_the_last_shown_tab_and_keeps_the_front() {
+        let (mut set, store, tabs) = parked_set(2, 3);
+        assert!(set.switch_to(tabs[0]));
+        assert_eq!(set.unpark(tabs[3]), Some(2));
+        assert_eq!(set.tabs()[2].id, tabs[3]);
+        assert!(!set.tabs()[2].parked);
+        assert_eq!(set.shown_len(), 3);
+        assert_eq!(set.active_id(), Some(tabs[0]));
+        assert!(set.invariant_holds(&store));
+        assert_eq!(set.unpark(tabs[0]), None, "only a parked tab comes out");
+    }
+
+    #[test]
+    fn a_parked_tabs_chip_is_home_and_a_shown_tabs_is_its_own() {
+        let (mut set, _store, tabs) = parked_set(2, 1);
+        assert_eq!(set.chip_of(tabs[1]), Some(tabs[1]));
+        assert_eq!(
+            set.chip_of(tabs[2]),
+            None,
+            "no home yet: no chip stands for it"
+        );
+        assert!(set.set_home(Some(tabs[0])));
+        assert_eq!(set.chip_of(tabs[2]), Some(tabs[0]));
     }
 
     #[test]

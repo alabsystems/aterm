@@ -113,6 +113,10 @@ pub struct HandoverHold {
 }
 
 impl HandoverHold {
+    pub(super) fn state_lock(&self) -> &StateLock {
+        &self._lock
+    }
+
     /// Whether this holds the state at `paths`.
     #[must_use]
     pub fn holds(&self, paths: &Paths) -> bool {
@@ -167,7 +171,8 @@ fn handover_bundle_until(
     held: Option<&HandoverHold>,
 ) -> crate::Result<Bundle> {
     let none = || Error::new("this Mac holds no applied vault to hand a new Mac");
-    let _observation = match held.filter(|held| held.holds(paths)) {
+    let held = held.filter(|held| held.holds(paths));
+    let observation = match held {
         Some(_) => None,
         None => match StateLock::observe_until(paths, deadline)? {
             Some(observation) => Some(observation),
@@ -181,6 +186,10 @@ fn handover_bundle_until(
             None => return Err(none()),
         },
     };
+    let lock = held
+        .map(HandoverHold::state_lock)
+        .or(observation.as_ref())
+        .ok_or_else(none)?;
     let config = config(paths)?.ok_or_else(none)?;
     let pin = config.signer.ok_or_else(none)?;
     let Source::Url(url) = &config.source else {
@@ -198,28 +207,26 @@ fn handover_bundle_until(
         return Err(none());
     }
     let identity = read_identity(paths)?.ok_or_else(none)?;
-    if super::steward::local_recipient_denied_in_roster(paths) {
+    if super::steward::local_recipient_denied_in_roster_held(paths, lock) {
         return Err(none());
     }
-    if let Some(why) = super::admit::roster_keeps_out(paths, None, allowed.binding(), [0; 32]) {
+    if let Some(why) =
+        super::admit::roster_keeps_out(paths, None, allowed.binding(), [0; 32], Some(lock))?
+    {
         return Err(Error::new(why));
     }
     let joiner_rec = allowed.binding().recipient();
     let joiner_rec_str = joiner_rec.to_bech32();
-    if super::roster::swarm_roster(paths)
-        .ok()
-        .flatten()
-        .is_some_and(|r| {
-            r.member_by_recipient(&joiner_rec_str).is_none() && r.is_label_denied(allowed.name())
-        })
-    {
+    if super::roster::swarm_roster_held(paths, lock)?.is_some_and(|r| {
+        r.member_by_recipient(&joiner_rec_str).is_none() && r.is_label_denied(allowed.name())
+    }) {
         return Err(Error::new(
             "the vault removed this Mac, and an Allow does not let a removed Mac back in",
         ));
     }
     let check_log = |log: &crate::membership_log::Log| -> crate::Result<()> {
         let me = identity.recipient();
-        let roster = super::log_entries::local_swarm_roster_for_log(paths, log);
+        let roster = super::log_entries::local_swarm_roster_for_log_held(paths, log, lock)?;
         if log.recipient_is_removed(&me)
             || log.audience_left_out_recipient(&crate::membership_log::EpochAudience::Everyone, &me)
             || super::log_entries::recipient_denied_by_roster_or_log(roster.as_ref(), log, &me)
@@ -416,8 +423,6 @@ pub fn post_allowed(paths: &Paths, allowed: &Allowed) -> crate::Result<()> {
         host: allowed.name().to_owned(),
         code: super::join_code(&recipient),
         time: None,
-        lan: false,
-        home: None,
         allowed: Some(allowed.to_text()),
         proof: None,
     }

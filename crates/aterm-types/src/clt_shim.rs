@@ -2,25 +2,42 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The git-and-friends shim set a new Mac carries while Apple's Command Line Tools are missing
-//! (System State design §6.3).
+//! The git-and-friends shim set a Mac carries from aterm's first launch until Apple's Command Line
+//! Tools exist (System State design §6.3).
 //!
 //! Before the tools are installed, `/usr/bin/git`, `/usr/bin/cc`, `/usr/bin/clang`,
 //! `/usr/bin/make`, `/usr/bin/python3` and the rest are Apple's `xcode-select` install stubs:
-//! running any of them raises macOS's "install the command line developer tools?" dialog. A new
-//! Mac's setup is already installing those tools (`base.clt`), so a shell that runs `git` should
-//! say so and exit, not raise a second dialog. aterm puts a shim directory ahead of `/usr/bin` in
-//! the shells it spawns while the tools are missing; each entry is a symlink onto the one `aterm`
-//! binary, dispatched by its `argv[0]` to [`crate::clt_shim`]: while the tools install it prints
-//! one line and exits at once (never raising the dialog); once the tools are present it hands the
-//! call to Apple's own `/usr/bin/<tool>` (which then sets the SDK and raises no dialog) for a tool
-//! they carry ([`carried`]); and it hands the call there too once nothing installs them (a
-//! person's Stop). New tabs stop getting the directory on their PATH the moment nothing wants
-//! it; the directory itself stays until the next launch, for the shells that still have it.
+//! running any of them raises macOS's "install the command line developer tools?" dialog. aterm
+//! installs those tools itself, so nothing it starts may raise that dialog. Two layers keep it
+//! away while they are missing, each ending in the one `aterm` binary, dispatched by its
+//! `argv[0]` to [`crate::clt_shim`]:
 //!
-//! This module is the pure model shared by the dispatch (`aterm-cli`) and the shells' PATH
-//! (`aterm-gui`): the names to shim and the one line each prints. The dispatch itself, the
-//! presence probe and the `exec` live where they can reach the process and the filesystem.
+//! - PATH: a shim directory ahead of `/usr/bin` in the shells aterm spawns, a symlink per tool.
+//! - `DEVELOPER_DIR` ([`developer_dir`], set by [`developer_dir_move`] in every aterm process):
+//!   on macOS 26.6 with the tools installed, Apple's stubs hand a call to
+//!   `$DEVELOPER_DIR/usr/bin/xcrun <tool> <args>` when the variable names a directory holding
+//!   one, and fail plainly (`missing DEVELOPER_DIR path`, exit 1) when it names none. That the
+//!   stubs do the same on a Mac whose tools are missing, rather than raise their dialog first, is
+//!   not measured here: only a guest without them (`lab mac --no-clt`) can show it. Where it holds,
+//!   a process that inherits the variable is covered whatever its PATH says: a login shell's
+//!   `path_helper`, an agent's tool shell whose PATH was frozen by a snapshot, and a program that
+//!   runs `/usr/bin/git` by its absolute path.
+//!
+//! What neither layer reaches, as traced: a process with no aterm process among its ancestors
+//! (an app Finder, the Dock or Spotlight opened, one an aterm shell started with `open`, which
+//! Launch Services starts from launchd, a launchd agent or daemon, a login item, another
+//! terminal app and every shell in it), a process that empties its environment (`env -i`,
+//! `sudo`'s default `env_reset`), one running as root (the process start names nothing for root),
+//! and one that sets its own `DEVELOPER_DIR`. Any of them that runs `git` or another stub while
+//! the tools are missing can still raise Apple's dialog.
+//!
+//! With the tools missing a shim prints one line and exits at once, and it never runs Apple's
+//! stub. Once they are present it hands the call to Apple's own `/usr/bin/<tool>` (which then sets
+//! the SDK and raises no dialog) for a tool they carry ([`carried`]).
+//!
+//! This module is the pure model shared by the dispatch (`aterm-cli`), the process start
+//! (`aterm`) and the shells' PATH (`aterm-gui`): the names to shim and the one line each prints.
+//! The dispatch itself and the `exec` live where they can reach the process.
 
 /// The exit a shim returns after it prints its one line, with the tools missing: `EX_UNAVAILABLE`
 /// (the tool it stands in for is not here yet), chosen so a build that runs `cc` stops cleanly
@@ -157,13 +174,45 @@ pub fn runtime_tools(exists: impl Fn(&str) -> bool) -> Vec<&'static str> {
         .collect()
 }
 
-/// The one line a shim prints to its standard error with the tools missing, naming the tool a
-/// person ran and that it arrives with the install already under way.
+/// The one line a shim prints to its standard error with the tools missing and an install of them
+/// under way ([`installing_mark`]), naming the tool a person ran.
 #[must_use]
 pub fn arrival_line(tool: &str) -> String {
     format!(
         "{tool} arrives with Apple's Command Line Tools, installing: about {INSTALL_ETA_MINUTES} min"
     )
+}
+
+/// The one line a shim prints to its standard error with the tools missing and nothing installing
+/// them now (a person's Stop, an install that ended unfinished, an account that may not install
+/// them): the call fails plainly, and the line says who can install them, System State's
+/// Install… for an account that `may_install` them (one of the Mac's administrators), an
+/// administrator for one that may not, whose System State offers no Install….
+#[must_use]
+pub fn missing_line(tool: &str, may_install: bool) -> String {
+    if may_install {
+        format!(
+            "{tool} needs Apple's Command Line Tools, which are not installed: Install\u{2026} on System State adds them"
+        )
+    } else {
+        format!(
+            "{tool} needs Apple's Command Line Tools, which are not installed: only an administrator of this Mac can install them"
+        )
+    }
+}
+
+/// The tool a call to the shim named `shim` is for, for its one line: `xcrun`'s own first word
+/// when that names a tool (as Apple's stubs call `$DEVELOPER_DIR/usr/bin/xcrun git --version`),
+/// else `shim`.
+#[must_use]
+pub fn called_tool<'a>(shim: &'a str, rest: &'a [std::ffi::OsString]) -> &'a str {
+    if shim != "xcrun" {
+        return shim;
+    }
+    rest.first()
+        .and_then(|word| word.to_str())
+        .filter(|word| !word.is_empty() && !word.starts_with('-') && !word.contains('/'))
+        .unwrap_or(shim)
 }
 
 /// The one line a shim prints, with the tools installed, for a name they do not carry (Apple's
@@ -196,33 +245,107 @@ pub const DEFAULT_TOOLCHAIN_BIN: &str = "Toolchains/XcodeDefault.xctoolchain/usr
 /// `path_helper` puts `/usr/bin` in front of it.
 pub const SHIM_ENV: &str = "ATERM_CLT_SHIM";
 
+/// The variable Apple's stubs read before anything else on this Mac: the developer directory.
+pub const DEVELOPER_DIR_ENV: &str = "DEVELOPER_DIR";
+
 /// The shim directory under this account's state home (the `ATERM_STATE_HOME` dev seam, or a
 /// test binary's own root, isolates it), or `None` where there is no state home to anchor it to.
-/// The window lays it, and a launch removes one an earlier launch left, unless it adopted live
-/// shells that may still run through it; a shim strips it from the PATH it hands the real tool.
+/// The window lays it, and a launch removes one an earlier launch left once the tools exist,
+/// unless it adopted live shells that may still run through it; a shim strips it from the PATH
+/// it hands the real tool.
 #[must_use]
 pub fn shim_dir() -> Option<std::path::PathBuf> {
     crate::dirs::state_dir().map(|dir| dir.join("clt-shim"))
 }
 
+/// The directory a process's `DEVELOPER_DIR` names while the tools are missing, inside the shim
+/// directory `shim`. It holds `usr/bin/xcrun` alone, a link onto `aterm`: Apple's stubs refuse a
+/// directory without one (`invalid DEVELOPER_DIR path … missing xcrun`, a plain error and no
+/// dialog, which is also what a process gets before the window laid it), and it holds no `git`,
+/// so [`developer_tool`] never reads it as the tools.
+#[must_use]
+pub fn developer_dir(shim: &std::path::Path) -> std::path::PathBuf {
+    shim.join("developer")
+}
+
+/// Where [`developer_dir`] keeps its programs, under it.
+pub const DEVELOPER_DIR_BIN: &str = "usr/bin";
+
+/// Whether `dir` is a [`developer_dir`], whichever account's state home it sits under: a shell
+/// that changed `HOME` still hands on the one it inherited.
+#[must_use]
+pub fn is_shim_developer_dir(dir: &std::path::Path) -> bool {
+    dir.file_name() == Some(std::ffi::OsStr::new("developer"))
+        && dir.parent().and_then(std::path::Path::file_name)
+            == Some(std::ffi::OsStr::new("clt-shim"))
+}
+
+/// The shim directory a program that ran from `dir` belongs to: `dir` itself, or, for a program in
+/// its [`developer_dir`]'s `usr/bin`, the directory above that.
+#[must_use]
+pub fn shim_of_program_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.ancestors()
+        .nth(2)
+        .filter(|developer| {
+            is_shim_developer_dir(developer) && developer.join(DEVELOPER_DIR_BIN) == dir
+        })
+        .and_then(std::path::Path::parent)
+        .unwrap_or(dir)
+        .to_owned()
+}
+
+/// What a process start does to its own `DEVELOPER_DIR`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeveloperDirMove {
+    /// Leave it: a person's own choice, or nothing to do.
+    Keep,
+    /// The tools are missing: name this [`developer_dir`], for this process and all it starts.
+    Set(std::path::PathBuf),
+    /// The tools arrived: an inherited [`developer_dir`] goes.
+    Clear,
+}
+
+/// [`DeveloperDirMove`] for a process whose `DEVELOPER_DIR` is `current`, with the tools `present`,
+/// this account's shim directory `shim`, and `root` when it runs as root (which `sudo` gave a
+/// clean environment, and whose state home is not the person's). Empty reads as unset, as Apple's
+/// stubs read it (measured on macOS 26.6).
+#[must_use]
+pub fn developer_dir_move(
+    current: Option<&std::ffi::OsStr>,
+    present: bool,
+    shim: Option<&std::path::Path>,
+    root: bool,
+) -> DeveloperDirMove {
+    let current = current.filter(|value| !value.is_empty());
+    match current {
+        Some(value) => {
+            if present && is_shim_developer_dir(std::path::Path::new(value)) {
+                DeveloperDirMove::Clear
+            } else {
+                DeveloperDirMove::Keep
+            }
+        }
+        None if present || root => DeveloperDirMove::Keep,
+        None => shim.map_or(DeveloperDirMove::Keep, |shim| {
+            DeveloperDirMove::Set(developer_dir(shim))
+        }),
+    }
+}
+
 /// The mark beside the shim directory `shim` (`clt-shim.wanted`) that the window keeps exactly
-/// while it is installing the Command Line Tools: a setup pass wants them, they are missing,
-/// this account may install them, and no install of them ended unfinished since one last
-/// started. With it, a new shell gets the shim on its PATH, each integration keeps it there, and
-/// a shim says the tools are on their way; without it, a shell that still has the directory on
-/// its PATH (it stays until the next launch) reaches a shim that hands the call to Apple's own
-/// `/usr/bin/<tool>`: the tools' own once they are there, Apple's route while nothing installs
-/// them.
+/// while the tools are missing: with it, a new shell gets the shim on its PATH and each
+/// integration keeps it there.
 #[must_use]
 pub fn wanted_mark(shim: &std::path::Path) -> std::path::PathBuf {
     shim.with_extension("wanted")
 }
 
-/// Whether the window is installing the Command Line Tools now: this account's shim directory
-/// carries its [`wanted_mark`].
+/// The mark beside the shim directory `shim` (`clt-shim.installing`) that the window keeps while
+/// an install of the tools is on its way: a shim's one line says so ([`arrival_line`]), or that
+/// they are missing ([`missing_line`]) without it.
 #[must_use]
-pub fn shim_wanted() -> bool {
-    shim_dir().is_some_and(|dir| wanted_mark(&dir).is_file())
+pub fn installing_mark(shim: &std::path::Path) -> std::path::PathBuf {
+    shim.with_extension("installing")
 }
 
 /// The developer directories a call to `<tool>` is served from, in the order `xcode-select -p`
@@ -528,11 +651,112 @@ mod tests {
     }
 
     #[test]
-    fn the_wanted_mark_sits_beside_the_shim_directory() {
+    fn the_marks_sit_beside_the_shim_directory() {
+        let shim = std::path::Path::new("/state/aterm/clt-shim");
         assert_eq!(
-            wanted_mark(std::path::Path::new("/state/aterm/clt-shim")),
+            wanted_mark(shim),
             std::path::PathBuf::from("/state/aterm/clt-shim.wanted")
         );
+        assert_eq!(
+            installing_mark(shim),
+            std::path::PathBuf::from("/state/aterm/clt-shim.installing")
+        );
+    }
+
+    /// A process with the tools missing names the shim's developer directory for all it starts,
+    /// over an empty value too. Its own choice stands, and root's state home is not the person's.
+    /// Once the tools exist an inherited one goes.
+    /// NEGATIVE CONTROL: with the tools present nothing is set, and a person's own stays.
+    #[test]
+    fn a_process_names_the_shims_developer_dir_only_while_the_tools_are_missing() {
+        use std::ffi::OsStr;
+        use std::path::{Path, PathBuf};
+        let shim = Some(Path::new("/state/clt-shim"));
+        let ours = PathBuf::from("/state/clt-shim/developer");
+        let set = DeveloperDirMove::Set(ours.clone());
+        assert_eq!(developer_dir_move(None, false, shim, false), set);
+        assert_eq!(
+            developer_dir_move(Some(OsStr::new("")), false, shim, false),
+            set
+        );
+        assert_eq!(
+            developer_dir_move(None, false, shim, true),
+            DeveloperDirMove::Keep
+        );
+        assert_eq!(
+            developer_dir_move(None, false, None, false),
+            DeveloperDirMove::Keep
+        );
+        let own = OsStr::new("/Applications/Xcode-beta.app/Contents/Developer");
+        for present in [false, true] {
+            assert_eq!(
+                developer_dir_move(Some(own), present, shim, false),
+                DeveloperDirMove::Keep
+            );
+        }
+        assert_eq!(
+            developer_dir_move(None, true, shim, false),
+            DeveloperDirMove::Keep
+        );
+        assert_eq!(
+            developer_dir_move(Some(ours.as_os_str()), false, shim, false),
+            DeveloperDirMove::Keep
+        );
+        assert_eq!(
+            developer_dir_move(Some(ours.as_os_str()), true, shim, false),
+            DeveloperDirMove::Clear
+        );
+        assert_eq!(
+            developer_dir_move(
+                Some(OsStr::new("/elsewhere/clt-shim/developer")),
+                true,
+                shim,
+                false
+            ),
+            DeveloperDirMove::Clear,
+            "another state home's, inherited through a changed HOME"
+        );
+    }
+
+    /// Its developer directory never reads as the tools: `$DEVELOPER_DIR` comes first among the
+    /// directories, and it holds `xcrun` alone.
+    #[test]
+    fn the_shims_developer_dir_never_reads_as_the_tools() {
+        use std::path::Path;
+        let ours = developer_dir(Path::new("/state/clt-shim"));
+        let xcrun = ours.join(DEVELOPER_DIR_BIN).join("xcrun");
+        let dirs = developer_dirs(Some(&ours), None);
+        assert_eq!(dirs[0], ours);
+        assert_eq!(developer_tool_in("git", &dirs, |path| path == xcrun), None);
+        let tools = Path::new(CLT_DIR).join("usr/bin/git");
+        assert_eq!(
+            developer_tool_in("git", &dirs, |path| path == tools),
+            Some(tools.clone()),
+            "the tools themselves still read as present"
+        );
+    }
+
+    #[test]
+    fn a_program_in_the_developer_dir_belongs_to_the_shim_above_it() {
+        use std::path::{Path, PathBuf};
+        assert_eq!(
+            shim_of_program_dir(Path::new("/s/clt-shim/developer/usr/bin")),
+            PathBuf::from("/s/clt-shim")
+        );
+        for dir in ["/s/clt-shim", "/s/other/developer/usr/bin", "/usr/bin"] {
+            assert_eq!(shim_of_program_dir(Path::new(dir)), PathBuf::from(dir));
+        }
+    }
+
+    #[test]
+    fn the_called_tool_is_xcruns_first_word_when_that_names_one() {
+        use std::ffi::OsString;
+        let words = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(called_tool("xcrun", &words(&["git", "--version"])), "git");
+        for rest in [&["--show-sdk-path"][..], &[], &["/bin/x"], &[""]] {
+            assert_eq!(called_tool("xcrun", &words(rest)), "xcrun");
+        }
+        assert_eq!(called_tool("git", &words(&["status"])), "git");
     }
 
     #[test]
@@ -556,6 +780,29 @@ mod tests {
         let line = absent_line("pagestuff");
         assert!(line.starts_with("pagestuff is not part of Apple's Command Line Tools"));
         assert!(!line.contains("xcode-select") && !line.contains('`'));
+    }
+
+    #[test]
+    fn the_missing_line_names_the_tool_and_says_no_install_runs() {
+        for may_install in [true, false] {
+            let line = missing_line("git", may_install);
+            assert!(line.starts_with("git needs Apple's Command Line Tools"));
+            assert!(!line.contains("installing") && !line.contains("xcode-select"));
+        }
+    }
+
+    /// An administrator is pointed at Install…; an account that may not install the tools, whose
+    /// System State has no Install…, is told who can.
+    /// NEGATIVE CONTROL: the administrator's line names Install….
+    #[test]
+    fn the_missing_line_offers_install_only_to_an_account_that_may_install() {
+        assert!(missing_line("git", true).contains("Install\u{2026} on System State"));
+        let standard = missing_line("git", false);
+        assert!(!standard.contains("Install\u{2026}"), "{standard}");
+        assert!(
+            standard.contains("only an administrator of this Mac"),
+            "{standard}"
+        );
     }
 
     #[test]

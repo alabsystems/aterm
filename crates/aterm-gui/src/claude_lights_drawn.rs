@@ -49,6 +49,7 @@ pub(crate) const fn face_word(face: ChipFace) -> &'static str {
         ChipFace::Land => "land",
         ChipFace::Landed => "landed",
         ChipFace::Theirs => "theirs",
+        ChipFace::Failed => "failed",
         ChipFace::Off => "off",
         ChipFace::MasterOff => "master-off",
         ChipFace::AgentOff(_) => "agent-off",

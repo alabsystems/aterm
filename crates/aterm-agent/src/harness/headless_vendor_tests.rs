@@ -486,7 +486,7 @@ fn a_vendor_mailbox_read_takes_only_the_vendors_mail_sent_after_the_sign_in_bega
         poll_mailbox_config_for_credential(
             &plain,
             Some("kimi-one@example.com"),
-            Duration::from_millis(300)
+            aterm_spec::wait::MUST_HAPPEN
         ),
         Ok(MailboxCredential::Otp("482913".to_owned()))
     );
@@ -524,7 +524,7 @@ fn a_vendor_mailbox_read_takes_only_the_vendors_mail_sent_after_the_sign_in_bega
         poll_mailbox_config_for_credential(
             &fresh,
             Some("kimi-one@example.com"),
-            Duration::from_millis(300)
+            aterm_spec::wait::MUST_HAPPEN
         ),
         Ok(MailboxCredential::Otp("615204".to_owned())),
         "Kimi's own mail, sent after the start, is taken"
@@ -2248,8 +2248,9 @@ fn a_page_that_stalls_ends_the_drive_needs_sign_in() {
 }
 
 /// The APPROVER opens nothing on a profile another of aterm's launches holds (a headless shell
-/// writes no `SingletonLock`): it stops `NeedsYou`, naming that holder by its pid, before it looks
-/// for a browser. CONTROL: once that launch ends, the profile is free to claim.
+/// writes no `SingletonLock`): it stops `NotRun`, naming that holder by its pid without asking for
+/// a person, before it looks for a browser. CONTROL: once that launch ends, the profile is free to
+/// claim.
 #[cfg(unix)]
 #[test]
 fn the_approver_opens_nothing_on_a_profile_another_launch_holds() {
@@ -2275,7 +2276,7 @@ fn the_approver_opens_nothing_on_a_profile_another_launch_holds() {
         deadline: Instant::now() + Duration::from_secs(60),
     };
     match approver.approve(&handoff) {
-        Approval::NeedsYou(why) => assert!(
+        Approval::NotRun(why) => assert!(
             why.contains("in use by another of aterm's sign-ins (pid")
                 && why.contains(&std::process::id().to_string()),
             "{why}"
@@ -2286,6 +2287,117 @@ fn the_approver_opens_nothing_on_a_profile_another_launch_holds() {
     assert!(
         ProfileLock::claim(&profile).is_ok(),
         "CONTROL: free once released"
+    );
+}
+
+/// Browser preparation must not fetch or launch after the CLI exits or the
+/// sign-in deadline expires, even when no browser has been installed.
+#[cfg(unix)]
+#[test]
+fn vendor_browser_preparation_obeys_the_login_lifetime() {
+    use super::super::accounts::Cli;
+    use super::super::login_drive::{Approval, Approver as _, Handoff};
+
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let shared = tmp.path().join("accounts");
+    for finished in [false, true] {
+        let mut approver = VendorApprover::new(
+            Cli::Codex,
+            "codex-one",
+            Some("codex-one@example.com"),
+            &shared,
+            Some(&home),
+        );
+        let handoff = Handoff {
+            url: "https://auth.openai.com/authorize",
+            code: None,
+            completion: Completion::Loopback,
+            hosts: &["auth.openai.com"],
+            email: Some("codex-one@example.com"),
+            finished: &|| finished,
+            deadline: if finished {
+                Instant::now() + Duration::from_secs(60)
+            } else {
+                Instant::now()
+            },
+        };
+        assert_eq!(
+            approver.approve(&handoff),
+            Approval::NotRun(format!(
+                "headless browser preparation stopped: {}",
+                super::super::headless_fetch::STOPPED
+            ))
+        );
+        assert!(
+            !home.exists(),
+            "a stopped login must not create a browser cache"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn vendor_aterm_profile_contention_and_spawn_failure_report_not_run_while_external_lock_needs_person()
+ {
+    use super::super::accounts::Cli;
+    use super::super::browser_window::ProfileLock;
+    use super::super::login_drive::{Approval, Approver as _, Handoff};
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let shared = tmp.path().join("accounts");
+    let mut approver = VendorApprover::new(
+        Cli::Codex,
+        "codex-one",
+        Some("codex-one@example.invalid"),
+        &shared,
+        Some(&home),
+    );
+    let handoff = Handoff {
+        url: "https://auth.openai.com/authorize",
+        code: None,
+        completion: Completion::Loopback,
+        hosts: &["auth.openai.com"],
+        email: Some("codex-one@example.invalid"),
+        finished: &|| false,
+        deadline: Instant::now() + Duration::from_secs(60),
+    };
+    let profile_dir = approver.profile_dir(handoff.email);
+    std::fs::create_dir_all(&profile_dir).unwrap();
+
+    // 1. Concurrent aterm sign-in holding `ProfileLock` -> `Approval::NotRun` (never `NeedsYou`).
+    let held = ProfileLock::claim(&profile_dir).unwrap();
+    match approver.approve(&handoff) {
+        Approval::NotRun(why) => {
+            assert!(
+                why.contains("in use by another of aterm's sign-ins"),
+                "{why}"
+            );
+        }
+        other => panic!("expected Approval::NotRun on aterm profile contention, got {other:?}"),
+    }
+    drop(held);
+
+    // 2. Negative control: external `SingletonLock` on another host still needs a person (`NeedsYou`).
+    std::os::unix::fs::symlink("other-desk.example-4242", profile_dir.join("SingletonLock"))
+        .unwrap();
+    match approver.approve(&handoff) {
+        Approval::NeedsYou(why) => {
+            assert!(why.contains("SingletonLock"), "{why}");
+        }
+        other => panic!("expected Approval::NeedsYou on external SingletonLock, got {other:?}"),
+    }
+    std::fs::remove_file(profile_dir.join("SingletonLock")).unwrap();
+
+    // 3. Browser spawn failure -> `Approval::NotRun` (never `NeedsYou`).
+    let missing_browser = HeadlessBrowser {
+        path: tmp.path().join("missing-headless-shell"),
+        is_headless_shell: true,
+    };
+    let bound = FlowBound::of(handoff.url).unwrap();
+    assert_eq!(
+        approver.approve_in_profile(&handoff, &bound, &profile_dir, &missing_browser),
+        Approval::NotRun("could not spawn headless browser".to_owned()),
     );
 }
 
@@ -2759,7 +2871,7 @@ fn plus_addressed_mail_with_base_delivered_to_and_json_vendor_filters() {
         poll_mailbox_config_for_credential(
             &cfg,
             Some("owner+2@example.com"),
-            Duration::from_millis(50)
+            aterm_spec::wait::MUST_HAPPEN
         ),
         Ok(MailboxCredential::Otp("918273".to_owned())),
         "owner+2@example.com receives its own mail with RFC 2047 From and ISO-8601 Date"

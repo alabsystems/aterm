@@ -18,10 +18,13 @@ the specs are proved.
 Result: **86 specs**, covering **385 tests**. **27 tests are not spec samples** (§4): 2 to delete, 25 to
 move to a bench.
 
-Outside that count: `tests/vt_oracle` (8 tests, added after the recount) is the differential VT oracle
+Outside that count: `tests/vt_oracle` (added after the recount) is the differential VT oracle
 against astream-term's independent fold. It samples no single spec; it compares two engines over a corpus,
-width resizes and seeded random programs, holds the cases the pinned fold cannot judge to written xterm answers,
-and checks its own comparisons, so it stays a test when the specs above are proved. Two things are kept out,
+width resizes and seeded random programs, holds the cases the pinned fold cannot judge to written xterm answers, holds every
+spelling of SGR 38, 48 and 58 on both engines to written answers (from ITU T.416 and xterm where those two agree on 38 and 48;
+`colours.rs` names where the answer is this rule's choice, every 58 answer among them),
+and checks its own comparisons, so it stays a test when the specs above are proved. The differential comparison cannot see
+58's colour, since the fold has no underline colour: only aterm's written answers hold it. Two things are kept out,
 because the fold, with no reflow, carries them by other rules: a resize that aterm's main-screen rewrap moves
 text or a row in, and the restore (DECRC, `?1049l`) of a cursor slot saved before a resize, which aterm
 moves with the text it was saved on; aterm-core's `resize_keeps_the_next_write` and

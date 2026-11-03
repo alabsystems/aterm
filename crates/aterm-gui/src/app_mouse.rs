@@ -2876,7 +2876,11 @@ impl App {
             return;
         }
         let mut stepped = false;
-        for _ in 0..self.windows.get(&wid).map_or(0, |ws| ws.tab_set.len()) {
+        for _ in 0..self
+            .windows
+            .get(&wid)
+            .map_or(0, |ws| ws.tab_set.shown_len())
+        {
             let Some((from, to)) = self.strip_drag_step(wid, drag.tab, col) else {
                 break;
             };
@@ -2924,7 +2928,7 @@ impl App {
             return Some((from, from - 1));
         }
         let held = segment(from)?;
-        let tabs = ws.tab_set.len();
+        let tabs = ws.tab_set.shown_len();
         if from + 1 < tabs && segment(from + 1).is_none() && col >= held.end_col {
             return Some((from, from + 1));
         }

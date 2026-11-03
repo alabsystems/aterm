@@ -279,7 +279,8 @@ impl Glance {
                 word(line, "count")
                     .and_then(|n| n.parse::<usize>().ok())
                     .is_some_and(|n| {
-                        n == strip.len() && tooltips(line).is_some_and(|tips| tips.len() == n)
+                        n == line_tabs(line, 0).len()
+                            && tooltips(line).is_some_and(|tips| tips.len() == n)
                     })
             });
         let page = page_rows(page);
@@ -309,6 +310,12 @@ pub struct StripTab {
 }
 
 impl StripTab {
+    /// The one-based number the control `tab` verb takes for this strip entry.
+    #[must_use]
+    fn control_number(&self) -> String {
+        (self.index + 1).to_string()
+    }
+
     /// Formats `index=<i> selected=<0|1> states=<a,b|->`.
     #[must_use]
     pub fn words(&self) -> String {
@@ -456,12 +463,35 @@ fn lists(s: &str) -> Option<Vec<Vec<String>>> {
     }
 }
 
-/// Parses the front window's tab strip entries from `chrome`.
+/// Parses the front window's tabs from `chrome`: the strip's, then the workers parked behind it
+/// (`toolbar-workers`, `docs/DESIGN-workers-tab-2026-11-02.md`), so `index` is always the
+/// canonical index `tab <index>` selects.
 #[must_use]
 pub fn strip_tabs(chrome: &str) -> Vec<StripTab> {
     let Some(line) = chrome.lines().find(|l| l.starts_with("toolbar-tabs ")) else {
         return Vec::new();
     };
+    let mut tabs = line_tabs(line, 0);
+    let Some(line) = chrome.lines().find(|l| l.starts_with("toolbar-workers ")) else {
+        return tabs;
+    };
+    let first = word(line, "first")
+        .and_then(|w| w.parse::<usize>().ok())
+        .unwrap_or(tabs.len());
+    let parked = line_tabs(line, first);
+    // While a worker shows, the strip selects the chip that stands for it; the worker is the tab
+    // that is selected.
+    if parked.iter().any(|tab| tab.selected) {
+        for tab in &mut tabs {
+            tab.selected = false;
+        }
+    }
+    tabs.extend(parked);
+    tabs
+}
+
+/// The tabs one chrome line lists, the first at canonical index `first`.
+fn line_tabs(line: &str, first: usize) -> Vec<StripTab> {
     let selected = word(line, "selected").and_then(|w| w.parse::<usize>().ok());
     let after = |key: &str| line.find(key).map(|i| &line[i + key.len()..]);
     let labels = after(" labels=")
@@ -473,12 +503,12 @@ pub fn strip_tabs(chrome: &str) -> Vec<StripTab> {
     labels
         .into_iter()
         .enumerate()
-        .map(|(index, label)| StripTab {
-            index,
+        .map(|(at, label)| StripTab {
+            index: first + at,
             label: team_unmarked(&label).to_string(),
-            selected: selected == Some(index),
-            states: states.get(index).cloned().unwrap_or_default(),
-            tip: tips.get(index).cloned().flatten(),
+            selected: selected == Some(first + at),
+            states: states.get(at).cloned().unwrap_or_default(),
+            tip: tips.get(at).cloned().flatten(),
         })
         .collect()
 }
@@ -850,9 +880,10 @@ pub fn chip(line: &str) -> Chip {
     }
 }
 
-/// Full-width drawn cell text expected for `face`.
+/// `face` in words, as a line that names its mode writes it (`⤓ land`, `○ off`): codex-alab's
+/// own Autopilot line (`codex_alab_proof::SAYS_ITS_MODE`).
 #[must_use]
-pub fn face_cells(face: &str) -> Option<&'static str> {
+pub fn face_words(face: &str) -> Option<&'static str> {
     Some(match face {
         "cruise" => "\u{221e}",
         "cruise-until" => "\u{221e} \u{2913}",
@@ -865,7 +896,20 @@ pub fn face_cells(face: &str) -> Option<&'static str> {
     })
 }
 
-/// Whether `c`'s drawn cells match its face.
+/// Full-width drawn cell text expected for aterm's chip at rest under `face`: a mode a click
+/// cycles through is its glyph alone (`∞`, `⤓`, `○`). A lab run never clicks the chip, so the
+/// name a click brings up for a moment (`⤓ land`) is never its face: a name that stands is a
+/// fault.
+#[must_use]
+pub fn face_cells(face: &str) -> Option<&'static str> {
+    Some(match face {
+        "land" => "\u{2913}",
+        "off" => "\u{25cb}",
+        _ => return face_words(face),
+    })
+}
+
+/// Whether `c`'s drawn cells match its face at rest ([`face_cells`]).
 #[must_use]
 pub fn drawn_is_face(c: &Chip) -> bool {
     match (face_cells(&c.face), &c.drawn) {
@@ -2334,7 +2378,7 @@ fn read_did(door: &Door<'_>, desk: &Desk) -> Result<DidRead, Fail> {
     let back = strip_tabs(&door.out(&["chrome"]))
         .into_iter()
         .find(|t| t.selected)
-        .map(|t| t.index.to_string());
+        .map(|t| t.control_number());
     let opened = door.out(&["open", "app", "settings", "/harness"]);
     let tabs = || door.out(&["inspect", "app/v1", "tabs"]);
     let mut view = None;
@@ -3568,8 +3612,7 @@ fn in_front(door: &Door<'_>, tab: &Tab) -> Option<(String, Result<String, String
     let i = strip_tabs(&door.out(&["chrome"]))
         .into_iter()
         .find(|t| t.label == *label)?
-        .index
-        .to_string();
+        .control_number();
     let r = door.out(&["tab", &i]);
     let _ = on(door, &tab.sid, &["image", FRONT_IMAGE]);
     let line = autopilot_line(door, &tab.sid);
@@ -3639,10 +3682,10 @@ pub(super) fn opening_sweep(
             .into_iter()
             .find(|t| t.label == label)
     {
-        let r = door.out(&["tab", &i.index.to_string()]);
+        let r = door.out(&["tab", &i.control_number()]);
         println!(
             "  opening   {label} back in front (tab {}: {})",
-            i.index,
+            i.index + 1,
             r.trim()
         );
     }
@@ -4226,7 +4269,7 @@ pub(super) fn end_steps(
         strip_tabs(&door.out(&["chrome"]))
             .into_iter()
             .find(|t| t.label == label)
-            .map(|t| t.index.to_string())
+            .map(|t| t.control_number())
     };
     for tab in tabs.iter_mut() {
         let label = tab.seen.window.label.clone();

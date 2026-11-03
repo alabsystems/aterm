@@ -262,7 +262,9 @@ impl Tree {
     pub fn name(&self, id: DirId) -> &[u8] {
         self.get(id).map_or(&[][..], |r| {
             let at = r.name_at as usize;
-            self.names.get(at..at + r.name_len as usize).unwrap_or(&[])
+            at.checked_add(r.name_len as usize)
+                .and_then(|end| self.names.get(at..end))
+                .unwrap_or(&[])
         })
     }
 
@@ -542,5 +544,17 @@ mod tests {
                 .sentence()
                 .contains("huge directory: slow for anything that lists it")
         );
+    }
+
+    /// Out-of-bounds or wrapping `(name_at, name_len)` spans return an empty slice without panicking.
+    /// NEGATIVE CONTROL: unchecked `at + len` overflows on 32-bit targets when `name_at == u32::MAX`.
+    #[test]
+    fn name_handles_wrapping_offsets_without_panicking() {
+        let mut t = Tree::new(PathBuf::from("/w"), 1);
+        let child = t.push_child(DirId::ROOT, b"ok", 2);
+        assert_eq!(t.name(child), b"ok");
+        t.rec_mut(child).name_at = u32::MAX;
+        t.rec_mut(child).name_len = u32::MAX;
+        assert_eq!(t.name(child), b"");
     }
 }

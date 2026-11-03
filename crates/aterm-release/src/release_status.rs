@@ -3,18 +3,141 @@
 
 //! Read-only release progress, including failures emitted before verification ends.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 
+const MAX_OPEN_STAGES: usize = 256;
+
 use crate::ledger::{Error, GitCli};
+
+struct OpenStage {
+    title: String,
+    started_at_unix_ms: Option<u64>,
+}
 
 #[derive(Default)]
 struct Events {
     first_failure: Option<aterm_json::Value>,
     latest: Option<aterm_json::Value>,
+    latest_release_stage: Option<aterm_json::Value>,
     count: u64,
     rejected_lines: u64,
     incomplete_tail: bool,
+    stage_activity_observed: bool,
+    open_stages: BTreeMap<u64, OpenStage>,
+}
+
+fn valid_stage_title(title: &str) -> bool {
+    !title.is_empty() && title.len() <= 4096 && !title.chars().any(char::is_control)
+}
+
+impl Events {
+    fn observe_failure(&mut self, event: &aterm_json::Value) {
+        if self.first_failure.is_none() && failed(event) {
+            self.first_failure = Some(event.clone());
+        }
+        let Some(first) = self.first_failure.as_mut() else {
+            return;
+        };
+        if first["event"].as_str() != Some("test-case-failed")
+            || first["binary_completed"].as_bool() != Some(false)
+            || event["event"].as_str() != Some("test-binary-finished")
+        {
+            return;
+        }
+        let Some(test) = first["test"].as_str().filter(|test| !test.is_empty()) else {
+            return;
+        };
+        if event["test"].as_str() != Some(test) {
+            return;
+        }
+        // Keep the first case and its observation time. Completion enriches that
+        // failure rather than replacing it with a later success or another case.
+        let fields = first.as_object_mut().expect("a failure event is an object");
+        if let Some(detail) = fields.get("detail").cloned() {
+            fields.insert("initial_detail".into(), detail);
+        }
+        fields.insert("binary_completed".into(), true.into());
+        fields.insert("binary_result".into(), event.clone());
+        fields.insert(
+            "detail".into(),
+            "test binary finished; binary_result records its final outcome and failure details"
+                .into(),
+        );
+    }
+
+    fn observe_stage(&mut self, event: &aterm_json::Value) -> bool {
+        let started = event["event"].as_str() == Some("stage-started");
+        let finished = event["event"].as_str() == Some("stage-finished");
+        if !started && !finished {
+            return true;
+        }
+        let Some(index) = event.get("stage_index") else {
+            return !started; // Older completion-only logs carry no activity evidence.
+        };
+        let (Some(index), Some(title)) = (index.as_u64(), event["stage"].as_str()) else {
+            return false;
+        };
+        if !valid_stage_title(title) {
+            return false;
+        }
+        if self
+            .open_stages
+            .get(&index)
+            .is_some_and(|old| old.title != title)
+        {
+            return false;
+        }
+        if started {
+            if self.open_stages.len() >= MAX_OPEN_STAGES && !self.open_stages.contains_key(&index) {
+                return false;
+            }
+            let stamp = event.get("started_at_unix_ms");
+            if stamp.is_some_and(|stamp| !stamp.is_null() && stamp.as_u64().is_none()) {
+                return false;
+            }
+            self.open_stages.entry(index).or_insert_with(|| OpenStage {
+                title: title.to_owned(),
+                started_at_unix_ms: stamp.and_then(aterm_json::Value::as_u64),
+            });
+        } else {
+            self.open_stages.remove(&index);
+        }
+        self.stage_activity_observed = true;
+        true
+    }
+
+    fn unfinished_stages(&self) -> aterm_json::Value {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+        self.unfinished_stages_at(now)
+    }
+
+    fn unfinished_stages_at(&self, now: Option<u64>) -> aterm_json::Value {
+        if !self.stage_activity_observed {
+            return aterm_json::Value::Null;
+        }
+        let stages: Vec<_> = self
+            .open_stages
+            .iter()
+            .map(|(index, stage)| {
+                let mut value = aterm_json::json!({"stage_index":index,"stage":stage.title});
+                if let Some(started) = stage.started_at_unix_ms {
+                    let fields = value.as_object_mut().expect("stage is an object");
+                    fields.insert("started_at_unix_ms".into(), started.into());
+                    fields.insert(
+                        "elapsed_wall_ms".into(),
+                        now.and_then(|now| now.checked_sub(started)).into(),
+                    );
+                }
+                value
+            })
+            .collect();
+        aterm_json::json!(stages)
+    }
 }
 
 fn failed(event: &aterm_json::Value) -> bool {
@@ -60,16 +183,26 @@ fn read_events(mut reader: impl Read) -> std::io::Result<Events> {
                             && matches!(
                                 event["event"].as_str(),
                                 Some(
-                                    "stage-finished"
+                                    "stage-started"
+                                        | "stage-finished"
                                         | "test-binary-finished"
                                         | "test-case-failed"
                                         | "release-stage"
+                                        | "build-child-finished"
                                 )
                             ) =>
                     {
+                        if !result.observe_stage(&event) {
+                            result.rejected_lines += 1;
+                        }
                         result.count += 1;
-                        if result.first_failure.is_none() && failed(&event) {
-                            result.first_failure = Some(event.clone());
+                        result.observe_failure(&event);
+                        if event["event"].as_str() == Some("release-stage") {
+                            if event["stage"].as_str().is_some_and(valid_stage_title) {
+                                result.latest_release_stage = Some(event.clone());
+                            } else {
+                                result.rejected_lines += 1;
+                            }
                         }
                         result.latest = Some(event);
                     }
@@ -124,6 +257,62 @@ fn assign_journal(
     }
 }
 
+fn valid_log_dir(text: &str) -> Option<std::path::PathBuf> {
+    if text.is_empty() || text.len() > 8192 || text.chars().any(char::is_control) {
+        return None;
+    }
+    let path = std::path::PathBuf::from(text);
+    path.is_absolute().then_some(path)
+}
+
+fn read_latest_run(path: &Path) -> Result<Option<std::path::PathBuf>, Error> {
+    let bytes = match crate::durable::read_regular_bytes(path, 8192) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => {
+            return Err(Error::new("latest-run log pointer exceeds size limit"));
+        }
+        Err(error) => return Err(Error::new(error.to_string())),
+    };
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| Error::new("latest-run log pointer is not valid UTF-8"))?
+        .trim_end_matches(['\r', '\n']);
+    valid_log_dir(text)
+        .map(Some)
+        .ok_or_else(|| Error::new("latest-run log pointer is empty or invalid"))
+}
+
+fn resolve_logs(
+    holder: Option<&crate::release::Holder>,
+    latest_run: &Path,
+) -> Result<Option<std::path::PathBuf>, Error> {
+    if let Some(holder) = holder
+        && !holder.logs.is_empty()
+    {
+        return valid_log_dir(&holder.logs)
+            .map(Some)
+            .ok_or_else(|| Error::new("running holder log pointer is invalid"));
+    }
+    read_latest_run(latest_run)
+}
+
+/// Preflight verifiers write into their enclosing release step, not the final
+/// qualification log. Later publishing steps retain that final qualification.
+fn check_log(logs: &Path, step: Option<&str>) -> std::path::PathBuf {
+    use crate::release::Step;
+    let phase = Step::ALL
+        .into_iter()
+        .find(|phase| Some(phase.name()) == step)
+        .filter(|phase| {
+            matches!(
+                phase,
+                Step::Checks | Step::Stage | Step::Build | Step::Verify
+            )
+        })
+        .unwrap_or(Step::Verify);
+    logs.join(format!("{:02}-{}.log", phase.number(), phase.name()))
+}
+
 /// Read the journal and its logs without claiming, resuming or building a release.
 ///
 /// # Errors
@@ -136,24 +325,9 @@ pub fn run(repo: &Path, json: bool) -> Result<(), Error> {
         &dir.join(crate::release::RUNNING_FILE),
         &mut crate::release_steps::started_of,
     );
-    let logs = match holder.as_ref() {
-        Some(holder) => Some(std::path::PathBuf::from(&holder.logs)),
-        None => match std::fs::read_to_string(dir.join("latest-run")) {
-            Ok(path) => Some(std::path::PathBuf::from(path)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(Error::new(error.to_string())),
-        },
-    };
-    let log = logs.as_ref().map(|path| path.join("06-verify.log"));
-    let events = match log.as_ref().map(std::fs::File::open) {
-        Some(Ok(file)) => read_events(file).map_err(|error| Error::new(error.to_string()))?,
-        Some(Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
-            return Err(Error::new(error.to_string()));
-        }
-        _ => Events::default(),
-    };
+    let logs = resolve_logs(holder.as_ref(), &dir.join("latest-run"))?;
     let transcript = logs.as_ref().map(|path| path.join("transcript.log"));
-    let release_events = match transcript.as_ref().map(std::fs::File::open) {
+    let release_events = match transcript.as_deref().map(crate::durable::open_regular_file) {
         Some(Ok(file)) => read_events(file).map_err(|error| Error::new(error.to_string()))?,
         Some(Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
             return Err(Error::new(error.to_string()));
@@ -161,11 +335,25 @@ pub fn run(repo: &Path, json: bool) -> Result<(), Error> {
         _ => Events::default(),
     };
     let step = release_events
-        .latest
+        .latest_release_stage
         .as_ref()
         .and_then(|event| event["stage"].as_str())
         .map(str::to_string)
-        .or_else(|| holder.as_ref().and_then(|holder| holder.step.clone()));
+        .or_else(|| {
+            holder
+                .as_ref()
+                .and_then(|holder| holder.step.as_deref())
+                .filter(|step| valid_stage_title(step))
+                .map(str::to_string)
+        });
+    let log = logs.as_ref().map(|path| check_log(path, step.as_deref()));
+    let events = match log.as_deref().map(crate::durable::open_regular_file) {
+        Some(Ok(file)) => read_events(file).map_err(|error| Error::new(error.to_string()))?,
+        Some(Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(Error::new(error.to_string()));
+        }
+        _ => Events::default(),
+    };
     let state = if holder.is_some() {
         "running"
     } else if journal.is_some() || logs.is_some() {
@@ -173,7 +361,11 @@ pub fn run(repo: &Path, json: bool) -> Result<(), Error> {
     } else {
         "none"
     };
-    let journals = assign_journal(journal, release_events.latest.as_ref(), holder.is_some());
+    let journals = assign_journal(
+        journal,
+        release_events.latest_release_stage.as_ref(),
+        holder.is_some(),
+    );
     let journal = journals.current;
     let measurement_exception = journal
         .as_ref()
@@ -205,38 +397,381 @@ pub fn run(repo: &Path, json: bool) -> Result<(), Error> {
         "observations_complete": events.rejected_lines == 0 && release_events.rejected_lines == 0
             && !events.incomplete_tail && !release_events.incomplete_tail,
         "logs": logs,
+        "operational_status": operational_status(logs.as_deref()),
         "verification_log": log,
         "verification_events": events.count,
+        "unfinished_verification_stages": events.unfinished_stages(),
         "first_reported_failure": events.first_failure.or(release_events.first_failure),
         "latest_verification_event": events.latest,
-        "rejected_log_lines": events.rejected_lines,
+        "rejected_log_lines": events.rejected_lines.saturating_add(release_events.rejected_lines),
     });
     if json {
         println!("{value}");
     } else {
-        println!("release: {state}");
-        if let Some(log) = &value["verification_log"].as_str() {
-            println!("verification log: {log}");
-        }
-        if !value["first_reported_failure"].is_null() {
-            println!(
-                "first reported failure: {}",
-                value["first_reported_failure"]
-            );
-        }
-        if !value["latest_verification_event"].is_null() {
-            println!(
-                "latest verification event: {}",
-                value["latest_verification_event"]
-            );
-        }
+        println!("{}", text_status(&value));
     }
     Ok(())
+}
+
+fn scrub_controls(text: &str) -> String {
+    if !text.chars().any(char::is_control) {
+        return text.to_owned();
+    }
+    text.chars()
+        .map(|ch| if ch.is_control() { '\u{fffd}' } else { ch })
+        .collect()
+}
+
+fn text_status(value: &aterm_json::Value) -> String {
+    let mut lines = vec![scrub_controls(&format!(
+        "release: {}",
+        value["state"].as_str().unwrap_or("unknown")
+    ))];
+    for (label, field) in [
+        ("stage", "step"),
+        ("release log", "release_log"),
+        ("verification log", "verification_log"),
+    ] {
+        if let Some(text) = value[field].as_str() {
+            lines.push(scrub_controls(&format!("{label}: {text}")));
+        }
+    }
+    if let Some(stages) = value["unfinished_verification_stages"].as_array() {
+        for stage in stages {
+            if let Some(title) = stage["stage"].as_str() {
+                let age = stage["elapsed_wall_ms"]
+                    .as_u64()
+                    .map_or_else(String::new, |age| {
+                        format!(" ({} s since start, wall clock)", age / 1000)
+                    });
+                lines.push(scrub_controls(&format!(
+                    "unfinished verification stage: {title}{age}"
+                )));
+            }
+        }
+    } else if value["state"].as_str() == Some("running") && value["step"].as_str() == Some("verify")
+    {
+        lines.push("verification stage activity: not recorded".into());
+    }
+    for (label, field) in [
+        ("first reported failure", "first_reported_failure"),
+        ("latest release event", "latest_release_event"),
+        ("latest verification event", "latest_verification_event"),
+    ] {
+        if !value[field].is_null() {
+            lines.push(scrub_controls(&format!("{label}: {}", value[field])));
+        }
+    }
+    if value["observations_complete"].as_bool() == Some(false) {
+        lines.push("observations: incomplete; a log record is partial or unreadable".into());
+    }
+    lines.join("\n")
+}
+
+fn operational_status(logs: Option<&Path>) -> aterm_json::Value {
+    let Some(logs) = logs else {
+        return aterm_json::Value::Null;
+    };
+    let result = (|| -> Result<aterm_json::Value, String> {
+        let bytes =
+            crate::durable::read_regular_bytes(&logs.join("operational-status.json"), 256 * 1024)
+                .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::FileTooLarge {
+                    "operational record exceeds size limit".to_owned()
+                } else {
+                    e.to_string()
+                }
+            })?;
+        let record: aterm_json::Value =
+            aterm_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if record["schema"].as_u64() != Some(1)
+            || record["attempt"].as_str() != Some(logs.to_string_lossy().as_ref())
+        {
+            return Err("operational record belongs to another attempt".into());
+        }
+        Ok(record)
+    })();
+    result.unwrap_or_else(|reason| aterm_json::json!({"state":"unknown","reason":reason}))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_case_failure_gains_only_its_own_binary_completion() {
+        let first = aterm_json::json!({"schema":1,"event":"test-case-failed",
+            "outcome":"FAIL","test":"gui --lib","case":"broken",
+            "elapsed_s":72,"binary_completed":false,"detail":"result pending"});
+        let unrelated = aterm_json::json!({"schema":1,"event":"test-binary-finished",
+            "test":"other --lib","outcome":"ok","exit_code":0});
+        let complete = aterm_json::json!({"schema":1,"event":"test-binary-finished",
+            "test":"gui --lib","outcome":"FAIL","exit_code":101,
+            "execution_s":800,"failures":["broken"],"detail":"assertion failed"});
+        let prefix = format!("verify-event: {first}\nverify-event: {unrelated}\n");
+        let pending = read_events(prefix.as_bytes()).unwrap();
+        assert_eq!(pending.first_failure, Some(first.clone()));
+        let partial = read_events(format!("{prefix}verify-event: {complete}").as_bytes()).unwrap();
+        assert_eq!(partial.first_failure, Some(first.clone()));
+        assert!(partial.incomplete_tail);
+
+        let later = aterm_json::json!({"schema":1,"event":"test-binary-finished",
+            "test":"gui --lib","outcome":"ok","exit_code":0});
+        let log = format!("{prefix}verify-event: {complete}\nverify-event: {later}\n");
+        let events = read_events(log.as_bytes()).unwrap();
+        let observed = events.first_failure.unwrap();
+        assert_eq!(observed["case"], first["case"]);
+        assert_eq!(observed["elapsed_s"], first["elapsed_s"]);
+        assert_eq!(observed["outcome"], first["outcome"]);
+        assert_eq!(observed["binary_completed"].as_bool(), Some(true));
+        assert_eq!(observed["initial_detail"], first["detail"]);
+        assert_eq!(observed["binary_result"], complete);
+        assert!(!observed["detail"].as_str().unwrap().contains("pending"));
+    }
+
+    #[test]
+    fn unfinished_stage_age_preserves_the_first_start_and_clock_uncertainty() {
+        let mut events = Events::default();
+        let start = |stamp| {
+            aterm_json::json!({"event":"stage-started",
+            "stage_index":3,"stage":"lint","started_at_unix_ms":stamp})
+        };
+        assert!(events.observe_stage(&start(1_000)));
+        assert!(events.observe_stage(&start(2_000)));
+        let stages = events.unfinished_stages_at(Some(4_500));
+        assert_eq!(stages[0]["started_at_unix_ms"].as_u64(), Some(1_000));
+        assert_eq!(stages[0]["elapsed_wall_ms"].as_u64(), Some(3_500));
+        let status = aterm_json::json!({"unfinished_verification_stages":stages});
+        assert!(text_status(&status).contains("lint (3 s since start, wall clock)"));
+        assert!(events.unfinished_stages_at(Some(900))[0]["elapsed_wall_ms"].is_null());
+        assert!(events.unfinished_stages_at(None)[0]["elapsed_wall_ms"].is_null());
+        let malformed = aterm_json::json!({"event":"stage-started",
+            "stage_index":4,"stage":"test","started_at_unix_ms":"unknown"});
+        assert!(!events.observe_stage(&malformed));
+        assert_eq!(events.open_stages.len(), 1);
+    }
+
+    #[test]
+    fn preflight_progress_and_failures_are_read_from_the_enclosing_step() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("06-verify.log"), b"").unwrap();
+        let start = aterm_json::json!({"schema":1,"event":"stage-started",
+            "stage_index":1,"stage":"checker compile"});
+        let failure = aterm_json::json!({"schema":1,"event":"test-case-failed",
+            "outcome":"FAIL","test":"source closure"});
+        for phase in [
+            crate::release::Step::Checks,
+            crate::release::Step::Stage,
+            crate::release::Step::Build,
+        ] {
+            let path = dir
+                .path()
+                .join(format!("{:02}-{}.log", phase.number(), phase.name()));
+            std::fs::write(
+                path,
+                format!("verify-event: {start}\nverify-event: {failure}\n"),
+            )
+            .unwrap();
+            let selected = check_log(dir.path(), Some(phase.name()));
+            let events = read_events(std::fs::File::open(selected).unwrap()).unwrap();
+            assert_eq!(events.first_failure, Some(failure.clone()));
+            assert_eq!(
+                events.unfinished_stages(),
+                aterm_json::json!([
+                    {"stage_index":1,"stage":"checker compile"}
+                ])
+            );
+        }
+        for phase in [None, Some("publish"), Some("check"), Some("../outside")] {
+            assert_eq!(
+                check_log(dir.path(), phase),
+                dir.path().join("06-verify.log")
+            );
+        }
+    }
+
+    #[test]
+    fn compiler_telemetry_keeps_the_current_release_stage_and_journal_binding() {
+        let stage = aterm_json::json!({"schema":1,"event":"release-stage",
+            "source":"current-source","version":"0.150.0","stage":"build","outcome":"started"});
+        let child = aterm_json::json!({"schema":1,"event":"build-child-finished",
+            "package":"aterm","outcome":"ok","execution_s":3});
+        let log = format!("release-event: {stage}\nrelease-event: {child}\n");
+        let events = read_events(log.as_bytes()).unwrap();
+        assert_eq!(events.latest, Some(child));
+        assert_eq!(events.latest_release_stage, Some(stage));
+        let journal = crate::release::Journal {
+            commit: "current-source".into(),
+            version: "0.150.0".into(),
+            ..Default::default()
+        };
+        let bound = assign_journal(Some(journal), events.latest_release_stage.as_ref(), true);
+        assert_eq!(bound.binding, "current");
+        assert!(bound.current.is_some());
+        assert!(
+            check_log(
+                Path::new("logs"),
+                events
+                    .latest_release_stage
+                    .as_ref()
+                    .and_then(|event| event["stage"].as_str())
+            )
+            .ends_with("05-build.log")
+        );
+    }
+
+    #[test]
+    fn concurrent_stages_are_paired_by_index_and_failure_does_not_hide_open_work() {
+        let rows = [
+            aterm_json::json!({"schema":1,"event":"stage-started","stage_index":1,"stage":"compile"}),
+            aterm_json::json!({"schema":1,"event":"stage-started","stage_index":2,"stage":"compile"}),
+            aterm_json::json!({"schema":1,"event":"stage-finished","stage_index":1,"stage":"compile",
+                "decisions":[{"outcome":"FAIL"}]}),
+        ];
+        let text = rows
+            .iter()
+            .map(|row| format!("verify-event: {row}\n"))
+            .collect::<String>();
+        let events = read_events(text.as_bytes()).unwrap();
+        assert_eq!(events.count, 3);
+        assert!(events.first_failure.is_some());
+        assert_eq!(
+            events.unfinished_stages(),
+            aterm_json::json!([
+                {"stage_index":2,"stage":"compile"}
+            ])
+        );
+        let status = aterm_json::json!({"state":"running","step":"verify",
+            "unfinished_verification_stages":events.unfinished_stages()});
+        assert!(text_status(&status).contains("unfinished verification stage: compile"));
+        let done = format!(
+            "{text}verify-event: {}\n",
+            aterm_json::json!({
+            "schema":1,"event":"stage-finished","stage_index":2,"stage":"compile"})
+        );
+        assert_eq!(
+            read_events(done.as_bytes()).unwrap().unfinished_stages(),
+            aterm_json::json!([])
+        );
+    }
+
+    #[test]
+    fn stage_activity_is_unknown_for_old_logs_and_partial_finishes_leave_work_open() {
+        let old = b"verify-event: {\"schema\":1,\"event\":\"stage-finished\",\"stage\":\"old\"}\n";
+        assert!(
+            read_events(old.as_slice())
+                .unwrap()
+                .unfinished_stages()
+                .is_null()
+        );
+        let partial = concat!(
+            "verify-event: {\"schema\":1,\"event\":\"stage-started\",\"stage_index\":3,\"stage\":\"lint\"}\n",
+            "verify-event: {\"schema\":1,\"event\":\"stage-finished\",\"stage_index\":3"
+        );
+        let events = read_events(partial.as_bytes()).unwrap();
+        assert!(events.incomplete_tail);
+        assert_eq!(
+            events.open_stages.get(&3).map(|stage| stage.title.as_str()),
+            Some("lint")
+        );
+    }
+
+    #[test]
+    fn stage_activity_rejects_rebinding_and_bounds_retained_work() {
+        let mut events = Events::default();
+        for index in 0..MAX_OPEN_STAGES {
+            assert!(events.observe_stage(&aterm_json::json!({
+                "event":"stage-started","stage_index":index,"stage":"build"})));
+        }
+        assert!(!events.observe_stage(&aterm_json::json!({
+            "event":"stage-started","stage_index":MAX_OPEN_STAGES,"stage":"extra"})));
+        assert!(!events.observe_stage(&aterm_json::json!({
+            "event":"stage-finished","stage_index":0,"stage":"different"})));
+        assert_eq!(events.open_stages.len(), MAX_OPEN_STAGES);
+        assert!(events.observe_stage(&aterm_json::json!({
+            "event":"stage-finished","stage_index":0,"stage":"build"})));
+        assert!(events.observe_stage(&aterm_json::json!({
+            "event":"stage-started","stage_index":MAX_OPEN_STAGES,"stage":"extra"})));
+    }
+
+    #[test]
+    fn malformed_activity_never_hides_a_reported_failure_or_prints_control_titles() {
+        let rows = [
+            aterm_json::json!({"schema":1,"event":"stage-started","stage_index":4,"stage":"lint"}),
+            aterm_json::json!({"schema":1,"event":"stage-finished","stage_index":4,
+                "stage":"different","decisions":[{"outcome":"FAIL"}]}),
+            aterm_json::json!({"schema":1,"event":"stage-started","stage_index":5,"stage":"bad\nname"}),
+        ];
+        let text = rows
+            .iter()
+            .map(|row| format!("verify-event: {row}\n"))
+            .collect::<String>();
+        let events = read_events(text.as_bytes()).unwrap();
+        assert_eq!(events.count, 3);
+        assert_eq!(events.rejected_lines, 2);
+        assert!(events.first_failure.is_some());
+        assert_eq!(
+            events.open_stages.get(&4).map(|stage| stage.title.as_str()),
+            Some("lint")
+        );
+        assert!(!events.open_stages.contains_key(&5));
+    }
+
+    #[test]
+    fn text_status_exposes_build_progress_before_verification_starts() {
+        let event = aterm_json::json!({
+            "event": "build-child-finished", "execution_s": 12,
+            "child_cpu": {"observed_s": 9}, "outcome": "PASS",
+        });
+        let status = aterm_json::json!({
+            "state": "running", "step": "build", "release_log": "/cut/transcript.log",
+            "latest_release_event": event, "observations_complete": true,
+        });
+        let text = text_status(&status);
+        assert!(text.contains("stage: build"));
+        assert!(text.contains("release log: /cut/transcript.log"));
+        assert!(text.contains(&event.to_string()));
+        assert!(!text.contains("verification log:"));
+        assert!(!text.contains("incomplete"));
+    }
+
+    #[test]
+    fn text_status_keeps_failure_visible_alongside_later_progress_and_partial_logs() {
+        let failure = aterm_json::json!({"outcome": "FAIL", "case": "first"});
+        let latest = aterm_json::json!({"outcome": "PASS", "case": "later"});
+        let status = aterm_json::json!({
+            "state": "running", "step": "verify",
+            "first_reported_failure": failure, "latest_verification_event": latest,
+            "observations_complete": false,
+        });
+        let text = text_status(&status);
+        assert!(text.contains(&format!("first reported failure: {failure}")));
+        assert!(text.contains(&format!("latest verification event: {latest}")));
+        assert!(text.contains("observations: incomplete"));
+    }
+
+    #[test]
+    fn operational_record_is_bound_to_the_selected_attempt() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("operational-status.json");
+        let record = aterm_json::json!({"schema":1,"attempt":dir.path(),
+            "observation":{"capability":{"state":"unknown","reason":"peer unavailable"}}});
+        std::fs::write(&path, record.to_string()).unwrap();
+        let read = operational_status(Some(dir.path()));
+        assert_eq!(read, record);
+        assert!(read["observation"]["capability"].get("value").is_none());
+        let wrong = aterm_json::json!({"schema":1,"attempt":"another attempt","observation":{}});
+        std::fs::write(&path, wrong.to_string()).unwrap();
+        assert_eq!(
+            operational_status(Some(dir.path()))["state"].as_str(),
+            Some("unknown")
+        );
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            operational_status(Some(dir.path()))["state"].as_str(),
+            Some("unknown")
+        );
+    }
 
     #[test]
     fn a_new_preflight_cannot_inherit_a_finished_releases_journal() {
@@ -326,6 +861,15 @@ mod tests {
     }
 
     #[test]
+    fn build_cpu_and_failure_survive_status_readback() {
+        let events = read_events(b"release-event: {\"schema\":1,\"event\":\"build-child-finished\",\"outcome\":\"FAIL\",\"child_cpu\":{\"observed_s\":8},\"execution_s\":3}\n".as_slice()).unwrap();
+        assert_eq!(events.count, 1);
+        let failure = events.first_failure.unwrap();
+        assert_eq!(failure["child_cpu"]["observed_s"].as_u64(), Some(8));
+        assert_eq!(failure["execution_s"].as_u64(), Some(3));
+    }
+
+    #[test]
     fn oversized_and_invalid_lines_do_not_hide_a_later_unavailable_stage() {
         let mut bytes = vec![b'x'; 128 * 1024];
         bytes.extend_from_slice(b"\nverify-event: not json\nverify-event: {\"schema\":1,\"event\":\"stage-finished\",\"decisions\":[{\"outcome\":\"NOT RUN\"}]}\n");
@@ -333,6 +877,140 @@ mod tests {
         assert_eq!(events.rejected_lines, 2);
         assert_eq!(events.count, 1);
         assert!(events.first_failure.is_some());
+    }
+
+    #[test]
+    fn latest_run_pointer_is_bounded_and_trims_trailing_newline() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let pointer = dir.path().join("latest-run");
+        assert_eq!(read_latest_run(&pointer).unwrap(), None);
+
+        let expected = dir.path().join("release-logs");
+        std::fs::write(&pointer, format!("{}\n", expected.display())).unwrap();
+        assert_eq!(read_latest_run(&pointer).unwrap(), Some(expected));
+
+        std::fs::write(&pointer, "\n").unwrap();
+        assert!(read_latest_run(&pointer).is_err());
+
+        std::fs::write(&pointer, "relative/release-logs\n").unwrap();
+        assert!(read_latest_run(&pointer).is_err());
+
+        std::fs::write(&pointer, vec![b'a'; 8193]).unwrap();
+        assert!(read_latest_run(&pointer).is_err());
+    }
+
+    /// ORPHANED CHILD HOLDER FALLS BACK TO `latest-run` INSTEAD OF CWD: a `running.child.<pid>`
+    /// note carries `logs: ""` and `step: Some(...)`, so `resolve_logs` must read `latest-run`
+    /// rather than `PathBuf::from("")`, while rejecting relative holder paths and symlinks.
+    /// NEGATIVE CONTROL: a parent holder with an absolute `logs` path resolves directly to it.
+    #[test]
+    fn orphaned_child_holder_falls_back_to_latest_run_and_refuses_relative_or_symlink_logs() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let pointer = dir.path().join("latest-run");
+        let attempt = dir.path().join("attempt-1");
+        let direct = dir.path().join("attempt-2");
+        std::fs::create_dir_all(&attempt).unwrap();
+        std::fs::write(&pointer, format!("{}\n", attempt.display())).unwrap();
+
+        let child = crate::release::Holder {
+            pid: 4242,
+            started: "now".into(),
+            logs: String::new(),
+            step: Some("verify".into()),
+            handed: false,
+        };
+        assert_eq!(
+            resolve_logs(Some(&child), &pointer).unwrap(),
+            Some(attempt.clone())
+        );
+
+        let parent = crate::release::Holder {
+            logs: direct.display().to_string(),
+            ..child.clone()
+        };
+        assert_eq!(resolve_logs(Some(&parent), &pointer).unwrap(), Some(direct));
+
+        let relative = crate::release::Holder {
+            logs: "relative/logs".into(),
+            ..child
+        };
+        assert!(resolve_logs(Some(&relative), &pointer).is_err());
+
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("real-pointer");
+            std::fs::write(&target, format!("{}\n", attempt.display())).unwrap();
+            let link = dir.path().join("linked-pointer");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(
+                read_latest_run(&link).is_err(),
+                "symlinked latest-run must be refused"
+            );
+
+            let real_op = dir.path().join("real-operational.json");
+            let record = aterm_json::json!({"schema":1,"attempt":attempt,"observation":{}});
+            std::fs::write(&real_op, record.to_string()).unwrap();
+            std::os::unix::fs::symlink(&real_op, attempt.join("operational-status.json")).unwrap();
+            assert_eq!(
+                operational_status(Some(&attempt))["state"].as_str(),
+                Some("unknown"),
+                "symlinked operational-status.json must not be trusted"
+            );
+        }
+    }
+
+    /// MALFORMED `release-stage` AND CONTROL CHARACTERS ARE REJECTED OR SCRUBBED: a `release-stage`
+    /// record with an empty or control-character `stage` increments `rejected_lines` without
+    /// overwriting `latest_release_stage`, while `text_status` scrubs `\x7f` and Unicode C1
+    /// controls (`\u{9b}`). NEGATIVE CONTROL: a clean `release-stage` updates `latest_release_stage`
+    /// with zero rejected lines.
+    #[test]
+    fn release_stage_validates_stage_name_and_text_status_scrubs_c1_controls() {
+        let good = aterm_json::json!({
+            "schema": 1,
+            "event": "release-stage",
+            "source": "abc",
+            "version": "0.150.0",
+            "stage": "verify",
+        });
+        let bad_ctrl = aterm_json::json!({
+            "schema": 1,
+            "event": "release-stage",
+            "source": "abc",
+            "version": "0.150.0",
+            "stage": "build\u{9b}31m",
+            "outcome": "FAIL",
+        });
+        let bad_empty = aterm_json::json!({
+            "schema": 1,
+            "event": "release-stage",
+            "source": "abc",
+            "version": "0.150.0",
+            "stage": "",
+        });
+        let log = format!(
+            "release-event: {good}\nrelease-event: {bad_ctrl}\nrelease-event: {bad_empty}\n"
+        );
+        let events = read_events(log.as_bytes()).unwrap();
+        assert_eq!(events.count, 3);
+        assert_eq!(events.rejected_lines, 2);
+        assert_eq!(events.latest_release_stage, Some(good));
+        assert!(
+            events.first_failure.is_some(),
+            "failure outcome on a rejected stage line remains visible"
+        );
+
+        let status = aterm_json::json!({
+            "state": "running",
+            "step": "verify",
+            "first_reported_failure": {"case": "bad\x7f\u{9b}2Jtitle", "outcome": "FAIL"},
+            "observations_complete": true,
+        });
+        let rendered = text_status(&status);
+        assert!(
+            !rendered.chars().any(|ch| ch != '\n' && ch.is_control()),
+            "rendered text_status must contain no non-newline control chars: {rendered:?}"
+        );
     }
 }
 

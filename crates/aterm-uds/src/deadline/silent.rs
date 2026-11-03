@@ -1077,14 +1077,19 @@ mod tests {
                 .expect("the wait panics with its words")
                 .clone()
         };
-        for why in [
-            refused(&|| {
-                super::ends_within(&mut crate::spawnfd::command(MISSING), super::ECHO_HANG);
-            }),
-            refused(&|| {
+        let mut refusals = vec![refused(&|| {
+            super::ends_within(&mut crate::spawnfd::command(MISSING), super::ECHO_HANG);
+        })];
+        // Under a translator std's glibc posix_spawn loses the exec error (the store to
+        // its CLONE_VM-shared args is dropped, measured on the x86_64 cell under
+        // Rosetta): the spawn reports Ok and the child exits 127, so a std run cannot
+        // fail to start there. The transparent arm above still must, and does.
+        if crate::process::translator().is_none() {
+            refusals.push(refused(&|| {
                 super::std_ends_within(&mut std::process::Command::new(MISSING), super::ECHO_HANG);
-            }),
-        ] {
+            }));
+        }
+        for why in refusals {
             assert!(
                 why.starts_with(&format!("{MISSING} could not start: ")),
                 "{why}"

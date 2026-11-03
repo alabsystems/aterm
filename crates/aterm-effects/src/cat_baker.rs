@@ -1085,11 +1085,20 @@ pub const fn accessory_attach(acc: CatGlyphId) -> (f32, f32, f32) {
 /// aspect: a wide bow gets shorter, a tall bell narrower.
 #[inline]
 const fn accessory_transform(acc: CatGlyphId, w: u32, h: u32) -> PathTransform {
-    const INV_1000: f32 = 1.0 / 1000.0;
+    const GLYPH_ASPECTS: [f32; GLYPHS.len()] = {
+        const INV_1000: f32 = 1.0 / 1000.0;
+        let mut table = [0.0f32; GLYPHS.len()];
+        let mut i = 0;
+        while i < GLYPHS.len() {
+            table[i] = (GLYPHS[i].aspect_x1000 as f32 * INV_1000).max(0.001);
+            i += 1;
+        }
+        table
+    };
     let (cx, cy, s) = accessory_attach(acc);
     let max_w = s * w as f32;
     let max_h = s * h as f32;
-    let aspect = (GLYPHS[acc as usize].aspect_x1000 as f32 * INV_1000).max(0.001);
+    let aspect = GLYPH_ASPECTS[acc as usize];
     let (bw, bh) = if max_w / max_h > aspect {
         (max_h * aspect, max_h)
     } else {

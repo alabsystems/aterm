@@ -5,7 +5,7 @@
 //! What a write did (design §9.4, §10.2): the outcome every write method returns, the effect
 //! an ensure-style write had, and the operations the journal names.
 
-use crate::error::{Error, Kind, Result, SideEffect, Sub};
+use crate::error::{Error, Kind, Result, SideEffect};
 use crate::journal::{IntentId, Settled};
 
 /// How a one-shot write ended (design §10.2's settle table).
@@ -62,14 +62,7 @@ impl<T> Outcome<T> {
         match self {
             Outcome::Done(object) => Ok(object),
             Outcome::NeverSent(error) | Outcome::Refused(error) => Err(error),
-            Outcome::Unknown { intent, error } => {
-                let why = format!("outcome unknown; intent {intent} open: {}", error.why);
-                let next = match &error.repo {
-                    Some(repo) => format!("agh intent show {repo} {intent}"),
-                    None => "agh intent list --open".to_string(),
-                };
-                Err(error.recast(Kind::OutcomeUnknown, why).with_next(next))
-            }
+            Outcome::Unknown { intent, error } => Err(unknown_error(&intent, error)),
         }
     }
 
@@ -82,6 +75,20 @@ impl<T> Outcome<T> {
             Outcome::Unknown { intent, error } => Outcome::Unknown { intent, error },
         }
     }
+}
+
+/// `Outcome::into_result`'s error for `Unknown { intent, error }`: kind OutcomeUnknown (exit
+/// 13), `sub` the wire error's, why `outcome unknown; intent {intent} open: {error.why}`, next
+/// `agh intent show {repo} {intent}`, or `agh intent list --open` when the error names no
+/// repo.
+#[must_use]
+pub(crate) fn unknown_error(intent: &IntentId, error: Error) -> Error {
+    let why = format!("outcome unknown; intent {intent} open: {}", error.why);
+    let next = match &error.repo {
+        Some(repo) => format!("agh intent show {repo} {intent}"),
+        None => "agh intent list --open".to_string(),
+    };
+    error.recast(Kind::OutcomeUnknown, why).with_next(next)
 }
 
 /// What an ensure-style write did to reach its object.
@@ -221,8 +228,7 @@ impl WriteOp {
 /// no refusal code. Every write method's first step off unix.
 #[must_use]
 pub fn unix_only() -> Error {
-    Error::could_not_run("agh writes need the write journal, which is unix-only in M2")
-        .with_sub(Sub::Local)
+    Error::local("agh writes need the write journal, which is unix-only in M2")
 }
 
 /// Design §10.2's settle table, over one one-shot attempt's result. The one table every

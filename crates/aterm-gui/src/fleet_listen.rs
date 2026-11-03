@@ -88,7 +88,8 @@ fn lifetime() -> Duration {
     *WITHIN.get_or_init(|| seam_or(LIFETIME_SEAM, SERVED))
 }
 
-/// How often a member's listener registers with the members that answer it (F17: up to three).
+/// How often a member's listener registers with the members that answer it (F17: three, then up
+/// to three more of those marked missed).
 #[cfg(unix)]
 fn heartbeat_every() -> Duration {
     static EVERY: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
@@ -1304,6 +1305,7 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
         // The heartbeat's dial hints come from this process's one `_alab._tcp` browse.
         crate::network_moved::hear_alab_tcp(&[]);
         let sharing = share_units(addr, &running);
+        let serving_generation = Arc::clone(&running);
         let join_secret = Arc::new(secret.clone());
         let listening = aterm_net::fleet::Listening {
             secret,
@@ -1342,7 +1344,7 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                 if op == FleetOp::Book {
                     return served.answer(|stream| {
                         stream.set_write_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
-                        share_book(stream, peer, addr)
+                        share_book(stream, peer, (addr, &serving_generation))
                     });
                 }
                 if op == FleetOp::Facts {
@@ -1399,6 +1401,7 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                         }
                     };
                     let (near, far) = aterm_uds::CtlStream::pair()?;
+                    let driver_key = grant.key;
                     let Some(_open) = Opened::served_live(true, Some(grant), &near)? else {
                         return refuse_driver(
                             served,
@@ -1408,7 +1411,13 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                             true,
                         );
                     };
-                    if !crate::control::attach_fleet_drive(near, peer, driver) {
+                    if !crate::control::attach_fleet_drive(
+                        near,
+                        peer,
+                        driver,
+                        Some(driver_key),
+                        true,
+                    ) {
                         return Err(std::io::Error::other(
                             "this aterm's control server is not serving",
                         ));
@@ -1566,8 +1575,10 @@ fn admit_driver_at(
             true,
         ));
     }
+    // Each node named by a head no other node this Mac knows shares.
+    let knows = aterm_net::fleet_member::known_nodes(state);
     let node = proven_driver(served, state, grants, log)
-        .map_err(|why| (why.to_string(), why.ungranted()))?;
+        .map_err(|why| (why.said(&knows), why.ungranted()))?;
     let key = served
         .peer_node()
         .filter(|proof| proof.node == node)
@@ -1583,6 +1594,7 @@ fn admit_driver_at(
     let host = driver_name(
         &node,
         peer_of(state, &node).map(|peer| peer.host).as_deref(),
+        &knows,
     );
     Ok((crate::fabric::Driver { node, host }, grant))
 }
@@ -1769,10 +1781,11 @@ fn cut_unserved_with_denied(
     cut
 }
 
-/// The proven `node` of a drive as its credit, its hold and its records name it.
+/// The proven `node` of a drive as its credit, its hold and its records name it, by a head no
+/// other node this Mac `knows` shares ([`aterm_net::fleet_member::node_head`]).
 #[cfg(unix)]
-fn driver_name(node: &str, host: Option<&str>) -> String {
-    let short = node.get(..8).unwrap_or(node);
+fn driver_name(node: &str, host: Option<&str>, knows: &[String]) -> String {
+    let short = aterm_net::fleet_member::node_head(node, knows);
     match host.filter(|host| aterm_net::fleet_member::is_host(host)) {
         Some(host) => format!("{host} (node {short})"),
         None => format!("node {short}"),
@@ -1912,46 +1925,58 @@ fn own_host_from(
 fn share_book<S: std::io::Write>(
     stream: &mut S,
     peer: Option<SocketAddr>,
-    addr: SocketAddr,
+    (addr, current): (SocketAddr, &AtomicBool),
 ) -> std::io::Result<()> {
     let Some(state) = aterm_types::dirs::state_dir() else {
         return Err(std::io::Error::other("a book read with no state directory"));
     };
     let denied = denied_nodes_now().ok_or_else(|| std::io::Error::other(DENY_LIST_UNREAD))?;
     let log = window_log();
-    share_book_at(stream, &state, peer, (&denied, log.as_deref()), addr)
+    share_book_at(
+        stream,
+        &state,
+        peer,
+        (&denied, log.as_deref()),
+        (addr, current),
+    )
 }
 
-/// Serve this Mac's book to `peer`, its own entry first, signed now for the place it listens at
-/// (`addr`; [`aterm_net::fleet_member::Peer::own`]), every member alike (F17).
+/// Serve this Mac's book to `peer`, its own entry first, durably signed for the place it listens
+/// at (`addr`; [`aterm_net::fleet_member::self_entry_while`]), every member alike (F17). A worker
+/// from an ended generation commits no later descriptor and aborts its response.
 #[cfg(unix)]
 fn share_book_at<S: std::io::Write>(
     stream: &mut S,
     state: &std::path::Path,
     peer: Option<SocketAddr>,
     (denied, log): (&[String], Option<&aterm_net::fleet_member::MemberKeys>),
-    addr: SocketAddr,
+    (addr, current): (SocketAddr, &AtomicBool),
 ) -> std::io::Result<()> {
-    use aterm_net::fleet_member::{Peer, read_node_id, read_node_identity, serve_book_with_log};
+    use aterm_net::fleet_member::{
+        read_node_id, read_node_identity, self_entry_while, serve_book_with_log,
+    };
+    let ended = || std::io::Error::other("the fleet listener generation ended");
+    if !current.load(Ordering::Acquire) {
+        return Err(ended());
+    }
     let now_ms = aterm_time::unix_millis();
     let own = read_node_identity(state)
         .ok()
         .flatten()
         .zip(own_host(addr))
         .map(|(me, host)| {
-            Peer::own(
+            self_entry_while(
+                state,
                 &me,
                 (&host, addr.port(), aterm_types::version::app_version()),
-                now_ms.unwrap_or_default(),
+                current,
             )
-            .with_primary_name(
-                &me,
-                aterm_net::fleet_member::read_primary_name(state)
-                    .ok()
-                    .flatten()
-                    .as_deref(),
-            )
-        });
+        })
+        .transpose()?
+        .flatten();
+    if !current.load(Ordering::Acquire) {
+        return Err(ended());
+    }
     let node = || {
         read_node_id(state)
             .map_err(|e| e.to_string())?
@@ -2289,7 +2314,7 @@ fn read_node_key() -> Option<aterm_net::fleet::NodeIdentity> {
 #[cfg(unix)]
 fn watch_fleet_generation(
     (generation, addr): (u64, SocketAddr),
-    (running, rekeyed): (&AtomicBool, &AtomicBool),
+    (running, rekeyed): (&Arc<AtomicBool>, &AtomicBool),
     (secret, proved): (
         &aterm_net::fleet::FleetSecret,
         Option<(String, aterm_net::fleet::NodeKey)>,
@@ -2361,7 +2386,7 @@ fn watch_fleet_generation(
                 }
                 if lan && let Some(woke) = heartbeat.due_when_free(now, busy) {
                     say_heartbeat_woke("fleet listener", woke);
-                    spawn_member_heartbeat(addr, secret.clone(), &hb_in_flight);
+                    spawn_member_heartbeat(addr, secret.clone(), (running, &hb_in_flight));
                 }
                 continue;
             }
@@ -2394,7 +2419,7 @@ fn initial_heartbeat_anchor(every: Duration) -> Option<std::time::Instant> {
 fn spawn_member_heartbeat(
     addr: SocketAddr,
     secret: aterm_net::fleet::FleetSecret,
-    in_flight: &Arc<AtomicBool>,
+    (current, in_flight): (&Arc<AtomicBool>, &Arc<AtomicBool>),
 ) {
     let Some(state) = aterm_types::dirs::state_dir() else {
         return;
@@ -2422,35 +2447,9 @@ fn spawn_member_heartbeat(
         &state,
         addr,
         secret,
-        in_flight,
+        (current, in_flight),
         (denied, log, crate::network_moved::alab_tcp()),
-        aterm_secrets::client::Paths::live().ok(),
     );
-}
-
-/// Note a heartbeat round's `answered` members, each of which proved its node to this Mac, as
-/// evidence of the network each answered from ([`aterm_secrets::home_lan::note`]) under `vault`,
-/// the secrets directory of the vault this round serves (none: nothing is noted): the vault
-/// server observes a join on the home ALab LAN only where members answered. Runs on the round's
-/// thread, never the event loop.
-#[cfg(unix)]
-fn note_home_lan(
-    vault: Option<&aterm_secrets::client::Paths>,
-    answered: &[aterm_net::fleet_member::Answered],
-) {
-    let Some(paths) = vault else {
-        return;
-    };
-    if answered.is_empty() {
-        return;
-    }
-    let heard: Vec<(String, std::net::IpAddr)> = answered
-        .iter()
-        .map(|done| (done.node.clone(), done.at.ip()))
-        .collect();
-    if let Err(error) = aterm_secrets::home_lan::note(paths, &heard) {
-        aterm_log::debug!("fleet heartbeat: the home-LAN evidence was not noted: {error}");
-    }
 }
 
 /// How long a heartbeat round resolves the `_alab._tcp` adverts its browse holds.
@@ -2486,23 +2485,29 @@ type HeartbeatReach = (
 );
 
 /// One heartbeat round of this Mac, which listens at `addr` under `secret`, unless one is in
-/// flight (`in_flight`): its signed entry registered with up to three members
-/// ([`aterm_net::fleet_member::heartbeat_members_with_denied`]) its membership log admits (`log`;
-/// none: those its book binds) and `denied` does not list, the places `browse`'s adverts resolve to
-/// tried after the book's. Its answers are noted as home-LAN evidence under `vault`, the secrets
-/// directory of the vault this Mac serves ([`note_home_lan`]).
+/// flight (`in_flight`): its signed entry registered with three members, then up to three more of
+/// those marked missed ([`aterm_net::fleet_member::heartbeat_members_with_denied`]), its
+/// membership log admits (`log`; none: those its book binds) and `denied` does not list, the
+/// places `browse`'s adverts resolve to tried after the book's, and its facts pushed to each that
+/// answered. Its answers are noted in the network place's evidence under `state`
+/// (`aterm_net::fleet_member`'s `note_place`), the state root this process's member desk reads
+/// it under (`aterm_secrets::home_lan::home_net`), each marked logged only where the round ran
+/// under the vault's membership log (`log`): an isolated job (`ATERM_STATE_HOME` or `CI`) has
+/// none, so nothing it hears admits anyone, even under a state root it shares with the real vault
+/// (`CI` alone). A generation that is no longer `current` stops at the next exchange boundary and
+/// cannot supersede a newer generation.
 #[cfg(unix)]
 fn spawn_member_heartbeat_at(
     state: &std::path::Path,
     addr: SocketAddr,
     secret: aterm_net::fleet::FleetSecret,
-    in_flight: &Arc<AtomicBool>,
+    (current, in_flight): (&Arc<AtomicBool>, &Arc<AtomicBool>),
     (denied, log, browse): HeartbeatReach,
-    vault: Option<aterm_secrets::client::Paths>,
 ) {
-    use aterm_net::fleet_member::{
-        Registration, heartbeat_members_with_denied, read_node_identity,
-    };
+    use aterm_net::fleet_member::{Registration, heartbeat_members_while, read_node_identity};
+    if !current.load(Ordering::Acquire) {
+        return;
+    }
     let Some(me) = read_node_identity(state).ok().flatten() else {
         return;
     };
@@ -2516,6 +2521,7 @@ fn spawn_member_heartbeat_at(
         return;
     }
     let flag = Arc::clone(in_flight);
+    let current = Arc::clone(current);
     let state = state.to_path_buf();
     let reg = Registration {
         node: me.node().to_owned(),
@@ -2524,15 +2530,7 @@ fn spawn_member_heartbeat_at(
         version: aterm_types::version::app_version().to_owned(),
         key: None,
         signed: None,
-    }
-    .signed_by(&me, aterm_time::unix_millis().unwrap_or_default())
-    .with_primary_name(
-        &me,
-        aterm_net::fleet_member::read_primary_name(&state)
-            .ok()
-            .flatten()
-            .as_deref(),
-    );
+    };
     let started = std::thread::Builder::new()
         .name("aterm-fleet-hb".to_owned())
         .spawn(move || {
@@ -2557,17 +2555,21 @@ fn spawn_member_heartbeat_at(
                     .map(|browse| alab_hints(browse, left))
                     .unwrap_or_default()
             };
-            match heartbeat_members_with_denied(
+            match heartbeat_members_while(
                 &state,
                 (&secret, &me),
                 &reg,
                 within,
                 (log.as_deref(), &denied, &hints),
+                &current,
             ) {
                 Ok(answered) => {
-                    // Each answer proved its node to this Mac: evidence of the network it came
-                    // from, which the vault server and approver tell the home ALab LAN by.
-                    note_home_lan(vault.as_ref(), &answered);
+                    if !current.load(Ordering::Acquire) {
+                        return;
+                    }
+                    // Each answer proved its node to this Mac, and the round noted it in the
+                    // network place's evidence under `state` (`aterm_net::fleet_member`'s
+                    // `note_place`), which this Mac's member desk tells the home ALab LAN by.
                     if !answered.is_empty()
                         && let Some((_, payload)) =
                             aterm_net::fleet_member::read_pushed_facts(&state)
@@ -2576,6 +2578,9 @@ fn spawn_member_heartbeat_at(
                     {
                         let keyring = aterm_net::fleet_member::Keyring::read(&state);
                         for done in &answered {
+                            if !current.load(Ordering::Acquire) {
+                                return;
+                            }
                             let peer = aterm_net::fleet_member::Peer {
                                 node: Some(done.node.clone()),
                                 key: keyring.bound(&done.node),
@@ -2749,6 +2754,51 @@ fn note_fleet(line: &str, refusal: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A detached book response that passed its early generation check must not publish its
+    /// old listener endpoint after waiting on the descriptor lock and then being canceled.
+    #[cfg(unix)]
+    #[test]
+    fn an_ended_book_response_keeps_the_current_listener_descriptor() {
+        use aterm_net::fleet_member::{hold_book, lock_waiting_told, node_identity, self_entry};
+
+        let state = aterm_tempfile::tempdir().unwrap();
+        let me = node_identity(state.path()).unwrap();
+        self_entry(
+            state.path(),
+            &me,
+            ("127.0.0.1", 7200, aterm_types::version::app_version()),
+        )
+        .unwrap();
+        let descriptor = state.path().join("fleet-self-entry");
+        let committed = std::fs::read(&descriptor).unwrap();
+        let current = AtomicBool::new(true);
+        let within = aterm_spec::wait::MUST_HAPPEN;
+        let (waiting, waited) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let held = hold_book(state.path()).unwrap();
+            let worker = scope.spawn(|| {
+                let mut response = Vec::new();
+                let result = lock_waiting_told(within, waiting, || {
+                    share_book_at(
+                        &mut response,
+                        state.path(),
+                        None,
+                        (&[], None),
+                        ("127.0.0.1:7100".parse().unwrap(), &current),
+                    )
+                });
+                (result, response)
+            });
+            waited.recv_timeout(within).unwrap();
+            current.store(false, Ordering::Release);
+            drop(held);
+            let (result, response) = worker.join().unwrap();
+            assert!(result.is_err());
+            assert!(response.is_empty());
+            assert_eq!(std::fs::read(descriptor).unwrap(), committed);
+        });
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3008,18 +3058,34 @@ mod tests {
     #[test]
     fn a_drive_is_named_by_the_node_it_proved() {
         let (n, m) = ("1a2b3c4d".repeat(4), "9f8e7d6c".repeat(4));
+        let knows = [n.clone(), m.clone()];
         assert_eq!(
-            driver_name(&n, Some("mac-11.local")),
+            driver_name(&n, Some("mac-11.local"), &knows),
             "mac-11.local (node 1a2b3c4d)"
         );
         assert_ne!(
-            driver_name(&n, Some("mac-11.local")),
-            driver_name(&m, Some("mac-11.local")),
+            driver_name(&n, Some("mac-11.local"), &knows),
+            driver_name(&m, Some("mac-11.local"), &knows),
             "a node that names itself as another Mac reads as itself"
         );
         for unshown in [None, Some("the message bus"), Some("")] {
-            assert_eq!(driver_name(&n, unshown), "node 1a2b3c4d", "{unshown:?}");
+            assert_eq!(
+                driver_name(&n, unshown, &knows),
+                "node 1a2b3c4d",
+                "{unshown:?}"
+            );
         }
+        // NEGATIVE CONTROL: name the node by its first eight characters again, and the holder
+        // reads as the node it shares them with.
+        let (holder, reader) = (
+            "c0ffee34a18b0000000000000000000a".to_owned(),
+            "c0ffee34a27c0000000000000000000b".to_owned(),
+        );
+        assert_eq!(
+            driver_name(&holder, Some("127.0.0.1"), &[holder.clone(), reader]),
+            "127.0.0.1 (node c0ffee34a1)",
+            "a head another node this Mac knows shares is never the name"
+        );
     }
 
     /// THE JOIN'S AUDIT LINE NAMES THE MEMBER AS THE BOOK DOES.

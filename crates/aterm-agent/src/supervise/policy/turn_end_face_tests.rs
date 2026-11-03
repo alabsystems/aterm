@@ -67,6 +67,24 @@ fn the_face_is_a_function_of_the_policys_memory_in_the_designs_order() {
             true,
             TaskFace::Open,
         ),
+        (
+            "a worker's own `Could not finish:`",
+            state(|s| s.conclude(GaveUp::CouldNotFinish)),
+            false,
+            TaskFace::Failed,
+        ),
+        (
+            "the same reply again with no work",
+            state(|s| s.conclude(GaveUp::Repeated)),
+            false,
+            TaskFace::Failed,
+        ),
+        (
+            "someone else's turn after a failed conclusion",
+            state(|s| s.conclude(GaveUp::CouldNotFinish)),
+            true,
+            TaskFace::Open,
+        ),
     ];
     for (case, st, other, want) in &rows {
         assert_eq!(TaskFace::of(st, *other), *want, "{case}");
@@ -75,6 +93,48 @@ fn the_face_is_a_function_of_the_policys_memory_in_the_designs_order() {
     assert!(theirs.task_done() && TaskFace::of(&theirs, false) != TaskFace::Landed);
     let after = state(landed);
     assert_ne!(TaskFace::of(&after, true), TaskFace::of(&after, false));
+}
+
+/// A WORKER'S FAILED CONCLUSION IS A FACE OF ITS OWN: its `Could not finish:` under Land is told
+/// `failed`, never the open face's `wrapping up`, and a turn run since, or Cruise, which never
+/// rests, lifts it to open again.
+#[test]
+fn a_failed_conclusion_is_its_own_face_until_a_turn_or_cruise_lifts_it() {
+    const GAVE_UP: &str = "Could not finish: the grammar the parser needs was deleted upstream.";
+    let concluded = |now| {
+        let mut st = TurnEndState::default();
+        st.set_managed(true);
+        assert_eq!(st.face_start(), TaskFace::Open);
+        at(&mut st, &land(idle(GAVE_UP, Some(5 * MIN))), now);
+        assert_eq!(st.gave_up(), Some(GaveUp::CouldNotFinish));
+        assert_eq!(st.face(), TaskFace::Failed);
+        assert_eq!(st.face_moved(), Some(TaskFace::Failed));
+        assert_eq!(st.face_moved(), None, "told once");
+        st
+    };
+    let now = t0();
+    let mut st = concluded(now);
+    at(
+        &mut st,
+        &land(idle(
+            "Restored the grammar from the vendored copy.",
+            Some(4 * MIN),
+        )),
+        now + 10 * MIN,
+    );
+    assert_eq!(st.gave_up(), None, "a turn ran since");
+    assert_eq!(st.face_moved(), Some(TaskFace::Open));
+    let mut st = concluded(now);
+    at(
+        &mut st,
+        &TurnEndReading {
+            autopilot: Autopilot::Cruise,
+            ..idle(GAVE_UP, None)
+        },
+        now + 10 * MIN,
+    );
+    assert_eq!(st.gave_up(), None, "Cruise never rests");
+    assert_eq!(st.face_moved(), Some(TaskFace::Open));
 }
 
 /// THE FACE MOVES WITH THE POLICY'S OWN POINTS, told once each

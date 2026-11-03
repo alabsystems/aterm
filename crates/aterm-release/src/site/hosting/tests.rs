@@ -19,6 +19,109 @@ use super::*;
 
 const ISSUER: &str = "deployer@fake-project.iam.gserviceaccount.com";
 
+#[test]
+fn access_check_reads_the_actual_project_without_deploying() {
+    let lab = Lab::new();
+    lab.fake.state().live = Some("sites/fake-site/versions/existing".into());
+    let key = lab.key(&lab.fake.origins.token);
+    let access = access::check(
+        &lab.client(),
+        &lab.client(),
+        &key,
+        "fake-site",
+        1_700_000_000,
+    )
+    .unwrap();
+    assert_eq!(access.site, "fake-site");
+    assert_eq!(access.project, "fake-project");
+    let state = lab.fake.state();
+    assert_eq!(state.seen.len(), 3);
+    assert_eq!(state.seen[1].method, "GET");
+    assert_eq!(state.seen[1].target, "/v1beta1/projects/-/sites/fake-site");
+    assert!(state.seen[1].body.is_empty());
+    assert_eq!(
+        state.seen[2].target,
+        "/v3/projects/fake-project:testIamPermissions"
+    );
+    let request: Value = aterm_json::from_slice(&state.seen[2].body).unwrap();
+    assert_eq!(request, json!({"permissions":[access::UPDATE]}));
+    assert_eq!(
+        state.live.as_deref(),
+        Some("sites/fake-site/versions/existing")
+    );
+    assert!(state.configs.is_empty());
+    assert!(state.uploaded.is_empty());
+}
+
+#[test]
+fn access_check_refuses_missing_or_malformed_permission_and_site_data() {
+    for response in [
+        json!({}),
+        json!({"permissions":[]}),
+        json!({"permissions":"all"}),
+    ] {
+        let lab = Lab::new();
+        lab.fake.state().permissions = Some(response);
+        let key = lab.key(&lab.fake.origins.token);
+        assert!(
+            access::check(
+                &lab.client(),
+                &lab.client(),
+                &key,
+                "fake-site",
+                1_700_000_000
+            )
+            .is_err()
+        );
+        assert_eq!(lab.fake.state().seen.len(), 3);
+        assert!(lab.fake.state().live.is_none());
+    }
+    for name in [
+        "projects/-/sites/fake-site",
+        "projects/a%2fb/sites/fake-site",
+        "projects/real/sites/other-site",
+    ] {
+        let lab = Lab::new();
+        lab.fake.state().site_name = Some(name.into());
+        let key = lab.key(&lab.fake.origins.token);
+        assert!(
+            access::check(
+                &lab.client(),
+                &lab.client(),
+                &key,
+                "fake-site",
+                1_700_000_000
+            )
+            .is_err()
+        );
+        assert_eq!(lab.fake.state().seen.len(), 2, "no IAM call for {name}");
+    }
+}
+
+#[test]
+fn key_check_authenticates_without_touching_hosting() {
+    let lab = Lab::new();
+    lab.fake.state().live = Some("sites/fake-site/versions/existing".into());
+    let key = lab.key(&lab.fake.origins.token);
+    check_key(&lab.client(), &key, 1_700_000_000).unwrap();
+    let state = lab.fake.state();
+    assert_eq!(state.seen.len(), 1);
+    assert_eq!(state.seen[0].method, "POST");
+    assert_eq!(state.seen[0].target, "/token");
+    assert_eq!(
+        state.live.as_deref(),
+        Some("sites/fake-site/versions/existing")
+    );
+    assert!(state.configs.is_empty());
+    drop(state);
+    lab.fake.state().token_status = Some(403);
+    assert!(matches!(
+        check_key(&lab.client(), &key, 1_700_000_000),
+        Err(Failed::Credential(_))
+    ));
+    assert_eq!(lab.fake.state().seen.len(), 2);
+}
+
 /// The committed fixture's firebase.json, shaped as the site's own.
 fn fixture_config() -> String {
     std::fs::read_to_string(
@@ -690,6 +793,14 @@ fn what_the_deploy_cannot_express_is_refused_by_name() {
         (
             r#"{"hosting": {"public": "public", "headers": [{"source": "/a", "headers": [{"key": "A", "value": "1"}, {"key": "A", "value": "2"}]}]}}"#,
             "twice",
+        ),
+        (
+            r#"{"hosting": {"public": "public", "headers": [{"source": "/a", "headers": [{"key": "Cache-Control", "value": "1"}, {"key": "cache-control", "value": "2"}]}]}}"#,
+            "twice",
+        ),
+        (
+            r#"{"hosting": {"public": "public", "site": "  "}}"#,
+            "hosting.site",
         ),
         (
             r#"{"hosting": {"public": "public", "headers": [{"headers": [{"key": "A", "value": "b"}]}]}}"#,

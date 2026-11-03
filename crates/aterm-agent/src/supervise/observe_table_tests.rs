@@ -60,6 +60,11 @@ const ROWS: &[Row] = &[
         boxed: true,
     },
     Row {
+        name: "Claude in Chrome intro",
+        run: super::engine::observe_row_chrome_intro,
+        boxed: true,
+    },
+    Row {
         // The login dialog is the picker of aterm's own `/login`: observed, no `/login` goes, so
         // no picker of aterm's is drawn to decide.
         name: "login dialog",

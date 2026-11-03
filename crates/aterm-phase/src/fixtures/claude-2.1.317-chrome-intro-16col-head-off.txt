@@ -1,0 +1,60 @@
+# claude-code 2.1.317 · MEASURED 2026-11-03, `aterm ctl text` of a private headless aterm (16x59, aterm 0.150.0) running the real Claude Code, launched by path as `claude --chrome` with a scratch `CLAUDE_CONFIG_DIR` whose config never introduced Claude in Chrome, a stored fake claude.ai login (a Max plan's profile, so Claude in Chrome turns on) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab), [harness] enabled = false · the intro in the right half of a 33-column window split left/right (a 16-column pane, 59 rows), taller than the pane: its rule, title and first paragraphs scrolled off, the footer on four rows; every row of the screen kept
+  let you
+  control your
+  browser
+  directly
+  from Claude
+  Code. You
+  can navigate
+  websites,
+  fill forms,
+  capture
+  screenshots,
+  record
+  GIFs, and
+  debug with
+  console logs
+  and network
+  requests.
+
+  Requires the
+  Chrome
+  extension.
+  Get started
+  at
+  https://clau
+  de.ai/chrome
+
+  Site-level
+  permissions
+  are
+  inherited
+  from the
+  Chrome
+  extension.
+  Manage
+  permissions
+  in the
+  Chrome
+  extension
+  settings to
+  control
+  which sites
+  Claude can
+  browse,
+  click, and
+  type on.
+
+  For more
+  info, use
+  /chrome or
+  visit https:
+  //code.claud
+  e.com/docs/e
+  n/chrome
+
+  Enter to
+  confirm ·
+  Esc to
+  cancel
+

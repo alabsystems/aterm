@@ -523,12 +523,19 @@ pub fn build_is_complete(build_dir: &Path) -> bool {
     if is_provably_absent(build_dir) {
         return false;
     }
-    match std::fs::read_to_string(&marker) {
+    match crate::metadata_io::read_bounded_regular_utf8(&marker, 4 * 1024 * 1024) {
         Ok(text) => {
             ready_text_accepts(&text, &running_platform())
                 && ready_contents_accept(&text, build_dir)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => false,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            false
+        }
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => true,
         Err(_) => false,
     }
@@ -1026,15 +1033,18 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
         } else if let Some(v) = line.strip_prefix("at=") {
             let s = v.trim();
             let digits = s.strip_prefix('-').unwrap_or(s);
-            at = (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
-                .then(|| s.parse::<i64>().ok())
-                .flatten();
+            let canonical = !digits.is_empty()
+                && !(digits.len() > 1 && digits.starts_with('0'))
+                && s != "-0"
+                && digits.bytes().all(|b| b.is_ascii_digit());
+            at = canonical.then(|| s.parse::<i64>().ok()).flatten();
         } else if let Some(v) = line.strip_prefix("attempts=") {
             let s = v.trim();
-            attempts = (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-                .then(|| s.parse::<u32>().ok())
-                .flatten()
-                .filter(|n| *n >= 1);
+            attempts =
+                (!s.is_empty() && !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| s.parse::<u32>().ok())
+                    .flatten()
+                    .filter(|n| *n >= 1);
         } else if let Some(v) = line.strip_prefix("signer=") {
             signer = v.trim() == "1";
         } else if let Some(v) = line.strip_prefix("hold=") {
@@ -1048,6 +1058,9 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
         (None, Some(v)) => (DigestAlg::Sha512, v),
         _ => return None,
     };
+    if digest.is_empty() || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     Some(StageRefusal {
         alg,
         digest: digest.to_string(),
@@ -1204,13 +1217,6 @@ pub(crate) fn write_sidecar_durably(
     written
 }
 
-/// Remove the vendor record beside `build_dir`, if any.
-pub(crate) fn clear_vendor_sidecar(build_dir: &Path) {
-    if let Some(sidecar) = sidecar_path(build_dir, VENDOR_SIDECAR_SUFFIX) {
-        let _ = std::fs::remove_file(sidecar);
-    }
-}
-
 /// Forget every refusal recorded for `program`.
 pub fn clear_stage_refusals(layout: &Layout, program: &str) -> usize {
     if crate::ops::uninstall_name_shape(program).is_err() {
@@ -1312,7 +1318,11 @@ pub(crate) fn stage_scratch_of(name: &str) -> Option<(u64, Scratch)> {
         Some(pid) => (Scratch::Incoming, pid),
         None => (Scratch::Superseded, rest.strip_prefix("superseded-")?),
     };
-    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+    if pid.is_empty()
+        || pid.starts_with('0')
+        || !pid.bytes().all(|b| b.is_ascii_digit())
+        || pid.parse::<u32>().is_err()
+    {
         return None;
     }
     Some((build, kind))
@@ -1676,16 +1686,11 @@ pub(crate) fn discard_build(build_dir: &Path) {
     }
     crate::shim_env::remove_sidecar(build_dir);
     clear_stage_refusal(build_dir);
-    clear_vendor_sidecar(build_dir);
     clear_declared_modes(build_dir);
-    if let Some(unit) = sidecar_path(build_dir, crate::peers::UNIT_SUFFIX) {
-        let _ = std::fs::remove_file(unit);
-    }
-    if let Some(record) = sidecar_path(build_dir, EXPOSES_SUFFIX) {
-        let _ = std::fs::remove_file(record);
-    }
-    if let Some(record) = sidecar_path(build_dir, VERSION_SUFFIX) {
-        let _ = std::fs::remove_file(record);
+    for &suffix in STAGE_SIDECAR_SUFFIXES {
+        if let Some(record) = sidecar_path(build_dir, suffix) {
+            let _ = std::fs::remove_file(record);
+        }
     }
 }
 
@@ -2306,9 +2311,29 @@ mod tests {
         for bad in [
             text.replace("sha512=", "sha256=x\nsha512="),
             text.replace(&format!("sha512={sha512}\n"), ""),
+            text.replace(&format!("sha512={sha512}\n"), "sha512=not-hex\n"),
+            text.replace("attempts=1", "attempts=01"),
+            text.replace("at=2000", "at=02000"),
+            text.replace("at=2000", "at=-0"),
         ] {
             std::fs::write(&marker, &bad).unwrap();
             assert_eq!(stage_refusal(&build), None, "{bad}");
+        }
+        assert_eq!(
+            stage_scratch_of("17.incoming-42"),
+            Some((17, Scratch::Incoming))
+        );
+        assert_eq!(
+            stage_scratch_of("17.superseded-42"),
+            Some((17, Scratch::Superseded))
+        );
+        for bad_scratch in [
+            "17.incoming-0",
+            "17.incoming-042",
+            "17.incoming-+42",
+            "17.superseded-4294967296",
+        ] {
+            assert_eq!(stage_scratch_of(bad_scratch), None, "{bad_scratch}");
         }
         let _ = std::fs::remove_dir_all(&h);
     }
@@ -2555,8 +2580,17 @@ mod tests {
         assert_eq!(stage_refusal(&next), None, "the explicit door forgets it");
         record_stage_refusal(&next, sha256("dd"), "ee", "once more", 95_000).unwrap();
         std::fs::create_dir_all(next.join("bin")).unwrap();
+        for &suffix in STAGE_SIDECAR_SUFFIXES {
+            std::fs::write(sidecar_path(&next, suffix).unwrap(), b"x\n").unwrap();
+        }
         discard_build(&next);
         assert_eq!(stage_refusal(&next), None, "the discard takes it too");
+        for &suffix in STAGE_SIDECAR_SUFFIXES {
+            assert!(
+                !sidecar_path(&next, suffix).unwrap().exists(),
+                "discard_build must remove {suffix}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&h);
     }
 

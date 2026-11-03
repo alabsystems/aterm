@@ -4,7 +4,6 @@
 //! `<log_dir>/messages.log`, the durable half of the unified message system (docs/DESIGN-unified-messages-2026-09-21.md §3.7).
 
 use std::collections::VecDeque;
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -120,8 +119,8 @@ fn regular_len(path: &Path) -> Option<u64> {
 /// The last `tail` bytes of the regular file `path` as text, the partial first
 /// line of a cut dropped; `None` when it is not a regular file or unreadable.
 fn read_tail(path: &Path, tail: u64) -> Option<String> {
-    let bytes = regular_len(path)?;
-    let mut file = File::open(path).ok()?;
+    let mut file = crate::logging::open_regular_nonblock(path).ok()?;
+    let bytes = file.metadata().ok()?.len();
     let partial = bytes > tail;
     if partial {
         file.seek(SeekFrom::Start(bytes - tail)).ok()?;
@@ -567,7 +566,7 @@ mod tests {
 
     fn write_lines(path: &Path, lines: &[String]) {
         use std::io::Write as _;
-        let mut f = File::create(path).unwrap();
+        let mut f = std::fs::File::create(path).unwrap();
         for l in lines {
             f.write_all(l.as_bytes()).unwrap();
         }

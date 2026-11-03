@@ -46,7 +46,10 @@ pub const LOCK: &str = "align.lock";
 /// How long after a pass's attempt the next one is due on the same build and routes.
 pub const RECHECK: Duration = Duration::from_secs(30 * 60);
 
-/// Maximum random jitter before an automatic pass's first `sync.fleet` attempt (§7.1, C18).
+/// Maximum random jitter before an automatic pass's first `sync.fleet` attempt (§7.1, C18), on a
+/// Mac that holds a fleet key already ([`Ports::holds_fleet_key`]): every member re-joins at once
+/// after the vault rotates the code, and the jitter spreads that herd. A Mac in no fleet yet (one
+/// the vault just let in) joins at once; a burst of those lands on the capacity backoff alone.
 pub const FLEET_JOIN_JITTER_MAX: Duration = Duration::from_secs(120);
 
 /// Total wait budget (initial jitter plus capacity retries) for one `sync.fleet` apply (§12.3, C18).
@@ -331,6 +334,9 @@ pub enum FleetRead {
     Current(String),
     /// A sync would act: what it finds, in one line (never the secret).
     Due(String),
+    /// A sync leaves the fleet this Mac holds as it is (one joined by hand, one it issues, a key
+    /// it cannot read): why, and what a person does about it.
+    Blocked(String),
 }
 
 /// What a sync of the default ALab fleet did (`sync.fleet`'s apply).
@@ -577,6 +583,12 @@ pub trait Ports: Sync {
     }
     /// Pause this pass for `duration` (real sleep in `Live`, recorded or virtual-clock in tests).
     fn sleep(&self, duration: Duration);
+    /// Whether this Mac holds a fleet key already (it joined a fleet, so a `sync.fleet` re-joins
+    /// under a newer code and waits its join jitter first, [`FLEET_JOIN_JITTER_MAX`]). A Mac in
+    /// no fleet yet joins at once.
+    fn holds_fleet_key(&self) -> bool {
+        true
+    }
     /// Whether this process is the installed release aterm.app's (not a build, a renamed or held
     /// copy): only it re-lays the base layer.
     fn installed_release(&self) -> bool;
@@ -1036,7 +1048,7 @@ fn random_duration_up_to(max: Duration, fallback_seed: u64) -> Duration {
 
 fn sync_fleet_with_retry(ports: &dyn Ports, trigger: Trigger) -> Result<FleetDone, String> {
     let mut waited = Duration::ZERO;
-    if trigger != Trigger::Init {
+    if trigger != Trigger::Init && ports.holds_fleet_key() {
         let jitter = ports
             .random_wait(FLEET_JOIN_JITTER_MAX)
             .min(FLEET_JOIN_JITTER_MAX);
@@ -1270,6 +1282,7 @@ impl Item for Synced<'_> {
                     from,
                     to: "in the vault's default fleet".to_owned(),
                 },
+                FleetRead::Blocked(why) => Probe::Blocked { why },
             }),
             Kind::Node => read(self.ports.node(), |node| match node {
                 NodeRead::NotApplicable(why) => not_applicable(why),

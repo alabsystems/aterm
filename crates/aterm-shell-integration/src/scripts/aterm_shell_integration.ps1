@@ -90,12 +90,12 @@ if ($__aterm_word -and -not $env:EDITOR -and -not $env:VISUAL -and
 }
 Remove-Variable -Name __aterm_word -ErrorAction SilentlyContinue
 
-# While aterm installs Apple's Command Line Tools, `$env:ATERM_CLT_SHIM` names
-# the directory whose `git`, `cc` and kin say the tools are on their way instead
+# While Apple's Command Line Tools are missing, `$env:ATERM_CLT_SHIM` names
+# the directory whose `git`, `cc` and kin fail plainly instead
 # of raising Apple's install dialog, and its `.wanted` mark is there. A profile
 # can put `/usr/bin` back in front of it, so it moves to just ahead of the first
 # `/usr/bin` (else `/bin`): never ahead of a person's own earlier entry. Without
-# the mark nothing installs them: the shim is put back nowhere.
+# the mark the tools exist: the shim is put back nowhere.
 function Global:__aterm_clt_shim_place {
     $__aterm_dir = $env:ATERM_CLT_SHIM
     __aterm_clt_bash_env $__aterm_dir

@@ -100,6 +100,8 @@ struct FakeKernel {
     signals: RefCell<Vec<(i32, i32)>>,
     /// Whose environment was read, in order.
     markers_read: RefCell<Vec<i32>>,
+    /// One change after run-record admission, before the cleanup pass captures its uid table.
+    before_uid_table: RefCell<Option<Box<dyn FnOnce()>>>,
 }
 
 impl FakeKernel {
@@ -228,6 +230,9 @@ impl Kernel for FakeKernel {
         self.ttys.get(&dev).copied().unwrap_or(Some(false))
     }
     fn uid_pids(&self) -> Option<Vec<i32>> {
+        if let Some(change) = self.before_uid_table.borrow_mut().take() {
+            change();
+        }
         if self.unlisted {
             return None;
         }
@@ -669,6 +674,84 @@ fn the_dead_runs_window_closes_at_a_high_water_read_after_its_death() {
     assert_eq!(k.termed(), [71], "{lines:?}");
 }
 
+#[test]
+fn an_unrecorded_dead_seen_horizon_never_authorizes_cleanup() {
+    let mut k = FakeKernel::default();
+    with_me(&mut k, 5_000);
+    k.put(lin(71, 400, 500, 1), "/wt-a/target/debug/aterm");
+    k.markers.insert(71, verify_run(DEAD_ID));
+    let text = dead_record();
+    let dir = records(&[("41983-999.run", &text)]);
+    let path = dir.path().join("41983-999.run");
+    let saved = dir.path().join("41983-999.preserved");
+    let (changed_path, saved_path) = (path.clone(), saved.clone());
+    *k.before_uid_table.borrow_mut() = Some(Box::new(move || {
+        std::fs::rename(&changed_path, &saved_path).unwrap();
+        std::fs::create_dir(&changed_path).unwrap();
+    }));
+
+    let (ended, lines) = start_pass(dir.path(), &k);
+    let signals = k.signals.borrow().clone();
+    let markers = k.markers_read.borrow().clone();
+    let saved_text = std::fs::read_to_string(&saved).unwrap();
+    assert!(path.is_dir(), "the failed record path is retained");
+    assert_eq!(saved_text, text, "the admitted evidence is retained intact");
+    assert_eq!(ended, 0, "{lines:?}");
+    assert!(
+        signals.is_empty(),
+        "unrecorded horizon signaled {signals:?}"
+    );
+    assert!(
+        markers.is_empty(),
+        "cleanup began without a recorded horizon"
+    );
+}
+
+#[test]
+fn a_concurrent_first_dead_seen_horizon_limits_the_stale_cleanup_reader() {
+    let mut k = FakeKernel::default();
+    with_me(&mut k, 5_000);
+    k.put(lin(71, 400, 500, 1), "/wt-a/target/debug/aterm");
+    k.markers.insert(71, verify_run(DEAD_ID));
+    // An older member remains held, so even a successful cleanup pass retains the record.
+    k.put(lin(72, 320, 500, 1), "/wt-a/target/debug/aterm");
+    k.markers.insert(72, verify_run(DEAD_ID));
+    k.held.insert(72, Some(true));
+    let dir = records(&[("41983-999.run", &dead_record())]);
+    let path = dir.path().join("41983-999.run");
+    let winner_path = path.clone();
+    *k.before_uid_table.borrow_mut() = Some(Box::new(move || {
+        append(&winner_path, "dead_seen uniqueid=350 at=3").unwrap();
+        assert_eq!(
+            Record::parse(&std::fs::read_to_string(&winner_path).unwrap()).dead_seen,
+            Some(350),
+            "the first observer recorded its horizon before the stale reader continues"
+        );
+    }));
+
+    let (ended, lines) = start_pass(dir.path(), &k);
+    let signals = k.signals.borrow().clone();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let admitted = read_records(dir.path()).unwrap();
+    assert_eq!(
+        ended, 0,
+        "the later table cannot widen the first horizon: {lines:?}"
+    );
+    assert!(
+        signals.is_empty(),
+        "the earlier horizon excludes pid 71: {signals:?}"
+    );
+    assert_eq!(admitted.len(), 1, "the held member keeps its record");
+    assert_eq!(admitted[0].1.dead_seen, Some(350));
+    assert_eq!(admitted[0].1.dead_seen_ms, Some(3));
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("dead_seen "))
+            .count(),
+        1
+    );
+}
+
 /// A dead run's record is kept with `dead_seen` appended once while any member remains named or unjudged, and removed once nothing is left.
 #[test]
 fn a_dead_runs_record_stays_while_it_names_a_member() {
@@ -733,7 +816,7 @@ fn a_dead_runs_record_stays_while_it_names_a_member() {
         std::fs::write(&victim, "untouched\n").expect("victim");
         let link = dir.path().join("link.run");
         std::os::unix::fs::symlink(&victim, &link).expect("symlink");
-        append(&link, "dead_seen uniqueid=9 at=9");
+        assert!(append(&link, "dead_seen uniqueid=9 at=9").is_err());
         assert!(open_regular_write(&link, false).is_err());
         assert_eq!(
             std::fs::read_to_string(&victim).expect("victim"),

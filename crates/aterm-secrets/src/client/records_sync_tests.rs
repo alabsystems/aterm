@@ -4,12 +4,14 @@
 //! A member's record passes against a records server a test writes (`docs/DESIGN-fluid-swarm-
 //! 2026-10-28.md` §4.1 F13).
 
+use super::fan_out::held::HeldReads;
 use super::*;
 use crate::membership_log::untaken::chain::{Chain, carries, have_named};
 use crate::membership_log::{
     Body, Draft, Entrant, Evidence, Log, MemberId, Record, RecordId, decode_records,
     encode_records, with_kind_code,
 };
+use crate::server::RECORDS_PULLS_AT_ONCE;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -314,11 +316,12 @@ fn unused_peer_selection_does_not_advance_after_a_record_long_poll() {
         }]
     };
     let found = PeerDiscovery::supplied(&found);
-    sync_records_inner(&member, Some(Duration::ZERO), &[], Some(&found))
+    sync_records_inner(&member, Some(Duration::ZERO), &[], Some(&found), None)
         .expect("the primary answered its long poll");
     let after_poll = selections.load(Ordering::SeqCst);
     let reads_after_poll = peer_reads.load(Ordering::SeqCst);
-    sync_records_inner(&member, None, &[], Some(&found)).expect("a non-waiting pass asks peers");
+    sync_records_inner(&member, None, &[], Some(&found), None)
+        .expect("a non-waiting pass asks peers");
     let after_probe = selections.load(Ordering::SeqCst);
     let reads_after_probe = peer_reads.load(Ordering::SeqCst);
     peer.end();
@@ -409,6 +412,7 @@ fn bounded_member_records_pull_retains_verified_records_without_reposting() {
         &[],
         Some(&found),
         Some(Instant::now() + HANG_DETECTOR),
+        None,
     )
     .expect("bounded record pull");
     assert!(
@@ -420,6 +424,72 @@ fn bounded_member_records_pull_retains_verified_records_without_reposting() {
     assert_eq!(host.posts(), 0, "a bounded reader does not repost");
     host.end();
     fixture.host.end();
+}
+
+/// A records pass that waits on nothing asks the vault's peers beside its source, not after it:
+/// a source that answers nothing must not spend a bounded pass's deadline (a member's freshness
+/// read before it lets a Mac in, `readmit::FRESH_WITHIN`, inside the fleet listener's handshake
+/// watchdog) before any peer is asked, or one machine's being down keeps every Mac out.
+/// NEGATIVE CONTROL: asking the peers once the source's pull returned (the order before): the
+/// source holds its answer until a peer is asked, its pull runs out first, and the record only it
+/// sends is never taken.
+#[test]
+fn a_pass_that_waits_on_nothing_asks_the_peers_beside_its_source() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let mut fixture = lacking(root.path(), 400);
+    let late = fixture.mint(8);
+    let wire = encode_records(fixture.log.records());
+    let asked = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let peer_rings = Arc::clone(&asked);
+    let peer = RecordsHost::start(
+        Box::new(move |_| {
+            let (flag, bell) = &*peer_rings;
+            *flag.lock().unwrap() = true;
+            bell.notify_all();
+            (Vec::new(), false)
+        }),
+        400,
+    );
+    let source_waits = Arc::clone(&asked);
+    let source = RecordsHost::start(
+        Box::new(move |_| {
+            let (flag, bell) = &*source_waits;
+            let held = flag.lock().unwrap();
+            drop(bell.wait_timeout_while(held, HANG_DETECTOR, |asked| !*asked));
+            (wire.clone(), true)
+        }),
+        400,
+    );
+    let mut moved = configured(&fixture.member).unwrap();
+    moved.source = Source::Url(source.url("team"));
+    save_config(&fixture.member, &moved).unwrap();
+    let found = |_: &Config| {
+        vec![crate::discover::DiscoveredVault {
+            url: peer.url("team"),
+            txt: None,
+        }]
+    };
+    let found = PeerDiscovery::supplied(&found);
+    let pass = sync_records_until(
+        &fixture.member,
+        None,
+        &[],
+        Some(&found),
+        Some(Instant::now() + HANG_DETECTOR),
+        None,
+    );
+    let taken = load_records(&fixture.member)
+        .unwrap()
+        .complete_bytes(late.id())
+        .is_some();
+    peer.end();
+    source.end();
+    fixture.host.end();
+    pass.expect("the bounded pass");
+    assert!(
+        taken,
+        "the source's answer, sent once a peer was asked, is taken"
+    );
 }
 
 /// A server that cannot take a member's frontier (a record its build refuses, a store at its
@@ -1260,13 +1330,13 @@ fn a_member_whose_server_holds_records_it_cannot_take_lets_no_key_in_by_proof() 
     save_state(m22, &state).expect("m22's state follows its source");
     let _answering = ServersAnswering::set();
 
-    let first = sync_records_until(m22, None, &[], None, None);
+    let first = sync_records_until(m22, None, &[], None, None, None);
     assert!(
         !first.as_ref().is_ok_and(|pass| !pass.untaken),
         "a periodic pass takes nothing of a stream of nothing this build reads: {first:?}"
     );
     assert_eq!(
-        sync_records_until(m22, None, &[], None, None).expect("a periodic pass"),
+        sync_records_until(m22, None, &[], None, None, None).expect("a periodic pass"),
         RecordsPass {
             added: 0,
             untaken: true,
@@ -1279,6 +1349,8 @@ fn a_member_whose_server_holds_records_it_cannot_take_lets_no_key_in_by_proof() 
         node: n7,
         name: "m7",
         fleet: false,
+        lan: false,
+        fresh: false,
         book: Book {
             node_id_held_out: false,
             node_id_seated: false,
@@ -1380,7 +1452,7 @@ fn a_peer_that_holds_a_record_this_build_cannot_read_sends_it_once() {
     let found = PeerDiscovery::supplied(&found);
 
     for pass in 1..=3 {
-        let result = sync_records_inner(&member, None, &[], Some(&found));
+        let result = sync_records_inner(&member, None, &[], Some(&found), None);
         assert!(matches!(result, Ok(0)), "pass {pass}: {result:?}");
     }
     let answers = peer.answers();
@@ -1609,4 +1681,138 @@ fn a_whole_repost_carries_complete_records_only() {
         "the whole re-post carried a waiting record"
     );
     assert_eq!(posted, vec![*genesis.id(), *complete.id()]);
+}
+
+/// The two `GET`s of `/records` a pass makes of a peer whose answer is longer than its peek,
+/// each answered `200` with `body`: the first at once, which the pass hangs up on once it sees
+/// the length, and the second, the whole read, once `held` lets it go. Each request line, in
+/// order.
+fn serve_twice(held: &HeldReads, listener: TcpListener, body: &[u8]) -> Vec<String> {
+    listener.set_nonblocking(true).expect("nonblocking");
+    let mut lines = Vec::new();
+    for read in 0..2 {
+        let mut stream = aterm_spec::wait::until_within(HANG_DETECTOR, "the pass's GET", || {
+            listener.accept().ok().map(|(stream, _)| stream)
+        });
+        stream.set_nonblocking(false).expect("blocking");
+        let (line, _) = read_request(&mut stream).expect("a request");
+        lines.push(line);
+        if read == 0 {
+            held.peeks.fetch_add(1, Ordering::SeqCst);
+        } else {
+            held.hold();
+        }
+        let mut reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        reply.extend_from_slice(body);
+        // The pass hangs up on the first answer once it sees the length: the rest goes nowhere.
+        let _ = stream.write_all(&reply);
+    }
+    lines
+}
+
+/// A records pass reads at most [`RECORDS_PULLS_AT_ONCE`] of its peers' answers longer than its
+/// peek ([`fan_out::RECORDS`]) whole at once, however many peers it asks, and still takes the
+/// records such an answer brings: every answer is read first under the peek, all at once, and
+/// only one longer than that is asked again and read whole, under a slot held until the pass has
+/// judged its records. Before, every peer's answer was read whole at once, on a thread of its
+/// own, and held until all of them had ended, so a LAN host that advertised
+/// [`crate::discover::MAX_CANDIDATES`] instances of itself, each answering with 64 MiB, could have
+/// a pass hold up to a gigabyte of records nothing had verified. Here each of 16 peers answers its first read
+/// with more than the peek and holds its whole read until the test lets it go; one of them sends
+/// the records the member lacks, the rest bytes that are no records.
+///
+/// NEGATIVE CONTROL: the peers read with as many slots as a browse names (`fan_out::Reads {
+/// at_once: crate::discover::MAX_CANDIDATES, ..fan_out::RECORDS }` in `sync_records_until`'s
+/// `fetch_peers`): more whole reads in flight at once than 2, "whole reads in flight at once"
+/// (`left: 7, right: 2` in one run; any count over 2 fails it). The whole read held to the peek
+/// (`read_by(url, reads.peek)` in `fan_out::reads_within`'s slotted arm): the long answer is lost,
+/// "the records the long answer brought".
+#[test]
+fn a_records_pass_reads_at_most_two_peers_long_answers_whole_at_once() {
+    const PEERS: usize = crate::discover::MAX_CANDIDATES;
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let mut fixture = lacking(root.path(), 400);
+    // Records past the member's store, more of them than the peek reads.
+    let mut lacked = Vec::new();
+    let mut n = 7;
+    while encode_records(&lacked).len() <= fan_out::RECORDS.peek {
+        for _ in 0..64 {
+            lacked.push(fixture.mint(n));
+            n += 1;
+        }
+    }
+    let bodies: Vec<Vec<u8>> = (0..PEERS)
+        .map(|peer| {
+            if peer == 0 {
+                encode_records(&lacked)
+            } else {
+                vec![0xa5; fan_out::RECORDS.peek + 1]
+            }
+        })
+        .collect();
+    let listeners: Vec<TcpListener> = (0..PEERS)
+        .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let urls: Vec<String> = listeners
+        .iter()
+        .map(|listener| format!("http://{}/v1/team", listener.local_addr().expect("addr")))
+        .collect();
+    let found = PeerDiscovery::selected(&urls);
+    let held = HeldReads::new(fan_out::RECORDS);
+    let (counted, asked) = std::thread::scope(|scope| {
+        let held = &held;
+        let peers: Vec<_> = listeners
+            .into_iter()
+            .zip(&bodies)
+            .map(|(listener, body)| scope.spawn(move || serve_twice(held, listener, body)))
+            .collect();
+        let counted = held.count(PEERS, || {
+            // Every server it reads is its own on loopback, which answers.
+            let _answering = ServersAnswering::set();
+            sync_records_until(&fixture.member, None, &[], Some(&found), None, None)
+        });
+        let asked: Vec<Vec<String>> = peers
+            .into_iter()
+            .map(|peer| peer.join().expect("a peer"))
+            .collect();
+        (counted, asked)
+    });
+    fixture.host.end();
+    assert_eq!(
+        counted.seen.in_flight, RECORDS_PULLS_AT_ONCE,
+        "whole reads in flight at once"
+    );
+    assert_eq!(
+        counted.seen.waiting,
+        PEERS - RECORDS_PULLS_AT_ONCE,
+        "whole reads waiting for a slot"
+    );
+    assert_eq!(counted.most, RECORDS_PULLS_AT_ONCE);
+    assert_eq!(
+        held.peeks.load(Ordering::SeqCst),
+        PEERS,
+        "every peer's answer read under the peek first"
+    );
+    for lines in &asked {
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for line in lines {
+            assert!(
+                line.starts_with("GET ") && line.contains("/records"),
+                "{line}"
+            );
+        }
+    }
+    let pass = counted.result.expect("the pass");
+    let store = load_records(&fixture.member).expect("the member's store");
+    assert!(
+        lacked
+            .iter()
+            .all(|record| store.complete_bytes(record.id()).is_some()),
+        "the records the long answer brought"
+    );
+    assert_eq!(pass.added, lacked.len());
 }

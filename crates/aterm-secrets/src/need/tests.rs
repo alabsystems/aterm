@@ -391,6 +391,33 @@ fn the_catalog_answers_what_no_mac_can_give_and_names_every_want_once() {
 }
 
 #[test]
+fn mailbox_component_wants_are_exact_and_preserve_legacy_requests() {
+    use crate::mailbox_component::{Component, Part};
+    let component = Component::for_mailbox(
+        "https://mail.example",
+        "owner@example",
+        Part::SecondPassword,
+    )
+    .unwrap();
+    let want = Want::MailboxComponent(component);
+    assert_eq!(Want::parse(&want.key()).unwrap(), want);
+    assert_eq!(want.entries(), vec![component.entry()]);
+    assert_eq!(want.class(), Class::VaultOnly);
+    assert!(want.posted() && want.person_sourced());
+    assert_eq!(
+        Want::Mailbox("m29".into()).entries(),
+        vec!["m29_password", "m29_totp"]
+    );
+    let ask = ask_for(&want, Purpose::HarnessSignIn, HOST).unwrap();
+    assert!(!ask.needs_you.contains("Claude"));
+    let mut need = fresh([3; 16], want, Purpose::HarnessSignIn, &bare_facts());
+    need.state = State::AwaitingPerson;
+    need.asking = true;
+    need.ask = Some(ask);
+    assert!(exception(&need).unwrap().message().is_ok());
+}
+
+#[test]
 fn the_hold_probe_names_only_the_catalog_path_whatever_the_environment_says() {
     let home = std::path::Path::new("/Users//someone");
     assert_eq!(

@@ -23,13 +23,13 @@ pub enum Lane {
     MainTarget,
     /// Target directory for stages awaiting [`StageId::TestCompile`] alongside [`StageId::Test`].
     AfterCompile,
-    /// `<target>/verify/.ubd/tippy.noindex` for lint builds ([`lanes_dir`]).
+    /// `tippy.noindex` under [`lanes_dir`] for lint builds.
     TippyTarget,
-    /// `<target>/verify/.ubd/checkers.noindex` for `--features aterm-spec/checkers` test builds.
+    /// `checkers.noindex` under [`lanes_dir`] for `--features aterm-spec/checkers` test builds.
     CheckersTarget,
-    /// `<target>/verify/.ubd/trust.noindex` for `ship check --export` release tools.
+    /// `trust.noindex` under [`lanes_dir`] for `ship check --export` release tools.
     TrustTarget,
-    /// `<target>/verify/.ubd/cells.noindex` for cross-target cells, wasm modules, and browser runs.
+    /// `cells.noindex` under [`lanes_dir`] for cross-target cells, wasm modules, and browser runs.
     CellsTarget,
     /// `<root>/libc-oracle/target.noindex` for the per-checkout libc oracle workspace.
     LibcOracleTarget,
@@ -149,13 +149,17 @@ pub struct StageSpec {
     pub part: Option<crate::shape::Part>,
 }
 
-/// The side lanes' build directories ([`SIDE_LANES`]), each `*.noindex`, live in
-/// `<target>/verify/.ubd`, a folder whose file events fseventsd drops (`aterm_tempfile::QUIET`):
+/// The side lanes' build directories ([`SIDE_LANES`]), each `*.noindex`, live under
+/// the managed build cache when the shim selects it, so removing a worktree does not
+/// discard its expensive compiler artifacts. Caller-selected layouts keep them in
+/// `<target>/verify/.ubd`. Both use a folder whose file events fseventsd drops (`aterm_tempfile::QUIET`):
 /// one checkout's lint lane gave it 4,983 file events in a 10-minute census, and a lane under
 /// `.ubd` gives it none.
 #[must_use]
 pub fn lanes_dir(ctx: &Ctx) -> PathBuf {
-    ctx.state_dir().join(aterm_tempfile::QUIET)
+    ctx.cached_lanes_dir
+        .clone()
+        .unwrap_or_else(|| ctx.state_dir().join(aterm_tempfile::QUIET))
 }
 
 /// The side lanes' names, each a `<name>.noindex` directory in [`lanes_dir`].
@@ -241,6 +245,9 @@ pub fn named_skip(ctx: &Ctx, id: StageId) -> bool {
 #[must_use]
 pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     let mut wanted = crate::checks::stages_of(&ctx.checks);
+    if ctx.compile_only {
+        wanted.retain(|id| matches!(id, StageId::TestCompile | StageId::CheckersCompile));
+    }
     if ctx.cursor_pacing {
         wanted.retain(|id| *id == StageId::GuiSmoke);
     }
@@ -252,6 +259,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         .filter(|s| wanted.contains(&s.id))
         .collect();
     let present: Vec<StageId> = v.iter().map(|s| s.id).collect();
+    let measures = present.contains(&StageId::MeasuringTests);
     let records = ctx
         .memory
         .as_ref()
@@ -259,6 +267,9 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     let mut planned = Vec::with_capacity(v.len());
     for mut s in v {
         s.after_stages.retain(|id| present.contains(id));
+        if measures && matches!(s.id, StageId::RedrawConformance | StageId::ObjcDrives) {
+            s.exclusive = true;
+        }
         if let (Some(book), Some((records, plain))) = (&ctx.memory, &records)
             && !named_skip(ctx, s.id)
         {
@@ -456,12 +467,8 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
             "measuring rows' compile (paint, spin, aos and rewind, --no-run)",
             Lane::MainTarget,
         ),
-        exclusive(
-            StageId::MeasuringTests,
-            "measuring tests (paint, spin, aos and rewind over the handed bundle; run alone)",
-            Lane::MainTarget,
-        ),
-        exclusive(StageId::GuiSmoke, "gui typing-pacing smoke", Lane::Pure),
+        // Report live UI defects before the longer performance matrices. The
+        // planner isolates these when the run also selects measurements.
         spec(
             StageId::RedrawConformance,
             "control redraw conformance (a select repaints a real window)",
@@ -473,6 +480,12 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
              AppKit)",
             Lane::MainTarget,
         ),
+        exclusive(
+            StageId::MeasuringTests,
+            "measuring tests (paint, spin, aos and rewind over the handed bundle; run alone)",
+            Lane::MainTarget,
+        ),
+        exclusive(StageId::GuiSmoke, "gui typing-pacing smoke", Lane::Pure),
         exclusive(
             StageId::CodexAlabProof,
             "codex-alab proof (the native harness end to end on the real package; run alone)",
@@ -630,6 +643,52 @@ mod tests {
         atpkg::platform::set_file_flags(&stuck, 0).expect("the flag off");
         assert_eq!(retire(), Vec::<String>::new());
         assert!(aside.symlink_metadata().is_err(), "the aside went");
+    }
+
+    #[test]
+    fn compile_only_uses_the_normal_test_compile_without_running_tests() {
+        let normal = ctx(&[Check::Test], Scope::Workspace);
+        let expected = plan(&normal)
+            .into_iter()
+            .find(|s| s.id == StageId::TestCompile)
+            .unwrap();
+        let focused = normal.with_compile_only(true);
+        let planned = plan(&focused);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].id, expected.id);
+        assert_eq!(planned[0].mem, expected.mem);
+        assert_eq!(
+            focused.rerun(Check::Test),
+            "targo --unverified verify test --all --compile-only"
+        );
+        assert!(
+            plan(&ctx(&[Check::Test], Scope::Workspace))
+                .iter()
+                .any(|s| s.id == StageId::Test)
+        );
+    }
+
+    #[test]
+    fn compile_only_keeps_both_test_modes_and_neither_runtime() {
+        let full = ctx(&[Check::Test, Check::Checkers], Scope::Workspace);
+        let expected: Vec<_> = plan(&full)
+            .into_iter()
+            .filter(|s| matches!(s.id, StageId::TestCompile | StageId::CheckersCompile))
+            .map(|s| (s.id, s.mem, s.lane))
+            .collect();
+        let focused = full.with_compile_only(true);
+        let actual: Vec<_> = plan(&focused)
+            .into_iter()
+            .map(|s| (s.id, s.mem, s.lane))
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 2);
+        assert!(focused.rerun(Check::Checkers).ends_with(" --compile-only"));
+        assert!(
+            plan(&ctx(&[Check::Test, Check::Checkers], Scope::Workspace))
+                .iter()
+                .any(|s| s.id == StageId::SpecCheckers)
+        );
     }
 
     /// A run that measures memory plans each stage's claim from its book: the test compile its
@@ -922,12 +981,14 @@ mod tests {
         let at = |id| p.iter().position(|s| s.id == id).expect("planned");
         let prebuild = at(StageId::MeasurePrebuild);
         let barrier = p.iter().position(|s| s.exclusive).expect("a barrier");
-        assert_eq!(p[barrier].id, StageId::MeasuringTests);
+        assert_eq!(p[barrier].id, StageId::RedrawConformance);
         assert!(prebuild < barrier && !p[prebuild].exclusive);
         assert_eq!(p[prebuild].lane, Lane::MainTarget);
         assert_eq!(p[barrier].lane, Lane::MainTarget);
         for id in [StageId::RedrawConformance, StageId::ObjcDrives] {
-            assert!(barrier < at(id), "{id:?} runs behind the barrier");
+            assert!(barrier <= at(id), "{id:?} runs at or behind the barrier");
+            assert!(at(id) < at(StageId::MeasuringTests));
+            assert!(p[at(id)].exclusive);
             assert_eq!(p[at(id)].lane, Lane::MainTarget, "{id:?}");
         }
         assert_eq!(
@@ -938,6 +999,32 @@ mod tests {
                 StageId::GuiSmoke
             ]
         );
+    }
+
+    #[test]
+    fn appkit_failure_is_observed_before_measurements_and_all_checks_still_run() {
+        let stages = plan(&ctx(&[Check::Appkit, Check::Measure], Scope::workspace()));
+        let seen = std::sync::Mutex::new(Vec::new());
+        let reports = crate::sched::run_stages(
+            &stages,
+            u64::MAX,
+            |stage, _| {
+                seen.lock().unwrap().push(stage.id);
+                let mut report = crate::ladder::Report::new(stage.title.clone());
+                if stage.id == StageId::ObjcDrives {
+                    report.fail("fixture: toolbar state missing");
+                } else {
+                    report.pass("fixture");
+                }
+                report
+            },
+            |_, _| {},
+        );
+        let seen = seen.into_inner().unwrap();
+        let position = |id| seen.iter().position(|seen| *seen == id).unwrap();
+        assert!(position(StageId::ObjcDrives) < position(StageId::MeasuringTests));
+        assert_eq!(reports.len(), stages.len());
+        assert_eq!(seen.len(), stages.len());
     }
 
     #[test]

@@ -88,7 +88,7 @@ fn discover_root() -> Result<PathBuf, String> {
         &std::env::current_dir().map_err(|e| format!("cannot read the current directory: {e}"))?;
     loop {
         let manifest = dir.join("Cargo.toml");
-        if let Ok(text) = std::fs::read_to_string(&manifest)
+        if let Ok(text) = aterm_forge::read_regular_text(&manifest)
             && text.contains("[workspace]")
             && text.contains("members")
         {

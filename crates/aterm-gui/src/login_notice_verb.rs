@@ -121,6 +121,7 @@ pub(crate) fn notes(asked: &Asked, sid: &str) -> Vec<HostNote> {
             none_soon: false,
             wrong,
             no_sign_in: Vec::new(),
+            clock: None,
         })
     };
     match asked {

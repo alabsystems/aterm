@@ -42,6 +42,7 @@ pub(super) struct BoundProgress {
     born: Option<u64>,
     state: Option<PathBuf>,
     labels: BTreeSet<String>,
+    rows: Arc<[accounts::Row]>,
     policy: Arc<()>,
     /// The exact gate recheck, independent of displayed wall time. Normal decisions have none.
     pub(super) execution_until: Option<Instant>,
@@ -138,6 +139,25 @@ fn pause_progress(value: &mut AccountProgress, off: bool, current_work: bool) {
     );
 }
 
+fn retire_judgment(value: &mut AccountProgress, point: AccountPoint) {
+    use aterm_agent::harness::account_progress::{
+        BINDINGS_CHANGED_FINDING, RECOVERY_HISTORY_PREFIX,
+    };
+    if value.phase != ProgressPhase::Disabled {
+        value.phase = ProgressPhase::Unknown;
+    }
+    // A stale Resume cannot clear the independently observed provider wall.
+    value.wall = wall_name(point).map(str::to_owned);
+    value.eligible = None;
+    value.next_at = None;
+    for detail in &mut value.details {
+        if !detail.starts_with(RECOVERY_HISTORY_PREFIX) {
+            *detail = format!("{RECOVERY_HISTORY_PREFIX}{detail}");
+        }
+    }
+    value.details.insert(0, BINDINGS_CHANGED_FINDING.into());
+}
+
 fn replace_execution_progress(kept: &mut Kept, next: Option<BoundProgress>, now: Instant) -> bool {
     let same = match (&kept.account.execution_progress, &next) {
         (Some(old), Some(new)) => {
@@ -146,6 +166,7 @@ fn replace_execution_progress(kept: &mut Kept, next: Option<BoundProgress>, now:
                 && old.value == new.value
                 && old.state == new.state
                 && old.labels == new.labels
+                && old.rows == new.rows
         }
         (None, None) => true,
         _ => false,
@@ -174,6 +195,7 @@ impl BoundProgress {
         if self.born.is_some() {
             self.state = Some(seat.state.clone());
             self.labels = roster.rows.iter().map(|row| row.label.clone()).collect();
+            self.rows = roster.rows.clone().into();
         }
     }
 
@@ -299,6 +321,7 @@ fn wait_deadline(now: i64, wait: Duration) -> Option<i64> {
 fn apply_login_activity(
     value: &mut AccountProgress,
     labels: &BTreeSet<String>,
+    rows: &[accounts::Row],
     activity: Vec<aterm_agent::harness::accounts_sync::LoginActivity>,
     now: i64,
 ) {
@@ -306,6 +329,15 @@ fn apply_login_activity(
         .into_iter()
         .filter(|entry| labels.contains(&entry.label))
     {
+        let mut candidates = rows.iter().filter(|row| row.label == entry.label);
+        let Some(row) = candidates.next() else {
+            continue;
+        };
+        // A reused label can name a different login. All activity claims belong
+        // to the worker's captured row, including its route and retry clock.
+        if candidates.next().is_some() || !entry.matches_row(row) {
+            continue;
+        }
         if entry.observed_at > 0 && entry.observed_at <= now {
             value
                 .details
@@ -314,6 +346,12 @@ fn apply_login_activity(
                 "Activity at {}",
                 aterm_agent::harness::usage::rfc3339_utc(entry.observed_at),
             ));
+        }
+        if let Some(diagnostic) = entry.diagnostic.as_ref().filter(|diagnostic| {
+            !entry.active && diagnostic.completed_at > 0 && diagnostic.completed_at <= now
+        }) && diagnostic.matches_row(row)
+        {
+            value.login_diagnostics.push(diagnostic.clone());
         }
         if entry.active
             && !matches!(
@@ -361,6 +399,7 @@ impl WorkerIdle {
             born,
             state: None,
             labels: BTreeSet::new(),
+            rows: Arc::from([]),
             policy,
             execution_until: None,
             value: AccountProgress::unknown(now),
@@ -464,6 +503,7 @@ impl WorkerIdle {
             born,
             state: None,
             labels: BTreeSet::new(),
+            rows: Arc::from([]),
             policy: Arc::clone(&request.turn.progress_policy),
             execution_until: None,
             value,
@@ -492,6 +532,7 @@ impl WorkerIdle {
             }
         };
         bound.labels = roster.rows.iter().map(|r| r.label.clone()).collect();
+        bound.rows = roster.rows.clone().into();
         bound.value.known = Some(roster.rows.len());
         let Some(who) = exec_login(&self.hooks, &bound.snapshot) else {
             bound
@@ -519,10 +560,7 @@ impl WorkerIdle {
                 (Some(&judged.point), Some(&mut judged.identities))
             }
             Some(_) => {
-                bound
-                    .value
-                    .details
-                    .push(aterm_agent::harness::account_progress::BINDINGS_CHANGED_FINDING.into());
+                retire_judgment(&mut bound.value, point);
                 (None, None)
             }
             None => (None, None),
@@ -696,6 +734,7 @@ impl HostHandle {
         };
         let state = activity_context.state.clone();
         let labels = activity_context.labels.clone();
+        let rows = Arc::clone(&activity_context.rows);
         let mut current_work = false;
         if bound.born.is_some() {
             if let Some(flying) = kept.account.flying.as_ref().filter(|flying| {
@@ -753,7 +792,7 @@ impl HostHandle {
             let gate_deadline = execution_until.is_some().then_some(value.next_at);
             let activity = activity(&accounts::Store::at(&state), accounts::Cli::Claude, now);
             match activity {
-                Some(activity) => apply_login_activity(&mut value, &labels, activity, now),
+                Some(activity) => apply_login_activity(&mut value, &labels, &rows, activity, now),
                 None if execution_active => activity_contended = true,
                 None => return Err(()),
             }

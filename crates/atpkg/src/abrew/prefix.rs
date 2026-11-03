@@ -353,6 +353,11 @@ impl Prefix {
                     if is_staging_name(&version) {
                         continue;
                     }
+                    // brew's per-cask metadata container is
+                    // not an installed version.
+                    if kind == Kind::Cask && version == ".metadata" {
+                        continue;
+                    }
                     if !super::valid_cask_version(&version)
                         || !owned_receipt(&row.path(), kind, &name, &version)
                     {
@@ -426,6 +431,22 @@ impl Prefix {
             && std::fs::symlink_metadata(&keg).is_ok_and(|metadata| metadata.file_type().is_dir())
             && owned_receipt(&keg, Kind::Formula, name, &version))
         .then_some(version)
+    }
+
+    /// brew's `Formula#linked?`: the linked-keg record exists.
+    #[must_use]
+    pub fn linked_keg_exists(&self, name: &str) -> bool {
+        super::valid_component(name) && self.root.join("var/homebrew/linked").join(name).exists()
+    }
+
+    /// The version the linked-keg record points at, when linked.
+    #[must_use]
+    pub fn linked_keg_version(&self, name: &str) -> Option<String> {
+        if !super::valid_component(name) {
+            return None;
+        }
+        let target = std::fs::read_link(self.root.join("var/homebrew/linked").join(name)).ok()?;
+        target.file_name()?.to_str().map(str::to_owned)
     }
 
     #[must_use]
@@ -1006,6 +1027,66 @@ pub(super) fn receipt_word(dir: &Path, key: &str) -> Option<String> {
         .get(key)
         .and_then(aterm_json::Value::as_str)
         .map(str::to_string)
+}
+
+/// The keg tab's `used_options` names (leading dashes stripped,
+/// as brew's `Option#name`), for `bundle dump` args.
+pub(super) fn receipt_used_options(dir: &Path) -> Vec<String> {
+    let Ok(bytes) =
+        crate::metadata_io::read_bounded_regular(&dir.join("INSTALL_RECEIPT.json"), 64 * 1024)
+    else {
+        return Vec::new();
+    };
+    let Ok(receipt) = aterm_json::from_slice::<aterm_json::Value>(&bytes) else {
+        return Vec::new();
+    };
+    receipt
+        .get("used_options")
+        .and_then(aterm_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(aterm_json::Value::as_str)
+                .map(|flag| {
+                    flag.strip_prefix("--")
+                        .or_else(|| flag.strip_prefix('-'))
+                        .unwrap_or(flag)
+                        .to_owned()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Reads boolean field `key` from `INSTALL_RECEIPT.json` in
+/// `dir` (brew tabs store real booleans; abrew receipts may
+/// store the string form).
+pub(super) fn receipt_bool(dir: &Path, key: &str) -> Option<bool> {
+    let bytes =
+        crate::metadata_io::read_bounded_regular(&dir.join("INSTALL_RECEIPT.json"), 64 * 1024)
+            .ok()?;
+    let receipt = aterm_json::from_slice::<aterm_json::Value>(&bytes).ok()?;
+    let value = receipt.get(key)?;
+    value
+        .as_bool()
+        .or_else(|| value.as_str().map(|s| s == "true"))
+}
+
+/// The keg tab's recorded runtime dependency full names, when
+/// the receipt carries the list (`bundle dump` graph input).
+pub(super) fn receipt_runtime_deps(dir: &Path) -> Option<Vec<String>> {
+    let bytes =
+        crate::metadata_io::read_bounded_regular(&dir.join("INSTALL_RECEIPT.json"), 1024 * 1024)
+            .ok()?;
+    let receipt = aterm_json::from_slice::<aterm_json::Value>(&bytes).ok()?;
+    let items = receipt.get("runtime_dependencies")?.as_array()?;
+    Some(
+        items
+            .iter()
+            .filter_map(|d| d.get("full_name").and_then(aterm_json::Value::as_str))
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
 /// Replace one string-valued receipt word in place, preserving
@@ -1608,6 +1689,23 @@ mod tests {
         std::fs::create_dir_all(&stray).unwrap();
         let checked = p.installed_checked(Kind::Formula).unwrap();
         assert_eq!(checked[0].versions, vec!["2.12.3".to_string()]);
+        // A brew-layout caskroom keeps its metadata beside the
+        // installed version; the checked census must skip it.
+        let cask_dir = p.cask_dir("demo", "1.0");
+        std::fs::create_dir_all(&cask_dir).unwrap();
+        p.write_receipt(
+            &cask_dir,
+            &[
+                ("installed_by", "abrew"),
+                ("token", "demo"),
+                ("version", "1.0"),
+            ],
+        )
+        .unwrap();
+        std::fs::create_dir_all(p.caskroom().join("demo/.metadata/1.0")).unwrap();
+        let casks = p.installed_checked(Kind::Cask).unwrap();
+        assert_eq!(casks.len(), 1);
+        assert_eq!(casks[0].versions, vec!["1.0".to_string()]);
     }
 
     /// macOS and Linux only: the restore publishes by an atomic directory

@@ -43,6 +43,8 @@ pub mod admission;
 pub mod entries;
 mod eval;
 pub mod genesis;
+#[cfg(unix)]
+pub(crate) mod history;
 pub mod store;
 #[cfg(unix)]
 pub(crate) mod untaken;
@@ -55,6 +57,34 @@ pub use entries::{
 pub use eval::{Member, Membership, NodeStanding, Quorum, Removal, Undo};
 pub use genesis::Proof;
 pub use store::{MAX_RECORDS_STREAM, Store, decode_records, encode_records};
+
+/// Exercise the actual quorum grounder at its current maximum candidate count for heap tests.
+///
+/// # Panics
+/// The relation layout refuses the current bound, or the abstract verdict differs from its
+/// known result (all candidates for an empty relation, only candidate zero for a dense order).
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn quorum_relations_allocation_probe(dense: bool) -> usize {
+    eval::allocation_probe(dense)
+}
+
+/// Prepare real candidate-derived authorization states before a test measures their results.
+/// The callback's operation retains its memo and every result through a checksum, then drops
+/// them. Graph, states, ancestry and scratch allocation happen before the callback.
+///
+/// # Panics
+/// `states` is zero or exceeds the distinct membership-void states of holding candidates.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn with_authorization_allocation_probe(
+    log: &Log,
+    states: usize,
+    observe: impl FnOnce(&mut dyn FnMut() -> usize),
+) {
+    eval::with_authorization_allocation_probe(&log.order, states, observe);
+}
 
 /// Which audience an [`Body::Epoch`], [`Body::Put`] or [`Body::Delete`] seals.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -107,6 +137,8 @@ const MAGIC: &[u8; 4] = b"ALM1";
 const VERSION: u8 = 1;
 /// Where a record's kind byte sits: after the magic, the layout version and the network.
 const KIND_AT: usize = 4 + 1 + 32;
+/// Bytes through the parent-count field, before the variable parent list.
+const FRAME_PREFIX_LEN: usize = 4 + 1 + 32 + 1 + 48 + 8 + 32 + 1;
 const SIGNING_DOMAIN: &[u8] = b"aterm/members/record/1\0";
 /// The largest record [`Record::decode`] reads: a 1 MiB secret value (`Put`) plus headers fits
 /// with room.
@@ -184,8 +216,10 @@ pub enum Evidence {
     Phrase,
     /// No phrase: the admitting member decided by itself. A person's `aterm secrets approve
     /// <code>` on the member, or (since 0.148) the Mac proved to the member, on a fresh
-    /// challenge, the fleet node key the log binds to its seat or the fleet's current key
-    /// (`client::readmit`). 0.147 readers know this code, so no new evidence was needed.
+    /// challenge, the fleet node key the log binds to its seat or the fleet's current key, or
+    /// (since 0.150) its device key from the member's home ALab LAN, which the owner's
+    /// 2026-11-02 ruling makes sufficient proof (`client::readmit`). 0.147 readers know this
+    /// code, so no new evidence was needed.
     Manual,
     /// No person: the genesis lists the Mac's recipient with no binding, under the label the
     /// `Admit` carries, and the Mac proved its device key to the member by the possession
@@ -626,9 +660,18 @@ impl Record {
         }
     }
     /// The exact byte length of the first record at the start of `wire`, bounded by [`MAX_RECORD`],
-    /// refusing a kind this build does not know ([`Record::frame_prefix`] frames one).
+    /// refusing a kind this build does not know.
     pub(super) fn wire_len_prefix(wire: &[u8]) -> Result<usize> {
-        let (len, _) = Self::frame_prefix(wire)?;
+        let len = Self::known_frame_header(wire)?;
+        if wire.len() < len {
+            return Err(Error::new("membership record is truncated"));
+        }
+        Ok(len)
+    }
+
+    /// Length from a complete header, before allocating or reading its body.
+    fn known_frame_header(wire: &[u8]) -> Result<usize> {
+        let (len, _) = Self::frame_header(wire)?;
         let code = wire
             .get(KIND_AT)
             .copied()
@@ -637,11 +680,7 @@ impl Record {
         Ok(len)
     }
 
-    /// [`Record::wire_len_prefix`] without judging the kind byte, with the parents the frame
-    /// names. The layout (`VERSION` 1) frames a record of a kind only a newer build writes as it
-    /// frames any other, so a stream holding one still splits into its records' ids
-    /// (`store::frames`). Nothing is verified: the parents are whatever the bytes say.
-    pub(super) fn frame_prefix(wire: &[u8]) -> Result<(usize, Vec<RecordId>)> {
+    fn frame_prefix_reader(wire: &[u8]) -> Result<(Reader<'_>, usize)> {
         let mut reader = Reader::new(wire);
         if reader.take(4)? != MAGIC || reader.byte()? != VERSION {
             return Err(Error::new("not a membership record"));
@@ -655,18 +694,44 @@ impl Record {
         if count > MAX_PARENTS {
             return Err(Error::new("membership record names too many parents"));
         }
+        debug_assert_eq!(reader.at, FRAME_PREFIX_LEN);
+        Ok((reader, count))
+    }
+
+    #[cfg(unix)]
+    fn frame_header_len(wire: &[u8]) -> Result<usize> {
+        let (reader, count) = Self::frame_prefix_reader(wire)?;
+        Ok(reader.at + count * 32 + 8 + 4)
+    }
+
+    fn frame_header(wire: &[u8]) -> Result<(usize, Vec<RecordId>)> {
+        let (mut reader, count) = Self::frame_prefix_reader(wire)?;
         let mut parents = Vec::with_capacity(count);
         for _ in 0..count {
             parents.push(reader.array::<32>()?);
         }
         let _authored_ms = reader.take(8)?;
         let body_len = reader.len(4)?;
-        let _body = reader.take(body_len)?;
-        let _sig = reader.take(64)?;
-        if reader.at > MAX_RECORD {
-            return Err(Error::new("membership record is too long"));
+        let len = reader
+            .at
+            .checked_add(body_len)
+            .and_then(|len| len.checked_add(64))
+            .filter(|&len| len <= MAX_RECORD)
+            .ok_or_else(|| Error::new("membership record is too long"))?;
+        Ok((len, parents))
+    }
+
+    /// [`Record::wire_len_prefix`] without judging the kind byte, with the parents the frame
+    /// names. The layout (`VERSION` 1) frames a record of a kind only a newer build writes as it
+    /// frames any other, so a stream holding one still splits into its records' ids
+    /// (`store::frames`). Nothing is verified: the parents are whatever the bytes say.
+    #[cfg(unix)]
+    pub(super) fn frame_prefix(wire: &[u8]) -> Result<(usize, Vec<RecordId>)> {
+        let (len, parents) = Self::frame_header(wire)?;
+        if wire.len() < len {
+            return Err(Error::new("membership record is truncated"));
         }
-        Ok((reader.at, parents))
+        Ok((len, parents))
     }
     /// The signing member; all zero for a genesis.
     pub fn actor(&self) -> &MemberId {
@@ -1278,6 +1343,7 @@ pub struct Log {
     // Its pure evaluation is shared too; no disk observation or grant is cached.
     membership: Arc<OnceLock<Membership>>,
     effective: Arc<OnceLock<eval::Effective>>,
+    ancestry: Arc<OnceLock<Arc<eval::Ancestry>>>,
 }
 
 impl Log {
@@ -1300,6 +1366,7 @@ impl Log {
             enforce_seats: false,
             membership: Arc::default(),
             effective: Arc::default(),
+            ancestry: Arc::default(),
         })
     }
 
@@ -1538,7 +1605,8 @@ impl Log {
             if self.waiting.len() >= MAX_WAITING
                 || self.total_bytes().saturating_add(record.bytes().len()) > MAX_RECORDS_STREAM
             {
-                return Err(Error::new(
+                return Err(Error::of_kind(
+                    crate::ErrorKind::MembershipCapacity,
                     "membership log holds its limit of waiting records",
                 ));
             }
@@ -1549,7 +1617,10 @@ impl Log {
         if self.order.len() >= MAX_RECORDS
             || self.held_bytes().saturating_add(record.bytes().len()) > MAX_RECORDS_STREAM
         {
-            return Err(Error::new("membership log holds its limit of records"));
+            return Err(Error::of_kind(
+                crate::ErrorKind::MembershipCapacity,
+                "membership log holds its limit of records",
+            ));
         }
         self.check_against_parents(&record)?;
         self.hold(record);
@@ -1607,13 +1678,18 @@ impl Log {
     )]
     pub fn membership(&self) -> Membership {
         self.membership
-            .get_or_init(|| eval::evaluate(&self.order))
+            .get_or_init(|| eval::evaluate_with(&self.order, self.ancestry()))
             .clone()
+    }
+
+    fn ancestry(&self) -> &Arc<eval::Ancestry> {
+        self.ancestry
+            .get_or_init(|| eval::Ancestry::new(&self.order))
     }
 
     fn effective(&self) -> &eval::Effective {
         self.effective
-            .get_or_init(|| eval::effective_records(&self.order))
+            .get_or_init(|| eval::effective_records(&self.order, self.ancestry()))
     }
 
     /// The cutoff of the quorum `Remove` of `actor` that F16's "Undo <actor>'s removals" row
@@ -1629,7 +1705,7 @@ impl Log {
     /// never vote. `None` where `actor` has no contested act or no entry in this log.
     #[must_use]
     pub fn undo_cutoff(&self, actor: &MemberId) -> Option<RecordId> {
-        eval::undo_cutoff(&self.order, actor)
+        eval::undo_cutoff(&self.order, self.ancestry(), actor)
     }
 
     /// Where the quorum `Remove` of `actor` at [`Log::undo_cutoff`] stands: its voters, the
@@ -1637,7 +1713,7 @@ impl Log {
     /// such cutoff.
     #[must_use]
     pub fn undo(&self, actor: &MemberId) -> Option<Undo> {
-        let mut undo = eval::undo(&self.order, actor)?;
+        let mut undo = eval::undo(&self.order, self.ancestry(), actor)?;
         undo.took_effect = self
             .membership()
             .quorums()
@@ -1682,21 +1758,21 @@ impl Log {
     /// good by a quorum `Remove`).
     #[must_use]
     pub fn historical_seat_entry(&self, binding: &Binding) -> Option<RecordId> {
-        eval::historical_seat_entry(&self.order, binding)
+        eval::historical_seat_entry(&self.order, self.ancestry(), binding)
     }
 
     /// Whether `binding` holds a founding or effective admitted seat in this log (even if later
     /// retired by an ordinary `Remove`, unless voided out for good by a quorum `Remove`).
     #[must_use]
     pub fn has_historical_seat(&self, binding: &Binding) -> bool {
-        eval::has_historical_seat(&self.order, binding)
+        eval::has_historical_seat(&self.order, self.ancestry(), binding)
     }
 
     /// Whether `actor` holds a founding or non-void, authorized, non-cut-off admitted seat in
     /// this log (including actors later retired by an ordinary or quorum `Remove`).
     #[must_use]
     pub fn has_known_actor(&self, actor: &MemberId) -> bool {
-        eval::has_known_actor(&self.order, actor)
+        eval::has_known_actor(&self.order, self.ancestry(), actor)
     }
 
     /// Historical Commons writer bindings eligible to authenticate table records sealed under
@@ -1713,7 +1789,7 @@ impl Log {
         else {
             return None;
         };
-        let writers = eval::historical_bindings_for_epoch(&self.order, idx)?;
+        let writers = eval::historical_bindings_for_epoch(&self.order, self.ancestry(), idx)?;
         Some((*generation, writers))
     }
 
@@ -1897,6 +1973,7 @@ impl Log {
         self.order.push(record);
         self.membership = Arc::default();
         self.effective = Arc::default();
+        self.ancestry = Arc::default();
     }
 
     /// Hold every waiting record whose parents have all arrived, until none is left to land.

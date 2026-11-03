@@ -48,6 +48,8 @@ fn scratch() -> Volume {
 /// A claim by `pid`, made at `start_ms`, for `disk` bytes on `on`, held when `held`.
 fn claim(pid: u32, start_ms: u64, disk: u64, on: &str, held: bool) -> Record {
     Record {
+        accounting: aterm_capacity::Accounting::Holder,
+        timing: aterm_capacity::TimingEvidence::default(),
         pid,
         start_ms,
         seq: 0,

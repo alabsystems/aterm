@@ -55,18 +55,7 @@ pub(crate) fn cmd_scroll(
 
 /// `send <text>` -> the bytes to write to the PTY.
 pub(crate) fn send_bytes(rest: &str) -> Vec<u8> {
-    if let Some(head) = rest.strip_suffix("\\n") {
-        let mut b = head.as_bytes().to_vec();
-        b.push(0x0d);
-        b
-    } else if let Some(head) = rest.strip_suffix('\n') {
-        let head = head.strip_suffix('\r').unwrap_or(head);
-        let mut b = head.as_bytes().to_vec();
-        b.push(0x0d);
-        b
-    } else {
-        rest.as_bytes().to_vec()
-    }
+    aterm_types::control_request::send_payload(rest.as_bytes())
 }
 
 /// Parse the optional trailing `mods=<list>` token (e.g. `mods=ctrl+shift`), returning the modifier mask and the rest of the line with the token removed.
@@ -1102,7 +1091,7 @@ pub(crate) fn feed_bytes(rest: &str) -> Result<Vec<u8>, &'static str> {
     aterm_codec::hex::decode_vec(hex.as_bytes()).ok_or("ERR bad hex\n")
 }
 
-/// `signal <name> [pid=<n>] [quiet=<s>]` -> deliver a job-control signal to the PTY's foreground process group (`tcgetpgrp` on the master, then `killpg`), or with `pid=` (which must be that group's id) to its leader alone (`kill`), whatever the line discipline would generate. A signal that ends a program (`term`, `kill`, `int`, `quit`, `hup`; never `cont` or `tstp`) is `asker`'s ask: past every refusal and just before the signal it writes `act word=signal by=<asker>` and the ask ([`crate::session_log::EndAsker::ask`]), taken back when the signal is not delivered.
+/// `signal <name> [pid=<n>] [quiet=<s>]` -> deliver a job-control signal to the PTY's foreground process group (`tcgetpgrp` on the master, then `killpg`), or with `pid=` (which must be that group's id) to its leader alone (`kill`), whatever the line discipline would generate. A signal that ends a program (`term`, `kill`, `int`, `quit`, `hup`; never `cont` or `tstp`) is `asker`'s ask: past every refusal and just before the signal it writes `act word=signal by=<asker>` (with `from=<program>` when a control connection asked) and the ask ([`crate::session_log::EndAsker::ask`]), taken back when the signal is not delivered.
 #[cfg(unix)]
 pub(crate) fn cmd_signal(
     master: i32,
@@ -1166,25 +1155,49 @@ const fn ends_a_program(sig: i32) -> bool {
 
 /// THE ASK A SIGNAL MAKES: a signal `sig` to group `pgrp` that ends a program
 /// ([`ends_a_program`]) writes `asker`'s act mark and its ask ([`crate::session_log::EndAsker::ask`])
-/// and hands the asker back, so a signal that fails takes it back; any other asks nothing.
+/// and hands the asker back, so a signal that fails takes it back; any other asks nothing. An
+/// `int` asks as an interrupt ([`crate::session_log::AskWord::Interrupt`]: Claude Code's Ctrl-C
+/// stops a turn, so the end it brings is asked but owns no agent's exit); every other is a stop
+/// ([`crate::session_log::AskWord::Signal`]).
 #[cfg(unix)]
 pub(crate) fn ask_signal_end(
     asker: Option<crate::session_log::EndAsker<'_>>,
     sig: i32,
     pgrp: i32,
 ) -> Option<crate::session_log::EndAsker<'_>> {
+    use crate::session_log::AskWord;
     let asker = asker.filter(|_| ends_a_program(sig))?;
-    asker.ask(pgrp, crate::session_log::AskWord::Signal);
+    asker.ask(
+        pgrp,
+        if sig == libc::SIGINT {
+            AskWord::Interrupt
+        } else {
+            AskWord::Signal
+        },
+    );
     Some(asker)
 }
 
-/// The `signal` verb as the control dispatch runs it ([`super::serve_session_verb`]'s arm), on
-/// `by`'s ask.
+/// The `signal` verb on `by`'s ask, as aterm's own callers run it (the Overview's Stop, the
+/// credit claim's end): no control connection asks, so no program is named ([`signal_verb_from`]).
 pub(crate) fn signal_verb(
     master: i32,
     rest: &str,
     ctx: &SessionCtx,
     by: aterm_slog::Actor,
+) -> String {
+    signal_verb_from(master, rest, ctx, by, None)
+}
+
+/// The `signal` verb as the control dispatch runs it ([`super::serve_session_verb`]'s arm), on
+/// `by`'s ask, `from` the words naming the program whose connection asked (its typing's credit):
+/// the act's `from=`, and who the host says ended an agent whose work an Autopilot carried.
+pub(crate) fn signal_verb_from(
+    master: i32,
+    rest: &str,
+    ctx: &SessionCtx,
+    by: aterm_slog::Actor,
+    from: Option<&str>,
 ) -> String {
     cmd_signal(
         master,
@@ -1194,6 +1207,7 @@ pub(crate) fn signal_verb(
         Some(crate::session_log::EndAsker {
             timeline: &ctx.timeline,
             by,
+            from,
         }),
     )
 }
@@ -1480,7 +1494,12 @@ pub(crate) fn parse_focus(rest: &str) -> Option<bool> {
     }
 }
 
-/// Parse `tab <arg>` into its [`TabAction`]: `new`, a 0-based `<N>`, `next`/`prev`, `close [N]`, `move <from> <to>`.
+fn parse_tab_number(rest: &str) -> Option<usize> {
+    (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
+    rest.parse::<usize>().ok()?.checked_sub(1)
+}
+
+/// Parse `tab <arg>` into its [`TabAction`]: `new`, a one-based `<N>`, `next`/`prev`, `close [N]`, `move <from> <to>`.
 pub(crate) fn parse_tab(rest: &str) -> Option<TabAction> {
     let rest = rest.trim();
     let mut it = rest.split_whitespace();
@@ -1492,47 +1511,42 @@ pub(crate) fn parse_tab(rest: &str) -> Option<TabAction> {
             return match it.next() {
                 None => Some(TabAction::Close(None)),
                 Some(n) => {
-                    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
-                    let i = n.parse::<usize>().ok()?;
+                    let i = parse_tab_number(n)?;
                     it.next().is_none().then_some(TabAction::Close(Some(i)))
                 }
             };
         }
         Some("move") => {
             let (from, to) = (it.next()?, it.next()?);
-            if it.next().is_some()
-                || from.is_empty()
-                || to.is_empty()
-                || !from.bytes().all(|b| b.is_ascii_digit())
-                || !to.bytes().all(|b| b.is_ascii_digit())
-            {
+            if it.next().is_some() {
                 return None;
             }
-            let from = from.parse::<usize>().ok()?;
-            let to = to.parse::<usize>().ok()?;
+            let from = parse_tab_number(from)?;
+            let to = parse_tab_number(to)?;
             return Some(TabAction::Move { from, to });
         }
         _ => {}
     }
-    (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
-        .then(|| rest.parse::<usize>().ok().map(TabAction::Select))
-        .flatten()
+    parse_tab_number(rest).map(TabAction::Select)
 }
 
 /// The refusal `tab <N>` / `tab close <N>` / `tab move <from> <to>` answer for an index no tab holds.
 #[must_use]
 pub(crate) fn no_such_tab(index: usize, count: usize) -> String {
+    let number = index + 1;
     match count {
-        0 => format!("no tab at index {index}: this window has no tabs"),
-        1 => format!("no tab at index {index}: this window has 1 tab, index 0"),
-        n => format!(
-            "no tab at index {index}: this window has {n} tabs, indexes 0..{}",
-            n - 1
-        ),
+        0 => format!("no tab at index {number}: this window has no tabs"),
+        1 => format!("no tab at index {number}: this window has 1 tab, index 1"),
+        n => format!("no tab at index {number}: this window has {n} tabs, indexes 1..={n}"),
     }
 }
 
-/// `tab new | <N> | next | prev | close [N] | move <from> <to>` -> drive the front window's tabs and reply `OK <active_index> <tab_count>` when the action happened, or `ERR <why>`.
+pub(crate) fn tab_state_reply(active: usize, count: usize) -> String {
+    let active = if count == 0 { 0 } else { active + 1 };
+    format!("OK {active} {count}\n")
+}
+
+/// `tab new | <N> | next | prev | close [N] | move <from> <to>` -> drive the front window's tabs and reply `OK <active_number> <tab_count>` when the action happened, or `ERR <why>`.
 pub(crate) fn cmd_tab(
     proxy: &EventLoopProxy<Wake>,
     rest: &str,
@@ -1542,7 +1556,7 @@ pub(crate) fn cmd_tab(
         return "ERR usage: tab <new|N|next|prev|close [N]|move <from> <to>>\n".to_string();
     };
     match super::control_media::call_main(proxy, |reply| Wake::TabCmd { action, by, reply }) {
-        Ok(Ok((active, count))) => format!("OK {active} {count}\n"),
+        Ok(Ok((active, count))) => tab_state_reply(active, count),
         Ok(Err(why)) => format!("ERR {why}\n"),
         Err(error) => format!("ERR tab command failed: {error}\n"),
     }
@@ -2394,38 +2408,25 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn typeahead_after_restart(remedy: Remedy, typed: Typed) -> (bool, Option<String>) {
-        use aterm_uds::spawnfd::InheritNothing as _;
-        use std::os::fd::{FromRawFd, OwnedFd};
-        use std::os::unix::process::CommandExt;
+        use std::os::fd::IntoRawFd as _;
         use std::time::Duration;
-        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-        // SAFETY: `slave` is a fresh fd this function alone owns.
-        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-        let stdio = || std::process::Stdio::from(slave.try_clone().expect("dup slave"));
         let home = aterm_tempfile::tempdir().expect("scratch home");
-        let mut shell = std::process::Command::new("/bin/zsh");
-        shell
-            .inherit_nothing()
-            .args(["-f", "-i"])
-            .envs(aterm_spec::host::hermetic_env(home.path()))
-            .env("TERM", "xterm")
-            .stdin(stdio())
-            .stdout(stdio())
-            .stderr(stdio());
-        for key in aterm_spec::host::SHELL_START_POINTERS {
-            shell.env_remove(key);
-        }
-        // SAFETY: runs in the forked child before exec, after stdio is in
-        // place: `setsid` and `ioctl(TIOCSCTTY)` are async-signal-safe and
-        // touch nothing of the parent's.
-        unsafe {
-            shell.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        let (master, slave, child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
+            let mut shell = std::process::Command::new("/bin/zsh");
+            shell
+                .args(["-f", "-i"])
+                .envs(aterm_spec::host::hermetic_env(home.path()))
+                .env("TERM", "xterm")
+                .stdout(std::process::Stdio::from(slave.try_clone()?))
+                .stderr(std::process::Stdio::from(slave.try_clone()?));
+            for key in aterm_spec::host::SHELL_START_POINTERS {
+                shell.env_remove(key);
+            }
+            Ok(shell)
+        })
+        .expect("spawn zsh");
+        drop(slave);
+        let master = master.into_raw_fd();
         struct Reap(std::process::Child);
         impl Drop for Reap {
             fn drop(&mut self) {
@@ -2433,8 +2434,7 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        let shell = Reap(shell.spawn().expect("spawn zsh"));
-        drop(slave);
+        let shell = Reap(child);
         aterm_pty::set_nonblocking(master, true).expect("nonblocking master");
         let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));

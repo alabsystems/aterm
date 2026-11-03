@@ -4,7 +4,7 @@
 //! THE OCCUPANCY DOOR (`docs/DESIGN-harness-occupancy-2026-10-20.md` §7, as the red-team corrects it: F6's fairness, dials and bound, F7's hold clock, F11's upgrade input).
 //!
 //! THE STUCK FACT (§2.1's rank 4; `docs/DESIGN-hung-background-call-2026-10-20.md` R3): `Key` is
-//! the owner's `[harness] stuck_break_note`, off as it ships. On, a hung call's fact is an episode
+//! the owner's `[harness] stuck_break_note`, on as it ships. On, a hung call's fact is an episode
 //! of its own (`due == 3`), opened where a fresh reading names it untold, for Cruise and Land
 //! alike; it waits for the upgrade's notice as a nudge does (`UpgradeTypes` goes over everything
 //! but a wake), and it shares the nudges' door, pace, untaken act and rows; typed in a hold of

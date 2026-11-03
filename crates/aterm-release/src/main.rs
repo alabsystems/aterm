@@ -7,6 +7,7 @@ mod accepted_measure;
 mod apple;
 
 mod artifact;
+mod build_inputs;
 mod buildplan;
 mod bundle;
 mod changelog;
@@ -41,6 +42,7 @@ mod ledger;
 
 mod machines;
 mod manifest_out;
+mod service_qualification;
 
 mod provision;
 mod publish;
@@ -51,6 +53,8 @@ mod release_status;
 mod release_steps;
 
 mod sign;
+mod source_signing;
+mod stage_local;
 
 mod site;
 

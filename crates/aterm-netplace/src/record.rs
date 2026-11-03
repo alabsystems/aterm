@@ -72,7 +72,7 @@ fn parse_path(text: &str) -> Option<PathFacts> {
     for part in text.split(' ') {
         let (key, value) = part.split_once('=')?;
         match key {
-            "usable" => {
+            "usable" if usable.is_none() => {
                 usable = Some(match value {
                     "1" => Some(true),
                     "0" => Some(false),
@@ -80,9 +80,21 @@ fn parse_path(text: &str) -> Option<PathFacts> {
                     _ => return None,
                 });
             }
-            "expensive" => expensive = Some(value == "1"),
-            "constrained" => constrained = Some(value == "1"),
-            "link" => link = Link::from_word(value),
+            "expensive" if expensive.is_none() => {
+                expensive = Some(match value {
+                    "1" => true,
+                    "0" => false,
+                    _ => return None,
+                });
+            }
+            "constrained" if constrained.is_none() => {
+                constrained = Some(match value {
+                    "1" => true,
+                    "0" => false,
+                    _ => return None,
+                });
+            }
+            "link" if link.is_none() => link = Some(Link::from_word(value)?),
             _ => return None,
         }
     }
@@ -92,6 +104,15 @@ fn parse_path(text: &str) -> Option<PathFacts> {
         constrained: constrained?,
         link: link?,
     })
+}
+
+fn valid_subnet(subnet: &str) -> bool {
+    let Some((addr, prefix)) = subnet.split_once('/') else {
+        return false;
+    };
+    addr.parse::<Ipv4Addr>().is_ok()
+        && !prefix.starts_with('+')
+        && prefix.parse::<u8>().is_ok_and(|p| p <= 32)
 }
 
 fn stay_line(stay: &Stay) -> String {
@@ -123,7 +144,8 @@ fn parse_stay(text: &str) -> Option<Stay> {
     };
     let subnet = match next()? {
         "-" => None,
-        subnet => Some(subnet.to_owned()),
+        subnet if valid_subnet(subnet) => Some(subnet.to_owned()),
+        _ => return None,
     };
     let gateway = match next()? {
         "-" => None,
@@ -205,8 +227,14 @@ pub fn format(written: &Written) -> String {
 /// read.
 #[must_use]
 pub fn parse(text: &str) -> Option<Written> {
-    let mut written = Written::default();
     let mut schema = None;
+    let mut revision = None;
+    let mut keeper_pid = None;
+    let mut keeper_started_ms = None;
+    let mut written_ms = None;
+    let mut path = None;
+    let mut stays: Option<Vec<Stay>> = None;
+    let mut remembered: Option<Vec<Known>> = None;
     let mut list: Option<&str> = None;
     for line in text.lines() {
         let line = line.trim();
@@ -224,33 +252,48 @@ pub fn parse(text: &str) -> Option<Written> {
                 .strip_prefix('"')?
                 .strip_suffix('"')?;
             match name {
-                "stays" => written.record.stays.push(parse_stay(item)?),
-                _ => written.record.remembered.push(parse_known(item)?),
+                "stays" => stays.as_mut()?.push(parse_stay(item)?),
+                _ => remembered.as_mut()?.push(parse_known(item)?),
             }
             continue;
         }
         let (key, value) = line.split_once(" = ")?;
         match key {
-            "schema" => schema = Some(value.parse::<u32>().ok()?),
-            "revision" => written.revision = value.parse().ok()?,
-            "keeper_pid" => written.keeper_pid = Some(value.parse().ok()?),
-            "keeper_started_ms" => written.keeper_started_ms = Some(value.parse().ok()?),
-            "written_ms" => written.written_ms = value.parse().ok()?,
-            "path" => {
-                written.record.path =
-                    Some(parse_path(value.strip_prefix('"')?.strip_suffix('"')?)?);
+            "schema" if schema.is_none() => schema = Some(value.parse::<u32>().ok()?),
+            "revision" if revision.is_none() => revision = Some(value.parse().ok()?),
+            "keeper_pid" if keeper_pid.is_none() => keeper_pid = Some(value.parse().ok()?),
+            "keeper_started_ms" if keeper_started_ms.is_none() => {
+                keeper_started_ms = Some(value.parse().ok()?);
             }
-            "stays" | "remembered" if value == "[" => {
-                list = Some(if key == "stays" {
-                    "stays"
-                } else {
-                    "remembered"
-                });
+            "written_ms" if written_ms.is_none() => written_ms = Some(value.parse().ok()?),
+            "path" if path.is_none() => {
+                path = Some(parse_path(value.strip_prefix('"')?.strip_suffix('"')?)?);
+            }
+            "stays" if value == "[" && stays.is_none() => {
+                stays = Some(Vec::new());
+                list = Some("stays");
+            }
+            "remembered" if value == "[" && remembered.is_none() => {
+                remembered = Some(Vec::new());
+                list = Some("remembered");
             }
             _ => return None,
         }
     }
-    (schema == Some(SCHEMA) && list.is_none()).then_some(written)
+    if schema != Some(SCHEMA) || list.is_some() {
+        return None;
+    }
+    Some(Written {
+        revision: revision?,
+        keeper_pid,
+        keeper_started_ms,
+        written_ms: written_ms?,
+        record: Record {
+            stays: stays?,
+            remembered: remembered?,
+            path,
+        },
+    })
 }
 
 /// The record in `dir` ([`dir`]); `None` where it is missing, not private, too large or unread.
@@ -334,6 +377,53 @@ mod tests {
             "a weak id is never remembered"
         );
         assert_eq!(parse(""), None);
+    }
+
+    /// Truncated files, duplicate keys, malformed `path` booleans, and invalid CIDR `subnet`
+    /// tokens make the whole record unread rather than inventing defaults or overwriting fields.
+    /// NEGATIVE CONTROL: defaulting missing `revision`/`written_ms`/`stays`/`remembered` or
+    /// parsing `expensive=yes` as `false` accepts corrupted `place.toml` inputs, failing this test.
+    #[test]
+    fn truncated_duplicate_and_malformed_record_fields_are_unread_whole() {
+        let base = format(&Written {
+            revision: 3,
+            written_ms: 9_000,
+            record: Record {
+                stays: vec![Stay {
+                    start_ms: 1_000,
+                    end_ms: None,
+                    at: StayAt::AlabLan,
+                    network: None,
+                    subnet: Some("10.0.0.0/24".to_owned()),
+                    gateway: Some(Ipv4Addr::new(10, 0, 0, 1)),
+                    from_start: true,
+                }],
+                remembered: Vec::new(),
+                path: Some(PathFacts {
+                    usable: Some(true),
+                    expensive: false,
+                    constrained: false,
+                    link: Link::Wired,
+                }),
+            },
+            ..Written::default()
+        });
+        assert!(parse(&base).is_some());
+        assert_eq!(parse("schema = 1\n"), None);
+        assert_eq!(parse("schema = 1\nrevision = 3\nwritten_ms = 9000\n"), None);
+        assert_eq!(
+            parse(&base.replace("revision = 3", "revision = 3\nrevision = 4")),
+            None
+        );
+        assert_eq!(
+            parse(&base.replace("stays = [", "stays = [\n]\nstays = [")),
+            None
+        );
+        assert_eq!(parse(&base.replace("expensive=0", "expensive=yes")), None);
+        assert_eq!(parse(&base.replace("constrained=0", "constrained=2")), None);
+        assert_eq!(parse(&base.replace("usable=1", "usable=1 usable=0")), None);
+        assert_eq!(parse(&base.replace("10.0.0.0/24", "10.0.0.0/33")), None);
+        assert_eq!(parse(&base.replace("10.0.0.0/24", "not-a-cidr")), None);
     }
 
     /// The record is written private and read back through the private-file rules.

@@ -595,9 +595,10 @@ fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
 
 #[test]
 fn without_the_guard_a_listen_on_an_address_this_machine_lacks_is_retried() {
+    // Not the default port: a private aterm refuses that one at any address before its bind.
     let inst = boot_on(
         "aflu",
-        "[fleet]\nlisten = \"192.0.2.1:7100\"\nallow = \"facts\"\n",
+        "[fleet]\nlisten = \"192.0.2.1:7101\"\nallow = \"facts\"\n",
         false,
     );
     let (_, sid) = boot_session(&inst);
@@ -628,6 +629,17 @@ fn spawn_fleet(
     stdin: Option<&str>,
     env: &[(&str, &str)],
 ) -> std::process::Child {
+    spawn_fleet_unset(root, args, stdin, env, &[])
+}
+
+/// [`spawn_fleet`], with the variables `unset` taken out after its seams and `env`.
+fn spawn_fleet_unset(
+    root: &Path,
+    args: &[&str],
+    stdin: Option<&str>,
+    env: &[(&str, &str)],
+    unset: &[&str],
+) -> std::process::Child {
     let aterm = crate::launch_isolation::aterm_executable();
     #[expect(
         clippy::disallowed_types,
@@ -651,6 +663,9 @@ fn spawn_fleet(
         .env(JOIN_WITHIN_SEAM, HANG.as_millis().to_string())
         .env(LOCK_WAIT_SEAM, HANG.as_millis().to_string())
         .envs(env.iter().copied());
+    for name in unset {
+        cmd.env_remove(name);
+    }
     let mut child = cmd.spawn().expect("spawn aterm fleet");
     if let Some(text) = stdin {
         let mut pipe = child.stdin.take().expect("its stdin");
@@ -747,6 +762,54 @@ fn succeeded(args: &[&str], out: Output) -> String {
         String::from_utf8_lossy(&out.stderr),
     );
     String::from_utf8(out.stdout).expect("utf-8")
+}
+
+/// The binary is no Cargo test binary, so an `init` with no `--port` writes [`DEFAULT_PORT`], where
+/// an aterm of the person's may answer on this machine's loopback. Under a private state root, and
+/// under a scratch `HOME` with none (a debug build that is no shell of its user's own account), the
+/// verb's proof of its own listener reaches no such aterm: it stops before its connect, and its
+/// report says why. The cut answers a dial past that, so this reaches no aterm with the guard gone.
+#[test]
+fn a_private_binarys_init_writes_the_default_port_and_never_dials_it() {
+    for (prefix, state_root) in [("afpi", true), ("afph", false)] {
+        let world = World(headless_boot::scratch_root(prefix));
+        let cut = world.0.join("cut");
+        std::fs::write(
+            &cut,
+            format!("127.0.0.1:{DEFAULT_PORT}\n[::1]:{DEFAULT_PORT}\n"),
+        )
+        .expect("write the cut");
+        let cut = cut.to_str().expect("a UTF-8 world");
+        let unset: &[&str] = if state_root {
+            &[]
+        } else {
+            &["ATERM_STATE_HOME"]
+        };
+        let init = spawn_fleet_unset(
+            &world.0,
+            &["init"],
+            None,
+            &[(aterm_uds::partition::SEAM, cut)],
+            unset,
+        );
+        let out = fleet_ended(&["init"], init);
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "state root {state_root}: {said}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            said.contains(&format!("listen = \"0.0.0.0:{DEFAULT_PORT}\"")),
+            "state root {state_root}: {said}"
+        );
+        assert!(
+            said.contains(&format!(
+                "  listener   this private aterm refuses a dial of 127.0.0.1:{DEFAULT_PORT}: "
+            )),
+            "state root {state_root}: {said}"
+        );
+    }
 }
 
 /// The binary is no Cargo test binary, so a host named with no port is at [`DEFAULT_PORT`], where
@@ -1951,6 +2014,112 @@ fn open_drive(root: &Path, target: &str) -> aterm_net::fleet_member::Driven {
     .unwrap_or_else(|why| panic!("{why}"))
 }
 
+/// Another process's handle on a session's direct mailbox, as a seamless update's predecessor
+/// holds one: its writes ring only its own waiters.
+struct HandoffPeer {
+    sid: aterm_session::SessionId,
+    fabric: aterm_gui_fabric::SessionFabric,
+    path: PathBuf,
+}
+
+impl HandoffPeer {
+    fn of(session: &str, path: &Path) -> Self {
+        Self {
+            sid: aterm_session::SessionId::new(session),
+            fabric: aterm_gui_fabric::SessionFabric::default(),
+            path: path.to_owned(),
+        }
+    }
+}
+
+impl aterm_gui_fabric::FabricSession for HandoffPeer {
+    fn self_id(&self) -> &aterm_session::SessionId {
+        &self.sid
+    }
+    fn fabric(&self) -> &aterm_gui_fabric::SessionFabric {
+        &self.fabric
+    }
+    fn record_fact(&self, _: &'static str, _: aterm_gui_fabric::FabricFact<'_>) -> bool {
+        false
+    }
+    fn fabric_changed(&self) {}
+    fn holder_token(&self) -> Option<String> {
+        None
+    }
+    fn fleet_mail_path(&self) -> Option<PathBuf> {
+        Some(self.path.clone())
+    }
+    fn fleet_mail_ready(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn startup_migrates_only_the_current_owners_legacy_mailbox() {
+    const OTHER: &str = "s-0e0d0e0d";
+    const TEXT: &str = "PRIVATE_EARLIER_SESSION_TEXT";
+    let legacy = format!(
+        "next = 1\n\n[[rows]]\nid = 1\nnode = \"{}\"\nkey = \"k\"\nkind = \"ask\"\n\
+         text = \"{TEXT}\"\nlisted = false\nreply_seen = false\n",
+        "a".repeat(32)
+    );
+    let foreign_temp = format!(".{OTHER}.toml.tmp.{}.0badcafe", u32::MAX);
+    let instance = headless_boot::boot_with(
+        "afms",
+        |tmp, cmd| {
+            // An idle older reader may still own this file. No transaction lock means neither
+            // that its owner ended nor that it can read the sealed format.
+            let folder = tmp.join("state/fleet-mail");
+            for dir in [tmp.join("state"), folder.clone()] {
+                aterm_uds::private_file::create_private_dir(&dir).expect("a private folder");
+            }
+            aterm_uds::private_file::write_private(
+                &folder,
+                &format!("{OTHER}.toml"),
+                legacy.as_bytes(),
+            )
+            .expect("the earlier build's mailbox");
+            aterm_uds::private_file::write_private(&folder, &foreign_temp, legacy.as_bytes())
+                .expect("a foreign writer's retained temporary");
+            cmd.env("ATERM_STATE_HOME", tmp.join("state"));
+        },
+        |_| true,
+    );
+    let folder = instance.tmp.join("state/fleet-mail");
+    let (_, own_sid) = boot_session(&instance);
+    let own_name = format!("{own_sid}.toml");
+    let own_path = folder.join(&own_name);
+    aterm_uds::private_file::write_private(&folder, &own_name, legacy.as_bytes())
+        .expect("the active owner's old mailbox");
+    // This is also a progress witness: the one watcher has finished startup and refreshed
+    // its own session. An immediate unchanged-file assertion could race that first pass.
+    aterm_spec::wait::within(HANG, POLL_GAP, || {
+        std::fs::read(&own_path)
+            .ok()
+            .filter(|bytes| bytes.starts_with(b"\0aterm fleet mail, sealed\n"))
+    })
+    .expect("the active owner's watcher seals its own mailbox");
+    let page = ctl_ok(&instance, &[&format!("@{own_sid}"), "inbox", "fleet"]);
+    assert!(page.contains(&format!("text={TEXT}")), "{page}");
+
+    let other_name = format!("{OTHER}.toml");
+    let expected: aterm_toml::Value = aterm_toml::from_str(&legacy).unwrap();
+    for _ in 0..2 {
+        // The old reader's exact codec boundary: it still opens UTF-8 TOML, not AEAD.
+        let bytes = aterm_uds::private_file::read_private(&folder, &other_name, 65536)
+            .expect("the older reader's file remains accessible");
+        assert_eq!(bytes, legacy.as_bytes());
+        let text = std::str::from_utf8(&bytes).expect("the older reader's UTF-8");
+        let read: aterm_toml::Value = aterm_toml::from_str(text).expect("the older reader's TOML");
+        assert_eq!(read, expected);
+    }
+    assert_eq!(
+        aterm_uds::private_file::read_private(&folder, &foreign_temp, 65536).unwrap(),
+        legacy.as_bytes(),
+        "startup has no ownership of a foreign temporary"
+    );
+}
+
 #[test]
 fn direct_fleet_mail_delivers_and_replies_without_terminal_input_and_requires_a_drive_grant() {
     let (sender, receiver, session, target) = driven_pair(("afmi", "afmm"));
@@ -1992,39 +2161,33 @@ fn direct_fleet_mail_delivers_and_replies_without_terminal_input_and_requires_a_
     );
     assert!(!notification.contains("fleet-mail-only-question"));
     // A predecessor can finish a durable write after the successor cached its mailbox.
-    // Write from this separate process, without issuing a receiver-side inbox command.
+    // Write from this separate process, through the mailbox's own transaction (sealed under the
+    // key beside it), as the sending node, without issuing a receiver-side inbox command.
     let durable = receiver
         .tmp
         .join("state/fleet-mail")
         .join(format!("{session}.toml"));
+    let node = notification
+        .split_once(" from=fleet:")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .expect("the sending node")
+        .to_owned();
+    let handoff = HandoffPeer::of(&session, &durable);
+    let as_sender = || {
+        aterm_gui_fabric::DrivingAs::enter(aterm_gui_fabric::Driver {
+            node: node.clone(),
+            host: "handoff.local".to_owned(),
+        })
+    };
     {
-        use aterm_toml::Value;
-        use aterm_uds::private_file::{PrivateLock, write_private};
-        let dir = durable.parent().unwrap();
-        let name = durable.file_name().unwrap().to_str().unwrap();
-        let _lock =
-            PrivateLock::take(dir, &format!("{name}.lock"), HANG, "test handoff writer").unwrap();
-        let mut mailbox: Value =
-            aterm_toml::from_str(&std::fs::read_to_string(&durable).unwrap()).unwrap();
-        let mut rows = mailbox.get("rows").unwrap().as_array().unwrap().clone();
-        let mut late = rows[0].clone();
-        let row = late.as_table_mut().unwrap();
-        row.insert("id".to_owned(), Value::Integer(2));
-        row.insert("key".to_owned(), Value::String("late-handoff".to_owned()));
-        row.insert(
-            "text".to_owned(),
-            Value::String("PRIVATE_HANDOFF_BODY".to_owned()),
+        let _sender = as_sender();
+        assert_eq!(
+            aterm_gui_fabric::fleet_mail::post(
+                &handoff,
+                "key=late-handoff kind=ask -- PRIVATE_HANDOFF_BODY"
+            ),
+            "OK f2\n"
         );
-        rows.push(late);
-        let table = mailbox.as_table_mut().unwrap();
-        table.insert("next".to_owned(), Value::Integer(2));
-        table.insert("rows".to_owned(), Value::Array(rows));
-        write_private(
-            dir,
-            name,
-            aterm_toml::to_string(&mailbox).unwrap().as_bytes(),
-        )
-        .unwrap();
     }
     let late = rx
         .recv_timeout(HANG)
@@ -2085,10 +2248,30 @@ fn direct_fleet_mail_delivers_and_replies_without_terminal_input_and_requires_a_
         1,
         "{log}"
     );
+    // The mailbox on disk holds the answer, opened only under its key: no row's text is in it.
+    let reread = {
+        let _sender = as_sender();
+        aterm_gui_fabric::fleet_mail::inbox(&HandoffPeer::of(&session, &durable), "", false)
+    };
     assert!(
-        std::fs::read_to_string(durable)
-            .unwrap()
-            .contains("fleet-mail-only-answer")
+        reread.contains("reply_text=fleet-mail-only-answer"),
+        "{reread}"
+    );
+    let on_disk = std::fs::read(&durable).unwrap();
+    for text in [
+        "fleet-mail-only-question",
+        "fleet-mail-only-answer",
+        "PRIVATE_HANDOFF_BODY",
+    ] {
+        assert!(
+            !on_disk.windows(text.len()).any(|w| w == text.as_bytes()),
+            "{text} is on disk in plaintext"
+        );
+    }
+    assert!(
+        durable
+            .with_file_name(aterm_gui_fabric::fleet_mail::KEY)
+            .exists()
     );
     fleet_ok(&receiver.tmp, &["allow", "content"], None);
     drive_refused(
@@ -2508,11 +2691,26 @@ fn nothing_listening_here_is_told_as_the_aterm_here_stands() {
         // SAFETY: `kill(2)` on the instance this test started and still holds.
         assert_eq!(unsafe { libc::kill(pid, sig) }, 0, "signal {sig}");
     };
+    let state = inst.tmp.join("state");
+    let stop = || {
+        // Do not freeze a heartbeat while it owns the book: the next fleet verb
+        // needs that lock too. Keep it here until the kernel confirms the stop,
+        // so the node cannot take it between the signal and its delivery.
+        let book = aterm_net::fleet_member::lock_waiting(HANG, || {
+            aterm_net::fleet_member::hold_book(&state)
+        })
+        .expect("hold the book while stopping its node");
+        signal(libc::SIGSTOP);
+        aterm_spec::wait::until_within(HANG, "the owned fleet node stopped", || {
+            aterm_uds::process::is_stopped(inst.child.id()).then_some(())
+        });
+        drop(book);
+    };
     let config = inst.tmp.join("cfg/aterm/aterm.toml");
     let place = format!("127.0.0.1:{port}");
     let port_word = port.to_string();
 
-    signal(libc::SIGSTOP);
+    stop();
     let init = fleet(
         &inst.tmp,
         &["init", "--host", "127.0.0.1", "--port", &port_word],
@@ -2576,7 +2774,7 @@ fn nothing_listening_here_is_told_as_the_aterm_here_stands() {
         "its node's proof outweighs aterm.toml's word: {proved}"
     );
 
-    signal(libc::SIGSTOP);
+    stop();
     let rotate = fleet(&inst.tmp, &["init", "--rotate"], None);
     let stalled = head(fleet_ok(&inst.tmp, &["peers"], None));
     signal(libc::SIGCONT);

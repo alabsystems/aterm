@@ -1551,16 +1551,39 @@ struct CapMiss {
     /// than the state dir names, or one off this fleet that is not the ring `on` mints for
     /// another.
     keep: bool,
+    /// The owner-only rule refused the file ([`crate::bridge::cap_refused`]), so nothing is known
+    /// of the ring in it: `on` names the refusal and leaves the file, never minting over it.
+    refused: bool,
 }
 
 impl From<String> for CapMiss {
     fn from(why: String) -> Self {
-        Self { why, keep: false }
+        Self {
+            why,
+            keep: false,
+            refused: false,
+        }
     }
 }
 
-fn cap_is_for(path: &Path, fleet: &str, node: &str, secret: &[u8]) -> Result<usize, CapMiss> {
-    let caps = crate::bridge::read_cap_file(&path.to_string_lossy()).map_err(|e| e.to_string())?;
+impl From<io::Error> for CapMiss {
+    fn from(error: io::Error) -> Self {
+        Self {
+            why: error.to_string(),
+            keep: false,
+            refused: crate::bridge::cap_refused(&error),
+        }
+    }
+}
+
+/// How `ring`, as a reader of it answered, stands to this `fleet`, `node` and mint `secret`.
+fn ring_is_for(
+    ring: io::Result<Vec<crate::bridge::Cap>>,
+    fleet: &str,
+    node: &str,
+    secret: &[u8],
+) -> Result<usize, CapMiss> {
+    let caps = ring?;
     if !caps.iter().all(|c| {
         if astream_cap::Grant::parse(&c.grant).is_err() {
             return false;
@@ -1586,6 +1609,7 @@ fn cap_is_for(path: &Path, fleet: &str, node: &str, secret: &[u8]) -> Result<usi
         return Err(CapMiss {
             why: format!("minted for a different node id, not {node}"),
             keep: true,
+            refused: false,
         });
     }
     let fleet_of = |grant: &str| {
@@ -1623,6 +1647,7 @@ fn cap_is_for(path: &Path, fleet: &str, node: &str, secret: &[u8]) -> Result<usi
             )
         },
         keep: !regenerable,
+        refused: false,
     })
 }
 
@@ -3101,6 +3126,19 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
     trace("Supervise");
     let sock = p.sock();
     let label = p.label();
+    if out.dry_run {
+        // THE RING THE BUS IS READ WITH IS THE ONE THE CAP STEP LEAVES. A dry run left the ring it
+        // would mint over as it found it, and one it refused stopped the run, so what
+        // this ring says of the bus is nothing the real run would see.
+        let view = probe(p, node);
+        if view.reachable && view.cap_unread {
+            out.already(
+                "broker",
+                &format!("answers on {sock}; the real run reads its bus with the cap step's ring"),
+            );
+            return true;
+        }
+    }
     match service {
         Service::None => {
             let view = probe(p, node);
@@ -4537,16 +4575,32 @@ fn on_steps(
     }
 
     let cap = p.cap();
-    let cap_ok = if cap.exists() {
-        read_secret(&secret_shown)
+    let cap_shown = cap.to_string_lossy().into_owned();
+    // The file is judged before the secret is read: the rule's verdict on it is what the real
+    // run stops at, so a dry run over no secret yet says the same.
+    let ring = crate::bridge::read_cap_file(&cap_shown);
+    let cap_ok = match ring {
+        Err(e) if crate::bridge::cap_refused(&e) => Err(CapMiss::from(e)),
+        ring if cap.exists() => read_secret(&secret_shown)
             .map_err(|e| CapMiss::from(crate::transport::describe(&secret_shown, &e)))
-            .and_then(|key| cap_is_for(&cap, &p.fleet, &node, &key))
-    } else {
-        Err(CapMiss::from("absent".to_string()))
+            .and_then(|key| ring_is_for(ring, &p.fleet, &node, &key)),
+        _ => Err(CapMiss::from("absent".to_string())),
     };
     match cap_ok {
         Ok(n) => out.already("cap", &format!("{} ({n} grants for {node})", cap.display())),
-        Err(CapMiss { why, keep }) => {
+        Err(CapMiss {
+            why, refused: true, ..
+        }) => {
+            out.fail(
+                "cap",
+                &format!(
+                    "{why}; `on` leaves a ring it was refused where it is, since no `on` mints \
+                     one made by hand again: fix it, or move it aside and run again"
+                ),
+            );
+            return Err(ExitCode::from(2));
+        }
+        Err(CapMiss { why, keep, .. }) => {
             let mint = |kept: &str| {
                 format!(
                     "mint 8 grants for {node} into {} ({why}{kept})",
@@ -5256,8 +5310,15 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
         )
     } else if s("no node id") {
         format!("{again} provisions one and mints the cap for it")
+    } else if s("cap file") && (s("a secret file") || s("read through no link")) {
+        format!(
+            "the file is refused as a cap for what this warning says: do what it names (`chmod \
+             600 <cap>`, `chmod -N <cap>`), since whoever could read it could have copied it, or \
+             move it aside and run {again}, which mints this node's ring; a bridge aterm runs \
+             must satisfy the same owner-only rule at every new start"
+        )
     } else if s("cap file") {
-        format!("{again} re-mints the cap file for the node id in the state dir")
+        format!("{again} can re-mint a missing or malformed cap file; permission-refused files are left intact, so restore access before retrying")
     } else if s("has no bridge") {
         format!("{again} arms every running instance")
     } else if s("bridge is down") {
@@ -8971,6 +9032,10 @@ mod tests {
             "no [fabric] command in /c: this report read instance 1's running bridge",
             "no node id in /s/node",
             "cap file /c: the tag is not hex",
+            "cap file /c: /c is mode 0644: a secret file must be readable by its owner alone \
+             (0600 or tighter); run `chmod 600 /c` and treat its contents as exposed",
+            "cap file /c: /c is a symlink: a private ring is read through no link, so name the \
+             file it points at",
             "instance 1 has no bridge (fabric=absent, not supervised)",
             "instance 1's bridge is down (fabric=disconnected)",
             "instance 1's bridge was armed with a different command than x",
@@ -9525,6 +9590,10 @@ mod tests {
 
     #[test]
     fn a_cap_minted_under_the_roots_secret_is_recognised() {
+        let cap_is_for = |path: &Path, fleet: &str, node: &str, secret: &[u8]| {
+            let ring = crate::bridge::read_cap_file(&path.to_string_lossy());
+            ring_is_for(ring, fleet, node, secret)
+        };
         let dir = std::env::temp_dir().join(format!("atfo-minted-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch");
@@ -9539,16 +9608,32 @@ mod tests {
                 })
                 .collect();
             let path = dir.join(name);
-            std::fs::write(&path, lines).expect("cap");
+            crate::bridge::write_owner_only(&path, lines);
             path
         };
         let own = cap_under(&[4u8; 32], "own.cap", &ring);
         assert_eq!(cap_is_for(&own, "lab", node, &[4u8; 32]), Ok(8));
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let at = |mode| std::fs::set_permissions(&own, std::fs::Permissions::from_mode(mode));
+            at(0o644).expect("widen");
+            let miss = cap_is_for(&own, "lab", node, &[4u8; 32]).expect_err("others can read it");
+            assert!(miss.refused && !miss.keep, "{miss:?}");
+            assert!(miss.why.contains("chmod 600"), "{miss:?}");
+            at(0o000).expect("close");
+            let miss = cap_is_for(&own, "lab", node, &[4u8; 32]).expect_err("the OS refuses it");
+            assert!(
+                miss.refused && !miss.keep,
+                "OS permissions are a refusal: {miss:?}"
+            );
+            at(0o600).expect("narrow");
+        }
         assert_eq!(
             cap_is_for(&own, "lab", "n-other", &[4u8; 32]),
             Err(CapMiss {
                 why: "minted for a different node id, not n-other".to_string(),
-                keep: true
+                keep: true,
+                refused: false,
             }),
             "another node's ring, the last record of its id once the state dir names another"
         );
@@ -9566,7 +9651,8 @@ mod tests {
             cap_is_for(&own, "work", node, &[4u8; 32]),
             Err(CapMiss {
                 why: "minted for fleet lab, not work".to_string(),
-                keep: false
+                keep: false,
+                refused: false,
             }),
             "another fleet's ring, which `on --fleet lab` mints again grant for grant"
         );

@@ -8554,7 +8554,7 @@ fn run_check(
     {
         let label = tabs[i].seen.window.label.clone();
         let strip = surfaces::strip_tabs(&door.out(&["chrome"]));
-        let Some(at) = strip.iter().find(|t| t.label == label).map(|t| t.index) else {
+        let Some(at) = strip.iter().find(|t| t.label == label).map(|t| t.index + 1) else {
             return Err(could_not(&format!(
                 "{label} is not in the chains' window's strip"
             )));

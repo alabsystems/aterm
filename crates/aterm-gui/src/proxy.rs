@@ -480,22 +480,81 @@ fn open_private_untruncated(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(unix)]
 fn open_private_opts(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(truncate)
         .mode(0o600)
-        .open(path)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private sidecar is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 /// Windows twin of [`open_private_opts`] (ACL-inherited; see the Unix docs).
 #[cfg(windows)]
 fn open_private_opts(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(truncate)
-        .open(path)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private sidecar is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+const MAX_PRIVATE_TEXT_BYTES: u64 = 16 * 1024;
+
+/// Read a bounded regular UTF-8 sidecar file (`graph/<sid>`, `edges/<sid>`) without following symlinks or blocking on a FIFO.
+pub(crate) fn read_private_text(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "private sidecar is a symlink",
+        ));
+    }
+    let file = opts.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() > MAX_PRIVATE_TEXT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "private sidecar is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    file.take(MAX_PRIVATE_TEXT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PRIVATE_TEXT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "private sidecar exceeds size bound",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "private sidecar is not UTF-8",
+        )
+    })
 }
 
 /// Remove `<sock_dir>/graph/<sid>` on graceful exit (best-effort).
@@ -510,7 +569,7 @@ pub(crate) fn remove_own_graph_entry(sock_dir: &Path, sid: &SessionId, our_sock:
     let Some(path) = entry_path(sock_dir, sid) else {
         return;
     };
-    let Ok(body) = std::fs::read_to_string(&path) else {
+    let Ok(body) = read_private_text(&path) else {
         return;
     };
     let Some(named) = aterm_types::control_socket::graph_entry_sock(&body) else {
@@ -535,7 +594,7 @@ pub(crate) fn sweep_stale_graph(sock_dir: &Path) {
     };
     for ent in entries.flatten() {
         let path = ent.path();
-        if let Ok(body) = std::fs::read_to_string(&path)
+        if let Ok(body) = read_private_text(&path)
             && let Some((sock, _nonce)) = parse_graph_entry(&body)
             && !crate::control_auth::socket_is_live(&sock)
         {
@@ -672,7 +731,7 @@ pub(crate) fn start_edge_sweeper() {
 
 /// Read `(read, write, signal)` edge-token hexes from the 0600 file at `path`.
 pub(crate) fn read_edge_tokens(path: &str) -> Option<(String, String, String)> {
-    let body = std::fs::read_to_string(path).ok()?;
+    let body = read_private_text(Path::new(path)).ok()?;
     let (mut r, mut w, mut s) = (None, None, None);
     for line in body.lines() {
         if let Some(v) = line.strip_prefix("read ") {
@@ -708,7 +767,7 @@ impl Drop for ChildProxy {
 
 /// Return the hosting PID recorded in `sid`'s discovery entry, if present.
 pub(crate) fn graph_entry_host_pid(sock_dir: &Path, sid: &SessionId) -> Option<u32> {
-    let body = std::fs::read_to_string(entry_path(sock_dir, sid)?).ok()?;
+    let body = read_private_text(&entry_path(sock_dir, sid)?).ok()?;
     aterm_types::control_socket::graph_entry_pid(&body)
 }
 
@@ -720,7 +779,7 @@ pub(crate) fn sid_of(id: &SessionId) -> Sid<'_> {
 
 /// Read `(sock_path, nonce)` from a session's discovery entry.
 pub(crate) fn read_graph_entry(sock_dir: &Path, sid: Sid<'_>) -> Option<(String, LaunchNonce)> {
-    let body = std::fs::read_to_string(graph_path(sock_dir, sid)).ok()?;
+    let body = read_private_text(&graph_path(sock_dir, sid)).ok()?;
     parse_graph_entry(&body)
 }
 
@@ -1296,6 +1355,34 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, [std::ffi::OsString::from(minted.as_str())]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_and_edge_sidecars_reject_symlinks_and_oversized_entries() {
+        let dir = crate::test_scratch::short_dir("graph-sidecar-hygiene");
+        let nonce = LaunchNonce::generate();
+        let minted = SessionId::generate();
+        let _ = std::fs::create_dir_all(dir.path().join("graph"));
+        let target = dir.path().join("target.txt");
+        std::fs::write(
+            &target,
+            format!("sock /x/aterm-1.sock\nnonce {}\npid 1\n", nonce.to_hex()),
+        )
+        .expect("target");
+        let entry = dir.path().join("graph").join(minted.as_str());
+        std::os::unix::fs::symlink(&target, &entry).expect("symlink");
+        assert!(read_graph_entry(dir.path(), sid_of(&minted)).is_none());
+        assert_eq!(graph_entry_host_pid(dir.path(), &minted), None);
+        write_graph_entry(dir.path(), &minted, "/x/aterm-2.sock", &nonce);
+        assert!(
+            std::fs::read_to_string(&target)
+                .expect("target intact")
+                .contains("/x/aterm-1.sock")
+        );
+        std::fs::remove_file(&entry).expect("remove symlink");
+        std::fs::write(&entry, "x".repeat(MAX_PRIVATE_TEXT_BYTES as usize + 1)).expect("oversized");
+        assert!(read_private_text(&entry).is_err());
     }
 
     #[test]

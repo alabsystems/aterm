@@ -34,6 +34,7 @@ fn realistic_layout() -> RestoreManifest {
         native_tabs: Vec::new(),
         tab_order: Vec::new(),
         active_item: Some(0),
+        workers_in_front: false,
         restored_tabs: vec![RestoredTab {
             root: RestoredSplitTree::Split {
                 axis: crate::restore::SplitKind::Vertical,
@@ -65,6 +66,7 @@ fn realistic_layout() -> RestoreManifest {
                         claim_ended: false,
                         not_claim_worker: false,
                         claim_worker: None,
+                        task: None,
                     },
                 ))),
                 second: Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
@@ -94,11 +96,13 @@ fn realistic_layout() -> RestoreManifest {
                         claim_ended: false,
                         not_claim_worker: false,
                         claim_worker: None,
+                        task: None,
                     },
                 ))),
             },
             focused_path: vec![crate::restore::RestoreBranch::Second],
             zoomed: false,
+            parked: false,
         }],
     }])
 }

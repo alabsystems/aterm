@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+#[path = "accounts_auto_shared_identity_tests.rs"]
+mod identity_tests;
+
 use super::super::{
     align::Captured,
     cli::{
@@ -16,6 +19,9 @@ use std::sync::{
 };
 
 const NOW: i64 = 1_793_000_000;
+
+#[path = "accounts_auto_shared_diagnostic_tests.rs"]
+mod diagnostic_tests;
 const EMAIL: &str = "owner@example.test";
 const SOURCE: accounts::shared::Source = accounts::shared::Source {
     network: [1; 32],
@@ -517,7 +523,6 @@ impl Bed {
         let fx = UpkeepEffects {
             fetch: &|_, _| panic!("no source fetch"),
             spawn_renewal: spawn,
-            quota_refresh: &|_, _, _, _| {},
             sync_cooldown: &Mutex::new(None),
             rediscovery: &Mutex::new(Rediscovery::default()),
             renew_guard: guard,
@@ -651,7 +656,6 @@ impl Bed {
         let fx = UpkeepEffects {
             fetch: &|_, _| panic!("no source fetch"),
             spawn_renewal: spawn,
-            quota_refresh: &|_, _, _, _| {},
             sync_cooldown: &Mutex::new(None),
             rediscovery: &Mutex::new(Rediscovery::default()),
             renew_guard: guard,

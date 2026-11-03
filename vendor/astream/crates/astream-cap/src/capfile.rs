@@ -5,7 +5,8 @@
 //! reads off disk, and both used to be written again by each face that read them.
 //! The line format is below. The secret-file rule ([`check_private`],
 //! [`read_private_file`], [`read_secret_file`], [`read_secret_in`], [`read_secret_at`],
-//! [`read_secret_at_narrowed`], [`SECRET_MIN`]), judged through astream-sys's owner-only rule, is at the end of this doc.
+//! [`read_secret_at_narrowed`], [`SECRET_MIN`]), judged through astream-sys's owner-only rule, is at the end of this doc,
+//! and [`read_private_ring`] holds a ring to it.
 //!
 //! A cap file holds a node's whole ring, one minted capability per line, in exactly
 //! the shape `asb mint` prints — so the file a mint wrote is the file every face
@@ -125,9 +126,16 @@
 //! `read_mint_secret`, for `aterm link broker --secret-file`, `aterm link mint` and
 //! `aterm fabric on`/`mint-for`), so the broker that verifies and the verb that mints
 //! read a secret by this one code, and `fabric on --dry-run` through
-//! [`read_secret_at_narrowed`] when its root step would narrow the root. [`read_file`] does
-//! NOT check a cap file's mode: a face that wants that reads the file with
-//! [`read_private_file`] and parses it with [`parse_text`].
+//! [`read_secret_at_narrowed`] when its root step would narrow the root.
+//!
+//! A cap file is read one of two ways, and the face that reads it says which. [`read_file`]
+//! does NOT check a cap file's mode, and is what `asb` and `aspump` read `--cap-file` by: an
+//! operator's tool reads the ring it is pointed at, a process substitution included.
+//! [`read_private_ring`] holds the ring to the owner-only rule on the file itself, refusing a
+//! link at the path too, and is what aterm's fabric reads every cap by
+//! (`bridge::read_cap_file`). The directory, the link count and the length floor are clauses of
+//! a secret in a directory of its own, and it holds none of them: a person keeps a cap where
+//! they choose, `~/h-andrew.cap` in a home directory of 0750, say.
 
 use std::fmt;
 use std::io::Read;
@@ -352,7 +360,8 @@ pub fn parse_text(path: &str, text: &str) -> Result<Vec<Line>, Malformed> {
 /// Read a whole ring from the file at `path` — [`parse_text`] over its contents,
 /// with errors naming the path as [`Path::display`] shows it. This is a plain read: the
 /// secret-file rule below does not reach it, so a ring at 0644 is read, and a FIFO at
-/// `path` waits for a writer. Whoever keeps a ring keeps it private.
+/// `path` waits for a writer. Whoever keeps a ring keeps it private, and a face that holds
+/// its rings private reads them with [`read_private_ring`].
 ///
 /// # Errors
 /// [`ReadError::Io`] when the file cannot be read as UTF-8 text at all;
@@ -399,6 +408,52 @@ fn refused(path: &Path, kind: std::io::ErrorKind, why: &str) -> std::io::Error {
     std::io::Error::new(kind, format!("{}{why}", path.display()))
 }
 
+/// Which clause of the owner-only rule a reader here refused a file for ([`refusal_of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// A symlink where the reader follows none.
+    Link,
+    /// A clause astream-sys judges off the open file ([`astream_sys::owner_private`]).
+    File(astream_sys::NotPrivate),
+}
+
+/// The words of a [`Refusal`] and the clause they say, as an [`std::io::Error`] carries them.
+#[derive(Debug)]
+struct RuleRefused {
+    said: String,
+    clause: Refusal,
+}
+
+impl fmt::Display for RuleRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.said)
+    }
+}
+
+impl std::error::Error for RuleRefused {}
+
+/// The clause of the owner-only rule `error` says, for a caller that acts on a refusal rather
+/// than only printing it, and `None` for anything else this module answers. An open the OS
+/// refused is `PermissionDenied` too (a file of mode 000, another user's 0600), and so is a clause
+/// of the rule: only this tells a file the reader cannot open from one the rule will not take. A
+/// refusal of the DIRECTORY that holds a secret, or of a file's link count, names no clause here.
+#[must_use]
+pub fn refusal_of(error: &std::io::Error) -> Option<Refusal> {
+    let refused = error.get_ref()?.downcast_ref::<RuleRefused>()?;
+    Some(refused.clause)
+}
+
+/// [`refused`] for the clause `clause`, which [`refusal_of`] then reads back.
+fn refused_by(
+    path: &Path,
+    kind: std::io::ErrorKind,
+    why: &str,
+    clause: Refusal,
+) -> std::io::Error {
+    let said = format!("{}{why}", path.display());
+    std::io::Error::new(kind, RuleRefused { said, clause })
+}
+
 /// The owner-only rule's refusal of the FILE at `path` (astream-sys's clause, worded
 /// for the person who owns the secret). A mode or an access list names the command
 /// that closes it rather than closing it silently: a key that sat readable may
@@ -407,9 +462,9 @@ fn file_refusal(path: &Path, why: astream_sys::NotPrivate) -> std::io::Error {
     use astream_sys::NotPrivate;
     use std::io::ErrorKind::{InvalidInput, PermissionDenied};
     let shown = path.display();
+    let refused = |kind, words: &str| refused_by(path, kind, words, Refusal::File(why));
     match why {
         NotPrivate::Mode(mode) => refused(
-            path,
             PermissionDenied,
             &format!(
                 " is mode {mode:04o}: a secret file must be readable by its owner alone \
@@ -417,7 +472,6 @@ fn file_refusal(path: &Path, why: astream_sys::NotPrivate) -> std::io::Error {
             ),
         ),
         NotPrivate::Acl => refused(
-            path,
             PermissionDenied,
             &format!(
                 " {why}: a secret file must be readable by its owner alone; run `chmod -N \
@@ -425,12 +479,10 @@ fn file_refusal(path: &Path, why: astream_sys::NotPrivate) -> std::io::Error {
             ),
         ),
         NotPrivate::Owner(_) => refused(
-            path,
             PermissionDenied,
             &format!(" {why}: a secret file is its reader's own"),
         ),
         NotPrivate::Kind(_) => refused(
-            path,
             InvalidInput,
             &format!(" {why}: a secret file is a regular file"),
         ),
@@ -491,24 +543,34 @@ fn open_private(
     path: &Path,
     links: astream_sys::Links,
 ) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
-    open_private_as(path, path, links)
+    open_private_as(path, path, links, SECRET_NO_LINK)
 }
+
+/// Why a secret in a private directory refuses a link at its path.
+const SECRET_NO_LINK: &str =
+    " is a symlink: a secret in a private directory is read through no link";
+
+/// Why [`read_private_ring`] refuses a link at its path, and what to do.
+const RING_NO_LINK: &str = " is a symlink: a private ring is read through no link, so name the \
+                            file it points at";
 
 /// [`open_private`] of the file at `at`, every refusal naming it as `path`: the
 /// spelling its caller was given ([`read_secret_at`] opens a bare name's file beneath
-/// `.` and names it as given).
+/// `.` and names it as given). `no_link` follows the path in the refusal of a link there.
 fn open_private_as(
     at: &Path,
     path: &Path,
     links: astream_sys::Links,
+    no_link: &str,
 ) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     let file = match astream_sys::open_nonblocking(at, links) {
         Ok(file) => file,
         Err(_) if links == astream_sys::Links::Refuse && is_link(at) => {
-            return Err(refused(
+            return Err(refused_by(
                 path,
                 std::io::ErrorKind::PermissionDenied,
-                " is a symlink: a secret in a private directory is read through no link",
+                no_link,
+                Refusal::Link,
             ));
         }
         Err(e) => return Err(at_path(path, e)),
@@ -563,6 +625,39 @@ pub fn read_private_file(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
     let path = path.as_ref();
     let (file, _meta) = open_private(path, astream_sys::Links::Follow)?;
     read_judged(path, file)
+}
+
+/// THE OWNER-ONLY RING READER: the ring at `path`, [`parse_text`] over the bytes of one open
+/// file held to the owner-only rule (the rules are the module's), with no link followed at the
+/// path. It is [`read_file`] for a face that holds its rings private: a cap is authority, and
+/// such a face wants a ring others can read, one behind a link or a FIFO refused at once.
+///
+/// The FILE is what it judges. A secret's other clauses do not reach a ring: its directory is
+/// its keeper's choice, a second name cannot widen the mode the one file carries, and its lines
+/// rather than its length say whether it is whole, so an empty ring reads as an empty ring.
+///
+/// # Errors
+///
+/// [`check_private`]'s, with `PermissionDenied` for a symlink too; any read error with its own
+/// kind; and `InvalidData` for bytes that are not UTF-8 or a line that breaks a rule, naming
+/// `path:line`. Each message starts with `path`. [`refusal_of`] reads the clause of a refusal.
+pub fn read_private_ring(path: impl AsRef<Path>) -> std::io::Result<Vec<Line>> {
+    let path = path.as_ref();
+    let (file, _meta) = open_private_as(path, path, astream_sys::Links::Refuse, RING_NO_LINK)?;
+    let bytes = read_judged(path, file)?;
+    let text = core::str::from_utf8(&bytes).map_err(|e| {
+        let line = 1 + bytes
+            .iter()
+            .take(e.valid_up_to())
+            .filter(|b| **b == b'\n')
+            .count();
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}:{line}: {e}", path.display()),
+        )
+    })?;
+    parse_text(&path.display().to_string(), text)
+        .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string()))
 }
 
 /// `secret`, or `InvalidData` naming its length when it holds fewer than
@@ -750,7 +845,7 @@ fn secret_in(
         Err(why) => return Err(dir_refusal(path, dir, why)),
     }
     drop(opened);
-    let (file, meta) = open_private_as(&at, path, astream_sys::Links::Refuse)?;
+    let (file, meta) = open_private_as(&at, path, astream_sys::Links::Refuse, SECRET_NO_LINK)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;

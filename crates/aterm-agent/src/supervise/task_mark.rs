@@ -4,7 +4,8 @@
 //! Task record publication over [`Ctl`] under [`super::claim`] ([`SuperviseOpts::tasks`],
 //! `Session::supervise`, [`mark_task_exited`]).
 //!
-//! Publishes [`TurnEndState::landed`] points ([`TurnEndState::point_number`],
+//! Publishes [`TurnEndState::landed`] and [`TurnEndState::gave_up`] points
+//! ([`TurnEndState::point_number`],
 //! [`TurnEndState::left_to_person`], [`TurnEndState::followed`]) with result snapshots
 //! ([`crate::harness::result::snapshot`], [`DoneBy`], [`crate::harness::result::snapshot_screen`],
 //! [`crate::harness::result::with_report`], [`result::prune_results`]) and seeds loops from
@@ -127,7 +128,7 @@ pub fn deadline_attention(text: &str) -> bool {
 pub(crate) struct TaskRead {
     /// The record's revision.
     pub(crate) rev: u64,
-    /// `working`, `done`, `exited` or `stalled`.
+    /// `working`, `done`, `exited`, `stalled` or `failed`.
     pub(crate) state: String,
     /// The result's size.
     pub(crate) result_bytes: u64,
@@ -166,6 +167,13 @@ pub(crate) fn task_read(reply: &CtlReply) -> Option<TaskRead> {
 /// The `why=` when the harness marks a task `done`.
 pub const LANDED_WHY: &str = "landed";
 
+/// The `why=` when the harness marks a task `failed` on the worker's own `Could not finish:` word.
+pub const COULD_NOT_FINISH_WHY: &str = GaveUp::CouldNotFinish.word();
+
+/// The `why=` when the harness marks a task `failed` because Land stopped typing to a reply that
+/// came back the same with no work.
+pub const REPEATED_WHY: &str = GaveUp::Repeated.word();
+
 /// Whether the record `t` is a landing this harness published: `done
 /// why=landed` ([`LANDED_WHY`]).
 fn is_landing(t: &TaskRead) -> bool {
@@ -191,11 +199,12 @@ impl<C: Ctl> Session<'_, C> {
         let te = &self.turn_end;
         if te.task_done() {
             let at = te.point_number();
-            if !te.landed() || at.is_none() || at == self.task_point {
+            let ending = te.gave_up();
+            if !(te.landed() || ending.is_some()) || at.is_none() || at == self.task_point {
                 return Ok(());
             }
             let again = self.task_point.is_some() && te.followed().is_none();
-            if self.publish_done(seq, again, tasks, opts, review)? {
+            if self.publish_done(seq, again, ending, tasks, opts, review)? {
                 self.task_point = at;
             }
         } else if was_done && te.followed().is_none() {
@@ -204,15 +213,16 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// The landing of this point, published, its result snapshotted under
-    /// `tasks`: `Ok(true)` once the record was read and, where it was
-    /// `working` — or `done` and opened `again` by someone else's turn, or
-    /// `done` by an older build's word (no landing, [`is_landing`]) — marked;
-    /// `Ok(false)` where a request failed or its reply did not confirm the mark.
+    /// The end of this point, published, its result snapshotted under `tasks`: a landing, or with
+    /// `ending` a worker's failed conclusion. `Ok(true)` once the record was read and, where it was
+    /// `working` — or ended and opened `again` by someone else's turn, or ended some other way
+    /// (an older build's `done`, with no landing, [`is_landing`]; a `failed` that a landing now
+    /// follows) — marked; `Ok(false)` where a request failed or its reply did not confirm the mark.
     fn publish_done(
         &mut self,
         seq: u64,
         again: bool,
+        ending: Option<GaveUp>,
         tasks: &Path,
         opts: &SuperviseOpts,
         review: &mut dyn Review,
@@ -222,9 +232,13 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(false);
         }
         let mut record = task_read(&r);
+        let stands = |t: &TaskRead| match ending {
+            None => is_landing(t),
+            Some(_) => t.state == "failed",
+        };
         if record
             .as_ref()
-            .is_some_and(|t| t.state == "done" && (again || !is_landing(t)))
+            .is_some_and(|t| matches!(t.state.as_str(), "done" | "failed") && (again || !stands(t)))
         {
             let r = self.call(&["task", "mark", "working", "why=turn"])?;
             if !r.ok() {
@@ -250,7 +264,11 @@ impl<C: Ctl> Session<'_, C> {
         }) else {
             return Ok(true);
         };
-        let by = DoneBy::Turn;
+        let by = if ending.is_some() {
+            DoneBy::Failed
+        } else {
+            DoneBy::Turn
+        };
         let stem = result::result_stem(self.setup.sid.as_deref(), record.rev);
         let transcript = opts.idle_host.as_ref().and_then(|h| h.transcript());
         let screen = if transcript.is_none() {
@@ -286,6 +304,7 @@ impl<C: Ctl> Session<'_, C> {
         let checked = self
             .land_receipt
             .as_ref()
+            .filter(|_| ending.is_none())
             .map(crate::harness::acts::LandReceipt::checked_word);
         let mut unnoted: Option<String> = None;
         let request = || {
@@ -338,11 +357,11 @@ impl<C: Ctl> Session<'_, C> {
             review.note(&format!("TASK seq={seq} {}", settled.note()));
         }
         let snap = taken.snap;
-        let why = LANDED_WHY;
+        let (state, why) = ending.map_or(("done", LANDED_WHY), |e| ("failed", e.word()));
         let mut args = vec![
             "task".to_string(),
             "mark".to_string(),
-            "done".to_string(),
+            state.to_string(),
             format!("why={why}"),
         ];
         if let Some(word) = &checked {
@@ -367,15 +386,15 @@ impl<C: Ctl> Session<'_, C> {
         if r.lost() || r.is_err("busy") {
             return Ok(false);
         }
-        let Some(after) = task_read(&r).filter(is_landing) else {
+        let Some(after) = task_read(&r).filter(|t| t.state == state && stands(t)) else {
             review.note(&format!(
-                "TASK seq={seq} done not marked: {}",
+                "TASK seq={seq} {state} not marked: {}",
                 one_line(r.err_text())
             ));
             return Ok(false);
         };
         review.note(&format!(
-            "TASK seq={seq} done why={why} rev={} {result}{}",
+            "TASK seq={seq} {state} why={why} rev={} {result}{}",
             after.rev,
             unnoted.unwrap_or_default()
         ));
@@ -397,7 +416,20 @@ impl<C: Ctl> Session<'_, C> {
         };
         self.turn_end.set_managed(record.state != "exited");
         self.door_task_seed(record.fact, &opts.policy);
-        if record.state == "done" {
+        if record.state == "failed" {
+            // A CONCLUSION THE LOOP BEFORE THIS ONE MADE ends this loop's typing too, unless a
+            // turn ran since; `why=off`, `why=off-ctl` and `why=expired` are the Autopilot word's to
+            // hold.
+            let ending = record.why.as_deref().and_then(GaveUp::of_word);
+            if let Some(ending) = ending
+                && self.turn_end.seed_gave_up(ending)
+            {
+                self.task_point = self.turn_end.point_number();
+                self.task_done_said = true;
+            } else if ending.is_some() && !self.turn_end.act_in_flight() {
+                self.task_done_said = true;
+            }
+        } else if record.state == "done" {
             let holds = self.turn_end.task_done() || self.turn_end.record_landing_holds();
             if is_landing(&record) && holds && self.turn_end.seed_task_done() {
                 self.task_point = self.turn_end.point_number();
@@ -440,12 +472,12 @@ impl<C: Ctl> Session<'_, C> {
         Ok(None)
     }
 
-    /// The task opened again by someone else's turn: a `done` record marked
+    /// The task opened again by someone else's turn: a `done` or `failed` record marked
     /// `working why=turn`.
     fn reopen_task(&mut self, seq: u64, review: &mut dyn Review) -> Result<(), Fail> {
         let _duty = self.metadata_duty_guard(Scope::TurnEnd);
         let r = self.call(&["task"])?;
-        if task_read(&r).is_none_or(|t| t.state != "done") {
+        if task_read(&r).is_none_or(|t| !matches!(t.state.as_str(), "done" | "failed")) {
             return Ok(());
         }
         let r = self.call(&["task", "mark", "working", "why=turn"])?;
@@ -483,7 +515,7 @@ pub fn mark_task_exited<C: Ctl + ?Sized>(ctl: &mut C, sel: &str) -> Result<Optio
     if let Some(code) = code {
         args.push(format!("exit={code}"));
     }
-    if record.state == "done"
+    if matches!(record.state.as_str(), "done" | "failed")
         && let Some(path) = &record.result_path
     {
         args.push(format!("result_bytes={}", record.result_bytes));
@@ -603,6 +635,24 @@ mod tests {
             assert_eq!(said, None);
             assert_eq!(tab.asked, ["@s-1 task"], "{record:?}");
         }
+    }
+
+    /// A FAILED CONCLUSION'S RESULT OUTLIVES THE AGENT'S EXIT, as a done task's does; the record
+    /// keeps what `why=` said (`TaskMark::apply`).
+    #[test]
+    fn an_agent_gone_after_it_failed_keeps_its_result() {
+        let mut tab = Tab {
+            record: Some(
+                "rev=2 state=failed from=ctl since_ms=5 result_bytes=17 why=could-not-finish result_path=/s/tasks/s-1-1.result.md",
+            ),
+            blocks: None,
+            asked: Vec::new(),
+        };
+        mark_task_exited(&mut tab, "@s-1").expect("served");
+        assert_eq!(
+            marks(&tab),
+            ["@s-1 task mark exited why=exit result_bytes=17 result_path=/s/tasks/s-1-1.result.md"]
+        );
     }
 
     /// The record is read by key off the `task` reply and the mark's own;

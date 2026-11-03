@@ -13322,6 +13322,141 @@ fn the_auto_mode_setup_offer_waits_its_own_settle_before_any_key() {
     );
 }
 
+/// Claude Code's `Claude in Chrome` intro as captured, and the REPL it gives way to once
+/// confirmed.
+fn intro_then_repl(text: &str) -> (Vec<String>, Vec<String>) {
+    let rows = aterm_phase::prompt::fixtures::screen(text);
+    assert_eq!(
+        aterm_phase::parse_prompt_v2(&rows).map(|p| p.kind),
+        Some(aterm_phase::PromptKind::ChromeIntro)
+    );
+    (rows, idle_screen())
+}
+
+/// THE 2026-11-02 INCIDENT: a worker started with `--chrome` stood on the intro at startup. The
+/// loop confirms it with one Enter, fenced on the person's count and the screen's generation and
+/// guarded by the footer's row, at `safe` and `all`, and books it.
+#[test]
+fn the_chrome_intro_is_confirmed_once_at_safe_and_all() {
+    use aterm_phase::prompt::fixtures as f;
+    for (text, approve) in [
+        (f::CHROME_INTRO, "all"),
+        (f::CHROME_INTRO, "safe"),
+        (f::CHROME_INTRO_FULLSCREEN[0].1, "all"),
+        (f::CHROME_INTRO_FULLSCREEN[1].1, "safe"),
+        (f::CHROME_INTRO_INLINE[3].1, "all"),
+        (f::CHROME_INTRO_EXTENSION_FOUND[1].1, "safe"),
+    ] {
+        let (dir, ledger) = ledger_file("chrome-intro");
+        let mut policy = auto(30).policy;
+        policy.set("approve", approve).expect("a level");
+        let opts = SuperviseOpts { policy, ..auto(30) };
+        let (intro, repl) = intro_then_repl(text);
+        let p = aterm_phase::parse_prompt_v2(&intro).expect("the intro");
+        let footer = crate::supervise::policy::row_guard(&intro[p.options[0].row]);
+        // The tail read and the whole read each see the intro, as the trust dialog's tests do.
+        let mut m = fenced(vec![intro.clone(), intro, repl]);
+        m.human_seq = Some(3);
+        m.vanish_after = Some(2);
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_env(owner_env());
+            s.set_approval_ledger(Some(ledger.clone()));
+        });
+        let presses = m.presses();
+        assert_eq!(presses.len(), 1, "{approve}: one Enter: {presses:#?}");
+        assert!(
+            presses[0].starts_with("key if-human=3 if-gen=")
+                && presses[0].ends_with(&format!(" if={footer} enter")),
+            "{approve}: Enter under the footer's guard: {presses:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("APPROVED seq=")
+                && l.contains("Claude in Chrome => Enter to confirm")),
+            "{approve}: {lines:#?}"
+        );
+        let rows = ledger_rows(&ledger);
+        assert!(
+            rows.iter().any(|r| r.contains("chrome-intro@v1")
+                && r.contains("approved")
+                && r.contains("Enter to confirm")),
+            "{approve}: {rows:#?}"
+        );
+        assert!(
+            !m.requests
+                .iter()
+                .any(|r| r.starts_with("meta set attention owner=supervisor claude chrome-intro")),
+            "{approve}: nothing asked of the owner: {:#?}",
+            m.requests
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn the_chrome_intro_waits_out_a_persons_typing() {
+    let (intro, _) = intro_then_repl(aterm_phase::prompt::fixtures::CHROME_INTRO);
+    let mut m = recent_person(vec![intro], TRUST_PUBLISHED_1S);
+    m.human_ms = Some(1_000);
+    let (_, noted) = full_power_watch(&mut m, "chrome-intro-held");
+    assert_held("a person typed a second ago", &m, &noted);
+}
+
+/// Under `approve = "none"` the intro is the owner's: nothing is pressed, and the owner is told.
+#[test]
+fn the_chrome_intro_is_the_owners_under_approve_none() {
+    let (intro, _) = intro_then_repl(aterm_phase::prompt::fixtures::CHROME_INTRO);
+    let mut opts = auto(30);
+    opts.policy.approve = Approve::None;
+    let mut m = fenced(vec![intro]);
+    m.vanish_after = Some(0);
+    let _ = watch_lines_with(&mut m, &opts, |s| s.set_approval_env(owner_env()));
+    assert!(m.presses().is_empty(), "{:#?}", m.requests);
+    assert!(
+        m.attention
+            .as_deref()
+            .is_some_and(|a| a.starts_with("claude chrome-intro: ")),
+        "{:?}",
+        m.attention
+    );
+}
+
+/// The negative control: a look-alike of the intro in other words is not pressed.
+#[test]
+fn a_look_alike_of_the_chrome_intro_is_not_pressed() {
+    let (intro, _) = intro_then_repl(aterm_phase::prompt::fixtures::CHROME_INTRO);
+    for (from, to) in [
+        ("control your browser", "control your tabs"),
+        ("https://claude.ai/chrome", "https://claude.ai/edge"),
+        (
+            "Enter to confirm · Esc to cancel",
+            "Enter to select · Esc to cancel",
+        ),
+    ] {
+        let alike: Vec<String> = intro.iter().map(|r| r.replace(from, to)).collect();
+        assert_ne!(alike, intro, "{from:?} is on the screen");
+        let mut m = fenced(vec![alike]);
+        m.vanish_after = Some(0);
+        let (jdir, journal) = journal_file("chrome-intro-alike");
+        let opts = SuperviseOpts {
+            journal: Some(journal.clone()),
+            ..auto(60)
+        };
+        let _ = watch_lines_with(&mut m, &opts, |s| s.set_approval_env(owner_env()));
+        let (records, _) = journal_records(&journal);
+        let _ = std::fs::remove_dir_all(&jdir);
+        let noted: Vec<String> = records.into_iter().map(|r| r.line).collect();
+        assert!(
+            m.presses().is_empty(),
+            "{to}: {noted:#?}\n{:#?}",
+            m.requests
+        );
+        assert!(
+            !noted.iter().any(|l| l.contains("chrome-intro@v1")),
+            "{to}: {noted:#?}"
+        );
+    }
+}
+
 #[test]
 fn a_hold_on_the_autocompact_offer_parks_and_sends_nothing_more() {
     let (ldir, ledger) = ledger_file("autocompact-halted");
@@ -14600,6 +14735,22 @@ pub(super) fn observe_row_autocompact() -> &'static [&'static str] {
     });
     let _ = std::fs::remove_dir_all(&dir);
     &[" down", " enter"]
+}
+
+/// [`super::observe_table`]'s row of Claude Code's `Claude in Chrome` intro, confirmed with its
+/// Enter ([`the_chrome_intro_is_confirmed_once_at_safe_and_all`]).
+pub(super) fn observe_row_chrome_intro() -> &'static [&'static str] {
+    let (dir, ledger) = ledger_file("observe-chrome-intro");
+    let (intro, repl) = intro_then_repl(aterm_phase::prompt::fixtures::CHROME_INTRO);
+    let mut m = fenced(vec![intro, repl]);
+    m.human_seq = Some(3);
+    m.vanish_after = Some(2);
+    let _ = watch_lines_with(&mut m, &auto(30), |s| {
+        s.set_approval_env(owner_env());
+        s.set_approval_ledger(Some(ledger.clone()));
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    &[" enter"]
 }
 
 /// [`super::observe_table`]'s row of Claude Code's auto-mode setup offer, put off

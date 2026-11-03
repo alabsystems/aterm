@@ -2,34 +2,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The git-and-friends shim directory the window keeps on a Mac whose Command Line Tools are
-//! installing (System State design §6.3).
+//! The git-and-friends shim directory the window keeps on a Mac from aterm's first launch until
+//! its Command Line Tools exist (System State design §6.3).
 //!
-//! While a setup pass is installing Apple's Command Line Tools ([`crate::clt_install`]) and they
-//! are missing, the window lays a directory of symlinks — one per
-//! [`aterm_types::clt_shim::SHIM_TOOLS`] name that exists as a `/usr/bin` stub — each onto the
-//! one `aterm` binary, and marks it wanted ([`Shim::settle`],
+//! While the tools are missing, whatever becomes of an install of them, a launch lays a directory
+//! of symlinks, one per [`aterm_types::clt_shim::SHIM_TOOLS`] name that exists as a `/usr/bin`
+//! stub, each onto the one `aterm` binary, and marks it wanted ([`Shim::settle`],
 //! [`aterm_types::clt_shim::wanted_mark`]). Every shell the window spawns while it is wanted gets
 //! that directory ahead of `/usr/bin` on its PATH and named in
-//! [`aterm_types::clt_shim::SHIM_ENV`], decided at the spawn ([`settle_session_path`]); the
-//! shell integration moves it back ahead of `/usr/bin` once the profile files have run, since a
-//! login shell's `path_helper` puts `/usr/bin` first. So a tab opened during the install reaches
-//! `aterm` when it runs `git`, which says the tools are on their way ([`aterm_cli::clt_shim`])
-//! instead of raising macOS's install dialog. The mark goes the moment nothing installs the
-//! tools or they arrived (a person's Stop, the Developer group turned off, an install that ended
-//! unfinished, an account that may not install them, the tools installed), and a shell spawned
-//! after that gets neither the PATH entry nor the variable. The directory itself stays until the
-//! next launch removes it ([`Shim::reconcile`]), or longer when that launch adopted live shells:
-//! a shell that already ran `git` through it (bash hashes the path) still reaches a shim, which
-//! hands the call to Apple's own `/usr/bin/git` (with the tools there, or once nothing installs
-//! them).
+//! [`aterm_types::clt_shim::SHIM_ENV`], and its developer directory in `DEVELOPER_DIR`
+//! ([`aterm_types::clt_shim::developer_dir`]), decided at the spawn ([`settle_session_path`]); the
+//! shell integration moves the directory back ahead of `/usr/bin` once the profile files have run,
+//! since a login shell's `path_helper` puts `/usr/bin` first. A login shell or an agent's tool
+//! shell that loads no integration keeps the variable, which Apple's stubs read first. So a tab
+//! or an agent that runs `git` reaches `aterm`, which fails plainly ([`aterm_cli::clt_shim`])
+//! instead of raising macOS's install dialog. A second mark
+//! ([`aterm_types::clt_shim::installing_mark`]) says whether an install is on its way, for the
+//! shim's one line. The wanted mark goes the moment the tools exist, and a shell spawned after
+//! that gets neither. The directory itself stays once laid, and each launch links it again onto
+//! its own `aterm` ([`Shim::for_launch`]): a process that outlives the window (a tmux server, a
+//! `nohup` job, a service started from a tab) keeps the PATH entry and the `DEVELOPER_DIR` it
+//! inherited, and a bash there may have hashed `<shim>/git`. Through the kept links each of them
+//! reaches a shim, which hands the call to Apple's own `/usr/bin/<tool>` once the tools exist;
+//! with the developer directory gone, Apple's stubs there would fail
+//! `missing DEVELOPER_DIR path` instead, and a hashed `git` `No such file or directory`, on a Mac
+//! that has the tools, until that process ends.
 //!
-//! The owner's Mac, which already has the tools, never lays it, leaving every shell's PATH
-//! untouched.
+//! The owner's Mac, which already had the tools at aterm's first launch, never lays it, leaving
+//! every shell's PATH untouched.
 
-#[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The shim directory this window keeps, and how it reads whether the tools are installed.
 pub(crate) struct Shim {
@@ -38,30 +40,39 @@ pub(crate) struct Shim {
     dir: Option<PathBuf>,
     /// Whether the developer tools are installed now ([`aterm_types::clt_shim::developer_git`]).
     present: fn() -> bool,
+    /// The program its links point at: this process's own executable, or a test's stand-in.
+    exe: Option<PathBuf>,
 }
 
 impl Default for Shim {
-    /// A shim laid nowhere.
+    /// A shim laid nowhere (a test's, or a headless one's that needs none).
     fn default() -> Self {
         Self {
             dir: None,
             present: aterm_types::clt_shim::developer_git,
+            exe: None,
         }
     }
 }
 
 impl Shim {
-    /// This account's shim, as a launch keeps it; none in a test, which never touches the
-    /// account's state.
+    /// This account's shim, as a launch keeps it, reconciled ahead of the launch's first shell
+    /// ([`Self::reconcile`]); none in a test, which never touches the account's state, nor off
+    /// macOS, where `/usr/bin` holds no install stubs. The window keeps the one this returns
+    /// ([`crate::workstation_setup::Host::for_launch`]), so no launch keeps one unreconciled.
+    #[must_use]
     pub(crate) fn for_launch() -> Self {
-        Self {
-            dir: if cfg!(test) {
-                None
-            } else {
+        let shim = Self {
+            dir: if cfg!(all(target_os = "macos", not(test))) {
                 aterm_types::clt_shim::shim_dir()
+            } else {
+                None
             },
             present: aterm_types::clt_shim::developer_git,
-        }
+            exe: None,
+        };
+        shim.reconcile();
+        shim
     }
 
     /// A shim laid at `dir`, the tools installed as `present` says (a test's; only a Unix host
@@ -71,34 +82,51 @@ impl Shim {
         Self {
             dir: Some(dir),
             present,
+            exe: None,
         }
     }
 
-    /// Lay the directory and mark it wanted when `wanted` (a pass is installing the Command Line
-    /// Tools now) and they are missing; else take the mark away, at once, and leave the directory
-    /// to the next launch. Best effort: a Mac that cannot lay it keeps raising Apple's own dialog,
-    /// as it did before.
-    pub(crate) fn settle(&self, wanted: bool) {
+    /// This shim with its links onto `exe` in place of this process's executable (a test's).
+    #[cfg(all(test, unix))]
+    pub(crate) fn onto(self, exe: PathBuf) -> Self {
+        Self {
+            exe: Some(exe),
+            ..self
+        }
+    }
+
+    /// Whether a directory is kept here and the tools are missing now.
+    pub(crate) fn tools_missing(&self) -> bool {
+        self.dir.is_some() && !(self.present)()
+    }
+
+    /// While the tools are missing, lay the directory and mark it wanted, with its installing mark
+    /// saying whether an install is on its way (`installing`); once they exist take both marks
+    /// away, at once, and leave the directory where it is. Best effort: a directory that could
+    /// not be laid leaves nothing wanted, and a process whose start named its developer directory
+    /// keeps that name ([`settle_session_path`]), which on macOS 26.6 makes Apple's stubs fail
+    /// `missing DEVELOPER_DIR path` (measured with the tools installed; a Mac without them is not).
+    pub(crate) fn settle(&self, installing: bool) {
         if let Some(dir) = &self.dir {
-            refresh(dir, wanted && !(self.present)());
+            refresh(dir, !(self.present)(), installing, self.exe.as_deref());
         }
     }
 
-    /// This shim as a launch keeps it: no pass wants the tools yet, so the mark an earlier launch
-    /// left (one that ended mid-install, stopped, or crashed) goes, and no shell is told the tools
-    /// are on their way while nothing installs them. The directory goes with it only when this
-    /// launch `adopted` no live shells (a seamless update's hand-off, the PTY keeper after a
-    /// crash): an adopted shell may have it on its PATH, and a bash there hashed `<shim>/git`,
-    /// which would fail `No such file or directory` (127) with the directory gone. Its shim
-    /// hands the call to Apple's own tool instead, until a pass installs the tools again.
-    pub(crate) fn reconcile(&self, adopted: bool) {
+    /// This shim as a launch keeps it, ahead of the launch's first shell. The marks an earlier
+    /// launch left go, as nothing installs the tools yet. A directory an earlier launch laid
+    /// stays, its links (the developer directory's `xcrun` among them) made again onto this
+    /// launch's executable, so a process that inherited it from an earlier launch, however long
+    /// it lives, still reaches a shim that hands the call on once the tools exist. With the tools
+    /// missing it is laid, and wanted, at once.
+    pub(crate) fn reconcile(&self) {
         if let Some(dir) = &self.dir {
             let _ = std::fs::remove_file(aterm_types::clt_shim::wanted_mark(dir));
-            if !adopted {
-                // We own this directory; removing it drops our symlinks, never their targets.
-                let _ = std::fs::remove_dir_all(dir);
+            let _ = std::fs::remove_file(aterm_types::clt_shim::installing_mark(dir));
+            if dir.is_dir() && (self.present)() {
+                let _ = relay(dir, self.exe.as_deref());
             }
         }
+        self.settle(false);
     }
 
     /// Whether the directory is laid now.
@@ -119,28 +147,52 @@ fn is_wanted(dir: &std::path::Path) -> bool {
     dir.is_dir() && aterm_types::clt_shim::wanted_mark(dir).is_file()
 }
 
-/// Lay `dir` and mark it wanted when `active`, or take the mark away when not (the directory
-/// stays for the shells that have it). Each link is `name -> aterm_exe`; the set is
-/// [`aterm_types::clt_shim::SHIM_TOOLS`] filtered to the names that exist as `/usr/bin` stubs
-/// now. The mark is written only once the links are there, so a spawn that reads it finds them.
+/// Lay `dir` and mark it wanted while the tools are `missing`, with the installing mark as
+/// `installing` says, or take both marks away once they exist (the directory stays for the shells
+/// that have it). Each link is `name -> aterm_exe`; the set is
+/// [`aterm_types::clt_shim::SHIM_TOOLS`] filtered to the names that exist as `/usr/bin` stubs now.
+/// The wanted mark is written only once the links are there, so a spawn that reads it finds them.
 #[cfg(unix)]
-fn refresh(dir: &Path, active: bool) {
-    let mark = aterm_types::clt_shim::wanted_mark(dir);
-    if !active {
-        let _ = std::fs::remove_file(&mark);
+fn refresh(dir: &Path, missing: bool, installing: bool, exe: Option<&Path>) {
+    let wanted = aterm_types::clt_shim::wanted_mark(dir);
+    let on_its_way = aterm_types::clt_shim::installing_mark(dir);
+    if !missing {
+        let _ = std::fs::remove_file(&wanted);
+        let _ = std::fs::remove_file(&on_its_way);
         return;
     }
-    let Ok(aterm_exe) = std::env::current_exe() else {
+    if installing {
+        let _ = std::fs::write(&on_its_way, b"");
+    } else {
+        let _ = std::fs::remove_file(&on_its_way);
+    }
+    if is_wanted(dir) {
         return;
-    };
-    let tools = aterm_types::clt_shim::runtime_tools(usr_bin_stub_exists);
-    if lay(dir, &aterm_exe, &tools).is_ok() {
-        let _ = std::fs::write(&mark, b"");
+    }
+    if relay(dir, exe).is_ok() {
+        let _ = std::fs::write(&wanted, b"");
     }
 }
 
 #[cfg(not(unix))]
-fn refresh(_dir: &std::path::Path, _active: bool) {}
+fn refresh(_dir: &Path, _missing: bool, _installing: bool, _exe: Option<&Path>) {}
+
+/// Lay `dir` onto `exe`, else this process's own executable ([`lay`]), the set of tools this
+/// Mac's `/usr/bin` holds stubs for.
+#[cfg(unix)]
+fn relay(dir: &Path, exe: Option<&Path>) -> std::io::Result<()> {
+    let aterm_exe = match exe {
+        Some(exe) => exe.to_owned(),
+        None => std::env::current_exe()?,
+    };
+    let tools = aterm_types::clt_shim::runtime_tools(usr_bin_stub_exists);
+    lay(dir, &aterm_exe, &tools)
+}
+
+#[cfg(not(unix))]
+fn relay(_dir: &Path, _exe: Option<&Path>) -> std::io::Result<()> {
+    Ok(())
+}
 
 /// This account's shim directory while it is wanted: what a spawn puts on its shell's PATH and
 /// names in [`aterm_types::clt_shim::SHIM_ENV`] ([`settle_session_path`]), and what a warm
@@ -148,7 +200,7 @@ fn refresh(_dir: &std::path::Path, _active: bool) {}
 #[must_use]
 pub(crate) fn wanted_dir() -> Option<String> {
     aterm_types::clt_shim::shim_dir()
-        .filter(|dir| is_wanted(dir))
+        .filter(|dir| is_wanted(dir) && !aterm_types::clt_shim::developer_git())
         .and_then(|dir| dir.to_str().map(str::to_owned))
 }
 
@@ -156,12 +208,18 @@ pub(crate) fn wanted_dir() -> Option<String> {
 /// `inherited` reads of this process's): with the directory wanted now (`wanted`), on PATH
 /// ahead of `/usr/bin` and behind the person's own earlier entries ([`on_path`]), and named in
 /// [`aterm_types::clt_shim::SHIM_ENV`]; without it, a copy left on that PATH (a window started
-/// from a shell that had it) is dropped and the variable is emptied. Decided at each spawn, so a
-/// tab opened while the shim is wanted gets it, and one opened after nothing wants it does not.
+/// from a shell that had it) is dropped and the variable is emptied. `DEVELOPER_DIR` follows: the
+/// shim's developer directory while it is wanted, unless a person's own stands; once the tools
+/// are `present`, empty (which Apple's stubs read as unset) in place of one this process kept from
+/// before they arrived. With them missing and the directory not wanted (it could not be laid),
+/// an inherited one stays: it keeps Apple's stubs off their dialog route, where an empty one
+/// would send them there. Decided at each spawn, so a tab opened while the shim is wanted gets
+/// it, and one opened after nothing wants it does not.
 pub(crate) fn settle_session_path(
     env_add: &mut Vec<(String, String)>,
     inherited: &dyn Fn(&str) -> Option<String>,
     wanted: Option<&str>,
+    present: bool,
 ) {
     let var = aterm_types::clt_shim::SHIM_ENV;
     let given = |env_add: &[(String, String)], key: &str| {
@@ -201,6 +259,20 @@ pub(crate) fn settle_session_path(
         None if named.is_some() => set(env_add, var, String::new()),
         None => {}
     }
+    let developer = aterm_types::clt_shim::DEVELOPER_DIR_ENV;
+    let inherited_ours_or_none = given(env_add, developer)
+        .filter(|value| !value.is_empty())
+        .map(|value| aterm_types::clt_shim::is_shim_developer_dir(Path::new(&value)));
+    match (wanted, inherited_ours_or_none) {
+        (Some(shim), None | Some(true)) => {
+            let dir = aterm_types::clt_shim::developer_dir(Path::new(shim));
+            if let Some(dir) = dir.to_str() {
+                set(env_add, developer, dir.to_owned());
+            }
+        }
+        (None, Some(true)) if present => set(env_add, developer, String::new()),
+        _ => {}
+    }
 }
 
 /// Whether `/usr/bin/<tool>` exists (the `xcode-select` stub a new Mac carries).
@@ -209,25 +281,34 @@ fn usr_bin_stub_exists(tool: &str) -> bool {
     Path::new("/usr/bin").join(tool).exists()
 }
 
-/// Create `dir` and link each of `tools` onto `aterm_exe`, replacing a stale link. Extra links a
-/// shrunken tool set left behind are removed, so the directory holds exactly `tools`.
+/// Create `dir` and link each of `tools` onto `aterm_exe`, replacing a stale link, and its developer
+/// directory's `xcrun` the same way ([`aterm_types::clt_shim::developer_dir`]). Extra links a
+/// shrunken tool set left behind are removed, so the directory holds exactly `tools` and that.
 #[cfg(unix)]
 fn lay(dir: &Path, aterm_exe: &Path, tools: &[&str]) -> std::io::Result<()> {
     use std::os::unix::fs::symlink;
-    std::fs::create_dir_all(dir)?;
-    for tool in tools {
-        let link = dir.join(tool);
-        // Replace a link that points elsewhere (a moved bundle); leave a correct one.
-        if std::fs::read_link(&link).ok().as_deref() != Some(aterm_exe) {
-            let _ = std::fs::remove_file(&link);
-            symlink(aterm_exe, &link)?;
+    let developer_bin =
+        aterm_types::clt_shim::developer_dir(dir).join(aterm_types::clt_shim::DEVELOPER_DIR_BIN);
+    std::fs::create_dir_all(&developer_bin)?;
+    // Replace a link that points elsewhere (a moved bundle); leave a correct one.
+    let link_onto_aterm = |link: &Path| -> std::io::Result<()> {
+        if std::fs::read_link(link).ok().as_deref() != Some(aterm_exe) {
+            let _ = std::fs::remove_file(link);
+            symlink(aterm_exe, link)?;
         }
+        Ok(())
+    };
+    link_onto_aterm(&developer_bin.join("xcrun"))?;
+    for tool in tools {
+        link_onto_aterm(&dir.join(tool))?;
     }
     // Drop a link for a name no longer in the set.
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
+            // Its developer directory is the one thing here that is no link.
             if let Some(name) = entry.file_name().to_str()
                 && !tools.contains(&name)
+                && !entry.file_type().is_ok_and(|kind| kind.is_dir())
             {
                 let _ = std::fs::remove_file(entry.path());
             }
@@ -325,7 +406,7 @@ mod tests {
         };
         let nothing = |_: &str| None;
         let mut wanted = composed();
-        settle_session_path(&mut wanted, &nothing, Some("/S"));
+        settle_session_path(&mut wanted, &nothing, Some("/S"), false);
         assert_eq!(
             get(&wanted, "PATH").as_deref(),
             Some("/opt/homebrew/bin:/S:/usr/bin:/bin")
@@ -338,7 +419,7 @@ mod tests {
         // No PATH composed at launch: the inherited one carries it.
         let mut bare = vec![("TERM".to_owned(), "xterm-256color".to_owned())];
         let inherited = |key: &str| (key == "PATH").then(|| "/usr/bin:/bin".to_owned());
-        settle_session_path(&mut bare, &inherited, Some("/S"));
+        settle_session_path(&mut bare, &inherited, Some("/S"), false);
         assert_eq!(get(&bare, "PATH").as_deref(), Some("/S:/usr/bin:/bin"));
         assert_eq!(get(&bare, var).as_deref(), Some("/S"));
 
@@ -346,15 +427,15 @@ mod tests {
         let shim = aterm_types::clt_shim::shim_dir().unwrap();
         let shim = shim.to_str().unwrap();
         let mut stale = vec![("PATH".to_owned(), format!("{shim}:/usr/bin"))];
-        settle_session_path(&mut stale, &nothing, None);
+        settle_session_path(&mut stale, &nothing, None, true);
         assert_eq!(get(&stale, "PATH").as_deref(), Some("/usr/bin"));
         assert_eq!(get(&stale, var), None, "no variable where none was");
         let mut clean = composed();
-        settle_session_path(&mut clean, &nothing, None);
+        settle_session_path(&mut clean, &nothing, None, true);
         assert_eq!(clean, composed());
         let mut none = vec![("TERM".to_owned(), "xterm-256color".to_owned())];
         let clean_path = |key: &str| (key == "PATH").then(|| "/usr/bin".to_owned());
-        settle_session_path(&mut none, &clean_path, None);
+        settle_session_path(&mut none, &clean_path, None, true);
         assert_eq!(
             get(&none, "PATH"),
             None,
@@ -369,7 +450,7 @@ mod tests {
             key if key == var => Some("/T".to_owned()),
             _ => None,
         };
-        settle_session_path(&mut heir, &from_a_shim_shell, None);
+        settle_session_path(&mut heir, &from_a_shim_shell, None, true);
         assert_eq!(
             get(&heir, "PATH").as_deref(),
             Some("/opt/homebrew/bin:/usr/bin")
@@ -377,51 +458,176 @@ mod tests {
         assert_eq!(get(&heir, var).as_deref(), Some(""));
     }
 
-    /// A person's Stop (or the Developer group turned off) with the tools still missing takes
-    /// the shim off new shells at once, and leaves the directory, with its links, to the next
-    /// launch, so a shell that already reaches it is handed to Apple's own tool, not to a
-    /// missing file. A launch then removes the directory and its mark.
+    /// While the tools are missing the shim stays wanted, whatever becomes of an install: only its
+    /// installing mark, which changes a shim's line, follows the install. Once they exist both
+    /// marks go at once, and the directory, with its links, stays for the processes that reach
+    /// it; a next launch keeps it too, its developer directory's `xcrun` linked onto that launch's
+    /// executable, so a process that inherited `DEVELOPER_DIR` from before still reaches a shim.
+    /// NEGATIVE CONTROL: on a Mac with the tools a launch lays nothing at all.
     #[cfg(unix)]
     #[test]
-    fn a_stop_takes_the_shim_off_new_shells_and_leaves_the_directory_to_the_next_launch() {
+    fn the_shim_stays_until_the_tools_exist_and_only_then_comes_off_new_shells() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static PRESENT: AtomicBool = AtomicBool::new(false);
         let tmp = aterm_tempfile::tempdir().unwrap();
         let dir = tmp.path().join("clt-shim");
-        let shim = Shim::at(dir.clone(), || false);
-        shim.settle(true);
+        let installing = || aterm_types::clt_shim::installing_mark(&dir).is_file();
+        let shim = Shim::at(dir.clone(), || PRESENT.load(Ordering::SeqCst));
+        shim.reconcile();
         assert!(
             shim.laid() && shim.wanted(),
-            "a pass wants the missing tools"
+            "from the launch, with no pass"
         );
-        let links = std::fs::read_dir(&dir).unwrap().count();
+        assert!(!installing());
+        shim.settle(true);
+        assert!(shim.wanted() && installing());
         shim.settle(false);
-        assert!(!shim.wanted(), "new shells no longer get it");
+        assert!(shim.wanted(), "a Stop, or an unfinished install, leaves it");
+        assert!(!installing());
+        let links = std::fs::read_dir(&dir).unwrap().count();
+        PRESENT.store(true, Ordering::SeqCst);
+        shim.settle(true);
+        assert!(!shim.wanted() && !installing(), "the tools exist");
+        assert!(shim.laid());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), links);
+        let xcrun = aterm_types::clt_shim::developer_dir(&dir)
+            .join(aterm_types::clt_shim::DEVELOPER_DIR_BIN)
+            .join("xcrun");
+        std::fs::remove_file(&xcrun).unwrap();
+        shim.reconcile();
         assert!(
-            shim.laid(),
-            "the directory stays for the shells that have it"
+            shim.laid() && !shim.wanted(),
+            "the next launch keeps it, unwanted"
         );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), links);
         assert_eq!(
-            std::fs::read_dir(&dir).unwrap().count(),
-            links,
-            "its links too"
+            std::fs::read_link(&xcrun).unwrap(),
+            std::env::current_exe().unwrap(),
+            "its developer directory's xcrun, linked onto this launch's executable"
         );
-        shim.reconcile(false);
-        assert!(!shim.laid() && !shim.wanted(), "the next launch removes it");
-        assert!(!aterm_types::clt_shim::wanted_mark(&dir).exists());
+
+        let owner = tmp.path().join("owner").join("clt-shim");
+        let with_the_tools = Shim::at(owner.clone(), || true);
+        with_the_tools.reconcile();
+        assert!(!owner.exists(), "the tools are here: nothing is laid");
     }
 
-    /// A launch that adopts live shells (a seamless hand-off to an updated aterm, or the PTY
-    /// keeper after a crash: "the same live shell") must not take their shim directory from under
-    /// them: a bash there that hashed `<shim>/git` while the install ran would fail `No such file
-    /// or directory` (127). That launch takes only the mark. Stand-ins only: the shim's `git` and
-    /// the next directory's are scripts of this test's own.
+    /// Apple's real `/usr/bin/git` with `DEVELOPER_DIR` naming the directory [`lay`] lays runs that
+    /// directory's `xcrun`, whose target here is a stand-in that notes it ran; the real one is
+    /// `aterm`, whose shim prints a line and exits. Named before the directory is laid (as a
+    /// process start names it) the stub fails plainly, with Apple's own error and no dialog.
+    /// Measured against the real stub, so only on a Mac whose tools answer in place of its dialog.
+    /// NEGATIVE CONTROL: without the variable the same stub never reaches the stand-in.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apples_real_stub_reaches_the_laid_developer_dir_and_never_its_install_route() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !aterm_types::clt_shim::developer_git() {
+            eprintln!("this Mac has no developer tools: its stub would raise Apple's dialog");
+            return;
+        }
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let noted = root.join("noted");
+        let stand_in = root.join("stand-in");
+        std::fs::write(
+            &stand_in,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nexit 69\n",
+                noted.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shim = root.join("clt-shim");
+        let developer = aterm_types::clt_shim::developer_dir(&shim);
+        let git = |dir: Option<&Path>| {
+            let mut git = aterm_uds::spawnfd::command("/usr/bin/git");
+            git.arg("--version")
+                .env_remove(aterm_types::clt_shim::DEVELOPER_DIR_ENV);
+            if let Some(dir) = dir {
+                git.env(aterm_types::clt_shim::DEVELOPER_DIR_ENV, dir);
+            }
+            git.output().unwrap()
+        };
+        let unlaid = git(Some(&developer));
+        assert_eq!(unlaid.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&unlaid.stderr).contains("DEVELOPER_DIR"),
+            "{unlaid:?}"
+        );
+        lay(&shim, &stand_in, &["git"]).unwrap();
+        let laid = git(Some(&developer));
+        assert_eq!(laid.status.code(), Some(69), "{laid:?}");
+        assert_eq!(
+            std::fs::read_to_string(&noted).unwrap(),
+            "git --version\n",
+            "Apple's stub called the laid xcrun with the tool and its words"
+        );
+        std::fs::remove_file(&noted).unwrap();
+        assert!(git(None).status.success(), "the tools' own git");
+        assert!(!noted.exists(), "no variable, no stand-in");
+    }
+
+    /// A spawn hands `DEVELOPER_DIR` on while the shim is wanted, a person's own excepted, and
+    /// empties one this process kept from before the tools arrived, only once they did.
+    /// NEGATIVE CONTROL: with the tools still missing and the directory not wanted (its laying
+    /// failed), the inherited one stays, as an empty one would send Apple's stubs to their dialog.
+    #[test]
+    fn a_spawn_names_the_developer_dir_only_while_the_shim_is_wanted() {
+        let key = aterm_types::clt_shim::DEVELOPER_DIR_ENV;
+        let get = |env: &[(String, String)]| {
+            env.iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+        let ours = "/s/clt-shim/developer";
+        let with = |value: &'static str| move |k: &str| (k == key).then(|| value.to_owned());
+        let nothing = |_: &str| None;
+
+        let mut env = Vec::new();
+        settle_session_path(&mut env, &nothing, Some("/s/clt-shim"), false);
+        assert_eq!(get(&env).as_deref(), Some(ours));
+
+        let mut env = Vec::new();
+        settle_session_path(&mut env, &with("/opt/xcode"), Some("/s/clt-shim"), false);
+        assert_eq!(get(&env), None, "a person's own stands");
+
+        let mut env = Vec::new();
+        settle_session_path(&mut env, &with(ours), None, true);
+        assert_eq!(get(&env).as_deref(), Some(""), "the tools arrived");
+
+        let mut env = Vec::new();
+        settle_session_path(&mut env, &with(ours), None, false);
+        assert_eq!(get(&env), None, "still missing: the inherited one stays");
+
+        for inherited in ["/opt/xcode", ""] {
+            for present in [false, true] {
+                let mut env = Vec::new();
+                settle_session_path(&mut env, &with(inherited), None, present);
+                assert_eq!(get(&env), None, "{inherited:?}");
+            }
+        }
+        let mut env = Vec::new();
+        settle_session_path(&mut env, &nothing, None, true);
+        assert_eq!(get(&env), None, "the owner's Mac gets nothing");
+    }
+
+    /// A launch never takes the shim directory from under a live shell, whether it adopted that
+    /// shell (a seamless hand-off to an updated aterm, the PTY keeper after a crash) or the shell
+    /// outlived the window on its own (a tmux server started from a tab): a bash there that hashed
+    /// `<shim>/git` while the install ran would fail `No such file or directory` (127). The launch
+    /// takes only the mark. Stand-ins only: the shim's `git` and the next directory's are scripts
+    /// of this test's own.
     #[cfg(unix)]
     #[test]
-    fn a_launch_that_adopts_live_shells_leaves_their_shim_runnable() {
+    fn a_launch_leaves_a_live_shells_shim_runnable() {
         use std::io::{BufRead as _, Read as _, Write as _};
         let tmp = aterm_tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let shim = root.join("clt-shim");
         let real = root.join("real");
+        let aterm = root.join("aterm");
         std::fs::create_dir_all(&shim).unwrap();
         std::fs::create_dir_all(&real).unwrap();
         std::fs::write(aterm_types::clt_shim::wanted_mark(&shim), b"").unwrap();
@@ -430,7 +636,8 @@ mod tests {
             std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         };
-        script(&shim.join("git"), "echo shim");
+        script(&aterm, "echo shim");
+        std::os::unix::fs::symlink(&aterm, shim.join("git")).unwrap();
         script(&real.join("git"), "echo real");
         let mut child = aterm_uds::spawnfd::command("/bin/bash")
             .args([
@@ -450,9 +657,9 @@ mod tests {
         let mut first = String::new();
         stdout.read_line(&mut first).unwrap();
         assert_eq!(first.trim(), "shim", "the install under way");
-        // The successor's launch, its predecessor's shells adopted alive.
-        let kept = Shim::at(shim.clone(), || false);
-        kept.reconcile(true);
+        // The successor's launch with the tools there, its predecessor's shells adopted alive.
+        let kept = Shim::at(shim.clone(), || true).onto(aterm.clone());
+        kept.reconcile();
         assert!(!kept.wanted(), "new shells no longer get it");
         assert!(kept.laid(), "the adopted shells' directory stays");
         let mut stdin = child.stdin.take().unwrap();
@@ -520,7 +727,7 @@ mod tests {
         let mut first = String::new();
         stdout.read_line(&mut first).unwrap();
         assert_eq!(first.trim(), "shim", "the tools still installing");
-        // The tools arrived: the window settles the want.
+        // The tools arrived: the window settles the shim.
         std::fs::write(&arrived, b"").unwrap();
         let kept = Shim::at(shim.clone(), || true);
         kept.settle(true);

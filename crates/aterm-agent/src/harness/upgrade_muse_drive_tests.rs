@@ -271,11 +271,25 @@ impl MuseKernel for Script {
     }
 
     fn args(&self, pid: u32) -> Option<atpkg::caller_shell::ProcArgs> {
-        (pid == SHELL).then(|| atpkg::caller_shell::ProcArgs {
-            exec_path: "/bin/zsh".to_string(),
-            argv: vec!["-zsh".to_string()],
-            env: Vec::new(),
-        })
+        match pid {
+            SHELL => Some(atpkg::caller_shell::ProcArgs {
+                exec_path: "/bin/zsh".to_string(),
+                argv: vec!["-zsh".to_string()],
+                env: Vec::new(),
+            }),
+            TUI if !self.knobs.noappear => Some(atpkg::caller_shell::ProcArgs {
+                exec_path: self.exe.to_string_lossy().into_owned(),
+                argv: self.knobs.new_argv.clone().unwrap_or_else(|| {
+                    vec![
+                        self.exe.to_string_lossy().into_owned(),
+                        "resume".to_string(),
+                        S1.to_string(),
+                    ]
+                }),
+                env: vec![format!("ATERM_PARENT_SESSION_ID={TAB}")],
+            }),
+            _ => None,
+        }
     }
 
     fn exe(&self, pid: u32) -> Option<PathBuf> {
@@ -673,6 +687,48 @@ fn an_own_exit_a_signal_and_a_refused_start_are_never_relaunched() {
             )
         ),
         Some("refused-start")
+    );
+}
+
+/// An exit an Autopilot carries ([`ExitCause::Carried`]) comes back however its shell read it,
+/// a signal's (`SIGINT`, `SIGTERM`), an own exit's or an unwitnessed one; a start Muse Code
+/// refused is a refusal the owner hears, never relaunched.
+#[test]
+fn an_exit_an_autopilot_carries_comes_back_unless_its_start_was_refused() {
+    for (status, want) in [
+        (0, "continued"),
+        (130, "continued"),
+        (143, "continued"),
+        (137, "continued"),
+        (1, "refused:refused-start"),
+        (2, "refused:refused-start"),
+    ] {
+        let rig = Rig::new("carried", status, true, false, Log::Crash, true);
+        let snap = rig.snap(Some(S1));
+        let left = exit_record(
+            || Some(look_at_exit(&rig.opts, &snap, &rig.kernel)),
+            |_| true,
+        );
+        let r = rig.attempt(&snap, &left, ExitCause::Carried);
+        assert_eq!(r.step, want, "{status}: {left:?} {r:?}");
+        if want.starts_with("refused:") {
+            assert!(rig.typed().is_empty(), "{status}: {:#?}", rig.typed());
+        }
+    }
+    let rig = Rig::new("carried-unwitnessed", 137, false, false, Log::None, true);
+    let snap = rig.snap(Some(S1));
+    let left = exit_record(
+        || Some(look_at_exit(&rig.opts, &snap, &rig.kernel)),
+        |_| true,
+    );
+    assert_eq!(
+        rig.attempt(&snap, &left, ExitCause::Exit).step,
+        "ended:exit-unwitnessed",
+        "the control"
+    );
+    assert_eq!(
+        rig.attempt(&snap, &left, ExitCause::Carried).step,
+        "continued"
     );
 }
 
@@ -2230,4 +2286,45 @@ fn a_relaunch_under_land_into_a_defense_leaves_it_to_the_land_check() {
     let r = carry_adopted(&going, CAUSE_EXIT, true);
     assert_eq!(r.step, "continued", "{r:?}");
     assert_eq!(going.continuations(), 1);
+}
+
+#[test]
+fn holders_in_reports_live_tui_and_ignores_non_tui_commands() {
+    let mut rig = Rig::new("holders-tui", 0, true, false, Log::Clean, true);
+    let session = key(TAB);
+    let sessions = BTreeSet::from([session.clone()]);
+    let pids = [TUI];
+    let live_tabs = vec![LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(i64::from(TUI)),
+    }];
+
+    let found = holders_in(&sessions, Some(&live_tabs), &pids, &rig.kernel);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].pid, TUI);
+    assert_eq!(found[0].session, session);
+    assert_eq!(found[0].version, VERSION);
+    assert_eq!(found[0].tab.as_deref(), Some(TAB));
+
+    let found_env = holders_in(&sessions, None, &pids, &rig.kernel);
+    assert_eq!(found_env.len(), 1);
+    assert_eq!(found_env[0].pid, TUI);
+    assert_eq!(found_env[0].version, VERSION);
+
+    for argv in [
+        vec!["muse", "serve", "--no-session-log", "--provider", "meta"],
+        vec!["muse", "--version"],
+        vec!["muse", "login"],
+        vec!["muse", "exec", "hi"],
+    ] {
+        rig.kernel.knobs.new_argv = Some(argv.iter().map(|s| (*s).to_string()).collect());
+        assert!(
+            holders_in(&sessions, Some(&live_tabs), &pids, &rig.kernel).is_empty(),
+            "non-TUI argv {argv:?} must not count as a live TUI holder"
+        );
+        assert!(
+            holders_in(&sessions, None, &pids, &rig.kernel).is_empty(),
+            "non-TUI argv {argv:?} must not count as a live TUI holder without live_tabs"
+        );
+    }
 }

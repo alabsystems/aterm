@@ -119,7 +119,12 @@ pub fn compare(sources: &BTreeMap<&str, String>) -> Vec<SiblingFinding> {
 pub fn read_sources(src: &Path) -> io::Result<BTreeMap<&'static str, String>> {
     cells::CELLS
         .iter()
-        .map(|cell| Ok((cell.source, std::fs::read_to_string(src.join(cell.source))?)))
+        .map(|cell| {
+            Ok((
+                cell.source,
+                crate::read_regular_text(&src.join(cell.source))?,
+            ))
+        })
         .collect()
 }
 

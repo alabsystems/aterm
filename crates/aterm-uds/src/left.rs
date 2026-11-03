@@ -348,9 +348,8 @@ struct Run<'r> {
     rec: &'r Record,
     id: Option<String>,
     dead: bool,
-    /// Where its windows close: its `dead_seen`, or this reading's horizon for a dead run that
-    /// has none yet; no bound while it lives.
-    horizon: u64,
+    /// A dead run's actually recorded upper bound; `None` before it is retained or while live.
+    horizon: Option<u64>,
     /// Its open groups whose leader check passed, each with that leader's unique id.
     groups: Vec<(u32, u64)>,
 }
@@ -441,7 +440,7 @@ impl Pass<'_> {
 
 /// The records of `known.boot` among `known.records`, each judged dead or live by a direct read
 /// of its launcher.
-fn this_boot<'r>(k: &dyn LeftKernel, known: &'r Known<'r>, horizon: u64) -> Vec<Run<'r>> {
+fn this_boot<'r>(k: &dyn LeftKernel, known: &'r Known<'r>) -> Vec<Run<'r>> {
     known
         .records
         .iter()
@@ -453,11 +452,7 @@ fn this_boot<'r>(k: &dyn LeftKernel, known: &'r Known<'r>, horizon: u64) -> Vec<
                 rec,
                 id: rec.id.map(|i| i.text()),
                 dead,
-                horizon: if dead {
-                    rec.dead_seen.unwrap_or(horizon)
-                } else {
-                    u64::MAX
-                },
+                horizon: dead.then_some(rec.dead_seen).flatten(),
                 groups: led_groups(rec, k),
             }
         })
@@ -605,7 +600,10 @@ fn tie(
     exe: Option<&Path>,
     auto: impl FnOnce() -> bool,
 ) -> Option<RunTie> {
-    let born_in = |from: u64| (from..=run.horizon).contains(&lin.uniqueid);
+    let born_in = |from: u64| {
+        from <= lin.uniqueid
+            && (!run.dead || run.horizon.is_some_and(|horizon| lin.uniqueid <= horizon))
+    };
     let group = run
         .groups
         .iter()
@@ -625,7 +623,7 @@ fn tie(
         run: run_w,
         tree,
         dead: run.dead,
-        auto: run.dead && (group || run_w) && auto(),
+        auto: run.dead && run.horizon.is_some() && (group || run_w) && auto(),
     })
 }
 
@@ -666,8 +664,11 @@ impl Reader {
             return Some(2);
         }
         let born = *self.born.get(&(row.pid, row.start))?;
-        dead.any(|run| (run.rec.uniqueid..=run.horizon).contains(&born))
-            .then_some(3)
+        dead.any(|run| {
+            run.horizon
+                .is_some_and(|horizon| (run.rec.uniqueid..=horizon).contains(&born))
+        })
+        .then_some(3)
     }
 
     /// One reading over `rows`, this uid's from the probe's sweep: each candidate's facts, at
@@ -681,7 +682,7 @@ impl Reader {
                 horizon = horizon.max(id);
             }
         }
-        let runs = this_boot(k, known, horizon);
+        let runs = this_boot(k, known);
         let by_pid: HashMap<u32, &Row> = rows.iter().map(|r| (r.pid, r)).collect();
         let spared = spared(known.self_pid, &by_pid);
         let mut candidates: Vec<(u8, &Row)> = rows
@@ -882,6 +883,9 @@ impl Reader {
             .iter()
             .filter_map(|run| {
                 tie(run, &lin, marks, exe, || {
+                    let Some(horizon) = run.horizon else {
+                        return false;
+                    };
                     let now = ReadNow {
                         k: pass.k,
                         lin,
@@ -896,7 +900,7 @@ impl Reader {
                         id: run.id.clone(),
                         run_uniqueid: run.rec.uniqueid,
                         groups: run.groups.clone(),
-                        horizon: run.horizon,
+                        horizon,
                         launchd: pass.launchd,
                         claims: pass.claims,
                     }
@@ -951,7 +955,7 @@ impl Reader {
 pub fn read_one(k: &dyn LeftKernel, pid: u32, known: &Known<'_>) -> Option<Facts> {
     let lin = k.lineage(i32::try_from(pid).ok()?)?;
     let me = i32::try_from(known.self_pid).ok()?;
-    let (pids, horizon) = crate::runs::table(k, me)?;
+    let (pids, _) = crate::runs::table(k, me)?;
     if !pids.contains(&lin.identity.pid) {
         return None;
     }
@@ -962,7 +966,7 @@ pub fn read_one(k: &dyn LeftKernel, pid: u32, known: &Known<'_>) -> Option<Facts
         ..Row::default()
     };
     let by_pid = HashMap::from([(pid, &row)]);
-    let runs = this_boot(k, known, horizon);
+    let runs = this_boot(k, known);
     let mut reader = Reader::new();
     reader
         .judge_rows(

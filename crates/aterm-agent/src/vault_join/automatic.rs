@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The node generation's automatic admission worker. An ask connection only verifies and
-//! acknowledges a request; reading membership and posting to the vault happen on this worker.
+//! The node generation's automatic admission worker. It keeps a current snapshot of this
+//! member's membership and home ALab LAN (at most `REFRESH_EVERY` old, read again at once on a
+//! network move or a membership change). A Mac on that LAN, or one recovering an existing seat
+//! from elsewhere, proves itself on the connection (`prove`), as a window's desk lets it in
+//! (`aterm_secrets::client::readmit`): being on the LAN is the admission, so a member with no
+//! window open lets new Macs in too.
 
 use aterm_secrets::client::Paths;
 use aterm_secrets::members::desk::{self, Desk, Local};
-use aterm_secrets::{Error, Result};
+use aterm_secrets::{Error, Result, SecretBytes};
 use aterm_types::MutexExt as _;
 use std::net::IpAddr;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -16,8 +20,8 @@ use std::time::{Duration, Instant};
 const REFRESH_EVERY: Duration = Duration::from_secs(30);
 const UNAVAILABLE: &str = "automatic LAN admission is unavailable on this Mac";
 
-/// One node generation's worker: current membership, a bounded desk and automatic submission.
-/// Dropping it refuses new requests, wakes the worker and joins its bounded in-flight work.
+/// One node generation's worker: current membership and a bounded desk. Dropping it refuses new
+/// requests, wakes the worker and joins it.
 pub struct AutomaticJoins {
     handle: AutomaticJoinHandle,
     worker: Option<JoinHandle<()>>,
@@ -39,11 +43,18 @@ struct Shared {
 struct State {
     snapshot: Option<Snapshot>,
     valid_until: Option<Instant>,
+    /// `LocalLog` retains the same allocation until its policy inputs change.
+    membership: Option<Arc<aterm_net::fleet_member::MemberKeys>>,
     /// Invalidates an in-flight state read on a network move or stop.
     epoch: u64,
-    /// Coalesces asks while preserving one that arrives during a read or a post.
-    requested: u64,
     stopped: bool,
+}
+
+impl State {
+    fn invalidate(&mut self) {
+        self.valid_until = None;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
 }
 
 struct Snapshot {
@@ -53,14 +64,21 @@ struct Snapshot {
 
 trait Backend: Send + Sync + 'static {
     fn read(&self) -> Result<Option<(Local, String)>>;
-    fn forward(
-        &self,
-        desk: &Mutex<Desk>,
-        now: Instant,
-        current: &dyn Fn() -> bool,
-    ) -> Result<usize>;
     fn now(&self) -> Instant {
         Instant::now()
+    }
+    /// Decide a Mac that proved itself from `peer` on this connection
+    /// (`aterm_secrets::client::prove_at`): its log bundle where this member lets it in.
+    ///
+    /// # Errors
+    /// It is not let in here, or local state failed.
+    fn prove(&self, _proving: &desk::Proving<'_>, _peer: IpAddr) -> Result<SecretBytes> {
+        Err(Error::new(UNAVAILABLE))
+    }
+    /// Why this member refuses `proving` from `peer` before the possession challenge
+    /// (`aterm_secrets::client::refuses_before_possession`), `None` where it goes on.
+    fn refuses(&self, _proving: &desk::Proving<'_>, _peer: IpAddr) -> Option<String> {
+        Some(UNAVAILABLE.to_owned())
     }
     #[cfg(test)]
     fn waiting(&self, _until: Instant) {}
@@ -82,20 +100,31 @@ impl Backend for Vault {
         })
     }
 
-    fn forward(
-        &self,
-        desk: &Mutex<Desk>,
-        _now: Instant,
-        current: &dyn Fn() -> bool,
-    ) -> Result<usize> {
-        desk::forward_automatic_requests_if(desk, &self.paths, current)
+    fn prove(&self, proving: &desk::Proving<'_>, peer: IpAddr) -> Result<SecretBytes> {
+        aterm_secrets::client::prove_at(&self.paths, proving, book(proving, peer))
     }
+
+    fn refuses(&self, proving: &desk::Proving<'_>, peer: IpAddr) -> Option<String> {
+        aterm_secrets::client::refuses_before_possession(&self.paths, proving, book(proving, peer))
+    }
+}
+
+/// What this Mac's fleet book says of a Mac proving itself from `peer`, read on the connection's
+/// thread, as a window's desk reads it.
+fn book(proving: &desk::Proving<'_>, peer: IpAddr) -> aterm_secrets::client::Book {
+    let peers = aterm_types::dirs::state_dir()
+        .and_then(|state| aterm_net::fleet_member::read_peers(&state).ok());
+    super::book_word_read(
+        peers.as_deref(),
+        &proving.node,
+        Some(peer),
+        aterm_time::unix_millis().unwrap_or(0),
+    )
 }
 
 impl AutomaticJoins {
     /// Start the worker for this node generation. It serves asks once its first read of local
-    /// membership and network succeeds. Every post is preceded by a fresh read, and the desk's
-    /// retry deadlines wake it even if no further Mac asks.
+    /// membership and network succeeds.
     ///
     /// # Errors
     /// The worker thread could not start.
@@ -133,8 +162,7 @@ impl Drop for AutomaticJoins {
         {
             let mut state = self.handle.shared.state.lock_or_recover();
             state.stopped = true;
-            state.valid_until = None;
-            state.epoch = state.epoch.wrapping_add(1);
+            state.invalidate();
             self.handle.shared.changed.notify_all();
         }
         if let Some(worker) = self.worker.take()
@@ -150,19 +178,40 @@ impl AutomaticJoinHandle {
     /// began before this call cannot make the old snapshot available again.
     pub fn refresh(&self) {
         let mut state = self.shared.state.lock_or_recover();
-        state.valid_until = None;
-        state.epoch = state.epoch.wrapping_add(1);
+        state.invalidate();
         self.shared.changed.notify_all();
     }
 
-    /// Verify and acknowledge a new Mac's signed request using current cached LAN policy.
-    /// This connection performs no vault I/O, membership read, or wait for a submission. It
-    /// offers no manual approval phrase or bundle; the vault's approver decides membership.
+    /// Wake admission when the node watcher's cached membership verdict changes, including
+    /// arrival or loss of the log. `LocalLog::keys` reuses its allocation for unchanged inputs;
+    /// a new allocation can reflect changed vault policy even when the node keys are equal.
+    /// This invalidates cached policy; the worker reads fresh policy before publishing it again.
+    pub fn observe_membership(&self, keys: Option<&Arc<aterm_net::fleet_member::MemberKeys>>) {
+        let mut state = self.shared.state.lock_or_recover();
+        let same = match (&state.membership, keys) {
+            (Some(previous), Some(keys)) => Arc::ptr_eq(previous, keys),
+            (None, None) => true,
+            _ => false,
+        };
+        if state.stopped || same {
+            return;
+        }
+        state.membership = keys.cloned();
+        state.invalidate();
+        self.shared.changed.notify_all();
+    }
+
+    /// Let a Mac prove itself (`prove`), using current cached membership and LAN policy:
+    /// a `prove` reads and signs the vault's records here, within the
+    /// listener's handshake watchdog, as a window's desk does. A plain `ask` is verified and
+    /// acknowledged only from the home LAN onto the headless desk, with no vault I/O, where nothing forwards it and no
+    /// window shows it: the asking Mac gets in by its own `prove`. It offers no manual approval
+    /// phrase.
     ///
     /// # Errors
-    /// Current policy is unavailable, does not cover `peer`, or the signed exchange fails.
+    /// Current policy is unavailable, a plain ask is outside home, or the signed exchange fails.
     pub fn serve(&self, stream: &mut dyn aterm_net::fleet::Duplex, peer: IpAddr) -> Result<()> {
-        let desk = {
+        let session = {
             let state = self.shared.state.lock_or_recover();
             state
                 .snapshot
@@ -173,20 +222,64 @@ impl AutomaticJoinHandle {
                             .valid_until
                             .is_some_and(|until| self.shared.backend.now() < until)
                 })
-                .map(|snapshot| Arc::clone(&snapshot.desk))
+                .map(|snapshot| (Arc::clone(&snapshot.desk), state.epoch))
         };
-        let Some(desk) =
-            desk.filter(|desk| desk.lock_or_recover().local().automatically_admits(peer))
-        else {
+        let Some((desk, epoch)) = session else {
             let _ = aterm_secrets::members::refuse(stream, UNAVAILABLE);
             return Err(Error::new(UNAVAILABLE));
         };
-        desk::serve(&desk, stream, peer, &|_| {
-            Err(Error::new("manual admission requires a window"))
-        })?;
-        let mut state = self.shared.state.lock_or_recover();
-        state.requested = state.requested.wrapping_add(1);
-        self.shared.changed.notify_all();
+        let home = desk.lock_or_recover().local().automatically_admits(peer);
+        let backend = &self.shared.backend;
+        // A greeting reserves no policy. Recheck at each vault phase: the client can wait
+        // between them while the node moves, loses membership or stops. A periodic read can
+        // also replace the desk or its home policy without a watcher invalidating the epoch.
+        // Release both locks before entering the vault; its own state lock guards its writes.
+        let current = || {
+            let state = self.shared.state.lock_or_recover();
+            !state.stopped
+                && state.epoch == epoch
+                && state.valid_until.is_some_and(|until| backend.now() < until)
+                && state
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| Arc::ptr_eq(&snapshot.desk, &desk))
+                && desk.lock_or_recover().local().automatically_admits(peer) == home
+        };
+        let request_policy = || {
+            if home && current() {
+                Ok(())
+            } else {
+                Err(Error::new(UNAVAILABLE))
+            }
+        };
+        // The desk captures `lan` while parsing the proof. Periodic refreshes can move its
+        // policy away and back without replacing the desk, so bind that captured word too.
+        let decide = |proving: &desk::Proving<'_>| {
+            if proving.lan == home && current() {
+                backend.prove(proving, peer)
+            } else {
+                Err(Error::new(UNAVAILABLE))
+            }
+        };
+        let refuses = |proving: &desk::Proving<'_>| {
+            if proving.lan == home && current() {
+                backend.refuses(proving, peer)
+            } else {
+                Some(UNAVAILABLE.to_owned())
+            }
+        };
+        desk::serve_with_request_policy(
+            &desk,
+            stream,
+            peer,
+            &|_| Err(Error::new("manual admission requires a window")),
+            Some(desk::Proof {
+                decide: &decide,
+                refuses: &refuses,
+                fleet: None,
+            }),
+            &request_policy,
+        )?;
         Ok(())
     }
 }
@@ -194,16 +287,16 @@ impl AutomaticJoinHandle {
 impl Shared {
     fn run(&self) {
         loop {
-            let (epoch, requested) = {
+            let epoch = {
                 let state = self.state.lock_or_recover();
                 if state.stopped {
                     return;
                 }
-                (state.epoch, state.requested)
+                state.epoch
             };
             let current = self.backend.read();
             let next_refresh = self.backend.now() + REFRESH_EVERY;
-            let desk = {
+            {
                 let mut state = self.state.lock_or_recover();
                 if state.stopped {
                     return;
@@ -227,59 +320,32 @@ impl Shared {
                         };
                         // A network or identity change gets a new desk. An ask already reading
                         // the old greeting can finish only on its old desk, never into this one.
-                        state.snapshot = Some(Snapshot {
-                            network,
-                            desk: Arc::clone(&desk),
-                        });
+                        state.snapshot = Some(Snapshot { network, desk });
                         state.valid_until = Some(next_refresh);
                         self.changed.notify_all();
-                        Some(desk)
                     }
                     result => {
                         state.valid_until = None;
                         if let Err(error) = result {
                             aterm_log::info!("node: automatic admission state will retry: {error}");
                         }
-                        None
-                    }
-                }
-            };
-            if let Some(desk) = &desk {
-                let current = || {
-                    let state = self.state.lock_or_recover();
-                    !state.stopped && state.epoch == epoch
-                };
-                match self.backend.forward(desk, self.backend.now(), &current) {
-                    Ok(0) => {}
-                    Ok(count) => aterm_log::info!(
-                        "node: queued {count} LAN requests for automatic ALab admission"
-                    ),
-                    Err(error) => {
-                        aterm_log::info!("node: automatic ALab admission will retry: {error}")
                     }
                 }
             }
-            let until = desk
-                .as_ref()
-                .and_then(|desk| {
-                    desk.lock_or_recover()
-                        .next_automatic_request(self.backend.now())
-                })
-                .map_or(next_refresh, |due| due.min(next_refresh));
             let mut state = self.state.lock_or_recover();
             loop {
                 if state.stopped {
                     return;
                 }
-                if state.epoch != epoch || state.requested != requested {
+                if state.epoch != epoch {
                     break;
                 }
-                let remaining = until.saturating_duration_since(self.backend.now());
+                let remaining = next_refresh.saturating_duration_since(self.backend.now());
                 if remaining.is_zero() {
                     break;
                 }
                 #[cfg(test)]
-                self.backend.waiting(until);
+                self.backend.waiting(next_refresh);
                 state = self
                     .changed
                     .wait_timeout(state, remaining)

@@ -55,6 +55,11 @@ src/lib.rs	artifact_extension_matches_what_the_linker_accepts	WR4
 src/lib.rs	outcome_display_names_the_state	WR6	WR5
 ```
 
+## 3. Coverage
+
+- 6 tests: all 6 are retired by a spec (WR1 retires 2; WR2, WR3, WR4 and WR6 retire 1 each, with
+  WR5 sampled alongside WR6).
+
 ## 4. Tests that are not spec samples
 
 None.

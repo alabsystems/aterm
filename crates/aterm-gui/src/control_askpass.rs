@@ -73,6 +73,7 @@ pub(crate) fn serve(
             ticket: std::sync::Arc::clone(&ticket),
             attribute_from: std::process::id() as i32,
             owned: Some(std::sync::Arc::clone(&owned)),
+            exact: false,
             command: "Read CPU policy flags (Game Mode, CarPlay, runaway mitigation)".into(),
             invoker: "aterm system resource diagnostics".into(),
             reply: tx,
@@ -90,36 +91,48 @@ pub(crate) fn serve(
         return response;
     }
 
-    // Classify the command from exact kernel argv (`KERN_PROCARGS2`), failing closed when unreadable.
-    let argv = u32::try_from(sudo_pid)
-        .ok()
-        .and_then(atpkg::caller_shell::process_args)
-        .map(|args| args.argv);
-    match sudo_target_is_debugger(argv.as_deref()) {
-        Ok(true) => return public_reply("ERR askpass refused debugger-as-root\n"),
-        Err(()) => return public_reply("ERR askpass refused command-unreadable\n"),
-        Ok(false) => {}
-    }
-
-    let invoker_pid = aterm_uds::sudo::parent_of(sudo_pid).unwrap_or(sudo_pid);
+    // A sudo aterm started: the words are the ones aterm passed to exec, so nothing is read back.
+    let started = crate::control_sudo::bound(sudo_pid);
+    let (command, invoker_pid) = if let Some(started) = &started {
+        (started.command.clone(), started.client_pid)
+    } else {
+        // Classify the command from exact kernel argv (`KERN_PROCARGS2`), failing closed when unreadable.
+        let argv = u32::try_from(sudo_pid)
+            .ok()
+            .and_then(atpkg::caller_shell::process_args)
+            .map(|args| args.argv);
+        match sudo_target_is_debugger(argv.as_deref()) {
+            Ok(true) => return public_reply("ERR askpass refused debugger-as-root\n"),
+            Err(()) => return public_reply("ERR askpass refused command-unreadable\n"),
+            Ok(false) => {}
+        }
+        let command = argv.as_deref().map(display_line).unwrap_or_default();
+        if command.is_empty() {
+            return public_reply("ERR askpass refused command-unreadable\n");
+        }
+        (
+            command,
+            aterm_uds::sudo::parent_of(sudo_pid).unwrap_or(sudo_pid),
+        )
+    };
     if crate::spare::askpass_refused(invoker_pid) {
         return public_reply("ERR askpass refused no such session\n");
     }
-    let command = argv.as_deref().map(display_line).unwrap_or_default();
     let invoker = command_line(invoker_pid);
-    if command.is_empty() {
-        return public_reply("ERR askpass refused command-unreadable\n");
-    }
 
     let (tx, rx) = std::sync::mpsc::channel();
     let ticket = std::sync::Arc::new(crate::askpass::AskpassTicket::new(
         crate::alert_keys::next_confirm_id(),
         Instant::now() + ASKPASS_DEADLINE,
     ));
+    if let Some(started) = &started {
+        started.watch(&ticket);
+    }
     let request = AskpassRequest {
         ticket: std::sync::Arc::clone(&ticket),
         attribute_from: invoker_pid,
         owned: None,
+        exact: started.is_some(),
         command,
         invoker,
         reply: tx,
@@ -132,6 +145,9 @@ pub(crate) fn serve(
     let mut now = Instant::now;
     let response = await_answer(&rx, &ticket, ASKPASS_TICK, &mut hung, &mut now);
     let _ = proxy.send_event(Wake::AskpassWithdraw { id: ticket.id });
+    if started.is_some_and(|started| !started.is_live()) {
+        return public_reply("ERR askpass refused the sudo aterm started has gone\n");
+    }
     response
 }
 
@@ -188,7 +204,7 @@ fn command_line(pid: i32) -> String {
 
 /// Classifies whether `sudo`'s direct target executable in `argv` is a debugger, returning `Err(())` if `argv` is absent or ambiguous.
 #[cfg(any(target_os = "macos", test))]
-fn sudo_target_is_debugger(argv: Option<&[String]>) -> Result<bool, ()> {
+pub(crate) fn sudo_target_is_debugger(argv: Option<&[String]>) -> Result<bool, ()> {
     let mut args = argv.ok_or(())?.iter();
     args.next().filter(|arg| !arg.is_empty()).ok_or(())?;
     let mut options = true;

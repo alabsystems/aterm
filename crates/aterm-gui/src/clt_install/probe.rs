@@ -7,27 +7,38 @@
 #[cfg(any(target_os = "macos", all(test, unix)))]
 use std::path::Path;
 
-/// The [`super::Reading`] with the placeholder there or not (`placeholder`), over the executable
-/// paths of the processes running, each read as `aterm init` and the root half read it
-/// ([`aterm_types::macos_setup::tools_installer`]): the exact paths of Apple's `softwareupdate`
-/// and `installer` ([`is_install_process`]) hold the on-demand placeholder while installing; an
-/// absolute path ending in Apple's installer app's own executable identifies its window. So
-/// [`super::activity`] reads an install exactly where
-/// [`aterm_types::macos_setup::tools_install_running`] does.
+/// The [`super::Reading`] with the placeholder there or not (`placeholder`), last changed at
+/// `placeholder_changed` (Unix seconds; `None` where unread), over the processes running, each a
+/// pid and its executable's path, read as `aterm init` and the root half read them
+/// ([`aterm_types::macos_setup::tools_installer`]) at `now` (Unix seconds): the exact paths of
+/// Apple's `softwareupdate` and `installer` ([`is_install_process`]) hold the on-demand
+/// placeholder while installing; an absolute path ending in Apple's installer app's own
+/// executable identifies its window, which installs only while it, from the start `started`
+/// reads of it, or the placeholder is younger than
+/// [`aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND`]
+/// ([`aterm_types::macos_setup::ToolsInstaller::installs`]). So [`super::activity`] reads an
+/// install exactly where [`aterm_types::macos_setup::tools_install_running`] does.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn reading_from(
     placeholder: bool,
-    paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    placeholder_changed: Option<u64>,
+    processes: impl IntoIterator<Item = (u32, impl AsRef<Path>)>,
+    started: impl Fn(u32) -> Option<u64>,
+    now: u64,
 ) -> super::Reading {
     use aterm_types::macos_setup::{ToolsInstaller, tools_installer};
     let mut reading = super::Reading {
         placeholder,
         ..super::Reading::default()
     };
-    for path in paths {
+    for (pid, path) in processes {
         match tools_installer(path.as_ref(), is_install_process) {
             Some(ToolsInstaller::CommandLine) => reading.install_process = true,
-            Some(ToolsInstaller::AppleWindow) => reading.apple_window = true,
+            Some(window @ ToolsInstaller::AppleWindow) => {
+                reading.apple_window = true;
+                reading.apple_window_young |=
+                    window.installs(started(pid), placeholder_changed, now);
+            }
             None => {}
         }
     }
@@ -41,14 +52,23 @@ fn is_install_process(path: &::std::path::Path) -> bool {
         || path == ::std::path::Path::new("/usr/sbin/installer")
 }
 
+/// This Mac's [`super::Reading`] now: the placeholder as one `lstat` finds it, which follows no
+/// link, as `aterm init` reads it (there, and its status change time, `st_ctime`), each
+/// process's start as the kernel recorded it, and the clock (a clock that cannot be read is `0`,
+/// before every start and change, so each window reads young).
 #[cfg(target_os = "macos")]
 pub(super) fn installing_now() -> super::Reading {
+    use std::os::unix::fs::MetadataExt as _;
     let path = std::path::Path::new(aterm_types::macos_setup::COMMAND_LINE_TOOLS_INSTALLING);
-    let mut reading = reading_from(path.exists(), process_paths());
+    let placeholder = std::fs::symlink_metadata(path).ok();
+    let changed = placeholder
+        .as_ref()
+        .and_then(|meta| u64::try_from(meta.ctime()).ok());
+    let started = |pid| aterm_sysprobe::kproc::record(pid).map(|record| record.start_s);
+    let now = aterm_time::unix_secs().unwrap_or(0);
+    let mut reading = reading_from(placeholder.is_some(), changed, processes(), started, now);
     reading.live_run = stamp_of(path, 0).is_some_and(|stamp| {
-        aterm_types::macos_setup::placeholder_held_by_a_live_run(&stamp, |pid| {
-            aterm_sysprobe::kproc::record(pid).map(|record| record.start_s)
-        })
+        aterm_types::macos_setup::placeholder_held_by_a_live_run(&stamp, started)
     });
     reading
 }
@@ -81,12 +101,13 @@ pub(super) fn installing_now() -> super::Reading {
     super::Reading::default()
 }
 
+/// Every process running now with the executable the kernel names for it, as a pid and a path.
 #[cfg(target_os = "macos")]
-fn process_paths() -> impl Iterator<Item = std::path::PathBuf> {
+fn processes() -> impl Iterator<Item = (u32, std::path::PathBuf)> {
     process_ids()
         .into_iter()
         .filter_map(|pid| match aterm_uds::holders::exe_of(pid) {
-            aterm_uds::holders::Exe::At(path) => Some(path),
+            aterm_uds::holders::Exe::At(path) => Some((pid, path)),
             _ => None,
         })
 }
@@ -114,45 +135,82 @@ fn process_ids() -> Vec<u32> {
 mod tests {
     use super::*;
 
+    /// The clock these readings are taken at.
+    const NOW: u64 = 1_800_000_000;
+
+    /// How long Apple's window beside the placeholder counts as an install.
+    const BOUND: u64 = aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND.as_secs();
+
+    /// [`super::super::activity`] at [`NOW`] over `paths`, each a process that started `age`
+    /// seconds before, beside the placeholder (when `placeholder`) last changed `changed`
+    /// seconds before (`None`: an age that cannot be read).
+    fn activity_aged(
+        placeholder: bool,
+        paths: impl IntoIterator<Item = impl AsRef<Path>>,
+        age: Option<u64>,
+        changed: Option<u64>,
+    ) -> super::super::Activity {
+        super::super::activity(reading_from(
+            placeholder,
+            changed.map(|changed| NOW - changed),
+            (1..).zip(paths),
+            |_| age.map(|age| NOW - age),
+            NOW,
+        ))
+    }
+
+    /// [`activity_aged`] of processes that started a minute ago, beside a placeholder changed as
+    /// long ago.
     fn activity(
         placeholder: bool,
         paths: impl IntoIterator<Item = impl AsRef<Path>>,
     ) -> super::super::Activity {
-        super::super::activity(reading_from(placeholder, paths))
+        activity_aged(placeholder, paths, Some(60), Some(60))
     }
 
     const INSTALLER: &str = "/System/Library/CoreServices/Install Command Line Developer Tools.app/Contents/MacOS/Install Command Line Developer Tools";
 
     /// The page reads an install exactly where `aterm init` does: the one predicate
-    /// ([`aterm_types::macos_setup::tools_install_running`]) over the same processes, or a
-    /// placeholder a live run's stamp names ([`aterm_types::macos_setup::placeholder_held_by_a_live_run`],
-    /// the one reader both share): a run between its steps, or waiting on Apple's installer
-    /// window a person closed, with no installer process running.
+    /// ([`aterm_types::macos_setup::tools_install_running`]) over the same processes and their
+    /// ages and the placeholder's, or a placeholder a live run's stamp names
+    /// ([`aterm_types::macos_setup::placeholder_held_by_a_live_run`], the one reader both share):
+    /// a run between its steps, or waiting on Apple's installer window a person closed, with no
+    /// installer process running.
     #[test]
     fn the_page_reads_an_install_where_init_and_the_root_half_do() {
         for placeholder in [false, true] {
             for live_run in [false, true] {
-                for paths in [
-                    &[][..],
-                    &["/usr/sbin/softwareupdate"],
-                    &["/usr/sbin/installer"],
-                    &[INSTALLER],
-                    &["/bin/zsh", "/usr/sbin/installer"],
-                    &["/tmp/softwareupdate", INSTALLER],
-                ] {
-                    let mut reading = reading_from(placeholder, paths.iter().copied());
-                    reading.live_run = live_run;
-                    let init = placeholder
-                        && (aterm_types::macos_setup::tools_install_running(
-                            true,
-                            paths.iter().copied(),
-                            is_install_process,
-                        ) || live_run);
-                    assert_eq!(
-                        super::super::activity(reading) == super::super::Activity::Installing,
-                        init,
-                        "{placeholder} {live_run} {paths:?}"
-                    );
+                let ages = [Some(60), Some(BOUND - 1), Some(BOUND), None];
+                for (age, changed) in ages.into_iter().flat_map(|a| ages.map(|c| (a, c))) {
+                    for paths in [
+                        &[][..],
+                        &["/usr/sbin/softwareupdate"],
+                        &["/usr/sbin/installer"],
+                        &[INSTALLER],
+                        &["/bin/zsh", "/usr/sbin/installer"],
+                        &["/tmp/softwareupdate", INSTALLER],
+                    ] {
+                        let started = |_| age.map(|age| NOW - age);
+                        let changed_at = changed.map(|changed| NOW - changed);
+                        let processes = || (1..).zip(paths.iter().copied());
+                        let mut reading =
+                            reading_from(placeholder, changed_at, processes(), started, NOW);
+                        reading.live_run = live_run;
+                        let init = placeholder
+                            && (aterm_types::macos_setup::tools_install_running(
+                                true,
+                                changed_at,
+                                processes(),
+                                is_install_process,
+                                started,
+                                NOW,
+                            ) || live_run);
+                        assert_eq!(
+                            super::super::activity(reading) == super::super::Activity::Installing,
+                            init,
+                            "{placeholder} {live_run} {age:?} {changed:?} {paths:?}"
+                        );
+                    }
                 }
             }
         }
@@ -204,21 +262,60 @@ mod tests {
         assert_eq!(activity(true, ["/tmp/softwareupdate"]), idle);
     }
 
-    /// Only the tools installers' live evidence makes the wait calm; Apple's installer app before
-    /// its install starts (no placeholder yet) waits for the person's press. Another program
-    /// named like an installer is none.
+    /// Only the tools installers' live evidence makes the wait calm, Apple's installer window
+    /// beside the placeholder among it while the window or the placeholder is younger than its
+    /// bound (or of an age nothing can read): a person pressed Install there, perhaps hours
+    /// after the window opened, and the press created the placeholder. That window with no
+    /// placeholder yet, before its install starts, or left open past the bound beside a
+    /// placeholder an ended install left as long ago, waits for the person's press. Another
+    /// program named like an installer is none.
     #[test]
     fn only_the_tools_installers_live_evidence_makes_the_wait_calm() {
         use super::super::Activity::{AppleWindow, Idle, Installing};
         assert_eq!(activity(true, ["/usr/sbin/softwareupdate"]), Installing);
         assert_eq!(activity(true, ["/usr/sbin/installer"]), Installing);
+        assert_eq!(
+            activity_aged(true, ["/usr/sbin/installer"], Some(BOUND), Some(BOUND)),
+            Installing,
+            "at any age"
+        );
         assert_eq!(activity(false, ["/usr/sbin/installer"]), Idle);
         assert_eq!(activity(true, ["/usr/local/bin/installer"]), Idle);
         assert_eq!(activity(true, ["/tmp/installer"]), Idle);
         assert_eq!(activity(true, ["usr/sbin/installer"]), Idle);
         assert_eq!(activity(true, ["/usr/local/bin/softwareupdate"]), Idle);
-        assert_eq!(activity(true, [INSTALLER]), Installing);
+        assert_eq!(activity(true, [INSTALLER]), Installing, "a press's install");
+        assert_eq!(
+            activity_aged(true, [INSTALLER], Some(BOUND - 1), Some(BOUND)),
+            Installing
+        );
+        assert_eq!(
+            activity_aged(true, [INSTALLER], None, Some(BOUND)),
+            Installing
+        );
+        assert_eq!(
+            activity_aged(true, [INSTALLER], Some(BOUND), Some(60)),
+            Installing,
+            "a press hours after the window opened: the placeholder it created is young"
+        );
+        assert_eq!(
+            activity_aged(true, [INSTALLER], Some(BOUND), Some(BOUND - 1)),
+            Installing
+        );
+        assert_eq!(
+            activity_aged(true, [INSTALLER], Some(BOUND), None),
+            Installing
+        );
+        assert_eq!(
+            activity_aged(true, [INSTALLER], Some(BOUND), Some(BOUND)),
+            AppleWindow,
+            "a window left open beside a leftover placeholder as old"
+        );
         assert_eq!(activity(false, [INSTALLER]), AppleWindow);
+        assert_eq!(
+            activity_aged(false, [INSTALLER], Some(BOUND), None),
+            AppleWindow
+        );
         assert_eq!(activity(false, ["/usr/sbin/softwareupdate"]), Idle);
         assert_eq!(
             activity(

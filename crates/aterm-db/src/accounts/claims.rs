@@ -106,13 +106,32 @@ impl Source {
 }
 
 fn legacy_descriptor(bootstrap: &Bootstrap, generation: u32) -> Result<Descriptor> {
+    legacy_descriptor_in(bootstrap.trust(), generation)
+}
+
+fn legacy_descriptor_in(
+    trust: aterm_secrets::commons::journal::Trust,
+    generation: u32,
+) -> Result<Descriptor> {
     let role = if generation <= 1 {
         "claims".to_owned()
     } else {
         format!("claims.{generation}")
     };
-    Descriptor::application(bootstrap.trust(), "accounts", &role, 1)
+    Descriptor::application(trust, "accounts", &role, 1)
 }
+
+/// Every table an F19 build from before the ring declared (`claims`, `claims.2` .. `claims.6`):
+/// what each ring Mac's claims write seals, and what the storage release frees once their rows
+/// have lapsed (`catalog::release`).
+pub(crate) fn legacy_descriptors(trust: aterm_secrets::commons::journal::Trust) -> Vec<Descriptor> {
+    (1..=LEGACY_GENERATIONS)
+        .filter_map(|generation| legacy_descriptor_in(trust, generation).ok())
+        .collect()
+}
+
+/// How long after its seal an old build's claims rows still count (`legacy_active`).
+pub(crate) const LEGACY_GRACE_S: u64 = 2 * EPOCH_S;
 
 /// What a read of the table gives.
 #[derive(Debug, Clone)]
@@ -123,6 +142,20 @@ pub struct Read {
     pub rows: Vec<([u8; 16], Value)>,
     /// Whether this Mac may write its row, and why not.
     pub writable: std::result::Result<(), String>,
+    /// What this Mac's peers say of its clock, and the peers it reads as skewed
+    /// (docs/DESIGN-fluid-swarm-2026-10-28.md F22): under Off, `writable` carries its refusal.
+    pub clock: crate::clock::Judgement,
+}
+
+/// What this Mac's peers say of its clock at `now` (seconds), from the Commons runtime's
+/// `clock.state` (F22).
+fn clock_of(
+    bootstrap: &Bootstrap,
+    session: &Session<'_>,
+    me: &[u8; 16],
+    now: u64,
+) -> crate::clock::Judgement {
+    crate::clock::judge(bootstrap, &session.members(), me, now.saturating_mul(1000))
 }
 
 fn command(machine: &[u8; 16], body: &Value) -> Result<Command> {
@@ -325,7 +358,7 @@ fn legacy_active(snapshot: &CatalogSnapshot, first: &Descriptor, now: u64) -> bo
         .map(|d| d.authored_ms)
         .max()
         .is_some_and(|sealed_ms| {
-            now.saturating_mul(1000) < sealed_ms.saturating_add(2 * EPOCH_S * 1000)
+            now.saturating_mul(1000) < sealed_ms.saturating_add(LEGACY_GRACE_S * 1000)
         })
 }
 
@@ -418,7 +451,7 @@ pub fn read(paths: &Paths) -> Result<Read> {
     read_at(paths, now()?, Caps::default())
 }
 
-fn read_at(paths: &Paths, now: u64, caps: Caps) -> Result<Read> {
+pub(crate) fn read_at(paths: &Paths, now: u64, caps: Caps) -> Result<Read> {
     let selected = crate::generation::selected(paths)?;
     let paths = &selected;
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -431,6 +464,8 @@ fn read_at(paths: &Paths, now: u64, caps: Caps) -> Result<Read> {
     logs.extend(legacy_logs(&session, &directory, &bootstrap, now));
     let machines = machines(&session);
     let latest = latest(&logs, &machines);
+    let me = me(&session, &machines)?;
+    let clock = clock_of(&bootstrap, &session, &me, now);
     let roster = aterm_secrets::client::swarm_roster(paths).ok().flatten();
     let local_denied = aterm_secrets::client::local_recipient_denied_in_roster(paths)
         || roster.as_ref().is_some_and(|r| {
@@ -442,6 +477,8 @@ fn read_at(paths: &Paths, now: u64, caps: Caps) -> Result<Read> {
         });
     let writable = if local_denied {
         Err("this Mac is denied in the swarm roster".to_owned())
+    } else if let Some(why) = clock.refusal() {
+        Err(why)
     } else {
         session
             .may_write()
@@ -470,13 +507,14 @@ fn read_at(paths: &Paths, now: u64, caps: Caps) -> Result<Read> {
         None => std::collections::BTreeSet::new(),
     };
     Ok(Read {
-        me: me(&session, &machines)?,
+        me,
         rows: latest
             .into_iter()
             .filter(|(actor, _)| !denied_actors.contains(actor))
             .map(|(_, latest)| (latest.machine, latest.body))
             .collect(),
         writable,
+        clock,
     })
 }
 
@@ -487,8 +525,9 @@ fn read_at(paths: &Paths, now: u64, caps: Caps) -> Result<Read> {
 /// What a Mac does as it goes to sleep or stops, when no later round of its own may come.
 ///
 /// # Errors
-/// This Mac has no Commons or is not a member, a day table it holds cannot be read, or no ring
-/// table holds a row of its.
+/// This Mac has no Commons or is not a member, a day table it holds cannot be read, no ring
+/// table holds a row of its, or its peers read its clock as off (F22): it then writes no row, and
+/// hands none on.
 pub fn push(
     paths: &Paths,
     pusher: &crate::runtime::Pusher,
@@ -499,15 +538,19 @@ pub fn push(
 }
 
 /// The day table that holds this writer's latest ring row (its scope digest), read without the
-/// table's writer lock or enrolling any table.
+/// table's writer lock or enrolling any table; none while its peers read its clock as off.
 fn own_table(paths: &Paths, now: u64, deadline: Instant) -> Result<astream_wire::sync::Digest> {
     let admission = deadline.min(Instant::now() + Duration::from_secs(2));
     let bootstrap = Bootstrap::required_until(paths, admission).map_err(crate::table::failure)?;
     let session = Session::observe(&bootstrap)?;
     let directory = Directory::new(paths, bootstrap.trust());
+    let machines = machines(&session);
+    if let Some(why) = clock_of(&bootstrap, &session, &me(&session, &machines)?, now).refusal() {
+        return Err(Error::new(&why));
+    }
     let state = directory.ring_view(&session, &CLAIMS);
     let logs = ring_logs(&session, &directory, &state, now)?;
-    let latest = latest(&logs, &machines(&session));
+    let latest = latest(&logs, &machines);
     let epoch = own_epoch(latest.get(&session.actor()))
         .ok_or_else(|| Error::new("no claims table holds this Mac's row"))?;
     Ok(CLAIMS.scope(directory.trust(), epoch)?.digest())
@@ -581,7 +624,15 @@ pub fn write(paths: &Paths, body: &Value) -> Result<()> {
         project = "aterm_db::accounts::claims::tests::publication_transition"
     )
 )]
-fn write_at(paths: &Paths, body: &Value, now: u64, caps: Caps) -> Result<()> {
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbClaimClock",
+        action = "Write",
+        project = "aterm_db::clock::tests::claim_clock_transition"
+    )
+)]
+pub(crate) fn write_at(paths: &Paths, body: &Value, now: u64, caps: Caps) -> Result<()> {
     let selected = crate::generation::selected(paths)?;
     let paths = &selected;
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -605,6 +656,11 @@ fn write_at(paths: &Paths, body: &Value, now: u64, caps: Caps) -> Result<()> {
     }
     let machines = machines(&session);
     let machine = me(&session, &machines)?;
+    // A Mac its peers read as off writes no row (F22): a row it wrote would land in a table its
+    // peers never read, or outrank its later rows once its clock is set right.
+    if let Some(why) = clock_of(&bootstrap, &session, &machine, now).refusal() {
+        return Err(Error::new(&why));
+    }
     let command = command(&machine, body)?;
     let proposed_counter = counter(body)?;
     let encoded = encode(&command)?;
@@ -629,6 +685,15 @@ fn write_at(paths: &Paths, body: &Value, now: u64, caps: Caps) -> Result<()> {
         }
     }
     let state = directory.retire(&session, &CLAIMS, now)?;
+    // The registry roll's housekeeping rides the same writer pass as the ring's retirement: this
+    // Mac declares each registry generation it compiles that another Mac declared, which is what
+    // lets a roll seal the one before (`alab::roll::endorse`), and at most daily each sealed
+    // table whose rows lapsed or were carried frees its directory (`catalog::release`). Neither
+    // ever fails the write.
+    if let Ok(snapshot) = directory.snapshot_if_exists(&session) {
+        crate::alab::roll::endorse(&session, &directory, &snapshot);
+        let _ = directory.release_due(&session, &snapshot, now, &crate::alab::roll::covered);
+    }
 
     // The admitted session holds one exclusive control writer through the revision check across
     // every table read and the append, so no other write lands between them.
@@ -715,3 +780,6 @@ mod tests;
 
 #[cfg(test)]
 mod frontier_tests;
+
+#[cfg(test)]
+mod clock_tests;

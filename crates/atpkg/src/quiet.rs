@@ -306,9 +306,17 @@ pub fn read(layout: &Layout) -> Option<Deferral> {
     let text =
         crate::metadata_io::read_bounded_regular_utf8(&record_path(layout), MAX_RECORD_BYTES)
             .ok()?;
-    aterm_toml::from_str::<Deferral>(&text)
-        .ok()
-        .filter(|d| d.schema == SCHEMA)
+    aterm_toml::from_str::<Deferral>(&text).ok().filter(|d| {
+        d.schema == SCHEMA
+            && !d.group.is_empty()
+            && !d.group.chars().any(char::is_control)
+            && !d.why.chars().any(char::is_control)
+            && d.from
+                .keys()
+                .chain(d.to.keys())
+                .chain(d.assets.keys())
+                .all(|k| crate::ops::uninstall_name_shape(k).is_ok())
+    })
 }
 
 /// Write the record.
@@ -316,13 +324,19 @@ pub fn read(layout: &Layout) -> Option<Deferral> {
 /// # Errors
 /// The render's or the write's.
 pub(crate) fn write(layout: &Layout, record: &Deferral) -> io::Result<()> {
+    if std::fs::symlink_metadata(&layout.prefix).is_ok_and(|m| !m.file_type().is_dir()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "prefix is not a real directory",
+        ));
+    }
     let text = aterm_toml::to_string(record).map_err(|e| io::Error::other(e.to_string()))?;
     let dest = record_path(layout);
-    let tmp = dest.with_file_name(format!("flip-deferred.toml.tmp-{}", std::process::id()));
+    let (tmp, mut f) = crate::platform::create_temp_beside(&dest, 0o600)?;
     let written = (|| {
         use std::io::Write as _;
-        let mut f = crate::platform::open_create_write(&tmp, 0o600)?;
         f.write_all(text.as_bytes())?;
+        crate::platform::sync_durable(&f)?;
         drop(f);
         std::fs::rename(&tmp, &dest)
     })();
@@ -522,28 +536,45 @@ pub struct ViewsLeft {
 /// The recorded views left behind.
 #[must_use]
 pub fn views_left(layout: &Layout) -> ViewsLeft {
-    crate::metadata_io::read_bounded_regular_utf8(&view_record_path(layout), MAX_RECORD_BYTES)
-        .ok()
-        .and_then(|text| aterm_toml::from_str::<ViewsLeft>(&text).ok())
-        .filter(|r| r.schema == SCHEMA)
-        .unwrap_or_default()
+    let mut out =
+        crate::metadata_io::read_bounded_regular_utf8(&view_record_path(layout), MAX_RECORD_BYTES)
+            .ok()
+            .and_then(|text| aterm_toml::from_str::<ViewsLeft>(&text).ok())
+            .filter(|r| r.schema == SCHEMA)
+            .unwrap_or_default();
+    out.views.retain(|name, v| {
+        crate::seam::name_allowed(name)
+            && !v.build.is_empty()
+            && !v.build.chars().any(char::is_control)
+            && !v.why.chars().any(char::is_control)
+    });
+    out
 }
 
 /// Write `record` (temp + rename), or remove the file when it holds no view.
 fn write_views_left(layout: &Layout, record: &ViewsLeft) -> io::Result<()> {
+    if std::fs::symlink_metadata(&layout.prefix).is_ok_and(|m| !m.file_type().is_dir()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "prefix is not a real directory",
+        ));
+    }
     let dest = view_record_path(layout);
     if record.views.is_empty() {
+        if !std::fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_file()) {
+            return Ok(());
+        }
         return match std::fs::remove_file(&dest) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         };
     }
     let text = aterm_toml::to_string(record).map_err(|e| io::Error::other(e.to_string()))?;
-    let tmp = dest.with_file_name(format!("view-left.toml.tmp-{}", std::process::id()));
+    let (tmp, mut f) = crate::platform::create_temp_beside(&dest, 0o600)?;
     let written = (|| {
         use std::io::Write as _;
-        let mut f = crate::platform::open_create_write(&tmp, 0o600)?;
         f.write_all(text.as_bytes())?;
+        crate::platform::sync_durable(&f)?;
         drop(f);
         std::fs::rename(&tmp, &dest)
     })();
@@ -1119,6 +1150,44 @@ mod tests {
         assert!(!woken_move_still_stands(&l, &view), "renewed view");
         clear_view_left(&l, "trust");
         assert!(!woken_move_still_stands(&l, &view), "completed view");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// NEGATIVE CONTROL: `read` and `views_left` drop records with traversal/unsafe program or
+    /// seam names or control characters, while valid `rustc` / `trust` records round-trip cleanly.
+    #[test]
+    fn deferral_and_views_left_reject_traversal_keys_and_control_bytes() {
+        let l = layout("quiet-validate");
+        std::fs::write(
+            record_path(&l),
+            format!(
+                "schema = {SCHEMA}\ngroup = \"rustc\"\nsince = 1\nchecked = 2\nwhy = \"busy\"\n\
+                 [from]\n\"../escape\" = 1\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(read(&l), None);
+
+        std::fs::write(
+            record_path(&l),
+            format!(
+                "schema = {SCHEMA}\ngroup = \"bad\\u0007\"\nsince = 1\nchecked = 2\nwhy = \"busy\"\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(read(&l), None);
+
+        std::fs::write(
+            view_record_path(&l),
+            format!(
+                "schema = {SCHEMA}\n\
+                 [views.\"../escape\"]\nbuild = \"/p/store/trust/1\"\nsince = 1\nchecked = 2\nwhy = \"busy\"\n\
+                 [views.trust]\nbuild = \"/p/store/trust/1\"\nsince = 1\nchecked = 2\nwhy = \"busy\"\n"
+            ),
+        )
+        .unwrap();
+        let views = views_left(&l);
+        assert_eq!(views.views.keys().collect::<Vec<_>>(), ["trust"]);
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 }

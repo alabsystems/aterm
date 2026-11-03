@@ -78,6 +78,7 @@ fn the_fork_lane_waits_while_the_policy_read_runs_and_parks_under_its_answer() {
         reason: None,
         policy: Some(HandoffPolicy::parse("schema = 1\ncarry = \"repaint\"\n").expect("schema 1")),
         grant_chunks: false,
+        grant_empty: false,
     });
     done.store(true, Ordering::Release);
 
@@ -239,6 +240,7 @@ fn a_read_in_flight_is_not_started_twice() {
         reason: None,
         policy: None,
         grant_chunks: false,
+        grant_empty: false,
     };
     assert!(!preverify_read_needed(
         Some(&fresh),

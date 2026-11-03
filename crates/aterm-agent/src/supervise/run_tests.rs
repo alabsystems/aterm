@@ -425,12 +425,13 @@ struct Mock {
     unmoved_from_read: usize,
     /// How many `text` reads had been served when the first `send` arrived.
     reads_at_send: Option<usize>,
-    /// While the screen stands unmoved ([`Self::unmoved_after_send`]) once the supervisor's
-    /// attention is set, this many `await seq` waits wake at once with nothing drawn: the loop
-    /// reads the screen again at the same seq.
+    /// While the screen stands unmoved ([`Self::unmoved_after_send`]) once the loop has given up
+    /// on the write's echo ([`turn_end_loop::ECHO_HANG`] after the first `send`), this many
+    /// `await seq` waits wake at once with nothing drawn: the loop reads the screen again at the
+    /// same seq.
     unmoved_wakes: u32,
-    /// While the screen stands unmoved once the supervisor's attention is set, its row `.0`
-    /// reads as `.1` at the same content seq and generation: a frame the loop keys apart from
+    /// While the screen stands unmoved once the loop has given up on the write's echo, its row
+    /// `.0` reads as `.1` at the same content seq and generation: a frame the loop keys apart from
     /// the point it handed over ([`point_key`]), the composer and every fence the same.
     unmoved_rekeyed: Option<(usize, &'static str)>,
     /// Every `lease` request, on the run's clock: the request and when it arrived.
@@ -1658,6 +1659,13 @@ impl Mock {
         self.scrollback.get_or_insert_with(Vec::new);
         self.alt_screen.get_or_insert(false);
     }
+    /// Whether the loop has given up on the first write's echo: [`turn_end_loop::ECHO_HANG`]
+    /// after the first `send`, on the run's clock.
+    fn echo_given_up(&self) -> bool {
+        self.first_send_at.is_some_and(|sent| {
+            run_since(self.waits.as_deref(), sent) >= super::turn_end_loop::ECHO_HANG
+        })
+    }
     fn unmoved_for(&self) -> Option<Duration> {
         if let Some((hold, (_, keyed))) = self.unmoved_after_key.zip(self.key_times.first()) {
             return hold
@@ -1775,7 +1783,7 @@ impl Mock {
         };
         let mut shown = shown;
         if let Some((row, text)) = self.unmoved_rekeyed
-            && self.attention_at.is_some()
+            && self.echo_given_up()
             && self.unmoved_for().is_some()
             && let Some(at) = shown.get_mut(row)
         {
@@ -2899,10 +2907,7 @@ impl Mock {
                     .get(1)
                     .and_then(|n| n.parse::<u64>().ok())
                     .is_some_and(|n| n > self.seq);
-                if self.unmoved_wakes > 0
-                    && self.attention_at.is_some()
-                    && self.unmoved_for().is_some()
-                {
+                if self.unmoved_wakes > 0 && self.echo_given_up() && self.unmoved_for().is_some() {
                     self.unmoved_wakes -= 1;
                     return Ok(ok("OK seq\n"));
                 }

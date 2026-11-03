@@ -28,7 +28,7 @@ enum Counter {
 
 fn counter(root: &Path) -> Result<Counter, String> {
     let path = root.join(RECORD);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match crate::macos_doctor::read_record_bytes(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Counter::Missing),
         Err(error) => return Err(format!("{}: {error}", path.display())),
@@ -87,13 +87,16 @@ fn rebuilt(root: &Path) -> u64 {
             path.extension()
                 .is_some_and(|extension| extension == "json")
         })
-        .filter_map(|path| std::fs::read(path).ok())
+        .filter_map(|path| crate::macos_doctor::read_record_bytes(&path).ok())
         .filter_map(|bytes| aterm_json::from_slice::<Value>(&bytes).ok())
         .map(|value| named(&value));
     let access = root
         .parent()
         .and_then(|dir| {
-            std::fs::read_to_string(dir.join(aterm_types::macos_setup::access_record::FILE)).ok()
+            crate::macos_doctor::read_record_text(
+                &dir.join(aterm_types::macos_setup::access_record::FILE),
+            )
+            .ok()
         })
         .into_iter()
         .flat_map(|text| {

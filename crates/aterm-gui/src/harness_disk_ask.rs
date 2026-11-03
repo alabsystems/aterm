@@ -197,13 +197,54 @@ impl crate::App {
         );
     }
 
-    /// The disk worker `sid` ran out of its time ([`ask::WORKER_MS`]): its Autopilot goes Off,
-    /// written by aterm, so Land types nothing more into it.
+    /// The disk worker `sid` ran out of its time ([`ask::WORKER_MS`]): a task still working fails
+    /// `why=expired`, and its Autopilot goes Off, written by aterm, so Land types nothing more into
+    /// it.
     pub(crate) fn disk_worker_expired(&mut self, sid: &str) {
+        self.mark_disk_worker_expired(sid);
         if self.worker_autopilot_off(sid) {
             aterm_log::info!(
                 "harness disk watch: the disk worker @{sid} ran out of its time; its Autopilot is \
                  Off"
+            );
+        }
+    }
+
+    /// [`Self::disk_worker_expired`]'s mark, on the window's thread, so it waits on no update's
+    /// fence.
+    fn mark_disk_worker_expired(&self, sid: &str) {
+        let handle = {
+            let store = self.store.read().unwrap_or_else(PoisonError::into_inner);
+            store
+                .live_handles()
+                .find(|h| h.sid.as_str() == sid)
+                .map(|h| (h.local_id, h.ctx.clone()))
+        };
+        let Some((local, ctx)) = handle else {
+            return;
+        };
+        let mut mark = crate::task_record::TaskMark::new(TaskState::Failed);
+        mark.why = Some(crate::task_record::WHY_EXPIRED);
+        // A stalled worker runs out of its time too (a stall is no end, `task_seen`): it ends
+        // failed, and the deadline's ask it raised goes with it, as nobody owes it an answer now.
+        let running = |r: Option<&crate::task_record::TaskRecord>, _: Option<&str>| {
+            r.is_some_and(|r| matches!(r.state, TaskState::Working | TaskState::Stalled))
+        };
+        if crate::task_record::mark_session_task_with(
+            &ctx,
+            local,
+            Some(&mark),
+            crate::task_record::AttentionEdit::TakeDown(
+                crate::harness_host::deadline_attention_stands,
+            ),
+            std::time::Duration::ZERO,
+            running,
+        )
+        .is_err()
+        {
+            aterm_log::warn!(
+                "harness disk watch: the disk worker @{sid}'s record does not say it expired: an \
+                 update is committing"
             );
         }
     }
@@ -291,8 +332,8 @@ fn worker_report(store: &Store, sid: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut text = String::new();
-    let read =
-        std::fs::File::open(&path).and_then(|f| f.take(REPORT_MAX_BYTES).read_to_string(&mut text));
+    let read = crate::logging::open_regular_nonblock(&path)
+        .and_then(|f| f.take(REPORT_MAX_BYTES).read_to_string(&mut text));
     if let Err(e) = read {
         aterm_log::debug!(
             "harness disk watch: the disk worker's result {} could not be read ({e})",
@@ -354,13 +395,17 @@ fn worker_folder(state: &Path) -> Option<PathBuf> {
 
 /// What session `sid`'s task record says, for the disk worker this process runs
 /// ([`ask::Ahead::task`]): `None` where no live session of this process is `sid`, or it has no
-/// task record.
+/// task record. A stall reads working: a worker stopped at a screen, a sign-in or an install may
+/// move on once someone acts, and the lease's time bound ends one that does not
+/// ([`HostNote::DiskWorkerExpired`]).
 fn task_seen(store: &Store, sid: &str) -> Option<ask::TaskSeen> {
     let record = task_record_of(store, sid)?;
-    Some(match record.state {
-        TaskState::Working => ask::TaskSeen::Working,
-        TaskState::Done | TaskState::Exited => ask::TaskSeen::Ended,
-        TaskState::Stalled => ask::TaskSeen::Stalled(record.why.unwrap_or("stalled").to_owned()),
+    Some(match (record.state, record.conclusion()) {
+        (TaskState::Working | TaskState::Stalled, _) | (_, None) => ask::TaskSeen::Working,
+        (_, Some(crate::task_record::Conclusion::Finished)) => ask::TaskSeen::Ended,
+        (_, Some(crate::task_record::Conclusion::Failed)) => {
+            ask::TaskSeen::Failed(record.why.unwrap_or("failed").to_owned())
+        }
     })
 }
 
@@ -368,14 +413,16 @@ fn task_seen(store: &Store, sid: &str) -> Option<ask::TaskSeen> {
 /// record's state, the first found: the record trusts the worker folder
 /// ([`aterm_agent::harness::disk::fence::is_worker_folder`]) and is stalled, or working for less
 /// than [`ask::WORKER_MS`] since it last changed, and the session's own Autopilot is not Off.
+/// The lease runs a worker through a stall and ends it at [`ask::WORKER_MS`], marking its record
+/// `failed why=expired` ([`crate::App::disk_worker_expired`]); this read bars a second one beside it
+/// while that mark has not been made (an update committing) or the lease no longer holds it.
 ///
 /// Every live session is read, not only those whose foreground is Claude Code: a worker can stall
 /// before Claude Code runs at all (`stalled why=install` when installing it fails, as it may on a
 /// full disk, or `why=shell`), and one stopped at its start (`why=startup`: a sign-in or
 /// first-run screen where its composer should be) counts the same. A worker always carries its
 /// own Autopilot word (it starts under Land), so a person who switches it Off takes it over. One
-/// working past [`ask::WORKER_MS`] since its last change is one the lease no longer bounds (it
-/// ended it as held, and it worked on): it is past the time any worker is given.
+/// working past [`ask::WORKER_MS`] since its last change is past the time any worker is given.
 ///
 /// While one runs this host starts no other ([`worker_ok_here`]): the next would share its folder,
 /// and one stopped at its start would stop again beside the one that already carries the
@@ -401,7 +448,7 @@ fn earlier_worker(store: &Store, now_ms: i64) -> Option<(String, String)> {
             let runs = match record.state {
                 TaskState::Stalled => true,
                 TaskState::Working => now_ms.saturating_sub(since) < ask::WORKER_MS,
-                TaskState::Done | TaskState::Exited => false,
+                TaskState::Done | TaskState::Exited | TaskState::Failed => false,
             };
             if !(in_folder && runs) {
                 return None;
@@ -614,6 +661,9 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     let task = |sid: &str| task_seen(store, sid);
+    let worker_target = floor_now
+        .saturating_add(disk::PRESSURE_MARGIN_GIB << 30)
+        .saturating_add(projected.map_or(0, |p| p.need));
     let look = ask::Look {
         now_ms: now,
         host: &host,
@@ -638,6 +688,7 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
             worker_ok: worker_ok_here(store, now),
             task: Some(&task),
             spawned: spawned.as_ref(),
+            target: Some(worker_target),
         },
     };
     let unrecorded = typed_last(&key);
@@ -690,9 +741,7 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
                     .and_then(|e| e.floor.as_ref())
                     .map_or(floor_now, |f| f.bytes),
                 projected,
-                target: floor_now
-                    .saturating_add(disk::PRESSURE_MARGIN_GIB << 30)
-                    .saturating_add(projected.map_or(0, |p| p.need)),
+                target: worker_target,
                 holders: &holders,
                 asked: entry
                     .as_ref()
@@ -863,24 +912,61 @@ fn worker_moved(
             }),
             None => worker_spawned(Err("no-folder".to_owned())),
         },
+        // EVERY OVER THE LEASE RECORDS IS TOLD ONCE, by the process that moved it, which is the one
+        // this step ran in: a worker that never started and one whose host died have an end too.
+        // Only this host's own worker has a report to read and an Autopilot to turn Off.
         ask::WorkerSaid::Over {
-            sid: Some(sid),
+            sid,
             why,
-            here: true,
-            ..
+            rose,
+            target_met,
+            here,
         } => {
-            let report = worker_report(store, sid);
+            let ours = sid.as_deref().filter(|_| *here);
+            let report = ours.map_or_else(Vec::new, |sid| worker_report(store, sid));
             if !report.is_empty() {
                 *WORKER_REPORT.lock().unwrap_or_else(PoisonError::into_inner) =
-                    Some((key.to_owned(), report));
+                    Some((key.to_owned(), report.clone()));
             }
-            if why == "expired" {
-                note(HostNote::DiskWorkerExpired { sid: sid.clone() });
+            if let Some(sid) = ours
+                && why == "expired"
+            {
+                note(HostNote::DiskWorkerExpired {
+                    sid: sid.to_owned(),
+                });
             }
+            note(HostNote::DiskWorkerOver {
+                sid: sid.clone(),
+                volume: key.to_owned(),
+                why: why.clone(),
+                rose: *rose,
+                target_met: *target_met,
+                removed: sid.as_deref().map_or(0, |sid| worker_removed(state, sid)),
+                report,
+            });
         }
-        ask::WorkerSaid::Started { .. } | ask::WorkerSaid::Over { .. } => {}
+        ask::WorkerSaid::Started { .. } => {}
     }
 }
+
+/// The bytes the worker `sid` removed itself, by the disk ledger's rows
+/// (`disk::free::removed_by`); `0` where the ledger cannot be read.
+fn worker_removed(state: &Path, sid: &str) -> u64 {
+    let ledger = state.join(aterm_agent::harness::cli::DISK_LEDGER);
+    match aterm_agent::harness::cli::tail_lines(&ledger, WORKER_LEDGER_ROWS) {
+        Ok(rows) => disk::free::removed_by(&rows, sid),
+        Err(e) => {
+            aterm_log::debug!(
+                "harness disk watch: {} could not be read for what the worker removed ({e})",
+                ledger.display()
+            );
+            0
+        }
+    }
+}
+
+/// The ledger rows read back for what a worker removed: more than a run's rows at any pace.
+const WORKER_LEDGER_ROWS: usize = 4096;
 
 /// What the owner's filling entry and alert say the asks and the worker did: the owner's line
 /// ([`ask::owner_line`]), the worker's state, then what its report said ([`report_lines`]).
@@ -1013,7 +1099,7 @@ enum Judged {
 }
 
 /// The seat rule: a supervised Claude Code (the line is written for its composer) working on the
-/// volume, with no task record that stands ([`task_bar_of`]: done, exited, or a manager's
+/// volume, with no task record that stands ([`task_bar_of`]: done, exited, failed, or a manager's
 /// worker's) and whose worker did not find it unfit at its last turn break
 /// ([`super::WorkerIdle`]: its task finished or landed, it has none, its Autopilot is Off, or it
 /// is the person's own exchange). The task record bars a session whether or not it is still
@@ -1318,6 +1404,7 @@ fn task_bar_of(state: Option<TaskState>) -> Option<&'static str> {
     match state? {
         TaskState::Done => Some("task-done"),
         TaskState::Exited => Some("task-exited"),
+        TaskState::Failed => Some("task-failed"),
         TaskState::Working | TaskState::Stalled => Some(Guard::Managed.word()),
     }
 }
@@ -1909,6 +1996,127 @@ mod tests {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    /// A DISK WORKER'S RECORD READS BY HOW IT ENDED: a landing an exit followed finished, an agent
+    /// that left first or a worker that said it could not finish failed with its word, and a stall
+    /// is no end, so it reads working. A failed session bars a seat as a finished one does.
+    #[test]
+    fn a_workers_record_reads_by_how_it_ended() {
+        use crate::task_record::{
+            TaskMark, WHY_COULD_NOT_FINISH, WHY_EXIT, WHY_LANDED, mark_session_task,
+        };
+        let mut sessions = crate::session_store::SessionStore::default();
+        let h = crate::session_store::test_handle(9_301);
+        sessions.register(h.clone());
+        let sid = h.sid.as_str().to_owned();
+        let store: Store = std::sync::Arc::new(std::sync::RwLock::new(sessions));
+        let mark = |state, why| {
+            let mark = TaskMark {
+                why,
+                ..TaskMark::new(state)
+            };
+            mark_session_task(&h.ctx, 9_301, &mark).expect("unfenced");
+            task_seen(&store, &sid)
+        };
+        assert_eq!(mark(TaskState::Working, None), Some(ask::TaskSeen::Working));
+        assert_eq!(
+            mark(TaskState::Failed, Some(WHY_COULD_NOT_FINISH)),
+            Some(ask::TaskSeen::Failed("could-not-finish".to_owned()))
+        );
+        assert_eq!(mark(TaskState::Working, None), Some(ask::TaskSeen::Working));
+        assert_eq!(
+            mark(TaskState::Exited, Some(WHY_EXIT)),
+            Some(ask::TaskSeen::Failed("exit".to_owned()))
+        );
+        assert_eq!(mark(TaskState::Working, None), Some(ask::TaskSeen::Working));
+        assert_eq!(
+            mark(TaskState::Done, Some(WHY_LANDED)),
+            Some(ask::TaskSeen::Ended)
+        );
+        assert_eq!(
+            mark(TaskState::Exited, Some(WHY_EXIT)),
+            Some(ask::TaskSeen::Ended),
+            "the landing outlives the exit"
+        );
+        for why in ["startup", "held", "signin"] {
+            assert_eq!(
+                mark(TaskState::Stalled, Some(why)),
+                Some(ask::TaskSeen::Working),
+                "{why}"
+            );
+        }
+        assert_eq!(task_bar_of(Some(TaskState::Failed)), Some("task-failed"));
+    }
+
+    /// EVERY `Over` THE LEASE RECORDS IS NOTED ONCE, by the process that moved it: a worker that never
+    /// started (no sid) and one whose host died (not here) have an end too. Only this host's own
+    /// worker has an Autopilot to turn Off at its expiry. NEGATIVE CONTROL: a start notes no end.
+    #[test]
+    fn every_over_the_lease_records_is_noted_once() {
+        let state = aterm_tempfile::TempDir::new().expect("owned disk journal");
+        let host = ask::HostId {
+            pid: 1,
+            start: String::new(),
+        };
+        let reading = aterm_sysprobe::volumes::Reading {
+            mount: std::path::PathBuf::from("/u"),
+            key: aterm_sysprobe::volumes::VolumeKey::Volume("dev:over".to_owned()),
+            total: 2000 * GIB,
+            free: 10 * GIB,
+            files_free: Some(1 << 30),
+            dev: 0,
+            read_only: false,
+        };
+        let store: Store = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::session_store::SessionStore::default(),
+        ));
+        let words = |said: &ask::WorkerSaid| {
+            let noted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = noted.clone();
+            let note: Box<NoteFn> = Box::new(move |n: HostNote| {
+                seen.lock().unwrap().push(match n {
+                    HostNote::DiskWorkerExpired { sid } => format!("expired {sid}"),
+                    HostNote::DiskWorkerOver {
+                        sid, volume, why, ..
+                    } => {
+                        format!("over {sid:?} {volume} {why}")
+                    }
+                    _ => "other".to_owned(),
+                });
+            });
+            worker_moved(
+                state.path(),
+                0,
+                "dev:over",
+                said,
+                &reading,
+                &host,
+                (&*note, &store),
+                String::new,
+            );
+            noted.lock().unwrap().clone()
+        };
+        let over = |sid: Option<&str>, why: &str, here: bool| ask::WorkerSaid::Over {
+            sid: sid.map(str::to_owned),
+            why: why.to_owned(),
+            rose: 0,
+            target_met: None,
+            here,
+        };
+        assert_eq!(
+            words(&over(None, "failed:spawn", true)),
+            ["over None dev:over failed:spawn"]
+        );
+        assert_eq!(
+            words(&over(Some("s-1"), "expired", false)),
+            ["over Some(\"s-1\") dev:over expired"],
+            "another host's worker: no Off to send"
+        );
+        assert_eq!(
+            words(&over(Some("s-2"), "expired", true)),
+            ["expired s-2", "over Some(\"s-2\") dev:over expired"]
+        );
     }
 
     #[test]
@@ -4125,6 +4333,7 @@ mod tests {
             },
             orphan_ms: None,
             free_at_claim: None,
+            target: None,
         });
         assert_eq!(
             filling_said(Some("asked @a"), Some(&entry), &[]).as_deref(),

@@ -232,7 +232,13 @@ impl Api {
     }
 
     pub fn formula(&self, name: &str) -> Result<Formula, String> {
-        formula_record(&self.formula_doc(name)?, name, Machine::this())
+        self.formula_on(name, Machine::this())
+    }
+
+    /// [`Api::formula`] resolved against a simulated machine
+    /// (`deps --os`/`--arch`).
+    pub(super) fn formula_on(&self, name: &str, machine: &Machine) -> Result<Formula, String> {
+        formula_record(&self.formula_doc(name)?, name, machine)
     }
 
     /// Deletion may not interpret a missing or malformed dependency field as empty.
@@ -372,13 +378,22 @@ impl Api {
     /// split runtime/build for formulae (casks declare formula
     /// dependencies only). Variation-resolved like any other record.
     pub fn deps_index(&self, casks: bool) -> Result<Vec<DepRow>, String> {
+        self.deps_index_on(casks, Machine::this())
+    }
+
+    /// [`Api::deps_index`] resolved against a simulated machine
+    /// (`deps --os`/`--arch`); cask rows carry no variations.
+    pub(super) fn deps_index_on(
+        &self,
+        casks: bool,
+        machine: &Machine,
+    ) -> Result<Vec<DepRow>, String> {
         let (rel, file) = if casks {
             ("cask.json", "cask-index.json")
         } else {
             ("formula.json", "formula-index.json")
         };
         let v = self.doc_with_freshness(rel, file, 86_400, true)?;
-        let machine = Machine::this();
         let mut out = Vec::new();
         if let Some(arr) = v.as_array() {
             for item in arr {
@@ -614,10 +629,7 @@ pub(super) fn formula_record(v: &Value, name: &str, machine: &Machine) -> Result
     let short = Formula::short_name(name);
     let mut f = Formula::from_api(v)?;
     f.resolve_variations(machine);
-    if f.name != short
-        && !f.aliases.iter().any(|a| a == short)
-        && !f.oldnames.iter().any(|a| a == short)
-    {
+    if !f.matches_name(short) {
         return Err(format!(
             "abrew: formula metadata for {short} names {}",
             f.name

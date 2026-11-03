@@ -127,7 +127,7 @@ fn covers(want: &str, item: &str) -> bool {
 pub fn audit(rows: &[Row], vf5: &Path) -> (Vec<String>, usize) {
     let mut out = Vec::new();
     let mut compared = 0;
-    let graded = match std::fs::read_to_string(vf5.join("rows.out.tsv")) {
+    let graded = match crate::tree::read_to_string(&vf5.join("rows.out.tsv")) {
         Ok(text) => proved_rows(&text),
         Err(e) => {
             return (
@@ -152,7 +152,7 @@ pub fn audit(rows: &[Row], vf5: &Path) -> (Vec<String>, usize) {
             ));
         }
         named.insert(row.harness.clone());
-        let Ok(harness) = std::fs::read_to_string(blobs.join(&row.harness)) else {
+        let Ok(harness) = crate::tree::read_to_string(&blobs.join(&row.harness)) else {
             out.push(format!(
                 "registry row `{}`: no harness blobs/{}",
                 row.row, row.harness
@@ -183,7 +183,7 @@ pub fn audit(rows: &[Row], vf5: &Path) -> (Vec<String>, usize) {
     }
     for rel in harnesses(&blobs, "") {
         if !named.contains(&rel)
-            && std::fs::read_to_string(blobs.join(&rel))
+            && crate::tree::read_to_string(&blobs.join(&rel))
                 .ok()
                 .and_then(|h| header_items(&h))
                 .is_some()

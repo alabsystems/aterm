@@ -79,7 +79,7 @@ impl Union {
     /// [`Unread::Absent`] when missing; [`Unread::Unusable`] when unreadable or malformed.
     pub fn read(root: &Path) -> Result<Self, Unread> {
         let path = path(root);
-        let text = std::fs::read_to_string(&path).map_err(|e| {
+        let text = crate::read_regular_text(&path).map_err(|e| {
             let said = format!("{}: {e}", path.display());
             if e.kind() == std::io::ErrorKind::NotFound {
                 Unread::Absent(said)

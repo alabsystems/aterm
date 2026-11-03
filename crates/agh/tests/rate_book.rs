@@ -286,4 +286,65 @@ mod files {
         assert_eq!(again.sub, Sub::PreRefused);
         assert_eq!(transport.requests().len(), 1);
     }
+
+    /// NEGATIVE CONTROL: Mixed-case `X-RateLimit-Resource` headers normalize to lowercase so
+    /// `refuse_before_send(..., "core", ...)` still matches, invalid resource characters/lengths
+    /// are rejected rather than corrupting `line()` or `RateBook`, and recording >64 distinct
+    /// unspent resources stays bounded well under `BOOK_MAX` without evicting a spent resource.
+    #[test]
+    fn rate_book_normalizes_resources_rejects_malformed_names_and_bounds_entries() {
+        let mixed = [
+            ("X-RateLimit-Limit", "60"),
+            ("X-RateLimit-Remaining", "0"),
+            ("X-RateLimit-Reset", "1760003600"),
+            ("X-RateLimit-Resource", "Core"),
+        ];
+        let parsed = RateSnapshot::from_headers(&common::headers(&mixed)).expect("mixed-case Core");
+        assert_eq!(parsed.resource, "core");
+
+        for bad in [
+            "core:0/0",
+            "core\nfake:0/60",
+            "core space",
+            "../escape",
+            &"r".repeat(65),
+        ] {
+            let headers = [
+                ("X-RateLimit-Limit", "60"),
+                ("X-RateLimit-Remaining", "0"),
+                ("X-RateLimit-Reset", "1760003600"),
+                ("X-RateLimit-Resource", bad),
+            ];
+            assert!(
+                RateSnapshot::from_headers(&common::headers(&headers)).is_none(),
+                "must reject {bad:?}"
+            );
+        }
+
+        let root = common::scratch("rate-bounded");
+        let rate_dir = Dirs::under(root.path()).rate();
+        let book = RateBook::at(rate_dir.clone());
+        book.record("anonymous", &snapshot("Core", 0, NOW + 60));
+        book.record("anonymous", &snapshot("core\ninjected", 0, NOW + 60));
+        for i in 0..200_u64 {
+            book.record(
+                "anonymous",
+                &snapshot(&format!("custom_res_{i}"), 50, NOW + 10_000 + i),
+            );
+        }
+
+        let held = book.read("anonymous");
+        assert_eq!(held.len(), 64, "book must cap stored resources at 64");
+        assert!(
+            book.refuse_before_send("anonymous", "core", NOW).is_some(),
+            "spent core entry must survive unspent resource churn and BOOK_MAX cap"
+        );
+        let size = std::fs::metadata(rate_dir.join("anonymous.json"))
+            .expect("book metadata")
+            .len();
+        assert!(
+            size < 16 * 1024,
+            "book size {size} must stay far below 64 KiB"
+        );
+    }
 }

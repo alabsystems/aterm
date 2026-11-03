@@ -180,8 +180,9 @@ instance of one of the general specs above.
    removed; wrong-pin rejection lives in `tls::a_wrong_fingerprint_pin_rejects_the_handshake`.
 2. **(Fixed.) Tests on hosts without dual-stack loopback call `could_not_run`.**
    `slots::tests::dual_stack_listener` calls `aterm_spec::host::could_not_run` (rather than returning
-   early after an `eprintln!`) when `[::]` cannot bind dual-stack or loopback IPv4/IPv6 do not map to
-   distinct sources, so `fleet::idle_sockets_from_one_address_never_turn_away_a_member_from_another` and
+   early after an `eprintln!`) when `[::]` cannot bind dual-stack, 127.0.0.1 or ::1 cannot reach it, or
+   more than 64 ports in a row are shadowed on loopback by other sockets (one bound to 127.0.0.1, ::1 or a
+   wildcard of the port; two loopback addresses that map to one source fail its assertion), so `fleet::idle_sockets_from_one_address_never_turn_away_a_member_from_another` and
    `fleet::a_slow_handshake_is_never_cut_for_a_heavier_address` never silently pass without running.
 3. **A relay assertion that is mostly about rustls.** In
    `tls::relay_early_request_close_delivers_guarded_reply_but_not_late_ack`, "the late ACK never

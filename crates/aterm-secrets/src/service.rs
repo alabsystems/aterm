@@ -212,7 +212,7 @@ fn record_server_off_locked(home: &Path) -> crate::Result<()> {
 /// judged the job. It is separate from the vault's data lock, and spans a fetch only in
 /// [`move_held_serving`], which holds it until the moved job is seen serving (up to a minute) or
 /// is put back, so an `off` meanwhile waits for that and then stands.
-struct JobDecision(std::fs::File);
+pub(crate) struct JobDecision(std::fs::File);
 
 /// The lock [`JobDecision`] takes for `job`: `~/.config/aterm/secrets/subscriber.lock`, the one
 /// earlier releases take for the subscriber, or `server.lock`.
@@ -224,7 +224,7 @@ fn decision_lock_path(home: &Path, job: Job) -> PathBuf {
 }
 
 impl JobDecision {
-    fn take(home: &Path, job: Job) -> crate::Result<Self> {
+    pub(crate) fn take(home: &Path, job: Job) -> crate::Result<Self> {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
         crate::fsx::ensure_private_dir(&secrets_dir(home))?;
         let path = decision_lock_path(home, job);
@@ -1228,9 +1228,20 @@ pub fn write_unit(
 
 /// One child run under [`CHILD_HANG`], its stdin `/dev/null`.
 fn run(program: &Path, argv: &[String]) -> crate::Result<std::process::Output> {
+    run_until(program, argv, Instant::now() + CHILD_HANG)
+}
+
+fn run_until(
+    program: &Path,
+    argv: &[String],
+    until: Instant,
+) -> crate::Result<std::process::Output> {
+    if Instant::now() >= until {
+        return Err(Error::new("service observation deadline expired"));
+    }
     let mut cmd = aterm_uds::spawnfd::command(program);
     cmd.args(argv);
-    aterm_uds::deadline::output_until(&mut cmd, Instant::now() + CHILD_HANG)
+    aterm_uds::deadline::output_until(&mut cmd, until)
         .map_err(|e| Error::new(format!("{} {}: {e}", program.display(), argv.join(" "))))
 }
 
@@ -1278,18 +1289,6 @@ fn launchctl_ok(call: Launchctl<'_>) -> crate::Result<()> {
 /// What one `launchctl` call answers, run or (in a test) made up.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 type LaunchctlRun<'a> = dyn FnMut(Launchctl<'_>) -> crate::Result<std::process::Output> + 'a;
-
-/// launchd's view of `label` in either domain: `None` when neither holds such a job, else the
-/// first that does ([`Domain::Gui`], then [`Domain::User`]) and its pid if running.
-#[cfg(target_os = "macos")]
-fn launchd_job(label: &str) -> crate::Result<Option<(Domain, Option<u32>)>> {
-    for domain in [Domain::Gui, Domain::User] {
-        if let Some(pid) = launchd_job_with(domain, label, &mut launchctl)? {
-            return Ok(Some((domain, pid)));
-        }
-    }
-    Ok(None)
-}
 
 /// launchd's view of `label` in `domain` through `launchctl`: `None` when it holds no such
 /// job, else its pid if running.
@@ -2441,6 +2440,13 @@ fn uninstall_job(home: &Path, job: Job) -> crate::Result<bool> {
 
 /// `job`'s state: absent for a home that is not this login's own ([`own_home`]).
 pub fn state(home: &Path, job: Job) -> crate::Result<State> {
+    state_until(home, job, Instant::now() + CHILD_HANG)
+}
+
+/// Observe a service without allowing child queries past `until`.
+/// # Errors
+/// The home, unit, service manager, or deadline cannot be read.
+pub fn state_until(home: &Path, job: Job, until: Instant) -> crate::Result<State> {
     // The login's job is not this home's: a scratch `HOME` has none.
     if check_own_home(home).is_err() {
         return Ok(State::Absent);
@@ -2449,7 +2455,20 @@ pub fn state(home: &Path, job: Job) -> crate::Result<State> {
     {
         let unit = plist_path(home, job);
         let on_disk = crate::fsx::kind(&unit)? != crate::fsx::Kind::Missing;
-        match launchd_job(job.label())? {
+        let mut loaded = None;
+        for domain in [Domain::Gui, Domain::User] {
+            if let Some(pid) = launchd_job_with(domain, job.label(), &mut |call| {
+                run_until(
+                    Path::new(LAUNCHCTL),
+                    &launchctl_argv(aterm_uds::peer::our_uid(), call),
+                    until,
+                )
+            })? {
+                loaded = Some((domain, pid));
+                break;
+            }
+        }
+        match loaded {
             Some((_, pid)) => Ok(State::Installed { pid, unit }),
             None if on_disk => Ok(State::Installed { pid: None, unit }),
             None => Ok(State::Absent),
@@ -2463,9 +2482,10 @@ pub fn state(home: &Path, job: Job) -> crate::Result<State> {
         }
         let pid = match systemctl() {
             Ok(systemctl) => {
-                let out = run(
+                let out = run_until(
                     &systemctl,
                     &systemctl_argv(&["show", "-p", "MainPID", "--value", &unit_name(job)]),
+                    until,
                 )?;
                 if out.status.success() {
                     main_pid(&String::from_utf8_lossy(&out.stdout))
@@ -2479,6 +2499,378 @@ pub fn state(home: &Path, job: Job) -> crate::Result<State> {
     }
 }
 
+/// Read the complete supported unit and the person's decisions for a signed repair.
+/// The caller holds [`JobDecision`] across this read and the transaction.
+/// # Errors
+/// The home, decision records, unit, or executable cannot be read, or the unit is not a
+/// definition written by aterm.
+pub fn repair_observe(home: &Path, job: Job) -> crate::Result<crate::service_repair::Observed> {
+    check_own_home(home)?;
+    repair_observe_at(home, job)
+}
+
+fn repair_observe_at(home: &Path, job: Job) -> crate::Result<crate::service_repair::Observed> {
+    let off_path = match job {
+        Job::Subscriber => subscriber_off_path(home),
+        Job::Server => server_off_path(home),
+    };
+    let off = crate::fsx::kind(&off_path)? != crate::fsx::Kind::Missing;
+    let pin = crate::fsx::read_private(&pin_path(home, job), 4096)?
+        .map(|bytes| {
+            String::from_utf8(bytes.as_slice().to_vec())
+                .map_err(|_| Error::new("non-UTF-8 service pin"))
+        })
+        .transpose()?;
+    let path = unit_file(home, job);
+    let unit = if crate::fsx::kind(&path)? == crate::fsx::Kind::Missing {
+        None
+    } else {
+        let definition = read_regular_string(&path, UNIT_FILE_MOST)
+            .ok_or_else(|| Error::new("cannot read complete service unit"))?;
+        let argv = repair_argv(&definition)
+            .ok_or_else(|| Error::new("unsupported service unit arguments"))?;
+        let (program, args) = argv.split_first().ok_or_else(|| Error::new("empty unit"))?;
+        let executable_sha256 = repair_image_hash(Path::new(program))?;
+        let unit = crate::service_repair::Unit {
+            program: program.clone(),
+            args: args.to_vec(),
+            image: executable_sha256.clone(),
+            executable_sha256,
+            definition,
+        };
+        repair_check_unit(home, job, &unit)?;
+        Some(unit)
+    };
+    Ok(crate::service_repair::Observed { unit, off, pin })
+}
+
+fn repair_argv(definition: &str) -> Option<Vec<String>> {
+    if cfg!(target_os = "macos") {
+        plist_argv(definition)
+    } else {
+        exec_argv(definition)
+    }
+}
+
+/// Produce a replacement of a supported unit, retaining its arguments and launchd domain.
+/// # Errors
+/// The old definition is unsupported or the new executable cannot be used by a service.
+pub fn repair_unit(
+    home: &Path,
+    job: Job,
+    old: &crate::service_repair::Unit,
+    program: &Path,
+    image: &str,
+) -> crate::Result<crate::service_repair::Unit> {
+    if image.is_empty() {
+        return Err(Error::new("service image identity must not be empty"));
+    }
+    repair_check_unit(home, job, old)?;
+    check_argv(program, &old.args)?;
+    let program_text = program
+        .to_str()
+        .ok_or_else(|| Error::new("non-UTF-8 executable"))?;
+    let definition = if cfg!(target_os = "macos") {
+        let log = log_path(home, job);
+        let old_program = Path::new(&old.program);
+        let old_bundle = bundle_id_of(old_program);
+        let (domain, had_bundle) = [Domain::Gui, Domain::User]
+            .into_iter()
+            .find_map(|d| {
+                if old.definition
+                    == plist_text_in(job.label(), old_program, &old.args, &log, d, None)
+                {
+                    Some((d, false))
+                } else if old_bundle.as_deref().is_some_and(|id| {
+                    old.definition
+                        == plist_text_in(job.label(), old_program, &old.args, &log, d, Some(id))
+                }) {
+                    Some((d, true))
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| Error::new("service definition has unsupported manager directives"))?;
+        let new_bundle = bundle_id_of(program);
+        plist_text_in(
+            job.label(),
+            program,
+            &old.args,
+            &log,
+            domain,
+            if had_bundle {
+                new_bundle.as_deref()
+            } else {
+                None
+            },
+        )
+    } else {
+        systemd_unit(job.description(), program, &old.args)
+    };
+    let next = crate::service_repair::Unit {
+        program: program_text.to_owned(),
+        args: old.args.clone(),
+        definition,
+        image: image.to_owned(),
+        executable_sha256: repair_image_hash(program)?,
+    };
+    repair_check_unit(home, job, &next)?;
+    Ok(next)
+}
+
+fn repair_check_unit(
+    home: &Path,
+    job: Job,
+    unit: &crate::service_repair::Unit,
+) -> crate::Result<()> {
+    let program = Path::new(&unit.program);
+    let argv = repair_argv(&unit.definition).ok_or_else(|| Error::new("unsupported unit"))?;
+    if argv.first() != Some(&unit.program) || argv.get(1..) != Some(unit.args.as_slice()) {
+        return Err(Error::new(
+            "unit executable or arguments disagree with receipt",
+        ));
+    }
+    let shaped = match job {
+        Job::Subscriber => unit.args == ["secrets", "watch"],
+        Job::Server => unit
+            .args
+            .get(..2)
+            .is_some_and(|words| words == ["secrets", "serve"]),
+    };
+    if !shaped {
+        return Err(Error::new("unit does not run the requested vault service"));
+    }
+    // Additional manager directives can override argv or add executable hooks. Only complete
+    // definitions produced by this service writer are candidates for independent activation.
+    let supported = if cfg!(target_os = "macos") {
+        let log = log_path(home, job);
+        let bundle = bundle_id_of(program);
+        [Domain::Gui, Domain::User].into_iter().any(|domain| {
+            [None, bundle.as_deref()].into_iter().any(|id| {
+                unit.definition == plist_text_in(job.label(), program, &unit.args, &log, domain, id)
+            })
+        })
+    } else {
+        unit.definition == systemd_unit(job.description(), program, &unit.args)
+    };
+    if !supported {
+        return Err(Error::new(
+            "service definition has unsupported manager directives",
+        ));
+    }
+    Ok(())
+}
+
+/// Hash an executable through an open regular file, refusing a concurrent file replacement.
+/// # Errors
+/// The file cannot be read, is a symlink or non-regular file, or changes while read.
+pub fn repair_image_hash(program: &Path) -> crate::Result<String> {
+    repair_hash_file(program, false)
+}
+
+fn repair_hash_file(program: &Path, mapped_image: bool) -> crate::Result<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(if mapped_image {
+            libc::O_NONBLOCK
+        } else {
+            libc::O_NOFOLLOW | libc::O_NONBLOCK
+        })
+        .open(program)?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(Error::new("service image is not a regular file"));
+    }
+    let mut hash = aterm_digest::Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    let after = file.metadata()?;
+    let named = if mapped_image {
+        std::fs::metadata(program)?
+    } else {
+        std::fs::symlink_metadata(program)?
+    };
+    let identity = |m: &std::fs::Metadata| {
+        (
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
+    };
+    if identity(&before) != identity(&after) || identity(&after) != identity(&named) {
+        return Err(Error::new("service image changed while hashing"));
+    }
+    Ok(aterm_codec::hex::encode_lower(&hash.finalize()))
+}
+
+/// Install the journal's exact service definition without changing Off or pin records.
+/// The transaction holds [`JobDecision`] and has already persisted its rollback journal.
+/// # Errors
+/// The definition is unsupported, its image changed, or the manager refuses the restart.
+pub fn repair_install(
+    home: &Path,
+    job: Job,
+    unit: &crate::service_repair::Unit,
+) -> crate::Result<()> {
+    check_own_home(home)?;
+    repair_check_unit(home, job, unit)?;
+    check_argv(Path::new(&unit.program), &unit.args)?;
+    if repair_image_hash(Path::new(&unit.program))? != unit.executable_sha256 {
+        return Err(Error::new("service image no longer matches the journal"));
+    }
+    if job == Job::Server && matches!(daemon_state_for_home(home)?, State::Installed { .. }) {
+        return Err(Error::new("a system vault daemon owns this server"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let boundary = aterm_types::update_boundary::Boundary::process();
+        let _guard = boundary
+            .hold(
+                aterm_types::update_boundary::GuardedItem::LaunchdBootstrap,
+                || Ok::<(), std::convert::Infallible>(()),
+            )
+            .unwrap_or_else(|never| match never {});
+        repair_restart_launchd(home, job, unit, &mut launchctl)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let manager = systemctl()?;
+        write_unit_file(&unit_file(home, job), &unit.definition)?;
+        run_ok(&manager, &systemctl_argv(&["daemon-reload"]))?;
+        let name = unit_name(job);
+        run_ok(&manager, &systemctl_argv(&["enable", "--now", &name]))?;
+        run_ok(&manager, &systemctl_argv(&["restart", &name]))?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn repair_restart_launchd(
+    home: &Path,
+    job: Job,
+    unit: &crate::service_repair::Unit,
+    manager: &mut LaunchctlRun<'_>,
+) -> crate::Result<()> {
+    let domain = if unit
+        .definition
+        .contains("\t<key>LimitLoadToSessionType</key>\n\t<string>Background</string>\n")
+    {
+        Domain::User
+    } else {
+        Domain::Gui
+    };
+    // The journal precedes this stop. Every retry restores this exact definition.
+    for held in [Domain::Gui, Domain::User] {
+        if launchd_job_with(held, job.label(), manager)?.is_some() {
+            launchctl_checked(Launchctl::Bootout(held, job.label()), manager)?;
+            let deadline = Instant::now() + BOOTOUT_SETTLE;
+            while launchd_job_with(held, job.label(), manager)?.is_some() {
+                if Instant::now() >= deadline {
+                    return Err(Error::new("service bootout did not settle"));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    crate::fsx::ensure_private_dir(&secrets_dir(home))?;
+    let path = plist_path(home, job);
+    write_unit_file(&path, &unit.definition)?;
+    launchctl_checked(Launchctl::Bootstrap(domain, &path), manager)?;
+    launchctl_checked(Launchctl::Kickstart(domain, job.label()), manager)?;
+    Ok(())
+}
+
+/// Prove the manager's live process still runs the expected executable and bytes.
+/// This is image evidence; the caller additionally verifies authenticated service behavior.
+/// # Errors
+/// The service is not running, the process changes during the check, or its image differs.
+pub fn repair_prove_image(
+    home: &Path,
+    job: Job,
+    unit: &crate::service_repair::Unit,
+) -> crate::Result<()> {
+    let State::Installed { pid: Some(pid), .. } = state(home, job)? else {
+        return Err(Error::new("service has no running process"));
+    };
+    let pid = i32::try_from(pid).map_err(|_| Error::new("invalid service pid"))?;
+    let identity = aterm_uds::process::read_identity(pid)
+        .ok_or_else(|| Error::new("service process identity unavailable"))?;
+    let expected = std::fs::canonicalize(&unit.program)?;
+    let actual = aterm_uds::process::read_process_path(pid)
+        .ok_or_else(|| Error::new("service executable unavailable"))?;
+    if std::fs::canonicalize(&actual)? != expected
+        || repair_image_hash(&actual)? != unit.executable_sha256
+    {
+        return Err(Error::new("running service image differs from the journal"));
+    }
+    repair_prove_loaded(pid, &actual, &unit.executable_sha256)?;
+    if aterm_uds::process::read_identity(pid) != Some(identity)
+        || aterm_uds::process::read_process_path(pid).as_ref() != Some(&actual)
+        || !matches!(state(home, job)?, State::Installed { pid: Some(now), .. } if now == pid as u32)
+    {
+        return Err(Error::new("service process changed during image proof"));
+    }
+    Ok(())
+}
+
+fn repair_prove_loaded(pid: i32, program: &Path, image: &str) -> crate::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let live = aterm_uds::process::read_code_directory_hash(pid)
+            .ok_or_else(|| Error::new("running service CodeDirectory hash unavailable"))?;
+        let output = run(
+            Path::new(aterm_uds::os_path!("codesign")),
+            &[
+                "--display".to_owned(),
+                "--verbose=4".to_owned(),
+                program.to_string_lossy().into_owned(),
+            ],
+        )?;
+        if !output.status.success() {
+            return Err(Error::new("cannot read service image code signature"));
+        }
+        let report = String::from_utf8_lossy(&output.stderr);
+        let expected = report
+            .lines()
+            .find_map(|line| line.strip_prefix("CDHash="))
+            .ok_or_else(|| Error::new("service image has no CodeDirectory hash"))?;
+        if expected != aterm_codec::hex::encode_lower(&live) {
+            return Err(Error::new(
+                "loaded service CodeDirectory differs from signed image",
+            ));
+        }
+        let _ = image;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = program;
+        if repair_hash_file(&PathBuf::from(format!("/proc/{pid}/exe")), true)? != image {
+            return Err(Error::new("mapped service image differs from journal"));
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (pid, program, image);
+        Err(Error::new(
+            "loaded service image proof unsupported on this platform",
+        ))
+    }
+}
+
 /// [`DAEMON_LABEL`]'s state for `home`: absent for a scratch `home` that is not this login's own
 /// ([`own_home`], so isolated CLI tests ask launchd nothing).
 pub fn daemon_state_for_home(home: &Path) -> crate::Result<State> {
@@ -2486,6 +2878,28 @@ pub fn daemon_state_for_home(home: &Path) -> crate::Result<State> {
         return Ok(State::Absent);
     }
     daemon_state()
+}
+
+/// Observe the system daemon under the caller's observation deadline.
+/// # Errors
+/// The service manager or its unit cannot be read before `until`.
+pub fn daemon_state_for_home_until(home: &Path, until: Instant) -> crate::Result<State> {
+    if check_own_home(home).is_err() {
+        return Ok(State::Absent);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let plist = Path::new(DAEMON_PLIST);
+        let on_disk = crate::fsx::kind(plist)? != crate::fsx::Kind::Missing;
+        daemon_state_with(plist, on_disk, &mut |call| {
+            run_until(Path::new(LAUNCHCTL), &system_launchctl_argv(call), until)
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = until;
+        Ok(State::Absent)
+    }
 }
 
 /// [`DAEMON_LABEL`]'s state in `system` on macOS; [`State::Absent`] elsewhere.
@@ -2529,6 +2943,369 @@ pub fn daemon_state_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_repair_observes_exact_unit_and_preserves_persons_records() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path();
+        let old = home.join("old-aterm");
+        let new = home.join("new-aterm");
+        std::fs::write(&old, b"old signed image").unwrap();
+        std::fs::write(&new, b"new signed image").unwrap();
+        let args = vec!["secrets".to_owned(), "watch".to_owned()];
+        let definition = if cfg!(target_os = "macos") {
+            plist_text_in(
+                Job::Subscriber.label(),
+                &old,
+                &args,
+                &log_path(home, Job::Subscriber),
+                Domain::User,
+                None,
+            )
+        } else {
+            systemd_unit(Job::Subscriber.description(), &old, &args)
+        };
+        write_unit_file(&unit_file(home, Job::Subscriber), &definition).unwrap();
+        crate::fsx::ensure_private_dir(&secrets_dir(home)).unwrap();
+        crate::fsx::write_atomic(&pin_path(home, Job::Subscriber), b"explicit pin\n", 0o600)
+            .unwrap();
+        crate::fsx::write_atomic(&subscriber_off_path(home), b"explicit off\n", 0o600).unwrap();
+        let observed = repair_observe_at(home, Job::Subscriber).unwrap();
+        assert!(observed.off);
+        assert_eq!(observed.pin.as_deref(), Some("explicit pin\n"));
+        let unit = observed.unit.unwrap();
+        assert_eq!(unit.definition, definition);
+        let next = repair_unit(home, Job::Subscriber, &unit, &new, &"a".repeat(64)).unwrap();
+        assert_eq!(next.image, "a".repeat(64));
+        assert_eq!(next.executable_sha256, repair_image_hash(&new).unwrap());
+        assert_eq!(next.args, args);
+        assert_eq!(
+            repair_argv(&next.definition).unwrap()[0],
+            new.to_str().unwrap()
+        );
+        repair_check_unit(home, Job::Subscriber, &next).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(unit_file(home, Job::Subscriber)).unwrap(),
+            definition
+        );
+        assert_eq!(
+            repair_observe_at(home, Job::Subscriber).unwrap().pin,
+            observed.pin
+        );
+    }
+
+    #[test]
+    fn signed_repair_refuses_overridden_units_and_symlink_images() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path();
+        let image = home.join("aterm");
+        std::fs::write(&image, b"image").unwrap();
+        let args = vec!["secrets".to_owned(), "watch".to_owned()];
+        let mut definition = if cfg!(target_os = "macos") {
+            plist_text(
+                Job::Subscriber.label(),
+                &image,
+                &args,
+                &log_path(home, Job::Subscriber),
+            )
+        } else {
+            systemd_unit(Job::Subscriber.description(), &image, &args)
+        };
+        definition.push_str("\nextra manager directive\n");
+        write_unit_file(&unit_file(home, Job::Subscriber), &definition).unwrap();
+        assert!(repair_observe_at(home, Job::Subscriber).is_err());
+        let link = home.join("linked-image");
+        std::os::unix::fs::symlink(&image, &link).unwrap();
+        assert!(repair_image_hash(&link).is_err());
+        assert!(repair_image_hash(home).is_err());
+        let first = repair_image_hash(&image).unwrap();
+        std::fs::write(&image, b"forged image").unwrap();
+        assert_ne!(repair_image_hash(&image).unwrap(), first);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn signed_repair_proves_loaded_code_and_rejects_a_different_executable() {
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let program = std::env::current_exe().unwrap();
+        let hash = repair_image_hash(&program).unwrap();
+        repair_prove_loaded(pid, &program, &hash).unwrap();
+        #[cfg(target_os = "macos")]
+        assert!(repair_prove_loaded(pid, Path::new("/usr/bin/true"), &hash).is_err());
+        #[cfg(target_os = "linux")]
+        assert!(repair_prove_loaded(pid, &program, &"0".repeat(64)).is_err());
+        assert!(repair_prove_loaded(i32::MAX, &program, &hash).is_err());
+    }
+
+    #[test]
+    fn signed_repair_restarts_and_restores_the_exact_launchd_definition() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path();
+        let old_program = home.join("old");
+        let new_program = home.join("new");
+        let args = vec!["secrets".to_owned(), "watch".to_owned()];
+        let unit = |program: &Path| crate::service_repair::Unit {
+            program: program.to_str().unwrap().to_owned(),
+            args: args.clone(),
+            definition: plist_text_in(
+                Job::Subscriber.label(),
+                program,
+                &args,
+                &log_path(home, Job::Subscriber),
+                Domain::User,
+                None,
+            ),
+            image: "unused by manager seam".to_owned(),
+            executable_sha256: "unused by manager seam".to_owned(),
+        };
+        let old = unit(&old_program);
+        let new = unit(&new_program);
+        let mut manager = FakeLaunchd {
+            loaded: Some(Domain::User),
+            no_gui: true,
+            calls: Vec::new(),
+        };
+        repair_restart_launchd(home, Job::Subscriber, &new, &mut |call| {
+            manager.answer(call)
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(plist_path(home, Job::Subscriber)).unwrap(),
+            new.definition
+        );
+        repair_restart_launchd(home, Job::Subscriber, &old, &mut |call| {
+            manager.answer(call)
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(plist_path(home, Job::Subscriber)).unwrap(),
+            old.definition
+        );
+        assert_eq!(manager.loaded, Some(Domain::User));
+        assert_eq!(
+            manager
+                .calls
+                .iter()
+                .filter(|call| call.first().is_some_and(|word| word == "bootout"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            manager
+                .calls
+                .iter()
+                .filter(|call| call.first().is_some_and(|word| word == "bootstrap"))
+                .count(),
+            2
+        );
+        assert!(!subscriber_off_path(home).exists());
+        assert!(!pin_path(home, Job::Subscriber).exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn signed_repair_retains_bundle_attribution_in_the_service_store() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path();
+        let old_bundle = home.join("Foo.app");
+        let stored_bundle = home
+            .join("service-store")
+            .join("a".repeat(64))
+            .join("image.app");
+        let old_program = old_bundle.join("Contents/MacOS/aterm");
+        let stored_program = stored_bundle.join("Contents/MacOS/aterm");
+        let bundle_id = "com.aterm.aterm";
+        for (bundle, executable) in [
+            (&old_bundle, &old_program),
+            (&stored_bundle, &stored_program),
+        ] {
+            std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+            std::fs::write(executable, b"inert signed image fixture").unwrap();
+            std::fs::write(bundle.join("Contents/Info.plist"), format!(
+                "<plist><dict><key>CFBundleIdentifier</key><string>{bundle_id}</string></dict></plist>"
+            )).unwrap();
+        }
+        let args = vec!["secrets".to_owned(), "watch".to_owned()];
+        let old = crate::service_repair::Unit {
+            program: old_program.to_str().unwrap().to_owned(),
+            args: args.clone(),
+            definition: plist_text_in(
+                Job::Subscriber.label(),
+                &old_program,
+                &args,
+                &log_path(home, Job::Subscriber),
+                Domain::User,
+                Some(bundle_id),
+            ),
+            image: repair_image_hash(&old_program).unwrap(),
+            executable_sha256: repair_image_hash(&old_program).unwrap(),
+        };
+        let new = repair_unit(
+            home,
+            Job::Subscriber,
+            &old,
+            &stored_program,
+            &"a".repeat(64),
+        )
+        .unwrap();
+        repair_check_unit(home, Job::Subscriber, &new).unwrap();
+        assert_eq!(new.args, old.args);
+        assert!(
+            new.definition
+                .contains("<key>AssociatedBundleIdentifiers</key>")
+        );
+        let mut manager = FakeLaunchd {
+            loaded: Some(Domain::User),
+            no_gui: true,
+            calls: Vec::new(),
+        };
+        repair_restart_launchd(home, Job::Subscriber, &new, &mut |call| {
+            manager.answer(call)
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(plist_path(home, Job::Subscriber)).unwrap(),
+            new.definition
+        );
+        repair_restart_launchd(home, Job::Subscriber, &old, &mut |call| {
+            manager.answer(call)
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(plist_path(home, Job::Subscriber)).unwrap(),
+            old.definition
+        );
+        assert_eq!(manager.loaded, Some(Domain::User));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_repair_restarts_gui_and_user_domains_even_when_argv_names_aqua() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path();
+        let program = home.join("aterm");
+        let gui_args = vec!["secrets".to_owned(), "watch".to_owned()];
+        let gui_unit = crate::service_repair::Unit {
+            program: program.to_str().unwrap().to_owned(),
+            args: gui_args.clone(),
+            definition: plist_text_in(
+                Job::Subscriber.label(),
+                &program,
+                &gui_args,
+                &log_path(home, Job::Subscriber),
+                Domain::Gui,
+                None,
+            ),
+            image: "unused by manager seam".to_owned(),
+            executable_sha256: "unused by manager seam".to_owned(),
+        };
+        let mut gui_manager = FakeLaunchd {
+            loaded: Some(Domain::Gui),
+            no_gui: false,
+            calls: Vec::new(),
+        };
+        repair_restart_launchd(home, Job::Subscriber, &gui_unit, &mut |call| {
+            gui_manager.answer(call)
+        })
+        .unwrap();
+        assert_eq!(gui_manager.loaded, Some(Domain::Gui));
+        assert!(log_path(home, Job::Subscriber).parent().unwrap().is_dir());
+
+        let user_args = vec![
+            "secrets".to_owned(),
+            "serve".to_owned(),
+            "--advertise".to_owned(),
+            "Aqua".to_owned(),
+        ];
+        let user_unit = crate::service_repair::Unit {
+            program: program.to_str().unwrap().to_owned(),
+            args: user_args.clone(),
+            definition: plist_text_in(
+                Job::Server.label(),
+                &program,
+                &user_args,
+                &log_path(home, Job::Server),
+                Domain::User,
+                None,
+            ),
+            image: "unused by manager seam".to_owned(),
+            executable_sha256: "unused by manager seam".to_owned(),
+        };
+        let mut user_manager = FakeLaunchd {
+            loaded: Some(Domain::User),
+            no_gui: true,
+            calls: Vec::new(),
+        };
+        repair_restart_launchd(home, Job::Server, &user_unit, &mut |call| {
+            user_manager.answer(call)
+        })
+        .unwrap();
+        assert_eq!(user_manager.loaded, Some(Domain::User));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn signed_repair_updates_changed_bundle_attribution_and_rejects_empty_image() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path();
+        let dev_bundle = home.join("Dev.app");
+        let release_bundle = home.join("Release.app");
+        let dev_program = dev_bundle.join("Contents/MacOS/aterm");
+        let release_program = release_bundle.join("Contents/MacOS/aterm");
+        let bare_program = home.join("bare-aterm");
+        for (bundle, executable, bundle_id) in [
+            (&dev_bundle, &dev_program, "com.aterm.dev"),
+            (&release_bundle, &release_program, "com.aterm.aterm"),
+        ] {
+            std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+            std::fs::write(executable, b"signed bundle fixture").unwrap();
+            std::fs::write(
+                bundle.join("Contents/Info.plist"),
+                format!(
+                    "<plist><dict><key>CFBundleIdentifier</key><string>{bundle_id}</string></dict></plist>"
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(&bare_program, b"signed bare fixture").unwrap();
+        let args = vec!["secrets".to_owned(), "watch".to_owned()];
+        let old = crate::service_repair::Unit {
+            program: dev_program.to_str().unwrap().to_owned(),
+            args: args.clone(),
+            definition: plist_text_in(
+                Job::Subscriber.label(),
+                &dev_program,
+                &args,
+                &log_path(home, Job::Subscriber),
+                Domain::Gui,
+                Some("com.aterm.dev"),
+            ),
+            image: repair_image_hash(&dev_program).unwrap(),
+            executable_sha256: repair_image_hash(&dev_program).unwrap(),
+        };
+        assert!(repair_unit(home, Job::Subscriber, &old, &release_program, "").is_err());
+
+        let to_release = repair_unit(
+            home,
+            Job::Subscriber,
+            &old,
+            &release_program,
+            &"a".repeat(64),
+        )
+        .unwrap();
+        assert!(
+            to_release
+                .definition
+                .contains("<string>com.aterm.aterm</string>")
+        );
+        assert!(!to_release.definition.contains("com.aterm.dev"));
+        repair_check_unit(home, Job::Subscriber, &to_release).unwrap();
+
+        let to_bare =
+            repair_unit(home, Job::Subscriber, &old, &bare_program, &"b".repeat(64)).unwrap();
+        assert!(!to_bare.definition.contains("AssociatedBundleIdentifiers"));
+        repair_check_unit(home, Job::Subscriber, &to_bare).unwrap();
+    }
 
     #[test]
     fn missing_subscriber_creation_is_guarded_against_off_pins_and_foreign_jobs() {
@@ -4022,8 +4799,17 @@ mod tests {
                     }
                     (held, "")
                 }
-                Launchctl::Bootstrap(domain, _) => {
-                    let ok = there(domain) && self.loaded.is_none();
+                Launchctl::Bootstrap(domain, path) => {
+                    let has_background = std::fs::read_to_string(path).is_ok_and(|text| {
+                        text.contains(
+                            "\t<key>LimitLoadToSessionType</key>\n\t<string>Background</string>\n",
+                        )
+                    });
+                    let domain_matches = match domain {
+                        Domain::Gui => !has_background,
+                        Domain::User => has_background,
+                    };
+                    let ok = there(domain) && self.loaded.is_none() && domain_matches;
                     if ok {
                         self.loaded = Some(domain);
                     }

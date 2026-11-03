@@ -166,6 +166,24 @@ fn run_kept(
     human: Option<&'static str>,
     more: impl FnOnce(&mut Mock),
 ) -> (Vec<String>, usize, Mock) {
+    run_kept_tracked(screens, word, gates, host, ledger, human, None, more)
+}
+
+/// [`run_kept`] of a loop that tracks a task record under `tasks`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "run_kept's own list and the one thing it leaves out"
+)]
+fn run_kept_tracked(
+    screens: Vec<Vec<String>>,
+    word: &'static str,
+    gates: Vec<usize>,
+    host: &Arc<Faces>,
+    ledger: Option<&Path>,
+    human: Option<&'static str>,
+    tasks: Option<PathBuf>,
+    more: impl FnOnce(&mut Mock),
+) -> (Vec<String>, usize, Mock) {
     let mut m = Mock::new(screens);
     m.autopilot = Some(word);
     m.turn_gates = gates;
@@ -181,6 +199,7 @@ fn run_kept(
         },
         journal: ledger.map(crate::supervise::approvals::journal_beside),
         idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
+        tasks,
         ..auto(30)
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
@@ -474,6 +493,13 @@ fn marked_row(line: &str, ago: Duration, sid: Option<&str>, mark: Option<u64>) -
 const LANDED_NOTE: &str = "DONE seq=104 rule=land@v1 the worker said it is done after the land \
      instruction (autopilot land): nothing more is typed until a person or an orchestrator types";
 
+/// What a loop journals at a worker's own failed conclusion.
+const FAILED_NOTE: &str = "FAILED seq=104 rule=land@v1 the worker said it could not finish \
+     (autopilot land): nothing more is typed until a person or an orchestrator types";
+
+/// The reply of a worker that gave up.
+const COULD_NOT: &str = "Could not finish: the grammar the parser needs was deleted upstream.";
+
 fn files(tag: &str, ledger: &[String], journal: &[String]) -> (PathBuf, PathBuf) {
     let dir = crate::supervise::test_scratch_path("task-face", tag);
     let _ = std::fs::remove_dir_all(&dir);
@@ -760,8 +786,7 @@ fn only_a_landing_is_read_back_and_an_older_builds_done_seeds_nothing() {
             let journal =
                 std::fs::read_to_string(crate::supervise::approvals::journal_beside(&path))
                     .unwrap_or_default();
-            let got =
-                ended_before(&journal, None, typed.last().copied()).map(|(words, _, _, _)| words);
+            let got = ended_before(&journal, None, typed.last().copied()).map(|(words, ..)| words);
             let _ = std::fs::remove_dir_all(&dir);
             got
         };
@@ -1511,6 +1536,57 @@ fn the_needs_entry_says_the_work_waits_on_you_where_nothing_carries_on() {
             && told[1].ends_with(&ends(NeedTail::WaitsOnYou))
             && told[1].contains("needs you: rotate"),
         "the check out, then landed beside the need: {told:#?}"
+    );
+}
+
+/// A `NEEDS YOU:` BESIDE A FAILED CONCLUSION WAITS ON THE PERSON: nothing carries the work on, so its
+/// entry never says the harness does. NEGATIVE CONTROL: the same need beside a reply of work carries
+/// on.
+#[test]
+fn a_need_beside_a_failed_conclusion_says_the_work_waits_on_you() {
+    use crate::harness::hold_said::NeedTail;
+    let need = "NEEDS YOU: rotate the deploy key in the dashboard";
+    let told = |tag: &str, said: String| {
+        let (dir, path) = files(tag, &[], &[]);
+        let (lines, _, m) = run_kept_tracked(
+            vec![busy_screen(), ended(&said)],
+            "land",
+            Vec::new(),
+            &Arc::new(Faces::default()),
+            Some(&path),
+            None,
+            Some(path.with_file_name("tasks")),
+            |m| {
+                m.task = Some((
+                    1,
+                    "state=working from=s-0a1b since_ms=0 result_bytes=0".to_string(),
+                ));
+            },
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let entries: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("meta set attention owner=needs "))
+            .cloned()
+            .collect();
+        assert!(!entries.is_empty(), "{tag}: {lines:#?}");
+        entries
+    };
+    let ends = |tail: NeedTail| format!(" \u{2014} {}", tail.words());
+    let gave_up = told("needs-tail-failed", format!("{COULD_NOT}\n{need}"));
+    assert!(
+        gave_up
+            .iter()
+            .all(|e| e.ends_with(&ends(NeedTail::WaitsOnYou))),
+        "{gave_up:#?}"
+    );
+    let worked = told("needs-tail-worked", format!("{PROGRESS}\n{need}"));
+    assert!(
+        worked
+            .iter()
+            .any(|e| e.ends_with(&ends(NeedTail::CarryingOn))),
+        "{worked:#?}"
     );
 }
 
@@ -2347,8 +2423,21 @@ fn relaunched(
     host: &Arc<Carrier>,
     ledger: &Path,
 ) -> (Vec<String>, usize, Vec<String>) {
+    relaunched_task(said, word, host, ledger, None)
+}
+
+/// [`relaunched`] of a session whose task record reads `task`.
+fn relaunched_task(
+    said: &str,
+    word: &'static str,
+    host: &Arc<Carrier>,
+    ledger: &Path,
+    task: Option<(u64, String)>,
+) -> (Vec<String>, usize, Vec<String>) {
     let mut m = Mock::new(vec![ended(said)]);
     m.history_served();
+    let tasks = task.is_some().then(|| ledger.with_file_name("tasks"));
+    m.task = task;
     m.autopilot = Some(word);
     m.vanish_after = Some(30);
     m.cursor_on_caret = true;
@@ -2361,6 +2450,7 @@ fn relaunched(
         },
         journal: Some(journal.clone()),
         idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
+        tasks,
         ..auto(30)
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
@@ -2432,6 +2522,107 @@ fn a_relaunched_task_landed_under_land_is_told_so_and_typed_nothing() {
             "{tag}: {notes:#?}"
         );
     }
+}
+
+/// A FAILED CONCLUSION RESTS EXACTLY AS A LANDING DOES ACROSS A RELAUNCH: the journal's `FAILED` row
+/// seeds it, the owed carry-on is settled at the first point with nothing typed, and the ending the
+/// row names comes back. NEGATIVE CONTROLS: with no row a reply of work gets its carry-on; Cruise,
+/// which never rests, carries on over the row; and a turn run since lifts it (the journal read gives
+/// nothing).
+#[test]
+fn a_relaunched_task_that_failed_under_land_rests_and_typed_nothing() {
+    use crate::supervise::policy::turn_end::GaveUp;
+    let min = |n: u64| Duration::from_secs(60 * n);
+    let carried = |tag: &str, said: &str, word: &'static str, seeded: bool| {
+        let (dir, path) = if seeded {
+            files(
+                tag,
+                &[ledger_row(RULE_LAND, "land", min(10))],
+                &[journal_row(FAILED_NOTE, min(9), None)],
+            )
+        } else {
+            files(tag, &[], &[])
+        };
+        let host = Arc::new(Carrier::default());
+        let (lines, turns, notes) = relaunched(said, word, &host, &path);
+        let _ = std::fs::remove_dir_all(&dir);
+        (host.points(), turns, notes, lines)
+    };
+    let done = IdlePoint {
+        done_under_land: true,
+        ..IdlePoint::default()
+    };
+    for (tag, said, seeded) in [
+        ("carry-failed", COULD_NOT, true),
+        ("carry-failed-unread", PROGRESS, true),
+    ] {
+        let (points, turns, notes, lines) = carried(tag, said, "land", seeded);
+        assert_eq!(points, [done], "{tag}: {notes:#?}");
+        assert_eq!(turns, 0, "{tag}: nothing typed: {lines:#?}");
+        assert!(
+            notes
+                .iter()
+                .any(|l| l.starts_with("HOST ") && l.ends_with("carry-on step=done:said-done")),
+            "{tag}: {notes:#?}"
+        );
+        assert!(
+            notes.iter().any(|l| l.starts_with("FAILED ")),
+            "{tag}: {notes:#?}"
+        );
+    }
+    // No journal row: a worker's own reply concludes at the relaunch's first point.
+    let (dir, path) = files("carry-failed-reply", &[], &[]);
+    let host = Arc::new(Carrier::default());
+    let task = Some((
+        1,
+        "state=working from=s-0a1b since_ms=0 result_bytes=0".to_string(),
+    ));
+    let (lines, turns, notes) = relaunched_task(COULD_NOT, "land", &host, &path, task);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        host.points().len() == 1 && host.points()[0].done_under_land,
+        "{notes:#?}"
+    );
+    assert_eq!(turns, 0, "nothing typed: {lines:#?}");
+    assert!(
+        notes
+            .iter()
+            .any(|l| l.starts_with("HOST ") && l.ends_with("carry-on step=done:said-done")),
+        "{notes:#?}"
+    );
+    for (tag, said, word, seeded) in [
+        ("carry-failed-cold", PROGRESS, "land", false),
+        // A session with no task record: the same words are a report like any other.
+        ("carry-failed-no-task", COULD_NOT, "land", false),
+        ("carry-failed-cruise", PROGRESS, "cruise", true),
+    ] {
+        let (points, _, notes, _) = carried(tag, said, word, seeded);
+        assert_eq!(points, [IdlePoint::default()], "{tag}: {notes:#?}");
+        assert!(
+            notes
+                .iter()
+                .any(|l| l.starts_with("HOST ") && l.ends_with("carry-on step=continued")),
+            "{tag}: {notes:#?}"
+        );
+    }
+
+    let row = journal_row(FAILED_NOTE, min(9), None);
+    assert_eq!(
+        ended_before(&row, None, None).map(|(.., ending)| ending),
+        Some(Some(GaveUp::CouldNotFinish))
+    );
+    assert_eq!(landed_before(&row, None, None), None, "no landing");
+    assert_eq!(
+        ended_before(&row, None, Some(i64::MAX)).map(|(.., ending)| ending),
+        None,
+        "a turn run since"
+    );
+    let unknown = journal_row(
+        "FAILED seq=104 rule=land@v1 the worker fell over (autopilot land)",
+        min(9),
+        None,
+    );
+    assert_eq!(ended_before(&unknown, None, None).map(|_| ()), None);
 }
 
 /// The idle point a host is offered names what holds a fact it would type there of its own

@@ -43,8 +43,8 @@ const LEGACY_RELEASE_PROFILE: &str = ".aterm/release-credentials.toml";
 /// The direct certificate/key leaves the shared signing reader may authenticate.
 pub(super) const APPLE_PREFIX: &str = "~/.aterm/apple/devid-";
 
-/// Where the vault puts the release roster, under the home: read when the profile names none,
-/// or names one that is not there.
+/// The canonical roster is considered alongside the profile's named roster. The legacy
+/// location is read only when neither provides a pair.
 const VAULT_ROSTER: &str = ".aterm/release-ring/roster/aterm-machines.toml";
 const LEGACY_VAULT_ROSTER: &str = ".aterm/roster/aterm-machines.toml";
 
@@ -280,21 +280,59 @@ const LIVE_STORE: fn(&Notary) -> crate::Result<()> =
     |_| Err(Error::new("a test build runs no notarytool"));
 
 /// The `machine_roster` the release-credentials profile `text` names, a leading `~/` read under
-/// `home`, as `ship release` reads it; only that line is read.
-fn named_roster(text: &str, home: &Path) -> Option<PathBuf> {
-    text.lines().find_map(|line| {
-        let value = line
-            .trim()
-            .strip_prefix("machine_roster")?
-            .trim_start()
-            .strip_prefix('=')?
-            .trim();
-        let value = value.strip_prefix('"')?.strip_suffix('"')?;
-        match value.strip_prefix("~/") {
-            Some(rest) => Some(home.join(rest.trim_start_matches('/'))),
-            None => Some(PathBuf::from(value)),
+/// `home`, as `ship release` reads it; only that assignment is parsed into a TOML value.
+/// Returns `Err(())` when the profile is malformed, duplicates `machine_roster`, or names an
+/// empty or relative roster path so callers fail closed rather than falling back to another path.
+fn parse_named_roster(text: &str, home: &Path) -> std::result::Result<Option<PathBuf>, ()> {
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
-    })
+        if line.starts_with('[') {
+            break;
+        }
+        let (name, rhs) = line.split_once('=').ok_or(())?;
+        if rhs.contains("\"\"\"") || rhs.contains("'''") {
+            return Err(());
+        }
+        if name.trim().trim_matches(['"', '\'']) != "machine_roster" {
+            continue;
+        }
+        if found.is_some() {
+            return Err(());
+        }
+        let doc = aterm_toml::from_str::<aterm_toml::Value>(line).map_err(|_| ())?;
+        let value = doc
+            .get("machine_roster")
+            .and_then(aterm_toml::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or(())?;
+        let path = match value.strip_prefix("~/") {
+            Some(rest) => {
+                let rest = rest.trim_start_matches('/');
+                if rest.is_empty() || !home.is_absolute() {
+                    return Err(());
+                }
+                home.join(rest)
+            }
+            None => {
+                let path = PathBuf::from(value);
+                if !path.is_absolute() {
+                    return Err(());
+                }
+                path
+            }
+        };
+        found = Some(path);
+    }
+    Ok(found)
+}
+
+#[cfg(test)]
+fn named_roster(text: &str, home: &Path) -> Option<PathBuf> {
+    parse_named_roster(text, home).ok().flatten()
 }
 
 /// Whether this member holds a private ring key/profile that proves its declared signer
@@ -343,24 +381,46 @@ fn authorized_ring_check(paths: &Paths, anchors: &[&str], now: i64, advance: boo
     let Ok(Some(key)) = fsx::read_private(&key_path, MAX_READ) else {
         return false;
     };
-    let named = profile.as_str().and_then(|text| named_roster(text, home));
-    let Some((roster_path, roster)) = named
-        .into_iter()
-        .chain([home.join(VAULT_ROSTER), home.join(LEGACY_VAULT_ROSTER)])
-        .find_map(|path| {
-            fsx::read_owned(&path, MAX_READ)
-                .ok()
-                .flatten()
-                .map(|raw| (path, raw))
-        })
-    else {
+    let Some(text) = profile.as_str() else {
         return false;
     };
-    let mut sig_path = roster_path.into_os_string();
-    sig_path.push(".sig");
-    let Ok(Some(signature)) = fsx::read_owned(Path::new(&sig_path), 64) else {
+    let Ok(named) = parse_named_roster(text, home) else {
         return false;
     };
+    let read_pair = |path: PathBuf| -> crate::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let Some(roster) = fsx::read_owned(&path, MAX_READ)? else {
+            return Ok(None);
+        };
+        let mut signature = path.into_os_string();
+        signature.push(".sig");
+        let signature = fsx::read_owned(Path::new(&signature), 64)?
+            .ok_or_else(|| Error::new("release roster signature is missing"))?;
+        Ok(Some((roster, signature)))
+    };
+    let mut candidates = Vec::new();
+    for path in named.into_iter().chain([home.join(VAULT_ROSTER)]) {
+        match read_pair(path) {
+            Ok(Some(pair)) => candidates.push(pair),
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+    }
+    if candidates.is_empty() {
+        match read_pair(home.join(LEGACY_VAULT_ROSTER)) {
+            Ok(Some(pair)) => candidates.push(pair),
+            Ok(None) | Err(_) => return false,
+        }
+    }
+    let Some((index, _)) = crate::release_ring::newest_roster(
+        anchors,
+        candidates
+            .iter()
+            .enumerate()
+            .map(|(index, (raw, signature))| (index, raw.as_slice(), signature.as_slice())),
+    ) else {
+        return false;
+    };
+    let (roster, signature) = candidates.swap_remove(index);
     let floor_path = paths.dir.join("release-ring-roster-floor");
     let floor = match fsx::read_private(&floor_path, 32) {
         Ok(Some(bytes)) => match bytes
@@ -378,7 +438,7 @@ fn authorized_ring_check(paths: &Paths, anchors: &[&str], now: i64, advance: boo
     let Ok(signer) = crate::release_ring::authorize_with(
         profile.as_slice(),
         key.as_slice(),
-        roster,
+        roster.as_slice().to_vec(),
         &signature,
         anchors,
         floor,

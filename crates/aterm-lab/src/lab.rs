@@ -1094,10 +1094,10 @@ fn lab_sets(name: &str) -> bool {
 /// `LAB_INSTANCE_ENV` read: `NAME=VALUE` words ([`lab_vars`]).
 /// # Errors
 /// A word that is no `NAME=VALUE`, a name outside those kinds (`TMPDIR`, an `ATERM_DEBUG_*` or
-/// `ATERM_DEV_*` seam, or the occupancy nudge's seam,
+/// `ATERM_DEV_*` seam, `NSZombieEnabled`, or the occupancy nudge's seam,
 /// [`NUDGE_SEAM`](aterm_agent::supervise::occupancy::rules::NUDGE_SEAM)) or one the lab sets, a
 /// name given twice, an empty value or one with a control character, or a `TMPDIR` that is not
-/// absolute.
+/// absolute, or `NSZombieEnabled` other than `YES` or `NO`.
 pub fn instance_env(spec: &str) -> Result<Vec<(String, String)>, String> {
     let refuse = |m: String| Err(format!("LAB_INSTANCE_ENV: {m}"));
     let mut out: Vec<(String, String)> = Vec::new();
@@ -1114,13 +1114,16 @@ pub fn instance_env(spec: &str) -> Result<Vec<(String, String)>, String> {
             })
         });
         let named = name == aterm_agent::supervise::occupancy::rules::NUDGE_SEAM;
-        if !(name == "TMPDIR" || seam || named) || lab_sets(name) {
+        if !(name == "TMPDIR" || name == "NSZombieEnabled" || seam || named) || lab_sets(name) {
             return refuse(format!(
-                "{name} is not a variable the lab hands its instance (TMPDIR, an ATERM_DEBUG_* or ATERM_DEV_* seam the lab does not set itself, or ATERM_OCCUPANCY_NUDGE_S)"
+                "{name} is not a variable the lab hands its instance (TMPDIR, NSZombieEnabled, an ATERM_DEBUG_* or ATERM_DEV_* seam the lab does not set itself, or ATERM_OCCUPANCY_NUDGE_S)"
             ));
         }
         if value.is_empty() || value.chars().any(char::is_control) {
             return refuse(format!("{name} needs a value with no control character"));
+        }
+        if name == "NSZombieEnabled" && !matches!(value, "YES" | "NO") {
+            return refuse("NSZombieEnabled takes YES or NO".into());
         }
         if name == "TMPDIR" && !value.starts_with('/') {
             return refuse(format!("TMPDIR={value} is not an absolute path"));
@@ -1354,7 +1357,7 @@ pub(crate) fn instance_argv(
 }
 
 /// The private instance (jailed), headless unless the run asks for a window ([`instance_vars`],
-/// [`instance_argv`]).
+/// [`instance_argv`]); once its socket is up, the build it runs is recorded ([`running_build`]).
 pub fn start_instance(run: &mut Run, scale: Option<&str>, armed: bool) -> Result<(), String> {
     let aterm = run.need_aterm()?.to_string_lossy().into_owned();
     let vars = instance_vars(run, &paths().user)?;
@@ -1382,7 +1385,33 @@ pub fn start_instance(run: &mut Run, scale: Option<&str>, armed: bool) -> Result
             run.instance_pid
         ));
     }
+    run.aterm_build = running_build(run);
+    run.save();
     Ok(())
+}
+
+/// The build the instance of `run` runs, as it names itself (`ctl version`): `?` when it does
+/// not say. The file at [`Run::aterm`] can be rebuilt while a lab runs, so only the process can
+/// say which build ran.
+fn running_build(run: &Run) -> String {
+    Door::new(run)
+        .and_then(|door| door.ctl(&["version"]))
+        .ok()
+        .filter(|reply| reply.code == 0)
+        .and_then(|reply| build_named(&reply.stdout))
+        .unwrap_or_else(|| "?".into())
+}
+
+/// `<version>+g<commit>` from a `ctl version` reply (`OK version=… build=… commit=… …`): the
+/// token the instance's harness tapes carry as `build=` (`aterm_types::version::build_id`),
+/// `-dirty` suffixed for a build of an uncommitted tree; `None` when either word is missing.
+pub(crate) fn build_named(reply: &str) -> Option<String> {
+    let line = reply.lines().next()?.strip_prefix("OK ")?;
+    let word = |key| {
+        crate::screen::field(line, key)
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_graphic()))
+    };
+    Some(format!("{}+g{}", word("version")?, word("commit")?))
 }
 
 /// Whether `pid` is a live process of the lab `run`.
@@ -1974,8 +2003,8 @@ pub fn cmd_up(args: &[String]) -> Res {
         run.port, run.stub_pid, run.proxy
     );
     println!(
-        "  instance    pid {}   socket {}   {}x{}   {aterm}",
-        run.instance_pid, run.sock, run.cols, run.rows
+        "  instance    pid {}   socket {}   {}x{}   {aterm} ({})",
+        run.instance_pid, run.sock, run.cols, run.rows, run.aterm_build
     );
     println!("  claude      {} ({})", run.claude_bin, run.claude_ver);
     if !run.fabric.is_empty() {
@@ -3042,6 +3071,33 @@ mod tests {
         );
     }
 
+    /// The build `up` names is the token the instance's harness tapes carry as `build=`:
+    /// `<version>+g<commit>` from its `ctl version` reply, a dirty build's `-dirty` kept, and
+    /// nothing from a refusal, a reply missing either word, or a word with a control byte.
+    #[test]
+    fn up_names_the_build_its_instance_says_it_runs() {
+        let reply = |commit: &str| {
+            format!(
+                "OK version=0.150.0 build=1793707820 commit={commit} built=2026-11-03T11:52:07Z \
+                 arch=aarch64 trustc=1.96.0 trustc_commit=0123456789ab trustc_host=aarch64-apple-darwin \
+                 flavor=t trust=0.1.0 rust_compat=1.96.0 profile=debug trust_verify=off \
+                 update_pin_sha256=ab objc_contained=0 signature=adhoc\n"
+            )
+        };
+        assert_eq!(
+            build_named(&reply("859f55cf4a7e")).as_deref(),
+            Some("0.150.0+g859f55cf4a7e")
+        );
+        assert_eq!(
+            build_named(&reply("851f150cfa26-dirty")).as_deref(),
+            Some("0.150.0+g851f150cfa26-dirty")
+        );
+        assert_eq!(build_named("ERR version: takes no arguments\n"), None);
+        assert_eq!(build_named("OK version=0.150.0 build=1\n"), None);
+        assert_eq!(build_named(&reply("859f\u{1b}[2J")), None);
+        assert_eq!(build_named(""), None);
+    }
+
     /// `ps_rows` reads each pid alone: its header once, a row for each live pid, and no
     /// row for a reaped one. Asked for the whole list at once, a wedged `ps` never
     /// returns; this test's return is that proof's other half.
@@ -3603,7 +3659,7 @@ mod tests {
     }
 
     #[test]
-    fn the_instance_is_handed_tmpdir_and_dev_seams_alone() {
+    fn the_instance_is_handed_only_explicit_diagnostics_and_dev_seams() {
         assert_eq!(instance_env(""), Ok(Vec::new()));
         assert_eq!(
             instance_env(" TMPDIR=/tmp  ATERM_DEBUG_PASTE_FILE=/s/p.txt "),
@@ -3624,7 +3680,17 @@ mod tests {
             instance_env("ATERM_OCCUPANCY_NUDGE_S=60"),
             Ok(pairs(&[("ATERM_OCCUPANCY_NUDGE_S", "60")]))
         );
+        assert_eq!(
+            instance_env("NSZombieEnabled=YES"),
+            Ok(pairs(&[("NSZombieEnabled", "YES")]))
+        );
+        assert_eq!(
+            instance_env("NSZombieEnabled=NO"),
+            Ok(pairs(&[("NSZombieEnabled", "NO")]))
+        );
         for bad in [
+            "NSZombieEnabled=1",
+            "NSZombieEnabled=YES NSZombieEnabled=NO",
             "ATERM_UPGRADE_QUIET_S=1",
             "ATERM_OCCUPANCY_NUDGE=60",
             "ATERM_OCCUPANCY_NUDGE_S=",

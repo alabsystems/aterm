@@ -6,6 +6,11 @@
 
 use super::*;
 
+#[cfg(test)]
+std::thread_local! {
+    static MAILBOX_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Authenticated local vault version for a named entry, even when that entry
 /// is absent or not safely materialized. Carries no secret commitment.
 #[derive(Clone)]
@@ -16,6 +21,7 @@ pub struct EntryVersion {
     seq: u64,
     envelope: [u8; 32],
     log_ids: Option<std::sync::Arc<std::collections::BTreeSet<[u8; 32]>>>,
+    mailbox_stamp: [u8; 32],
 }
 
 impl std::fmt::Debug for EntryVersion {
@@ -25,6 +31,13 @@ impl std::fmt::Debug for EntryVersion {
 }
 
 impl EntryVersion {
+    /// A public-version binding for the fixed registered mailbox source. This
+    /// includes no plaintext entry fingerprint and cannot identify a password.
+    #[must_use]
+    pub fn mailbox_source_stamp(&self) -> Option<[u8; 32]> {
+        (self.name == crate::mailbox_component::SOURCE_ENTRY).then_some(self.mailbox_stamp)
+    }
+
     /// The same authenticated source and entry at a nondecreasing version.
     /// A different signed envelope at the same sequence is a fork, not progress.
     #[cfg_attr(
@@ -124,6 +137,7 @@ pub struct EntrySnapshot {
     seq: u64,
     envelope: [u8; 32],
     log_ids: Option<std::sync::Arc<std::collections::BTreeSet<[u8; 32]>>>,
+    mailbox_stamp: [u8; 32],
 }
 
 impl std::fmt::Debug for EntrySnapshot {
@@ -174,6 +188,7 @@ impl EntrySnapshot {
             seq: self.seq,
             envelope: self.envelope,
             log_ids: self.log_ids.clone(),
+            mailbox_stamp: self.mailbox_stamp,
         }
     }
 
@@ -366,7 +381,15 @@ pub fn read_verified_entry(
     expected: &Config,
     name: &str,
 ) -> crate::Result<Option<VerifiedEntry>> {
-    Ok(read_entry(paths, expected, name, Reading::Materialized)?.map(|(entry, _)| entry))
+    #[cfg(test)]
+    if name == crate::mailbox_component::SOURCE_ENTRY {
+        MAILBOX_READS.with(|reads| reads.set(reads.get() + 1));
+    }
+    let value = read_entry(paths, expected, name, Reading::Materialized)?.map(|(entry, _)| entry);
+    if let Some(value) = &value {
+        let _ = super::mailbox_index::record_verified(paths, value);
+    }
+    Ok(value)
 }
 
 /// Read the authenticated vault version even if the named entry is absent or
@@ -429,6 +452,21 @@ pub(crate) fn read_reserved_entry(
     name: &str,
 ) -> crate::Result<Option<VerifiedEntry>> {
     Ok(read_entry(paths, expected, name, Reading::Reserved)?.map(|(entry, _)| entry))
+}
+
+/// Observe a reserved entry or its authenticated absence. An unavailable snapshot or a present
+/// entry whose conditional policy cannot be used as reserved data has no observation.
+pub(crate) fn observe_reserved_entry(
+    paths: &Paths,
+    expected: &Config,
+    name: &str,
+) -> crate::Result<Option<EntryObservation>> {
+    let mut version = None;
+    let entry = read_entry_with_version(paths, expected, name, Reading::Reserved, &mut version)?;
+    Ok(version.map(|version| EntryObservation {
+        version,
+        entry: entry.map(|(entry, _)| entry),
+    }))
 }
 
 pub(crate) fn read_reserved_entry_and_admin(
@@ -530,6 +568,9 @@ fn read_entry_with_version(
     let Some(identity) = read_identity(paths)? else {
         return Ok(None);
     };
+    // Selection happens after the shared register and anchor resolution. Reserved readers
+    // also retain the roster used below to establish this recipient's policy.
+    let requested = [name, crate::SWARM_ROSTER_ENTRY];
     let (entries, envelope_digest, is_admin, trusted_log) = if state.digest.is_none()
         && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing
     {
@@ -553,7 +594,12 @@ fn read_entry_with_version(
         {
             return Ok(None);
         }
-        let Some(entries) = configured.log.open_entries(&identity)? else {
+        let entries = if materialized {
+            configured.log.open_entries(&identity)?
+        } else {
+            configured.log.open_entries_named(&identity, &requested)?
+        };
+        let Some(entries) = entries else {
             return Ok(None);
         };
         let digest = *configured.log.genesis().id();
@@ -562,13 +608,18 @@ fn read_entry_with_version(
         if !source_bound(&config, &state) {
             return Ok(None);
         }
-        let Some(cached) = held_copy(paths, &config, &state) else {
+        let Some(cached) = read_held_copy(paths, &config, &state)? else {
             return Ok(None);
         };
         let envelope = envelope::parse(&cached)?;
-        let (Some(entries), _) =
+        let (entries, _) = if materialized {
             super::log_entries::open_entries_preferring_log(paths, &config, &envelope, &identity)?
-        else {
+        } else {
+            super::log_entries::open_named_entries_preferring_log(
+                paths, &config, &envelope, &identity, &requested,
+            )?
+        };
+        let Some(entries) = entries else {
             return Ok(None);
         };
         let trusted_log =
@@ -604,6 +655,10 @@ fn read_entry_with_version(
             return Ok(None);
         }
     }
+    let entry = entries.iter().find(|entry| entry.name == name);
+    if !materialized && entry.is_some_and(|entry| entry.if_absent || entry.anchor.is_some()) {
+        return Ok(None);
+    }
     let log_ids = trusted_log
         .as_ref()
         .map(|log| std::sync::Arc::new(log.records().map(|record| *record.id()).collect()));
@@ -614,8 +669,9 @@ fn read_entry_with_version(
         seq: state.seq,
         envelope: envelope_digest,
         log_ids: log_ids.clone(),
+        mailbox_stamp: public_state_stamp(&config, &state, identity.recipient()),
     });
-    let Some(entry) = entries.iter().find(|entry| entry.name == name) else {
+    let Some(entry) = entry else {
         return Ok(None);
     };
     let (value, admin) = if materialized {
@@ -635,15 +691,13 @@ fn read_entry_with_version(
         };
         (value, false)
     } else {
-        if entry.if_absent || entry.anchor.is_some() {
-            return Ok(None);
-        }
         (entry.value.clone(), is_admin)
     };
     Ok(Some((
         VerifiedEntry {
             value,
             snapshot: EntrySnapshot {
+                mailbox_stamp: public_state_stamp(&config, &state, identity.recipient()),
                 config,
                 name: name.into(),
                 fingerprint: fingerprint(entry),
@@ -655,6 +709,23 @@ fn read_entry_with_version(
         },
         admin,
     )))
+}
+
+pub(super) fn public_state_stamp(config: &Config, state: &State, recipient: Recipient) -> [u8; 32] {
+    let mut digest = aterm_digest::Sha256::new();
+    digest.update(b"aterm/mailbox-source-public-version/1\0");
+    digest.update(source_identity(config));
+    digest.update(config.host.as_bytes());
+    digest.update([0]);
+    digest.update(recipient.to_bech32().as_bytes());
+    digest.update(state.seq.to_be_bytes());
+    for value in [state.digest, state.records_digest] {
+        digest.update([u8::from(value.is_some())]);
+        if let Some(value) = value {
+            digest.update(value);
+        }
+    }
+    digest.finalize()
 }
 
 fn material_anchors_current(

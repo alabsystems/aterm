@@ -130,13 +130,9 @@ tests/decode_encode.rs	srgb_intent_round_trips	encode-indexed-and-metadata
 
 ## 3. Tests with no row or a leftover
 
-- `src/deflate.rs::roundtrips_image_like_input` keeps a 20x compression-ratio check, and
-  `tests/decode_encode.rs::the_repository_corpus_decodes_and_round_trips` its
-  `encoded_total < raw_total` check. Both are quality metrics: move them to a bench, then delete
-  the tests once their specs are proved.
 - The tests of `src/gzip.rs` and `src/squeeze.rs` sample modules no row covers.
 
-## 4. Proof order
+## 4. Tests that are not spec samples
 
 None (resolved: the `20x` scanline compression-ratio check in `src/deflate.rs::roundtrips_image_like_input` and the `encoded_total < raw_total` corpus-ratio check in `tests/decode_encode.rs::the_repository_corpus_decodes_and_round_trips` were removed so both tests sample only `zlib-compress-roundtrip`, `decode-total`, and `encode-decode-roundtrip`).
 

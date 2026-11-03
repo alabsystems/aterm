@@ -289,10 +289,11 @@ impl LocalLog {
             ],
             Box::new(move || {
                 let store = aterm_secrets::client::load_records(&from)?;
-                Ok(store.log().map(|log| {
-                    let roster = aterm_secrets::client::local_swarm_roster_for_log(&from, log);
-                    log_member_keys_with_roster(log, roster.as_ref())
-                }))
+                let Some(log) = store.log() else {
+                    return Ok(None);
+                };
+                let roster = aterm_secrets::client::local_swarm_roster_for_log(&from, log)?;
+                Ok(Some(log_member_keys_with_roster(log, roster.as_ref())))
             }),
         )
     }
@@ -695,6 +696,7 @@ mod tests {
                     node_key: Some(node_2.key().hex()),
                     admitted_ms: 100,
                     hint: None,
+                    hw_hint: None,
                     claimed_label: None,
                     claimed_at_ms: None,
                     aliases: Vec::new(),
@@ -707,6 +709,7 @@ mod tests {
                     node_key: Some(node_2.key().hex()),
                     admitted_ms: 200,
                     hint: None,
+                    hw_hint: None,
                     claimed_label: None,
                     claimed_at_ms: None,
                     aliases: Vec::new(),
@@ -720,6 +723,7 @@ mod tests {
                     node_key: Some(node_unproved.key().hex()),
                     admitted_ms: 100,
                     hint: None,
+                    hw_hint: None,
                     claimed_label: None,
                     claimed_at_ms: None,
                     aliases: Vec::new(),
@@ -733,6 +737,7 @@ mod tests {
                     node_key: Some(node_unproved.key().hex()),
                     admitted_ms: 200,
                     hint: None,
+                    hw_hint: None,
                     claimed_label: None,
                     claimed_at_ms: None,
                     aliases: Vec::new(),
@@ -802,6 +807,7 @@ mod tests {
                     node_key: Some(node_0.key().hex()),
                     admitted_ms: 50,
                     hint: None,
+                    hw_hint: None,
                     claimed_label: None,
                     claimed_at_ms: None,
                     aliases: Vec::new(),
@@ -814,6 +820,7 @@ mod tests {
                     node_key: Some(node_7_pre.key().hex()),
                     admitted_ms: 50,
                     hint: None,
+                    hw_hint: None,
                     claimed_label: None,
                     claimed_at_ms: None,
                     aliases: Vec::new(),

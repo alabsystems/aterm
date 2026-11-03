@@ -1234,12 +1234,15 @@ fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
 
     let (dir, ledger) = ledger_at("door-pre-door-tape");
     let board = Board::reading(OccupancyReading::default());
-    let opts = SuperviseOpts {
+    let mut opts = SuperviseOpts {
         idle_host: Some(Arc::clone(&board) as Arc<dyn IdleHost>),
         ledger: Some(ledger.clone()),
         journal: Some(dir.join("journal.jsonl")),
         ..hosted(2 * 3600 + 5 * 60)
     };
+    // The occupancy door alone: a build that recorded the stuck fact's `host.facts` exchange
+    // named its host doors, so no older tape carries one.
+    opts.policy.stuck_break_note = false;
     assert_eq!(opts.policy.occupancy, Occupancy::Observe);
     let mut m = Mock::new(vec![break_screen()]);
     m.stall_sleep = Some(Duration::from_secs(60));

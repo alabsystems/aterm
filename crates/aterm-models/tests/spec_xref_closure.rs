@@ -57,6 +57,14 @@ fn collected_digests(refs: &[&xref::RefinementAnchor], waivers: &[&xref::Waiver]
 #[test]
 fn spec_xref_closure() {
     let _domains = aterm_models::link_all();
+    #[cfg(unix)]
+    std::hint::black_box((
+        aterm_capacity::cohort::capacity_terminal_environment as fn(),
+        aterm_capacity::capacity_history_environment as fn(),
+        aterm_capacity::Ledger::cohort_claim_state as *const (),
+        aterm_capacity::Ledger::reap_cohort_claim as *const (),
+        aterm_capacity::admit::Claim::finish_cohort as *const (),
+    ));
     std::hint::black_box(
         aterm_agent::harness::accounts_sync::account_shared_recovery_environment as fn(),
     );
@@ -71,6 +79,10 @@ fn spec_xref_closure() {
     #[cfg(unix)]
     std::hint::black_box(aterm_db::accounts::claims::db_claim_ring_environment as fn());
     #[cfg(unix)]
+    std::hint::black_box(aterm_db::clock::db_claim_clock_environment as fn());
+    #[cfg(unix)]
+    std::hint::black_box(aterm_db::catalog::release::db_storage_release_environment as fn());
+    #[cfg(unix)]
     std::hint::black_box((
         aterm_db::import::commons::Imports::compare as *const (),
         aterm_db::import::commons::Imports::apply as *const (),
@@ -79,6 +91,9 @@ fn spec_xref_closure() {
         aterm_db::accounts::proposals::Proposals::replace_if_current as *const (),
     ));
     std::hint::black_box(aterm_secrets::need::credential_request_environment as fn());
+    // aterm-capacity's `CapacityCohort` waivers' host, beside its cohort ledger's anchors.
+    #[cfg(unix)]
+    std::hint::black_box(aterm_capacity::capacity_cohort_environment as fn());
     std::hint::black_box(
         aterm_agent::harness::codex_app_login::codex_refresh_publication_environment as fn(),
     );
@@ -100,6 +115,7 @@ fn spec_xref_closure() {
     std::hint::black_box(
         aterm_agent::harness::accounts_pool::account_pool_preparation_environment as fn(),
     );
+    std::hint::black_box(aterm_agent::harness::claims::account_claim_clock_environment as fn());
     // aterm-vz's `VzLifecycle` anchors: one named item in each module that holds them.
     #[cfg(unix)]
     std::hint::black_box((

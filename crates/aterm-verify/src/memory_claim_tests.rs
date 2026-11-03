@@ -121,7 +121,7 @@ impl Scratch {
             .push((need.what.clone(), need.mem, mode));
         crate::admit_in(
             &self.ledger(),
-            &on(self.available),
+            &crate::timing_test_machine::Measured::new(&on(self.available)),
             Pace {
                 poll: std::time::Duration::from_millis(20),
                 ..Pace::default()
@@ -615,7 +615,7 @@ fn standin_admit(need: Need, mode: Admit) -> Result<Claim, Error> {
     let waiting = dir.join(format!("waiting-{n}"));
     crate::admit_in(
         &Ledger::at(dir.join("ledger")),
-        &machine(),
+        &crate::timing_test_machine::Measured::new(&machine()),
         Pace {
             poll: MUST_HAPPEN * 2,
             ..Pace::default()
@@ -813,7 +813,7 @@ fn appkit_admit(need: Need, mode: Admit) -> Result<Claim, Error> {
     let mark = dir.join(format!("waiting-{role}-{kind}"));
     crate::admit_in(
         &Ledger::at(dir.join("ledger")),
-        &machine(),
+        &crate::timing_test_machine::Measured::new(&machine()),
         Pace {
             poll: std::time::Duration::from_millis(20),
             ..Pace::default()
@@ -1206,7 +1206,7 @@ fn stuck_admit(need: Need, mode: Admit) -> Result<Claim, Error> {
     };
     crate::admit_in(
         &STUCK.ledger(),
-        stuck_machine(),
+        &crate::timing_test_machine::Measured::new(stuck_machine()),
         Pace {
             poll: std::time::Duration::from_millis(20),
             ..Pace::default()

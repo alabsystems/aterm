@@ -114,17 +114,21 @@ fn read_pem_file(path: &Path, out: &mut Vec<Vec<u8>>) {
     read_pem_file_up_to(path, MAX_PEM_FILE_BYTES, out);
 }
 
+#[cfg(target_os = "macos")]
+const NONBLOCK_OPEN_FLAG: i32 = 0x0004;
+#[cfg(not(target_os = "macos"))]
+const NONBLOCK_OPEN_FLAG: i32 = 0o4000;
+
 fn read_pem_file_up_to(path: &Path, cap: u64, out: &mut Vec<Vec<u8>>) {
     use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     // An unreadable, non-regular, oversized, or non-UTF-8 file contributes
     // nothing; only an empty store overall (`Verifier::from_ders`) is a failure.
-    let Ok(meta) = std::fs::metadata(path) else {
-        return;
-    };
-    if !meta.is_file() || meta.len() > cap {
-        return;
-    }
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(NONBLOCK_OPEN_FLAG)
+        .open(path)
+    else {
         return;
     };
     let Ok(open_meta) = file.metadata() else {

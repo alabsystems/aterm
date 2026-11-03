@@ -5,7 +5,7 @@
 //! Help text rendered from the verb and exit tables.
 
 use super::jq::{DIVERGENCES, FORMATS, FUNCTIONS, REFUSED_JQ, SHARED_RULES};
-use super::verbs::{FlagSpec, GLOBAL_FLAGS, REFUSED, Takes, VERBS, Verb};
+use super::verbs::{Class, FlagSpec, GLOBAL_FLAGS, REFUSED, Takes, VERBS, Verb};
 use crate::error::{Error, Result, exit_rows};
 
 const MAX_LINE: usize = 100;
@@ -36,6 +36,9 @@ const ROUTING: &[&str] = &[
     "Ambient tokens in the environment are never sent; agh whoami reports them.",
     "agh whoami --for REPO --op read|writer-read|write shows the decision.",
 ];
+
+/// The line a Destructive verb's page adds (plan §10, body 11).
+pub const DESTRUCTIVE: &str = "It removes what it names only with --confirm NAME, typed again.";
 
 const BACKGROUND_WAIT: &str = concat!(
     "in Claude Code, run a wait over two minutes as a background Bash ",
@@ -193,6 +196,10 @@ pub fn verb_page(verb: &Verb) -> String {
     let mut text = format!("usage: {}\n{}\n", verb.usage, verb.summary);
     if verb.path == ["release", "wait"] {
         text.push_str(BACKGROUND_WAIT);
+        text.push('\n');
+    }
+    if verb.class == Class::Destructive {
+        text.push_str(DESTRUCTIVE);
         text.push('\n');
     }
     if !verb.flags.is_empty() {

@@ -390,6 +390,20 @@ impl EditorWorkspace {
             .is_some_and(|history| !history.redo.is_empty())
     }
 
+    /// Start `document`'s undo at its text now: every frame and every undone one goes, so
+    /// neither `C-/` nor redo puts back text from before. A host ends a history here when it
+    /// can no longer say who typed what that text held (aterm's discard of a buffer a control
+    /// client edited).
+    pub fn start_history_here(&mut self, document: DocumentId) {
+        if let Some(history) = self.histories.get_mut(&document) {
+            *history = DocumentHistory {
+                head: history.head,
+                next_id: history.next_id,
+                ..DocumentHistory::default()
+            };
+        }
+    }
+
     /// Take every unreported commit of `document` in application order. Each delta list uses its own transaction's coordinates; rebase through the lists separately.
     pub fn take_commits(&mut self, document: DocumentId) -> Vec<(Seq, Vec<EditDelta>)> {
         let mut commits = Vec::new();

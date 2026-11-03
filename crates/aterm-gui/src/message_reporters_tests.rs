@@ -1016,6 +1016,7 @@ fn every_reporter_message() -> Vec<Message> {
         "bench",
         "its task is not running: nothing was stopped",
     ));
+    all.push(workers_tab_stays("stop, close or move them first"));
     all.push(fabric_failure(
         "document",
         "Couldn't open the document",
@@ -1419,7 +1420,7 @@ fn every_reporter_message() -> Vec<Message> {
     all.push(consent_dialog_record(
         "MediaLibrary",
         "the music and media library",
-        Some(12),
+        Some(crate::consent_card::TabPlace::Number(12)),
     ));
     all.push(consent_dialog_record("AddressBook", "your contacts", None));
     all.extend(every_debugger_access_record());
@@ -1670,12 +1671,26 @@ fn the_rest_of_the_retired_toast_is_rows_only_where_there_is_something_to_fix() 
     }
     assert_eq!(file_access_granted().hold, Hold::LogOnly);
     assert_eq!(file_access_granted().key.as_deref(), Some(KEY_FILE_ACCESS));
-    let dialog = consent_dialog_record("MediaLibrary", "the music and media library", Some(3));
+    let dialog = consent_dialog_record(
+        "MediaLibrary",
+        "the music and media library",
+        Some(crate::consent_card::TabPlace::Number(3)),
+    );
     assert_eq!(dialog.hold, Hold::LogOnly, "{dialog:?}");
     assert_eq!(dialog.tag, tags::PRIVACY);
     assert_eq!(dialog.key.as_deref(), Some("privacy.dialog.medialibrary"));
     assert_eq!(dialog.title, "Asked for the music and media library");
     assert!(dialog.detail[0].contains("tab 3"), "{:?}", dialog.detail);
+    let worker = consent_dialog_record(
+        "Photos",
+        "the Photos library",
+        Some(crate::consent_card::TabPlace::Workers),
+    );
+    assert!(
+        worker.detail[0].contains("under Workers") && !worker.detail[0].contains("tab"),
+        "a worker has no number: {:?}",
+        worker.detail
+    );
     let untabbed = consent_dialog_record("Photos", "the Photos library", None);
     assert!(
         !untabbed.detail[0].contains("tab"),
@@ -4128,4 +4143,76 @@ fn appnotice_proc_records_under_the_proc_stem() {
     assert_eq!(record.tag, aterm_messages::tags::SYSTEM);
     assert_eq!(*record.need(), Need::Record);
     assert_eq!(record.title, text);
+}
+
+/// This Mac's clock warning (docs/DESIGN-fluid-swarm-2026-10-28.md F22): under Off, a warning
+/// keyed `clock-off` whose reason gives how far off and against how many of the Macs it hears,
+/// whose step is the System Settings switch, and whose log line carries the counts; under Split,
+/// one keyed `clock-split` that names the Macs that disagree in its Details. Neither asks a
+/// sign-in.
+///
+/// Negative control: with the Split entry built without its Details (the `peers` lines left
+/// out), the disagreeing Macs went unnamed (`the Macs to check`).
+#[test]
+fn the_clock_warning_says_how_far_off_and_names_the_macs_to_check() {
+    use aterm_agent::harness::accounts::ClockStanding;
+    let clock = |standing, by_s, against, of, peers: &[&str]| crate::harness_host::ClockSaid {
+        standing,
+        by_s,
+        against,
+        of,
+        peers: peers.iter().map(|peer| (*peer).to_owned()).collect(),
+    };
+    let by_s = 2 * 86_400 + 3 * 3600;
+    for (ahead, log) in [
+        (
+            true,
+            "accounts need=clock-off ahead=1 by_s=183600 against=5 of=6",
+        ),
+        (
+            false,
+            "accounts need=clock-off ahead=0 by_s=183600 against=5 of=6",
+        ),
+    ] {
+        let entry =
+            super::accounts_clock_entry(&clock(ClockStanding::Off { ahead }, by_s, 5, 6, &[]));
+        assert_eq!(entry.key(), super::ACCOUNTS_CLOCK_OFF_KEY);
+        assert_eq!(entry.log_line_text(), Some(log));
+        let msg = entry.message().expect("a valid entry");
+        assert_eq!(msg.severity, Severity::Warn);
+        assert!(!asks_a_sign_in(&msg), "{msg:?}");
+        assert_eq!(msg.detail[1], super::ACCOUNTS_CLOCK_STEP);
+        let span = super::clock_span_words(by_s);
+        assert!(
+            msg.detail[0].contains(&span)
+                && msg.detail[0].contains('5')
+                && msg.detail[0].contains('6'),
+            "how far, against how many: {:?}",
+            msg.detail
+        );
+    }
+    let split = super::accounts_clock_entry(&clock(ClockStanding::Split, 0, 2, 3, &["m3", "m5"]));
+    assert_eq!(split.key(), super::ACCOUNTS_CLOCK_SPLIT_KEY);
+    assert_eq!(
+        split.log_line_text(),
+        Some("accounts need=clock-split by_s=0 against=2 of=3")
+    );
+    let msg = split.message().expect("a valid entry");
+    assert!(!asks_a_sign_in(&msg), "{msg:?}");
+    assert!(
+        msg.detail[2..]
+            .iter()
+            .any(|line| line.contains("m3") && line.contains("m5")),
+        "the Macs to check: {:?}",
+        msg.detail
+    );
+    for (secs, words) in [
+        (45 * 60, "45 min"),
+        (3 * 3600, "3 h"),
+        (3 * 3600 + 7 * 60, "3 h 7 min"),
+        (86_400 + 59 * 60, "1 d"),
+        (by_s, "2 d 3 h"),
+    ] {
+        assert_eq!(super::clock_span_words(secs), words);
+    }
 }

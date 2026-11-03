@@ -413,7 +413,8 @@ unsafe extern "C" {
     fn pthread_override_qos_class_end_np(over: *mut std::ffi::c_void) -> libc::c_int;
 }
 
-/// A worker raised to [`Role::Responsive`] until this drops: it travels with the job the caller waits on, and the worker drops it once that job is done.
+/// A worker raised to [`Role::Responsive`] until this drops. The owner retains the worker's
+/// unjoined handle until the override ends.
 pub(crate) struct Boost {
     #[cfg(target_os = "macos")]
     over: Option<std::ptr::NonNull<std::ffi::c_void>>,
@@ -424,7 +425,7 @@ pub(crate) struct Boost {
 unsafe impl Send for Boost {}
 
 impl Boost {
-    /// Raise `thread`, a worker not yet joined, while the caller waits on it.
+    /// Raise `thread`, a worker not yet joined, for the lifetime of a demand.
     pub(crate) fn start(thread: Option<&std::thread::JoinHandle<()>>) -> Boost {
         #[cfg(target_os = "macos")]
         {
@@ -446,7 +447,7 @@ impl Boost {
     }
 
     /// Whether an override was started.
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn armed(&self) -> bool {
         self.over.is_some()
     }

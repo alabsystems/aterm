@@ -101,6 +101,45 @@ fn a_landing_under_land_is_a_record_and_no_other_move_is() {
     host.shutdown_and_join();
 }
 
+/// A WORKER WITH ITS OWN REPORT OF ITS END HAS THAT ONE ALONE, A LANDING TOO: the disk worker's
+/// disk-worker record and a credit claim worker's claim-worker record, so no landing record goes
+/// beside either. NEGATIVE CONTROL: a worker in any other folder lands with its record.
+#[test]
+fn a_worker_with_its_own_report_lands_with_no_landing_record() {
+    use crate::task_record::{TaskMark, TaskState, seed_carried};
+    let folder = |name: &str| format!("/state/aterm/{}/{name}", aterm_agent::harness::cli::HARNESS);
+    let host = idle_host();
+    for (trusted, recorded) in [
+        (
+            folder(aterm_agent::harness::disk::fence::WORKER_FOLDER),
+            false,
+        ),
+        (
+            folder(aterm_agent::harness::credit_offers::CLAIM_FOLDER),
+            false,
+        ),
+        ("/Users//me/project".to_owned(), true),
+    ] {
+        let mut app = App::headless_for_test();
+        app.harness = Some(host.clone());
+        let sid = under(&mut app, "land");
+        let ctx = app.pool.get(0).unwrap().ctx.clone();
+        let mut working = TaskMark::new(TaskState::Working)
+            .apply(None, false, Instant::now(), 1_000)
+            .0;
+        working.trusted_cwd = Some(trusted.clone());
+        seed_carried(&ctx, Some(&working.carry_row(Instant::now())));
+        tell(&mut app, &sid, Some(TaskFace::Open));
+        tell(&mut app, &sid, Some(TaskFace::Landed));
+        assert_eq!(
+            landing_records(&app, &sid).len(),
+            usize::from(recorded),
+            "{trusted}"
+        );
+    }
+    host.shutdown_and_join();
+}
+
 fn tell(app: &mut App, sid: &str, face: Option<TaskFace>) {
     app.apply_harness_fact(sid, crate::HarnessFact::Task(face));
 }
@@ -404,6 +443,7 @@ fn a_word_carried_from_before_this_process_starts_no_span() {
         claim_ended: false,
         not_claim_worker: false,
         claim_worker: None,
+        task: None,
     };
     assert!(app.graft_restored_user_meta(0, &leaf("land")));
     claim(&mut app, &ctx, true);

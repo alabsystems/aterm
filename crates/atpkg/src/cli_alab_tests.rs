@@ -121,10 +121,23 @@ fn a_pass_moves_a_vendor_codex_onto_the_alab_pin_and_the_legacy_row_leaves_it() 
             );
             let row = crate::status::read(&layout).unwrap().programs["codex"].clone();
             assert_eq!(row.installed_build, Some(at::BUILD));
+            assert!(!row.tree_root.is_empty(), "{label}: tree_root recorded");
             assert!(
                 crate::state::source_words("codex", &row.state, 0).starts_with("ALab build"),
                 "{}",
                 row.state
+            );
+            // If status.toml loses tree_root while codex is already at at::BUILD, the next pass
+            // recovers the signed attestation for the ALab store build.
+            let mut cleared = crate::status::read(&layout).unwrap();
+            cleared.programs.get_mut("codex").unwrap().tree_root.clear();
+            crate::status::write(&layout, &cleared).unwrap();
+            let installed = crate::active_builds(&layout);
+            run_update_pass(&layout, &cfg, &both, &installed, false, &seams(&trust));
+            assert_eq!(
+                crate::status::read(&layout).unwrap().programs["codex"].tree_root,
+                row.tree_root,
+                "{label}: recover_missing_roots restores the ALab build's tree_root"
             );
         } else {
             assert_eq!(active(&layout), Some(vendor_build), "{label}");
@@ -450,5 +463,287 @@ fn which_codex_says_the_upstream_a_dev_linked_package_records() {
         linked
             .strip_suffix(" — based on upstream rust-v0.163.0+g0123456789ab")
             .unwrap()
+    );
+}
+
+#[test]
+fn single_and_default_set_installs_warm_an_alab_codex_landing() {
+    if current_triple() != "aarch64-apple-darwin" {
+        return;
+    }
+    thread_local! {
+        static WARMED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    fn record_warm(_: &crate::store::Layout, landed: &std::collections::BTreeSet<String>) {
+        WARMED.with(|w| w.borrow_mut().extend(landed.iter().cloned()));
+    }
+    let ch = at::channel(
+        "codex-alab",
+        at::BUILD,
+        at::pack_archive(at::BUILD, &at::signed_exe(), true),
+    );
+    let vendor = Fake::default();
+    let both = Both {
+        index: &ch,
+        vendor: &vendor,
+    };
+    let trust = world::trust();
+    let mut s = seams(&trust);
+    s.warm_agents = record_warm;
+
+    let single = world::layout("alab-warm-single");
+    WARMED.with(|w| w.borrow_mut().clear());
+    let live_before = crate::flow::live_verifications();
+    let first = do_install_with(&single, &both, crate::config::CHANNEL, "codex", &s).unwrap();
+    assert!(!first.already_current);
+    assert_eq!(
+        crate::flow::live_verifications() - live_before,
+        1,
+        "do_install_with reuses the verified index across index_owning and install_inner"
+    );
+    assert_eq!(
+        WARMED.with(|w| w.borrow().clone()),
+        vec!["codex".to_string()],
+        "do_install_with warms an ALab codex landing"
+    );
+    WARMED.with(|w| w.borrow_mut().clear());
+    let second = do_install_with(&single, &both, crate::config::CHANNEL, "codex", &s).unwrap();
+    assert!(second.already_current);
+    assert!(
+        WARMED.with(|w| w.borrow().is_empty()),
+        "already-current do_install_with does not re-warm"
+    );
+
+    let toolset = world::layout("alab-warm-toolset");
+    let cfg = crate::config::PackagesConfig {
+        exclude: Some(
+            crate::vendor_direct::VENDORS
+                .iter()
+                .map(|v| v.program)
+                .filter(|p| *p != "codex")
+                .chain(["ay"])
+                .map(str::to_string)
+                .collect(),
+        ),
+        ..Default::default()
+    };
+    WARMED.with(|w| w.borrow_mut().clear());
+    assert_eq!(install_toolset(&toolset, &cfg, &both, &s), 0);
+    assert_eq!(
+        WARMED.with(|w| w.borrow().clone()),
+        vec!["codex".to_string()],
+        "install_toolset warms an ALab codex landing"
+    );
+    assert_eq!(
+        crate::status::read(&toolset).unwrap().last_index_build,
+        first.index_build,
+        "install_toolset records the resolved index build in status.toml"
+    );
+}
+
+#[test]
+fn rolling_back_from_a_newer_alab_codex_build_preserves_the_older_builds_signed_tree_root() {
+    if current_triple() != "aarch64-apple-darwin" {
+        return;
+    }
+    let layout = world::layout("alab-rollback-root");
+    let vendor = Fake::default();
+    let trust = world::trust();
+    let s = seams(&trust);
+    let exe = at::signed_exe();
+
+    let ch1 = at::channel(
+        "codex-alab",
+        at::BUILD,
+        at::pack_archive(at::BUILD, &exe, true),
+    );
+    let both1 = Both {
+        index: &ch1,
+        vendor: &vendor,
+    };
+    let r1 = do_install_with(&layout, &both1, crate::config::CHANNEL, "codex", &s).unwrap();
+    assert_eq!(r1.build, at::BUILD);
+    let root1 = crate::status::read(&layout).unwrap().programs["codex"]
+        .tree_root
+        .clone();
+    assert!(!root1.is_empty());
+
+    let next_build = at::BUILD + 1;
+    let ch2 = at::channel(
+        "codex-alab",
+        next_build,
+        at::pack_archive(next_build, &exe, true),
+    );
+    let both2 = Both {
+        index: &ch2,
+        vendor: &vendor,
+    };
+    let r2 = do_install_with(&layout, &both2, crate::config::CHANNEL, "codex", &s).unwrap();
+    assert_eq!(r2.build, next_build);
+
+    assert_eq!(cmd_rollback_vendor(&layout, codex()), ExitCode::SUCCESS);
+    assert_eq!(active(&layout), Some(at::BUILD));
+    assert_eq!(
+        crate::status::read(&layout).unwrap().programs["codex"].tree_root,
+        root1,
+        "rolling back onto the older ALab build restores its signed tree_root"
+    );
+    assert_eq!(
+        crate::verify::verify_all(&layout),
+        vec![(
+            "codex".to_string(),
+            crate::verify::VerifyOutcome::Match { build: at::BUILD }
+        )]
+    );
+
+    // Re-install next_build, then trigger an automatic AlabRolledBack via record_vendor_status
+    // and verify that record_vendor_status reads root1 before saving next_build's root.
+    let r3 = do_install_with(&layout, &both2, crate::config::CHANNEL, "codex", &s).unwrap();
+    assert_eq!(r3.build, next_build);
+    let policy = crate::vendor_direct::policy::Policy::from_entries([format!(
+        "codex@{next_build}"
+    )
+    .as_str()]);
+    let lane = crate::vendor_direct::lane::Lane {
+        layout: &layout,
+        fetcher: &vendor,
+        triple: current_triple(),
+        policy: &policy,
+        trust: &trust,
+        legacy_index: None,
+        asked: false,
+        now: now(),
+        download_turn: None,
+    };
+    let outcome = crate::vendor_direct::lane::install_one(&lane, codex(), false);
+    assert!(
+        matches!(
+            outcome.verdict,
+            crate::vendor_direct::lane::Verdict::AlabRolledBack {
+                to_build: at::BUILD,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    record_vendor_status(&layout, &outcome, now());
+    assert_eq!(active(&layout), Some(at::BUILD));
+    assert_eq!(
+        crate::status::read(&layout).unwrap().programs["codex"].tree_root,
+        root1,
+        "automatic AlabRolledBack preserves the older ALab build's signed tree_root"
+    );
+    assert_eq!(
+        crate::verify::verify_all(&layout),
+        vec![(
+            "codex".to_string(),
+            crate::verify::VerifyOutcome::Match { build: at::BUILD }
+        )]
+    );
+}
+
+#[test]
+fn plan_update_and_do_install_reuse_the_index_from_index_owning() {
+    if current_triple() != "aarch64-apple-darwin" {
+        return;
+    }
+    let layout = world::layout("alab-update-reuse-index");
+    let vendor = Fake::default();
+    let trust = world::trust();
+    let s = seams(&trust);
+    let exe = at::signed_exe();
+
+    let ch1 = at::channel(
+        "codex-alab",
+        at::BUILD,
+        at::pack_archive(at::BUILD, &exe, true),
+    );
+    let both1 = Both {
+        index: &ch1,
+        vendor: &vendor,
+    };
+    do_install_with(&layout, &both1, crate::config::CHANNEL, "codex", &s).unwrap();
+
+    let next_build = at::BUILD + 1;
+    let ch2 = at::channel(
+        "codex-alab",
+        next_build,
+        at::pack_archive(next_build, &exe, true),
+    );
+    let both2 = Both {
+        index: &ch2,
+        vendor: &vendor,
+    };
+    let anchor = (s.anchor)(&layout);
+    let floor = build_floor(&layout);
+    let live_before = crate::flow::live_verifications();
+    let owned = index_owning(&layout, &both2, &anchor, now(), "codex").expect("index owns codex");
+    let (plan, resolved) = crate::flow::plan_update_with_index(
+        &both2,
+        &layout,
+        &anchor,
+        crate::config::CHANNEL,
+        current_triple(),
+        "codex",
+        Some(at::BUILD),
+        floor,
+        now(),
+        Some(owned),
+    )
+    .unwrap();
+    assert_eq!(plan.decision, crate::ApplyDecision::Install);
+    let report = do_install_with_index(
+        &layout,
+        &both2,
+        crate::config::CHANNEL,
+        "codex",
+        Some(resolved),
+        &s,
+    )
+    .unwrap();
+    assert_eq!(report.build, next_build);
+    assert_eq!(
+        crate::flow::live_verifications() - live_before,
+        1,
+        "index_owning + plan_update_with_index + do_install_with_index verify the index once"
+    );
+    let next_words = crate::alab::build_words(&layout, "codex", next_build);
+    let prev_words = crate::alab::build_words(&layout, "codex", at::BUILD);
+    let what = crate::vendor_direct::display_have_build(&layout, "codex", next_build);
+    assert_eq!(what, format!("codex {next_words}"));
+    assert_eq!(
+        pin_line_for(&what, "codex", true, true, PinPeers::Alone),
+        format!(
+            "atpkg: codex {next_words} pinned \u{2014} updates leave it \
+             there until `aterm pkg unpin codex` (a yanked build is still replaced)",
+        )
+    );
+    assert_eq!(
+        verify_outcome_line(
+            &layout,
+            "codex",
+            &crate::verify::VerifyOutcome::Match { build: next_build }
+        ),
+        (
+            false,
+            format!("atpkg: codex {next_words} OK (matches signed tree_root)")
+        )
+    );
+    assert_eq!(
+        verify_outcome_line(
+            &layout,
+            "codex",
+            &crate::verify::VerifyOutcome::BuildMismatch {
+                active: next_build,
+                recorded: Some(at::BUILD)
+            }
+        ),
+        (
+            true,
+            format!(
+                "atpkg: codex active {next_words} differs from recorded \
+                 {prev_words} \u{2014} cannot attest; update/reinstall",
+            )
+        )
     );
 }

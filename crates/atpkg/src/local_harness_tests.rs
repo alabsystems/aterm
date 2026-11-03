@@ -153,6 +153,7 @@ fn observation_never_converts_foreign_incomplete_or_changed_current_to_absence()
         "ready",
         "bytes",
         "empty-executables",
+        "command-mismatch",
     ] {
         let w = World::new("local-harness-observe-refuse");
         let lock = w.lock();
@@ -190,6 +191,21 @@ fn observation_never_converts_foreign_incomplete_or_changed_current_to_absence()
                 )
                 .unwrap();
                 record.receipt.executables.clear();
+                std::fs::write(
+                    crate::store::sidecar_path(&w.build(), SUFFIX).unwrap(),
+                    aterm_json::to_vec(&record).unwrap(),
+                )
+                .unwrap();
+            }
+            "command-mismatch" => {
+                let mut record: Record = aterm_json::from_slice(
+                    &std::fs::read(crate::store::sidecar_path(&w.build(), SUFFIX).unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+                record.receipt.command = PROGRAM.to_string();
+                record.receipt.exposes = vec![PROGRAM.to_string()];
+                record.receipt.executables[0].path = format!("bin/{PROGRAM}");
                 std::fs::write(
                     crate::store::sidecar_path(&w.build(), SUFFIX).unwrap(),
                     aterm_json::to_vec(&record).unwrap(),

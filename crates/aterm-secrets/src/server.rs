@@ -17,6 +17,7 @@ use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
+use std::os::fd::AsFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
@@ -116,14 +117,12 @@ const LINGER_DEADLINE: Duration = Duration::from_secs(2);
 const PROGRAM_EVERY: Duration = Duration::from_secs(5);
 /// How long a server stopping for a new program waits for the answers in flight.
 const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
-/// How long [`Running::stop`] waits to connect to its own listener, which wakes its accept loop.
-const STOP_WAKE_CONNECT: Duration = Duration::from_secs(5);
-/// The longest a server stopping for a new program takes from its last answer to its end
-/// ([`supervise`]): the wake connect [`Running::stop`] makes and the drain
-/// ([`DRAIN_DEADLINE`]). Its registrations end, and a holder of `alab-secrets` leaves its
-/// [`HeldStamp`], only at that end ([`Children`]' drop).
-const STOP_TAKES: Duration =
-    Duration::from_secs(STOP_WAKE_CONNECT.as_secs() + DRAIN_DEADLINE.as_secs());
+/// The conservative allowance for a server stopping for a new program: the answer drain
+/// ([`DRAIN_DEADLINE`]), plus stopping bookkeeping and the accept loop's cancellation and join.
+/// This is a takeover margin, not a bound on a stalled filesystem. Its registrations end,
+/// and a holder of `alab-secrets` leaves its [`HeldStamp`], only at that end
+/// ([`Children`]' drop).
+const STOP_TAKES: Duration = Duration::from_secs(15);
 /// How often a server whose address another process holds tries it again
 /// ([`bind_when_free`]).
 const BIND_AGAIN_EVERY: Duration = Duration::from_secs(60);
@@ -134,7 +133,7 @@ const ALAB_HELD_FILE: &str = ".alab-held";
 /// may take the name back at once ([`AlabNameWatcher::resume`]): its first decision must come
 /// within this of the stamp. Every other server that follows the probe takes the name only
 /// after [`ALAB_FALLBACK_AFTER`] in which nothing answered there, counted from a round of its
-/// own after the holder stopped answering, which was at most [`STOP_TAKES`] before the stamp;
+/// own after the holder stopped answering, allowing [`STOP_TAKES`] before the stamp;
 /// one round ([`ADVERTISE_EVERY`]) of what is left is kept as a margin. A device that registers
 /// the name with no probe can hold it anyway, and takes it from this one by mDNS
 /// ([`AlabNameWatcher::lost_name`]).
@@ -466,15 +465,8 @@ pub fn serve_with_role(
             main.unpark();
         });
     }
-    let program = std::env::current_exe().ok();
-    let started_as = program.as_deref().and_then(stamp_of);
-    let stopping = || {
-        stop_reason(
-            &signalled,
-            started_as,
-            program.as_deref().and_then(stamp_of),
-        )
-    };
+    let program = crate::program_watch::ProgramWatch::current();
+    let stopping = || stop_reason(&signalled, program.replaced());
     let Some(listener) = bind_when_free(
         options.listen,
         BIND_AGAIN_EVERY,
@@ -484,13 +476,7 @@ pub fn serve_with_role(
     else {
         return Ok(());
     };
-    // The home ALab LAN is told from the evidence under this Mac's secrets directory; a server
-    // started with none (a LaunchDaemon's) observes no request at home.
-    let home: Arc<dyn crate::home_lan::Place> = match &client_paths {
-        Some(paths) => Arc::new(crate::home_lan::Live::new(paths.clone())),
-        None => Arc::new(crate::home_lan::Nowhere),
-    };
-    let running = launch_at(listener, &options, Tuning::default(), home)?;
+    let running = launch(listener, &options, Tuning::default())?;
     note(&format!(
         "serving the vaults in {} on {}",
         options.store.display(),
@@ -520,13 +506,15 @@ pub fn serve_with_role(
         (None, None) => None,
     };
     let children = Children::default();
+    let health_paths = client_paths.clone();
+    let health_address = running.addr;
     children.tend_with_role(options.keep_awake, advertise, client_paths);
-    let result = supervise(
-        running,
-        PROGRAM_EVERY,
-        &|| program.as_deref().and_then(stamp_of),
-        &signalled,
-    );
+    let result = supervise(running, PROGRAM_EVERY, &|| {
+        if let Some(paths) = &health_paths {
+            let _ = crate::service_health::bound_server(paths, health_address);
+        }
+        stopping()
+    });
     drop(children);
     result
 }
@@ -583,57 +571,29 @@ fn bind_when_free(
 }
 
 /// Why a service process stops now, if it does: a stop signal came (`signalled`), or the
-/// program it started from (stamped `was`) was replaced on disk (`now`, [`replaced`]).
-fn stop_reason(
-    signalled: &AtomicBool,
-    was: Option<Stamp>,
-    now: Option<Stamp>,
-) -> Option<&'static str> {
+/// program it started from was replaced on disk (`replaced`).
+fn stop_reason(signalled: &AtomicBool, replaced: bool) -> Option<&'static str> {
     if signalled.load(Ordering::SeqCst) {
         Some("stopped by a signal")
-    } else if replaced(was, now) {
+    } else if replaced {
         Some("this program was replaced on disk; exiting so the service starts the new one")
     } else {
         None
     }
 }
 
-/// An executable as it is on disk.
-pub(crate) type Stamp = (u64, u64, u64, i64);
-
-/// Whether the program a service process started from (stamped `was`) was replaced on disk
-/// (`now`): another file at its path, which the service starts in its place once this process
-/// exits. A path that is gone (an `aterm.app` moved or deleted) is no replacement: nothing new
-/// waits there and launchd could not start the gone path, so the process keeps running from the
-/// file it holds open, and a repair moves the job (`crate::service::repair_server`, the GUI's
-/// subscriber mend).
-pub(crate) fn replaced(was: Option<Stamp>, now: Option<Stamp>) -> bool {
-    matches!((was, now), (Some(was), Some(now)) if was != now)
-}
-
-/// The file at `path` as it is on disk now. A service stamps the path its program started from,
-/// read once as it starts (client.rs's subscriber does the same): on Linux `current_exe` reads
-/// `/proc/self/exe`, which names `<path> (deleted)` once an update renames a new file over the
-/// path, so a read then would take the update for a program gone.
-pub(crate) fn stamp_of(path: &Path) -> Option<Stamp> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.dev(), meta.ino(), meta.size(), meta.mtime()))
-}
-
-/// Run until the accept loop ends ([`Running::stop`], [`DRAIN_DEADLINE`]).
+/// Run until the accept loop ends or the startup watch says to stop. The same watch covers
+/// binding and supervision, so an update between them cannot establish a new baseline.
 fn supervise(
     running: Running,
     every: Duration,
-    stamp: &dyn Fn() -> Option<Stamp>,
-    signalled: &AtomicBool,
+    stopping: &dyn Fn() -> Option<&'static str>,
 ) -> crate::Result<()> {
-    let program = stamp();
     loop {
         if running.accept.as_ref().is_none_or(JoinHandle::is_finished) {
             return running.wait();
         }
-        if let Some(why) = stop_reason(signalled, program, stamp()) {
+        if let Some(why) = stopping() {
             note(why);
             let shared = Arc::clone(&running.shared);
             running.stop();
@@ -653,6 +613,7 @@ pub struct Running {
     pub addr: SocketAddr,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shared: Arc<Shared>,
+    cancel: Option<io::PipeWriter>,
     accept: Option<JoinHandle<io::Result<()>>>,
 }
 
@@ -673,10 +634,8 @@ impl Running {
                 note(&format!("heard coverage was not closed cleanly: {error}"));
             }
         }
-        let wake = wake_addr(self.addr);
-        if TcpStream::connect_timeout(&wake, STOP_WAKE_CONNECT).is_ok()
-            && let Some(accept) = self.accept.take()
-        {
+        drop(self.cancel.take());
+        if let Some(accept) = self.accept.take() {
             let _ = accept.join();
         }
     }
@@ -743,19 +702,6 @@ impl Running {
     }
 }
 
-/// The address that reaches a listener bound to `addr` from this machine.
-fn wake_addr(addr: SocketAddr) -> SocketAddr {
-    match addr.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => {
-            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), addr.port())
-        }
-        IpAddr::V6(ip) if ip.is_unspecified() => {
-            SocketAddr::new(Ipv6Addr::LOCALHOST.into(), addr.port())
-        }
-        _ => addr,
-    }
-}
-
 /// Start serving on `listener` in background threads (no mDNS, no caffeinate).
 pub fn start(listener: std::net::TcpListener, options: &Options) -> crate::Result<Running> {
     launch(listener, options, Tuning::default())
@@ -775,26 +721,6 @@ pub fn start_with_join_change_gap(
             join_change_gap: gap,
             ..Tuning::default()
         },
-    )
-}
-
-/// [`start_with_join_change_gap`] whose every IPv4 join request is observed on the home ALab LAN
-/// [`crate::home_lan::HomeTag::test`] ([`crate::home_lan::AtHome`]): a test's server stands in
-/// for one on the owner's LAN, where members answered.
-#[cfg(any(test, debug_assertions))]
-pub fn start_at_home(
-    listener: std::net::TcpListener,
-    options: &Options,
-    gap: Duration,
-) -> crate::Result<Running> {
-    launch_at(
-        listener,
-        options,
-        Tuning {
-            join_change_gap: gap,
-            ..Tuning::default()
-        },
-        Arc::new(crate::home_lan::AtHome),
     )
 }
 
@@ -820,7 +746,7 @@ pub(crate) fn start_with_clock(
 /// is posted: its reply's status.
 #[cfg(test)]
 pub(crate) fn post_join_as(running: &Running, name: &str, line: &str, peer: IpAddr) -> u16 {
-    post_join(&running.shared, name, line.as_bytes(), peer, None).status
+    post_join(&running.shared, name, line.as_bytes(), peer).status
 }
 
 /// [`start`] as a server on another Mac than its clients' ([`refuse_unheld`]).
@@ -888,21 +814,6 @@ impl Default for Tuning {
 }
 
 fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Result<Running> {
-    launch_at(
-        listener,
-        options,
-        tuning,
-        Arc::new(crate::home_lan::Nowhere),
-    )
-}
-
-/// [`launch`], telling the home ALab LAN by `home` ([`Shared::home`]).
-fn launch_at(
-    listener: TcpListener,
-    options: &Options,
-    tuning: Tuning,
-    home: Arc<dyn crate::home_lan::Place>,
-) -> crate::Result<Running> {
     for (name, _) in &options.pins {
         if !envelope::valid_name(name) {
             return Err(Error::new(
@@ -918,6 +829,8 @@ fn launch_at(
         &mut state.heard,
     )?);
     let _ = aterm_uds::keep_out_of_children(&listener);
+    listener.set_nonblocking(true)?;
+    let (cancelled, cancel) = aterm_uds::kept_out(io::pipe)?;
     let addr = listener.local_addr()?;
     let shared = Arc::new(Shared {
         store: options.store.clone(),
@@ -925,7 +838,6 @@ fn launch_at(
         retired: (tuning.retired)(),
         hold: options.hold,
         tuning,
-        home,
         server_state: Mutex::new(state),
         stopping: AtomicBool::new(false),
         active: AtomicUsize::new(0),
@@ -980,12 +892,13 @@ fn launch_at(
         let stop = Arc::clone(&stop);
         std::thread::Builder::new()
             .name("vault-accept".to_owned())
-            .spawn(move || accept_loop(&listener, &shared, &stop, &refusals))?
+            .spawn(move || accept_loop(&listener, &cancelled, &shared, &stop, &refusals))?
     };
     Ok(Running {
         addr,
         stop,
         shared,
+        cancel: Some(cancel),
         accept: Some(accept),
     })
 }
@@ -1057,11 +970,6 @@ fn queue_epoch() -> u64 {
 struct Queued {
     request: JoinRequest,
     peer: Option<IpAddr>,
-    /// The home ALab LAN a real POST of this request was observed on ([`crate::home_lan`]),
-    /// kept apart from the first peer, which still accounts for rate limits. Held in memory
-    /// only, and listed only while this Mac is still on that network: the asking Mac posts again
-    /// within 15 minutes wherever the two meet.
-    home: Option<crate::home_lan::HomeTag>,
     /// The vault's seq when the request was last asked (queued, changed or asked again).
     asked: u64,
     /// When its address last queued or changed it.
@@ -1142,9 +1050,6 @@ struct State {
     vaults: BTreeMap<String, Slot>,
     records: BTreeMap<String, RecordSlot>,
     joins: BTreeMap<String, Vec<Queued>>,
-    /// The home ALab LAN networks this Mac was on at the last join listing: a listing reads
-    /// `home=` against them, so a move onto or off one is a new version of every queue.
-    listed_here: Vec<crate::home_lan::HomeTag>,
     heard: heard::History,
     heard_flushed: BTreeMap<String, u64>,
     heard_dirty: BTreeSet<String>,
@@ -1158,9 +1063,6 @@ struct Shared {
     retired: envelope::Retired,
     hold: Duration,
     tuning: Tuning,
-    /// Where this Mac is: whether a join request was observed on the home ALab LAN, and which
-    /// home networks this Mac is on now ([`crate::home_lan::Place`]).
-    home: Arc<dyn crate::home_lan::Place>,
     server_state: Mutex<State>,
     stopping: AtomicBool,
     active: AtomicUsize,
@@ -1672,19 +1574,13 @@ fn expire(queue: &mut Vec<Queued>, now: u64) {
     });
 }
 
-/// The listing: each bare request's home ALab LAN where it was observed on one this Mac is still
-/// on (`here`), never its address. No request is listed `lan=1`: an older approver admits by that
-/// marker alone, wherever its server heard the request. A request that carries a member's Allow
-/// or a password proof lists no `home=` either: an older approver skips any line with a field
-/// it does not know, and can still admit those two by what they carry.
-fn join_lines(queue: &[Queued], here: &[crate::home_lan::HomeTag]) -> String {
+/// The listing, which names no request's address. It carries no LAN marker (` lan=1`,
+/// ` home=`): an approver before aterm 0.148 admits a `lan=1` request by that marker alone, and
+/// one of 0.148 or 0.149 an open ALab vault's `home=` request with nobody's Allow.
+fn join_lines(queue: &[Queued]) -> String {
     let mut text = String::new();
     for queued in queue {
-        let mut request = queued.request.clone();
-        request.lan = false;
-        let bare = request.allowed.is_none() && request.proof.is_none();
-        request.home = queued.home.clone().filter(|tag| bare && here.contains(tag));
-        text.push_str(&request.listed());
+        text.push_str(&queued.request.listed());
         text.push('\n');
     }
     text
@@ -1697,16 +1593,14 @@ fn stored_lines(queue: &[Queued]) -> String {
         if let Some(peer) = queued.peer {
             text.push_str(&format!("peer {peer} {}\n", queued.asked));
         }
-        let mut request = queued.request.clone();
-        request.lan = false;
-        request.home = None;
-        text.push_str(&request.listed());
+        text.push_str(&queued.request.listed());
         text.push('\n');
     }
     text
 }
 
-/// Read [`stored_lines`].
+/// Read [`stored_lines`]: an older build's `lan=1` (any private peer's) is read past
+/// ([`parse_join_line`]).
 fn parse_stored(text: &str) -> Vec<Queued> {
     let mut queue = Vec::new();
     let mut peer = None;
@@ -1721,16 +1615,12 @@ fn parse_stored(text: &str) -> Vec<Queued> {
             continue;
         }
         let (from, asked) = peer.take().unzip();
-        if let Ok(mut request) = parse_join_line(line)
+        if let Ok(request) = parse_join_line(line)
             && request.time.is_some()
         {
-            // An older build's `lan=1` was any private peer's: no home LAN observation.
-            request.lan = false;
-            request.home = None;
             queue.push(Queued {
                 request,
                 peer: from,
-                home: None,
                 asked: asked.unwrap_or(0),
                 changed: 0,
                 noted: 0,
@@ -1741,23 +1631,46 @@ fn parse_stored(text: &str) -> Vec<Queued> {
     queue
 }
 
-/// Each connection is [`aterm_uds::accept`]'s: kept out of every child from its creation, with no
-/// spawn of this process held back while the loop waits for one.
+/// Wait for a connection or the owner's cancellation pipe to close. Only the nonblocking
+/// accept holds the spawn lock, keeping each connection out of children from its creation.
 fn accept_loop(
     listener: &TcpListener,
+    cancelled: &io::PipeReader,
     shared: &Arc<Shared>,
     stop: &AtomicBool,
     refusals: &SyncSender<TcpStream>,
 ) -> io::Result<()> {
     loop {
-        let accepted = aterm_uds::accept(listener);
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
-        match accepted {
-            Ok((stream, peer)) => dispatch(shared, stream, peer.ip(), refusals),
+        let ready = aterm_uds::ready::either(listener.as_fd(), cancelled.as_fd())?;
+        if ready.second || stop.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        match aterm_uds::kept_out(|| listener.accept()) {
+            Ok((stream, peer)) => {
+                if stop.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                stream.set_nonblocking(false)?;
+                dispatch(shared, stream, peer.ip(), refusals);
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
             Err(e) if is_transient(&e) => {
-                std::thread::sleep(Duration::from_millis(50));
+                match aterm_uds::ready::until(
+                    cancelled.as_fd(),
+                    aterm_uds::ready::Interest::Read,
+                    Instant::now() + Duration::from_millis(50),
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => {}
+                    Err(e) => return Err(e),
+                }
             }
             Err(e) => return Err(e),
         }
@@ -2480,11 +2393,10 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
             list_joins(shared, stream, name, request.query.as_deref())
         }
         (Route::Join(name), _) => {
-            let arrived_on = stream.local_addr().ok().map(|addr| addr.ip());
             match body_length(&request, MAX_JOIN_BODY)
                 .and_then(|length| read_body(stream, request, length, &shared.tuning))
             {
-                Ok(body) => post_join(shared, name, &body, peer, arrived_on),
+                Ok(body) => post_join(shared, name, &body, peer),
                 Err(reply) => reply,
             }
         }
@@ -3085,22 +2997,6 @@ fn follow_held(
     }
 }
 
-/// What this server keeps of a records file's `bytes`, read into `empty`: every record that
-/// verifies and that the store takes, each after its parents, as
-/// [`crate::membership_log::Store::recovering`] reads them, so a file an earlier build wrote
-/// (complete and waiting records, its tail in id order) reads back, and a file whose last append
-/// was cut short keeps what came before it. A store with no genesis keeps none of its records ([`post_records`]),
-/// so a file an earlier build let any LAN host fill reads as the empty store it would be now,
-/// and the next write replaces it.
-fn kept_records(empty: crate::membership_log::Store, bytes: &[u8]) -> crate::membership_log::Store {
-    let decoded = empty.clone().recovering(bytes);
-    if decoded.log().is_some() {
-        decoded
-    } else {
-        empty
-    }
-}
-
 /// Merge any verified records written directly at `<name>.records` on disk into memory
 /// ([`look_at_records`]). A file the read refuses is remembered by its stamp, and the start loop
 /// notes why; a read that failed leaves nothing remembered, so the next look reads again.
@@ -3132,7 +3028,7 @@ fn look_for_records(shared: &Shared, state: &mut State, name: &str) -> Result<()
 /// each long-poll looks on every wake and every liveness tick, and reading and comparing the
 /// whole file each time cost up to [`crate::membership_log::MAX_RECORDS_STREAM`] a look. A
 /// rooted store takes the file's records in place (what it refuses changes nothing); a store
-/// with no genesis keeps them only when they root it ([`kept_records`]). The slot keeps the
+/// with no genesis keeps them only when they root it. The slot keeps the
 /// stamp of the file it read, and knows the file holds exactly its log (`on_file`) only when
 /// the store was empty before the read and its records' bytes fill the file: then each held
 /// record came from the file, and nothing else is in it. Nothing is cloned.
@@ -3141,7 +3037,8 @@ fn look_for_records(shared: &Shared, state: &mut State, name: &str) -> Result<()
 /// [`fsx::Unread::Refused`]: the read refuses the file (past the bound, an owner or mode it
 /// refuses, a symlink); the slot remembers its stamp anyway, so it is not read again until it
 /// changes. [`fsx::Unread::Failed`]: the read failed (too many open files, an I/O error), or
-/// `name`'s store cannot be made ([`crate::membership_log::Store::for_vault`]); nothing is
+/// the descriptor changed during the read, or `name`'s store cannot be made
+/// ([`crate::membership_log::Store::for_vault`]); nothing is
 /// remembered, so the next look reads again.
 #[cfg_attr(
     all(unix, any(test, debug_assertions)),
@@ -3157,6 +3054,16 @@ fn look_at_records(
     path: &Path,
     keys: Option<&[[u8; 32]]>,
 ) -> Result<(), fsx::Unread> {
+    look_at_records_with(state, name, path, keys, || {})
+}
+
+fn look_at_records_with(
+    state: &mut State,
+    name: &str,
+    path: &Path,
+    keys: Option<&[[u8; 32]]>,
+    after_decode: impl FnOnce(),
+) -> Result<(), fsx::Unread> {
     if state.records.get(name).is_some_and(|slot| slot.writing) {
         return Ok(());
     }
@@ -3169,7 +3076,39 @@ fn look_at_records(
     {
         return Ok(());
     }
-    let read = match fsx::read_owned_stamped(path, crate::membership_log::MAX_RECORDS_STREAM) {
+    let read = (|| {
+        let Some(mut reader) = fsx::open_owned_reader_classified(path)? else {
+            return Ok(None);
+        };
+        let decoded = crate::membership_log::Store::read_records(reader.file())
+            .map_err(fsx::Unread::Failed)?;
+        after_decode();
+        // The shared decoder consumes at most the client's recovery prefix. Servers refuse
+        // the whole oversized file, including growth or a tail after malformed frames.
+        let mut extra = [0];
+        let more = loop {
+            match reader.file().read(&mut extra) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    return Err(fsx::Unread::Failed(Error::new(format!(
+                        "{}: {error}",
+                        path.display()
+                    ))));
+                }
+                Ok(n) => break n != 0,
+            }
+        };
+        reader.check_unchanged_classified()?;
+        if more {
+            return Err(fsx::Unread::Refused(Error::new(format!(
+                "{}: larger than {} bytes",
+                path.display(),
+                crate::membership_log::MAX_RECORDS_STREAM
+            ))));
+        }
+        Ok(Some((reader.stamp(), decoded)))
+    })();
+    let read = match read {
         Ok(None) => return Ok(()),
         Ok(Some(read)) => Ok(read),
         Err(fsx::Unread::Refused(e)) => Err(e),
@@ -3184,7 +3123,7 @@ fn look_at_records(
     let Some(slot) = state.records.get_mut(name) else {
         return Ok(());
     };
-    let (stamp, bytes) = match read {
+    let (stamp, decoded) = match read {
         Ok(read) => read,
         Err(e) => {
             slot.stamp = Some(seen);
@@ -3194,17 +3133,14 @@ fn look_at_records(
     };
     let was_empty = slot.store.is_empty();
     let heads = slot.store.log().map(crate::membership_log::Log::heads);
+    let bytes_read = decoded.bytes_read();
     let store = follow_held(std::mem::take(&mut slot.store), keys);
-    slot.store = if store.log().is_some() {
-        store.recovering(&bytes)
-    } else {
-        kept_records(store, &bytes)
-    };
+    slot.store = decoded.apply_rooted(store);
     slot.stamp = Some(stamp);
     slot.on_file = slot
         .store
         .log()
-        .filter(|log| was_empty && log.held_bytes() == bytes.len())
+        .filter(|log| was_empty && log.held_bytes() == bytes_read)
         .map(crate::membership_log::Log::held_count);
     if let Some(log) = slot.store.log()
         && Some(log.heads()) != heads
@@ -3212,6 +3148,27 @@ fn look_at_records(
         slot.wake.notify_all();
     }
     Ok(())
+}
+
+/// Load a records file through the server's real cold path, without listeners or preload.
+/// The returned store moves out of its slot, so this seam introduces no copy of its records.
+///
+/// # Errors
+/// The server refuses or cannot read the file, or the path supplied no records slot.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn test_cold_records(
+    path: &Path,
+    name: &str,
+    keys: &[[u8; 32]],
+) -> crate::Result<(crate::membership_log::Store, Option<usize>)> {
+    let mut state = State::default();
+    look_at_records(&mut state, name, path, Some(keys)).map_err(fsx::Unread::into_error)?;
+    let slot = state
+        .records
+        .remove(name)
+        .ok_or_else(|| Error::new("the path supplied no records slot"))?;
+    Ok((slot.store, slot.on_file))
 }
 
 fn have_query(query: Option<&str>) -> Result<Vec<crate::membership_log::RecordId>, Reply> {
@@ -3348,7 +3305,7 @@ fn get_records(
         }
     };
     drop(wake);
-    // A slot that read a records file stays though it keeps nothing ([`kept_records`]): taken
+    // A slot that read a records file stays though it keeps nothing: taken
     // out, the next look would read the whole file again.
     if state.records.get(name).is_some_and(|slot| {
         slot.store.is_empty() && slot.stamp.is_none() && Arc::strong_count(&slot.wake) == 1
@@ -3617,15 +3574,9 @@ fn unreadable_records(shared: &Shared, state: &mut State, name: &str) -> Option<
     }
 }
 
-/// `POST /v1/<name>/join` from `peer`, which reached this Mac at its address `arrived_on`
-/// (`None`: unknown): queued with the home ALab LAN it was observed on, if any.
-fn post_join(
-    shared: &Shared,
-    name: &str,
-    body: &[u8],
-    peer: IpAddr,
-    arrived_on: Option<IpAddr>,
-) -> Reply {
+/// `POST /v1/<name>/join` from `peer`: a bare request line, with a member's Allow or a join
+/// password proof where it carries one, never a listing's time or LAN marker.
+fn post_join(shared: &Shared, name: &str, body: &[u8], peer: IpAddr) -> Reply {
     let Ok(text) = std::str::from_utf8(body) else {
         return Reply::text(400, "a join request is one line of text");
     };
@@ -3634,7 +3585,7 @@ fn post_join(
         return Reply::text(400, "a join request is one line: `age1… <host> <code>`");
     }
     let request = match parse_join_line(line) {
-        Ok(request) if request.time.is_none() && !request.lan && request.home.is_none() => request,
+        Ok(request) if request.time.is_none() => request,
         Ok(_) => return Reply::text(400, "a join request is `age1… <host> <code>`"),
         Err(e) => return Reply::text(400, e.0),
     };
@@ -3645,12 +3596,8 @@ fn post_join(
         return Reply::text(400, "a join request's code is not its key's");
     }
     let now = (shared.tuning.now)();
-    // Judged before any lock: it reads this Mac's interfaces and the evidence file.
-    let home = arrived_on
-        .ok_or(crate::home_lan::Away::NotOnLink)
-        .and_then(|arrived_on| shared.home.observed(arrived_on, peer));
     let _writing = shared.join_writes();
-    let (queue, noted) = match decide_join(shared, name, request, peer, home, now) {
+    let (queue, noted) = match decide_join(shared, name, request, peer, now) {
         Ok(Decided::Next(queue, noted)) => (queue, noted),
         Ok(Decided::Queued) => return Reply::empty(204),
         Err(reply) => return reply,
@@ -3701,14 +3648,13 @@ enum Decided {
     Next(Vec<Queued>, Option<String>),
 }
 
-/// Decide a join request from `peer`, observed on the home ALab LAN `home` or not (why), under
-/// `server_state`, or refuse it ([`Shared::join_writes`]).
+/// Decide a join request from `peer` under `server_state`, or refuse it
+/// ([`Shared::join_writes`]).
 fn decide_join(
     shared: &Shared,
     name: &str,
     request: JoinRequest,
     peer: IpAddr,
-    home: Result<crate::home_lan::HomeTag, crate::home_lan::Away>,
     now: u64,
 ) -> Result<Decided, Reply> {
     let mut state = shared.lock_server_state();
@@ -3726,20 +3672,6 @@ fn decide_join(
             && asked.proof == request.proof
     };
     if let Some(at) = queue.iter().position(same) {
-        // Preserve the first address for queue accounting, but let a machine observed anew on
-        // the home ALab LAN become eligible without a changed request or a manual Allow. A
-        // repeat observed elsewhere does not clear it: the listing shows it only while this Mac
-        // is on that network.
-        if let Ok(tag) = &home
-            && queue[at].home.as_ref() != Some(tag)
-        {
-            queue[at].home = Some(tag.clone());
-            queue[at].asked = seq;
-            if now.saturating_sub(queue[at].request.time.unwrap_or(0)) >= JOIN_REFRESH_EVERY_SECS {
-                queue[at].request.time = Some(now);
-            }
-            return Ok(Decided::Next(queue, None));
-        }
         if now.saturating_sub(queue[at].request.time.unwrap_or(0)) < JOIN_REFRESH_EVERY_SECS {
             if let Some(held) = state
                 .joins
@@ -3792,15 +3724,8 @@ fn decide_join(
         ));
     }
     let host = &request.host;
-    let at = match &home {
-        Ok(_) => "observed on the home ALab LAN".to_owned(),
-        Err(why) => format!("not on the home ALab LAN: {why}"),
-    };
     let (noted, line) = match &previous {
-        None => (
-            now,
-            Some(format!("join request queued for host {host} ({at})")),
-        ),
+        None => (now, Some(format!("join request queued for host {host}"))),
         Some(previous) if now.saturating_sub(previous.noted) >= JOIN_NOTE_EVERY_SECS => (
             now,
             Some(format!(
@@ -3815,7 +3740,6 @@ fn decide_join(
             ..request
         },
         peer: Some(peer),
-        home: home.ok().or_else(|| previous.and_then(|old| old.home)),
         asked: seq,
         changed: now,
         noted,
@@ -3856,27 +3780,9 @@ fn list_joins(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&st
         Ok(after) => after,
         Err(reply) => return reply,
     };
-    // Read before the lock (interfaces and the evidence file): a request observed on a home
-    // network this Mac has since left lists no home there.
-    let here = shared.home.here();
     let mut state = shared.lock_server_state();
     let now = (shared.tuning.now)();
-    let State {
-        vaults,
-        joins,
-        listed_here,
-        ..
-    } = &mut *state;
-    // A listing names a request's `home=` only while this Mac is on that network: a move onto
-    // or off one changes what every queue lists, so its version moves too, and an approver that
-    // holds the old listing reads the new one at once rather than an hour later.
-    if *listed_here != here {
-        listed_here.clone_from(&here);
-        for slot in vaults.values_mut() {
-            slot.joins += 1;
-            slot.wake.notify_all();
-        }
-    }
+    let State { vaults, joins, .. } = &mut *state;
     let Some(slot) = vaults.get_mut(name) else {
         return Reply::text(404, format!("no vault named {name} here"));
     };
@@ -3912,7 +3818,7 @@ fn list_joins(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&st
     let queue = state.joins.entry(name.to_owned()).or_default();
     Reply {
         status: 200,
-        body: Body::Text(join_lines(queue, &here)),
+        body: Body::Text(join_lines(queue)),
         etag: generation,
         vault_head: None,
         allow: None,
@@ -4506,48 +4412,62 @@ fn is_obviously_self_url(
 /// [`crate::membership_log::MAX_RECORDS_STREAM`], and is decoded again where [`post_records`]
 /// stores it, one at a time. A pass asks all its peers (up to
 /// [`crate::discover::MAX_CANDIDATES`]) for their envelopes at once, which finds the dark ones
-/// in one budget, and holds this many records bodies: one read while another is stored.
-const RECORDS_PULLS_AT_ONCE: usize = 2;
+/// in one budget, and holds this many records bodies: one read while another is stored. A
+/// client's records pass reads its peers' longer answers as many at once (`crate::client`'s
+/// `fan_out::RECORDS`).
+pub(crate) const RECORDS_PULLS_AT_ONCE: usize = 2;
 
 /// How much of each peer's envelope answer a pass reads at once from all its peers
 /// ([`pull_from_peer`]): a `204` and a small envelope fit. A longer answer is asked again and
-/// read whole, up to [`MAX_ENVELOPE`], under one of [`ENVELOPE_PULLS_AT_ONCE`] slots.
-const ENVELOPE_PEEK: usize = 256 << 10;
+/// read whole, up to [`MAX_ENVELOPE`], under one of [`ENVELOPE_PULLS_AT_ONCE`] slots. A client
+/// reading many servers' envelopes at once (`crate::client`'s `fan_out::envelopes_within`) reads
+/// each answer the same way.
+pub(crate) const ENVELOPE_PEEK: usize = 256 << 10;
 
 /// How many peers' whole envelopes longer than [`ENVELOPE_PEEK`] a server reads at once: each
 /// is up to [`MAX_ENVELOPE`] and is parsed again where [`put_vault`] stores it, so a host that
-/// advertises 16 instances of itself costs a pass this many such bodies, not 16.
-const ENVELOPE_PULLS_AT_ONCE: usize = 2;
+/// advertises 16 instances of itself costs a pass this many such bodies, not 16. A client's
+/// fan-out of envelope reads through `crate::client`'s `fan_out::reads_within` (an admin
+/// command's open, the servers' heads read before a mirror, the sync's probes of its peers, a
+/// join's probes, and a join request's check of each mirror before it is posted there,
+/// `join_routing`, on a joining Mac) holds as many at once, and one
+/// from each compiled-in default address, each until it has verified it, and a join request's
+/// until it has also left the request with that server. Two client fan-outs that read only the
+/// servers the signed swarm policy names, never one a browse named, still read each of them
+/// whole at once: the check of each mirror whose join queue an admin Mac reads (`join_queues`)
+/// and an admission's read-back (`ledger_publish::verify_approved_in_served_head`).
+pub(crate) const ENVELOPE_PULLS_AT_ONCE: usize = 2;
 
 /// Slots for a few pulls at once ([`RECORDS_PULLS_AT_ONCE`] records pulls,
 /// [`ENVELOPE_PULLS_AT_ONCE`] whole envelopes).
-struct PullSlots {
+pub(crate) struct PullSlots {
     /// How many pulls hold a slot at once.
     at_once: usize,
     taken: Mutex<usize>,
     freed: Condvar,
-    /// Pulls waiting for a slot now.
+    /// Pulls waiting for a slot now, shared with a test that watches the slots a client's
+    /// fan-out made (`crate::client`'s `fan_out::held`).
     #[cfg(test)]
-    waiting: AtomicUsize,
+    pub(crate) waiting: Arc<AtomicUsize>,
 }
 
 /// One pull's slot, given back when dropped.
-struct PullSlot<'a>(&'a PullSlots);
+pub(crate) struct PullSlot<'a>(&'a PullSlots);
 
 impl PullSlots {
     /// Slots for `at_once` pulls.
-    const fn new(at_once: usize) -> PullSlots {
+    pub(crate) fn new(at_once: usize) -> PullSlots {
         PullSlots {
             at_once,
             taken: Mutex::new(0),
             freed: Condvar::new(),
             #[cfg(test)]
-            waiting: AtomicUsize::new(0),
+            waiting: Arc::default(),
         }
     }
 
     /// A slot, once one is free: a slot's pull ends within its budget.
-    fn take(&self) -> PullSlot<'_> {
+    pub(crate) fn take(&self) -> PullSlot<'_> {
         let mut taken = self.taken.lock().unwrap_or_else(PoisonError::into_inner);
         #[cfg(test)]
         let queued = usize::from(*taken >= self.at_once);
@@ -4972,7 +4892,8 @@ type SpawnAdvert =
 
 /// Hear this Mac's sleep and wake until the bell given is gone, handing each to the handler
 /// given; whether it hears them ([`Seams::power`]).
-type ListenPower = dyn FnOnce(std::sync::Weak<Bell>, Box<dyn FnMut(Power) + Send>) -> bool + Send;
+type ListenPower =
+    dyn FnOnce(Box<dyn FnMut(Power) + Send>) -> Option<aterm_uds::power::Listening> + Send;
 
 /// End one registration's `dns-sd -P` as this Mac goes to sleep ([`Seams::end_for_sleep`]).
 type EndAdvert = dyn Fn(&mut aterm_uds::spawnfd::Child) + Send + Sync;
@@ -5036,7 +4957,7 @@ impl Seams {
                 quiet(DNS_SD, &registration_args(target, name, port, txt))
             }),
             every: ADVERTISE_EVERY,
-            power: Box::new(aterm_uds::power::listen::<Bell>),
+            power: Box::new(aterm_uds::power::listen),
             end_for_sleep: Arc::new(end),
             sleep_bound: SLEEP_YIELD_BOUND,
             probe: probe_alab_endpoint,
@@ -5308,8 +5229,9 @@ impl Children {
         }
         // A server that advertises ends its registrations before this Mac sleeps.
         let asleep = Arc::new(AtomicBool::new(false));
-        if advertise.is_some() {
-            let listen = std::mem::replace(&mut seams.power, Box::new(|_, _| false));
+        // The listener hears while the tending thread runs: it moves there, and ends with it.
+        let power = if advertise.is_some() {
+            let listen = std::mem::replace(&mut seams.power, Box::new(|_| None));
             let yielding = SleepYield {
                 set: Arc::clone(&held),
                 asleep: Arc::clone(&asleep),
@@ -5317,17 +5239,17 @@ impl Children {
                 end: Arc::clone(&seams.end_for_sleep),
                 bound: seams.sleep_bound,
             };
-            let hears = listen(
-                Arc::downgrade(&bell),
-                Box::new(move |power| yielding.hear(power)),
-            );
-            if !hears && cfg!(target_os = "macos") {
+            let hears = listen(Box::new(move |power| yielding.hear(power)));
+            if hears.is_none() && cfg!(target_os = "macos") {
                 note(
                     "could not hear this Mac's sleep and wake, so this server's advertisements \
                      stay registered while it sleeps",
                 );
             }
-        }
+            hears
+        } else {
+            None
+        };
         let browse_bell = Arc::clone(&bell);
         let napping = Arc::clone(&bell);
         let shared_for_wake = advertise
@@ -5336,6 +5258,7 @@ impl Children {
         let spawned = std::thread::Builder::new()
             .name("vault-tend".to_owned())
             .spawn(move || {
+                let _power = power;
                 let mut watch = None;
                 // Where a server that held `alab-secrets` stopped, this one takes it back.
                 let mut alab_watcher = AlabNameWatcher::resume(
@@ -5841,48 +5764,71 @@ mod tests {
         launch(listener, options, tuning).expect("started")
     }
 
-    /// A test's place for a server: what it observes a join on and where it is now, both moved
-    /// by the test as a Mac moves between networks.
-    struct Scripted {
-        observed: Mutex<Result<crate::home_lan::HomeTag, crate::home_lan::Away>>,
-        here: Mutex<Vec<crate::home_lan::HomeTag>>,
+    #[test]
+    fn stopping_after_listener_retirement_never_connects_to_its_replacement() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let owner = run(&options(root.path(), HANG_DETECTOR));
+        let shared = Arc::clone(&owner.shared);
+        owner.stop();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (released, gone) = std::sync::mpsc::channel();
+        let accept = std::thread::spawn(move || {
+            drop(listener);
+            released.send(()).unwrap();
+            Ok::<(), io::Error>(())
+        });
+        gone.recv_timeout(HANG_DETECTOR).unwrap();
+        let replacement = TcpListener::bind(addr).unwrap();
+        replacement.set_nonblocking(true).unwrap();
+        Running {
+            addr,
+            stop: Arc::new(AtomicBool::new(false)),
+            shared,
+            cancel: None,
+            accept: Some(accept),
+        }
+        .stop();
+        assert_eq!(
+            replacement.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "a retired listener's address belongs to its replacement"
+        );
     }
 
-    impl Scripted {
-        fn away() -> Arc<Self> {
-            Arc::new(Self {
-                observed: Mutex::new(Err(crate::home_lan::Away::Hotspot)),
-                here: Mutex::new(Vec::new()),
-            })
-        }
-
-        fn at(&self, home: Option<&crate::home_lan::HomeTag>) {
-            *self.observed.lock().unwrap() = home.cloned().ok_or(crate::home_lan::Away::Hotspot);
-            *self.here.lock().unwrap() = home.into_iter().cloned().collect();
-        }
+    #[test]
+    fn stopping_an_idle_server_joins_its_listener() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let running = run(&options(root.path(), HANG_DETECTOR));
+        let addr = running.addr;
+        let (stopped, done) = std::sync::mpsc::channel();
+        let stopper = std::thread::spawn(move || {
+            running.stop();
+            stopped.send(()).unwrap();
+        });
+        done.recv_timeout(HANG_DETECTOR).unwrap();
+        stopper.join().unwrap();
+        let _replacement = TcpListener::bind(addr).unwrap();
     }
 
-    impl crate::home_lan::Place for Scripted {
-        fn observed(
-            &self,
-            _: IpAddr,
-            _: IpAddr,
-        ) -> Result<crate::home_lan::HomeTag, crate::home_lan::Away> {
-            self.observed.lock().unwrap().clone()
-        }
-
-        fn here(&self) -> Vec<crate::home_lan::HomeTag> {
-            self.here.lock().unwrap().clone()
-        }
-
-        fn serving(&self, _: IpAddr) -> Vec<crate::home_lan::HomeTag> {
-            self.here()
-        }
-    }
-
-    fn run_at(options: &Options, place: Arc<Scripted>) -> Running {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        launch_at(listener, options, Tuning::default(), place).expect("started")
+    #[test]
+    fn dropping_an_idle_server_cancels_accept_without_the_stop_flag() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut running = run(&options(root.path(), HANG_DETECTOR));
+        let addr = running.addr;
+        let stop = Arc::clone(&running.stop);
+        let accept = running.accept.take().unwrap();
+        drop(running);
+        let (stopped, done) = std::sync::mpsc::channel();
+        let joiner = std::thread::spawn(move || {
+            accept.join().unwrap().unwrap();
+            stopped.send(()).unwrap();
+        });
+        done.recv_timeout(HANG_DETECTOR).unwrap();
+        joiner.join().unwrap();
+        assert!(!stop.load(Ordering::SeqCst));
+        let _replacement = TcpListener::bind(addr).unwrap();
     }
 
     /// Wait (a hang detector, not a budget) until `done` holds.
@@ -5924,7 +5870,6 @@ mod tests {
         Queued {
             request,
             peer,
-            home: None,
             asked: 1,
             changed: 0,
             noted: 0,
@@ -6415,7 +6360,7 @@ mod tests {
         let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let line = join_line(1, "m22");
         assert_eq!(
-            post_join(&running.shared, "alab", line.as_bytes(), peer, None).status,
+            post_join(&running.shared, "alab", line.as_bytes(), peer).status,
             204
         );
         let woke = waiter.join().expect("waiter").expect("woken");
@@ -6466,7 +6411,7 @@ mod tests {
         let ask = |running: &Running, n: u8, host: &str| {
             let line = join_line(n, host);
             assert_eq!(
-                post_join(&running.shared, "alab", line.as_bytes(), peer, None).status,
+                post_join(&running.shared, "alab", line.as_bytes(), peer).status,
                 204
             );
         };
@@ -6583,12 +6528,12 @@ mod tests {
         assert_eq!(requests[0].host, "m3");
         assert_eq!(requests[1].host, "m22b");
         assert!(requests.iter().all(|request| request.time.is_some()));
-        // No member evidence here: nothing is observed on the home ALab LAN, and no request is
-        // listed `lan=1`, which an older approver would admit by alone.
+        // No request is listed with a LAN marker (` lan=1`, ` home=`), which an older approver
+        // would admit it by.
         assert!(
-            requests
+            listed
                 .iter()
-                .all(|request| !request.lan && request.home.is_none())
+                .all(|line| !line.contains("lan=") && !line.contains("home="))
         );
 
         for bad in [
@@ -6637,8 +6582,6 @@ mod tests {
                     host: format!("h{n}"),
                     code: "abcd-ef23-ghij-k234".to_owned(),
                     time: Some(now),
-                    lan: false,
-                    home: None,
                     allowed: None,
                     proof: None,
                 },
@@ -6895,18 +6838,6 @@ mod tests {
             "every TXT string fits RFC 6763's 255-byte limit"
         );
         assert_eq!(caffeinate_args(4242), ["-i", "-w", "4242"]);
-        assert_eq!(
-            wake_addr("0.0.0.0:7484".parse().expect("addr")),
-            "127.0.0.1:7484".parse().expect("addr")
-        );
-        assert_eq!(
-            wake_addr("[::]:7484".parse().expect("addr")),
-            "[::1]:7484".parse().expect("addr")
-        );
-        assert_eq!(
-            wake_addr("10.0.0.2:7484".parse().expect("addr")),
-            "10.0.0.2:7484".parse().expect("addr")
-        );
     }
 
     #[test]
@@ -7042,8 +6973,6 @@ mod tests {
                     host: "m22".to_owned(),
                     code: "abcd-ef23-ghij-k234".to_owned(),
                     time: Some(time),
-                    lan: false,
-                    home: None,
                     allowed: None,
                     proof: None,
                 },
@@ -7361,7 +7290,7 @@ mod tests {
         let machine: IpAddr = "192.0.2.10".parse().expect("address");
         let stranger: IpAddr = "192.0.2.66".parse().expect("address");
         let ask = |line: &str, from: IpAddr| {
-            post_join(&running.shared, "alab", line.as_bytes(), from, None).status
+            post_join(&running.shared, "alab", line.as_bytes(), from).status
         };
         let proof = |n: u8| crate::b64::encode_padded(&[n; 32]);
         let key = crate::transport::test_recipient(1);
@@ -7482,7 +7411,7 @@ mod tests {
             let line = format!("{key} {host} {} allowed={allowed}", code(1));
             let from = from.parse().expect("address");
             assert_eq!(
-                post_join(&running.shared, "twice", line.as_bytes(), from, None).status,
+                post_join(&running.shared, "twice", line.as_bytes(), from).status,
                 204
             );
         }
@@ -7738,7 +7667,7 @@ mod tests {
             text,
             format!("peer 192.0.2.7 1\n{one}\n{two}\npeer 2001:db8::7 1\n{three}\n")
         );
-        assert_eq!(join_lines(&queue, &[]), format!("{one}\n{two}\n{three}\n"));
+        assert_eq!(join_lines(&queue), format!("{one}\n{two}\n{three}\n"));
         let triples = |queue: &[Queued]| {
             queue
                 .iter()
@@ -7761,178 +7690,31 @@ mod tests {
         assert_eq!((read[2].peer, read[2].asked), (Some(here), 0));
     }
 
-    /// A request is listed as observed on the home ALab LAN only from this server's own
-    /// observation, and only while this Mac is still on that network: an older build's
-    /// persisted `lan=1` and a private peer restore as no observation, no listing names an
-    /// address, and no listing says `lan=1` (an older approver admits by it alone).
+    /// An older build's store, whose requests carry `lan=1` (any private peer's) or an aterm
+    /// 0.148 or 0.149 server's `home=` tag, restores every request, and no listing or store
+    /// names an address or carries a LAN marker (an older approver admits by one).
     ///
-    /// NEGATIVE CONTROLS: with `join_lines` listing `queued.home` unfiltered by `here`, the
-    /// listing of a Mac that left its home network still says `home=` and this test fails. With
-    /// its `bare` filter dropped, "a carried request lists no home" fails.
+    /// NEGATIVE CONTROL: with `parse_join_line` refusing a ` home=` token in place of reading
+    /// past it, the tagged request does not restore and the count fails.
     #[test]
-    fn home_lan_observations_come_only_from_the_servers_place() {
+    fn an_older_store_restores_with_no_lan_marker_or_address_listed() {
         let request = |n| JoinRequest {
             time: Some(1_792_530_000),
             ..parse_join_line(&join_line(n, &format!("m{n}"))).unwrap()
         };
         let old = format!(
-            "peer 192.168.1.2 1\n{} lan=1\npeer 10.0.0.9 1\n{}\n{}\n",
+            "peer 192.168.1.2 1\n{} lan=1\npeer 10.0.0.9 1\n{}\n{} home=0123456789abcdef\n",
             request(1).listed(),
             request(2).listed(),
             request(3).listed()
         );
         let restored = parse_stored(&old);
         assert_eq!(restored.len(), 3);
-        assert!(restored.iter().all(|queued| queued.home.is_none()));
-        let tag = crate::home_lan::HomeTag::test();
-        let listing = join_lines(&restored, std::slice::from_ref(&tag));
+        for text in [join_lines(&restored), stored_lines(&restored)] {
+            assert!(!text.contains("lan=") && !text.contains("home="), "{text}");
+        }
+        let listing = join_lines(&restored);
         assert!(!listing.contains("192.168") && !listing.contains("10.0.0.9"));
-        assert!(!listing.contains("lan=") && !listing.contains("home="));
-        let forged = vec![queued(
-            JoinRequest {
-                lan: true,
-                home: Some(tag.clone()),
-                ..request(4)
-            },
-            Some("192.0.2.7".parse().unwrap()),
-        )];
-        assert!(!join_lines(&forged, &[]).contains("lan="));
-        assert!(!join_lines(&forged, &[]).contains("home="));
-        let mut observed = queued(request(5), Some("192.168.1.40".parse().unwrap()));
-        observed.home = Some(tag.clone());
-        let at_home = join_lines(std::slice::from_ref(&observed), std::slice::from_ref(&tag));
-        let listed = parse_join_line(at_home.trim()).unwrap();
-        assert_eq!(listed.home.as_ref(), Some(&tag));
-        assert!(!listed.lan && !at_home.contains("192.168"));
-        let moved = join_lines(std::slice::from_ref(&observed), &[]);
-        assert_eq!(
-            parse_join_line(moved.trim()).unwrap().home,
-            None,
-            "moved off"
-        );
-        let elsewhere = crate::home_lan::HomeTag::of(std::net::Ipv4Addr::new(10, 9, 8, 0), 24);
-        let other = join_lines(std::slice::from_ref(&observed), &[elsewhere]);
-        assert_eq!(parse_join_line(other.trim()).unwrap().home, None);
-        // The store never keeps it: a restart observes anew.
-        assert!(!stored_lines(std::slice::from_ref(&observed)).contains("home="));
-        // A request carrying a member's Allow or a password proof lists no `home=`: an older
-        // approver skips a line with a field it does not know, and admits these by what they
-        // carry.
-        for carried in [
-            JoinRequest {
-                allowed: Some("allowed-by-a-member".to_owned()),
-                ..request(6)
-            },
-            JoinRequest {
-                proof: Some("proof-of-the-password".to_owned()),
-                ..request(7)
-            },
-        ] {
-            let mut observed = queued(carried, Some("192.168.1.41".parse().unwrap()));
-            observed.home = Some(tag.clone());
-            let line = join_lines(std::slice::from_ref(&observed), std::slice::from_ref(&tag));
-            assert!(
-                !line.contains("home="),
-                "a carried request lists no home: {line}"
-            );
-        }
-    }
-
-    /// A Mac that asks again once its server is on the home ALab LAN (members heard there) is
-    /// listed at home at once, with its first address and time kept; the listing drops it when
-    /// the server moves off that network (a phone hotspot) and shows it again back home; a
-    /// repeat observed elsewhere does not clear it; and a restarted server observes anew.
-    ///
-    /// NEGATIVE CONTROL: with `decide_join`'s identical-request branch ignoring `home` (no
-    /// update of `queue[at].home`), the repeat at home is never listed and this test fails.
-    #[test]
-    fn a_request_observed_at_home_is_listed_there_only_while_this_mac_is() {
-        let tag = crate::home_lan::HomeTag::test();
-        let home_of = |at: &str| {
-            parse_join_line(&transport::list_joins(at).unwrap()[0])
-                .unwrap()
-                .home
-        };
-        let root = aterm_tempfile::tempdir().unwrap();
-        let opts = options(root.path(), HANG_DETECTOR);
-        let place = Scripted::away();
-        let running = run_at(&opts, Arc::clone(&place));
-        put(&running, &envelope(&OLD, 1)).unwrap();
-        let request = parse_join_line(&join_line(1, "m20")).unwrap();
-        let at = url(&running);
-        transport::post_join(&at, &request.line()).unwrap();
-        assert_eq!(home_of(&at), None, "asked from a hotspot");
-        let (peer, time, generation) = {
-            let state = running.shared.lock_server_state();
-            let queued = &state.joins["alab"][0];
-            (queued.peer, queued.request.time, state.vaults["alab"].joins)
-        };
-        place.at(Some(&tag));
-        transport::post_join(&at, &request.line()).unwrap();
-        assert_eq!(home_of(&at), Some(tag.clone()), "asked again at home");
-        {
-            let state = running.shared.lock_server_state();
-            let queued = &state.joins["alab"][0];
-            assert_eq!((queued.peer, queued.request.time), (peer, time));
-            assert!(state.vaults["alab"].joins > generation);
-        }
-        place.at(None);
-        assert_eq!(home_of(&at), None, "this Mac moved onto a hotspot");
-        assert_eq!(
-            post_join(
-                &running.shared,
-                "alab",
-                request.line().as_bytes(),
-                "192.0.2.8".parse().unwrap(),
-                None,
-            )
-            .status,
-            204
-        );
-        place.at(Some(&tag));
-        assert_eq!(home_of(&at), Some(tag.clone()), "back home, still observed");
-        running.stop();
-        let running = run(&opts);
-        assert_eq!(home_of(&url(&running)), None, "a restart observes anew");
-        running.stop();
-    }
-
-    /// A listing's version moves when this Mac moves onto or off a home ALab LAN network, since
-    /// `home=` is read against where it is: an approver that holds the listing heard while the
-    /// server was away reads the one at home at once, not after an hour's refresh.
-    ///
-    /// NEGATIVE CONTROL: `list_joins` leaving the version alone when `here` changes (its
-    /// `listed_here` comparison read as `false`): the long-poll past the away version is held
-    /// for the whole hold and answers `Unchanged`, and the `Listed` match fails.
-    #[test]
-    fn a_listing_moves_when_this_mac_moves_onto_its_home_network() {
-        let tag = crate::home_lan::HomeTag::test();
-        let root = aterm_tempfile::tempdir().unwrap();
-        let place = Scripted::away();
-        let running = run_at(&options(root.path(), HANG_DETECTOR), Arc::clone(&place));
-        put(&running, &envelope(&OLD, 1)).unwrap();
-        let at = url(&running);
-        place.at(Some(&tag));
-        let request = parse_join_line(&join_line(1, "m20")).unwrap();
-        transport::post_join(&at, &request.line()).unwrap();
-        place.at(None);
-        let transport::Joins::Listed(lines, Some(away)) =
-            transport::wait_joins(&at, None, HANG_DETECTOR).unwrap()
-        else {
-            panic!("a listing with a version");
-        };
-        assert_eq!(parse_join_line(&lines[0]).unwrap().home, None, "away");
-        place.at(Some(&tag));
-        let back = transport::wait_joins(&at, Some(away), HANG_DETECTOR).unwrap();
-        let transport::Joins::Listed(lines, _) = back else {
-            panic!("the listing back home was held: {back:?}");
-        };
-        assert_eq!(
-            parse_join_line(&lines[0]).unwrap().home,
-            Some(tag),
-            "back home"
-        );
-        running.stop();
     }
 
     #[test]
@@ -8262,9 +8044,6 @@ mod tests {
 
     #[test]
     fn a_replaced_program_stops_the_server_and_ends_it_cleanly() {
-        let program = std::env::current_exe().expect("this test's program");
-        assert!(stamp_of(&program).is_some());
-        assert_eq!(stamp_of(&program), stamp_of(&program));
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let running = run(&options(root.path(), 2 * HANG_DETECTOR));
         put(&running, &envelope(&OLD, 1)).expect("first");
@@ -8273,23 +8052,16 @@ mod tests {
         until_waiting(&running, 1);
         let shared = Arc::clone(&running.shared);
         let looks = AtomicUsize::new(0);
-        // The program as started, then its path gone a while (the app moved: no replacement,
-        // the server keeps serving), then another file there.
-        let stamp = || match looks.fetch_add(1, Ordering::SeqCst) {
-            0..3 => Some((1, 1, 0, 0)),
-            3..6 => None,
-            _ => Some((1, 2, 0, 0)),
+        // The shared startup watch initially sees no replacement (including a missing
+        // successor), then finds a replacement and ends the existing long-poll cleanly.
+        let stopping = || {
+            (looks.fetch_add(1, Ordering::SeqCst) >= 6)
+                .then_some("this program was replaced on disk")
         };
-        supervise(
-            running,
-            Duration::from_millis(1),
-            &stamp,
-            &AtomicBool::new(false),
-        )
-        .expect("a clean exit");
+        supervise(running, Duration::from_millis(1), &stopping).expect("a clean exit");
         assert!(
             looks.load(Ordering::SeqCst) >= 7,
-            "served on while the path was gone"
+            "served until the startup watch reported replacement"
         );
         assert!(shared.stopping.load(Ordering::SeqCst));
         assert_eq!(
@@ -8301,36 +8073,21 @@ mod tests {
         });
     }
 
-    /// Another file at the program's path is a replacement; a path gone, or a program never
-    /// stamped, is none.
+    /// The binding watch already detected replacement before supervision began. That first
+    /// result must stop this server, not become a fresh baseline of the replacement file.
     #[test]
-    fn only_another_file_at_the_programs_path_replaces_it() {
-        let (one, two) = (Some((1, 1, 10, 0)), Some((1, 2, 10, 0)));
-        assert!(replaced(one, two));
-        assert!(replaced(one, Some((1, 1, 11, 0))), "rewritten in place");
-        assert!(!replaced(one, one));
-        assert!(!replaced(one, None), "moved or deleted");
-        assert!(!replaced(None, two), "never stamped");
-    }
-
-    /// The stamps of a path a service started from: an update renamed over it is a replacement
-    /// (on Linux too, where the running program's own link then names it deleted); the file moved
-    /// away is none.
-    #[test]
-    fn a_file_renamed_over_the_programs_path_replaces_it_and_one_moved_away_does_not() {
+    fn a_replacement_seen_before_supervision_is_not_taken_as_its_baseline() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
-        let path = root.path().join("aterm");
-        std::fs::write(&path, b"one").expect("written");
-        let was = stamp_of(&path);
-        assert!(was.is_some());
-        let update = root.path().join("aterm.new");
-        std::fs::write(&update, b"two").expect("written");
-        std::fs::rename(&update, &path).expect("renamed over");
-        assert!(replaced(was, stamp_of(&path)), "an update in place");
-        let was = stamp_of(&path);
-        std::fs::rename(&path, root.path().join("moved")).expect("moved away");
-        assert_eq!(stamp_of(&path), None);
-        assert!(!replaced(was, stamp_of(&path)), "moved away");
+        let running = run(&options(root.path(), HANG_DETECTOR));
+        let shared = Arc::clone(&running.shared);
+        let looked = AtomicBool::new(false);
+        supervise(running, HANG_DETECTOR, &|| {
+            assert!(!looked.swap(true, Ordering::SeqCst), "one read suffices");
+            Some("this program was replaced during startup")
+        })
+        .unwrap();
+        assert!(looked.load(Ordering::SeqCst));
+        assert!(shared.stopping.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -8345,7 +8102,11 @@ mod tests {
         let signalled = Arc::new(AtomicBool::new(false));
         let supervisor = {
             let signalled = Arc::clone(&signalled);
-            std::thread::spawn(move || supervise(running, 2 * HANG_DETECTOR, &|| None, &signalled))
+            std::thread::spawn(move || {
+                supervise(running, 2 * HANG_DETECTOR, &|| {
+                    stop_reason(&signalled, false)
+                })
+            })
         };
         signalled.store(true, Ordering::SeqCst);
         supervisor.thread().unpark();
@@ -8622,7 +8383,7 @@ mod tests {
                 }),
                 spawn: Box::new(move |_, _, _, _| quiet(&sleep, &["60".to_owned()])),
                 every: ADVERTISE_EVERY,
-                power: Box::new(|_, _| false),
+                power: Box::new(|_| None),
                 end_for_sleep: Arc::new(end),
                 sleep_bound: SLEEP_YIELD_BOUND,
                 probe: |_, _, _, _, _, _| None,
@@ -8713,7 +8474,7 @@ mod tests {
                 }),
                 spawn: Box::new(move |_, _, _, _| quiet(&sleep, &["60".to_owned()])),
                 every: ADVERTISE_EVERY,
-                power: Box::new(|_, _| false),
+                power: Box::new(|_| None),
                 end_for_sleep: Arc::new(end),
                 sleep_bound: SLEEP_YIELD_BOUND,
                 probe: |_, _, _, _, _, _| None,
@@ -9120,7 +8881,7 @@ mod tests {
                 quiet(&sleep, &["60".to_owned()])
             }),
             every: Duration::from_secs(3600),
-            power: Box::new(|_, _| false),
+            power: Box::new(|_| None),
             end_for_sleep: Arc::new(end),
             sleep_bound: SLEEP_YIELD_BOUND,
             probe: |_, _, _, _, _, _| None,
@@ -9891,9 +9652,9 @@ mod tests {
                 every: Duration::from_secs(3600),
                 power: Box::new({
                     let heard = Arc::clone(&heard);
-                    move |_, handler| {
+                    move |handler| {
                         *heard.lock().expect("heard") = Some(handler);
-                        true
+                        Some(aterm_uds::power::Listening::inert())
                     }
                 }),
                 end_for_sleep: Arc::new(end),
@@ -11007,8 +10768,8 @@ mod tests {
     /// a file an earlier build filled reads as empty (while serving and at a restart), and the
     /// pinned key's genesis with a record beside it is kept and read back after a restart.
     /// NEGATIVE CONTROL: without `post_records`' no-genesis check (main before this fix) the
-    /// junk POST to ALab answers 204 ("junk POST to alab: 204"); with `kept_records` keeping what
-    /// it decoded (main before this fix), the file an earlier build filled reads back with its
+    /// junk POST to ALab answers 204 ("junk POST to alab: 204"); with an unrooted file load
+    /// keeping what it decoded (main before this fix), the file an earlier build filled reads back with its
     /// junk ("the server kept a records file's junk").
     #[test]
     fn a_store_with_no_genesis_takes_posted_records_only_with_the_genesis_that_roots_them() {
@@ -12765,6 +12526,130 @@ mod tests {
         assert_eq!(failed, 500, "a POST wrote though its look failed");
         assert_eq!(retried, 204);
         assert!(log.get(later.id()).is_some(), "the retry wrote nothing");
+    }
+
+    #[test]
+    fn a_changed_cold_records_read_keeps_the_previous_slot_retryable() {
+        use crate::membership_log::encode_records;
+
+        for existing_slot in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let path = root.path().join("team.records");
+            let mut founded = Founded::new();
+            let first = founded.mint(5_000, "first");
+            fsx::write_atomic(&path, &encode_records([&founded.genesis, &first]), 0o600).unwrap();
+            let mut state = State::default();
+            if existing_slot {
+                look_at_records(&mut state, "team", &path, None).unwrap();
+            }
+            let before = state.records.get("team").map(|slot| {
+                (
+                    slot.store.encode(),
+                    slot.store.keys().map(<[_]>::to_vec),
+                    slot.stamp,
+                    slot.on_file,
+                    Arc::clone(&slot.wake),
+                )
+            });
+            let next = founded.mint(5_001, "next");
+            fsx::write_atomic(
+                &path,
+                &encode_records([&founded.genesis, &first, &next]),
+                0o600,
+            )
+            .unwrap();
+            let outcome =
+                look_at_records_with(&mut state, "team", &path, Some(&[[99; 32]]), || {
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(b"!")
+                        .unwrap();
+                });
+            assert!(matches!(outcome, Err(fsx::Unread::Failed(_))));
+            match before {
+                Some((bytes, keys, stamp, on_file, wake)) => {
+                    let slot = &state.records["team"];
+                    assert_eq!(slot.store.encode(), bytes);
+                    assert_eq!(slot.store.keys(), keys.as_deref());
+                    assert_eq!(slot.stamp, stamp);
+                    assert_eq!(slot.on_file, on_file);
+                    assert!(Arc::ptr_eq(&slot.wake, &wake));
+                }
+                None => assert!(!state.records.contains_key("team")),
+            }
+            // Failed did not memoize the changed file. A fresh read accepts its valid prefix.
+            look_at_records(&mut state, "team", &path, None).unwrap();
+            let slot = &state.records["team"];
+            assert!(slot.store.complete_bytes(next.id()).is_some());
+            assert_eq!(slot.on_file, None, "the trailing byte is not on-file proof");
+        }
+    }
+
+    #[test]
+    fn a_cold_records_file_past_the_bound_is_refused_whole_and_retried_after_change() {
+        use crate::membership_log::{MAX_RECORDS_STREAM, encode_records};
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let path = root.path().join("team.records");
+        let founded = Founded::new();
+        let bytes = encode_records([&founded.genesis]);
+        fsx::write_atomic(&path, &bytes, 0o600).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_RECORDS_STREAM as u64 + 1)
+            .unwrap();
+        let mut state = State::default();
+        assert!(matches!(
+            look_at_records(&mut state, "team", &path, None),
+            Err(fsx::Unread::Refused(_))
+        ));
+        let slot = &state.records["team"];
+        assert!(
+            slot.store.is_empty(),
+            "a prefix of an oversized file is not accepted"
+        );
+        assert_eq!(slot.stamp, fsx::stamp(&path));
+        assert_eq!(slot.on_file, None);
+        let reads = fsx::reads_of(&path);
+        look_at_records(&mut state, "team", &path, None).unwrap();
+        assert_eq!(fsx::reads_of(&path), reads, "stable refusal is remembered");
+
+        fsx::write_atomic(&path, &bytes, 0o600).unwrap();
+        look_at_records(&mut state, "team", &path, None).unwrap();
+        let slot = &state.records["team"];
+        assert_eq!(slot.store.encode(), bytes);
+        assert_eq!(slot.on_file, Some(1));
+    }
+
+    #[test]
+    fn a_dormant_records_slot_reopens_the_same_file_after_its_trust_changes() {
+        use crate::membership_log::Body as RecordBody;
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let path = root.path().join("team.records");
+        let founded = Founded::new();
+        let RecordBody::Genesis { signer, .. } = founded.genesis.body() else {
+            panic!("fixture genesis");
+        };
+        fsx::write_atomic(&path, founded.genesis.bytes(), 0o600).unwrap();
+        let mut state = State::default();
+        look_at_records(&mut state, "team", &path, Some(&[[99; 32]])).unwrap();
+        let stamp = state.records["team"].stamp;
+        assert!(state.records["team"].store.log().is_none());
+        assert!(state.records["team"].store.is_empty());
+        let reads = fsx::reads_of(&path);
+        look_at_records(&mut state, "team", &path, Some(&[[99; 32]])).unwrap();
+        assert_eq!(fsx::reads_of(&path), reads);
+        look_at_records(&mut state, "team", &path, Some(&[*signer])).unwrap();
+        let slot = &state.records["team"];
+        assert_eq!(slot.stamp, stamp, "the file itself did not change");
+        assert!(slot.store.log().is_some());
+        assert_eq!(slot.on_file, Some(1));
+        assert_eq!(fsx::reads_of(&path), reads + 1);
     }
 
     /// F23 review 3: a look while a POST appends (each parked long-poll's liveness tick, any

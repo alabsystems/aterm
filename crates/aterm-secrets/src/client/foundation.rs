@@ -16,7 +16,9 @@ const PREPARED: &str = "commons-foundation";
 /// open approval included (`enrollment::include_approved`), and counts an `Open` decision as
 /// admission. An approver before it records `Open` for a machine an open vault lets in but
 /// leaves it outside the control entry's audience, which a later aterm reads as an admin's
-/// explicit exclusion, so no aterm ever shares the root with it.
+/// explicit exclusion, so no aterm ever shares the root with it. Since aterm 0.150 an approver
+/// lets no Mac in by an open vault's policy at all; this guards against the older ones still
+/// running.
 const SHARES_ON_OPEN: locker_skew::Version = (0, 145, 0);
 
 /// Why this Mac's approver would leave each Mac it lets in after a founding by default outside
@@ -175,7 +177,8 @@ fn vouched(admin: &Admin, doc: &Document) -> Vec<text::Machine> {
 /// way it came in can be told: on a closed vault, and for this admin's own machine and a key on a
 /// `code-only` line (which an open vault's approver never lets in by itself), the admin's
 /// `Manual`; on an open vault every other one as the vault's standing approval (`Open`), since
-/// its approver may have let it in with nobody approving it. A `Manual` there would say a person
+/// it may have come in with nobody approving it (`aterm secrets password open`, or an approver
+/// before aterm 0.150 that let a Mac in by the open policy). A `Manual` there would say a person
 /// approved a machine nobody did, and the anchored credentials (identity, roster, agh token,
 /// Name) key on that boundary, which a later revocation alone could narrow again; `Open` admits
 /// to Commons all the same ([`admission::Ledger::permits`]), and a person's later approval

@@ -3,14 +3,16 @@
 
 //! What tells a parked setup run that a fact it reads may have moved, with no timer
 //! ([`super::InitialSetupParkMark::watches`]): the secrets folder changing (the subscriber's
-//! `state.toml`, a join's identity or source), this Mac's network addresses changing (a route
-//! socket's address and interface messages), and a `git` arriving (the Command Line Tools' or
+//! `state.toml`, a join's identity or source, and materialized `~/.secrets` files), this Mac's
+//! network addresses changing (a route socket's address and interface messages), and a `git`
+//! arriving (the Command Line Tools' or
 //! Xcode's). A watch only
 //! says "look again": the park reads its mark again and runs a pass only when a fact changed.
 //! Each watch lets a burst settle before it says so, and the network watch says so at most once a
 //! minute, so an interface that keeps going up and down moves a park no more often than the
 //! minute's timer the watches replaced.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -71,14 +73,14 @@ impl ParkWatch {
         if watches.secrets {
             let home = aterm_types::dirs::home_dir()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))?;
-            folders.push((home.join(".config/aterm/secrets"), home.join(".config")));
+            folders.extend(secrets_folders(&home));
         }
         if watches.developer_tools {
             let tools = Path::new(aterm_machines::items::github::CLT_GIT)
                 .parent()
                 .map_or_else(PathBuf::new, Path::to_path_buf);
-            folders.push((tools, PathBuf::from("/Library")));
-            folders.push((PathBuf::from(XCODE_BIN), PathBuf::from("/Applications")));
+            folders.push((tools, PathBuf::from("/Library")).into());
+            folders.push((PathBuf::from(XCODE_BIN), PathBuf::from("/Applications")).into());
         }
         if !folders.is_empty() {
             watch.files = Some(watch_folders(
@@ -129,54 +131,172 @@ fn lose(stop: &AtomicBool, lost: &AtomicBool, changed: fn()) {
 
 /// The deepest folder that exists on the way to `target`, no higher than `floor`: watching it
 /// sees the next folder on the way appear, and the target's own entries once it is there.
-fn nearest(target: &Path, floor: &Path) -> Option<PathBuf> {
+fn nearest(target: &Path, floor: &Path, follow_links: bool) -> Option<PathBuf> {
     target
         .ancestors()
         .take_while(|folder| folder.starts_with(floor))
-        .find(|folder| folder.is_dir())
+        .find(|folder| {
+            if follow_links {
+                folder.is_dir()
+            } else {
+                std::fs::symlink_metadata(folder).is_ok_and(|meta| meta.is_dir())
+            }
+        })
         .map(Path::to_path_buf)
 }
 
-/// The folders a park watches: each target's nearest existing folder ([`nearest`]), moved deeper
-/// as folders on the way appear.
+struct FolderTarget {
+    target: PathBuf,
+    floor: PathBuf,
+    follow_links: bool,
+}
+
+impl From<(PathBuf, PathBuf)> for FolderTarget {
+    fn from((target, floor): (PathBuf, PathBuf)) -> Self {
+        Self {
+            target,
+            floor,
+            follow_links: true,
+        }
+    }
+}
+
+/// State writes and output repairs can happen independently. Watch both, following missing
+/// parents from home. Materialization refuses a symlink at `~/.secrets`, so watch its parent
+/// until a real directory replaces it rather than opening the link's destination.
+fn secrets_folders(home: &Path) -> Vec<FolderTarget> {
+    vec![
+        (home.join(".config/aterm/secrets"), home.to_path_buf()).into(),
+        FolderTarget {
+            target: home.join(".secrets"),
+            floor: home.to_path_buf(),
+            follow_links: false,
+        },
+    ]
+}
+
+struct ArmedFolder {
+    resolved: PathBuf,
+    id: atpkg::dirwatch::WatchId,
+}
+
+/// Each target and its existing parent chain. Parents keep hearing namespace changes after
+/// the destination appears, including a config link retargeted while its old destination lives.
 struct Folders {
-    /// Each `(target, floor)`.
-    targets: Vec<(PathBuf, PathBuf)>,
-    /// What each target's watch is on now.
+    targets: Vec<FolderTarget>,
+    /// The nearest directory each target currently reaches.
     watched: Vec<Option<(PathBuf, atpkg::dirwatch::WatchId)>>,
+    armed: BTreeMap<PathBuf, ArmedFolder>,
 }
 
 impl Folders {
-    fn new(targets: Vec<(PathBuf, PathBuf)>) -> Self {
+    fn new(targets: Vec<FolderTarget>) -> Self {
         let watched = targets.iter().map(|_| None).collect();
-        Self { targets, watched }
+        Self {
+            targets,
+            watched,
+            armed: BTreeMap::new(),
+        }
     }
 
     /// Put each target's watch on its nearest existing folder now. A watch moves only once its
     /// new folder is watched, so one that cannot follow keeps the folder it had; and a folder
     /// that appeared on the way while the watch moved moves it again, since no watch saw it come.
     fn arm(&mut self, watcher: &atpkg::dirwatch::Watcher) -> io::Result<()> {
-        for ((target, floor), slot) in self.targets.iter().zip(self.watched.iter_mut()) {
-            loop {
-                let want = nearest(target, floor);
-                if slot.as_ref().map(|(folder, _)| folder) == want.as_ref() {
-                    break;
-                }
-                // A folder reached through a symbolic link (a `~/.config` kept elsewhere) is
-                // watched where it is: the kernel watch opens no link.
-                let added = match want {
-                    Some(folder) => {
-                        let id = watcher.add_dir(&folder.canonicalize()?)?;
-                        Some((folder, id))
+        self.arm_after(watcher, &BTreeSet::new())
+    }
+
+    /// A signaled directory can have been replaced at the same path. Open its current object
+    /// before releasing the old watch; a rename does not make the old object cease to exist.
+    fn arm_after(
+        &mut self,
+        watcher: &atpkg::dirwatch::Watcher,
+        fired: &BTreeSet<atpkg::dirwatch::WatchId>,
+    ) -> io::Result<()> {
+        loop {
+            let coverage: Vec<_> = self
+                .targets
+                .iter()
+                .map(|target| nearest(&target.target, &target.floor, target.follow_links))
+                .collect();
+            let mut wanted = BTreeMap::<PathBuf, bool>::new();
+            for (target, closest) in self.targets.iter().zip(&coverage) {
+                if let Some(closest) = closest {
+                    for folder in closest
+                        .ancestors()
+                        .take_while(|folder| folder.starts_with(&target.floor))
+                    {
+                        // The materialized root itself refuses links. Its parents, including
+                        // the login's home path, retain their ordinary path resolution.
+                        let follow = target.follow_links || folder != target.target.as_path();
+                        wanted
+                            .entry(folder.to_path_buf())
+                            .and_modify(|links| *links &= follow)
+                            .or_insert(follow);
                     }
-                    None => None,
-                };
-                if let Some((_, id)) = std::mem::replace(slot, added) {
-                    watcher.remove(id);
                 }
             }
+            // A parent can have a new object at the same spelling. Rebind its descendants
+            // even when their canonical strings are unchanged after a directory replacement.
+            let changed: Vec<_> = self
+                .armed
+                .iter()
+                .filter(|(_, on)| fired.contains(&on.id) || watcher.is_gone(on.id))
+                .map(|(path, _)| path.clone())
+                .collect();
+            let mut next = BTreeMap::new();
+            let mut added = Vec::new();
+            let result = (|| -> io::Result<()> {
+                // Prefix paths sort before their children, so parents are armed first.
+                for (path, follow) in wanted {
+                    let resolved = if follow {
+                        path.canonicalize()?
+                    } else {
+                        path.clone()
+                    };
+                    let keep = self.armed.get(&path).filter(|on| {
+                        on.resolved == resolved
+                            && !changed.iter().any(|parent| path.starts_with(parent))
+                    });
+                    let id = if let Some(on) = keep {
+                        on.id
+                    } else {
+                        let id = watcher.add_dir(&resolved)?;
+                        added.push(id);
+                        id
+                    };
+                    next.insert(path, ArmedFolder { resolved, id });
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                for id in added {
+                    watcher.remove(id);
+                }
+                return Err(error);
+            }
+            let kept: BTreeSet<_> = next.values().map(|on| on.id).collect();
+            for on in self.armed.values() {
+                if !kept.contains(&on.id) {
+                    watcher.remove(on.id);
+                }
+            }
+            self.armed = next;
+            self.watched = coverage
+                .iter()
+                .map(|path| {
+                    path.as_ref()
+                        .and_then(|path| self.armed.get(path).map(|on| (path.clone(), on.id)))
+                })
+                .collect();
+            // Creation before a parent was first armed must not leave the new directory
+            // unwatched. Later creations are heard by the retained parent watches.
+            if self.targets.iter().zip(coverage).all(|(target, before)| {
+                nearest(&target.target, &target.floor, target.follow_links) == before
+            }) {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 }
 
@@ -190,7 +310,7 @@ const FILES_SETTLE_MOST: Duration = Duration::from_secs(2);
 /// Watch `targets` ([`Folders`]) and call `changed` once each burst of changes settles, until
 /// `stop`; a watch that fails is `lost` ([`lose`]).
 fn watch_folders(
-    targets: Vec<(PathBuf, PathBuf)>,
+    targets: Vec<FolderTarget>,
     stop: Arc<AtomicBool>,
     lost: Arc<AtomicBool>,
     changed: fn(),
@@ -210,26 +330,35 @@ fn watch_folders(
         .name("aterm-setup-park-files".into())
         .spawn(move || {
             while !stop.load(Ordering::Acquire) {
-                if thread_watcher.wait(None).is_err() {
-                    lose(&stop, &lost, changed);
-                    return;
-                }
+                let mut fired: BTreeSet<_> = match thread_watcher.wait(None) {
+                    Ok(fired) => fired.into_iter().collect(),
+                    Err(_) => {
+                        lose(&stop, &lost, changed);
+                        return;
+                    }
+                };
                 let settle = Instant::now() + FILES_SETTLE_MOST;
-                while !stop.load(Ordering::Acquire)
-                    && Instant::now() < settle
-                    && thread_watcher
-                        .wait(Some(FILES_SETTLE))
-                        .is_ok_and(|fired| !fired.is_empty())
-                {}
+                while !stop.load(Ordering::Acquire) && Instant::now() < settle {
+                    match thread_watcher.wait(Some(FILES_SETTLE)) {
+                        Ok(batch) if !batch.is_empty() => fired.extend(batch),
+                        Ok(_) => break,
+                        Err(_) => {
+                            lose(&stop, &lost, changed);
+                            return;
+                        }
+                    }
+                }
                 if stop.load(Ordering::Acquire) {
                     return;
                 }
                 // A folder that appeared moves its watch deeper before the park looks again.
-                if folders.arm(&thread_watcher).is_err() {
+                if folders.arm_after(&thread_watcher, &fired).is_err()
+                    || folders.watched.iter().any(Option::is_none)
+                {
                     lose(&stop, &lost, changed);
-                } else {
-                    changed();
+                    return;
                 }
+                changed();
             }
         })?;
     Ok(watcher)
@@ -388,7 +517,7 @@ mod tests {
         let floor = home.path().join(".config");
         let target = floor.join("aterm/secrets");
         let watcher = atpkg::dirwatch::Watcher::new().unwrap();
-        let mut folders = Folders::new(vec![(target.clone(), floor.clone())]);
+        let mut folders = Folders::new(vec![(target.clone(), floor.clone()).into()]);
         let on = |folders: &Folders| {
             folders.watched[0]
                 .as_ref()
@@ -424,7 +553,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let lost = Arc::new(AtomicBool::new(false));
         let watcher = watch_folders(
-            vec![(target.clone(), floor)],
+            vec![(target.clone(), floor).into()],
             Arc::clone(&stop),
             Arc::clone(&lost),
             fired,
@@ -433,6 +562,195 @@ mod tests {
         std::fs::write(target.join("state.toml"), "seq = 1\n").unwrap();
         until("the watch never fired", || FIRED.load(Ordering::SeqCst) > 0);
         assert!(!lost.load(Ordering::Acquire));
+        stop.store(true, Ordering::Release);
+        watcher.wake().unwrap();
+    }
+
+    static MATERIALIZED_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+    fn materialized_fired() {
+        MATERIALIZED_FIRED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_materialized_file_repair_wakes_without_a_vault_state_write() {
+        let home = aterm_tempfile::TempDir::new().unwrap();
+        let state_dir = home.path().join(".config/aterm/secrets");
+        let output = home.path().join(".secrets");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        let state = state_dir.join("state.toml");
+        std::fs::write(&state, "seq = 7\n").unwrap();
+        let credential = output.join("test_credential");
+        std::fs::write(&credential, "before").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
+        let watcher = watch_folders(
+            secrets_folders(home.path()),
+            Arc::clone(&stop),
+            Arc::clone(&lost),
+            materialized_fired,
+        )
+        .unwrap();
+        let replacement = output.join("replacement");
+        std::fs::write(&replacement, "after").unwrap();
+        std::fs::rename(replacement, credential).unwrap();
+        until("the materialized repair was never heard", || {
+            MATERIALIZED_FIRED.load(Ordering::SeqCst) > 0
+        });
+        assert_eq!(std::fs::read_to_string(state).unwrap(), "seq = 7\n");
+        assert!(!lost.load(Ordering::Acquire));
+        stop.store(true, Ordering::Release);
+        watcher.wake().unwrap();
+    }
+
+    #[test]
+    fn a_materialized_root_symlink_is_watched_at_its_parent() {
+        let home = aterm_tempfile::TempDir::new().unwrap();
+        let elsewhere = aterm_tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), home.path().join(".secrets")).unwrap();
+        let watcher = atpkg::dirwatch::Watcher::new().unwrap();
+        let mut folders = Folders::new(secrets_folders(home.path()));
+        folders.arm(&watcher).unwrap();
+        assert_eq!(
+            folders.watched[1].as_ref().map(|(path, _)| path.as_path()),
+            Some(home.path()),
+            "materialization refuses the symlink; only its replacement can make progress"
+        );
+    }
+
+    static REPLACED_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+    fn replaced_fired() {
+        REPLACED_FIRED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_replaced_directory_keeps_hearing_its_new_contents() {
+        let home = aterm_tempfile::TempDir::new().unwrap();
+        let target = home.path().join("watched");
+        std::fs::create_dir(&target).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
+        let watcher = watch_folders(
+            vec![(target.clone(), home.path().to_path_buf()).into()],
+            Arc::clone(&stop),
+            Arc::clone(&lost),
+            replaced_fired,
+        )
+        .unwrap();
+        std::fs::rename(&target, home.path().join("previous")).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        until("the directory replacement was never heard", || {
+            REPLACED_FIRED.load(Ordering::SeqCst) > 0
+        });
+        assert!(!lost.load(Ordering::Acquire));
+        let before = REPLACED_FIRED.load(Ordering::SeqCst);
+        std::fs::write(target.join("state.toml"), "seq = 2\n").unwrap();
+        until("the watch stayed on the renamed old directory", || {
+            REPLACED_FIRED.load(Ordering::SeqCst) > before
+        });
+        assert!(!lost.load(Ordering::Acquire));
+        stop.store(true, Ordering::Release);
+        watcher.wake().unwrap();
+    }
+
+    static RETARGET_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+    fn retarget_fired() {
+        RETARGET_FIRED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_retargeted_config_link_keeps_hearing_the_new_vault() {
+        let home = aterm_tempfile::TempDir::new().unwrap();
+        let first = aterm_tempfile::TempDir::new().unwrap();
+        let second = aterm_tempfile::TempDir::new().unwrap();
+        for root in [first.path(), second.path()] {
+            std::fs::create_dir_all(root.join("aterm/secrets")).unwrap();
+        }
+        std::fs::create_dir(home.path().join(".secrets")).unwrap();
+        let config = home.path().join(".config");
+        std::os::unix::fs::symlink(first.path(), &config).unwrap();
+        let replacement = home.path().join("next-config");
+        std::os::unix::fs::symlink(second.path(), &replacement).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
+        let watcher = watch_folders(
+            secrets_folders(home.path()),
+            Arc::clone(&stop),
+            Arc::clone(&lost),
+            retarget_fired,
+        )
+        .unwrap();
+        std::fs::rename(replacement, config).unwrap();
+        until("the config link retarget was never heard", || {
+            RETARGET_FIRED.load(Ordering::SeqCst) > 0
+        });
+        let before = RETARGET_FIRED.load(Ordering::SeqCst);
+        std::fs::write(second.path().join("aterm/secrets/state.toml"), "seq = 2\n").unwrap();
+        until(
+            "the watch stayed on the previous config destination",
+            || RETARGET_FIRED.load(Ordering::SeqCst) > before,
+        );
+        assert!(!lost.load(Ordering::Acquire));
+        stop.store(true, Ordering::Release);
+        watcher.wake().unwrap();
+    }
+
+    #[test]
+    fn a_parent_replacement_rebinds_the_descendant_watch() {
+        let home = aterm_tempfile::TempDir::new().unwrap();
+        let parent = home.path().join("config");
+        let target = parent.join("aterm/secrets");
+        std::fs::create_dir_all(&target).unwrap();
+        let watcher = atpkg::dirwatch::Watcher::new().unwrap();
+        let mut folders = Folders::new(vec![(target.clone(), home.path().to_path_buf()).into()]);
+        folders.arm(&watcher).unwrap();
+        std::fs::rename(parent, home.path().join("previous-config")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let fired: BTreeSet<_> = watcher
+            .wait(Some(Duration::from_secs(60)))
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(!fired.is_empty(), "a parent must hear the namespace change");
+        folders.arm_after(&watcher, &fired).unwrap();
+        let current = folders.watched[0].as_ref().unwrap().1;
+        std::fs::write(target.join("state.toml"), "seq = 3\n").unwrap();
+        until("the descendant watch stayed on the old parent", || {
+            watcher
+                .wait(Some(Duration::ZERO))
+                .unwrap()
+                .contains(&current)
+        });
+    }
+
+    static FLOOR_LOST_TOLD: AtomicUsize = AtomicUsize::new(0);
+
+    fn floor_lost_told() {
+        FLOOR_LOST_TOLD.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_missing_watch_floor_returns_the_fallback_timer() {
+        let home = aterm_tempfile::TempDir::new().unwrap();
+        let floor = home.path().join("floor");
+        std::fs::create_dir(&floor).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
+        let watcher = watch_folders(
+            vec![(floor.clone(), floor.clone()).into()],
+            Arc::clone(&stop),
+            Arc::clone(&lost),
+            floor_lost_told,
+        )
+        .unwrap();
+        std::fs::remove_dir(floor).unwrap();
+        until(
+            "a park with no remaining watch must regain its timer",
+            || lost.load(Ordering::Acquire) && FLOOR_LOST_TOLD.load(Ordering::SeqCst) > 0,
+        );
         stop.store(true, Ordering::Release);
         watcher.wake().unwrap();
     }
@@ -454,7 +772,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let lost = Arc::new(AtomicBool::new(false));
         let watcher = watch_folders(
-            vec![(floor.join("aterm/secrets"), floor.clone())],
+            vec![(floor.join("aterm/secrets"), floor.clone()).into()],
             Arc::clone(&stop),
             Arc::clone(&lost),
             lost_told,
@@ -464,9 +782,8 @@ mod tests {
         std::fs::create_dir(&unreadable).unwrap();
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
         until("the watch never said it was lost", || {
-            lost.load(Ordering::Acquire)
+            lost.load(Ordering::Acquire) && LOST_TOLD.load(Ordering::SeqCst) > 0
         });
-        assert!(LOST_TOLD.load(Ordering::SeqCst) > 0, "the park was told");
         stop.store(true, Ordering::Release);
         watcher.wake().unwrap();
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();

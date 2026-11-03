@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The only two holder sources: an explicit local give, or a compiled catalog path.
+//! Holder sources are an explicit local give, a compiled catalog path, or one
+//! exact component of the authenticated registered mailbox source after custody.
 //! No packet, record, entry name or environment variable chooses a path to read.
 
 use super::*;
@@ -105,6 +106,23 @@ pub(super) fn read(
             return Values::decode(&bytes[HEADER..]).map_err(crate::table::failure);
         }
     }
+    if let Want::MailboxComponent(component) = &thread.want {
+        let entry = component.entry();
+        let file = paths.home.join(".secrets").join(&entry);
+        let value = fsx::read_private(&file, MAX_VALUE)
+            .map_err(crate::table::failure)?
+            .filter(|value| value::is_line(value.as_slice()));
+        let value = match value {
+            Some(value) => Some(value),
+            None => client::read_mailbox_component(paths, *component)
+                .map_err(crate::table::failure)?
+                .filter(|value| value::is_line(value.as_slice())),
+        }
+        .ok_or_else(|| Error::new("the registered mailbox component is absent or changed"))?;
+        let values = Values(vec![(entry, value)]);
+        values.encode().map_err(crate::table::failure)?;
+        return Ok(values);
+    }
     let first = thread
         .want
         .hold_path(&paths.home)
@@ -116,7 +134,10 @@ pub(super) fn read(
     let mut values = vec![(thread.want.entries()[0].clone(), value)];
     if let Want::Mailbox(label) = &thread.want {
         let totp = paths.home.join(".secrets").join(format!("{label}_totp"));
-        if let Some(value) = fsx::read_private(&totp, MAX_VALUE).map_err(crate::table::failure)? {
+        if let Some(value) = fsx::read_private(&totp, MAX_VALUE)
+            .map_err(crate::table::failure)?
+            .filter(|value| value::is_line(value.as_slice()))
+        {
             values.push((format!("{label}_totp"), value));
         }
     }

@@ -5,6 +5,104 @@ use super::*;
 use crate::{catalog::Directory, table::tests::repair_commons};
 
 #[test]
+fn conflict_inventory_defers_until_all_primary_proofs_reach_recovery() {
+    let lab = Lab::new(&[Role::Writer; BATCH + 3]);
+    let bootstrap = lab.bootstrap(0);
+    let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+    let session = Session::open(&bootstrap).unwrap();
+    let scope = directory
+        .open_application(&session, "conflict-preparation", "rows", 1)
+        .unwrap();
+    drop(session);
+
+    let mut proofs = Vec::new();
+    for actor in 1..=BATCH + 1 {
+        let author = lab.bootstrap(actor);
+        let session = Session::open(&author).unwrap();
+        let own = Directory::new(&lab.paths[actor], author.trust());
+        assert_eq!(
+            own.open_application(&session, "conflict-preparation", "rows", 1)
+                .unwrap(),
+            scope
+        );
+        let mut store = own.open_store(&session, scope).unwrap();
+        let receipt = store.commit_catalog(&session, b"proof source").unwrap();
+        let first = store.wire(&session, &receipt.id).unwrap().unwrap();
+        let mut second = first.to_vec();
+        let end = second.len() - 64;
+        second[end - 1] ^= 1;
+        crate::table::tests::resign(&author, &mut second);
+        proofs.push(
+            crate::table::conflict::Conflict::from_pair(&session, scope, first, &second)
+                .unwrap()
+                .wire()
+                .to_vec(),
+        );
+    }
+
+    let session = Session::open(&bootstrap).unwrap();
+    let mut primary = directory.open_store(&session, scope).unwrap();
+    for proof in &proofs {
+        primary.ingest_conflict(&session, proof).unwrap();
+    }
+    let expected = primary.proof_inventory(&session).unwrap();
+    assert_eq!(expected.len(), BATCH + 1);
+    directory.recovery().enroll(&session, scope).unwrap();
+    let tables = directory
+        .existing_subscriptions(&session, &crate::catalog::policy::Policy::default())
+        .unwrap()
+        .unwrap();
+    drop((primary, session));
+
+    let primary_before = crate::tests::files(&directory.path(scope).unwrap());
+    let peer = lab
+        .bootstrap(BATCH + 2)
+        .request()
+        .unwrap()
+        .binding()
+        .actor();
+    let replica = Replica::commons(lab.paths[0].clone(), lab.paths[0].home.join("config")).unwrap();
+    let mut round = replica.round(peer).unwrap();
+    round.tables = tables;
+    round.active_table.set(Some(scope.digest()));
+    for (retained, incomplete) in [(BATCH, true), (BATCH + 1, false), (BATCH + 1, false)] {
+        // The peer declines its own inventory, so this call ends after the
+        // local readiness/proof response without another application batch.
+        let mut stream = Cursor::new(vec![0]);
+        let mut repair = Repair::default();
+        let mut report = Report::default();
+        assert!(
+            !round
+                .conflicts(
+                    &mut stream,
+                    peer,
+                    Side::Responder,
+                    scope.digest(),
+                    &mut repair,
+                    &mut report
+                )
+                .unwrap()
+        );
+        let bytes = stream.into_inner();
+        let offered = receive_inventory::<81>(&mut Cursor::new(&bytes[1..]), MAX_PROOFS).unwrap();
+        assert_eq!(offered, (!incomplete).then(|| expected.clone()));
+        assert_eq!(
+            repair.deferral.unwrap().retaining_primary_conflicts,
+            incomplete
+        );
+        assert!(report.recovery);
+        let session = Session::observe(&bootstrap).unwrap();
+        let recovery = directory
+            .recovery()
+            .observe_store_if_exists(&session, scope)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovery.proof_inventory(&session).unwrap().len(), retained);
+        assert!(crate::tests::files(&directory.path(scope).unwrap()) == primary_before);
+    }
+}
+
+#[test]
 fn recovery_obeys_disabled_and_excluded_policy_without_replacing_either_catalog() {
     for disabled in [true, false] {
         let lab = Lab::new(&[Role::Writer, Role::Writer]);

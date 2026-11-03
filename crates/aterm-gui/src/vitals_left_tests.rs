@@ -386,6 +386,110 @@ fn a_dead_record_gets_one_dead_seen_line() {
     assert_eq!(seen, ["dead_seen uniqueid=1000 at=1000"], "{text}");
 }
 
+#[test]
+fn a_failed_dead_seen_write_stays_pending_until_it_is_recorded() {
+    let dir = aterm_tempfile::tempdir().expect("scratch rendezvous");
+    let path = dir.path().join("77-1792000000000077.run");
+    let header =
+        "run v=1 boot=b id=77-1792000000000077 uniqueid=900 start=1 sid=-\nroot path=/usr/bin\n";
+    std::fs::write(&path, header).unwrap();
+    let fake = world();
+    fake.add(2606, 1, 950, None);
+    fake.procs
+        .lock()
+        .unwrap()
+        .get_mut(&2606)
+        .unwrap()
+        .markers
+        .verify_run = Some("77-1792000000000077".to_owned());
+    let mut pass = pass(&fake, Some(dir.path().to_path_buf()));
+    pass.refresh_records(900);
+    assert_eq!(pass.records.list.len(), 1);
+
+    // A failed refresh retains the last admitted record, whose pending horizon must not be
+    // marked recorded when the subsequent write is refused too.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let failed = tick(&mut pass, &fake, 1_000, true);
+    assert_eq!(pass.records.list[0].1.dead_seen, None);
+    assert_eq!(pass.records.list[0].1.dead_seen_ms, None);
+    assert!(
+        failed
+            .rows
+            .iter()
+            .find(|row| row.pid == 2606)
+            .unwrap()
+            .token
+            .is_none()
+    );
+
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, header).unwrap();
+    fake.add(2607, 1, 1600, None);
+    let recorded = tick(&mut pass, &fake, 2_000, true);
+    assert_eq!(pass.records.list[0].1.dead_seen, Some(1600));
+    assert_eq!(pass.records.list[0].1.dead_seen_ms, Some(2_000));
+    let records = aterm_uds::runs::read_records(dir.path()).unwrap();
+    assert_eq!(records[0].1.dead_seen, Some(1600));
+    assert_eq!(records[0].1.dead_seen_ms, Some(2_000));
+    assert!(
+        recorded
+            .rows
+            .iter()
+            .find(|row| row.pid == 2606)
+            .unwrap()
+            .token
+            .is_none()
+    );
+    let fresh = tick(&mut pass, &fake, 3_000, true);
+    assert!(
+        fresh
+            .rows
+            .iter()
+            .find(|row| row.pid == 2606)
+            .unwrap()
+            .token
+            .is_some()
+    );
+}
+
+#[test]
+fn a_stale_dead_seen_cache_adopts_the_first_recorded_horizon() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("77-1792000000000077.run");
+    std::fs::write(
+        &path,
+        "run v=1 boot=b id=77-1792000000000077 uniqueid=900 start=1 sid=-\nroot path=/wt\n",
+    )
+    .unwrap();
+    let fake = world();
+    let mut pass = pass(&fake, Some(dir.path().to_path_buf()));
+    pass.refresh_records(900);
+    let stale = aterm_uds::left::RunRead {
+        path: path.clone(),
+        record: pass.records.list[0].1.clone(),
+        dead: true,
+    };
+    let first = aterm_uds::runs::append_dead_seen(&path, &stale.record, 1200, 1500).unwrap();
+    assert_eq!((first.horizon, first.at_ms), (1200, 1500));
+
+    fake.add(2606, 1, 1600, None);
+    pass.append_dead_seen(&*fake, SELF, &[stale], 2000);
+    assert_eq!(pass.records.list[0].1.dead_seen, Some(1200));
+    assert_eq!(pass.records.list[0].1.dead_seen_ms, Some(1500));
+    let records = aterm_uds::runs::read_records(dir.path()).unwrap();
+    assert_eq!(records[0].1.dead_seen, Some(1200));
+    assert_eq!(records[0].1.dead_seen_ms, Some(1500));
+    assert_eq!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("dead_seen "))
+            .count(),
+        1
+    );
+}
+
 /// A held program outside every job is tied to the live tab its group-mate's environment names
 /// (its own is never read), for the jobs pass to name it by; its row gets no token.
 #[test]

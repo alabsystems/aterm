@@ -199,7 +199,7 @@ pub fn read_records(dir: &Path) -> Result<Vec<Record>, String> {
         .iter()
         .map(|p| {
             let bytes =
-                std::fs::read(p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+                crate::read_regular(p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
             Record::decode(&bytes).ok_or_else(|| format!("{} is not a test record", p.display()))
         })
         .collect()
@@ -229,10 +229,17 @@ pub fn runner_config(gate: &Path, dir: &Path) -> Option<String> {
     ))
 }
 
-/// Build the serial `--tests` command with the recording runner prepended before the subcommand alongside [`crate::stages::main_targo`].
+/// Build the serial `--tests` command with the recording runner and current target metadata.
 #[must_use]
 pub fn recording_cmd(serial: &Cmd, config: &str) -> Cmd {
     let mut c = serial.clone();
+    let args_end = c
+        .args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(c.args.len());
+    c.args
+        .insert(args_end, "--message-format=json-render-diagnostics".into());
     c.args
         .splice(0..0, [OsString::from("--config"), OsString::from(config)]);
     c
@@ -318,6 +325,26 @@ pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
         Some(what) => Err(format!("cargo reported what this gate cannot read: {what}")),
         None => Ok(exes),
     }
+}
+
+/// Read Cargo's artifact prelude without treating a test's own JSON as metadata.
+fn take_recording_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
+    let prelude_len = log
+        .split_inclusive('\n')
+        .take_while(|line| {
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.contains('\x1b') {
+                crate::libtest::header(&crate::libtest::strip_ansi(line)).is_none()
+            } else {
+                crate::libtest::header(line).is_none()
+            }
+        })
+        .map(str::len)
+        .sum();
+    let tail = log.split_off(prelude_len);
+    let exes = take_test_executables(log);
+    log.push_str(&tail);
+    exes
 }
 
 /// One test binary the run will run.
@@ -433,7 +460,26 @@ where
 }
 
 fn binary_event(binary: &Binary, run: &Run, waiting: Duration, execution: Duration) -> String {
-    let unavailable = run.environment_failure();
+    // The child has no cargo rerun footer. Classify it with the same known-binary
+    // context as the final report, so passing fixture output cannot own a failure.
+    let combined =
+        (!run.ok).then(|| combined(std::slice::from_ref(binary), std::slice::from_ref(run)));
+    let failures = combined
+        .as_ref()
+        .and_then(|all| crate::libtest::failed_tests(&all.output))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|failed| {
+            aterm_json::json!({
+                "case": failed.name, "output": failed.block, "refused": failed.refused,
+            })
+        })
+        .collect::<Vec<_>>();
+    let unavailable = if run.ok || run.spawn_error.is_some() {
+        run.environment_failure()
+    } else {
+        combined.as_ref().and_then(Run::environment_failure)
+    };
     let outcome = if run.ok {
         "ok"
     } else if unavailable.is_some() {
@@ -447,6 +493,7 @@ fn binary_event(binary: &Binary, run: &Run, waiting: Duration, execution: Durati
             "schema": 1, "event": "test-binary-finished", "test": binary.spec,
             "outcome": outcome, "exit_code": run.code,
             "waiting_s": waiting.as_secs_f64(), "execution_s": execution.as_secs_f64(),
+            "failures": failures,
             "detail": if run.ok { String::new() } else { unavailable.unwrap_or_else(|| first_error(&run.output)) },
         })
     )
@@ -627,14 +674,64 @@ fn decide(r: &mut Report, run: &Run, label: &str, env: &[(OsString, OsString)]) 
     r.decide_test_child(run, label, env);
 }
 
-/// THE TEST RUN (the test stage's second half, after its compile).
-pub fn run_tests(
-    ctx: &crate::Ctx,
-    r: &mut Report,
-    label: &str,
-    serial: &Cmd,
-    exes: Result<Vec<TestExe>, String>,
-) {
+fn feature_args(command: &Cmd) -> String {
+    let mut kept = Vec::new();
+    let mut args = command.args.iter();
+    while let Some(arg) = args.next() {
+        let arg = arg.to_string_lossy();
+        if arg == "--" {
+            break;
+        }
+        if matches!(arg.as_ref(), "--features" | "-F") {
+            kept.push(arg.into_owned());
+            if let Some(value) = args.next() {
+                kept.push(crate::findings::shell_word(&value.to_string_lossy()));
+            }
+        } else if matches!(arg.as_ref(), "--all-features" | "--no-default-features")
+            || arg.starts_with("--features=")
+            || arg.starts_with("-F=")
+        {
+            kept.push(crate::findings::shell_word(&arg));
+        }
+    }
+    kept.join(" ")
+}
+
+fn serial_feature_reruns(run: &mut Run, features: &str) {
+    if features.is_empty() {
+        return;
+    }
+    run.output = run
+        .output
+        .split_inclusive('\n')
+        .map(|line| {
+            for prefix in [
+                "error: test failed, to rerun pass `",
+                "error: doctest failed, to rerun pass `",
+            ] {
+                if let Some((spec, tail)) = line
+                    .strip_prefix(prefix)
+                    .and_then(|rest| rest.split_once('`'))
+                {
+                    return format!("{prefix}{spec} {features}`{tail}");
+                }
+            }
+            line.to_string()
+        })
+        .collect();
+}
+
+fn binary_features(bins: &mut [Binary], features: &str) {
+    if !features.is_empty() {
+        for binary in bins {
+            binary.spec.push(' ');
+            binary.spec.push_str(features);
+        }
+    }
+}
+
+/// Record Cargo's current test invocations and run them with the admitted parallelism.
+pub fn run_tests(ctx: &crate::Ctx, r: &mut Report, label: &str, serial: &Cmd) {
     if let Err(why) = crate::test_workers::admitted_share(&ctx.env) {
         r.cannot_run(format!("{why}; no test was run"));
         return;
@@ -644,6 +741,7 @@ pub fn run_tests(
         |threads| serial.clone().env("RUST_TEST_THREADS", threads.to_string()),
     );
     let serial = &serial;
+    let features = feature_args(serial);
     #[cfg(unix)]
     match aterm_uds::host::open_file_room(4096) {
         Ok(room) => {
@@ -662,7 +760,8 @@ pub fn run_tests(
         r.raw(format!(
             "  test binaries: run by cargo, one at a time — {why}"
         ));
-        let out = exec::run(serial, ctx.exec_env());
+        let mut out = exec::run(serial, ctx.exec_env());
+        serial_feature_reruns(&mut out, &features);
         r.raw(out.output.as_str());
         decide(r, &out, label, &env);
     };
@@ -681,7 +780,7 @@ pub fn run_tests(
         serially(r, "verify could not name itself as the recording runner");
         return;
     };
-    let pass = exec::run(&recording_cmd(serial, &config), ctx.exec_env());
+    let mut pass = exec::run(&recording_cmd(serial, &config), ctx.exec_env());
     let records = read_records(&dir);
     std::fs::remove_dir_all(&dir).ok();
 
@@ -713,10 +812,12 @@ pub fn run_tests(
                  used (a runner in the caller's cargo config outranks it)",
             );
         }
+        serial_feature_reruns(&mut pass, &features);
         r.raw(pass.output.as_str());
         decide(r, &pass, label, &env);
         return;
     }
+    let exes = take_recording_executables(&mut pass.output);
     let bins = if pass.ok {
         records
             .and_then(|recs| exes.and_then(|exes| plan(recs, &pass.output, &exes)))
@@ -727,13 +828,14 @@ pub fn run_tests(
             first_error(&pass.output)
         ))
     };
-    let bins = match bins {
+    let mut bins = match bins {
         Ok(bins) => bins,
         Err(why) => {
             serially(r, &why);
             return;
         }
     };
+    binary_features(&mut bins, &features);
     let jobs = ctx.test_jobs();
     let threads = ctx.test_threads();
     let ceiling = ctx.exec_env().child_ceiling;
@@ -774,6 +876,14 @@ pub fn run_tests(
 }
 
 static RECORDING: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+#[path = "testrun_environment_tests.rs"]
+mod environment_tests;
+
+#[cfg(test)]
+#[path = "testrun_discovery_tests.rs"]
+mod discovery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -848,6 +958,7 @@ mod tests {
             aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap()
         };
         assert_eq!(parse(&run)["outcome"].as_str(), Some("ok"));
+        assert_eq!(parse(&run)["failures"].as_array().unwrap().len(), 0);
         run.ok = false;
         run.spawn_error = Some("test executable unavailable".into());
         assert_eq!(parse(&run)["outcome"].as_str(), Some("NOT RUN"));
@@ -978,6 +1089,7 @@ mod tests {
                 "--unverified",
                 "test",
                 "--tests",
+                "--message-format=json-render-diagnostics",
                 "--",
                 "--skip",
                 "x"
@@ -1244,6 +1356,43 @@ mod tests {
         assert_eq!(tests.len(), 1);
         assert_eq!(tests[0].spec, "-p x --test b");
         assert_eq!(tests[0].name, "t::broke");
+        let event = binary_event(&bins[1], &runs[1], Duration::ZERO, Duration::ZERO);
+        let event: aterm_json::Value =
+            aterm_json::from_str(event.strip_prefix("verify-event: ").unwrap()).unwrap();
+        assert_eq!(event["failures"][0]["case"].as_str(), Some("t::broke"));
+        assert_eq!(
+            event["failures"][0]["output"].as_str(),
+            Some(tests[0].block.as_str())
+        );
+        let command = Cmd::new("targo").args([
+            "test",
+            "--features",
+            "aterm-spec/checkers",
+            "--no-default-features",
+            "--",
+            "--features",
+            "child-option",
+        ]);
+        let features = feature_args(&command);
+        assert_eq!(
+            features,
+            "--features aterm-spec/checkers --no-default-features"
+        );
+        let mut serial_failure = all.clone();
+        serial_feature_reruns(&mut serial_failure, &features);
+        let mut featured = bins.clone();
+        binary_features(&mut featured, &features);
+        let parallel_failure = combined(&featured, &runs);
+        for output in [&serial_failure.output, &parallel_failure.output] {
+            let findings = crate::findings::test_findings("checkers", output, &[]);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(
+                findings[0].rerun.as_deref(),
+                Some(
+                    "targo --unverified test -p x --test b --features aterm-spec/checkers --no-default-features -- t::broke --exact"
+                )
+            );
+        }
         let findings = crate::findings::test_findings("targo test --tests", &all.output, &[]);
         assert_eq!(findings[0].id, "-p x --test b -- t::broke");
         assert!(

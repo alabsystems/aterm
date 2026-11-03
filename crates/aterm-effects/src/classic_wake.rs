@@ -104,7 +104,7 @@ pub struct ClassicWake {
     /// One run's air pieces before [`one_air_piece`] keeps them.
     air_pieces: Vec<Vec<CometSample>>,
     /// Scratch: each point's share of a tracer through the letters ([`through_letters`]).
-    air_shares: Vec<f32>,
+    air_shares: TracerShares,
     /// The runs up a page held out of the one-colour bed, by index.
     held_runs: Vec<(usize, Vec<CometSample>)>,
     /// A one-colour run up a page as its straightened beam draws it, before
@@ -314,7 +314,11 @@ const TRACER_STEP_PX: f32 = 2.0;
 /// caret's at [`TRACER_UNDER_LETTERS`] of its light ([`up_stretch`]).
 #[inline]
 fn tracer_on_caret_row(
-    (verts, dense, shares): (&mut Vec<BeamVertex>, &mut Vec<BeamVertex>, &mut Vec<f32>),
+    (verts, dense, shares): (
+        &mut Vec<BeamVertex>,
+        &mut Vec<BeamVertex>,
+        &mut TracerShares,
+    ),
     text: TextView<'_>,
     geom: Geom,
     caret_row: Option<i32>,
@@ -451,7 +455,7 @@ fn tracer_on_caret_row(
 /// new, anchored to neither (`classic-light-move-up.up`, looks10 L6).
 #[inline]
 fn up_stretch(
-    (dense, shares): (&mut [BeamVertex], &mut Vec<f32>),
+    (dense, shares): (&mut [BeamVertex], &mut TracerShares),
     text: TextView<'_>,
     geom: Geom,
     (half, leave): (f32, f32),
@@ -471,8 +475,9 @@ fn up_stretch(
             geom,
             (half, leave, TRACER_UNDER_LETTERS_PAPER),
             shares,
+            None,
         );
-        for (v, k) in dense.iter_mut().zip(&*shares) {
+        for (v, k) in dense.iter_mut().zip(&shares.shares) {
             v.cov = (f32::from(v.cov) * k).round() as u8;
         }
         return;
@@ -591,6 +596,35 @@ enum Passed {
     Unread,
 }
 
+/// [`through_letters`]'s output, each point's share of a tracer's light, and its walk's
+/// resident buffers: kept by the engine, so a frame's tracers allocate nothing once the
+/// longest has been walked.
+struct TracerShares {
+    shares: Vec<f32>,
+    /// Each point's distance along the stroke.
+    along: Vec<f32>,
+    /// Each point's (near a letter, near an unread row).
+    marks: Vec<(bool, bool)>,
+    /// Each point's distance along the stroke to the nearest of each mark.
+    gaps: Vec<(f32, f32)>,
+}
+
+impl TracerShares {
+    const EMPTY: Self = Self {
+        shares: Vec::new(),
+        along: Vec::new(),
+        marks: Vec::new(),
+        gaps: Vec::new(),
+    };
+}
+
+impl Default for TracerShares {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 /// The share of its light each of a tracer's `n` points (`at(i)`, window
 /// px, dense along its stroke, the last the caret's) keeps, into `shares`:
 /// `under` ([`TRACER_UNDER_LETTERS`]) where its stroke, `half` wide, comes within
@@ -599,6 +633,8 @@ enum Passed {
 /// (the letter guard cannot hold letters it has not read, so light there is
 /// the over-ink budget's, as the dark streak's is: [`TextView::over_text`]),
 /// whole `leave` px along the stroke from every such point, eased between.
+/// `shade`, when given, takes the same shares with no light kept under letters
+/// (`under` of `0`), read off the same walk.
 #[inline]
 fn through_letters(
     n: usize,
@@ -606,10 +642,20 @@ fn through_letters(
     seen: impl Fn(i32, i32) -> Passed,
     geom: Geom,
     (half, leave, under): (f32, f32, f32),
-    shares: &mut Vec<f32>,
+    scratch: &mut TracerShares,
+    shade: Option<&mut Vec<f32>>,
 ) {
+    let TracerShares {
+        shares,
+        along,
+        marks,
+        gaps,
+    } = scratch;
     shares.clear();
     if n == 0 {
+        if let Some(shade) = shade {
+            shade.clear();
+        }
         return;
     }
     let (ox, oy) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
@@ -647,57 +693,81 @@ fn through_letters(
                         Passed::Letter => letter = true,
                         Passed::Unread => unread = true,
                     }
+                    if letter && unread {
+                        return (true, true);
+                    }
                 }
             }
         }
         (letter, unread)
     };
-    let mut along = Vec::with_capacity(n);
+    // One walk reads each point once: its distance along the stroke and its marks.
+    along.clear();
+    marks.clear();
     let mut walked = 0.0f32;
+    let mut prev = at(0);
     for i in 0..n {
+        let here = if i > 0 { at(i) } else { prev };
         if i > 0 {
-            let (a, b) = (at(i - 1), at(i));
-            walked += crate::color_math::hypot_f32(b.0 - a.0, b.1 - a.1);
+            walked += crate::color_math::hypot_f32(here.0 - prev.0, here.1 - prev.1);
         }
         along.push(walked);
+        marks.push(near(here));
+        prev = here;
     }
-    let marks: Vec<(bool, bool)> = (0..n).map(|i| near(at(i))).collect();
-    // Each point's distance along the stroke from the nearest marked point,
-    // both ways.
-    let gap = |marked: &dyn Fn(usize) -> bool| {
-        let mut gap = vec![f32::INFINITY; n];
-        let mut last: Option<f32> = None;
-        for i in 0..n {
-            if marked(i) {
-                last = Some(along[i]);
-            }
-            if let Some(l) = last {
-                gap[i] = along[i] - l;
-            }
+    // Each point's distance along the stroke from the nearest point near a
+    // letter and from the nearest near an unread row, both ways, in one pass
+    // each way.
+    gaps.clear();
+    gaps.resize(n, (f32::INFINITY, f32::INFINITY));
+    let (mut last_l, mut last_u): (Option<f32>, Option<f32>) = (None, None);
+    for i in 0..n {
+        let (l, u) = marks[i];
+        if l {
+            last_l = Some(along[i]);
         }
-        last = None;
-        for i in (0..n).rev() {
-            if marked(i) {
-                last = Some(along[i]);
-            }
-            if let Some(l) = last {
-                gap[i] = gap[i].min(l - along[i]);
-            }
+        if u {
+            last_u = Some(along[i]);
         }
-        gap
-    };
-    let (to_letter, to_unread) = (gap(&|i| marks[i].0), gap(&|i| marks[i].1));
+        if let Some(x) = last_l {
+            gaps[i].0 = along[i] - x;
+        }
+        if let Some(x) = last_u {
+            gaps[i].1 = along[i] - x;
+        }
+    }
+    (last_l, last_u) = (None, None);
+    for i in (0..n).rev() {
+        let (l, u) = marks[i];
+        if l {
+            last_l = Some(along[i]);
+        }
+        if u {
+            last_u = Some(along[i]);
+        }
+        if let Some(x) = last_l {
+            gaps[i].0 = gaps[i].0.min(x - along[i]);
+        }
+        if let Some(x) = last_u {
+            gaps[i].1 = gaps[i].1.min(x - along[i]);
+        }
+    }
     let inv_leave = 1.0 / leave.max(1.0);
     let eased = |floor: f32, d: f32| {
         let u = (d * inv_leave).clamp(0.0, 1.0);
         floor + (1.0 - floor) * u * u * (3.0 - 2.0 * u)
     };
     shares.extend(
-        to_letter
-            .iter()
-            .zip(&to_unread)
-            .map(|(&dl, &du)| eased(under, dl).min(eased(0.0, du))),
+        gaps.iter()
+            .map(|&(dl, du)| eased(under, dl).min(eased(0.0, du))),
     );
+    if let Some(shade) = shade {
+        shade.clear();
+        shade.extend(
+            gaps.iter()
+                .map(|&(dl, du)| eased(0.0, dl).min(eased(0.0, du))),
+        );
+    }
 }
 
 /// Drop the points of a dense stroke `piece` that change nothing laid
@@ -894,7 +964,7 @@ impl ClassicWake {
             bed_scratch: BedScratch::EMPTY,
             air_runs: Vec::new(),
             air_pieces: Vec::new(),
-            air_shares: Vec::new(),
+            air_shares: TracerShares::EMPTY,
             held_runs: Vec::new(),
             up_line: Vec::new(),
             up_line_scratch: BeamScratch::EMPTY,
@@ -1771,6 +1841,7 @@ impl ClassicWake {
                         }
                     };
                     let leave = chf * TRACER_LEAVE_SHARE;
+                    let shade_too = dim_page && !up_unshaded;
                     through_letters(
                         piece.len(),
                         |i| (piece[i].x, piece[i].y),
@@ -1778,6 +1849,7 @@ impl ClassicWake {
                         geom,
                         (core_thick, leave, TRACER_UNDER_LETTERS),
                         &mut shares,
+                        shade_too.then_some(&mut self.up_shade),
                     );
                     // A dim theme's letters take no light (each keeps 97% of
                     // its own reading), so the guard cut the run through them
@@ -1788,15 +1860,7 @@ impl ClassicWake {
                     // letters as the ribbons' bed is, its colour at the
                     // page's own luminance (`page_lit_ink`): a hue, neither
                     // light nor shade, that leaves every letter its reading.
-                    if dim_page && !up_unshaded {
-                        through_letters(
-                            piece.len(),
-                            |i| (piece[i].x, piece[i].y),
-                            seen,
-                            geom,
-                            (core_thick, leave, 0.0),
-                            &mut self.up_shade,
-                        );
+                    if shade_too {
                         // Laid at the tracer's own share of its light, the
                         // shade was a quarter of its hue (`#102735` on
                         // `#002b36`, 1.02-1.04:1, 9 to 16 levels): nothing at
@@ -1818,7 +1882,8 @@ impl ClassicWake {
                         let gain = if faint { 1.0 } else { 255.0 / f32::from(peak) };
                         self.up_verts.clear();
                         for (i, p) in piece.iter().enumerate() {
-                            let w = ((shares[i] - self.up_shade[i]) * (1.0 / TRACER_UNDER_LETTERS))
+                            let w = ((shares.shares[i] - self.up_shade[i])
+                                * (1.0 / TRACER_UNDER_LETTERS))
                                 .clamp(0.0, 1.0);
                             self.up_verts.push(BeamVertex {
                                 x: p.x,
@@ -1847,14 +1912,17 @@ impl ClassicWake {
                         // it to a twelfth, a trace of 5 bytes on the page
                         // (the gallery's `up`, looks10 round 2).
                         if !up_lit_letters {
-                            shares.copy_from_slice(&self.up_shade);
+                            shares.shares.copy_from_slice(&self.up_shade);
                         }
                     }
                     // A run that rises past letters keeps a share of its
                     // light in the air ([`TRACER_UP_AIR`]); one over blank
                     // rows alone keeps it whole.
-                    let crosses = shares.iter().any(|&k| k <= TRACER_UNDER_LETTERS + 1e-3);
-                    for (p, k) in piece.iter_mut().zip(shares.iter_mut()) {
+                    let crosses = shares
+                        .shares
+                        .iter()
+                        .any(|&k| k <= TRACER_UNDER_LETTERS + 1e-3);
+                    for (p, k) in piece.iter_mut().zip(shares.shares.iter_mut()) {
                         if *k > TRACER_UNDER_LETTERS && crosses && !up_whole {
                             *k = TRACER_UNDER_LETTERS
                                 + (*k - TRACER_UNDER_LETTERS)
@@ -1863,7 +1931,7 @@ impl ClassicWake {
                         }
                         p.cov = (f32::from(p.cov) * *k).round() as u8;
                     }
-                    thin_exact(piece, &shares);
+                    thin_exact(piece, &shares.shares);
                     if n < 128 {
                         exact |= 1 << n;
                     }

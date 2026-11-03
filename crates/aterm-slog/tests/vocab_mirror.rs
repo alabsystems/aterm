@@ -36,6 +36,7 @@ fn prompt_kinds() -> Vec<PromptKind> {
         P::AutocompactOffer,
         P::McpServer,
         P::AutoModeSetup,
+        P::ChromeIntro,
         P::Other,
     ];
     for k in all {
@@ -66,6 +67,7 @@ fn prompt_kinds() -> Vec<PromptKind> {
             | P::AutocompactOffer
             | P::McpServer
             | P::AutoModeSetup
+            | P::ChromeIntro
             | P::Other => {}
         }
     }

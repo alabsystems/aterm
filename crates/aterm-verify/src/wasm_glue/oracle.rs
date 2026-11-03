@@ -275,7 +275,7 @@ fn run(
 }
 
 fn read(path: &Path) -> Result<String, Refused> {
-    std::fs::read_to_string(path)
+    crate::read_regular_text(path)
         .map_err(|e| Refused::Failed(format!("could not read {}: {e}", path.display())))
 }
 

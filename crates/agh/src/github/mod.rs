@@ -27,6 +27,29 @@ use crate::policy::{Access, Named, RouteRequest, RouteTarget};
 use crate::retry::RetryPolicy;
 use crate::slug::Slug;
 
+/// The checks every write method makes first (plan §9 body 1): unix only, and a permit for
+/// `slug` (ASCII case-insensitive, as `Slug`'s `==` compares), else Usage with nothing sent,
+/// naming `what` (`refs`, `releases`) as `slug`'s.
+pub(crate) fn permit_covers(
+    permit: &crate::policy::Permit,
+    slug: &Slug,
+    what: &str,
+) -> crate::error::Result<()> {
+    use crate::policy::PermitTarget;
+    if cfg!(not(unix)) {
+        return Err(crate::write::unix_only());
+    }
+    let target = match permit.target() {
+        PermitTarget::Repo(held) if held == slug => return Ok(()),
+        PermitTarget::Repo(held) => held.to_string(),
+        PermitTarget::Identity => "/user".to_string(),
+    };
+    Err(crate::error::Error::usage(format!(
+        "the permit is for {target}, and these {what} are {slug}'s"
+    ))
+    .with_repo(slug.to_string()))
+}
+
 /// `limit` applied to a listing already in its final order ([`crate::page::cut`]).
 pub(crate) fn limit_after_sort<T>(listing: &mut crate::page::Listing<T>, limit: Option<usize>) {
     listing.end = crate::page::cut(listing.end, &mut listing.items, limit);
@@ -247,4 +270,15 @@ impl Github {
     pub const fn raw(&self) -> Raw<'_> {
         Raw::new(self)
     }
+}
+
+/// `value` as compact JSON with sorted keys: a write's body, which agh encodes from its own
+/// `json!` values.
+///
+/// # Errors
+///
+/// could_not_run `Sub::Local`, why `a write body did not encode: {e}`.
+pub(crate) fn encode_body(value: &aterm_json::Value) -> crate::error::Result<Vec<u8>> {
+    aterm_json::to_vec(value)
+        .map_err(|e| crate::error::Error::local(format!("a write body did not encode: {e}")))
 }

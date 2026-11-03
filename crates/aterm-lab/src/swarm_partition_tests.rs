@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::swarm::partition::split::tests as ledgers;
 
 #[test]
 fn an_in_process_join_post_obeys_the_cut_file_and_its_heal() {
@@ -267,6 +268,7 @@ fn whole() -> Evidence {
                     crossed: Vec::new(),
                 },
             ],
+            cut_ledger: Some(ledgers::held()),
             healed: Some((2_500, merged.clone())),
             servers_after: vec![
                 (Island::A, Some(merged.clone())),
@@ -324,6 +326,87 @@ fn a_run_where_every_part_held_passes_every_check() {
     let checks = judge(&whole());
     assert!(checks.len() >= 9, "{checks:#?}");
     assert_eq!(failed(&whole()), Vec::<&str>::new(), "{checks:#?}");
+}
+
+/// A membership record one island made in the cut, held on the other island's server and a Mac
+/// there before the heal, fails [`RECORDS_HELD`] alone: the heads and values the other cut
+/// checks read did not cross.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): drop the
+/// `split::judge(RECORDS_HELD, ..)` row from `vault_checks`: fails with left `[]`, right
+/// `[RECORDS_HELD]` (proven 2026-11-02).
+#[test]
+fn a_record_that_crossed_the_cut_fails_records_held() {
+    let mut ev = whole();
+    ev.vault.cut_ledger = Some(ledgers::crossed());
+    assert_eq!(failed(&ev), vec![RECORDS_HELD]);
+}
+
+/// A run is recorded under `docs/measured/` only where every split it held held: a record that
+/// crossed the cut or F21's split voids it, while a run whose removals plane held no F21 split
+/// (it did not get that far) stands on the cut alone.
+///
+/// An F21 split whose records sync went unexercised saw nothing cross, so its run is recorded
+/// (its row red).
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): in
+/// `unmeasured`, leave F21's split out (`f21` always `None`): the run whose F21 split leaked is
+/// recordable, and the test fails at `!recordable(&with_split(Some(ledgers::crossed())))`
+/// (proven 2026-11-03). Make `split::Shortfall::voids` answer `true` for every shortfall: the
+/// unexercised split's run is not recorded, and the test fails at
+/// `recordable(&with_split(Some(ledgers::unexercised())))` (proven 2026-11-03).
+#[test]
+fn a_run_whose_cut_or_f21_split_leaked_is_never_recorded() {
+    let recordable = |ev: &Evidence| unmeasured(ev, &judge(ev)).is_empty();
+    assert!(recordable(&whole()));
+
+    let mut cut_leaked = whole();
+    cut_leaked.vault.cut_ledger = Some(ledgers::crossed());
+    assert!(!recordable(&cut_leaked));
+
+    let with_split = |ledger: Option<split::Ledger>| {
+        let mut ev = whole();
+        ev.removals = Some(removals::Evidence {
+            kept: Some(removals::Kept {
+                ledger,
+                ..removals::Kept::default()
+            }),
+            ..removals::Evidence::default()
+        });
+        ev
+    };
+    assert!(recordable(&with_split(Some(ledgers::held()))));
+    assert!(!recordable(&with_split(Some(ledgers::crossed()))));
+    assert!(recordable(&with_split(None)));
+    assert!(recordable(&with_split(Some(ledgers::unexercised()))));
+}
+
+/// The not-recorded line says why each split fell short: one whose server could not be read at
+/// its end is not shown to hold, never told as one something crossed, and one that leaked says
+/// so.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): in
+/// `unmeasured`, word every shortfall as `split::Shortfall::Crossed`: the unread cut reads as
+/// crossed, and the test fails at its first `assert_eq!` (proven 2026-11-03).
+#[test]
+fn a_split_not_read_whole_is_not_recorded_as_one_that_leaked() {
+    let mut unread = whole();
+    if let Some(ledger) = unread.vault.cut_ledger.as_mut() {
+        ledger
+            .end
+            .unread
+            .push("island B's server's records: timed out".to_owned());
+    }
+    assert_eq!(
+        unmeasured(&unread, &judge(&unread)),
+        vec!["the cut could not be read whole, so it is not shown that nothing crossed"]
+    );
+    let mut crossed = whole();
+    crossed.vault.cut_ledger = Some(ledgers::crossed());
+    assert_eq!(
+        unmeasured(&crossed, &judge(&crossed)),
+        vec!["a record or head crossed the cut"]
+    );
 }
 
 #[test]
@@ -851,9 +934,8 @@ fn a_heartbeat_that_asks_the_same_three_members_before_the_cut_fails_the_reach_b
     assert!(detail.contains("b4's heartbeats were not read"), "{detail}");
 }
 
-/// A member whose dial by a Mac's heartbeat missed, and that the rounds then passed over while
-/// three others answered, is told from one the rounds never asked: the row names the Macs whose
-/// last dial missed.
+/// A member whose last dial by a Mac's heartbeat missed, still dark when the row is read, is
+/// told from one the rounds never asked: the row names the Macs whose last dial missed.
 /// NEGATIVE CONTROL: leave the dark members out of the row (`dark` read as none in
 /// `reach_check`): the assertion failed with the row "b1's heartbeat reached b2, b4, b3 and never
 /// a1, a2, a4", which no longer says whose last dial missed.

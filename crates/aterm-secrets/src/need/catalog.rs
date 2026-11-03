@@ -19,7 +19,7 @@ pub const SITE_DEPLOYER_KEY_ENTRY: &str =
 pub const NOTARY_ENTRY: &str = "release-notary";
 
 /// The catalog's version, cited as a catalog retirement's evidence.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// The most characters a mailbox label or a `login:` name takes.
 const MAX_LABEL: usize = 63;
@@ -42,6 +42,8 @@ pub enum Want {
     Notary,
     /// `mailbox:<label>`: one AI account's mailbox password (and TOTP seed).
     Mailbox(String),
+    /// One credential of a registered mailbox, bound to its authority and login.
+    MailboxComponent(crate::mailbox_component::Component),
     /// `gh:<dev|release>`: a vault GitHub token.
     Gh(GhProfile),
     /// `entry:<name>`: any vault entry by name, answered from this Mac's own envelope.
@@ -113,7 +115,7 @@ impl Want {
     pub fn parse(word: &str) -> Result<Self, String> {
         let bad = |what: &str| {
             Err(format!(
-                "{word:?}: {what} (wants: site-deployer-key, notary, mailbox:<label>, gh:dev, \
+                "{word:?}: {what} (wants: site-deployer-key, notary, mailbox:<label>, mailbox-field:<identity>/<component>, gh:dev, \
                  gh:release, entry:<name>, paper-master, login:<provider>/<label>, \
                  browser-profile:<label>, refresh-token:<provider>/<label>, vault-identity, \
                  commons-device-key, commons-control)"
@@ -133,6 +135,11 @@ impl Want {
                     return bad("not a want the catalog names");
                 };
                 match kind {
+                    "mailbox-field" => Self::MailboxComponent(
+                        crate::mailbox_component::Component::parse(word).ok_or_else(|| {
+                            "invalid mailbox component identity or part".to_owned()
+                        })?,
+                    ),
                     "mailbox" if valid_label(rest) => Self::Mailbox(rest.to_owned()),
                     "entry"
                         if crate::text::valid_entry_name(rest) && !crate::reserved_name(rest) =>
@@ -163,6 +170,7 @@ impl Want {
             Self::SiteDeployerKey => "site-deployer-key".to_owned(),
             Self::Notary => "notary".to_owned(),
             Self::Mailbox(label) => format!("mailbox:{label}"),
+            Self::MailboxComponent(component) => component.key(),
             Self::Gh(GhProfile::Dev) => "gh:dev".to_owned(),
             Self::Gh(GhProfile::Release) => "gh:release".to_owned(),
             Self::Entry(name) => format!("entry:{name}"),
@@ -181,7 +189,9 @@ impl Want {
     pub const fn class(&self) -> Class {
         match self {
             Self::SiteDeployerKey | Self::Notary => Class::Copyable,
-            Self::Mailbox(_) | Self::Gh(_) | Self::Entry(_) => Class::VaultOnly,
+            Self::Mailbox(_) | Self::MailboxComponent(_) | Self::Gh(_) | Self::Entry(_) => {
+                Class::VaultOnly
+            }
             Self::PaperMaster => Class::Nowhere,
             Self::Login(_)
             | Self::BrowserProfile(_)
@@ -198,7 +208,11 @@ impl Want {
     pub const fn posted(&self) -> bool {
         matches!(
             self,
-            Self::SiteDeployerKey | Self::Notary | Self::Mailbox(_) | Self::Gh(_)
+            Self::SiteDeployerKey
+                | Self::Notary
+                | Self::Mailbox(_)
+                | Self::MailboxComponent(_)
+                | Self::Gh(_)
         )
     }
 
@@ -207,7 +221,11 @@ impl Want {
     pub const fn person_sourced(&self) -> bool {
         matches!(
             self,
-            Self::SiteDeployerKey | Self::Notary | Self::Mailbox(_) | Self::Gh(_)
+            Self::SiteDeployerKey
+                | Self::Notary
+                | Self::Mailbox(_)
+                | Self::MailboxComponent(_)
+                | Self::Gh(_)
         )
     }
 
@@ -218,6 +236,7 @@ impl Want {
             Self::SiteDeployerKey => vec![SITE_DEPLOYER_KEY_ENTRY.to_owned()],
             Self::Notary => vec![NOTARY_ENTRY.to_owned()],
             Self::Mailbox(label) => vec![format!("{label}_password"), format!("{label}_totp")],
+            Self::MailboxComponent(component) => vec![component.entry()],
             Self::Gh(GhProfile::Dev) => vec!["gh_access_token".to_owned()],
             Self::Gh(GhProfile::Release) => vec!["gh_access_token_alabsystems".to_owned()],
             Self::Entry(name) => vec![name.clone()],
@@ -250,6 +269,7 @@ impl Want {
             Self::SiteDeployerKey => "the site deployer's service-account key".to_owned(),
             Self::Notary => "the notary credential".to_owned(),
             Self::Mailbox(label) => format!("{label}'s mailbox password"),
+            Self::MailboxComponent(component) => format!("the {}", component.part().description()),
             Self::Gh(GhProfile::Dev) => "the dev GitHub token".to_owned(),
             Self::Gh(GhProfile::Release) => "the release GitHub token".to_owned(),
             Self::Entry(name) => format!("the vault entry {name}"),
@@ -272,6 +292,17 @@ impl Want {
             }
             Self::Notary => "a person makes an app-specific password at account.apple.com",
             Self::Mailbox(_) => "the mailbox's own password, which only its owner holds",
+            Self::MailboxComponent(component) => match component.part() {
+                crate::mailbox_component::Part::Password => {
+                    "the mailbox's login password, held by its owner"
+                }
+                crate::mailbox_component::Part::SecondPassword => {
+                    "the mailbox's separate decryption password, held by its owner"
+                }
+                crate::mailbox_component::Part::Totp => {
+                    "the mailbox's TOTP seed, not a one-time code"
+                }
+            },
             Self::Gh(_) => "a person makes a new token at github.com/settings/tokens",
             Self::Entry(_) => "the vault's admin",
             Self::PaperMaster => "paper",
@@ -325,6 +356,9 @@ impl Want {
             }
             Self::Notary => Some(home.join(".secrets").join(NOTARY_ENTRY)),
             Self::Mailbox(label) => Some(home.join(".secrets").join(format!("{label}_password"))),
+            Self::MailboxComponent(component) => {
+                Some(home.join(".secrets").join(component.entry()))
+            }
             _ => None,
         }
     }
@@ -337,7 +371,7 @@ pub enum Purpose {
     ReleaseSiteKey,
     /// `ship provision`'s notary row.
     ReleaseNotary,
-    /// The Claude Code sign-in ladder's mailbox route.
+    /// An AI account's unattended email-code sign-in route.
     HarnessSignIn,
     /// agh's dev identity.
     AghDev,

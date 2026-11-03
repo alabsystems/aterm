@@ -189,3 +189,55 @@ fn a_fixture_replays_from_a_pipe_with_a_bare_replay() {
     assert_eq!(requests, 0);
     drop(reader);
 }
+
+/// A writer-less FIFO and a directory, named as tapes: neither blocks the replay. The FIFO opens
+/// without waiting and reads as an empty pipe, which is no tape; the directory is neither a
+/// regular file nor a pipe.
+#[cfg(unix)]
+#[test]
+fn a_writerless_fifo_or_a_directory_tape_is_refused_without_waiting() {
+    use std::sync::mpsc;
+
+    let root = scratch("fixture-not-a-tape");
+    let fifo = root.path().join("tape.fifo");
+    let mut mkfifo = aterm_uds::spawnfd::command("mkfifo");
+    mkfifo.arg(&fifo);
+    let made = aterm_uds::deadline::outputs_until(
+        &mut [&mut mkfifo],
+        std::time::Instant::now() + common::HANG,
+        common::HANG,
+    )
+    .pop()
+    .expect("one child result")
+    .expect("mkfifo ran");
+    assert!(made.status.success(), "mkfifo: {made:?}");
+    let shelf = root.path().join("shelf");
+    std::fs::create_dir(&shelf).expect("a directory");
+    for (path, pipe) in [(fifo.clone(), true), (shelf.clone(), false)] {
+        let (tx, rx) = mpsc::channel();
+        let dir = root.path().to_path_buf();
+        let named = path.display().to_string();
+        std::thread::spawn(move || {
+            let transport = Arc::new(ScriptedTransport::new());
+            let (mut ctx, captured) = agh::cli::Ctx::for_tests(
+                &dir,
+                transport.clone(),
+                Endpoints::github_com(),
+                common::env(),
+            );
+            let ran = run_cli(&mut ctx, &["--replay", &named]);
+            let _ = tx.send((ran, captured.stderr_text(), transport.requests().len()));
+        });
+        let (ran, stderr, requests) = rx
+            .recv_timeout(common::HANG)
+            .unwrap_or_else(|_| panic!("the replay of {} ended", path.display()));
+        assert_ne!(ran, 0, "{}: {stderr}", path.display());
+        assert_eq!(
+            stderr.contains("not a regular file or pipe"),
+            !pipe,
+            "{}: a FIFO is read as a pipe, a directory refused: {stderr}",
+            path.display()
+        );
+        assert_eq!(requests, 0);
+    }
+}

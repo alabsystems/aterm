@@ -1555,6 +1555,26 @@ fn submodule_records(
     )
 }
 
+fn open_git_file(path: &Path) -> Option<std::fs::File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        if !std::fs::symlink_metadata(path).ok()?.is_file() {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
 /// The boundary commits of the shallow clone at `dir` (its `shallow` file, the first
 /// [`SHALLOW_BYTES`] of it), none where it is no shallow clone: a fetch cut each one's history
 /// there, so each came from a remote, though no remote-tracking ref reaches it. `None` where a
@@ -1562,7 +1582,7 @@ fn submodule_records(
 fn shallow_roots(dir: &Path, reads: &Reads<'_>) -> Option<std::collections::HashSet<String>> {
     let at = git_offline(dir, &["rev-parse", "--git-path", "shallow"], reads, None)?;
     let mut text = String::new();
-    if let Ok(file) = std::fs::File::open(dir.join(at.trim_end_matches(['\n', '\r']))) {
+    if let Some(file) = open_git_file(&dir.join(at.trim_end_matches(['\n', '\r']))) {
         let _ =
             std::io::Read::read_to_string(&mut std::io::Read::take(file, SHALLOW_BYTES), &mut text);
     }
@@ -1583,7 +1603,7 @@ fn shallow_roots(dir: &Path, reads: &Reads<'_>) -> Option<std::collections::Hash
 /// cut.
 fn remote_fetch_heads(dir: &Path, reads: &Reads<'_>) -> Option<Vec<String>> {
     let at = git_offline(dir, &["rev-parse", "--git-path", "FETCH_HEAD"], reads, None)?;
-    let Ok(file) = std::fs::File::open(dir.join(at.trim_end_matches(['\n', '\r']))) else {
+    let Some(file) = open_git_file(&dir.join(at.trim_end_matches(['\n', '\r']))) else {
         return Some(Vec::new());
     };
     let mut bytes = Vec::new();

@@ -134,8 +134,10 @@ const NOTED: char = '\u{2139}';
 pub(crate) enum ApplyPosture {
     /// `update.auto_apply` on (the default) and no veto.
     Automatic,
-    /// The automatic lane is armed, but this process kept the image it was launched with and has no terminal open (`App::kept_image_waits_for_terminal`).
-    WaitsForTerminal,
+    /// The automatic lane is armed, but this process keeps the image it was launched with, has
+    /// no live terminal session, and its last admission found the sessionless handoff unable to
+    /// carry it (`App::kept_image_installs_at_next_launch`).
+    AtNextLaunch,
     /// `[update] auto_apply = false`.
     ManualByConfig,
     /// An environment veto for this run.
@@ -289,7 +291,7 @@ pub(crate) const fn apply_capsule_for(posture: Option<ApplyPosture>, build: u64)
         Some(
             ApplyPosture::HandoffDisabled { .. }
             | ApplyPosture::Automatic
-            | ApplyPosture::WaitsForTerminal
+            | ApplyPosture::AtNextLaunch
             | ApplyPosture::ManualOnlyLatched { lapses: true }
             | ApplyPosture::TrialSpent,
         ) => None,
@@ -307,9 +309,7 @@ pub(crate) fn staged_is_decision(posture: Option<ApplyPosture>) -> bool {
 pub(crate) fn staged_detail(posture: ApplyPosture) -> String {
     match posture {
         ApplyPosture::Automatic => INSTALLS_BY_ITSELF.to_string(),
-        ApplyPosture::WaitsForTerminal => {
-            "installs by itself once a terminal tab is open".to_string()
-        }
+        ApplyPosture::AtNextLaunch => "installs once aterm is quit and opened again".to_string(),
         ApplyPosture::ManualByConfig => aterm_update_core::settings::install_switch_off(),
         ApplyPosture::VetoedByEnv { var } => format!("${var} is set \u{2014} {INSTALL_FROM_MENU}"),
         ApplyPosture::ManualOnlyLatched { lapses: true } => {
@@ -1678,7 +1678,7 @@ mod tests {
         use ApplyPosture as P;
         let mut postures = vec![
             P::Automatic,
-            P::WaitsForTerminal,
+            P::AtNextLaunch,
             P::ManualByConfig,
             P::VetoedByEnv {
                 var: "ATERM_DEBUG_RELAUNCH_NUDGE",
@@ -2289,6 +2289,9 @@ mod tests {
             },
         );
         assert_eq!(r.actions, Some(Vec::new()), "the handoff off strips it");
+        let r = restate_apply_posture("0.67.0", 7, P::AtNextLaunch);
+        assert_eq!(r.hold, Some(Hold::LogOnly));
+        assert_eq!(r.actions, Some(Vec::new()), "a press would only be refused");
     }
 
     #[test]
@@ -2990,6 +2993,34 @@ mod tests {
                     && !lower.contains("version menu"),
                 "{line}"
             );
+        }
+        let kept = |seamless_capable: bool| AdmissionFacts {
+            seamless_capable,
+            image_kept: true,
+            ..opted_out(0)
+        };
+        assert_eq!(
+            classify(kept(false)),
+            AdmissionDecision::Block(AdmissionBlock::KeptImageWithoutHandoff),
+            "a kept image the handoff cannot carry installs at a later launch"
+        );
+        assert_eq!(
+            classify(kept(true)),
+            AdmissionDecision::Apply(ApplyLane::Seamless),
+            "a kept image with no terminal hands over: no tab is waited for"
+        );
+        for why in HandoffUnavailable::ALL {
+            let line = staged_detail(ApplyPosture::HandoffDisabled {
+                why,
+                veto: None,
+                image_kept: true,
+            });
+            assert!(
+                line.starts_with(why.cause())
+                    && line.ends_with("once aterm is quit and opened again"),
+                "{line}"
+            );
+            assert!(!line.contains("terminal tab"), "{line}");
         }
     }
 }

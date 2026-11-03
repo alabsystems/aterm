@@ -563,7 +563,7 @@ fn sweep_stale_temps(context: &Context) {
     }
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path.parent().ok_or("update record has no parent")?;
     let (temp, mut file) = fresh_file(parent, "record")?;
     let result = (|| {
@@ -964,12 +964,17 @@ const TIME_NAMESPACE: &str = "/proc/self/ns/time";
 /// namespace (`time_namespace`) they count on ([`Steady`]); `None` when the boot has no
 /// name to read or the clock cannot be read, and the wall clock judges alone.
 fn steady_clock(boot_id: &Path, time_namespace: &Path) -> Option<Steady> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let mut boot = String::new();
-    File::open(boot_id)
-        .ok()?
-        .take(64)
-        .read_to_string(&mut boot)
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(boot_id)
         .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    file.take(64).read_to_string(&mut boot).ok()?;
     astream_sys::parse_boot_id(boot.as_bytes())?;
     let boot = boot.trim();
     let namespace = fs::read_link(time_namespace)

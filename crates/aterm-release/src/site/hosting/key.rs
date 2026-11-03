@@ -167,17 +167,38 @@ impl Key {
     }
 }
 
-/// Whether `bytes` is a credential file a deploy must never publish: a JSON object with a
-/// string `private_key` (a service-account key, the deployer's own among them).
+/// Whether `bytes` is a credential file a deploy must never publish: a JSON document with a
+/// non-empty string `private_key` (top-level, nested, or JSON-escaped), or a standalone PEM
+/// private-key block.
 #[must_use]
 pub fn holds_a_private_key(bytes: &[u8]) -> bool {
-    const FIELD: &[u8] = b"\"private_key\"";
-    bytes.windows(FIELD.len()).any(|w| w == FIELD)
-        && matches!(
-            aterm_json::from_slice::<aterm_json::Value>(bytes),
-            Ok(aterm_json::Value::Object(doc))
-                if doc.get("private_key").is_some_and(|k| k.as_str().is_some())
-        )
+    const PEM_HEAD: &[u8] = concat!("-----BEGIN", " ").as_bytes();
+    const PEM_TAIL: &[u8] = concat!("PRIVATE ", "KEY-----").as_bytes();
+    if bytes.windows(PEM_TAIL.len()).any(|w| w == PEM_TAIL)
+        && bytes.split(|b| *b == b'\n').any(|line| {
+            let line = line.trim_ascii();
+            line.starts_with(PEM_HEAD) && line.ends_with(PEM_TAIL)
+        })
+    {
+        return true;
+    }
+    let trimmed = bytes.trim_ascii_start();
+    matches!(trimmed.first(), Some(b'{' | b'['))
+        && aterm_json::from_slice::<aterm_json::Value>(trimmed)
+            .is_ok_and(|doc| json_holds_private_key(&doc))
+}
+
+fn json_holds_private_key(value: &aterm_json::Value) -> bool {
+    match value {
+        aterm_json::Value::Object(map) => {
+            map.get("private_key")
+                .and_then(aterm_json::Value::as_str)
+                .is_some_and(|key| !key.trim().is_empty())
+                || map.values().any(json_holds_private_key)
+        }
+        aterm_json::Value::Array(items) => items.iter().any(json_holds_private_key),
+        _ => false,
+    }
 }
 
 /// A `PRIVATE KEY` PEM block's first line, spelled in halves so the export's secret scan

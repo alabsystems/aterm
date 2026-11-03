@@ -17,7 +17,7 @@ use crate::{Error, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 
-pub use crate::alab_join::{JOIN_QUIET, JOINING, LET_IN};
+pub use crate::alab_join::{JOIN_QUIET, JOINING, JoinPlace, LET_IN, let_in};
 
 /// A stream to one member's `ask` op.
 pub trait Stream: Read + Write + Send {}
@@ -349,12 +349,48 @@ fn run_once(
     Ok((greeting, bundle))
 }
 
+/// The lock file under the vault's state directory that one proof of this Mac holds at a time.
+const PROVING_LOCK: &str = "proving.lock";
+
+/// This Mac's one proof to its members at a time, across processes: `aterm members join` and the
+/// vault subscriber's round both prove, and [`prove_first`]'s one-member-at-a-time rule holds only
+/// inside one call. Two proofs at once could each reach a member that signs (two `Remove`s of one
+/// old seat at one cutoff make a quorum `Remove`). Released when dropped.
+#[derive(Debug)]
+pub struct ProofLock(std::fs::File);
+
+impl ProofLock {
+    /// Take the proof lock under `paths`, waiting while another process holds it until `until`
+    /// (`None`: one try). `Ok(None)` while another proof still holds it: that proof goes on, and
+    /// this one sends nothing, as after a member that may have signed.
+    ///
+    /// # Errors
+    /// The vault's state directory or its lock file cannot be made or opened.
+    pub fn take(paths: &Paths, until: Option<std::time::Instant>) -> Result<Option<Self>> {
+        crate::fsx::ensure_private_dir(&paths.dir)?;
+        let path = paths.dir.join(PROVING_LOCK);
+        let file = crate::fsx::open_lock(&path)?;
+        let deadline = until.unwrap_or_else(std::time::Instant::now);
+        match aterm_uds::file_lock::lock_exclusive_until(&file, deadline, "a proof is running") {
+            Ok(()) => Ok(Some(Self(file))),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(Error::new(format!("{}: {error}", path.display()))),
+        }
+    }
+}
+
+impl Drop for ProofLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// Prove this Mac to the members at `ats` with nobody's Allow (`desk::serve_with`'s `prove`):
 /// its request's writer key and its fleet node key (`sign_node`) sign each member's fresh
 /// challenge, and it answers the possession challenge. The first member that lets it in hands the
 /// log bundle (`client::admit_by_proof`), which this Mac writes and then follows. Members are
 /// tried one after another in address order, never at once, and none after one that may have
-/// signed (its possession answer went): two members removing one old seat at one cutoff would
+/// signed (its possession write began): two members removing one old seat at one cutoff would
 /// make a quorum `Remove`, which no Allow undoes, and the next try reaches the same member first,
 /// which then signs nothing new. Where none let it in, why each refused, by address: this Mac then
 /// asks a person as before.
@@ -419,7 +455,7 @@ pub fn prove_first(
 pub struct Missed {
     /// Why each member it tried refused or failed, by address.
     pub refused: Vec<(String, String)>,
-    /// The last one tried may have signed this Mac's records (its possession answer went): try no
+    /// The last one tried may have signed this Mac's records (its possession write began): try no
     /// other member, on any path, until that one's records had time to reach the others.
     pub signed_maybe: bool,
 }
@@ -462,4 +498,37 @@ fn written(
         report,
         admission,
     })
+}
+
+#[cfg(test)]
+mod proof_lock_tests {
+    use super::*;
+
+    /// One proof of this Mac at a time: a second take sees the first and sends nothing, for one
+    /// try and for a wait that ends while the first still holds it, and takes the lock once the
+    /// first let go.
+    ///
+    /// NEGATIVE CONTROL: with `ProofLock::take` returning `Ok(Some(..))` without locking, the
+    /// second take holds a lock beside the first and the test fails at "a second proof".
+    #[test]
+    fn a_second_proof_waits_for_the_first_and_sends_nothing_while_it_runs() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(root.path());
+        let first = ProofLock::take(&paths, None).unwrap();
+        assert!(first.is_some(), "the first proof takes the lock");
+        assert!(
+            ProofLock::take(&paths, None).unwrap().is_none(),
+            "a second proof while the first runs"
+        );
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        assert!(
+            ProofLock::take(&paths, Some(until)).unwrap().is_none(),
+            "a second proof whose wait ended while the first runs"
+        );
+        drop(first);
+        assert!(
+            ProofLock::take(&paths, None).unwrap().is_some(),
+            "a proof after the first let go"
+        );
+    }
 }

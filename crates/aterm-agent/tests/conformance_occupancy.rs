@@ -166,7 +166,7 @@ fn grant(key: i64) -> Option<aterm_agent::supervise::config::StuckBreakGrant> {
     let toml = if key == 1 {
         "[harness]\nstuck_break_note = true\n"
     } else {
-        "[harness]\n"
+        "[harness]\nstuck_break_note = false\n"
     };
     SupervisorConfig::from_aterm_toml(toml)
         .0

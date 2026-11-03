@@ -46,9 +46,26 @@ pub struct Compiled {
     /// The table descriptor's version.
     pub version: u32,
     pub birth: Birth,
+    /// Which generation of its table family this is (`registry` 1, `registry.2` 2, design §3.8).
+    pub generation: u32,
+    /// The next generation a roll restates this one into, when this build compiles one.
+    pub successor: Option<&'static Compiled>,
 }
 
 impl Compiled {
+    /// This table's catalog declaration in `trust`'s lab.
+    ///
+    /// # Errors
+    /// The table's words break the descriptor grammar.
+    pub fn descriptor(&self, trust: aterm_secrets::commons::journal::Trust) -> Result<Descriptor> {
+        Descriptor::application(trust, self.table.application, self.table.role, self.version)
+    }
+
+    /// This generation and every later one this build compiles, oldest first.
+    pub fn chain(&'static self) -> Vec<&'static Compiled> {
+        std::iter::successors(Some(self), |compiled| compiled.successor).collect()
+    }
+
     /// The key a new grid row in `collection` is born under ([`Birth`]), refused when the
     /// table already holds a row there: a `--where` export can leave that row out of the
     /// file, and a birth never writes into a row the owner did not see (design §8).
@@ -83,19 +100,80 @@ impl Compiled {
     pub fn collection(&self, name: &str) -> Result<&'static Collection> {
         self.table
             .collection(name)
-            .ok_or_else(|| Error::new(&format!("{}: no collection {name}", self.name())))
+            .ok_or_else(|| Error::new(&format!("{}: no collection of that name", self.name())))
     }
 }
 
-/// `alab/registry`, the lab model's owner data.
+/// `alab/registry`, the lab model's owner data, until a roll seals it ([`REGISTRY_2`]).
 pub const REGISTRY: Compiled = Compiled {
     table: &registry::REGISTRY,
     version: registry::VERSION,
     birth: registry::birth,
+    generation: 1,
+    successor: Some(&REGISTRY_2),
+};
+
+/// `alab/registry.2`, the registry's second generation (design §3.8, step 13).
+pub const REGISTRY_2: Compiled = Compiled {
+    table: &registry::REGISTRY_2,
+    version: registry::VERSION,
+    birth: registry::birth,
+    generation: 2,
+    successor: None,
 };
 
 /// Every typed catalog table this build compiles.
-pub const TABLES: &[Compiled] = &[REGISTRY];
+pub const TABLES: &[Compiled] = &[REGISTRY, REGISTRY_2];
+
+/// The generation of `chain` (oldest first) readers and writers use in `snapshot`: the oldest
+/// one subscribed here. A roll declares the next generation and restates into it while the old
+/// one stays subscribed, so every Mac keeps reading the old one until the roll seals it; then
+/// the old one's declarations conflict and the next is the oldest subscribed. With none
+/// subscribed it is the first, whose read then says why.
+pub(crate) fn current_in(
+    snapshot: &crate::catalog::Snapshot,
+    trust: aterm_secrets::commons::journal::Trust,
+    chain: &[&'static Compiled],
+) -> &'static Compiled {
+    chain
+        .iter()
+        .copied()
+        .find(|compiled| {
+            compiled.descriptor(trust).is_ok_and(|descriptor| {
+                snapshot
+                    .entries
+                    .get(&descriptor.scope.digest())
+                    .is_some_and(|entry| entry.state == crate::catalog::State::Subscribed)
+            })
+        })
+        .unwrap_or(chain[0])
+}
+
+/// The generation of `first`'s family this Mac's catalog says to use ([`current_in`]), read as
+/// an observer: `first` itself where it has no successor, where there is no Commons, or where
+/// the catalog cannot be read (the read that follows then says why).
+pub fn current(paths: &Paths, first: &'static Compiled) -> &'static Compiled {
+    let chain = first.chain();
+    if chain.len() == 1 {
+        return first;
+    }
+    application::peek_catalog(paths)
+        .ok()
+        .flatten()
+        .map_or(first, |(trust, snapshot)| {
+            current_in(&snapshot, trust, &chain)
+        })
+}
+
+/// The compiled table of `table`'s family at `generation`.
+fn generation_of(table: &Table, generation: u64) -> Option<&'static Compiled> {
+    let family = |role: &str| role.split('.').next().unwrap_or(role).to_owned();
+    TABLES.iter().find(|compiled| {
+        compiled.table.application == table.application
+            && family(compiled.table.role) == family(table.role)
+            && u64::from(compiled.generation) == generation
+    })
+}
 
 /// The compiled table named `<application>/<role>`.
 ///
@@ -166,15 +244,21 @@ impl View {
             .cloned()
             .collect();
         let resolve = owned::commons::historical(session);
+        let cells = log.cells_without(&quota.over);
+        let archived = archived_ops(table, session, &within);
         let owned = table
             .collections
             .iter()
             .filter(|collection| collection.kind == typed::Kind::Owned)
             .map(|collection| {
-                (
-                    collection.name,
-                    owned::read_owned(collection, &within, &resolve),
-                )
+                let mut read = owned::read_owned(collection, &within, &resolve);
+                // A row a Mac wrote in this generation outranks the one a roll carried for it.
+                let carried = owned::read_owned(collection, &archived, &resolve);
+                read.inert += carried.inert;
+                for (key, row) in carried.rows {
+                    read.rows.entry(key).or_insert(row);
+                }
+                (collection.name, read)
             })
             .collect();
         let awaited = log.awaited(session.actor());
@@ -186,9 +270,15 @@ impl View {
             .map(|op| op.header.id)
             .filter(|id| !awaited.contains(id))
             .collect();
+        // A later generation is whole only once a roll's cover row is here: before that its
+        // history is still arriving from the Macs that restated it.
+        let restated = table.collection(registry::ROLL.name).is_none()
+            || cells
+                .keys()
+                .any(|(collection, _)| collection == registry::ROLL.name);
         Self {
-            cells: log.cells_without(&quota.over),
-            complete: awaited.is_empty(),
+            cells,
+            complete: awaited.is_empty() && restated,
             refused,
             ops,
             quota,
@@ -205,6 +295,99 @@ impl View {
     pub fn schema(&self, collection: &str) -> SchemaState {
         owned::schema_state(&self.ops, collection)
     }
+}
+
+/// The records a roll carried into `table`'s `archived` rows (design §3.8), each authenticated
+/// under the scope of the generation that sealed it: its signer, roster and operation digest are
+/// the record's own, so its owned rows go through the owned rule exactly as they did there.
+///
+/// They are read from every eligible operation `ops` holds that wrote an archived row, not from
+/// the cells' current values: any Writer may write any archived cell, so a later write over a
+/// carried record (junk, or an older genuine record of the same row) must not hide it. Every
+/// record that authenticates stands, and the owned rule ranks them as it ranked them in the
+/// generation that sealed them, so an older record never outranks a newer one. A row whose
+/// record does not authenticate, whose key does not name its operation, or whose generation
+/// this build does not compile is left out; nothing a later writer wrote can stand for another
+/// Mac's row or take one away.
+pub(crate) fn archived_ops(table: &Table, session: &Session<'_>, ops: &[Op]) -> Vec<Op> {
+    let Some(collection) = table.collection(registry::ARCHIVED.name) else {
+        return Vec::new();
+    };
+    let trust = session.trust();
+    let mut out: BTreeMap<Digest, Op> = BTreeMap::new();
+    for op in ops.iter().filter(|op| !op.revert) {
+        // One archived row's cells go in one record (`pack` never splits a row).
+        let mut rows: BTreeMap<&str, (Option<u64>, Option<String>)> = BTreeMap::new();
+        for change in op
+            .changes
+            .iter()
+            .filter(|change| change.collection == collection.name)
+        {
+            let Ok(key) = cell::CellKey::parse(&change.key) else {
+                continue;
+            };
+            let Some(value) = change
+                .value
+                .as_ref()
+                .and_then(|value| cell::CellValue::decode(value).ok())
+            else {
+                continue;
+            };
+            let slot = rows.entry(key.pk).or_default();
+            match (key.col, key.elem) {
+                ("generation", None) => slot.0 = value.x.as_u64(),
+                ("wire", None) => slot.1 = value.x.as_str().map(str::to_owned),
+                _ => {}
+            }
+        }
+        for (pk, (generation, wire)) in rows {
+            let (Some(generation), Some(wire)) = (generation, wire) else {
+                continue;
+            };
+            let Some(compiled) = generation_of(table, generation) else {
+                continue;
+            };
+            let (Some(wire), Ok(descriptor)) = (
+                aterm_secrets::b64::decode_padded(&wire),
+                compiled.descriptor(trust),
+            ) else {
+                continue;
+            };
+            let Ok(record) = session.authenticate(descriptor.scope, &wire) else {
+                continue;
+            };
+            let header = record.header();
+            if typed::keys::archived_pk(&header.id) != pk || out.contains_key(&header.id) {
+                continue;
+            }
+            let Some(changes) = decode(record.payload())
+                .ok()
+                .and_then(|command| command.changes().map(<[Change]>::to_vec))
+            else {
+                continue;
+            };
+            out.insert(
+                header.id,
+                Op {
+                    id: header.id,
+                    actor: header.actor,
+                    sequence: header.sequence,
+                    roster: *record.roster(),
+                    period: 0,
+                    revert: false,
+                    changes: changes
+                        .into_iter()
+                        .filter(|change| {
+                            table
+                                .collection(&change.collection)
+                                .is_some_and(|c| c.kind == typed::Kind::Owned)
+                        })
+                        .collect(),
+                },
+            );
+        }
+    }
+    out.into_values().collect()
 }
 
 /// Pack rows of changes into records of at most [`MAX_WRITES`] changes and a payload within
@@ -246,6 +429,10 @@ pub struct Applied {
     pub unchanged: usize,
     /// Cells that changed since the export: left alone.
     pub stale: Vec<Stale>,
+    /// Keys of born rows written by this save.
+    pub born: Vec<String>,
+    /// Keys of rows retired or ended by this save.
+    pub retired: Vec<String>,
     /// The operations appended.
     pub operations: Vec<Digest>,
 }
@@ -335,7 +522,10 @@ pub struct Handle {
 }
 
 impl Handle {
+    /// The table `compiled` names, at the generation this Mac's catalog says to use
+    /// ([`current`]): after a roll, `alab/registry` reaches `alab/registry.2`.
     pub fn at(paths: Paths, compiled: &'static Compiled) -> Self {
+        let compiled = current(&paths, compiled);
         Self { paths, compiled }
     }
 
@@ -451,6 +641,8 @@ impl Handle {
                 let mut applied = Applied {
                     unchanged: settled.unchanged,
                     stale: settled.stale,
+                    born: settled.born,
+                    retired: settled.retired,
                     ..Applied::default()
                 };
                 for changes in pack(settled.rows)? {
@@ -527,13 +719,15 @@ impl Handle {
     }
 
     /// Append the exact compensation of `operation` while every key it wrote still holds it as
-    /// the sole candidate (`Log::compensate`); a later edit stays. An exact retry of `request`
-    /// returns the first operation.
+    /// the sole candidate (`Log::compensate`); a later edit stays. The target, current value and
+    /// preimage use the same quota-filtered history as [`Self::view`]. An exact retry of
+    /// `request` returns the first operation.
     ///
     /// # Errors
     /// No Commons writer, the operation is not an eligible typed record here, or a key it wrote
     /// changed since.
     pub fn revert(&self, request: [u8; 16], operation: Digest) -> Result<Digest> {
+        let table = self.compiled.table;
         application::with_store(
             &self.paths,
             false,
@@ -545,7 +739,8 @@ impl Handle {
                 if let Some(id) = log.revert_retry(session.actor(), request, operation)? {
                     return Ok(id);
                 }
-                let command = log.compensate(request, operation)?;
+                let view = View::read(table, session, &log);
+                let command = log.compensate(request, operation, &view.quota.over)?;
                 Ok(application::append(session, store, &command.encode()?)?.id)
             },
         )
@@ -588,7 +783,7 @@ impl Handle {
 /// The schema rows a build compiled at these versions may publish over `view`: a collection
 /// whose stored row is absent or below the compiled version. Never one below a version already
 /// visible, and never a second row at an equal version (that would split it).
-fn schema_rows(table: &Table, view: &View) -> Vec<Vec<Change>> {
+pub(crate) fn schema_rows(table: &Table, view: &View) -> Vec<Vec<Change>> {
     table
         .collections
         .iter()
@@ -606,6 +801,40 @@ fn schema_rows(table: &Table, view: &View) -> Vec<Vec<Change>> {
             }]
         })
         .collect()
+}
+
+/// Read a regular UTF-8 file of at most `limit` bytes without following a final symlink or
+/// blocking on a FIFO (`LOCK_OPEN_FLAGS`).
+pub(crate) fn read_regular_utf8(
+    path: &std::path::Path,
+    limit: usize,
+    unreadable: &str,
+    oversize: &str,
+    non_utf8: &str,
+) -> Result<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let err = || Error::new(unreadable);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+        .open(path)
+        .map_err(|_| err())?;
+    let meta = file.metadata().map_err(|_| err())?;
+    if !meta.is_file() {
+        return Err(err());
+    }
+    if meta.len() > limit as u64 {
+        return Err(Error::new(oversize));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| err())?;
+    if bytes.len() > limit {
+        return Err(Error::new(oversize));
+    }
+    String::from_utf8(bytes).map_err(|_| Error::new(non_utf8))
 }
 
 #[cfg(test)]

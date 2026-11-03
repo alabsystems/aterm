@@ -49,7 +49,20 @@ pub fn zone_offset_in(root: &Path, zone: &str, unix: i64) -> Option<i64> {
         return None;
     }
     const MOST: usize = 1 << 20;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(root.join(zone))
+            .ok()?
+    };
+    #[cfg(not(unix))]
     let file = std::fs::File::open(root.join(zone)).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(
         &mut std::io::Read::take(file, (MOST + 1) as u64),

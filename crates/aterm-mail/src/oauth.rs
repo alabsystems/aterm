@@ -5,6 +5,47 @@
 
 use crate::Secret;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    Transport,
+    Temporary,
+    Rejected,
+    InvalidResponse,
+    Storage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Error {
+    pub kind: ErrorKind,
+}
+impl Error {
+    pub fn retryable(&self) -> bool {
+        !matches!(self.kind, ErrorKind::Rejected)
+    }
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.kind {
+            ErrorKind::Transport => "Could not reach Google authentication",
+            ErrorKind::Temporary => "Google authentication is temporarily unavailable",
+            ErrorKind::Rejected => "Google rejected the mail authorization",
+            ErrorKind::InvalidResponse => "Google returned an invalid mail authorization",
+            ErrorKind::Storage => "Could not persist Google mail authorization",
+        })
+    }
+}
+impl From<Error> for String {
+    fn from(error: Error) -> Self {
+        error.to_string()
+    }
+}
+
+#[path = "google_session.rs"]
+pub mod session;
+
+#[path = "oauth_enrollment.rs"]
+pub mod enrollment;
+
 pub struct Pending {
     pub state: String,
     pub verifier: Secret,
@@ -77,9 +118,29 @@ pub fn exchange(
     pending: &Pending,
     state: &str,
     code: &str,
-) -> Result<Tokens, String> {
+) -> Result<Tokens, Error> {
+    exchange_until(
+        client_id,
+        client_secret,
+        pending,
+        state,
+        code,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+}
+
+pub fn exchange_until(
+    client_id: &str,
+    client_secret: Option<&str>,
+    pending: &Pending,
+    state: &str,
+    code: &str,
+    end: std::time::Instant,
+) -> Result<Tokens, Error> {
     if !aterm_digest::ct_eq(state.as_bytes(), pending.state.as_bytes()) {
-        return Err("Google sign-in state did not match".into());
+        return Err(Error {
+            kind: ErrorKind::Rejected,
+        });
     }
     let mut fields = vec![
         ("client_id", client_id),
@@ -91,14 +152,33 @@ pub fn exchange(
     if let Some(secret) = client_secret {
         fields.push(("client_secret", secret));
     }
-    request(fields)
+    request_until(fields, end)
 }
 
 pub fn refresh(
     client_id: &str,
     client_secret: Option<&str>,
     refresh_token: &Secret,
-) -> Result<Tokens, String> {
+) -> Result<Tokens, Error> {
+    refresh_until(
+        client_id,
+        client_secret,
+        refresh_token,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+}
+
+pub fn refresh_until(
+    client_id: &str,
+    client_secret: Option<&str>,
+    refresh_token: &Secret,
+    end: std::time::Instant,
+) -> Result<Tokens, Error> {
+    if client_id.is_empty() || refresh_token.expose().is_empty() {
+        return Err(Error {
+            kind: ErrorKind::Rejected,
+        });
+    }
     let mut fields = vec![
         ("client_id", client_id),
         ("refresh_token", refresh_token.expose()),
@@ -107,46 +187,109 @@ pub fn refresh(
     if let Some(secret) = client_secret {
         fields.push(("client_secret", secret));
     }
-    request(fields)
+    request_until(fields, end)
 }
 
-fn request(fields: Vec<(&str, &str)>) -> Result<Tokens, String> {
-    let body = fields
-        .into_iter()
-        .map(|(k, v)| format!("{}={}", encode(k), encode(v)))
-        .collect::<Vec<_>>()
-        .join("&");
+fn request_until(fields: Vec<(&str, &str)>, end: std::time::Instant) -> Result<Tokens, Error> {
+    let within = end
+        .saturating_duration_since(std::time::Instant::now())
+        .min(std::time::Duration::from_secs(30));
+    if within.is_zero() {
+        return Err(Error {
+            kind: ErrorKind::Transport,
+        });
+    }
+    let body = zeroize::Zeroizing::new(
+        fields
+            .into_iter()
+            .map(|(k, v)| format!("{}={}", encode(k), encode(v)))
+            .collect::<Vec<_>>()
+            .join("&"),
+    );
     let client = aterm_http::Client::new(
         aterm_http::Trust::PlatformVerifier,
         aterm_http::ProxyMode::Environment,
-        std::time::Duration::from_secs(30),
+        within,
     );
     let response = client
         .post("https://oauth2.googleapis.com/token")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .limit(64 * 1024)
         .send(body.as_bytes())
-        .map_err(|e| e.to_string())?;
-    if response.status() != 200 {
-        return Err(format!(
-            "Google sign-in failed (HTTP {})",
-            response.status()
-        ));
+        .map_err(|_| Error {
+            kind: ErrorKind::Transport,
+        })?;
+    decode_response(response.status(), response.body())
+}
+
+fn decode_response(status: u16, body: &[u8]) -> Result<Tokens, Error> {
+    if matches!(status, 407 | 408 | 425 | 429) || status >= 500 {
+        return Err(Error {
+            kind: ErrorKind::Temporary,
+        });
     }
-    let value: aterm_json::Value =
-        aterm_json::from_slice(response.body()).map_err(|_| "Invalid Google token response")?;
-    Ok(Tokens {
-        access_token: Secret::new(
-            value["access_token"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .ok_or("Google returned no access token")?
-                .into(),
-        ),
-        refresh_token: value["refresh_token"]
+    if status != 200 {
+        if let Ok(err_val) = aterm_json::from_slice::<aterm_json::Value>(body)
+            && let Some(code) = err_val["error"].as_str()
+            && matches!(
+                code.trim().to_ascii_lowercase().as_str(),
+                "temporarily_unavailable" | "server_error" | "slow_down"
+            )
+        {
+            return Err(Error {
+                kind: ErrorKind::Temporary,
+            });
+        }
+        return Err(Error {
+            kind: ErrorKind::Rejected,
+        });
+    }
+    let invalid = || Error {
+        kind: ErrorKind::InvalidResponse,
+    };
+    let value: aterm_json::Value = aterm_json::from_slice(body).map_err(|_| invalid())?;
+    if value["token_type"]
+        .as_str()
+        .is_none_or(|kind| !kind.eq_ignore_ascii_case("Bearer"))
+    {
+        return Err(invalid());
+    }
+    if value.get("scope").is_some()
+        && !value["scope"].is_null()
+        && value["scope"].as_str().is_none()
+    {
+        return Err(invalid());
+    }
+    if let Some(scope) = value["scope"].as_str()
+        && !scope
+            .split_whitespace()
+            .any(|scope| scope == "https://mail.google.com/")
+    {
+        return Err(Error {
+            kind: ErrorKind::Rejected,
+        });
+    }
+    let secret = |name: &str| -> Result<Secret, Error> {
+        let raw = value[name]
             .as_str()
-            .map(|s| Secret::new(s.into())),
-        expires_in: value["expires_in"].as_u64().unwrap_or(3600),
+            .filter(|value| {
+                !value.is_empty() && value.len() <= 8192 && !value.chars().any(char::is_control)
+            })
+            .ok_or_else(invalid)?;
+        Ok(Secret::new(raw.into()))
+    };
+    let expires_in = value["expires_in"]
+        .as_u64()
+        .filter(|seconds| *seconds > 0 && *seconds <= 86_400)
+        .ok_or_else(invalid)?;
+    let refresh_token = match value.get("refresh_token") {
+        None | Some(aterm_json::Value::Null) => None,
+        Some(_) => Some(secret("refresh_token")?),
+    };
+    Ok(Tokens {
+        access_token: secret("access_token")?,
+        refresh_token,
+        expires_in,
     })
 }
 
@@ -160,5 +303,70 @@ mod tests {
         assert_ne!(first.state, second.state);
         assert!(first.authorize_url.contains("code_challenge_method=S256"));
         assert!(exchange("client", None, &first, "wrong", "unused").is_err());
+    }
+    #[test]
+    fn token_responses_validate_scope_type_expiry_and_secrets() {
+        let valid = br#"{"token_type":"Bearer","access_token":"access","expires_in":3600}"#;
+        assert_eq!(
+            decode_response(200, valid).unwrap().access_token.expose(),
+            "access"
+        );
+        for body in [
+            br#"{"token_type":"Bearer","access_token":"","expires_in":3600}"#.as_slice(),
+            br#"{"token_type":"Basic","access_token":"access","expires_in":3600}"#,
+            br#"{"token_type":"Bearer","access_token":"access","expires_in":0}"#,
+            br#"{"token_type":"Bearer","access_token":"access","expires_in":3600,"scope":123}"#,
+        ] {
+            assert!(matches!(
+                decode_response(200, body),
+                Err(Error {
+                    kind: ErrorKind::InvalidResponse
+                })
+            ));
+        }
+        assert!(matches!(decode_response(200, br#"{"token_type":"Bearer","access_token":"access","expires_in":3600,"scope":"profile"}"#), Err(Error { kind: ErrorKind::Rejected })));
+        let with_nulls = br#"{"token_type":"Bearer","access_token":"access","expires_in":3600,"refresh_token":null,"scope":null}"#;
+        let decoded_nulls = decode_response(200, with_nulls).unwrap();
+        assert_eq!(decoded_nulls.access_token.expose(), "access");
+        assert!(decoded_nulls.refresh_token.is_none());
+        assert!(
+            Error {
+                kind: ErrorKind::InvalidResponse
+            }
+            .retryable()
+        );
+        for status in [407, 408, 425, 429, 500, 503] {
+            assert!(
+                decode_response(status, b"private")
+                    .err()
+                    .unwrap()
+                    .retryable()
+            );
+        }
+        assert!(
+            decode_response(400, br#"{"error":"temporarily_unavailable"}"#)
+                .err()
+                .unwrap()
+                .retryable()
+        );
+        let rejected = decode_response(400, b"sensitive-token").err().unwrap();
+        assert!(!rejected.retryable());
+        assert!(!format!("{rejected:?} {rejected}").contains("sensitive"));
+    }
+
+    #[test]
+    fn expired_refresh_deadline_never_reaches_network() {
+        let result = refresh_until(
+            "client",
+            None,
+            &Secret::new("refresh".into()),
+            std::time::Instant::now(),
+        );
+        assert!(matches!(
+            result,
+            Err(Error {
+                kind: ErrorKind::Transport
+            })
+        ));
     }
 }

@@ -20,6 +20,7 @@ use std::process::ExitCode;
 pub const USAGE: &str = "usage:
   aterm secrets need [ls] [--all] [--json]        this Mac's needs; --all adds every request in the lab's table
   aterm secrets need peek [--all] [--json]        read retained state only; never posts, sweeps or advances needs
+                                                  JSON identifies the observer, requester and delivery origin; never credential values
   aterm secrets need <want> [--purpose <id>]       raise a need by hand (want: site-deployer-key, notary, mailbox:<label>, gh:dev, gh:release, entry:<name>, ...)
   aterm secrets need retire <want|id> [--declined] [--note <text>]
                                                    withdraw a need, or decline one a person was asked for
@@ -349,6 +350,8 @@ fn observation_json(table: &Result<Observation, String>) -> Value {
                 "id": hex::encode_lower(&thread.id),
                 "want": thread.want.key(),
                 "purpose": thread.purpose.id(),
+                "requester": hex::encode_lower(&thread.requester),
+                "delivery_origin": thread.origin.map(|actor| hex::encode_lower(&actor)),
                 "own": thread.requester == observed.observer,
                 "requester_current": observed.members.contains(&thread.requester),
                 "offers": thread.offers.len(),
@@ -365,6 +368,7 @@ fn observation_json(table: &Result<Observation, String>) -> Value {
         .collect();
     aterm_json::json!({
         "available": true,
+        "observer": hex::encode_lower(&observed.observer),
         "observed_at_ms": observed.at_ms,
         "current_members": observed.members.len(),
         "retained_operations": observed.retained_operations,

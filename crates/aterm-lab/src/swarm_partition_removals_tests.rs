@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::swarm::partition::split::tests as ledgers;
 
 fn failed(ev: &Evidence) -> Vec<&'static str> {
     judge(ev)
@@ -79,7 +80,7 @@ fn kept() -> Kept {
         skipped: None,
         removals: vec![act("a1", "b3"), act("a1", "a3"), act("b3", "a3")],
         put: Some(Ok(())),
-        leaked: false,
+        ledger: Some(ledgers::held()),
         under_cut_epoch: true,
         minted: vec!["b1 minted 9 records in round 1".to_owned()],
         wrapped_to_cut: Vec::new(),
@@ -142,18 +143,84 @@ fn an_epoch_kept_readable_but_never_resealed_fails_kept() {
     assert_eq!(failed(&ev), vec![KEPT]);
 }
 
-/// A split that leaked (b1 held a1's removal of b3 before it wrote, so its write keys nothing
-/// and measures no write on the removed Mac's side) fails [`KEPT`] though every Mac reads as it
-/// should.
+/// A split that leaked (a1's removal of b3 reached island B's server and b1 before the heal, so
+/// b1's write keys nothing and the run measured no write on the removed Mac's side) fails
+/// [`SPLIT_HELD`], the lab's check, and leaves [`KEPT`] unjudged, though every Mac reads as it
+/// should: the leak is never a verdict on the product.
 ///
 /// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): drop
-/// `judge_kept`'s `leaked` arm: fails with left `[]`, right `["removals: a write on the removed
-/// Mac's side survives the heal"]`.
+/// `judge_kept`'s `!short.is_empty()` arm: [`KEPT`] judges the leaked run as a product pass, and
+/// the test fails with left `[SPLIT_HELD]`, right `[KEPT, SPLIT_HELD]` (proven 2026-11-03).
 #[test]
-fn a_split_that_leaked_fails_kept() {
+fn a_split_that_leaked_fails_split_held_and_leaves_kept_unjudged() {
     let mut ev = whole();
     if let Some(k) = ev.kept.as_mut() {
-        k.leaked = true;
+        k.ledger = Some(ledgers::crossed());
     }
-    assert_eq!(failed(&ev), vec![KEPT]);
+    assert_eq!(failed(&ev), vec![KEPT, SPLIT_HELD]);
+}
+
+/// A split the plane never read (a build whose removals plane held no ledger) is not shown to
+/// hold, and [`KEPT`] is not judged on it.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): in `judge`,
+/// pass `judge_kept` no shortfalls (`&[]`): [`KEPT`] passes on an unread split, and the test
+/// fails with left `[SPLIT_HELD]`, right `[KEPT, SPLIT_HELD]` (proven 2026-11-03).
+#[test]
+fn a_split_never_read_is_not_shown_to_hold() {
+    let mut ev = whole();
+    if let Some(k) = ev.kept.as_mut() {
+        k.ledger = None;
+    }
+    assert_eq!(failed(&ev), vec![KEPT, SPLIT_HELD]);
+}
+
+/// A split whose island B server could not be read at its end, though nothing is seen to cross:
+/// [`SPLIT_HELD`] fails and [`KEPT`] is not judged, each saying the split was not read whole,
+/// never that something crossed.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): in
+/// `split::shortfalls`, count an unread holder as `Shortfall::Crossed`: [`KEPT`] says a record
+/// or head crossed, and the test fails at its `KEPT` assertion (proven 2026-11-03).
+#[test]
+fn a_split_not_read_whole_leaves_kept_unjudged_and_says_why() {
+    let mut ev = whole();
+    if let Some(ledger) = ev.kept.as_mut().and_then(|k| k.ledger.as_mut()) {
+        ledger
+            .end
+            .unread
+            .push("island B's server's records: timed out".to_owned());
+    }
+    assert_eq!(failed(&ev), vec![KEPT, SPLIT_HELD]);
+    let checks = judge(&ev);
+    let detail = |name: &str| {
+        checks
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.detail.clone())
+            .unwrap_or_default()
+    };
+    for name in [KEPT, SPLIT_HELD] {
+        let said = detail(name);
+        assert!(
+            said.contains("F21's split could not be read whole")
+                && !said.contains("a record or head crossed"),
+            "{name}: {said}"
+        );
+    }
+}
+
+/// A records sync under F21's split that left its own island's server short fails
+/// [`SPLIT_HELD`] alone: nothing crossed, so [`KEPT`] is judged on the run as ever.
+///
+/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): make
+/// `split::Shortfall::voids` answer `true` for every shortfall: [`KEPT`] is left unjudged, and
+/// the test fails with left `[KEPT, SPLIT_HELD]`, right `[SPLIT_HELD]` (proven 2026-11-03).
+#[test]
+fn an_unexercised_records_sync_fails_split_held_alone_and_kept_is_judged() {
+    let mut ev = whole();
+    if let Some(k) = ev.kept.as_mut() {
+        k.ledger = Some(ledgers::unexercised());
+    }
+    assert_eq!(failed(&ev), vec![SPLIT_HELD]);
 }

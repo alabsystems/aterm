@@ -1251,6 +1251,16 @@ impl SessionStore {
             crate::fabric::watch_direct_mail(&handle.ctx);
         }
         let journal = first.then(|| (handle.sid.as_str().to_string(), handle.local_id));
+        // A replace journals nothing, but `bridge_roster` emits these two, so a bridge holding
+        // the count must learn of it: the count alone moves, and leaves a hole in the journal's
+        // seqs that `roster_since` reads past.
+        if self
+            .by_id
+            .get(&handle.sid)
+            .is_some_and(|had| (had.local_id, had.nonce) != (handle.local_id, handle.nonce))
+        {
+            self.roster_seq += 1;
+        }
         self.by_local.insert(handle.local_id, handle.sid.clone());
         self.by_id.insert(handle.sid.clone(), handle);
         if let Some((sid, local_id)) = journal {
@@ -1663,7 +1673,9 @@ impl SessionStore {
             .collect()
     }
 
-    /// Returns the highest sequence number in the roster lifecycle journal.
+    /// Returns the roster's count: the highest sequence number in the lifecycle journal, or above
+    /// it after a replace that changed a row, which moves the count with no record
+    /// ([`SessionStore::register`]). Equal counts in one process mean one [`SessionStore::bridge_roster`].
     #[must_use]
     pub(crate) const fn roster_seq(&self) -> u64 {
         self.roster_seq
@@ -2917,6 +2929,7 @@ title = \"zsh\"
             crate::task_record::TaskRecord {
                 since: record.since,
                 started: record.started,
+                carried_entered: None,
                 ..seeded
             },
             record,
@@ -3321,6 +3334,41 @@ title = \"zsh\"
         assert_eq!(store.roster_since(3).count(), 0);
         assert_eq!(store.roster_since(99).count(), 0, "past the high = nothing");
         assert_eq!(store.roster_low_seq(), Some(1));
+    }
+
+    /// `bridge_roster` emits each row's local id and nonce, so a replace that changes either moves
+    /// the count a bridge holds its roster by (`sessions bridge`'s and `outbox`'s `roster=`),
+    /// journals nothing, and the next record reads on above it.
+    #[test]
+    fn a_replace_that_changes_a_roster_row_moves_the_count() {
+        let mut store = SessionStore::default();
+        let mut row = handle(1, None);
+        store.register(row.clone());
+        assert_eq!(store.roster_seq(), 1);
+
+        store.register(row.clone());
+        assert_eq!(store.roster_seq(), 1, "the same row again moves nothing");
+
+        row.nonce = aterm_session::LaunchNonce::generate();
+        store.register(row.clone());
+        assert_eq!(store.roster_seq(), 2, "a new nonce");
+        assert_eq!(store.bridge_roster()[0].2, row.nonce);
+
+        row.local_id = 7;
+        store.register(row.clone());
+        assert_eq!(store.roster_seq(), 3, "a new local id");
+        assert_eq!(store.bridge_roster()[0].0, 7);
+
+        assert_eq!(store.roster_since(0).count(), 1, "neither is a record");
+        store.register(handle(2, None));
+        assert_eq!(store.roster_seq(), 4);
+        let seqs: Vec<u64> = store.roster_since(0).map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![1, 4], "the next record reads on above the hole");
+        assert_eq!(
+            store.roster_since(1).count(),
+            1,
+            "a reader at 1 still sees it"
+        );
     }
 
     #[test]

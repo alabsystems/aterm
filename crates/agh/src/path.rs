@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! RFC 3986 encoders and dot-segment guards for URL path segments and query values.
+//! RFC 3986 encoders and dot-segment guards for URL path segments and query values, and the
+//! shape checks of the words agh puts in a path or an argv: digits, lowercase hex, a sha and a
+//! git ref name.
 
 use crate::error::{Error, Result};
 
@@ -143,4 +145,58 @@ pub(crate) fn digits<T: std::str::FromStr>(text: &str) -> Option<T> {
     } else {
         None
     }
+}
+
+/// Whether `text` is a full sha: 40 lowercase hex digits.
+#[inline]
+pub(crate) fn is_sha(text: &str) -> bool {
+    aterm_codec::hex::is_lower(text, 40)
+}
+
+/// The one refusal of a value [`is_sha`] rejects, the value redacted by shape: every caller
+/// (`agh ref`, `Refs`, the git runner) adds only its own context.
+pub(crate) fn sha_refusal(sha: &str) -> String {
+    format!(
+        "{}: a sha is 40 lowercase hex digits",
+        crate::redact::Redactor::shapes(sha)
+    )
+}
+
+/// The one refusal of a reference [`reference_ok`] rejects (plan §9 body 14), the reference
+/// redacted by shape: every caller adds only its own context.
+pub(crate) fn reference_refusal(reference: &str) -> String {
+    format!(
+        "{}: agh reads and writes refs/heads/… and refs/tags/… only, by names git accepts",
+        crate::redact::Redactor::shapes(reference)
+    )
+}
+
+/// Whether `name` is a ref git's `check-ref-format` accepts under `refs/`: one or more
+/// components after `refs/`, none empty, starting with `.` or ending with `.lock`; no `..`,
+/// `@{`, ASCII control or DEL, space, `~`, `^`, `:`, `?`, `*`, `[` or `\`; and no trailing `.`.
+pub(crate) fn ref_name_ok(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("refs/") else {
+        return false;
+    };
+    if rest.is_empty() || name.ends_with('.') || name.contains("..") || name.contains("@{") {
+        return false;
+    }
+    let bad_byte = |b: u8| {
+        b.is_ascii_control() || matches!(b, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+    };
+    if name.bytes().any(bad_byte) {
+        return false;
+    }
+    name.split('/')
+        .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
+/// The reference rule (plan §9 body 14): `refs/heads/…` or `refs/tags/…`, by a name
+/// [`ref_name_ok`] accepts.
+pub(crate) fn reference_ok(reference: &str) -> bool {
+    let branch_or_tag = reference
+        .strip_prefix("refs/heads/")
+        .or_else(|| reference.strip_prefix("refs/tags/"))
+        .is_some_and(|rest| !rest.is_empty());
+    branch_or_tag && ref_name_ok(reference)
 }

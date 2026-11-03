@@ -44,6 +44,7 @@ pub(super) fn prelaunch_record(
             #[cfg(target_os = "macos")]
             booked_launch_unregistered: false,
             history_export: None,
+            sessionless: false,
         },
         cancelled,
         stood_down,

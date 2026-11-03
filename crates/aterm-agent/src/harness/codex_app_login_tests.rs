@@ -122,7 +122,9 @@ fn raw_get_loopback(url: &str) -> (u16, String) {
         format!("GET /{path_and_query} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).expect("write callback");
     let mut resp = String::new();
-    let _ = stream.read_to_string(&mut resp);
+    stream
+        .read_to_string(&mut resp)
+        .expect("read callback reply through peer close");
     let status = resp
         .lines()
         .next()
@@ -135,6 +137,172 @@ fn raw_get_loopback(url: &str) -> (u16, String) {
 fn query_map(url: &str) -> Vec<(String, String)> {
     let (_, query) = url.split_once('?').unwrap_or((url, ""));
     parse_query_params(query)
+}
+
+#[test]
+fn callback_listener_uses_fallback_without_contacting_an_occupied_port() {
+    let occupied = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    occupied.set_nonblocking(true).unwrap();
+    let port = occupied.local_addr().unwrap().port();
+    let fallback =
+        bind_callback_listener(&[port, 0], Instant::now() + aterm_spec::wait::MUST_HAPPEN).unwrap();
+    assert_ne!(fallback.local_addr().unwrap().port(), port);
+    assert!(
+        matches!(occupied.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    let refused = bind_callback_listener(&[port], Instant::now() + aterm_spec::wait::MUST_HAPPEN)
+        .unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::AddrInUse);
+    assert!(
+        matches!(occupied.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    let expired = bind_callback_listener(&[0], Instant::now()).unwrap_err();
+    assert_eq!(expired.kind(), std::io::ErrorKind::TimedOut);
+}
+
+#[test]
+fn callback_listener_ignores_a_bare_cancel_and_keeps_its_active_flow() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let done = Arc::new(AtomicBool::new(false));
+    let server_done = done.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        serve_callback_loop(
+            listener,
+            port,
+            "owned-state".into(),
+            Arc::new(AtomicBool::new(false)),
+            server_done,
+            tx,
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        );
+    });
+    let base = format!("http://127.0.0.1:{port}");
+    assert_eq!(raw_get_loopback(&format!("{base}/cancel")).0, 404);
+    assert!(!done.load(Ordering::SeqCst));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        raw_get_loopback(&format!(
+            "{base}/auth/callback?state=owned-state&error=access_denied"
+        ))
+        .0,
+        200
+    );
+    server.join().unwrap();
+    assert!(done.load(Ordering::SeqCst));
+    assert!(matches!(rx.try_recv(), Ok(CallbackOutcome::Failed)));
+}
+
+#[test]
+fn callback_io_budget_bounds_trickling_headers() {
+    let wire = b"GET /auth/callback?code=ok HTTP/1.1\r\nHost: 127.0.0.1:1455\r\n\r\n";
+    for trickle in [false, true] {
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let mut input = std::io::Cursor::new(wire);
+        let target = {
+            let mut reader = CallbackRead {
+                deadline: start + CALLBACK_IO_WAIT,
+                now: || clock.get(),
+                read: |buf: &mut [u8], remaining: Duration| {
+                    assert!(!remaining.is_zero() && remaining <= CALLBACK_IO_WAIT);
+                    let n = input.read(&mut buf[..1])?;
+                    if trickle {
+                        clock.set(clock.get() + Duration::from_secs(1));
+                    }
+                    Ok(n)
+                },
+            };
+            read_request_target(&mut reader, 1455)
+        };
+        if trickle {
+            assert!(target.is_none(), "progress cannot renew the header budget");
+            assert!(input.position() < wire.len() as u64);
+        } else {
+            assert_eq!(target.as_deref(), Some("/auth/callback?code=ok"));
+        }
+    }
+}
+
+#[test]
+fn callback_io_budget_bounds_reply_drain() {
+    for trickle in [false, true] {
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let consumed = std::cell::Cell::new(0);
+        let mut reader = CallbackRead {
+            deadline: start + CALLBACK_DRAIN_WAIT,
+            now: || clock.get(),
+            read: |buf: &mut [u8], remaining: Duration| {
+                assert!(!remaining.is_zero() && remaining <= CALLBACK_DRAIN_WAIT);
+                buf.fill(b'x');
+                consumed.set(consumed.get() + buf.len());
+                if trickle {
+                    clock.set(clock.get() + Duration::from_millis(25));
+                }
+                Ok(buf.len())
+            },
+        };
+        drain_callback(&mut reader);
+        if trickle {
+            assert!(
+                consumed.get() < CALLBACK_DRAIN_MAX,
+                "time bounds a live peer"
+            );
+        } else {
+            assert_eq!(
+                consumed.get(),
+                CALLBACK_DRAIN_MAX,
+                "bytes bound a fast peer"
+            );
+        }
+    }
+}
+
+#[test]
+fn callback_io_budget_bounds_partial_writes() {
+    for trickle in [false, true] {
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let mut sent = Vec::new();
+        let result = write_callback_until(
+            b"reply",
+            start + CALLBACK_IO_WAIT,
+            || clock.get(),
+            |bytes, remaining| {
+                assert!(!remaining.is_zero() && remaining <= CALLBACK_IO_WAIT);
+                sent.push(bytes[0]);
+                if trickle {
+                    clock.set(clock.get() + Duration::from_secs(1));
+                }
+                Ok(1)
+            },
+        );
+        if trickle {
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+            assert!(sent.len() < b"reply".len());
+        } else {
+            result.unwrap();
+            assert_eq!(sent, b"reply");
+        }
+    }
+    let start = Instant::now();
+    let clock = std::cell::Cell::new(start);
+    let zero = write_callback_until(
+        b"x",
+        start + CALLBACK_IO_WAIT,
+        || clock.get(),
+        |_, _| {
+            clock.set(clock.get() + Duration::from_secs(1));
+            Ok(0)
+        },
+    )
+    .unwrap_err();
+    assert_eq!(zero.kind(), std::io::ErrorKind::WriteZero);
 }
 
 /// Runs a complete in-process loopback PKCE login in `home` against a mock `127.0.0.1:0` token
@@ -224,10 +392,11 @@ pub(crate) fn mock_login_in_home(
                 let (status, _) =
                     raw_get_loopback(&format!("{redirect}?code=auth_code_ok&state={state}"));
                 assert_eq!(status, 200);
-                let start = Instant::now();
-                while !(handoff.finished)() && start.elapsed() < Duration::from_secs(5) {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+                aterm_spec::wait::until_within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    "the accepted callback's completion mark after its reply",
+                    || (handoff.finished)().then_some(()),
+                );
             }
             decision
         }
@@ -255,6 +424,35 @@ pub(crate) fn mock_login_in_home(
 }
 
 type Handed = Vec<(Option<String>, Option<String>, Completion)>;
+
+#[test]
+fn unavailable_browser_stops_native_pkce_without_requesting_a_person() {
+    struct Unavailable;
+    impl Approver for Unavailable {
+        fn approve(&mut self, _: &Handoff<'_>) -> Approval {
+            Approval::NotRun("pinned browser fetch is unavailable".into())
+        }
+    }
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("login");
+    let drove = login_with(
+        &home,
+        &Endpoints {
+            issuer: DEFAULT_ISSUER.into(),
+            token_url: "http://127.0.0.1:1/oauth/token".into(),
+            callback_ports: vec![0],
+        },
+        &mut Unavailable,
+        HOSTS,
+        Some("codex-one@example.com"),
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    );
+    assert_eq!(
+        drove.outcome,
+        Outcome::NotRun("pinned browser fetch is unavailable".into())
+    );
+    assert!(!home.join("auth.json").exists());
+}
 
 #[derive(Default)]
 struct Seen {
@@ -710,10 +908,11 @@ fn off_pin_issuer_state_mismatch_provider_error_and_refusal_are_enforced() {
         let (err_status, _) =
             raw_get_loopback(&format!("{redirect}?error=access_denied&state={state}"));
         assert_eq!(err_status, 200);
-        let start = Instant::now();
-        while !(handoff.finished)() && start.elapsed() < aterm_spec::wait::MUST_HAPPEN {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the matching error callback's completion mark after its reply",
+            || (handoff.finished)().then_some(()),
+        );
         matching_err_finished = (handoff.finished)();
         Approval::Approved { page: true }
     });
@@ -2611,6 +2810,144 @@ fn provider_seen(port: u16, server: std::thread::JoinHandle<Vec<RecordedHttp>>) 
         .collect()
 }
 
+#[test]
+fn sign_in_takes_the_publication_lock_before_spending_its_code() {
+    for held_elsewhere in [false, true] {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let home = tmp.path().join("login");
+        let now = 1_790_000_000;
+        hour_login(&home, now, Some("previous-refresh"));
+        let before = std::fs::read(home.join(AUTH_FILE)).unwrap();
+        let held = if held_elsewhere {
+            Some(AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().unwrap())
+        } else {
+            // A refused lock file must not become permission to publish without a lock.
+            std::fs::create_dir(beside_auth(&home, LOCK_SUFFIX)).unwrap();
+            None
+        };
+        let (port, server) = provider(|_, _| ("200 OK", json!({})));
+        let endpoints = Endpoints {
+            issuer: format!("http://127.0.0.1:{port}"),
+            token_url: format!("http://127.0.0.1:{port}/oauth/token"),
+            callback_ports: vec![],
+        };
+        assert!(
+            exchange_code_and_persist(
+                &home,
+                &endpoints,
+                "http://127.0.0.1/callback",
+                "unspent-code",
+                "verifier",
+                Duration::from_millis(20),
+                now,
+            )
+            .is_none()
+        );
+        assert!(provider_seen(port, server).is_empty());
+        assert_eq!(std::fs::read(home.join(AUTH_FILE)).unwrap(), before);
+        drop(held);
+    }
+}
+
+#[test]
+fn first_sign_in_holds_its_lock_during_the_token_exchange() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("new-login");
+    let server_home = home.clone();
+    let now = 1_790_000_000;
+    let (port, server) = provider(move |_, _| {
+        assert!(
+            AuthLock::try_take(&server_home.join(AUTH_FILE))
+                .unwrap()
+                .is_none(),
+            "the exchange must already hold the publication lock"
+        );
+        let access = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 3600);
+        (
+            "200 OK",
+            json!({"id_token":access, "access_token":access, "refresh_token":"new-refresh"}),
+        )
+    });
+    assert_eq!(
+        exchange_code_and_persist(
+            &home,
+            &Endpoints {
+                issuer: format!("http://127.0.0.1:{port}"),
+                token_url: format!("http://127.0.0.1:{port}/oauth/token"),
+                callback_ports: vec![],
+            },
+            "http://127.0.0.1/callback",
+            "code",
+            "verifier",
+            aterm_spec::wait::MUST_HAPPEN,
+            now,
+        ),
+        Some(Some("owner@example.test".into()))
+    );
+    assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
+    assert_eq!(
+        load_stored_auth(&home).unwrap().refresh_token.as_deref(),
+        Some("new-refresh")
+    );
+    assert!(AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().is_some());
+}
+
+#[test]
+fn sign_in_and_stale_journal_recovery_keep_evidence_until_publication_is_durable() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("login");
+    let now = 1_790_000_000;
+    hour_login(&home, now, Some("spent-refresh"));
+    RefreshJournal::Attempted {
+        token: refresh_token_digest("spent-refresh"),
+    }
+    .write(&home)
+    .unwrap();
+    let journal = beside_auth(&home, JOURNAL_SUFFIX);
+    let evidence = std::fs::read(&journal).unwrap();
+    let (port, server) = provider(move |_, _| {
+        let token = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 7200);
+        (
+            "200 OK",
+            json!({"id_token":token, "access_token":token, "refresh_token":"fresh-login"}),
+        )
+    });
+    let fault = aterm_durable::seam::FailingDirs::with(aterm_durable::seam::EIO);
+    assert!(
+        exchange_code_and_persist(
+            &home,
+            &Endpoints {
+                issuer: format!("http://127.0.0.1:{port}"),
+                token_url: format!("http://127.0.0.1:{port}/oauth/token"),
+                callback_ports: vec![],
+            },
+            "http://127.0.0.1/callback",
+            "code",
+            "verifier",
+            aterm_spec::wait::MUST_HAPPEN,
+            now,
+        )
+        .is_none()
+    );
+    assert_eq!(std::fs::read(&journal).unwrap(), evidence);
+    assert_eq!(
+        load_stored_auth(&home).unwrap().refresh_token.as_deref(),
+        Some("fresh-login"),
+        "the replacement is visible but its directory barrier failed"
+    );
+    let _held = AuthLock::within(&home, Instant::now() + aterm_spec::wait::MUST_HAPPEN)
+        .expect("hold the recovery lock");
+    assert!(matches!(
+        recover_journal_held(&home),
+        Err(Refreshed::Failed)
+    ));
+    assert_eq!(std::fs::read(&journal).unwrap(), evidence);
+    drop(fault);
+    assert!(recover_journal_held(&home).is_ok());
+    assert!(!journal.exists());
+    assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
+}
+
 /// A login in `home` whose access token is good for an hour, with `refresh` as its refresh token.
 fn hour_login(home: &Path, now: i64, refresh: Option<&str>) -> StoredAuth {
     let access = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 3600);
@@ -3406,35 +3743,44 @@ fn auth_lock_coordinates_refresh_reloads_rotated_tokens_and_refuses_symlinks() {
     let port = listener.local_addr().expect("addr").port();
     let token_url = format!("http://127.0.0.1:{port}/oauth/token");
     let home_rot = home.clone();
-    let rotated_for_thread = rotated_jwt.clone();
-    let rotator = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(80));
-        write_auth_doc(
-            &home_rot,
-            &json!({
-                "auth_mode": "chatgpt",
-                "tokens": {
-                    "id_token": rotated_for_thread,
-                    "access_token": rotated_for_thread,
-                    "refresh_token": "rt_from_codex_alab",
-                    "account_id": "acct_native_test"
-                }
-            }),
-        )
-        .expect("codex-alab rotates auth.json under lock");
-        drop(holder);
-    });
-
-    let reloaded = refresh_stored_auth(
-        &home,
-        &prior,
-        &token_url,
-        aterm_spec::wait::MUST_HAPPEN,
-        now,
-        Some("lock@example.com"),
+    let rotated_for_wait = rotated_jwt.clone();
+    let waited = Arc::new(AtomicBool::new(false));
+    let saw_wait = waited.clone();
+    let mut holder = Some(holder);
+    let reloaded = aterm_uds::file_lock::with_lock_wait_observer(
+        move |_| {
+            assert!(!saw_wait.swap(true, Ordering::SeqCst), "one contended wait");
+            write_auth_doc(
+                &home_rot,
+                &json!({
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "id_token": rotated_for_wait,
+                        "access_token": rotated_for_wait,
+                        "refresh_token": "rt_from_codex_alab",
+                        "account_id": "acct_native_test"
+                    }
+                }),
+            )
+            .expect("codex-alab rotates auth.json under lock");
+            drop(holder.take());
+        },
+        || {
+            refresh_stored_auth(
+                &home,
+                &prior,
+                &token_url,
+                aterm_spec::wait::MUST_HAPPEN,
+                now,
+                Some("lock@example.com"),
+            )
+        },
     )
     .expect("reloaded rotated credentials after lock release");
-    rotator.join().expect("rotator thread");
+    assert!(
+        waited.load(Ordering::SeqCst),
+        "the shared wait observed contention"
+    );
     assert_eq!(
         reloaded.refresh_token.as_deref(),
         Some("rt_from_codex_alab")
@@ -3533,4 +3879,159 @@ fn credential_debug_redacts_stored_and_refreshed_tokens() {
     ] {
         assert!(!output.contains(marker));
     }
+}
+
+/// NEGATIVE CONTROL: `CodeExchange::persist` refuses a non-regular `auth.json` or
+/// `auth.json.refreshed` before spending the one-use authorization code, keeps an existing
+/// journal intact when the HTTP exchange fails, and discards a corrupt or same-token journal once
+/// the newly signed-in `auth.json` is written so subsequent refreshes succeed.
+#[test]
+fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let issuer = format!("http://127.0.0.1:{port}/tenant");
+    let endpoints = Endpoints {
+        issuer: issuer.clone(),
+        token_url: format!("{issuer}/oauth/token"),
+        callback_ports: vec![],
+    };
+    let seen = Arc::new(Mutex::new(0usize));
+    let server_seen = Arc::clone(&seen);
+    let server_issuer = issuer.clone();
+    let server = std::thread::spawn(move || {
+        // Round 0 returns 400 (failed exchange preserves existing journal); round 1 returns 200.
+        for round in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let Some(_request) = read_http_request(&mut stream) else {
+                break;
+            };
+            *server_seen.lock().expect("seen lock") += 1;
+            let tok = make_jwt(&json!({
+                "iss": server_issuer,
+                "jti": round,
+                "email": "relogin@example.test",
+                "https://api.openai.com/auth": {
+                    "chatgpt_user_id": "user-relogin",
+                    "chatgpt_account_id": "workspace-relogin",
+                }
+            }));
+            send_http_json(
+                &mut stream,
+                if round == 0 {
+                    "400 Bad Request"
+                } else {
+                    "200 OK"
+                },
+                &json!({
+                    "id_token": tok,
+                    "access_token": tok,
+                    "refresh_token": concat!("reused-", "refresh"),
+                }),
+            );
+        }
+    });
+
+    // 1. Directory at `auth.json.refreshed` refuses before posting the one-use code.
+    let bad_journal_home = tmp.path().join("bad-journal");
+    std::fs::create_dir_all(beside_auth(&bad_journal_home, JOURNAL_SUFFIX))
+        .expect("journal directory");
+    assert_eq!(
+        exchange_code_and_persist(
+            &bad_journal_home,
+            &endpoints,
+            "http://127.0.0.1/callback",
+            "one-use-code",
+            "verifier",
+            Duration::from_secs(10),
+            1_790_000_000,
+        ),
+        None
+    );
+    assert_eq!(
+        *seen.lock().expect("seen lock"),
+        0,
+        "non-regular journal must refuse before spending the authorization code"
+    );
+
+    // 2. Directory at `auth.json` refuses before posting the one-use code.
+    let bad_auth_home = tmp.path().join("bad-auth");
+    std::fs::create_dir_all(bad_auth_home.join(AUTH_FILE)).expect("auth.json directory");
+    assert_eq!(
+        exchange_code_and_persist(
+            &bad_auth_home,
+            &endpoints,
+            "http://127.0.0.1/callback",
+            "one-use-code",
+            "verifier",
+            Duration::from_secs(10),
+            1_790_000_000,
+        ),
+        None
+    );
+    assert_eq!(*seen.lock().expect("seen lock"), 0);
+
+    // 3. Corrupt or rejected prior journal stays intact on a 400 exchange, then is discarded on a
+    //    200 sign-in so `recover_journal_held` succeeds even when the provider re-issues the same
+    //    refresh token string.
+    let relogin_home = tmp.path().join("relogin");
+    write_auth_doc(
+        &relogin_home,
+        &json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": concat!("old-", "access"),
+                "refresh_token": concat!("reused-", "refresh"),
+            }
+        }),
+    )
+    .expect("write initial auth");
+    RefreshJournal::Rejected {
+        token: refresh_token_digest(concat!("reused-", "refresh")),
+    }
+    .write(&relogin_home)
+    .expect("write rejected journal");
+
+    assert_eq!(
+        exchange_code_and_persist(
+            &relogin_home,
+            &endpoints,
+            "http://127.0.0.1/callback",
+            "bad-code",
+            "verifier",
+            Duration::from_secs(10),
+            1_790_000_000,
+        ),
+        None
+    );
+    assert!(
+        beside_auth(&relogin_home, JOURNAL_SUFFIX).is_file(),
+        "failed exchange must leave the prior refresh journal intact"
+    );
+
+    // Also overwrite with truncated journal bytes to exercise corrupt-journal cleanup on sign-in.
+    std::fs::write(beside_auth(&relogin_home, JOURNAL_SUFFIX), b"{truncated")
+        .expect("corrupt journal");
+    let signed_in = exchange_code_and_persist(
+        &relogin_home,
+        &endpoints,
+        "http://127.0.0.1/callback",
+        "good-code",
+        "verifier",
+        Duration::from_secs(10),
+        1_790_000_000,
+    );
+    assert_eq!(signed_in, Some(Some("relogin@example.test".to_owned())));
+    assert!(
+        !beside_auth(&relogin_home, JOURNAL_SUFFIX).exists(),
+        "successful sign-in must discard stale or corrupt auth.json.refreshed"
+    );
+    let _held = AuthLock::within(&relogin_home, Instant::now() + Duration::from_secs(5))
+        .expect("take auth lock");
+    assert!(recover_journal_held(&relogin_home).is_ok());
+    drop(_held);
+
+    server.join().expect("server join");
 }

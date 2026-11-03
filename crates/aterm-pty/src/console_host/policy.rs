@@ -342,6 +342,42 @@ pub(crate) fn runs_a_posix_runtime(program: &Path, is_file: impl Fn(&Path) -> bo
     .any(|dll| is_file(dll))
 }
 
+const MAX_OPENCONSOLE_BYTES: u64 = 32 * 1024 * 1024;
+
+fn read_openconsole_bounded(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = opts.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    if meta.len() > MAX_OPENCONSOLE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OpenConsole.exe exceeds size limit",
+        ));
+    }
+    let mut buf = Vec::new();
+    file.take(MAX_OPENCONSOLE_BYTES + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_OPENCONSOLE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OpenConsole.exe exceeds size limit",
+        ));
+    }
+    Ok(buf)
+}
+
 /// Copy `source` to `<cache>/<package>/OpenConsole.exe` unless an identical copy is already there, then prune the copies other packages left ([`prune_other_packages`]), so the cache holds one host however many Windows Terminal updates pass (each left about 1 MB behind before).
 pub(crate) fn copy_out(source: &Path, cache: &Path, package: &str) -> io::Result<PathBuf> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -355,9 +391,9 @@ pub(crate) fn copy_out(source: &Path, cache: &Path, package: &str) -> io::Result
         ));
     }
     let dest = dir.join("OpenConsole.exe");
-    let want = std::fs::read(source)?;
+    let want = read_openconsole_bounded(source)?;
     let up_to_date = std::fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_file())
-        && std::fs::read(&dest).is_ok_and(|have| have == want);
+        && read_openconsole_bounded(&dest).is_ok_and(|have| have == want);
     if !up_to_date {
         std::fs::create_dir_all(&dir)?;
         if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {

@@ -2231,7 +2231,7 @@ fn debug_ms(name: &'static str) -> Option<Duration> {
     let raw = raw.to_str()?;
     let held;
     let digits = if Path::new(raw).is_absolute() {
-        held = std::fs::read_to_string(raw).ok()?;
+        held = aterm_uds::atomic_file::read_regular_text(Path::new(raw), 4096).ok()?;
         held.trim()
     } else {
         raw
@@ -3054,6 +3054,7 @@ impl Wake {
             Wake::MailChanged
             | Wake::WorkstationSetup(_)
             | Wake::DeveloperToolsInstall(_, _)
+            | Wake::DeveloperToolsWatch
             | Wake::DeveloperToolsLowData(_)
             | Wake::InitialSetupStatus { .. }
             | Wake::InitialSetupApplyResolved

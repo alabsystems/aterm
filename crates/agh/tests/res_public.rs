@@ -170,3 +170,38 @@ fn a_dot_segment_tag_or_asset_is_refused_before_any_request() {
     assert!(!dest.exists());
     w.fake.assert_clean();
 }
+
+/// NEGATIVE CONTROL: `Public::fetch` refuses `.agh-part` destinations, directories, and live or
+/// dangling symlinks with `Kind::Usage` before issuing any network request.
+#[test]
+fn a_part_name_or_non_regular_dest_is_refused_before_any_request() {
+    let w = World::new("pub-dest-guard");
+    let public = w.gh.public();
+    let slug = common::slug(APP);
+    let target = w.root.path().join("target.bin");
+    std::fs::write(&target, b"keep").expect("write target");
+    let live_link = w.root.path().join("live.bin");
+    std::os::unix::fs::symlink(&target, &live_link).expect("live link");
+    let dangling_link = w.root.path().join("dangling.bin");
+    std::os::unix::fs::symlink(w.root.path().join("absent.bin"), &dangling_link)
+        .expect("dangling link");
+    let dir_dest = w.root.path().join("dir.bin");
+    std::fs::create_dir(&dir_dest).expect("dir dest");
+    let part_dest = w.root.path().join("app.bin.agh-part");
+
+    for bad_dest in [&part_dest, &dir_dest, &live_link, &dangling_link] {
+        let error = public
+            .fetch(&slug, "v1", "app.bin", bad_dest, 1024)
+            .expect_err("non-regular or part-name dest must fail");
+        assert_eq!(
+            error.kind,
+            Kind::Usage,
+            "{}: {}",
+            bad_dest.display(),
+            error.why
+        );
+    }
+    assert!(w.fake.seen().is_empty(), "{:?}", w.fake.seen());
+    assert_eq!(std::fs::read(&target).expect("target intact"), b"keep");
+    w.fake.assert_clean();
+}

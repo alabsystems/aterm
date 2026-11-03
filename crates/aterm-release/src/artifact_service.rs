@@ -37,6 +37,14 @@ pub(super) fn program(text: &str) -> Result<PathBuf, &'static str> {
     {
         return Err("ProgramArguments is not a string array");
     }
+    // chdir does not change an absolute executable selection. Keep unsupported
+    // directory forms unknown rather than guessing how launchd interprets them.
+    if let Some(directory) = fields.get("WorkingDirectory") {
+        match directory {
+            Value::Text(directory) if Path::new(directory).is_absolute() => {}
+            _ => return Err("WorkingDirectory is not an absolute string"),
+        }
+    }
     let selected = match fields.get("Program") {
         Some(Value::Text(program)) => program,
         Some(_) => return Err("Program is not a string"),
@@ -132,6 +140,7 @@ impl Xml<'_> {
                     "Label"
                         | "Program"
                         | "ProgramArguments"
+                        | "WorkingDirectory"
                         | "LimitLoadToSessionType"
                         | "AssociatedBundleIdentifiers"
                         | "RunAtLoad"
@@ -207,6 +216,33 @@ mod tests {
             &root.path().join("Library/Logs/aterm-secrets/service.log"),
         );
         assert_eq!(program(&text).unwrap(), executable);
+    }
+
+    #[test]
+    fn a_working_directory_does_not_rebase_an_absolute_executable() {
+        let wrap = |body: &str| format!("<plist><dict>{body}</dict></plist>");
+        for selection in [
+            "<key>Program</key><string>/artifact/bin/aterm</string>",
+            "<key>ProgramArguments</key><array><string>/artifact/bin/aterm</string><string>serve</string></array>",
+        ] {
+            let directory = "<key>WorkingDirectory</key><string>/another/directory</string>";
+            assert_eq!(
+                program(&wrap(&format!("{selection}{directory}"))).unwrap(),
+                PathBuf::from("/artifact/bin/aterm")
+            );
+            for value in ["<true/>", "<string>relative</string>", "<string/>"] {
+                assert!(
+                    program(&wrap(&format!(
+                        "{selection}<key>WorkingDirectory</key>{value}"
+                    )))
+                    .is_err()
+                );
+            }
+        }
+        assert!(program(&wrap(
+            "<key>Program</key><string>relative</string><key>WorkingDirectory</key><string>/artifact</string>"
+        ))
+        .is_err());
     }
 
     #[test]

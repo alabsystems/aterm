@@ -388,7 +388,7 @@ fn a_claim_worker_is_claude_code_with_the_browser_and_the_guarded_task() {
         claude,
         aterm_agent::harness::upgrade::Dialect::Zsh,
         &admitted,
-        &crate::task_launch::worker_fresh(None, false, false, order.chrome),
+        &crate::task_launch::worker_fresh(None, false, order.chrome),
     )
     .expect("a line");
     assert!(line.contains(" '--chrome' "), "{line}");
@@ -397,24 +397,19 @@ fn a_claim_worker_is_claude_code_with_the_browser_and_the_guarded_task() {
         "every box raised, whatever the person's settings: {line}"
     );
     assert_eq!(
-        crate::task_launch::worker_fresh(None, false, false, true).permission_mode,
+        crate::task_launch::worker_fresh(None, false, true).permission_mode,
         Some("default")
     );
     let plain = aterm_agent::harness::worker::line(
         claude,
         aterm_agent::harness::upgrade::Dialect::Zsh,
         &admitted,
-        &crate::task_launch::worker_fresh(None, false, false, false),
+        &crate::task_launch::worker_fresh(None, false, false),
     )
     .expect("a line");
     assert!(
         !plain.contains("--chrome") && !plain.contains("--permission-mode"),
         "CONTROL, only a claim worker's: {plain}"
-    );
-    assert_eq!(
-        crate::task_launch::worker_fresh(None, false, true, false).permission_mode,
-        Some("default"),
-        "the disk-free worker's, as before"
     );
 }
 
@@ -900,6 +895,40 @@ fn the_looks_exit_mark_keeps_a_result_and_takes_down_a_held_ask() {
         Some(Path::new("/s/tasks/s-1-1.result.md"))
     );
 
+    // A failed conclusion's reply is kept as a landing's is, and its `why=` with it.
+    let failed = new_tab(&mut app);
+    let began = set_task(&app, failed, &claim);
+    let h = live(&app, failed);
+    let mut gave_up = crate::task_record::TaskMark::new(TaskState::Failed);
+    gave_up.why = Some(crate::task_record::WHY_REPEATED);
+    gave_up.result_bytes = 23;
+    gave_up.result_path = Some(std::path::PathBuf::from("/s/tasks/s-2-1.result.md"));
+    crate::task_record::mark_session_task(&h.ctx, failed, &gave_up).expect("unfenced");
+    assert_eq!(
+        of(app.end_claim_workers(began + WORKER_FOR), failed),
+        [(failed, Ending::MarkExited)]
+    );
+    let after = h
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .task()
+        .cloned()
+        .expect("its record");
+    assert_eq!(
+        (after.state, after.why, after.result_bytes),
+        (
+            TaskState::Exited,
+            Some(crate::task_record::WHY_REPEATED),
+            23
+        )
+    );
+    assert_eq!(
+        after.result_path.as_deref(),
+        Some(Path::new("/s/tasks/s-2-1.result.md"))
+    );
+
     let held = new_tab(&mut app);
     let began = set_task(&app, held, &claim);
     let h = live(&app, held);
@@ -933,7 +962,23 @@ fn the_looks_exit_mark_keeps_a_result_and_takes_down_a_held_ask() {
         [(held, Ending::MarkExited)]
     );
     assert_eq!(attention(&h.ctx), None, "the ask went with its program");
-    assert_eq!(record(&app, held).0, TaskState::Exited);
+    let ended = live(&app, held)
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .task()
+        .cloned()
+        .expect("its record");
+    assert_eq!(
+        (ended.state, ended.why),
+        (TaskState::Exited, Some("held")),
+        "it ended where it stalled, and its report says so"
+    );
+    assert_eq!(
+        crate::task_record::failed_words(ended.state, ended.why),
+        "held at a screen aterm does not know"
+    );
 
     let moved = new_tab(&mut app);
     set_task(&app, moved, &claim);

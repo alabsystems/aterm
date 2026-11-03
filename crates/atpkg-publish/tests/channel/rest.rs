@@ -997,6 +997,54 @@ fn a_clobber_puts_the_new_bytes_up_before_the_old_asset_goes() {
     rig.fake.assert_clean();
 }
 
+/// During the swap both hosts write the same staging releases, so a clobber drops the other
+/// host's leftover too: a cut agh clobber's `{name}.agh-{8 hex}` beside a cut replace's own
+/// `{name}.atpkg-staged`, both when the release lacks the asset and when it holds an older
+/// one. The release ends holding the file alone, so the mirror finds no extra asset.
+/// `AghHost`'s half is `channel::agh_write_contract`'s
+/// `a_clobber_drops_either_host_s_leftover_temporary`.
+#[test]
+fn a_clobber_drops_either_host_s_leftover_temporary() {
+    let rig = Rig::new();
+    let host = rig.host();
+    let id = rig.fake.add_release(
+        SLUG,
+        ReleaseSpec::published("atpkg-ay-1", "2026-10-01T00:00:00Z").prerelease(true),
+    );
+    let manifest = rig.file("ay.toml", b"new manifest");
+    let leftovers = |rig: &Rig| {
+        rig.fake.add_asset(
+            id,
+            AssetSpec::uploaded("ay.toml.agh-00000000", b"an agh temporary"),
+        );
+        rig.fake.add_asset(
+            id,
+            AssetSpec::uploaded(&format!("ay.toml{STAGED}"), b"a stale stage"),
+        );
+    };
+    leftovers(&rig);
+    host.upload(
+        &slug(),
+        "atpkg-ay-1",
+        std::slice::from_ref(&manifest),
+        Replace::Clobber,
+    )
+    .expect("the clobber of an asset the release lacks");
+    assert_eq!(
+        rig.state("atpkg-ay-1").1,
+        [("ay.toml".to_string(), b"new manifest".to_vec())]
+    );
+    leftovers(&rig);
+    let newer = rig.file("ay.toml", b"newer manifest");
+    host.upload(&slug(), "atpkg-ay-1", &[newer], Replace::Clobber)
+        .expect("the clobber of an asset the release holds");
+    assert_eq!(
+        rig.state("atpkg-ay-1").1,
+        [("ay.toml".to_string(), b"newer manifest".to_vec())]
+    );
+    rig.fake.assert_clean();
+}
+
 #[test]
 fn a_create_killed_before_its_publish_leaves_a_draft_no_client_sees() {
     let rig = Rig::new();

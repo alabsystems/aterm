@@ -216,6 +216,10 @@ pub fn admit_in(
             "{why}; the VM can never boot here"
         ))),
         Err(Error::Ledger(e)) => Ok(unclaimed(guest, &e.to_string())),
+        Err(Error::Timing(why)) => Err(crate::linux::not_run(format!(
+            "timing admission for {} refused: {why}; this run started nothing",
+            guest.vm
+        ))),
         Err(e @ Error::Stuck { .. }) => Err(crate::linux::not_run(format!(
             "its claim for {} {e}; this run {}",
             guest.vm,

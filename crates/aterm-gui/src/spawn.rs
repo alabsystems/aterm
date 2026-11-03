@@ -1768,16 +1768,16 @@ pub(crate) fn spawn_session(
             crate::default_editor::decides(runs_command, integrated_shell),
             &|key| std::env::var_os(key),
         );
-        // While the window installs Apple's Command Line Tools (`App::settle_developer_tools_shim`:
-        // a setup pass wants them, they are missing, this account may install them, and no
-        // install of them ended unfinished since one last started), the shim directory is
-        // wanted: this shell gets it ahead of `/usr/bin`, and named in `ATERM_CLT_SHIM` for its
-        // integration to keep it there (design §6.3), decided now, so a tab opened during the
-        // install reaches it and one opened after does not.
+        // While Apple's Command Line Tools are missing the shim directory is wanted
+        // (`App::settle_developer_tools_shim`): this shell gets it ahead of `/usr/bin`, named in
+        // `ATERM_CLT_SHIM` for its integration to keep it there, and its developer directory in
+        // `DEVELOPER_DIR` (design §6.3), decided now, so a tab opened before they exist reaches
+        // it and one opened after does not.
         crate::clt_shim::settle_session_path(
             &mut env_add,
             &|key| std::env::var(key).ok(),
             crate::clt_shim::wanted_dir().as_deref(),
+            aterm_types::clt_shim::developer_git(),
         );
     }
 
@@ -3681,6 +3681,8 @@ fn attach_reader_inner(
     if let Some(old) = session.temporal_drain.take() {
         old.wait();
     }
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    let recording_costs;
     {
         let policy = crate::app_render::pty_resize_policy(session.master);
         let host_resyncs =
@@ -3692,6 +3694,10 @@ fn attach_reader_inner(
             .unwrap_or_else(|p| p.into_inner());
         rec.set_resize_policy(policy);
         rec.set_host_resyncs_alt_screen(host_resyncs);
+        #[cfg(any(debug_assertions, feature = "dev-seams"))]
+        {
+            recording_costs = rec.spine_watermark().costs.handle();
+        }
     }
     let (temporal_tx, spine_mark) = if factory.temporal_recording && factory.spare.is_none() {
         let tx = crate::temporal::open(&session.ctx.temporal, crate::temporal::QUEUE_CAP)?;
@@ -3752,6 +3758,8 @@ fn attach_reader_inner(
         temporal_tx,
         spine_mark,
         temporal_arm: session.temporal_arm.clone(),
+        #[cfg(any(debug_assertions, feature = "dev-seams"))]
+        recording_costs,
         byte_fanout: session.ctx.byte_fanout.clone(),
         watchers: session.ctx.watchers.clone(),
         #[cfg(unix)]
@@ -6983,6 +6991,8 @@ struct PtyReaderWiring {
     temporal_tx: Option<crate::temporal::TemporalTx>,
     spine_mark: crate::temporal::SpineMark,
     temporal_arm: Arc<crate::temporal::Arm>,
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    recording_costs: Option<Arc<crate::recording_cost::Costs>>,
     byte_fanout: Arc<crate::cast::ByteFanout>,
     watchers: Arc<crate::session_watch::Watchers>,
     #[cfg(unix)]
@@ -7326,6 +7336,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
         temporal_tx,
         spine_mark,
         temporal_arm,
+        #[cfg(any(debug_assertions, feature = "dev-seams"))]
+        recording_costs,
         byte_fanout,
         watchers,
         #[cfg(unix)]
@@ -7539,6 +7551,11 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                               holder: i32,
                               image: Option<Arc<crate::holder_image::HolderImage>>,
                               read_at: Option<Instant>| {
+                #[cfg(any(debug_assertions, feature = "dev-seams"))]
+                let _cost = crate::recording_cost::begin(
+                    recording_costs.as_deref().map(|cost| &cost.ingest),
+                    u64::try_from(buf.len()).ok(),
+                );
                 let arrived = (!buf.is_empty()).then(|| read_at.unwrap_or_else(Instant::now));
                 if let Some(at) = arrived {
                     stamp_output_arrival(
@@ -7585,13 +7602,27 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     .0
                     .as_ref()
                     .filter(|tx| temporal_lane.1.needs_input(tx))
-                    .map(|_| std::sync::Arc::from(buf));
+                    .map(|_| {
+                        #[cfg(any(debug_assertions, feature = "dev-seams"))]
+                        let _cost = crate::recording_cost::begin(
+                            recording_costs.as_deref().map(|cost| &cost.copy),
+                            u64::try_from(buf.len()).ok(),
+                        );
+                        std::sync::Arc::from(buf)
+                    });
                 #[cfg(unix)]
                 let mut journal_keyframe: Option<crate::crash_restore::Captured> = None;
                 let (response, reports) = {
                     let bytes: &[u8] = spine_copy.as_deref().unwrap_or(buf);
                     if let Some(req) = pending_reset.take() {
-                        let mut t = term_lock(&term);
+                        let mut t = {
+                            #[cfg(any(debug_assertions, feature = "dev-seams"))]
+                            let _cost = crate::recording_cost::begin(
+                                recording_costs.as_deref().map(|cost| &cost.reader_lock),
+                                Some(1),
+                            );
+                            term_lock(&term)
+                        };
                         crate::temporal::pick_up(
                             &temporal_arm,
                             &mut temporal_lane.0,
@@ -7754,7 +7785,14 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                         let mut group_notes = crate::holder_image::GroupNotes::default();
                         {
                             let waited = term_busy(&term).then(Instant::now);
-                            let mut t = term_lock(&term);
+                            let mut t = {
+                                #[cfg(any(debug_assertions, feature = "dev-seams"))]
+                                let _cost = crate::recording_cost::begin(
+                                    recording_costs.as_deref().map(|cost| &cost.reader_lock),
+                                    Some(1),
+                                );
+                                term_lock(&term)
+                            };
                             crate::metrics::note_parse_hold(parse_hold_wait(waited));
                             crate::temporal::pick_up(
                                 &temporal_arm,
@@ -7863,9 +7901,15 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 .as_ref()
                                 .map(|_| crate::temporal::SpinePre::take(&t));
                             let started_before = t.started_command_seq();
-                            if let Some(unread) =
+                            let unread = {
+                                #[cfg(any(debug_assertions, feature = "dev-seams"))]
+                                let _cost = crate::recording_cost::begin(
+                                    recording_costs.as_deref().map(|cost| &cost.parse),
+                                    u64::try_from(end - off).ok(),
+                                );
                                 launch.process(&mut t, &bytes[off..end], clock, &person)
-                            {
+                            };
+                            if let Some(unread) = unread {
                                 launch_unread = Some(unread);
                             }
                             c_signed = t.started_command_seq() != started_before

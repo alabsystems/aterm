@@ -645,23 +645,39 @@ pub fn parse_inet_diag_rtts_seq(
     expected_seq: Option<u32>,
     rtts: &mut Vec<f32>,
 ) -> Option<bool> {
+    let mut batch = Vec::new();
+    let mut done = false;
     for message in nl_messages(buf) {
         let message = message.ok()?;
         if expected_seq.is_some_and(|want| message.seq != want) {
             continue;
         }
+        if message.flags & NLM_F_DUMP_INTR != 0 {
+            return None;
+        }
         let msg = message.payload;
         match message.kind {
             NLMSG_NOOP => {}
-            NLMSG_DONE => return Some(true),
-            NLMSG_ERROR => return None,
-            SOCK_DIAG_BY_FAMILY if msg.len() >= INET_DIAG_MSG_LEN => {
+            NLMSG_DONE => {
+                let raw = msg.get(..4)?;
+                let errno = i32::from_ne_bytes(raw.try_into().ok()?);
+                if errno < 0 {
+                    return None;
+                }
+                done = true;
+                break;
+            }
+            NLMSG_ERROR | NLMSG_OVERRUN => return None,
+            SOCK_DIAG_BY_FAMILY => {
+                if msg.len() < INET_DIAG_MSG_LEN {
+                    return None;
+                }
                 let family = msg[0];
                 let state = msg[1];
                 let dst = &msg[INET_DIAG_DST_AT..INET_DIAG_DST_AT + 16];
                 if state == LINUX_TCP_ESTABLISHED && inet_diag_remote_peer(family, dst) {
                     for attr in nl_attributes(&msg[INET_DIAG_MSG_LEN..]) {
-                        let Ok((kind, info)) = attr else { break };
+                        let (kind, info) = attr.ok()?;
                         if kind == INET_DIAG_INFO_ATTR
                             && let Some(raw) = info.get(TCPI_RTT_AT..TCPI_RTT_AT + 4)
                         {
@@ -669,7 +685,7 @@ pub fn parse_inet_diag_rtts_seq(
                             if rtt_us > 0 {
                                 let ms = (rtt_us as f32) / 1_000.0;
                                 if ms.is_finite() && ms > 0.0 {
-                                    rtts.push(ms);
+                                    batch.push(ms);
                                 }
                             }
                         }
@@ -679,7 +695,8 @@ pub fn parse_inet_diag_rtts_seq(
             _ => {}
         }
     }
-    Some(false)
+    rtts.append(&mut batch);
+    Some(done)
 }
 
 /// Median RTT in milliseconds over `rtts` (sorts `rtts` in place), or `None` when empty.
@@ -729,6 +746,8 @@ pub fn tcp_srtt_ms() -> Option<f32> {
         if sent != REQ_LEN as isize {
             continue;
         }
+        let mut family_rtts = Vec::new();
+        let mut completed = false;
         for _ in 0..64 {
             // SAFETY: `sock` is valid and `recv_buf` is writable for `recv_buf.len()` bytes.
             let n = unsafe {
@@ -748,10 +767,17 @@ pub fn tcp_srtt_ms() -> Option<f32> {
             if n == 0 {
                 break;
             }
-            match parse_inet_diag_rtts_seq(&recv_buf[..n as usize], Some(seq), &mut rtts) {
-                Some(true) | None => break,
+            match parse_inet_diag_rtts_seq(&recv_buf[..n as usize], Some(seq), &mut family_rtts) {
+                Some(true) => {
+                    completed = true;
+                    break;
+                }
+                None => break,
                 Some(false) => {}
             }
+        }
+        if completed {
+            rtts.append(&mut family_rtts);
         }
     }
     median_rtt_ms(&mut rtts)

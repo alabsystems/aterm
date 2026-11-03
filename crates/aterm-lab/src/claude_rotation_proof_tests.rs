@@ -704,6 +704,39 @@ fn the_keys_hold_only_the_moves_resumes_and_cruises_rules_and_no_picker_key() {
     );
 }
 
+/// The instance names the fleet file's machine itself: a sync reads the scratch `aterm.toml`
+/// the lab composes ([`instance_toml`], then `scratch_aterm_toml`) beside a `LAB_ATERM_TOML` of
+/// other keys as [`MACHINE`]; one that names a machine of its own or a `[fleet]` table is
+/// refused before the lab is up, and a composed file that is no TOML document (a
+/// `LAB_ATERM_TOML` `[harness]` beside the lab's own) is caught by [`names_its_machine`] on
+/// the file itself. NEGATIVE CONTROL: an `instance_toml` that returns `lab` unchanged (the lab
+/// as it was, leaning on the default login's address) leaves the sync the host's own name or
+/// none, and this fails on the first case on any Mac but m9.
+#[test]
+fn the_instance_names_the_machine_its_fleet_file_lists() {
+    let tmp = aterm_tempfile::tempdir().expect("a scratch dir");
+    let path = tmp.path().join("aterm.toml");
+    let composed = |lab: &str| {
+        let text =
+            crate::lab::scratch_aterm_toml(&instance_toml(lab).expect("composes"), "", None, false);
+        std::fs::write(&path, &text).expect("write");
+        (text, names_its_machine(&path))
+    };
+    for lab in ["", "theme = \"dark\"\n", "[ai]\npreferred = \"claude\"\n"] {
+        let (text, wrong) = composed(lab);
+        assert_eq!(wrong, None, "{text}");
+    }
+    let (text, wrong) = composed("[harness]\naccounts = \"early\"\n");
+    assert!(wrong.is_some(), "two [harness] tables: {text}");
+    for lab in [
+        "[fleet]\nmachine = \"m5\"\n",
+        "[ai]\nmachine = \"m5\"\n",
+        "[",
+    ] {
+        assert!(instance_toml(lab).is_err(), "{lab:?}");
+    }
+}
+
 #[test]
 fn the_fleet_names_three_rows_of_one_machine_and_the_synced_roster_is_checked_against_it() {
     let text = fleet_text();

@@ -999,7 +999,7 @@ pub fn read_path(path: &Path, t: &Table) -> Result<Reading, Unread> {
 #[cfg(target_os = "linux")]
 fn read_capped(path: &Path, cap: usize) -> Option<(String, bool)> {
     use std::io::Read as _;
-    let f = std::fs::File::open(path).ok()?;
+    let f = crate::open_nonblock(path).ok()?;
     let mut buf = Vec::with_capacity(cap.min(16 * 1024));
     let n = f
         .take(u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1))

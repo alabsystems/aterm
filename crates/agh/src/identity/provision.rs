@@ -71,9 +71,23 @@ pub struct Added {
 }
 
 /// The refusal of provisioning off unix.
-#[cfg(not(unix))]
 const OFF_UNIX: &str =
     "provisioning needs unix permission checks; agh on Windows is anonymous only";
+
+/// Refused `OFF_UNIX` off unix, where every provisioning path ends in that refusal; nothing
+/// on unix. `auth import` asks it before it looks for gh, so its answer names the platform
+/// and not a verb that would refuse too.
+///
+/// # Errors
+///
+/// That Refused, off unix.
+pub(crate) fn refuse_off_unix() -> Result<()> {
+    if cfg!(unix) {
+        Ok(())
+    } else {
+        Err(Error::refused(OFF_UNIX))
+    }
+}
 
 /// Provision `req`. With no agh.toml and a vault token file there, the new agh.toml starts
 /// with `vault = true` (`vault::seed`), so the vault's rows keep joining as adoption derives
@@ -90,27 +104,7 @@ pub fn add(
     req: &AddRequest,
     stdin: &mut dyn std::io::Read,
 ) -> Result<Added> {
-    add_metered(gh, dirs, req, stdin).map(|(added, _)| added)
-}
-
-/// `add`, with the meter of the one-profile client that sent `GET /user` as the new token.
-/// # Errors
-/// As `add`.
-pub(crate) fn add_metered(
-    gh: &Github,
-    dirs: &Dirs,
-    req: &AddRequest,
-    stdin: &mut dyn std::io::Read,
-) -> Result<(Added, Meter)> {
-    #[cfg(unix)]
-    {
-        add_unix(gh, dirs, req, stdin)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (gh, dirs, req, stdin);
-        Err(Error::refused(OFF_UNIX))
-    }
+    add_with(gh, dirs, req, AddOptions::default(), stdin)
 }
 
 /// `auth add`'s options beyond M1's request.
@@ -133,12 +127,34 @@ impl AddOptions {
     }
 }
 
-/// [`add`] with `options`. `add(gh, dirs, req, stdin)` becomes
-/// `add_with(gh, dirs, req, AddOptions::default(), stdin)`.
+/// The refusal of `--legacy-loose` with a token from stdin, which agh writes 0600 itself.
+const LOOSE_STDIN: &str =
+    "--legacy-loose takes a --file: a token from stdin is written 0600 by agh";
+
+/// Usage `LOOSE_STDIN` for `options.legacy_loose` with a token from stdin (`from`), which agh
+/// writes 0600 itself. `auth import` asks it before gh runs, as its token comes as stdin.
 ///
 /// # Errors
 ///
-/// As [`add`].
+/// That Usage, next `agh help auth add`.
+pub(crate) fn refuse_loose_stdin(options: AddOptions, from: &AddFrom) -> Result<()> {
+    if options.legacy_loose && *from == AddFrom::Stdin {
+        return Err(Error::usage(LOOSE_STDIN).with_next(ADD_HELP));
+    }
+    Ok(())
+}
+
+/// [`add`] with `options`. `add(gh, dirs, req, stdin)` becomes
+/// `add_with(gh, dirs, req, AddOptions::default(), stdin)`. With `options.legacy_loose`, a
+/// `--file` with a group or other read bit (on the file or its directory) is read through
+/// `read_owned_into` for the login binding, and the profile's row says `legacy_loose = true`;
+/// a link, another owner's file, and a group or other write bit are refused as without it.
+/// Without it, a re-add drops the row's `legacy_loose`.
+///
+/// # Errors
+///
+/// As [`add`]; Usage for `options.legacy_loose` with a token from stdin, before anything is
+/// read or sent.
 pub fn add_with(
     gh: &Github,
     dirs: &Dirs,
@@ -146,15 +162,15 @@ pub fn add_with(
     options: AddOptions,
     stdin: &mut dyn std::io::Read,
 ) -> Result<Added> {
-    let _ = (gh, dirs, req, options, stdin);
-    Err(Error::not_yet("auth add's options", "WP8"))
+    add_with_metered(gh, dirs, req, options, stdin).map(|(added, _)| added)
 }
 
-/// `add_with`, with the one-profile client's meter, as M1's `add_metered` is for `add`.
+/// `add_with`, with the meter of the one-profile client that sent `GET /user` as the new
+/// token.
 ///
 /// # Errors
 ///
-/// As [`add`].
+/// As [`add_with`].
 pub(crate) fn add_with_metered(
     gh: &Github,
     dirs: &Dirs,
@@ -162,8 +178,16 @@ pub(crate) fn add_with_metered(
     options: AddOptions,
     stdin: &mut dyn std::io::Read,
 ) -> Result<(Added, Meter)> {
-    let _ = (gh, dirs, req, options, stdin);
-    Err(Error::not_yet("auth add's options", "WP8"))
+    refuse_loose_stdin(options, &req.from)?;
+    #[cfg(unix)]
+    {
+        add_unix(gh, dirs, req, options, stdin)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (gh, dirs, req, stdin);
+        Err(Error::refused(OFF_UNIX))
+    }
 }
 
 /// What `auth remove` did.
@@ -212,6 +236,21 @@ pub fn edit_config(
     login: &str,
     fingerprint: &str,
 ) -> Result<String> {
+    edit_config_with(text, req, token_file, login, fingerprint, false)
+}
+
+/// `edit_config`, with the profile's row saying `legacy_loose = true` when `legacy_loose`, and
+/// the key removed when not, so a re-add without `--legacy-loose` tightens the row.
+/// # Errors
+/// As `edit_config`.
+pub(crate) fn edit_config_with(
+    text: &str,
+    req: &AddRequest,
+    token_file: &str,
+    login: &str,
+    fingerprint: &str,
+    legacy_loose: bool,
+) -> Result<String> {
     let mut doc = parse_document(text)?;
     let name = req.name.as_str();
     let root = doc.as_table_mut();
@@ -241,6 +280,11 @@ pub fn edit_config(
             } else {
                 row.remove("drafts_fp");
             }
+            if legacy_loose {
+                set_value(row, "legacy_loose", Value::from(true));
+            } else {
+                row.remove("legacy_loose");
+            }
         }
         None => {
             let mut row = Table::new();
@@ -249,6 +293,9 @@ pub fn edit_config(
             row.insert("login", Item::Value(Value::from(login)));
             if req.drafts {
                 row.insert("drafts_fp", Item::Value(Value::from(fingerprint)));
+            }
+            if legacy_loose {
+                row.insert("legacy_loose", Item::Value(Value::from(true)));
             }
             profiles.insert(name, Item::Table(row));
         }
@@ -517,7 +564,6 @@ fn set_owner_tables(doc: &mut DocumentMut, tables: Vec<Table>) {
 }
 
 /// `auth add`'s help, the next of its usage errors.
-#[cfg(unix)]
 const ADD_HELP: &str = "agh help auth add";
 
 /// A stack buffer scrubbed on every way out of the scope that holds it.
@@ -943,8 +989,17 @@ fn add_unix(
     gh: &Github,
     dirs: &Dirs,
     req: &AddRequest,
+    options: AddOptions,
     stdin: &mut dyn std::io::Read,
 ) -> Result<(Added, Meter)> {
+    // The profile a `--file` is loaded as, here and in the login binding: with
+    // `--legacy-loose`, `identity::load` reads it through `read_owned_into`.
+    let file_profile = |path: &Path| {
+        let mut profile =
+            Profile::new(req.name.clone(), Source::File(path.to_path_buf()), req.tier);
+        profile.set_legacy_loose(options.legacy_loose);
+        profile
+    };
     if let Some(fault) = config::profile_name_fault(&req.name) {
         return Err(Error::usage(fault).with_next(ADD_HELP));
     }
@@ -971,7 +1026,7 @@ fn add_unix(
     let stdin_token = match &req.from {
         AddFrom::Stdin => Some(read_stdin_token(dirs, req, stdin)?),
         AddFrom::File(path) => {
-            let profile = Profile::new(req.name.clone(), Source::File(path.clone()), req.tier);
+            let profile = file_profile(path);
             identity::load(&profile, gh.env())
                 .map_err(|e| load_refusal(&e, &profile, &dirs.home, path))?;
             None
@@ -1017,13 +1072,14 @@ fn add_unix(
         }
         Some(current)
     };
-    edit_config(&text, req, "", "", "")?;
+    edit_config_with(&text, req, "", "", "", options.legacy_loose)?;
     match &req.from {
         AddFrom::File(path) => {
-            let profile = Profile::new(req.name.clone(), Source::File(path.clone()), req.tier);
+            let profile = file_profile(path);
             let cred = identity::load(&profile, gh.env())
                 .map_err(|e| load_refusal(&e, &profile, &dirs.home, path))?;
-            let (added, new_text, meter) = bind_and_edit(gh, dirs, req, &text, path, path, &cred)?;
+            let (added, new_text, meter) =
+                bind_and_edit(gh, dirs, req, &text, &profile, path, &cred)?;
             judge_edit(&new_text, &dirs.home, existed)?;
             write_config(dirs, &new_text, None)?;
             Ok((added, meter))
@@ -1050,7 +1106,7 @@ fn add_unix(
                 );
                 let cred = identity::load(&profile, gh.env())
                     .map_err(|e| load_refusal(&e, &profile, &dirs.home, &staged.path))?;
-                let added = bind_and_edit(gh, dirs, req, &text, &staged.path, &token_file, &cred)?;
+                let added = bind_and_edit(gh, dirs, req, &text, &profile, &token_file, &cred)?;
                 judge_edit(&added.1, &dirs.home, existed)?;
                 staged.place(&token_file)?;
                 Ok(added)
@@ -1069,25 +1125,26 @@ fn add_unix(
     }
 }
 
-/// Steps 5 and 6 of `add` (plan §11.2): the login bound, then the edit made (`judge_edit`
-/// judges it).
+/// Steps 5 and 6 of `add` (plan §11.2): the login bound as `loaded`, the profile `cred` was
+/// loaded as (its file source and its `legacy_loose`), then the edit made (`judge_edit` judges
+/// it), its row saying `legacy_loose = true` exactly when `--legacy-loose` asked for it
+/// (`loaded.legacy_loose()`), whether or not the file was loose.
 #[cfg(unix)]
 fn bind_and_edit(
     gh: &Github,
     dirs: &Dirs,
     req: &AddRequest,
     text: &str,
-    source: &Path,
+    loaded: &Profile,
     token_file: &Path,
     cred: &Credential,
 ) -> Result<(Added, String, Meter)> {
-    let profile = Profile::new(
-        req.name.clone(),
-        Source::File(source.to_path_buf()),
-        req.tier,
-    );
+    let source = match &loaded.source {
+        Source::File(path) => path.as_path(),
+        Source::Env(_) | Source::Inline(_) => token_file,
+    };
     let validated = Validated {
-        profiles: BTreeMap::from([(req.name.clone(), profile)]),
+        profiles: BTreeMap::from([(req.name.clone(), loaded.clone())]),
         owners: BTreeMap::new(),
         default_read: Vec::new(),
         targets: BTreeMap::new(),
@@ -1110,12 +1167,13 @@ fn bind_and_edit(
         ))
         .with_next("run agh auth add again"));
     }
-    let new_text = edit_config(
+    let new_text = edit_config_with(
         text,
         req,
         &tilde(token_file, &dirs.home),
         &login,
         cred.fingerprint(),
+        loaded.legacy_loose(),
     )?;
     let added = Added {
         profile: req.name.clone(),

@@ -15,7 +15,7 @@ pub const PACKAGE_JSON: &str = "codex-package.json";
 pub const ALAB_BUILD_JSON: &str = "alab-build.json";
 
 /// Bound on a package manifest or build record read.
-const MAX_PACKAGE_JSON_BYTES: usize = 64 * 1024;
+pub const MAX_PACKAGE_JSON_BYTES: usize = 64 * 1024;
 
 /// One agent program ALab builds itself on some targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,14 +82,56 @@ pub fn package_entrypoint(text: &str) -> Option<PathBuf> {
     if v.get("layoutVersion").and_then(aterm_json::Value::as_u64) != Some(1) {
         return None;
     }
-    let entry = Path::new(v.get("entrypoint")?.as_str()?);
-    if !entry
-        .components()
-        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    let raw = v.get("entrypoint")?.as_str()?;
+    if raw.is_empty()
+        || raw.starts_with('/')
+        || raw.ends_with('/')
+        || raw.contains('\\')
+        || raw.contains('\0')
+        || raw
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
     {
         return None;
     }
-    Some(entry.to_path_buf())
+    let entry = Path::new(raw);
+    entry
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)))
+        .then(|| entry.to_path_buf())
+}
+
+/// Whether `entry` resolves under `root` to a regular file with no symlink or reparse component.
+#[must_use]
+pub fn regular_entry_under(root: &Path, entry: &Path) -> bool {
+    let Ok(root_meta) = std::fs::symlink_metadata(root) else {
+        return false;
+    };
+    if !root_meta.file_type().is_dir() || crate::platform::is_reparse(&root_meta) {
+        return false;
+    }
+    let mut cur = root.to_path_buf();
+    let mut comps = entry.components().peekable();
+    while let Some(c) = comps.next() {
+        let std::path::Component::Normal(name) = c else {
+            return false;
+        };
+        cur.push(name);
+        let Ok(meta) = std::fs::symlink_metadata(&cur) else {
+            return false;
+        };
+        if crate::platform::is_reparse(&meta) {
+            return false;
+        }
+        if comps.peek().is_some() {
+            if !meta.is_dir() {
+                return false;
+            }
+        } else {
+            return meta.file_type().is_file();
+        }
+    }
+    false
 }
 
 /// The package root `root`'s manifest text and entrypoint, read bounded and never through a
@@ -116,18 +158,21 @@ pub fn is_alab_package(root: &Path) -> bool {
     let Some((_, entry)) = manifest_of(root) else {
         return false;
     };
-    std::fs::symlink_metadata(root.join(entry)).is_ok_and(|m| m.file_type().is_file())
+    regular_entry_under(root, &entry)
         && std::fs::symlink_metadata(root.join(ALAB_BUILD_JSON))
-            .is_ok_and(|m| m.file_type().is_file())
+            .is_ok_and(|m| m.file_type().is_file() && !crate::platform::is_reparse(&m))
 }
 
 /// The version an ALab package says it is (`codex-package.json`'s `version`), verbatim.
 #[must_use]
 pub fn package_version(root: &Path) -> Option<String> {
+    if !is_alab_package(root) {
+        return None;
+    }
     let (text, _) = manifest_of(root)?;
     let v: aterm_json::Value = aterm_json::from_str(&text).ok()?;
     let version = v.get("version")?.as_str()?;
-    (!version.is_empty() && version.len() <= 128 && !version.chars().any(char::is_control))
+    (!version.is_empty() && version.len() <= 128 && version.bytes().all(|b| b.is_ascii_graphic()))
         .then(|| version.to_string())
 }
 
@@ -285,6 +330,17 @@ pub fn package_version_of_exe(exe: &Path) -> Option<String> {
     package_version(&alab_root_of_exe(exe)?)
 }
 
+/// The recorded ALab package version of the executable that `program`'s current development link
+/// selects, or `None` when `program` is not a live dev-linked ALab agent package.
+#[must_use]
+pub fn linked_package_version(layout: &Layout, program: &str) -> Option<String> {
+    agent(program)?;
+    let checkout = crate::linkmode::live_linked_checkout(layout, program).ok()??;
+    let exe = crate::ops::which(layout, program)?.canonicalize().ok()?;
+    exe.starts_with(&checkout).then_some(())?;
+    package_version_of_exe(&exe)
+}
+
 /// The ALab package root whose entrypoint IS `exe` ([`exe_is_alab`]'s reading), canonical.
 pub(crate) fn alab_root_of_exe(exe: &Path) -> Option<PathBuf> {
     let exe = std::fs::canonicalize(exe).ok()?;
@@ -374,15 +430,7 @@ pub fn parse_upstream(text: &str) -> Option<Upstream> {
 /// The day of a UTC time as `alab/package.sh` records one (`2026-10-20T13:50:13Z`), or
 /// `None` for any other shape.
 fn utc_day(time: &str) -> Option<String> {
-    let shaped = time.len() == 20
-        && time.bytes().enumerate().all(|(i, b)| match i {
-            4 | 7 => b == b'-',
-            10 => b == b'T',
-            13 | 16 => b == b':',
-            19 => b == b'Z',
-            _ => b.is_ascii_digit(),
-        });
-    shaped.then(|| time[..10].to_string())
+    aterm_types::rfc3339::parse_utc(time).map(|_| time[..10].to_string())
 }
 
 /// The [`Upstream`] the ALab package at `root` records ([`is_alab_package`], its record read bounded and never through a link).
@@ -414,20 +462,14 @@ const MAX_ATERM_VERSION_BYTES: usize = 64;
 /// `MAJOR.MINOR.PATCH`, ignoring any `-<pre-release>` or `+<build>` suffix.
 #[must_use]
 pub fn parse_aterm_version(text: &str) -> Option<AtermVersion> {
-    if text.len() > MAX_ATERM_VERSION_BYTES {
+    if text.len() > MAX_ATERM_VERSION_BYTES
+        || !text.bytes().all(|b| b.is_ascii_graphic())
+        || text.ends_with(['+', '-'])
+    {
         return None;
     }
     let core = text.split(['+', '-']).next()?;
-    let mut parts = core.split('.');
-    let mut number = || -> Option<u64> {
-        let part = parts.next()?;
-        if part.is_empty() || part.len() > 9 || !part.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        part.parse().ok()
-    };
-    let version = (number()?, number()?, number()?);
-    parts.next().is_none().then_some(version)
+    canonical_triple(core)
 }
 
 /// `0.110.0`, as a line names an [`AtermVersion`].
@@ -691,8 +733,10 @@ pub fn vendor_choice_path(layout: &Layout, program: &str) -> PathBuf {
 #[must_use]
 pub fn vendor_chosen(layout: &Layout, program: &str) -> bool {
     agent(program).is_some()
-        && std::fs::symlink_metadata(vendor_choice_path(layout, program))
-            .is_ok_and(|m| m.file_type().is_file())
+        && regular_entry_under(
+            &layout.prefix,
+            &Path::new("sources").join(format!("{program}.vendor")),
+        )
 }
 
 /// Record a person's choice of the vendor's build of `program` (`aterm pkg update <program> --vendor`).
@@ -703,6 +747,13 @@ pub fn choose_vendor(layout: &Layout, program: &str) -> std::io::Result<()> {
     let path = vendor_choice_path(layout, program);
     if let Some(dir) = path.parent() {
         layout.ensure_dir(dir)?;
+        let meta = std::fs::symlink_metadata(dir)?;
+        if !meta.file_type().is_dir() || crate::platform::is_reparse(&meta) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} is not a real directory", dir.display()),
+            ));
+        }
     }
     match crate::platform::create_private_new(&path) {
         Ok(_) => Ok(()),
@@ -715,7 +766,12 @@ pub fn choose_vendor(layout: &Layout, program: &str) -> std::io::Result<()> {
 
 /// Forget that choice (`aterm pkg update <program> --alab`).
 pub fn clear_vendor_choice(layout: &Layout, program: &str) -> bool {
-    std::fs::remove_file(vendor_choice_path(layout, program)).is_ok()
+    agent(program).is_some()
+        && regular_entry_under(
+            &layout.prefix,
+            &Path::new("sources").join(format!("{program}.vendor")),
+        )
+        && std::fs::remove_file(vendor_choice_path(layout, program)).is_ok()
 }
 
 /// The words that name an ALab build on a line.
@@ -733,9 +789,7 @@ pub fn build_words(layout: &Layout, program: &str, build: u64) -> String {
 pub fn package_link_bin(program: &str, checkout: &Path) -> Option<PathBuf> {
     agent(program)?;
     let (_, entry) = manifest_of(checkout)?;
-    std::fs::symlink_metadata(checkout.join(&entry))
-        .is_ok_and(|m| m.file_type().is_file())
-        .then_some(entry)
+    regular_entry_under(checkout, &entry).then_some(entry)
 }
 
 #[cfg(test)]

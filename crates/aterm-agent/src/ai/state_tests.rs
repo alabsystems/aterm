@@ -959,3 +959,117 @@ fn a_clis_pool_is_named_in_its_row_and_a_row_without_one_says_nothing_of_it() {
         "Claude Code's row names no pool"
     );
 }
+
+fn settings_of(toml: &str) -> Settings {
+    let (local, notes) = crate::ai::config::read(toml);
+    crate::ai::config::resolve(&local, None, None, notes)
+}
+
+/// WHO ASKED: the built-in preferred CLI, a config that names one, and what used one here are asks.
+/// NEGATIVE: an installed CLI with a home, a synced pool row and a `use` left at its default are
+/// none, and neither is a login aterm's own ladder made under a row.
+#[test]
+fn a_cli_is_asked_for_by_a_name_or_a_use_never_by_a_synced_row() {
+    use crate::ai::facts::CliAccounts;
+    let none = settings_of("");
+    let mut codex = facts(&CODEX);
+    codex.login_file = None;
+    assert!(!asked(&codex, &none), "installed, with a home");
+    codex.pool = Some(CliAccounts {
+        rows: 2,
+        emails: 2,
+        ..CliAccounts::default()
+    });
+    assert!(!asked(&codex, &none), "a row the sheet synced");
+    codex.login_file = Some((PathBuf::from("/row/auth.json"), None));
+    codex.pool.as_mut().expect("pool").serving_login = Some(("CODEX_HOME", Some("/row".into())));
+    assert!(!asked(&codex, &none), "the ladder's own login of a row");
+
+    let mut claude = facts(&CLAUDE);
+    claude.profile_signed_in = false;
+    claude.login_file = None;
+    assert!(asked(&claude, &none), "the preferred CLI");
+    assert!(
+        !asked(&claude, &settings_of("[ai]\npreferred = \"codex\"\n")),
+        "NEGATIVE: preferred is the only thing that asked for it"
+    );
+
+    let mut bare = facts(&CODEX);
+    bare.login_file = None;
+    for toml in [
+        "[ai]\npreferred = \"codex\"\n",
+        "[ai.codex]\nuse = true\n",
+        "[ai]\nreviewers = [\"codex\"]\n",
+    ] {
+        assert!(asked(&bare, &settings_of(toml)), "{toml}");
+    }
+    let mut used = facts(&CODEX);
+    used.login_file = None;
+    used.record.ended_at = Some(NOW);
+    assert!(asked(&used, &none), "a review met its end");
+    let mut served = facts(&CODEX);
+    served.login_file = None;
+    served.pool = Some(CliAccounts {
+        served_at: Some(NOW),
+        ..CliAccounts::default()
+    });
+    assert!(asked(&served, &none), "a launch its pool served");
+    let mut own = facts(&CODEX);
+    own.login_file = Some((PathBuf::from("/home/.codex/auth.json"), None));
+    assert!(asked(&own, &none), "a login in its default home");
+}
+
+/// A signed-out or missing CLI nobody asked for leaves the verdict OK with no act and no
+/// `NEEDS YOU:`, and its fix stays on the row. CONTROL: the same row asked for fails.
+#[test]
+fn a_row_nobody_asked_for_is_a_note_with_its_fix_kept() {
+    let mut codex = facts(&CODEX);
+    codex.home_exists = false;
+    let mut agy = facts(&AGY);
+    agy.managed = None;
+    let asked_rows = [assess(&codex, true, NOW), assess(&agy, true, NOW)];
+    assert_eq!(health(&asked_rows).word, "FAIL", "CONTROL");
+    let rows = asked_rows.map(Row::not_asked);
+    let h = health(&rows);
+    assert_eq!(h.word, "OK", "{h:?}");
+    assert_eq!(h.noted, ["codex", "agy"]);
+    assert_eq!((h.next(), h.needs_you()), (None, None));
+    assert_eq!(rows[0].state, State::SignedOut);
+    assert_eq!(rows[0].fix.as_deref(), Some("aterm ai login codex"));
+    assert!(
+        rows[0].fact.contains("nobody has asked"),
+        "{}",
+        rows[0].fact
+    );
+    let ok = Row {
+        state: State::Ok,
+        mark: Mark::Ok,
+        fact: "signed in".to_string(),
+        ..rows[0].clone()
+    }
+    .not_asked();
+    assert_eq!(
+        (ok.mark, ok.fact.as_str()),
+        (Mark::Ok, "signed in"),
+        "working stays ok"
+    );
+}
+
+/// THE DOCTOR'S CLAIM: before a run the health line says what it tries, never that it fixes; after
+/// a run that tried a row and left it, the line says so instead of offering the same run again.
+/// CONTROL: a row that run did not try is still offered.
+#[test]
+fn the_doctor_never_promises_a_fix_and_owns_one_it_did_not_finish() {
+    let mut agy = facts(&AGY);
+    agy.managed = None;
+    let mut muse = facts(&MUSE);
+    muse.managed = None;
+    let h = health(&[assess(&agy, true, NOW), assess(&muse, true, NOW)]);
+    let before = h.next().expect("acts");
+    assert!(before.contains("tries agy and muse itself"), "{before}");
+    let after = h.next_after(&["agy"]).expect("acts");
+    assert!(after.contains("did not finish agy"), "{after}");
+    assert!(after.contains("tries muse itself"), "CONTROL: {after}");
+    let all = h.next_after(&["agy", "muse"]).expect("acts");
+    assert!(!all.contains("`aterm ai doctor`"), "{all}");
+}

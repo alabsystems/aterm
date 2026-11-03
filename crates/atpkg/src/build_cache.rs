@@ -25,6 +25,9 @@ pub mod remove;
 #[path = "build_cache_fence.rs"]
 mod fence;
 
+#[path = "build_cache_inventory.rs"]
+mod inventory;
+
 /// THE TESTS' CALL INTO A PASS between an entry's intent on record and its rename aside (the
 /// leaf's in [`Sweep::walk`], a tooling entry's in [`tooling::reclaim`]), with the entry's path:
 /// where a test sets what refuses that rename after the check. Unix test builds alone: only this
@@ -287,10 +290,6 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
 /// The locks cargo holds in a profile for a whole build; [`reclaim`] skips a build
 /// directory while a build holds one.
 const CARGO_LOCKS: &[&str] = &[".cargo-build-lock", ".cargo-lock", ".cargo-artifact-lock"];
-
-/// How deep under a build directory [`reclaim`] reads folders' modification times: a
-/// build writes `<profile>/deps`, or `<triple>/<profile>/deps` when it names a target.
-const WRITE_DEPTH: usize = 3;
 
 /// A build directory whose workspace is seen gone goes once unwritten this long.
 pub const RECLAIM_GONE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -1280,13 +1279,9 @@ fn hold(locks: &[PathBuf]) -> Option<Vec<crate::lock::Flock>> {
         .collect()
 }
 
-/// How deep [`remove_unbuilt`] looks for cargo's locks: a cells lane builds
-/// `<cell>/<triple>/<profile>` under its target directory.
-const UNBUILT_DEPTH: usize = 5;
-
 /// A cargo target or build directory `dir` that a tool of this repository no longer builds in,
-/// removed whole once no build holds any of its cargo locks ([`CARGO_LOCKS`], up to
-/// [`UNBUILT_DEPTH`] folders down, never through a link): every lock taken without waiting and
+/// removed whole once no build holds any of its cargo locks ([`CARGO_LOCKS`], found by a
+/// complete bounded inventory, never through a link): every lock taken without waiting and
 /// looked for again, then `dir` renamed aside, never over another entry, to the lowest free
 /// stage name from `<dir>.removing` (`<dir>.removing`, then `<dir>.removing-<n>`:
 /// [`stage_aside`]) and removed under them. Builds resolving the original path after its rename
@@ -1411,24 +1406,10 @@ fn revoked_words(aside: &Path) -> String {
     }
 }
 
-/// Cargo's locks under `dir` to [`UNBUILT_DEPTH`] folders down, sorted; no link is followed.
+/// All Cargo locks under `dir`, sorted; an incomplete inventory refuses rather than omitting
+/// deeper locks. No directory link is followed.
 fn locks_under(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut locks = Vec::new();
-    let mut stack = vec![(dir.to_path_buf(), 0)];
-    while let Some((at, depth)) = stack.pop() {
-        for entry in std::fs::read_dir(&at)? {
-            let entry = entry?;
-            if CARGO_LOCKS.iter().any(|lock| entry.file_name() == *lock) {
-                // Keep every lock pathname for `hold` to judge, including directories and
-                // links: a nonregular lock must retain the tree rather than disappear here.
-                locks.push(entry.path());
-            } else if entry.file_type()?.is_dir() && depth < UNBUILT_DEPTH {
-                stack.push((entry.path(), depth + 1));
-            }
-        }
-    }
-    locks.sort();
-    Ok(locks)
+    inventory::scan(dir).map(|seen| seen.locks)
 }
 
 /// The profiles of a build directory: the folders holding its cargo `locks`.
@@ -1450,35 +1431,10 @@ struct Seen {
     locks: Vec<PathBuf>,
 }
 
-/// The newest modification time of `leaf` and every folder down to [`WRITE_DEPTH`]
-/// levels below it, and the cargo locks on the way; never follows a link.
+/// The newest directory modification time and all Cargo locks in one complete bounded
+/// inventory. An unreadable, changing or oversized tree is unknown, never an idle witness.
 fn look(leaf: &Path) -> Option<Seen> {
-    let meta = std::fs::symlink_metadata(leaf).ok()?;
-    if !meta.is_dir() {
-        return None;
-    }
-    let mut seen = Seen {
-        newest: meta.modified().ok()?,
-        locks: Vec::new(),
-    };
-    let mut stack = vec![(leaf.to_path_buf(), 0)];
-    while let Some((dir, depth)) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                if let Ok(t) = std::fs::symlink_metadata(&path).and_then(|m| m.modified()) {
-                    seen.newest = seen.newest.max(t);
-                }
-                if depth + 1 < WRITE_DEPTH {
-                    stack.push((path, depth + 1));
-                }
-            } else if CARGO_LOCKS.iter().any(|l| entry.file_name() == *l) {
-                seen.locks.push(path);
-            }
-        }
-    }
-    seen.locks.sort();
-    Some(seen)
+    inventory::scan(leaf).ok()
 }
 
 /// `dir`'s own modification time, not followed.

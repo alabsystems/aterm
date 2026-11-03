@@ -12,6 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use aterm_spec::wait::MUST_HAPPEN;
 use aterm_types::control_verbs::{Framing, framing_of};
 
 use crate::headless_boot;
@@ -172,26 +173,30 @@ fn the_audit_verbs_frame_their_replies_as_the_table_says() {
         other => panic!("history is Lines-framed: {other:?}"),
     }
 
-    let latest = match wire(&inst, "temporal status") {
-        Reply::Status(s) => {
-            assert!(s.starts_with("OK enabled=true "), "the recorder is on: {s}");
-            field(&s, "latest_tick")
-                .and_then(|t| t.parse::<u64>().ok())
-                .unwrap_or_else(|| panic!("a latest_tick: {s}"))
+    // The recorder takes the screen off a queue and the turn may end before the shell drew it:
+    // each read is framed as the table says, and the latest instant comes to hold the turn's
+    // screen (a hang detector, not a budget).
+    let mut last = String::new();
+    let held = aterm_spec::wait::within(MUST_HAPPEN, headless_boot::POLL_GAP, || {
+        let latest = match wire(&inst, "temporal status") {
+            Reply::Status(s) => {
+                assert!(s.starts_with("OK enabled=true "), "the recorder is on: {s}");
+                field(&s, "latest_tick")
+                    .and_then(|t| t.parse::<u64>().ok())
+                    .unwrap_or_else(|| panic!("a latest_tick: {s}"))
+            }
+            other => panic!("`temporal status` is a status line: {other:?}"),
+        };
+        match wire(&inst, &format!("temporal {latest}")) {
+            Reply::Bytes(s, body) => {
+                assert!(s.starts_with(&format!("OK {}", body.len())), "{s}");
+                last = String::from_utf8_lossy(&body).into_owned();
+                last.contains("grammar-lane").then_some(())
+            }
+            other => panic!("a tick read is Bytes-framed: {other:?}"),
         }
-        other => panic!("`temporal status` is a status line: {other:?}"),
-    };
-    match wire(&inst, &format!("temporal {latest}")) {
-        Reply::Bytes(s, body) => {
-            assert!(s.starts_with(&format!("OK {}", body.len())), "{s}");
-            let screen = String::from_utf8_lossy(&body);
-            assert!(
-                screen.contains("grammar-lane"),
-                "the turn's screen: {screen:?}"
-            );
-        }
-        other => panic!("a tick read is Bytes-framed: {other:?}"),
-    }
+    });
+    assert!(held.is_some(), "the turn's screen: {last:?}");
     match wire(&inst, "temporal status trim") {
         Reply::Status(s) => assert!(s.starts_with("ERR usage"), "{s}"),
         other => panic!("`status trim` is a usage error: {other:?}"),

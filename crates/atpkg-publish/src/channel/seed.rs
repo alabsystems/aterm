@@ -83,8 +83,11 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 #[must_use]
 pub fn publish_refusals(ctx: &Ctx, trust_repo: &Path, seal: &Path) -> Vec<String> {
     let repo = ctx.shown(trust_repo);
-    let receipt =
-        std::fs::read_to_string(seal.join(atpkg::lineage::SEED_MINT_FILE)).unwrap_or_default();
+    let receipt = crate::identity::read_regular_text(
+        &seal.join(atpkg::lineage::SEED_MINT_FILE),
+        crate::identity::MAX_META_BYTES,
+    )
+    .unwrap_or_default();
     let repin = field(&receipt, "repin_commit").unwrap_or_default();
     let tag = field(&receipt, "repin_release_tag").unwrap_or_default();
     let commit = field(&receipt, "repin_compiler_git_commit_hash").unwrap_or_default();
@@ -142,12 +145,18 @@ pub fn publish_refusals(ctx: &Ctx, trust_repo: &Path, seal: &Path) -> Vec<String
                 Some((o, r)) => Slug::new(o, r),
                 None => Slug::new(owner_repo.as_str(), ""),
             };
-            match ctx.hosts.staging.release(&slug, &tag) {
+            let host = ctx
+                .hosts
+                .for_owner(&ctx.accounts, &slug.owner)
+                .unwrap_or(&ctx.hosts.staging);
+            match host.published_by_tag(&slug, &tag) {
                 Ok(_) => {}
                 Err(HostError::NotFound) => refusals.push(format!(
                     "the seed archives are not published: release {tag} on {owner_repo} does not \
-                     exist, so a fresh checkout of main cannot fetch the pin it builds from. \
-                     Upload the re-pin's dist/*.tar.xz there first"
+                     exist as a published release (it is absent or still a draft), so a fresh \
+                     checkout of main cannot fetch the pin it builds from. Upload the re-pin's \
+                     dist/*.tar.xz there and publish the release (a draft is invisible to a \
+                     fresh checkout)"
                 )),
                 Err(e) => refusals.push(format!(
                     "could not ask whether the seed archives' release {tag} on {owner_repo} \

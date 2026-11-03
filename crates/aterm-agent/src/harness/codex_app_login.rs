@@ -54,6 +54,9 @@ const AUTH_FILE_MAX: usize = 2 * 1024 * 1024;
 
 /// Maximum loopback HTTP callback request head read from the local browser redirect.
 const CALLBACK_REQ_MAX: usize = 16 * 1024;
+const CALLBACK_IO_WAIT: Duration = Duration::from_secs(2);
+const CALLBACK_DRAIN_WAIT: Duration = Duration::from_millis(50);
+const CALLBACK_DRAIN_MAX: usize = 16 * 1024;
 
 /// Refresh an access token proactively once its JWT `exp` is within five minutes.
 const PROACTIVE_REFRESH_MARGIN_SECS: i64 = 300;
@@ -436,10 +439,11 @@ fn prepare_auth_dest(home: &Path) -> std::io::Result<PathBuf> {
         aterm_types::fs_restricted::ensure_private_dir(home)?;
         home.join(AUTH_FILE)
     };
-    if std::fs::symlink_metadata(&dest).is_ok_and(|md| md.file_type().is_symlink()) {
+    if std::fs::symlink_metadata(&dest).is_ok_and(|md| md.file_type().is_symlink() || !md.is_file())
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "refusing to overwrite symlinked auth.json",
+            "refusing to overwrite non-regular auth.json",
         ));
     }
     Ok(dest)
@@ -459,7 +463,8 @@ pub const LOCK_SUFFIX: &str = ".lock";
 /// The suffix of the refresh journal beside a login's `auth.json` ([`RefreshJournal`]).
 pub const JOURNAL_SUFFIX: &str = ".refreshed";
 
-/// The pause between looks at an [`AuthLock`] another refresh holds.
+/// The pause between disk reads looking for an unlocked writer's credential rotation
+/// during [`confirmed_signed_out`]. Lock acquisition uses `aterm_uds::file_lock`.
 const LOCK_POLL: Duration = Duration::from_millis(20);
 
 /// How long a sign-in's write waits for a refresh of the login it replaces ([`AuthLock`]).
@@ -498,11 +503,16 @@ fn beside_auth(home: &Path, suffix: &str) -> PathBuf {
     auth.with_file_name(name)
 }
 
-/// An exclusive `flock(2)` on `auth.json.lock` beside a Codex login, held from the read before a
-/// refresh's request to its publication, so no two aterm processes, threads, or `codex-alab`
-/// sessions (`b09caa8d7`, `codex_alab_core::auth_lock`) spend one single-use refresh token: the
-/// one that waited reads the rotated file and sends nothing. Released by `LOCK_UN` on drop, so a
-/// child spawned meanwhile holds no copy of it. A vendor `codex` binary takes no file lock.
+/// An exclusive lock on `auth.json.lock` beside a Codex login. A refresh caller must re-read
+/// authentication after acquiring the guard and hold it through response publication.
+///
+/// This serializes cooperating writers only. The lock alone cannot prevent token reuse by a
+/// writer that bypasses it, or after a lost response or failed publication. Aterm additionally
+/// records and recovers refresh attempts through `auth.json.refreshed` while holding the lock;
+/// another program must honor both protocols for the cross-program guarantee (ATERM-KI-1027-12).
+///
+/// Drop explicitly unlocks the file. The Unix child-exclusion request made by
+/// `aterm_uds::keep_out_of_children` is best-effort, not a guarantee of fork exclusion.
 #[derive(Debug)]
 pub struct AuthLock(std::fs::File);
 
@@ -542,8 +552,6 @@ impl AuthLock {
                 ));
             }
         }
-        #[cfg(any(unix, windows))]
-        aterm_uds::keep_out_of_children(&file)?;
         Ok(file)
     }
 
@@ -551,22 +559,14 @@ impl AuthLock {
     /// `Ok(None)` where it was still held then, an error where it is refused or cannot be taken.
     fn until(auth_file: &Path, deadline: Instant) -> std::io::Result<Option<AuthLock>> {
         let file = Self::open(auth_file)?;
-        loop {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "the guard's own take: its Drop releases by LOCK_UN"
-            )]
-            let taken = file.try_lock();
-            match taken {
-                Ok(()) => return Ok(Some(AuthLock(file))),
-                Err(std::fs::TryLockError::WouldBlock) => {}
-                Err(std::fs::TryLockError::Error(err)) => return Err(err),
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Ok(None);
-            }
-            std::thread::sleep(left.min(LOCK_POLL));
+        match aterm_uds::file_lock::lock_exclusive_until(
+            &file,
+            deadline,
+            "the Codex login lock is held",
+        ) {
+            Ok(()) => Ok(Some(AuthLock(file))),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -866,7 +866,6 @@ fn recover_journal_held(home: &Path) -> Result<(), Refreshed> {
                 let doc = tokens.merged_into(current.doc).ok_or(Refreshed::Failed)?;
                 stored_auth_from_doc(doc.clone()).ok_or(Refreshed::Failed)?;
                 write_auth_doc(home, &doc).map_err(|_| Refreshed::Failed)?;
-                flush_auth_directory(home).map_err(|_| Refreshed::Failed)?;
             } else if token.is_some() && token == current_token {
                 // The login rename may have landed before its directory flush failed. When
                 // the provider kept the same refresh token, recognize its applied response
@@ -882,6 +881,9 @@ fn recover_journal_held(home: &Path) -> Result<(), Refreshed> {
         }
         _ => {}
     }
+    // A replacement visible by name may still await its directory barrier. Keep the old
+    // spent-token evidence until the current authentication's publication is durable.
+    flush_auth_directory(home).map_err(|_| Refreshed::Failed)?;
     RefreshJournal::discard(home).map_err(|_| Refreshed::Failed)
 }
 
@@ -918,6 +920,22 @@ pub fn read_account_in_home(home: &Path) -> Option<Account> {
         .and_then(|c| c.plan)
         .or_else(|| access_claims.and_then(|c| c.plan));
     Some(Account { email, plan })
+}
+
+/// Domain-separated native identity proof for a same-account renewal handoff.
+/// Missing or disagreeing user/workspace claims never authorize following a login.
+#[must_use]
+pub fn renewal_identity(home: &Path) -> Option<super::codex_renewal::Identity> {
+    let stored = load_stored_auth(home)?;
+    let account = stored.account_id.as_deref().filter(|s| !s.is_empty())?;
+    // CodexAuth::get_account_id uses TokenData.account_id: an explicit selected
+    // workspace intentionally outranks the JWT's default workspace.
+    let TokenUser::Known(user) =
+        token_user_claims(stored.id_claims.as_ref(), stored.access_claims.as_ref())
+    else {
+        return None;
+    };
+    Some(super::codex_renewal::Identity::from_native(account, &user))
 }
 
 /// Reads the ChatGPT account email from `<home>/auth.json`, if present.
@@ -2128,48 +2146,20 @@ fn build_authorize_url(
     format!("{base}/oauth/authorize?{query}")
 }
 
-fn send_loopback_cancel(port: u16) {
-    let Ok(addr) = format!("127.0.0.1:{port}").parse() else {
-        return;
-    };
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(250)) else {
-        return;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
-    let req =
-        format!("GET /cancel HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
-    let _ = stream.write_all(req.as_bytes());
-    let mut scratch = [0u8; 64];
-    let _ = stream.read(&mut scratch);
-}
-
 fn bind_callback_listener(ports: &[u16], deadline: Instant) -> std::io::Result<TcpListener> {
     let mut last_err = std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         "no callback port configured",
     );
     for &port in ports {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "callback listener bind deadline expired",
+            ));
+        }
         match TcpListener::bind(("127.0.0.1", port)) {
             Ok(listener) => return Ok(listener),
-            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && port != 0 => {
-                last_err = err;
-                if port == LOOPBACK_PORTS[0] && Instant::now() < deadline {
-                    send_loopback_cancel(port);
-                    for _ in 0..8 {
-                        let nap = deadline
-                            .saturating_duration_since(Instant::now())
-                            .min(Duration::from_millis(50));
-                        if nap.is_zero() {
-                            break;
-                        }
-                        std::thread::sleep(nap);
-                        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
-                            return Ok(listener);
-                        }
-                    }
-                }
-            }
             Err(err) => last_err = err,
         }
     }
@@ -2180,26 +2170,109 @@ fn bind_callback_listener(ports: &[u16], deadline: Instant) -> std::io::Result<T
 enum CallbackOutcome {
     Code(String),
     Failed,
-    Cancelled,
 }
 
-fn write_http_reply(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
-    let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.flush();
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+fn callback_io_budget(deadline: Instant, now: Instant) -> std::io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
+    if remaining.is_zero() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "native callback I/O deadline expired",
+        ))
+    } else {
+        Ok(remaining)
+    }
+}
+
+struct CallbackRead<R, N> {
+    deadline: Instant,
+    read: R,
+    now: N,
+}
+
+impl<R, N> Read for CallbackRead<R, N>
+where
+    R: FnMut(&mut [u8], Duration) -> std::io::Result<usize>,
+    N: Fn() -> Instant,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = callback_io_budget(self.deadline, (self.now)())?;
+        (self.read)(buf, remaining)
+    }
+}
+
+fn callback_reader(stream: &mut TcpStream, deadline: Instant) -> impl Read + '_ {
+    CallbackRead {
+        deadline,
+        now: Instant::now,
+        read: move |buf: &mut [u8], remaining: Duration| {
+            stream.set_read_timeout(Some(remaining))?;
+            stream.read(buf)
+        },
+    }
+}
+
+fn write_callback_until(
+    mut bytes: &[u8],
+    deadline: Instant,
+    now: impl Fn() -> Instant,
+    mut write: impl FnMut(&[u8], Duration) -> std::io::Result<usize>,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let remaining = callback_io_budget(deadline, now())?;
+        match write(bytes, remaining) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "native callback reply made no write progress",
+                ));
+            }
+            Ok(n) => bytes = &bytes[n..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn drain_callback(from: &mut impl Read) {
     let mut drain = [0u8; 1024];
     let mut drained = 0usize;
-    while drained < 16 * 1024 {
-        match stream.read(&mut drain) {
+    while drained < CALLBACK_DRAIN_MAX {
+        let take = drain.len().min(CALLBACK_DRAIN_MAX - drained);
+        match from.read(&mut drain[..take]) {
             Ok(0) | Err(_) => break,
             Ok(n) => drained += n,
         }
     }
+}
+
+fn write_http_reply(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = write_callback_until(
+        head.as_bytes(),
+        deadline.min(Instant::now() + CALLBACK_IO_WAIT),
+        Instant::now,
+        |bytes, remaining| {
+            stream.set_write_timeout(Some(remaining))?;
+            stream.write(bytes)
+        },
+    );
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    drain_callback(&mut callback_reader(
+        stream,
+        deadline.min(Instant::now() + CALLBACK_DRAIN_WAIT),
+    ));
 }
 
 fn is_loopback_host_header(value: &str, port: u16) -> bool {
@@ -2221,7 +2294,7 @@ fn is_loopback_host_header(value: &str, port: u16) -> bool {
     port_part.is_none_or(|p| crate::parse_uint::<u16>(p) == Some(port))
 }
 
-fn read_request_target(stream: &mut TcpStream, port: u16) -> Option<String> {
+fn read_request_target(stream: &mut impl Read, port: u16) -> Option<String> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
     while buf.len() < CALLBACK_REQ_MAX {
@@ -2320,33 +2393,41 @@ fn serve_callback_loop(
     while !cancelled.load(Ordering::SeqCst) && Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let io_wait = deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_secs(2))
-                    .max(Duration::from_millis(1));
                 let _ = stream.set_nonblocking(false);
-                let _ = stream.set_read_timeout(Some(io_wait));
-                let _ = stream.set_write_timeout(Some(io_wait));
-                let Some(target) = read_request_target(&mut stream, port) else {
-                    write_http_reply(&mut stream, "400 Bad Request", "text/plain", "Bad Request");
+                let target = read_request_target(
+                    &mut callback_reader(
+                        &mut stream,
+                        deadline.min(Instant::now() + CALLBACK_IO_WAIT),
+                    ),
+                    port,
+                );
+                let Some(target) = target else {
+                    write_http_reply(
+                        &mut stream,
+                        deadline,
+                        "400 Bad Request",
+                        "text/plain",
+                        "Bad Request",
+                    );
                     continue;
                 };
                 let (path, query) = target
                     .split_once('?')
                     .map_or((target.as_str(), ""), |(p, q)| (p, q));
-                if path == "/cancel" {
-                    write_http_reply(&mut stream, "200 OK", "text/plain", "Cancelled");
-                    done.store(true, Ordering::SeqCst);
-                    let _ = tx.send(CallbackOutcome::Cancelled);
-                    return;
-                }
                 if path != "/auth/callback" {
-                    write_http_reply(&mut stream, "404 Not Found", "text/plain", "Not Found");
+                    write_http_reply(
+                        &mut stream,
+                        deadline,
+                        "404 Not Found",
+                        "text/plain",
+                        "Not Found",
+                    );
                     continue;
                 }
                 let Some(params) = parse_strict_query_params(query) else {
                     write_http_reply(
                         &mut stream,
+                        deadline,
                         "400 Bad Request",
                         "text/plain",
                         "Invalid callback query",
@@ -2362,6 +2443,7 @@ fn serve_callback_loop(
                 if !state_ok {
                     write_http_reply(
                         &mut stream,
+                        deadline,
                         "400 Bad Request",
                         "text/plain",
                         "State mismatch",
@@ -2374,6 +2456,7 @@ fn serve_callback_loop(
                 ) else {
                     write_http_reply(
                         &mut stream,
+                        deadline,
                         "400 Bad Request",
                         "text/plain",
                         "Duplicate callback parameter",
@@ -2385,6 +2468,7 @@ fn serve_callback_loop(
                 if err_param.is_some_and(|e| !e.is_empty()) {
                     write_http_reply(
                         &mut stream,
+                        deadline,
                         "200 OK",
                         "text/html; charset=utf-8",
                         "<!doctype html><title>Sign-in failed</title><p>Sign-in was not completed.</p>",
@@ -2396,6 +2480,7 @@ fn serve_callback_loop(
                 let Some(code) = code_param.filter(|c| !c.is_empty()) else {
                     write_http_reply(
                         &mut stream,
+                        deadline,
                         "400 Bad Request",
                         "text/plain",
                         "Missing authorization code",
@@ -2406,6 +2491,7 @@ fn serve_callback_loop(
                 };
                 write_http_reply(
                     &mut stream,
+                    deadline,
                     "200 OK",
                     "text/html; charset=utf-8",
                     "<!doctype html><title>Signed in</title><p>Sign-in complete. You may close this window.</p>",
@@ -2496,6 +2582,21 @@ impl CodeExchange<'_> {
         if wait.is_zero() || !is_allowed_auth_endpoint(token_url) {
             return None;
         }
+        // Take the publication lock before spending the authorization code. A lock refusal
+        // must not leave a successful exchange with nowhere serialized to save its tokens.
+        // Preparing the destination first also lets a first sign-in take the lock.
+        let deadline = Instant::now() + wait;
+        prepare_auth_dest(home).ok()?;
+        let _held = AuthLock::within(home, Instant::now() + wait.min(SIGN_IN_LOCK_WAIT))?;
+        match std::fs::symlink_metadata(beside_auth(home, JOURNAL_SUFFIX)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(md) if md.is_file() && !md.file_type().is_symlink() => {}
+            Ok(_) | Err(_) => return None,
+        }
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return None;
+        }
         let form = encode_form(&[
             ("grant_type", "authorization_code"),
             ("client_id", CLIENT_ID),
@@ -2562,12 +2663,10 @@ impl CodeExchange<'_> {
                 .as_object_mut()?
                 .insert("oauth_provenance".into(), provenance);
         }
-        // Ordered after a refresh of the login this replaces ([`AuthLock`]), in a folder made
-        // ready first so a first sign-in takes the lock too; the sign-in is written even where
-        // that refresh outlasts the wait, since its code is spent too.
-        prepare_auth_dest(home).ok()?;
-        let _held = AuthLock::within(home, Instant::now() + wait.min(SIGN_IN_LOCK_WAIT));
         write_auth_doc(home, &doc).ok()?;
+        flush_auth_directory(home).ok()?;
+        RefreshJournal::discard(home).ok()?;
+        flush_auth_directory(home).ok()?;
         Some(email)
     }
 }
@@ -2699,6 +2798,14 @@ pub fn login_with(
         deadline,
     }) {
         Approval::Approved { page } => page,
+        Approval::NotRun(why) => {
+            cancelled.store(true, Ordering::SeqCst);
+            let _ = server_thread.join();
+            return Drove {
+                outcome: Outcome::NotRun(why),
+                host,
+            };
+        }
         Approval::NeedsYou(why) => {
             cancelled.store(true, Ordering::SeqCst);
             let _ = server_thread.join();
@@ -2740,7 +2847,7 @@ pub fn login_with(
 
     let code = match callback {
         Ok(CallbackOutcome::Code(code)) => code,
-        Ok(CallbackOutcome::Failed | CallbackOutcome::Cancelled) => {
+        Ok(CallbackOutcome::Failed) => {
             return Drove {
                 outcome: Outcome::Failed,
                 host,

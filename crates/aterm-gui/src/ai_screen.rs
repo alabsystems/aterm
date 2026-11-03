@@ -17,6 +17,7 @@ use aterm_messages::exceptions::{Entry, Family};
 use aterm_messages::need::{Mover, Reason, Resurface, Then, Why};
 
 use crate::App;
+use crate::message_reporters;
 use crate::native_settings::SettingsRoute;
 
 /// How often the window looks with nothing else asking.
@@ -37,6 +38,9 @@ pub(crate) struct AiCli {
     pub(crate) claude: bool,
     /// Whether it is wanted here.
     pub(crate) wanted: bool,
+    /// Whether someone asked for it here ([`aterm_agent::ai::state::asked`]): only then does its
+    /// trouble reach the digest. Its row on the page shows it either way.
+    pub(crate) asked: bool,
     /// Its state.
     pub(crate) state: State,
     /// How much it matters.
@@ -131,6 +135,7 @@ impl AiReading {
                     product: row.connector.product,
                     claude: row.connector.is_claude(),
                     wanted: row.wanted,
+                    asked: row.asked,
                     state: row.state,
                     mark: row.mark,
                     path: named_path(&fact, foreign),
@@ -280,6 +285,17 @@ impl AiAct {
             Self::Install => "Install",
         }
     }
+
+    /// The `aterm` words the tab this act opens for the CLI `id` runs. The install says no setup
+    /// follows it ([`atpkg::cli::NO_INIT_FLAG`]): the tab is this screen's step toward the CLI's
+    /// sign-in, not a request to finish this Mac's setup.
+    #[must_use]
+    pub(crate) fn words(self, id: &str) -> Vec<&str> {
+        match self {
+            Self::SignIn => vec!["ai", "login", id],
+            Self::Install => vec!["pkg", "install", id, atpkg::cli::NO_INIT_FLAG],
+        }
+    }
 }
 
 /// One row of the CLIS card: what it is, its state, and the act it offers.
@@ -418,7 +434,7 @@ impl AiState {
         let needing: Vec<&str> = reading
             .clis
             .iter()
-            .filter(|cli| cli.needs_person() && self.choices.wants(cli.id))
+            .filter(|cli| cli.asked && cli.needs_person() && self.choices.wants(cli.id))
             .map(|cli| cli.product)
             .collect();
         let words = match needing.as_slice() {
@@ -653,13 +669,25 @@ pub(crate) fn ai_entries(reading: &AiReading, accounts_listed: bool) -> Vec<Entr
     reading
         .clis
         .iter()
-        .filter(|cli| cli.needs_you())
+        .filter(|cli| cli.asked && cli.needs_you())
         .filter(|cli| {
             !cli.claude
                 || (!accounts_listed && matches!(cli.state, State::SignedOut | State::NotInstalled))
         })
         .map(|cli| ai_entry(cli, cli.id == reading.preferred))
         .collect()
+}
+
+/// The CLIs someone asked for in `reading`, none before the first look.
+fn pools_asked(reading: Option<&AiReading>) -> Vec<&'static str> {
+    reading.map_or_else(Vec::new, |reading| {
+        reading
+            .clis
+            .iter()
+            .filter(|cli| cli.asked)
+            .map(|cli| cli.id)
+            .collect()
+    })
 }
 
 fn ai_entry(cli: &AiCli, preferred: bool) -> Entry {
@@ -697,7 +725,7 @@ fn ai_entry(cli: &AiCli, preferred: bool) -> Entry {
     })
     .resurface(Resurface::WAIT)
     .more(&cli.fact)
-    .more("In a terminal, aterm ai doctor signs in every AI CLI that needs it")
+    .more("aterm ai doctor tries each install and sign-in and says why any did not finish")
     .log_line(format!("ai need={} cli={}", cli.state.word(), cli.id))
 }
 
@@ -852,6 +880,16 @@ pub(crate) struct AiScreen {
     pub(crate) unavailable: Option<String>,
     /// Whether accounts v2's roster lists rows (`AccountsSaid::Listed`).
     pub(crate) accounts_listed: bool,
+    /// What the other CLIs' pools last said ([`crate::harness_host::HostNote::Pools`]), which
+    /// reaches the digest only for a CLI someone asked for ([`App::hand_pool_entries`]).
+    pub(crate) pools: Vec<crate::harness_host::PoolSaid>,
+    /// The CLIs the newest landed look found asked for ([`pools_asked`]). Kept while `[ai]` is
+    /// off and across a reload until the next look lands, since what it read (a review or
+    /// sign-in on record, a login in a CLI's default home) is this machine's history, not policy.
+    pub(crate) looked_asked: Vec<&'static str>,
+    /// The pooled CLIs [`App::hand_pool_entries`] last spoke for: one of them that goes quiet
+    /// has its lines filed as fixed, any other's are withdrawn.
+    pub(crate) pools_spoke: Vec<&'static str>,
 }
 
 impl App {
@@ -1003,6 +1041,68 @@ impl App {
         };
         let entries = ai_entries(reading, self.ai_screen.accounts_listed);
         self.except_replace(Family::Ai, &entries);
+        let asked = pools_asked(self.ai_screen.reading.as_ref());
+        if asked != self.ai_screen.looked_asked {
+            self.ai_screen.looked_asked = asked;
+            self.hand_pool_entries();
+        }
+    }
+
+    /// Hand the digest what each other CLI's pool says, for a CLI someone asked for: the host
+    /// found it named in config, pinned or served ([`crate::harness_host::PoolSaid::asked`]), or
+    /// the newest look found it used here ([`AiScreen::looked_asked`]), so a pin's sign-in reaches
+    /// the digest whatever `[ai]` says. A pool nobody asked for says nothing here: the sheet syncs
+    /// its rows and aterm's ladder works them unasked, and `aterm harness accounts --cli <id>`
+    /// shows them on demand. A line of a CLI no longer asked for is withdrawn, never filed as
+    /// fixed; one whose pool went quiet is.
+    pub(crate) fn hand_pool_entries(&mut self) {
+        use aterm_agent::harness::accounts_sync::OTHER_CLIS;
+        let said = std::mem::take(&mut self.ai_screen.pools);
+        let mut spoke = Vec::new();
+        for cli in OTHER_CLIS {
+            let pool = said.iter().find(|pool| pool.cli == cli);
+            let speaks = self.ai_screen.looked_asked.contains(&cli.id())
+                || pool.map_or_else(
+                    || self.ai_screen.pools_spoke.contains(&cli.id()),
+                    |pool| pool.asked,
+                );
+            if speaks {
+                spoke.push(cli.id());
+            }
+            let due = pool.map_or(&[][..], |pool| pool.due.as_slice());
+            let wrong = pool.map_or(&[][..], |pool| pool.wrong.as_slice());
+            let sign_in = pool.map_or(&[][..], |pool| pool.sign_in.as_slice());
+            // Where a renewal cannot approve the page itself (Grok's), the due entry asks
+            // for each login's sign-in; a login whose renewal already stopped for it is
+            // that task's ask, so the due entry leaves it out and the person is asked once.
+            let due: Vec<String> = due
+                .iter()
+                .filter(|label| {
+                    cli.renews_headlessly() || !sign_in.iter().any(|(task, _)| task == *label)
+                })
+                .cloned()
+                .collect();
+            for (cause, entry) in [
+                ("due", message_reporters::accounts_due_entry_for(cli, &due)),
+                (
+                    "wrong-account",
+                    message_reporters::accounts_wrong_entry_for(cli, wrong),
+                ),
+                (
+                    "sign-in",
+                    message_reporters::accounts_sign_in_entry_for(cli, sign_in),
+                ),
+            ] {
+                let key = message_reporters::pool_notice_key(cli, cause);
+                match entry {
+                    Some(entry) if speaks => self.except(&entry),
+                    _ if !speaks => self.except_withdraw(&key),
+                    _ => self.except_clear(&key),
+                }
+            }
+        }
+        self.ai_screen.pools = said;
+        self.ai_screen.pools_spoke = spoke;
     }
 
     /// `[ai]` turned off or changed: its entries end withdrawn, never as fixed, since
@@ -1020,14 +1120,11 @@ impl App {
             return;
         };
         let state = self.ai_state();
-        let args: [&str; 3] = match state.actionable_cli(c.id).and_then(AiCli::act) {
-            Some(AiAct::Install) => ["pkg", "install", c.id],
-            Some(AiAct::SignIn) => ["ai", "login", c.id],
-            None => {
-                aterm_log::warn!("ai: {id} does not need an action under the current policy");
-                return;
-            }
+        let Some(act) = state.actionable_cli(c.id).and_then(AiCli::act) else {
+            aterm_log::warn!("ai: {id} does not need an action under the current policy");
+            return;
         };
+        let args = act.words(c.id);
         let Some(line) = crate::ledger_key::own_front_door().and_then(|exe| {
             #[cfg(windows)]
             {

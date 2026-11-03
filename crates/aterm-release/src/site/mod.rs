@@ -26,18 +26,25 @@ pub use world::Real;
 /// Command-line usage string for `ship site`.
 pub const USAGE: &str = "usage: targo --unverified ship site [--latest] [--dry-run] [--no-deploy] \
      [--redeploy] [--skip-site] [--site-dir DIR] [--releases FILE]
+       targo --unverified ship site --check-key [--site-dir DIR]
+       targo --unverified ship site --check-access [--site-dir DIR]
   --latest       sync to the public repo's main tip; PUB_PUBLIC_COMMIT, when set, names
                  the commit instead (one of the two is required)
   --dry-run      compute and print the plan; change nothing (PUB_DRY_RUN=1 too)
   --no-deploy    commit and push, no deploy, no live check (SITE_NO_DEPLOY=1 too)
   --redeploy     deploy the committed site to Firebase Hosting even when nothing changed
   --skip-site    do nothing, say so, exit 0
+  --check-key    ask Google to authenticate the configured key; build and deploy nothing
+                 (success does not prove Firebase Hosting deployment permission)
+  --check-access read the Hosting site and test its project's update permission;
+                 change no site or IAM policy (a point-in-time permission observation)
   --site-dir DIR the site checkout (else SITE_DIR, else publish/site.toml's dir)
   --releases FILE take the release list from FILE instead of GitHub's API (needs
                  --dry-run); the clone, --latest and FILE's asset URLs are still fetched
-exit: 0 synced (said when not deployed or the live site is unreadable), planned, skipped
-      or deferred · 1 failed · 2 usage or an unreadable publish/site.toml · 3 no usable
-      site checkout · 4 the live site does not show the committed site";
+exit: 0 key authenticated, synced and verified, planned, skipped, deferred or explicitly not deployed
+      (--no-deploy) · 1 failed · 2 usage or an unreadable publish/site.toml · 3 no usable
+      checkout, deployment unavailable or live verification unavailable · 4 the live
+      site does not show the committed site";
 
 /// Closure fetching up to the given byte count from a release asset URL.
 pub type Fetch<'f> = dyn FnMut(&str, u64) -> Result<Vec<u8>, String> + 'f;
@@ -122,6 +129,10 @@ pub struct Options {
     pub latest: bool,
     pub dry_run: bool,
     pub no_deploy: bool,
+    /// Authenticate the configured key without synchronizing or deploying the site.
+    pub check_key: bool,
+    /// Observe the configured Hosting site's project permission without deployment.
+    pub check_access: bool,
     /// Deploy the committed site even when the sync changed nothing.
     pub redeploy: bool,
     pub skip: bool,
@@ -141,6 +152,8 @@ pub fn parse_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Option<
             "--latest" => o.latest = true,
             "--dry-run" => o.dry_run = true,
             "--no-deploy" => o.no_deploy = true,
+            "--check-key" => o.check_key = true,
+            "--check-access" => o.check_access = true,
             "--redeploy" => o.redeploy = true,
             "--skip-site" => o.skip = true,
             "--site-dir" | "--releases" => {
@@ -158,6 +171,16 @@ pub fn parse_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Option<
             "-h" | "--help" => return Ok(None),
             other => return Err(format!("unknown argument: {other}")),
         }
+    }
+    if o.check_key && o.check_access {
+        return Err("choose --check-key or --check-access".into());
+    }
+    if (o.check_key || o.check_access)
+        && (o.latest || o.dry_run || o.no_deploy || o.redeploy || o.skip || o.releases.is_some())
+    {
+        return Err(
+            "a credential check only accepts --site-dir; it does not synchronize the site".into(),
+        );
     }
     if o.redeploy && o.no_deploy {
         return Err("--redeploy and --no-deploy ask for opposite things".into());
@@ -272,7 +295,7 @@ impl Env {
             (Some(n), Some(e)) => Some((n, e)),
             _ => None,
         };
-        let wasm_pin = std::fs::read_to_string(repo.join("publish/config.sh"))
+        let wasm_pin = crate::durable::read_text(&repo.join("publish/config.sh"))
             .ok()
             .and_then(|c| crate::release_steps::wasm_clause(&c).ok())
             .map(|c| c.pin);
@@ -451,7 +474,7 @@ impl std::fmt::Display for Disagreement {
     }
 }
 
-/// Non-failing outcome of a site sync.
+/// Outcome of a site sync, including incomplete deployment or verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Skipped via `--skip-site`.
@@ -1759,6 +1782,17 @@ fn steps(
         say(out, "nothing changed — no deploy needed");
     } else {
         halt(launch, "the deploy")?;
+        let current_hosting =
+            hosting::config::read(&site_dir).map_err(|e| refusal(Refusal::Hosting, e))?;
+        if current_hosting != hosting {
+            return fail(
+                Refusal::Hosting,
+                format!(
+                    "firebase.json's deployment settings changed during the sync; nothing was \
+                     deployed. Rerun {DEPLOY_LATER} to plan from the current settings"
+                ),
+            );
+        }
         let plan = hosting::Plan::of(&site_dir, &hosting, hosting_site.clone(), &BTreeMap::new())
             .map_err(|e| {
             refusal(
@@ -1991,6 +2025,46 @@ pub fn run_cli(args: &[String], repo: &Path) -> i32 {
         curl: std::sync::Arc::new(crate::github::Launched(Plain)),
     };
     let mut out = std::io::stdout();
+    if opts.check_key || opts.check_access {
+        if env.dry_run {
+            eprintln!(
+                "ship site: credential checks send authentication requests; unset PUB_DRY_RUN"
+            );
+            return 2;
+        }
+        let site = opts.site_dir.as_deref().or(env.site_dir.as_deref());
+        let key = env
+            .firebase_sa_key
+            .clone()
+            .or_else(|| site.and_then(|site| env.sa_key(site)));
+        let result = key
+            .ok_or_else(|| "no service-account key is configured".to_string())
+            .and_then(|key| {
+                if opts.check_access {
+                    let in_config = site.map(hosting::config::read).transpose()?;
+                    let target = hosting::site(
+                        in_config.as_ref().and_then(|config| config.site.as_deref()),
+                        env.firebase_site.as_deref(),
+                    )?;
+                    let access = world.check_access(&key, target.as_deref())?;
+                    Ok(format!("Hosting site {} in project {} reports {}; no deployment or policy change performed",
+                        access.site, access.project, hosting::access::UPDATE))
+                } else {
+                    world.check_key(&key)?;
+                    Ok("Google accepted the configured key; no site was built or deployed; Hosting deployment permission is untested".into())
+                }
+            });
+        return match result {
+            Ok(message) => {
+                println!("ship site: {message}");
+                0
+            }
+            Err(why) => {
+                eprintln!("ship site: credential check failed: {why}");
+                3
+            }
+        };
+    }
     let ended = sync(&opts, &env, &mut world, &mut out);
     let _ = out.flush();
     report(&ended)
@@ -2080,6 +2154,34 @@ mod tests {
         );
         let why = parse_args(["--redeploy", "--no-deploy"]).unwrap_err();
         assert!(why.contains("--redeploy"), "{why}");
+    }
+
+    #[test]
+    fn key_check_cannot_be_combined_with_site_changes() {
+        let parsed = parse_args(["--check-key", "--site-dir", "/site"])
+            .unwrap()
+            .unwrap();
+        assert!(parsed.check_key);
+        assert_eq!(parsed.site_dir.as_deref(), Some(Path::new("/site")));
+        for flag in [
+            "--latest",
+            "--dry-run",
+            "--no-deploy",
+            "--redeploy",
+            "--skip-site",
+        ] {
+            assert!(parse_args(["--check-key", flag]).is_err(), "{flag}");
+        }
+        assert!(parse_args(["--check-key", "--releases", "/list"]).is_err());
+        assert!(parse_args(["--check-key", "--check-access"]).is_err());
+        assert!(parse_args(["--check-access", "--redeploy"]).is_err());
+        assert!(parse_args(["--check-access", "--dry-run"]).is_err());
+        assert!(
+            parse_args(["--check-access"])
+                .unwrap()
+                .unwrap()
+                .check_access
+        );
     }
 
     #[test]

@@ -190,7 +190,7 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::WholeTree,
         needs: &["targo", "ty"],
         also: "",
-        runs: "targo test --workspace --features aterm-spec/checkers (own target dir; after test)",
+        runs: "targo test --workspace --features aterm-spec/checkers --tests (own target dir; after test; binaries in parallel)",
     },
     Spec {
         check: Check::GpuOracle,

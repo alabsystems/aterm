@@ -44,8 +44,16 @@ mod on {
     }
 
     impl Recorder {
-        /// On, writing to a newly created private `path`.
+        /// On, writing to a newly created private `path` inside a real directory.
         fn at(path: &Path) -> std::io::Result<Self> {
+            if let Some(parent) = path.parent().filter(|d| !d.as_os_str().is_empty())
+                && !std::fs::symlink_metadata(parent)?.file_type().is_dir()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "handler tally parent path is not a directory",
+                ));
+            }
             let mut open = std::fs::OpenOptions::new();
             open.write(true).create_new(true);
             #[cfg(unix)]
@@ -102,6 +110,13 @@ mod on {
                 aterm_types::dev_seam!(HANDLER_SEAM)?;
                 let dir = aterm_types::dirs::state_dir()?;
                 let path = dir.join(HANDLER_FILE);
+                if std::fs::symlink_metadata(&dir).is_ok_and(|m| !m.file_type().is_dir()) {
+                    eprintln!(
+                        "aterm: {HANDLER_SEAM} is set, but {} is not a directory; no handler tally",
+                        dir.display()
+                    );
+                    return None;
+                }
                 std::fs::create_dir_all(&dir)
                     .and_then(|()| Recorder::at(&path))
                     .map_err(|e| {
@@ -151,6 +166,7 @@ mod on {
     /// wait is the tally's read point, and counts nothing.
     #[derive(Debug)]
     pub struct AwaitSpans {
+        recorder: Option<&'static Recorder>,
         began: Stamp,
         parked: bool,
     }
@@ -160,16 +176,29 @@ mod on {
         /// ([`write`]).
         #[must_use]
         pub fn begin(timeout_ms: u64) -> Self {
+            Self::on(recorder(), timeout_ms)
+        }
+
+        /// [`AwaitSpans::begin`], counted by `recorder`: the process's, or a test's own.
+        fn on(recorder: Option<&'static Recorder>, timeout_ms: u64) -> Self {
             if timeout_ms == 0 {
-                write();
+                write_to(recorder);
                 return Self {
+                    recorder: None,
                     began: None,
                     parked: false,
                 };
             }
             Self {
-                began: stamp(),
+                recorder,
+                began: recorder.map(|_| Instant::now()),
                 parked: false,
+            }
+        }
+
+        fn note(&self, row: Row, since: Stamp) {
+            if let (Some(recorder), Some(started)) = (self.recorder, since) {
+                recorder.note(row, started);
             }
         }
 
@@ -177,7 +206,7 @@ mod on {
         pub fn parks(&mut self) {
             if !self.parked {
                 self.parked = true;
-                note_since(Row::AwaitArm, self.began);
+                self.note(Row::AwaitArm, self.began);
             }
         }
 
@@ -186,7 +215,7 @@ mod on {
         pub fn answers(&self, arrived: &mut Stamp) {
             let arrived = arrived.take();
             if self.parked && self.began.is_some() {
-                note_since(Row::AwaitWake, arrived);
+                self.note(Row::AwaitWake, arrived);
             }
         }
     }
@@ -194,14 +223,18 @@ mod on {
     impl Drop for AwaitSpans {
         fn drop(&mut self) {
             if !self.parked {
-                note_since(Row::AwaitArm, self.began);
+                self.note(Row::AwaitArm, self.began);
             }
         }
     }
 
     /// Write the line, when the tally is on.
     pub fn write() {
-        if let Some(recorder) = recorder()
+        write_to(recorder());
+    }
+
+    fn write_to(recorder: Option<&Recorder>) {
+        if let Some(recorder) = recorder
             && let Err(e) = recorder.write()
         {
             eprintln!("aterm: the handler tally could not be written ({e})");
@@ -246,6 +279,89 @@ mod on {
             );
         }
 
+        /// A recorder held for the process's life, as the real one is, and its file.
+        fn on_file() -> (
+            aterm_tempfile::TempDir,
+            std::path::PathBuf,
+            &'static Recorder,
+        ) {
+            let dir = aterm_tempfile::tempdir().expect("scratch");
+            let path = dir.path().join(HANDLER_FILE);
+            let recorder = Recorder::at(&path).expect("a new file");
+            (dir, path, Box::leak(Box::new(recorder)))
+        }
+
+        /// Every row that counted anything, with its count.
+        fn counted(recorder: &Recorder) -> Vec<(Row, u64)> {
+            let rows = *recorder.rows.lock().expect("not poisoned");
+            Row::ALL
+                .into_iter()
+                .map(|row| (row, rows[row.index()].count))
+                .filter(|(_, count)| *count > 0)
+                .collect()
+        }
+
+        #[test]
+        fn a_wait_with_no_time_writes_every_earlier_span_and_counts_in_no_row() {
+            let (_dir, path, recorder) = on_file();
+            recorder.note(Row::Post, Instant::now());
+            let mut spans = AwaitSpans::on(Some(recorder), 0);
+            let line = HandlerTally::parse(&std::fs::read_to_string(&path).expect("the fence"))
+                .expect("a whole line");
+            assert_eq!(line.row(Row::Post).count, 1, "written before the answer");
+            spans.parks();
+            spans.answers(&mut Some(Instant::now()));
+            drop(spans);
+            assert_eq!(counted(recorder), [(Row::Post, 1)]);
+        }
+
+        #[test]
+        fn a_parked_wait_counts_its_arm_once_and_its_answer_as_the_wake() {
+            let (_dir, _path, recorder) = on_file();
+            let mut spans = AwaitSpans::on(Some(recorder), 60_000);
+            assert_eq!(counted(recorder), []);
+            spans.parks();
+            spans.parks();
+            assert_eq!(
+                counted(recorder),
+                [(Row::AwaitArm, 1)],
+                "a park again is one"
+            );
+            let mut arrived = Some(Instant::now());
+            spans.answers(&mut arrived);
+            assert_eq!(arrived, None, "the arrival is spent");
+            drop(spans);
+            assert_eq!(
+                counted(recorder),
+                [(Row::AwaitArm, 1), (Row::AwaitWake, 1)],
+                "and the drop counts no second arm"
+            );
+        }
+
+        #[test]
+        fn a_wait_that_never_parked_spends_the_arrival_and_counts_only_its_arm() {
+            let (_dir, _path, recorder) = on_file();
+            let mut arrived = Some(Instant::now());
+            let spans = AwaitSpans::on(Some(recorder), 60_000);
+            spans.answers(&mut arrived);
+            assert_eq!(
+                arrived, None,
+                "or a later wait would read this row's moment"
+            );
+            assert_eq!(counted(recorder), [], "its arm ends when it does");
+            drop(spans);
+            assert_eq!(counted(recorder), [(Row::AwaitArm, 1)]);
+
+            let mut later = AwaitSpans::on(Some(recorder), 60_000);
+            later.parks();
+            later.answers(&mut arrived);
+            assert_eq!(
+                counted(recorder),
+                [(Row::AwaitArm, 2)],
+                "an answer with no arrival of its own has no wake to count"
+            );
+        }
+
         #[test]
         fn with_the_seam_unset_nothing_is_counted() {
             assert!(stamp().is_none());
@@ -254,6 +370,23 @@ mod on {
             spans.parks();
             spans.answers(&mut stamp());
             write();
+        }
+
+        /// NEGATIVE CONTROL: `Recorder::at` refuses a symlinked parent directory without creating
+        /// the tally file in the link target.
+        #[cfg(unix)]
+        #[test]
+        fn recorder_refuses_symlinked_parent_directory() {
+            let root = aterm_tempfile::tempdir().expect("scratch");
+            let real_dir = root.path().join("real");
+            std::fs::create_dir(&real_dir).expect("real dir");
+            let linked_dir = root.path().join("linked");
+            std::os::unix::fs::symlink(&real_dir, &linked_dir).expect("symlink dir");
+
+            let err = Recorder::at(&linked_dir.join(HANDLER_FILE))
+                .expect_err("symlinked parent must be refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(!real_dir.join(HANDLER_FILE).exists());
         }
     }
 }

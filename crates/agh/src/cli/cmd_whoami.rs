@@ -10,9 +10,12 @@ use std::path::Path;
 use aterm_json::{Value, json};
 
 use super::args::Invocation;
+use super::cmd_credential::helper_dirs;
 use super::verbs::Noun;
 use super::{Answer, Completeness, Ctx, Outcome, Receipt};
-use crate::error::{Error, Kind, Result};
+use crate::error::{Kind, Result};
+use crate::git::credential::{self, Asked, CredentialAnswer, CredentialRequest};
+use crate::git::grant::LiveGrants;
 use crate::identity::vault::{Adoption, Found};
 use crate::identity::{self, EnvSource, Profile, Source, tilde};
 use crate::policy::{Access, Presence, RouteRequest, RouteTarget};
@@ -236,11 +239,25 @@ pub(super) fn vault_rows(
 ///
 /// # Errors
 ///
-/// Usage for the flags' combinations; the client's refusal of an invalid agh.toml; with
-/// `--verify`, any error of `GET /user` but a 401; with `--git`, could_not_run until WP7.
+/// Usage for the flags' combinations (`--git` with `--for`, `--op`, `--verify`, `--as` or
+/// `--anonymous`, none of which git's helper sees); the client's refusal of an invalid
+/// agh.toml; with
+/// `--verify`, any error of `GET /user` but a 401; with `--git`, Usage for a URL that is not
+/// a github.com repository's.
 pub(crate) fn whoami(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
-    if inv.flag("--git").is_some() {
-        return Err(Error::not_yet("whoami --git", "WP7"));
+    if let Some(url) = inv.flag("--git") {
+        if inv.has("--for")
+            || inv.has("--op")
+            || inv.has("--verify")
+            || inv.global.anonymous
+            || inv.global.as_profile.is_some()
+        {
+            return Err(inv.usage(
+                "--git takes no --for, --op, --verify, --as or --anonymous: git's credential \
+                 helper never sees them",
+            ));
+        }
+        return whoami_git(ctx, inv, url);
     }
     let usage = |why: &str| inv.usage(why);
     let target = inv.flag("--for");
@@ -348,6 +365,109 @@ pub(crate) fn whoami(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
             completeness: Completeness::Complete,
         },
         receipt,
+    })
+}
+
+/// The `get` request git would send for `url`, and the loopback host a runner pointing git
+/// there would name: `https://github.com/{owner}/{repo}[.git]`, or, in a test or debug build,
+/// `http://127.0.0.1:{port}/{owner}/{repo}[.git]`, with the repository it names. `None` for
+/// anything else.
+fn git_request(url: &str) -> Option<(CredentialRequest, crate::slug::Slug, Option<String>)> {
+    let (protocol, host, path, loopback) =
+        if let Some(path) = url.strip_prefix("https://github.com/") {
+            ("https", "github.com".to_string(), path, None)
+        } else {
+            loopback_request(url)?
+        };
+    let req = CredentialRequest {
+        op: "get".to_string(),
+        protocol: Some(protocol.to_string()),
+        host: Some(host),
+        path: Some(path.to_string()),
+    };
+    let slug = req.slug()?;
+    Some((req, slug, loopback))
+}
+
+/// `http://127.0.0.1:{port}/{path}` in a test or debug build: `http`, its host, its path and
+/// that host as the loopback a runner would name.
+#[cfg(any(test, debug_assertions))]
+fn loopback_request(url: &str) -> Option<(&'static str, String, &str, Option<String>)> {
+    let rest = url.strip_prefix("http://127.0.0.1:")?;
+    let (port, path) = rest.split_once('/')?;
+    crate::path::digits::<u16>(port)?;
+    let host = format!("127.0.0.1:{port}");
+    Some(("http", host.clone(), path, Some(host)))
+}
+
+/// A release build answers only github.com.
+#[cfg(not(any(test, debug_assertions)))]
+fn loopback_request(url: &str) -> Option<(&'static str, String, &str, Option<String>)> {
+    let _ = url;
+    None
+}
+
+/// `agh whoami --git URL`: the identity the git helper would answer for `url`, decided as the
+/// helper decides (its directories, its route with vault adoption, and the live grants), with
+/// no token loaded past presence and none printed. Where the helper quits silently on an
+/// invalid agh.toml or adoption's refusal, this verb fails with that refusal, as every routed
+/// verb does.
+fn whoami_git(ctx: &mut Ctx, inv: &Invocation, url: &str) -> Result<Outcome> {
+    let Some((req, slug, loopback)) = git_request(url) else {
+        return Err(inv.usage(
+            "--git wants https://github.com/OWNER/REPO or https://github.com/OWNER/REPO.git",
+        ));
+    };
+    let now = ctx.fx.wall_secs()?;
+    let env = &*ctx.env;
+    let nonce = credential::var(env, crate::git::GRANT_VAR);
+    let asked = Asked {
+        stdin_is_terminal: false,
+        nonce: nonce.as_deref(),
+        loopback: loopback.as_deref(),
+        now,
+    };
+    let (answer, granted, router) = match helper_dirs(env, ctx.dirs.as_ref()) {
+        Some(dirs) => {
+            let router = credential::helper_route(env, &dirs)?.router;
+            let presence = |name: &str| router.presence(name, env);
+            let (answer, granted) =
+                credential::explained(&req, &asked, &router, &LiveGrants::new(&dirs), &presence);
+            (answer, granted, router)
+        }
+        None => (
+            CredentialAnswer::Quit {
+                why: "agh has no config directory, so the helper answers nothing".to_string(),
+            },
+            false,
+            crate::policy::Router::empty(),
+        ),
+    };
+    let text = |s: &str| Value::from(ctx.redactor.apply(s));
+    let value = match &answer {
+        CredentialAnswer::Credential { profile, tier } => json!({
+            "answer": "credential",
+            "grant": if granted { Value::from("live") } else { Value::Null },
+            "profile": profile.as_str(),
+            "repo": slug.to_string(),
+            "tier": tier.slug(),
+            "why": null,
+        }),
+        CredentialAnswer::Quit { why } => json!({
+            "answer": "quit",
+            "grant": null,
+            "profile": null,
+            "repo": slug.to_string(),
+            "tier": router.tier_of(slug.owner()).slug(),
+            "why": text(why),
+        }),
+    };
+    Ok(Outcome {
+        answer: Answer::Object {
+            noun: Noun::Credential,
+            value,
+        },
+        receipt: Receipt::new(&inv.verb_name()),
     })
 }
 

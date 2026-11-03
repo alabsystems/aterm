@@ -2,22 +2,57 @@
 // Copyright 2026 Andrew Yates
 //! Brew's terminal styling (`Utils::Tty` + `Formatter`): colour is
 //! emitted only when the destination stream styles (a terminal, or
-//! `HOMEBREW_COLOR`), and never under `HOMEBREW_NO_COLOR`. Every
-//! painter returns its plain text unchanged when colour is off, so
-//! piped output is byte-identical either way.
+//! `HOMEBREW_COLOR`), and never under `HOMEBREW_NO_COLOR` or the
+//! cross-tool `NO_COLOR`. Every painter returns its plain text
+//! unchanged when colour is off, so piped output is byte-identical
+//! either way.
 
 #[cfg(not(test))]
 use std::io::IsTerminal as _;
 
 /// Whether a stream styles, from brew's env rules alone.
 fn env_color() -> Option<bool> {
-    if super::env_set("HOMEBREW_NO_COLOR") {
+    env_color_with(|key| std::env::var(key).ok())
+}
+
+/// Brew's colour envs are value booleans, not presence ones: `bin/brew`
+/// copies `NO_COLOR` into `HOMEBREW_NO_COLOR` only when the latter is
+/// unset or empty and `NO_COLOR` is non-empty and not `"0"`, and
+/// EnvConfig's `boolean: :set` then requires the value `present?`
+/// (contains a non-whitespace character). `HOMEBREW_COLOR` forces
+/// colour the same `present?` way, disabled by the no-colour vars.
+fn env_color_with(get: impl Fn(&str) -> Option<String>) -> Option<bool> {
+    fn present(value: &Option<String>) -> bool {
+        value
+            .as_ref()
+            .is_some_and(|v| v.chars().any(|c| !c.is_whitespace()))
+    }
+    let homebrew_no_color = get("HOMEBREW_NO_COLOR");
+    let no_color = if homebrew_no_color.as_ref().is_some_and(|v| !v.is_empty()) {
+        present(&homebrew_no_color)
+    } else {
+        match get("NO_COLOR") {
+            Some(v) if !v.is_empty() && v != "0" => present(&Some(v)),
+            _ => false,
+        }
+    };
+    if no_color {
         Some(false)
-    } else if super::env_set("HOMEBREW_COLOR") {
+    } else if present(&get("HOMEBREW_COLOR")) || github_actions_visible(&get) {
+        // brew.sh exports HOMEBREW_COLOR=1 on GitHub Actions.
         Some(true)
     } else {
         None
     }
+}
+
+/// Whether brew's entry points can see GitHub Actions: `bin/brew`
+/// only carries `GITHUB_*` through its env filter when `CI` is set
+/// (a hosted runner always sets both), and `GitHub::Actions`
+/// then requires `GITHUB_ACTIONS` `present?`.
+fn github_actions_visible(get: &impl Fn(&str) -> Option<String>) -> bool {
+    get("CI").is_some_and(|v| !v.is_empty())
+        && get("GITHUB_ACTIONS").is_some_and(|v| v.chars().any(|c| !c.is_whitespace()))
 }
 
 /// Whether stdout receives colour escapes.
@@ -181,12 +216,71 @@ pub(super) fn visible_len(text: &str) -> usize {
 /// A stderr `Error:`-labelled message with the label in red, as
 /// brew's `onoe` prints it; messages without the label pass through.
 pub(super) fn error_line(message: &str) -> String {
-    label_line(stderr_color(), RED, "Error:", message)
+    if let Some(line) = annotation_line("error", "Error:", message) {
+        return line;
+    }
+    label_line(stderr_color(), RED, "Error:", unchomp(message))
 }
 
 /// A stderr `Warning:`-labelled message with the label in yellow.
 pub(super) fn warning_line(message: &str) -> String {
-    label_line(stderr_color(), YELLOW, "Warning:", message)
+    if let Some(line) = annotation_line("warning", "Warning:", message) {
+        return line;
+    }
+    label_line(stderr_color(), YELLOW, "Warning:", unchomp(message))
+}
+
+/// Brew prints label lines with `puts`, which adds no newline to
+/// a message already ending in one; the macros here `eprintln!`,
+/// so drop one trailing newline a heredoc-style message carries.
+fn unchomp(message: &str) -> &str {
+    message.strip_suffix('\n').unwrap_or(message)
+}
+
+/// Brew's GitHub Actions annotation for an `onoe`/`opoo` line
+/// (`::error::`/`::warning::` with the label removed, ANSI
+/// stripped, `%`/newlines escaped), when Actions is visible and
+/// `HOMEBREW_TESTS` is unset (any non-empty value suppresses).
+fn annotation_line(kind: &str, label: &str, message: &str) -> Option<String> {
+    annotation_line_with(kind, label, message, &|key| std::env::var(key).ok())
+}
+
+fn annotation_line_with(
+    kind: &str,
+    label: &str,
+    message: &str,
+    get: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if get("HOMEBREW_TESTS").is_some_and(|v| !v.is_empty()) || !github_actions_visible(get) {
+        return None;
+    }
+    let body = message
+        .strip_prefix(label)
+        .map_or(message, |rest| rest.strip_prefix(' ').unwrap_or(rest));
+    let escaped = strip_ansi(body)
+        .replace('%', "%25")
+        .replace('\n', "%0A")
+        .replace('\r', "%0D");
+    Some(format!("::{kind}::{escaped}"))
+}
+
+/// `Tty.strip_ansi`: drop CSI escape sequences.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn label_line(on: bool, color: &str, label: &str, message: &str) -> String {
@@ -275,6 +369,96 @@ pub(super) fn pretty_install_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_color_env_wins_over_force_color() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| (*v).to_string())
+            }
+        };
+        assert_eq!(env_color_with(env(&[("NO_COLOR", "1")])), Some(false));
+        assert_eq!(
+            env_color_with(env(&[("HOMEBREW_NO_COLOR", "0")])),
+            Some(false),
+            "boolean :set: any present value opts out"
+        );
+        assert_eq!(
+            env_color_with(env(&[("NO_COLOR", "0")])),
+            None,
+            "bin/brew skips copying NO_COLOR=0"
+        );
+        assert_eq!(env_color_with(env(&[("NO_COLOR", "")])), None);
+        assert_eq!(env_color_with(env(&[("HOMEBREW_NO_COLOR", "  ")])), None);
+        assert_eq!(
+            env_color_with(env(&[("HOMEBREW_NO_COLOR", ""), ("NO_COLOR", "1")])),
+            Some(false),
+            "empty HOMEBREW_NO_COLOR lets NO_COLOR through"
+        );
+        assert_eq!(env_color_with(env(&[("HOMEBREW_COLOR", "1")])), Some(true));
+        assert_eq!(env_color_with(env(&[("HOMEBREW_COLOR", "")])), None);
+        assert_eq!(
+            env_color_with(env(&[("NO_COLOR", "1"), ("HOMEBREW_COLOR", "1")])),
+            Some(false)
+        );
+        assert_eq!(env_color_with(env(&[])), None);
+    }
+
+    #[test]
+    fn github_actions_annotations_and_colour() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| (*v).to_string())
+            }
+        };
+        let gha = env(&[("CI", "true"), ("GITHUB_ACTIONS", "true")]);
+        assert_eq!(
+            annotation_line_with("error", "Error:", "Error: boom\n100% bad\r\n", &gha),
+            Some("::error::boom%0A100%25 bad%0D%0A".to_string())
+        );
+        assert_eq!(
+            annotation_line_with("warning", "Warning:", "Warning: \x1b[33mhey\x1b[0m", &gha),
+            Some("::warning::hey".to_string()),
+            "labels and ANSI are stripped"
+        );
+        assert_eq!(env_color_with(gha), Some(true), "brew.sh forces colour");
+        // The env filter hides GITHUB_* without CI.
+        assert_eq!(
+            annotation_line_with(
+                "error",
+                "Error:",
+                "Error: boom",
+                &env(&[("GITHUB_ACTIONS", "true")])
+            ),
+            None
+        );
+        assert_eq!(env_color_with(env(&[("GITHUB_ACTIONS", "true")])), None);
+        // HOMEBREW_TESTS suppresses annotations, not the colour.
+        let tests = env(&[
+            ("CI", "true"),
+            ("GITHUB_ACTIONS", "true"),
+            ("HOMEBREW_TESTS", "1"),
+        ]);
+        assert_eq!(
+            annotation_line_with("error", "Error:", "Error: boom", &tests),
+            None
+        );
+        // No-colour opt-outs still beat the Actions colour force.
+        assert_eq!(
+            env_color_with(env(&[
+                ("CI", "true"),
+                ("GITHUB_ACTIONS", "true"),
+                ("NO_COLOR", "1"),
+            ])),
+            Some(false)
+        );
+    }
 
     #[test]
     fn labels_pass_through_without_the_label() {

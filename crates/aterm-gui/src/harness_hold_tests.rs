@@ -825,6 +825,8 @@ fn a_worker_reads_landing_only_after_its_instruction() {
             result_bytes: 0,
             result_path: None,
             seen: false,
+            finished: false,
+            own_report: false,
         }),
         landing,
         landing_tip: landing.then(|| "not landed yet: 2 unpushed commits \u{b7} 3 nudges".into()),
@@ -1171,6 +1173,8 @@ fn a_stopped_cruise_says_the_stop_in_place_of_its_promise() {
                 result_bytes: 0,
                 result_path: None,
                 seen: false,
+                finished: false,
+                own_report: false,
             }),
             ..app.status_session_row(&handle)
         };
@@ -1338,7 +1342,7 @@ fn an_outage_wait_is_said_on_the_state_line_and_in_status_alone() {
 
 /// Land's one ask at the person's switch over a held tab (v6 §14.17 item 3) is said by Settings ▸
 /// Harness's state line and `status land_asked=` while its answer is unread, and only while the
-/// chip reads `⤓ land`: the chip's title and description, the hover, the worker's tip and `held=`
+/// chip reads Land's `⤓`: the chip's title and description, the hover, the worker's tip and `held=`
 /// stay as they were, and its answer or the supervisor's release takes it down.
 #[test]
 fn the_switchs_ask_is_said_on_the_state_line_and_in_status_while_it_stands() {

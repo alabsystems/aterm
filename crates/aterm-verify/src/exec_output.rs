@@ -76,8 +76,8 @@ impl Scope {
         drop(permit);
         Ok(Output {
             status: status?,
-            stdout: std::fs::read(stdout)?,
-            stderr: std::fs::read(stderr)?,
+            stdout: crate::read_captured(stdout)?,
+            stderr: crate::read_captured(stderr)?,
         })
     }
 }
@@ -185,6 +185,7 @@ impl OwnedChild {
             {
                 return Ok(None);
             }
+            self.read_usage();
             let _ = self.live.kill();
             let status = self
                 .live

@@ -153,6 +153,27 @@ fn decided(log: &Log, mac: Mac, tag: u8, fleet: bool, at: u64) -> Decision {
             node: node(tag),
             name: "machine",
             fleet,
+            lan: false,
+            fresh: false,
+            book: CURRENT,
+        },
+        at,
+    )
+}
+
+/// [`decided`] for a proof from another host on the member's home ALab LAN, with no fleet key.
+fn decided_on_lan(log: &Log, mac: Mac, tag: u8, at: u64) -> Decision {
+    let request = mac.request();
+    decide(
+        log,
+        &ME.id(),
+        &Proven {
+            request: &request,
+            node: node(tag),
+            name: "machine",
+            fleet: false,
+            lan: true,
+            fresh: false,
             book: CURRENT,
         },
         at,
@@ -179,7 +200,7 @@ fn apply(log: &mut Log, mac: Mac, tag: u8, decision: &Decision, at: u64) {
             label.clone()
         }
         Decision::Founder { label } => label.clone(),
-        Decision::Fleet => "m60".to_owned(),
+        Decision::Fleet | Decision::Lan => "m60".to_owned(),
         other => panic!("nothing to sign for {other:?}"),
     };
     admit(log, ME, mac, tag, &label, Evidence::Manual, at);
@@ -246,6 +267,8 @@ fn a_seat_moves_by_no_proof_while_a_member_still_runs_0147() {
         node: node(2),
         name: "m2",
         fleet: true,
+        lan: false,
+        fresh: false,
         book: Book {
             moved_seats_read: false,
             ..CURRENT
@@ -300,6 +323,8 @@ fn a_seat_whose_mac_may_still_run_goes_to_a_person() {
         node: node(2),
         name: "m2",
         fleet: true,
+        lan: false,
+        fresh: false,
         book: Book {
             node_elsewhere: true,
             ..CURRENT
@@ -442,6 +467,89 @@ fn two_macs_holding_one_node_key_never_trade_its_seat_back_and_forth() {
     );
 }
 
+/// A new Mac on the home ALab LAN is let in for being there (owner, 2026-11-02: "we assume that
+/// physical access to the LAN is sufficient proof"): no seat binds its node key and it proved no
+/// fleet key, yet it takes a new seat, past this member's hourly share and the vault's daily one,
+/// which hold only off the LAN. The same proof from off the LAN gets nothing.
+///
+/// NEGATIVE CONTROLS: the `proven.lan` arm of `decide`'s unknown-node branch cut (`else if false`):
+/// the first assert fails with `NO_SEAT`. `!proven.lan &&` cut from the `PROVEN_PER_DAY` check: the
+/// LAN Mac past the day's share is refused and "the LAN takes no daily share" fails.
+#[test]
+fn a_new_mac_on_the_home_lan_takes_a_seat_with_nobody() {
+    let mut log = alab();
+    assert_eq!(decided_on_lan(&log, Mac(70), 70, T0), Decision::Lan);
+    assert!(
+        refused(&decided(&log, Mac(70), 70, false, T0)),
+        "off the LAN, with no seat and no fleet key, nothing"
+    );
+    for (n, tag) in (80..80 + PROVEN_PER_DAY as u8).enumerate() {
+        let at = T0 + n as u64;
+        assert_eq!(decided_on_lan(&log, Mac(tag), tag, at), Decision::Lan);
+        admit(
+            &mut log,
+            ME,
+            Mac(tag),
+            tag,
+            &format!("m{tag}"),
+            Evidence::Manual,
+            at,
+        );
+    }
+    let late = T0 + PROVEN_PER_DAY as u64;
+    assert!(
+        refused(&decided(&log, Mac(71), 71, true, late)),
+        "off the LAN the shares hold"
+    );
+    assert_eq!(
+        decided_on_lan(&log, Mac(71), 71, late),
+        Decision::Lan,
+        "the LAN takes no daily share"
+    );
+}
+
+/// A seat that only its own `Admit` binds to a node key (`ADMITTED`, which no `Node` record or
+/// genesis listing proves) moves to the Mac that proves that node key from the home ALab LAN, as it
+/// does for one that proves the fleet's key; from off the LAN with neither, it stays. A Mac the
+/// vault removed stays out on the LAN too.
+///
+/// NEGATIVE CONTROL: `&& !proven.lan` cut from the authority check in `decide`: the LAN Mac is
+/// refused and the first assert fails.
+#[test]
+fn on_the_home_lan_a_node_key_takes_back_the_seat_its_admit_binds() {
+    let mut log = alab();
+    assert!(
+        matches!(
+            decided_on_lan(&log, Mac(13), 3, T0),
+            Decision::Replace { seat, .. } if seat == ADMITTED.id()
+        ),
+        "the LAN moves the seat its Admit binds"
+    );
+    assert!(
+        refused(&decided(&log, Mac(13), 3, false, T0)),
+        "off the LAN, with no fleet key, the seat stays"
+    );
+    let cutoff = *log
+        .records()
+        .filter(|r| r.actor() == &SEAT.id())
+        .last()
+        .unwrap()
+        .id();
+    keep(
+        &mut log,
+        ME,
+        T0,
+        Body::Remove {
+            member: SEAT.id(),
+            cutoff,
+        },
+    );
+    assert!(
+        refused(&decided_on_lan(&log, Mac(32), 2, T0 + DAY)),
+        "a removed node key stays out on the LAN"
+    );
+}
+
 /// A Mac the vault removed (a person's plain removal, no `--stolen`) stays out whatever it
 /// proves: its own key, its node key under a new vault key, the fleet's key, or a fresh node key
 /// under a node id the fleet book bound to a key the log holds out.
@@ -475,6 +583,8 @@ fn a_removed_mac_stays_out_whatever_it_proves() {
         node: node(9),
         name: "m2",
         fleet: true,
+        lan: false,
+        fresh: false,
         book: Book {
             node_id_held_out: true,
             ..CURRENT
@@ -501,6 +611,8 @@ fn contested_own_and_past_the_hourly_share_go_to_a_person() {
         node: [0; 32],
         name: "machine",
         fleet: true,
+        lan: false,
+        fresh: false,
         book: CURRENT,
     };
     assert!(refused(&decide(&log, &ME.id(), &no_key, T0)));
@@ -567,6 +679,8 @@ fn the_log_holds_a_daily_limit_and_room_for_people() {
         node: node(81),
         name: "m81",
         fleet: true,
+        lan: false,
+        fresh: false,
         book: Book {
             node_id_seated: true,
             ..CURRENT
@@ -576,6 +690,40 @@ fn the_log_holds_a_daily_limit_and_room_for_people() {
         refused(&decide(&log, &ME.id(), &reborn, T0 + 2 * DAY)),
         "one seat a node id"
     );
+}
+
+#[test]
+fn proof_capacity_observation_matches_the_decision_at_its_boundary() {
+    let mut log = alab();
+    let limit = MAX_RECORDS * PROVEN_FILL.0 / PROVEN_FILL.1;
+    while log.held_count() < limit - 1 {
+        keep(
+            &mut log,
+            ME,
+            T0,
+            Body::Name {
+                name: "capacity-observation".into(),
+            },
+        );
+    }
+    let before = ProofAdmissionCapacity::observe(&log);
+    assert_eq!(before.complete_records, limit - 1);
+    assert_eq!(before.exclusive_record_limit, limit);
+    assert!(before.within_limit);
+    assert_eq!(decided(&log, Mac(99), 99, true, T0), Decision::Fleet);
+
+    keep(
+        &mut log,
+        ME,
+        T0,
+        Body::Name {
+            name: "capacity-boundary".into(),
+        },
+    );
+    let at = ProofAdmissionCapacity::observe(&log);
+    assert_eq!(at.complete_records, limit);
+    assert!(!at.within_limit);
+    assert!(refused(&decided(&log, Mac(99), 99, true, T0)));
 }
 
 /// 0.147's reader in small: the record framing and the kind and evidence codes v0.147.0's
@@ -660,6 +808,8 @@ fn a_mac_whose_vault_key_changed_takes_its_seat_back_by_proof_with_nobody() {
         node: n7,
         name: "m7",
         fleet: false,
+        lan: false,
+        fresh: false,
         book: CURRENT,
     };
     // A day past m7's last record (its `Node`), so the old seat is dark.
@@ -754,6 +904,8 @@ fn a_member_that_reads_no_newer_records_lets_no_new_key_in() {
         node: n7,
         name: "m7",
         fleet: false,
+        lan: false,
+        fresh: false,
         book: CURRENT,
     };
     let later = aterm_time::unix_millis().unwrap() + DARK_FOR_MS + 1;
@@ -766,8 +918,8 @@ fn a_member_that_reads_no_newer_records_lets_no_new_key_in() {
     drop(macs.root);
 }
 
-/// A brand-new Mac proves itself first and only then asks plainly, which is the only way a member
-/// forwards it for automatic admission. A member that refuses a Mac whatever it proves next says so
+/// A brand-new Mac proves itself first and only then asks plainly, an ask that waits for a person's
+/// Allow. A member that refuses a Mac whatever it proves next says so
 /// before its possession challenge, so nothing was asked of `decide`, the Mac sent nothing a member
 /// could sign on (`Missed::signed_maybe` false) and no server is read: a stranger, and a seat whose
 /// Mac signed in the last day, which a person decides.
@@ -812,56 +964,58 @@ fn a_stranger_is_refused_before_possession_and_a_refusal_after_it_stays_ambiguou
         asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(crate::Error::new("this member refused after possession"))
     };
-    let tried = |node_key: [u8; 32], signer: &Ed25519KeyPair, fleet: Option<[u8; 32]>, at: u64| {
-        let joining = Joining {
-            device: &device,
-            node: node_key,
-            name: "new-mac".to_owned(),
-            model: "Mac17,6".to_owned(),
-        };
-        let sign_node = |message: &[u8]| -> [u8; 64] {
-            signer
-                .sign(&[prefix.as_bytes(), message].concat())
-                .as_ref()
-                .try_into()
-                .unwrap()
-        };
-        let hearing = std::sync::Mutex::new(Desk::new(
-            Local::of(&m22)
-                .expect("m22's desk")
-                .expect("m22 is a member"),
-        ));
-        std::thread::scope(|scope| {
-            let dial = |_: &str| -> crate::Result<Box<dyn Stream>> {
-                let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
-                for end in [&ours, &theirs] {
-                    end.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
-                }
-                let (hearing, decide, member) = (&hearing, &decide, &m22);
-                scope.spawn(move || {
-                    let refuses = |proving: &desk::Proving<'_>| {
-                        refuses_before_possession_at_ms(member, proving, Book::default(), at)
-                    };
-                    let _ = desk::serve_with(
-                        hearing,
-                        &mut ours,
-                        std::net::IpAddr::from([192, 0, 2, 22]),
-                        &|_| Err(crate::Error::new("no phrase runs here")),
-                        Some(desk::Proof {
-                            decide,
-                            refuses: &refuses,
-                            fleet,
-                        }),
-                    );
-                });
-                Ok(Box::new(theirs))
+    let tried =
+        |node_key: [u8; 32], signer: &Ed25519KeyPair, fleet: Option<desk::Fleet>, at: u64| {
+            let joining = Joining {
+                device: &device,
+                node: node_key,
+                name: "new-mac".to_owned(),
+                model: "Mac17,6".to_owned(),
             };
-            match join::prove_first(&fresh, &dial, &joining, &sign_node, &["m22:7".to_owned()]) {
-                Ok(_) => panic!("this Mac was let in by its proof"),
-                Err(missed) => missed,
-            }
-        })
-    };
+            let sign_node = |message: &[u8]| -> [u8; 64] {
+                signer
+                    .sign(&[prefix.as_bytes(), message].concat())
+                    .as_ref()
+                    .try_into()
+                    .unwrap()
+            };
+            let hearing = std::sync::Mutex::new(Desk::new(
+                Local::of(&m22)
+                    .expect("m22's desk")
+                    .expect("m22 is a member"),
+            ));
+            std::thread::scope(|scope| {
+                let dial = |_: &str| -> crate::Result<Box<dyn Stream>> {
+                    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+                    for end in [&ours, &theirs] {
+                        end.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
+                    }
+                    let (hearing, decide, member) = (&hearing, &decide, &m22);
+                    scope.spawn(move || {
+                        let refuses = |proving: &desk::Proving<'_>| {
+                            refuses_before_possession_at_ms(member, proving, Book::default(), at)
+                        };
+                        let _ = desk::serve_with(
+                            hearing,
+                            &mut ours,
+                            std::net::IpAddr::from([192, 0, 2, 22]),
+                            &|_| Err(crate::Error::new("no phrase runs here")),
+                            Some(desk::Proof {
+                                decide,
+                                refuses: &refuses,
+                                fleet,
+                            }),
+                        );
+                    });
+                    Ok(Box::new(theirs))
+                };
+                match join::prove_first(&fresh, &dial, &joining, &sign_node, &["m22:7".to_owned()])
+                {
+                    Ok(_) => panic!("this Mac was let in by its proof"),
+                    Err(missed) => missed,
+                }
+            })
+        };
     let count = || asked.load(std::sync::atomic::Ordering::SeqCst);
 
     let now = aterm_time::unix_millis().unwrap();
@@ -869,7 +1023,15 @@ fn a_stranger_is_refused_before_possession_and_a_refusal_after_it_stays_ambiguou
     let stranger_pair = node_pair(9);
 
     // The fleet's channel proved this one: its log may yet seat it, so the decision runs.
-    let over_fleet = tried(node(9), &stranger_pair, Some(node(9)), now);
+    let over_fleet = tried(
+        node(9),
+        &stranger_pair,
+        Some(desk::Fleet {
+            node: node(9),
+            current: true,
+        }),
+        now,
+    );
     assert_eq!(count(), 1, "{over_fleet:?}");
     assert!(over_fleet.signed_maybe, "{over_fleet:?}");
 
@@ -906,11 +1068,14 @@ fn a_stranger_is_refused_before_possession_and_a_refusal_after_it_stays_ambiguou
 
     // A Mac with no claim learns nothing else of the log, whatever `decide` would have said of it.
     let request = Mac(33).request();
+    let unread = std::cell::Cell::new(false);
     let proving = |node_key: [u8; 32]| desk::Proving {
         request: &request,
         node: node_key,
         name: "new-mac",
         fleet: false,
+        lan: false,
+        fresh: &unread,
     };
     let seated_elsewhere = Book {
         node_id_seated: true,
@@ -1155,4 +1320,212 @@ fn a_fresh_vault_key_proves_its_node_key_to_a_members_desk_and_is_in() {
     assert_eq!(membership.label(&me), Some("m7"));
     macs.server.stop();
     drop(macs.root);
+}
+
+/// When `read_newest` pulls records that either deny the proving Mac in `aterm-swarm-roster` or
+/// remove the answering member itself, [`refuses_before_possession_at_ms`] checks the roster and
+/// local signer again before challenging possession, so a newcomer reaches the next healthy member
+/// instead of halting on an ambiguous post-possession `NO`.
+///
+/// NEGATIVE CONTROLS: re-running only `decide` after `read_newest`: the roster-denied Mac goes on
+/// to possession (`missed.signed_maybe` is true), and the removed `m7` challenges possession first
+/// so `prove_first` stops at `a-m7:7` and never reaches `b-m22:7`.
+#[test]
+fn a_member_whose_newest_records_keep_it_or_the_mac_out_refuses_before_possession() {
+    use crate::members::desk::{self, Desk, Local};
+    use crate::members::join::{self, Stream};
+    use crate::members::joiner::Joining;
+
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (m22, m7) = (macs.m22.clone(), macs.m7.clone());
+    let now = aterm_time::unix_millis().unwrap();
+    let prefix = format!("aterm-fleet/v3 record {}\0", desk::PROVE_RECORD);
+
+    let desk_m7 = std::sync::Mutex::new(Desk::new(
+        Local::of(&m7).expect("m7's desk").expect("m7 is a member"),
+    ));
+    let desk_m22 = std::sync::Mutex::new(Desk::new(
+        Local::of(&m22)
+            .expect("m22's desk")
+            .expect("m22 is a member"),
+    ));
+
+    // 1. m22 publishes a roster deny for node(11) in the log before m7 syncs.
+    let denied_roster = format!(
+        "deny_nodes = [\"{}\"]\n",
+        aterm_codec::hex::encode_lower(&node(11))
+    );
+    test_put_everyone(&m22, crate::SWARM_ROSTER_ENTRY, denied_roster.as_bytes())
+        .expect("m22 writes roster deny");
+    post_records_to_servers(&m22).expect("m22 posts roster deny");
+
+    let denied_mac = Paths::for_home(&macs.root.path().join("denied-mac"));
+    machine_identity(&denied_mac).expect("identity");
+    let denied_device = crate::commons::bootstrap::Device::open(&denied_mac)
+        .expect("device")
+        .expect("an identity");
+    let denied_joining = Joining {
+        device: &denied_device,
+        node: node(11),
+        name: "denied-mac".to_owned(),
+        model: "Mac17,6".to_owned(),
+    };
+    let denied_pair = node_pair(11);
+    let sign_denied = |message: &[u8]| -> [u8; 64] {
+        denied_pair
+            .sign(&[prefix.as_bytes(), message].concat())
+            .as_ref()
+            .try_into()
+            .unwrap()
+    };
+
+    std::thread::scope(|scope| {
+        let dial = |target: &str| -> crate::Result<Box<dyn Stream>> {
+            let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+            for end in [&ours, &theirs] {
+                end.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
+            }
+            let (desk, member) = match target {
+                "a-m7:7" => (&desk_m7, &m7),
+                "b-m22:7" => (&desk_m22, &m22),
+                other => panic!("unexpected target: {other}"),
+            };
+            scope.spawn(move || {
+                let decide =
+                    |proving: &desk::Proving<'_>| prove_at_ms(member, proving, CURRENT, now);
+                let refuses = |proving: &desk::Proving<'_>| {
+                    refuses_before_possession_at_ms(member, proving, CURRENT, now)
+                };
+                let _ = desk::serve_with(
+                    desk,
+                    &mut ours,
+                    std::net::IpAddr::from([192, 0, 2, 22]),
+                    &|_| Err(crate::Error::new("no phrase runs here")),
+                    Some(desk::Proof {
+                        decide: &decide,
+                        refuses: &refuses,
+                        fleet: Some(desk::Fleet {
+                            node: node(11),
+                            current: true,
+                        }),
+                    }),
+                );
+            });
+            Ok(Box::new(theirs))
+        };
+        let missed = join::prove_first(
+            &denied_mac,
+            &dial,
+            &denied_joining,
+            &sign_denied,
+            &["a-m7:7".to_owned()],
+        )
+        .expect_err("roster-denied node key must be refused");
+        assert!(
+            !missed.signed_maybe,
+            "roster deny synced via read_newest must refuse before possession: {missed:?}"
+        );
+        assert!(
+            missed.refused[0].1.contains("the vault removed this Mac"),
+            "{missed:?}"
+        );
+    });
+
+    // 2. m22 removes m7 on the server before m7 syncs; a newcomer dialling m7 first moves on to m22.
+    remove_member(&m22, "m7", false).expect("m22 removes m7");
+    post_records_to_servers(&m22).expect("m22 posts m7 removal");
+
+    let fresh = Paths::for_home(&macs.root.path().join("fresh-fleet-mac"));
+    machine_identity(&fresh).expect("identity");
+    let fresh_device = crate::commons::bootstrap::Device::open(&fresh)
+        .expect("device")
+        .expect("an identity");
+    let fresh_joining = Joining {
+        device: &fresh_device,
+        node: node(12),
+        name: "fresh-mac".to_owned(),
+        model: "Mac17,6".to_owned(),
+    };
+    let fresh_pair = node_pair(12);
+    let sign_fresh = |message: &[u8]| -> [u8; 64] {
+        fresh_pair
+            .sign(&[prefix.as_bytes(), message].concat())
+            .as_ref()
+            .try_into()
+            .unwrap()
+    };
+
+    let dialled = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        let dial = |target: &str| -> crate::Result<Box<dyn Stream>> {
+            dialled.lock().unwrap().push(target.to_owned());
+            let (mut ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+            for end in [&ours, &theirs] {
+                end.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
+            }
+            let (desk, member) = match target {
+                "a-m7:7" => (&desk_m7, &m7),
+                "b-m22:7" => (&desk_m22, &m22),
+                other => panic!("unexpected target: {other}"),
+            };
+            scope.spawn(move || {
+                let decide =
+                    |proving: &desk::Proving<'_>| prove_at_ms(member, proving, CURRENT, now);
+                let refuses = |proving: &desk::Proving<'_>| {
+                    refuses_before_possession_at_ms(member, proving, CURRENT, now)
+                };
+                let _ = desk::serve_with(
+                    desk,
+                    &mut ours,
+                    std::net::IpAddr::from([192, 0, 2, 22]),
+                    &|_| Err(crate::Error::new("no phrase runs here")),
+                    Some(desk::Proof {
+                        decide: &decide,
+                        refuses: &refuses,
+                        fleet: Some(desk::Fleet {
+                            node: node(12),
+                            current: true,
+                        }),
+                    }),
+                );
+            });
+            Ok(Box::new(theirs))
+        };
+        let joined = join::prove_first(
+            &fresh,
+            &dial,
+            &fresh_joining,
+            &sign_fresh,
+            &["a-m7:7".to_owned(), "b-m22:7".to_owned()],
+        )
+        .expect("removed m7 refuses before possession and m22 admits the newcomer");
+        assert!(matches!(joined.admission, join::Admission::Logged));
+    });
+    assert_eq!(
+        *dialled.lock().unwrap(),
+        vec!["a-m7:7".to_owned(), "b-m22:7".to_owned()]
+    );
+    assert_eq!(load_state(&fresh).unwrap().membership, Stored::In);
+    assert_eq!(
+        std::fs::read(fresh.home.join(".secrets/shared")).unwrap(),
+        b"everyone-v1"
+    );
+    macs.server.stop();
+    drop(macs.root);
+}
+
+/// An unset clock (`now_ms == 0`) refuses every proof decision instead of signing permanent
+/// membership-log records stamped at epoch zero.
+///
+/// NEGATIVE CONTROL: `decide` without `if now_ms == 0` admits `Mac(9)` over the fleet or wraps
+/// `ME` with `authored_ms = 0`, failing these assertions.
+#[test]
+fn unset_clock_refuses_proof_decisions() {
+    let log = alab();
+    assert!(
+        matches!(decided(&log, Mac(9), 9, true, 0), Decision::Refuse(why) if why.contains("clock"))
+    );
+    assert!(
+        matches!(decided(&log, ME, 9, false, 0), Decision::Refuse(why) if why.contains("clock"))
+    );
 }

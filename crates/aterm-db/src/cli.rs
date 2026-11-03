@@ -30,7 +30,7 @@ pub const USAGE: &str = "aterm db — encrypted embedded application databases (
   commons-lineage                      verified predecessor-to-current public writer identities\n\
   network-state                        local place, observer and retained history; never grants access\n\
   commons-authority                    inspect cached admin control metadata; changes nothing\n\
-  commons-tables                       list declarations, provenance and subscriptions\n\
+  commons-tables                       list declared and rolling tables, provenance and subscriptions\n\
   commons-inventory --table <digest>    local retained operation counts and fingerprints\n\
                     [--records <1..256> [--after <digest>]]\n\
                                        page operation IDs and eligibility; no values or keys\n\

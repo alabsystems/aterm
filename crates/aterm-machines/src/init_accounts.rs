@@ -543,19 +543,31 @@ fn registered(sys: &dyn System, user: &User, service: Service) -> Result<bool, S
             return Err("persisted account store is not a regular file".into());
         }
         Ok(_) => {
-            let gzip = Cmd::new(GZIP).args(["-dc", "--"]).arg(path).as_user(user);
-            let unpacked = sys
-                .run_complete_stdout(&gzip)
-                .map_err(|_| "cannot read the complete persisted account store".to_owned())?;
-            if !unpacked.success() {
-                return Err("cannot decompress the persisted account store".into());
-            }
-            let convert = Cmd::new(PLUTIL)
-                .args(["-convert", "xml1", "-o", "-", "--", "-"])
-                .as_user(user);
-            let xml = sys
-                .run_complete_stdout_input(&convert, &unpacked.stdout)
-                .map_err(|_| "cannot decode the complete persisted account store".to_owned())?;
+            let compressed = sys
+                .read_head(&path, 2)
+                .map_err(|_| "cannot read the persisted account store header".to_owned())?
+                == [0x1f, 0x8b];
+            let xml = if compressed {
+                let gzip = Cmd::new(GZIP).args(["-dc", "--"]).arg(path).as_user(user);
+                let unpacked = sys
+                    .run_complete_stdout(&gzip)
+                    .map_err(|_| "cannot read the complete persisted account store".to_owned())?;
+                if !unpacked.success() {
+                    return Err("cannot decompress the persisted account store".into());
+                }
+                let convert = Cmd::new(PLUTIL)
+                    .args(["-convert", "xml1", "-o", "-", "--", "-"])
+                    .as_user(user);
+                sys.run_complete_stdout_input(&convert, &unpacked.stdout)
+                    .map_err(|_| "cannot decode the complete persisted account store".to_owned())?
+            } else {
+                let convert = Cmd::new(PLUTIL)
+                    .args(["-convert", "xml1", "-o", "-", "--"])
+                    .arg(&path)
+                    .as_user(user);
+                sys.run_complete_stdout(&convert)
+                    .map_err(|_| "cannot decode the complete persisted account store".to_owned())?
+            };
             if !xml.success() {
                 return Err("cannot decode the persisted account store".into());
             }
@@ -1070,7 +1082,10 @@ mod tests {
 
     fn store(sys: &Fake, item: &SignOut, xml: &str) {
         let path = store_path(&item.user);
-        sys.file(path.to_str().unwrap(), b"compressed account fixture");
+        sys.file(
+            path.to_str().unwrap(),
+            b"\x1f\x8bcompressed account fixture",
+        );
         let gzip = Cmd::new(GZIP)
             .args(["-dc", "--"])
             .arg(path)
@@ -1078,6 +1093,16 @@ mod tests {
         sys.on(&gzip.display(), Ran::ok("binary account fixture"));
         let convert = Cmd::new(PLUTIL)
             .args(["-convert", "xml1", "-o", "-", "--", "-"])
+            .as_user(&item.user);
+        sys.on(&convert.display(), Ran::ok(xml));
+    }
+
+    fn uncompressed_store(sys: &Fake, item: &SignOut, xml: &str) {
+        let path = store_path(&item.user);
+        sys.file(path.to_str().unwrap(), b"bplist00account fixture");
+        let convert = Cmd::new(PLUTIL)
+            .args(["-convert", "xml1", "-o", "-", "--"])
+            .arg(path)
             .as_user(&item.user);
         sys.on(&convert.display(), Ran::ok(xml));
     }
@@ -1110,6 +1135,41 @@ mod tests {
         assert!(matches!(item.probe(&sys, &ctx), Probe::Ok { .. }));
         assert!(sys.calls().iter().all(|c| !c.contains("osascript")));
         assert_eq!(item.detail(&sys, &ctx), None);
+    }
+
+    #[test]
+    fn an_uncompressed_account_store_reads_signed_out_without_decompression() {
+        let (sys, ctx, item) = fixture();
+        uncompressed_store(&sys, &item, "<dict/>");
+        prefs(&sys, &item, EMPTY_PREFS);
+        assert!(matches!(item.probe(&sys, &ctx), Probe::Ok { .. }));
+        assert!(sys.calls().iter().all(|call| !call.contains(GZIP)));
+        assert_eq!(item.detail(&sys, &ctx), None);
+    }
+
+    #[test]
+    fn an_uncompressed_account_store_still_detects_a_registered_account() {
+        let (sys, ctx, item) = fixture();
+        uncompressed_store(&sys, &item, DISABLED);
+        prefs(&sys, &item, EMPTY_PREFS);
+        assert!(matches!(item.probe(&sys, &ctx), Probe::Change { .. }));
+        assert_eq!(
+            item.detail(&sys, &ctx),
+            Some(crate::init_observe::Reading::SignedIn.token())
+        );
+    }
+
+    #[test]
+    fn a_malformed_uncompressed_account_store_is_never_reported_signedout() {
+        let (sys, ctx, item) = fixture();
+        let path = store_path(&item.user);
+        sys.file(path.to_str().unwrap(), b"bplist00malformed account fixture");
+        let convert = Cmd::new(PLUTIL)
+            .args(["-convert", "xml1", "-o", "-", "--"])
+            .arg(path)
+            .as_user(&item.user);
+        sys.on(&convert.display(), Ran::exit(1, "invalid property list"));
+        assert!(matches!(item.probe(&sys, &ctx), Probe::Unusable { .. }));
     }
 
     #[test]

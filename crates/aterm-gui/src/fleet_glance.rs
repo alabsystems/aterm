@@ -148,7 +148,10 @@ pub(crate) struct FleetSnapshot {
     pub(crate) macs: Vec<FleetMac>,
     /// The peers that did not, and why.
     pub(crate) unanswered: Vec<Unanswered>,
-    /// Every peer failed at once with no route: a Mac's local-network privacy, until the person allows aterm.
+    /// The read judged a no-route this Mac's Local Network privacy, until the person allows
+    /// aterm: a member on this network refused with none there answering
+    /// (`aterm_netplace::words::ON_LINK_PRIVACY_NOTE`), or, with no address to judge, every peer
+    /// refused at once (`aterm_ctl::NO_ROUTE_NOTE`).
     pub(crate) no_route: bool,
 }
 
@@ -986,8 +989,12 @@ fn reader_loop(
             moved_since = Asked::with_queued(None, rx).moved;
             let now = (seams.now_ms)();
             let parsed = answer.and_then(|(json, stderr)| {
-                let no_route = stderr.contains(aterm_ctl::NO_ROUTE_NOTE);
-                parse(&json, no_route, seams.own_node.as_deref(), now)
+                parse(
+                    &json,
+                    privacy_refused(&stderr),
+                    seams.own_node.as_deref(),
+                    now,
+                )
             });
             // Whom a read on the old network reached says nothing of the new one.
             let away = (seams.away)();
@@ -1116,6 +1123,16 @@ pub(crate) fn parse_told(rows: &[String]) -> std::collections::HashMap<u64, Need
         })
         .take(FLEET_TOLD_MAX)
         .collect()
+}
+
+/// Whether a fleet read's notes (its `stderr`) judged a no-route this Mac's Local Network
+/// privacy ([`FleetSnapshot::no_route`]): the on-link verdict's note
+/// (`aterm_netplace::words::ON_LINK_PRIVACY_NOTE`), or with no address to judge every peer
+/// refused at once (`aterm_ctl::NO_ROUTE_NOTE`). A read that says where this Mac is instead
+/// blames nothing.
+pub(crate) fn privacy_refused(stderr: &str) -> bool {
+    stderr.contains(aterm_ctl::NO_ROUTE_NOTE)
+        || stderr.contains(aterm_netplace::words::ON_LINK_PRIVACY_NOTE)
 }
 
 /// THE FLEET'S DIGEST ENTRY (`fleet.unreadable.no-route`, the whole answer of the level `Family::FleetUnreadable`).

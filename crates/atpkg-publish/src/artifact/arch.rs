@@ -93,7 +93,7 @@ const HEAD: usize = 8 + 16 * 32;
 /// Read `path`'s object format and architectures from its header.
 #[must_use]
 pub fn read(path: &Path) -> Option<Object> {
-    let mut f = std::fs::File::open(path).ok()?;
+    let (mut f, _) = crate::identity::open_regular_nonblock(path).ok()?;
     let mut b = Vec::with_capacity(HEAD);
     f.by_ref().take(HEAD as u64).read_to_end(&mut b).ok()?;
     if b.len() < 20 {
@@ -356,7 +356,7 @@ pub fn gate_tree(triple: Triple, dir: &Path) -> Result<TreeGate, Refusal> {
 
 fn is_script(path: &Path) -> bool {
     let mut two = [0u8; 2];
-    std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut two))
+    crate::identity::open_regular_nonblock(path)
+        .and_then(|(mut f, _)| f.read_exact(&mut two))
         .is_ok_and(|()| two == *b"#!")
 }

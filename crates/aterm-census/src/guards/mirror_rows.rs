@@ -251,7 +251,7 @@ fn read<'t>(tree: &'t Tree<'_>, rel: &str) -> Option<Cow<'t, str>> {
     if let Some(script) = tree.corpus.scripts.iter().find(|s| s.rel == rel) {
         return Some(Cow::Borrowed(script.raw.as_str()));
     }
-    std::fs::read_to_string(tree.root.join(rel))
+    crate::tree::read_to_string(&tree.root.join(rel))
         .ok()
         .map(Cow::Owned)
 }

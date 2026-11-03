@@ -35,11 +35,13 @@ fn restored_on_its_question() -> Vec<String> {
 }
 
 /// A host that owes a relaunch's carry-on while `owed` stands, and takes it at the first point it
-/// is offered, as [`crate::harness::relaunch::resume_as`] does.
+/// is offered, as [`crate::harness::relaunch::resume_as`] does; it saw the agent launched at
+/// `launch` (unix ms) where it is set.
 #[derive(Debug, Default)]
 struct Carrier {
     wants: AtomicBool,
     owed: AtomicBool,
+    launch: Option<i64>,
     points: Mutex<Vec<IdlePoint>>,
 }
 
@@ -48,6 +50,17 @@ impl Carrier {
         let host = Self::default();
         host.wants.store(true, Ordering::SeqCst);
         host.owed.store(owed, Ordering::SeqCst);
+        Arc::new(host)
+    }
+
+    /// A relaunch's host: the agent launched at `launch`, its carry-on owed.
+    fn relaunched(launch: i64) -> Arc<Self> {
+        let host = Self {
+            launch: Some(launch),
+            ..Self::default()
+        };
+        host.wants.store(true, Ordering::SeqCst);
+        host.owed.store(true, Ordering::SeqCst);
         Arc::new(host)
     }
 
@@ -78,6 +91,9 @@ impl IdleHost for Carrier {
     }
     fn relaunch_owed(&self) -> bool {
         self.owed.load(Ordering::SeqCst)
+    }
+    fn launch(&self) -> Option<i64> {
+        self.launch
     }
 }
 
@@ -390,5 +406,279 @@ fn a_held_carry_ons_short_reply_measures_the_back_off_from_the_reply() {
             matches!(&later, Ok(TurnEndAction::Type { rule_id, .. }) if *rule_id == then),
             "{case}: CONTROL: Cruise goes on past it: {later:?}"
         );
+    }
+}
+
+/// A TURN A RESTART CUT IS NO SHORT ANSWER OF THE AGENT'S (v6 §14.17.5.7): a read caught the turn
+/// running, the restart ended it seconds in, and the resumed conversation restores it as the
+/// `Interrupted` row its carry-on is owed at. Nobody's prompt was answered short there, so the streak
+/// stands at the short answers before it, and the carry-on's short reply backs off on that rung, as
+/// it does where no read caught the cut turn. The 2026-11-03 real-Claude flows on main read 2 min
+/// after the carry-on's reply where the restart came from inside the call (no read caught it) and
+/// 4 min where it came from outside (a read did). The same holds for the agent's answer to Cruise's
+/// own `continue@v1` that the restart cut, the common case of an agent restarting itself, whether
+/// this loop typed it or a loop before this one did (its yield seeded).
+/// CONTROL: the same short turn ended by the agent itself, at rest, counts.
+#[test]
+fn a_turn_a_restart_cut_adds_nothing_to_the_short_streak() {
+    use crate::supervise::policy::turn_end::{RULE_CONTINUE, TurnEndTiming};
+    /// Whose turn the restart cuts.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Turn {
+        /// Someone's own, no act of aterm's awaited.
+        Theirs,
+        /// The answer to the `continue@v1` this loop typed.
+        Continue,
+        /// The answer to the `continue@v1` a loop before this one typed.
+        SeededContinue,
+    }
+    let at_rest = |said: &str| {
+        let mut r = rows(&[&format!("⏺ {said}"), ""]);
+        r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        r
+    };
+    let backoff = TurnEndTiming::default().short_backoff;
+    const HI: &str = "Hi! I am the local lab stub, not a model.";
+    let run = |turn: Turn, cut: bool, tag: &str| {
+        let answers_continue = turn == Turn::Continue;
+        let mut m = Mock::new(vec![busy_screen()]);
+        let (mut s, dir) = policy_session(&mut m, tag);
+        let mut opts = hosted(30);
+        opts.policy.autopilot = Autopilot::Cruise;
+        let host = Carrier::owing(false);
+        opts.idle_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+        s.program = Some("claude".to_owned());
+        let point = point_at(&s, at_rest(HI), 1);
+        let first = s.turn_end_at_point(&point, None, &opts);
+        assert!(
+            matches!(first, Ok(TurnEndAction::WaitUntil { .. })),
+            "{tag}: PRECONDITION: the first short turn's back-off: {first:?}"
+        );
+        assert_eq!(s.turn_end.short_streak(), 1, "{tag}: PRECONDITION");
+        if answers_continue {
+            // Past the back-off Cruise types its own continue, and the turn is its answer.
+            s.test_clock().skip(backoff + Duration::from_secs(1));
+            let point = point_at(&s, at_rest(HI), 1);
+            let act = s
+                .turn_end_at_point(&point, None, &opts)
+                .expect("a decision");
+            assert_eq!(act.rule_id(), Some(RULE_CONTINUE), "{tag}: PRECONDITION");
+            let r = s.turn_end_reread(&point.screen, &opts);
+            let typed = s.fx.mono();
+            s.turn_end.acted(&act, &r, typed);
+        }
+        if turn == Turn::SeededContinue {
+            s.turn_end.seed_yield(RULE_CONTINUE);
+        }
+        // A turn runs three seconds: a restart cuts it, or the agent ends it.
+        s.test_clock()
+            .skip(Duration::from_secs(if answers_continue { 3 } else { 10 }));
+        host.owed.store(cut, Ordering::SeqCst);
+        host.wants.store(cut, Ordering::SeqCst);
+        let screen = if cut {
+            restored()
+        } else {
+            at_rest("Tool call done.")
+        };
+        let point = point_at(&s, screen, 2);
+        let at = s.turn_end_at_point(&point, Some(Duration::from_secs(3)), &opts);
+        let streak = s.turn_end.short_streak();
+        let after_reply = (cut && turn == Turn::Theirs).then(|| {
+            // The carry-on typed there, and its short reply.
+            let typed = s.fx.mono();
+            s.turn_end.host_typed(typed, HostTurn::CarryOn);
+            let worked = Duration::from_secs(1);
+            s.test_clock().skip(worked);
+            let reply = s.fx.mono();
+            let point = point_at(&s, at_rest("Tool call done."), 3);
+            (reply, s.turn_end_at_point(&point, Some(worked), &opts))
+        });
+        let _ = std::fs::remove_dir_all(dir);
+        (streak, at, after_reply)
+    };
+    let (streak, at, after_reply) = run(Turn::Theirs, true, "restart-cut-theirs");
+    assert_eq!(streak, 1, "the turn the restart cut was counted: {at:?}");
+    let (reply, after) = after_reply.expect("the carry-on's reply");
+    assert!(
+        matches!(&after, Ok(TurnEndAction::WaitUntil { until, .. })
+            if *until >= reply + backoff && *until < reply + backoff * 2),
+        "the carry-on's short reply backs off on the first rung: {after:?}"
+    );
+    for (turn, tag) in [
+        (Turn::Continue, "restart-cut-continue"),
+        (Turn::SeededContinue, "restart-cut-seeded"),
+    ] {
+        let (streak, at, _) = run(turn, true, tag);
+        assert_eq!(
+            streak, 1,
+            "{turn:?}: the answer the restart cut was counted: {at:?}"
+        );
+    }
+    for (turn, tag) in [
+        (Turn::Theirs, "restart-cut-theirs-control"),
+        (Turn::Continue, "restart-cut-continue-control"),
+        (Turn::SeededContinue, "restart-cut-seeded-control"),
+    ] {
+        let (streak, at, _) = run(turn, false, tag);
+        assert_eq!(
+            streak, 2,
+            "CONTROL {turn:?}: a short turn the agent ended counts: {at:?}"
+        );
+    }
+}
+
+/// THE LOOP A RELAUNCH STARTS COUNTS NOTHING FOR THE CUT AT ITS FIRST POINT EITHER: its books hold
+/// the point the loop before it judged (one short turn) and the turn that loop read running after it
+/// (the restart's own call), and its first point, no work read, is the `Interrupted` row the resume
+/// draws while the carry-on is owed. The 2026-11-03 real-Claude flow f2 on main recorded that point
+/// as a second short turn, so the carry-on's short reply backed off 4 min where flow f1, whose
+/// restart no read caught (the books then seed the point, `TurnEndState::seed_point`), backed off 2.
+/// CONTROL: the same loop, books and host at the agent's own short reply counts it, and the carry-on's
+/// reply backs off on that second rung.
+#[test]
+fn the_loop_a_relaunch_starts_counts_nothing_for_the_cut_at_its_first_point() {
+    let (_, books) = launched_run(
+        "restored-cut-books",
+        &mut Mock::new(vec![claude_pre_banner(), busy_screen()]),
+        &LaunchHost::saw(None),
+        Some(""),
+    );
+    assert_eq!(
+        point_rows(&books),
+        [(101, 1)],
+        "PRECONDITION: the books: {books:#?}"
+    );
+    assert!(
+        books
+            .last()
+            .is_some_and(|r| r.contains(approvals::RULE_TURN_RAN)),
+        "PRECONDITION: the turn read running: {books:#?}"
+    );
+    let books = books.join("\n") + "\n";
+    let last = approvals::last_row_ms(&books).expect("the books' last row");
+    let run = |first: Vec<String>, tag: &str| {
+        let host = Carrier::relaunched(last + 1_000);
+        let (dir, ledger) = ledger_at(tag);
+        std::fs::write(&ledger, &books).expect("the ledger");
+        let journal = dir.join("journal.jsonl");
+        let mut m = Mock::new(vec![first, busy_screen(), ended_quick(LAB_REPLY)]);
+        m.cursor_on_caret = true;
+        m.vanish_after = Some(3);
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            journal: Some(journal.clone()),
+            ..hosted(60)
+        };
+        let _ = watch_lines_with(&mut m, &opts, |s| {
+            s.set_approval_ledger(Some(ledger.clone()));
+        });
+        let lines: Vec<String> = journal_records(&journal)
+            .0
+            .into_iter()
+            .map(|r| r.line)
+            .collect();
+        let rows: Vec<String> = std::fs::read_to_string(&ledger)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        let streaks: Vec<u32> = point_rows(&rows)
+            .into_iter()
+            .skip(1)
+            .map(|(_, n)| n)
+            .collect();
+        (host.points().len(), streaks, back_offs(&lines), lines)
+    };
+    let (offered, streaks, waits, lines) = run(restored(), "restored-cut-new-loop");
+    assert_eq!(
+        offered, 1,
+        "PRECONDITION: the carry-on is offered its point: {lines:#?}"
+    );
+    assert_eq!(
+        streaks.first(),
+        Some(&1),
+        "the cut was counted: {streaks:?}\n{lines:#?}"
+    );
+    assert_eq!(
+        waits.last().map(String::as_str),
+        Some("1 short turn(s) in a row: 2 min back-off"),
+        "the carry-on's short reply: {lines:#?}"
+    );
+    let (offered, streaks, waits, lines) =
+        run(ended_quick(LAB_REPLY), "restored-cut-new-loop-control");
+    assert_eq!(offered, 1, "CONTROL PRECONDITION: {lines:#?}");
+    assert_eq!(
+        streaks.first(),
+        Some(&2),
+        "CONTROL: the agent's own short reply counts: {streaks:?}\n{lines:#?}"
+    );
+    assert_eq!(
+        waits.last().map(String::as_str),
+        Some("2 short turn(s) in a row: 4 min back-off"),
+        "CONTROL: {lines:#?}"
+    );
+}
+
+/// THE RESTORE LINE'S SHORT REPLY MEASURES ITS BACK-OFF FROM THE REPLY AS WELL: `continued:restore`
+/// is the one line a restart types where the resumed build warned something was lost, as much a
+/// restart's prompt as the two above and held behind a draft or Off the same way. Its reply stays
+/// no done report (`a_quiet_restarts_line_answered_nothing_else_is_no_done_report`). CONTROL: an
+/// upgrade's `announced` asks again at its own pace, so a run of its short replies moves nothing
+/// and the loop's own prompt comes at once.
+#[test]
+fn a_restore_lines_short_reply_measures_the_back_off_from_the_reply() {
+    use crate::harness::upgrade_drive::host_turn;
+    use crate::supervise::policy::turn_end::{RULE_CONTINUE, TurnEndTiming};
+    const REPLY: &str = "Restored nothing: no watch, monitor or loop was running.";
+    let at_rest = |said: &str| {
+        let mut r = rows(&[&format!("⏺ {said}"), ""]);
+        r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        r
+    };
+    let backoff = TurnEndTiming::default().short_backoff;
+    for (step, from_the_reply) in [("continued:restore", true), ("announced:1", false)] {
+        let mut m = Mock::new(vec![busy_screen()]);
+        let (mut s, dir) = policy_session(&mut m, "held-restore-clock");
+        let mut opts = hosted(30);
+        opts.policy.autopilot = Autopilot::Cruise;
+        opts.idle_host = Some(Carrier::owing(false) as Arc<dyn IdleHost>);
+        s.program = Some("claude".to_owned());
+        let point = point_at(&s, at_rest("The parser reads the first half."), 1);
+        let first = s.turn_end_at_point(&point, None, &opts);
+        assert!(
+            matches!(first, Ok(TurnEndAction::WaitUntil { .. })),
+            "{step}: the first short turn's back-off: {first:?}"
+        );
+        // The hold: the back-off runs out while nothing can be typed.
+        s.test_clock().skip(backoff + Duration::from_secs(1));
+        let typed = s.fx.mono();
+        s.turn_end
+            .host_typed(typed, host_turn(step).expect("a typed step"));
+        let worked = Duration::from_secs(3);
+        s.test_clock().skip(worked);
+        let reply = s.fx.mono();
+        let point = point_at(&s, at_rest(REPLY), 2);
+        let after = s.turn_end_at_point(&point, Some(worked), &opts);
+        if from_the_reply {
+            assert!(
+                matches!(&after, Ok(TurnEndAction::WaitUntil { until, .. }) if *until >= reply + backoff),
+                "{step}: the back-off from the reply: {after:?}"
+            );
+            s.test_clock().skip(backoff);
+            let point = point_at(&s, at_rest(REPLY), 2);
+            let later = s.turn_end_at_point(&point, None, &opts);
+            assert!(
+                matches!(&later, Ok(TurnEndAction::Type { rule_id, .. }) if *rule_id == RULE_CONTINUE),
+                "{step}: Cruise goes on past it: {later:?}"
+            );
+            assert_eq!(s.turn_end.done_reports(), 0, "{step}: no done report");
+        } else {
+            assert!(
+                matches!(&after, Ok(TurnEndAction::Type { rule_id, .. }) if *rule_id == RULE_CONTINUE),
+                "CONTROL {step}: the clock stayed on the earlier point: {after:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

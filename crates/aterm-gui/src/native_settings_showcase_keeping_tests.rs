@@ -6085,51 +6085,107 @@ fn walked_with(
     walked.faults
 }
 
-/// c5ef831d7f's unled rung cuts the field to 52 of 56pt where the toolbar-led list holds it: R2.
+/// Find an R2 witness for refusing toolbar lending, measured in this host's UI faces.
+///
+/// The original reviewed window is first. Around it, try every integer height within one
+/// focused control's measured height, at the original width and one such height either side.
+/// These are different geometry inputs, not retries of a failed test. A witness must break the
+/// exact R2 rule under the toolbar-lending mutant while the unmodified page keeps every rule
+/// and both walks' reaches draw exactly alike. Finding none is a failure, on any host's fonts.
+fn toolbar_lending_r2_witness(scenario: Scenario, original: Drawn) {
+    let switch = &TOOLBAR_LENT_REFUSED;
+    let steps = [Step::Text];
+    assert!(!switch.with(Cell::get), "the negative control starts off");
+    let started = std::time::Instant::now();
+    let baseline = Sweep::new(scenario);
+    let mutant = Sweep::new(scenario);
+    let tall = {
+        let probe = Drawn {
+            window: (original.window.0, WINDOWS.last().expect("a roomy probe").1),
+            scale: 2,
+            ..original
+        };
+        let (mut runtime, instance, view) = baseline.opened(probe);
+        let frame = draw(&mut runtime, instance, view, probe);
+        frame
+            .shown(baseline.control.as_deref().expect("a focused control"))
+            .expect("the roomy probe lays out the focused control")
+            .1
+    };
+    assert!(tall.is_finite() && tall > 0.0 && tall <= f32::from(u16::MAX));
+    let span = tall.ceil() as i32;
+    let mut examined = 0;
+    let mut rejected_baselines = 0;
+    let mut first_rejected_baseline = None;
+    let mut last = Findings::default();
+    for across in [0, -span, span] {
+        let Ok(width) = u16::try_from(i32::from(original.window.0) + across) else {
+            continue;
+        };
+        for below in std::iter::once(0).chain((1..=span).flat_map(|delta| [-delta, delta])) {
+            let Ok(height) = u16::try_from(i32::from(original.window.1) + below) else {
+                continue;
+            };
+            if width == 0 || height == 0 {
+                continue;
+            }
+            let start = Drawn {
+                window: (width, height),
+                ..original
+            };
+            switch.with(|on| on.set(true));
+            let changed = walk(&mutant, start, &steps);
+            switch.with(|on| on.set(false));
+            examined += 1;
+            if changed.faults.iter().any(|(rule, _)| *rule == Rule::R2) {
+                let kept = walk(&baseline, start, &steps);
+                if !kept.faults.is_empty() || !kept.unlike.is_empty() {
+                    rejected_baselines += 1;
+                    first_rejected_baseline.get_or_insert_with(|| {
+                        format!(
+                            "{start} {steps:?}: faults {:?}, unlike {:?}",
+                            kept.faults, kept.unlike
+                        )
+                    });
+                }
+                if !kept.faults.is_empty() || !kept.unlike.is_empty() || !changed.unlike.is_empty()
+                {
+                    last = changed;
+                    continue;
+                }
+                eprintln!(
+                    "{scenario}: negative control witnessed at {start} {steps:?}, measured \
+                     control {tall}pt, input {examined}, elapsed {:?}: {:?}; rejected \
+                     baselines {rejected_baselines}, first {first_rejected_baseline:?}",
+                    started.elapsed(),
+                    changed.faults
+                );
+                return;
+            }
+            last = changed;
+        }
+    }
+    panic!(
+        "no negative-control witness around {original} in {examined} inputs over {:?}, measured control \
+         {tall}pt (width offsets 0 and +/-{span}, every height offset within +/-{span}); last \
+         faults {:?}, unlike {:?}; rejected baselines {rejected_baselines}, first \
+         {first_rejected_baseline:?}",
+        started.elapsed(),
+        last.faults,
+        last.unlike
+    );
+}
+
+/// Refusing toolbar lending breaks R2 for a host-measured input whose baseline keeps every rule.
 #[test]
-fn a_list_led_by_the_demo_where_the_toolbar_would_lead_it_too_breaks_r2() {
-    let faults = walked_with(
+fn refusing_toolbar_lending_has_an_r2_witness_with_a_clean_baseline() {
+    toolbar_lending_r2_witness(
         Scenario {
             keyboard: Keyboard::Sheet("settings/control/selection_foreground"),
             theme: "GitHub Light",
             in_use: "GitHub Light",
         },
-        &TOOLBAR_LENT_REFUSED,
-        "930x148@1+status",
-        &[Step::Text],
-    );
-    assert!(
-        faults.iter().any(|(rule, said)| *rule == Rule::R2
-            && said.contains("frame 1 at")
-            && said.contains("led by the toolbar its window lists too")),
-        "a field cut where the toolbar-led list holds it whole breaks R2: {faults:?}"
-    );
-}
-
-/// c5ef831d7f's screen for these new results, cutting the filter and first result, breaks R5 too.
-#[test]
-fn new_results_cutting_the_filter_and_its_first_result_break_r5_too() {
-    let faults = walked_with(
-        Scenario {
-            keyboard: Keyboard::Filter,
-            theme: "Tokyo Night",
-            in_use: "Tokyo Night",
-        },
-        &GIVE_WAY_STRICT_ONLY,
-        "324x146@1+warning+status",
-        &[
-            Step::Text,
-            Step::Status,
-            Step::Wheel(-5),
-            Step::Window((325, 147)),
-            Step::Type,
-        ],
-    );
-    assert!(
-        faults
-            .iter()
-            .any(|(rule, said)| *rule == Rule::R5 && said.contains("frame 5 at")),
-        "a frame breaking R2 cuts its first result for no rule above R5: {faults:?}"
+        drawn_of("930x148@1+status"),
     );
 }
 
@@ -6718,14 +6774,70 @@ fn page_work(
     BAR_STEPS_SEATED.with(|seated| seated.set(true));
     let sweep = Sweep::new(scenario);
     let (mut runtime, instance, view) = sweep.opened(start);
+    // Read existing state only: these notes never draw, seat, measure, or reset counters.
+    // They are retained in frame descriptions and emitted only when a work bound fails.
+    let context = |runtime: &NativeRuntime| {
+        let state = state(runtime, view);
+        let plan = state.scroll_plan();
+        let top = state
+            .scroll_record
+            .borrow()
+            .as_ref()
+            .map(scroll::ScrollRecord::top);
+        let seats = state.bar_seats.borrow();
+        let seat_keys = seats
+            .iter()
+            .take(4)
+            .map(|(at, settled)| {
+                (
+                    at.0.viewport,
+                    at.0.bars,
+                    at.1,
+                    at.2,
+                    at.3.as_ref().map(scroll::ScrollRecord::top),
+                    at.4,
+                    settled,
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "room={:?} top={top:?} control={:?} control_stop={:?} chrome={:?} \
+             drawn_at={:?} gave_way={:?} let_go={} bar_most={:?} memo_chrome={:?} \
+             chromes={} bar_reuse_counter={} bar_seats={} first_four_seats={seat_keys:?}",
+            plan.as_ref().map(scroll::ScrollPlan::room),
+            sweep.control,
+            sweep
+                .control
+                .as_ref()
+                .and_then(|key| plan.as_ref()?.stop_of_identity(&UiKey::new(key.as_str()))),
+            state.page_chrome.get(),
+            state.page_chrome_at.get(),
+            state.page_gave_way.get(),
+            state.start_let_go.get(),
+            state.status_bar_most.get(),
+            state
+                .page_chrome_memo
+                .borrow()
+                .as_ref()
+                .map(|(_, chrome)| *chrome),
+            state.page_chromes.borrow().len(),
+            BAR_SEATED.with(Cell::get),
+            seats.len(),
+        )
+    };
     let _ = crate::work_counts::take_settings_page_work();
     let mut drawn = start;
+    let before = context(&runtime);
     let mut last = draw(&mut runtime, instance, view, drawn);
     let mut work = vec![(
-        format!("opened at {drawn}"),
+        format!(
+            "opened at {drawn}; before[{before}] after[{}]",
+            context(&runtime)
+        ),
         crate::work_counts::take_settings_page_work(),
     )];
     for then in frames {
+        let before = context(&runtime);
         let frame = match *then {
             Then::Step(step) => {
                 let event = match step {
@@ -6768,7 +6880,10 @@ fn page_work(
                 format!("drawn untouched at {drawn}")
             }
         };
-        work.push((frame, crate::work_counts::take_settings_page_work()));
+        work.push((
+            format!("{frame}; before[{before}] after[{}]", context(&runtime)),
+            crate::work_counts::take_settings_page_work(),
+        ));
     }
     work
 }

@@ -988,20 +988,10 @@ impl Launchd<'_> {
 /// (an update replaced it at the same path).
 #[must_use]
 pub fn image_replaced(pid: u32, program: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let now = std::fs::metadata(program).ok().map(|meta| meta.ino());
-        matches!(
-            (aterm_sysprobe::kproc::image_inode(pid), now),
-            (Some(running), Some(now)) if running != now
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (pid, program);
-        false
-    }
+    i32::try_from(pid)
+        .ok()
+        .and_then(|pid| aterm_uds::process::image_matches_file(pid, program))
+        == Some(false)
 }
 
 /// Live OS supervisor (`launchd` on macOS, `systemd --user` on Linux).

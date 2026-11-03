@@ -64,7 +64,7 @@ const WARM_ROW: PaintRow = PaintRow {
     reach: None,
 };
 
-static WARMED: std::sync::Once = std::sync::Once::new();
+static WARMED: std::sync::OnceLock<Result<(), CouldNotRun>> = std::sync::OnceLock::new();
 
 /// Measure one row.
 /// # Errors
@@ -75,8 +75,8 @@ pub fn measure(rig: &Rig, row: &PaintRow) -> Result<PaintReport, CouldNotRun> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     row.validate()?;
     let bench_band = super::instance::Band::take_own();
-    super::instance::first_exec(&rig.fake_tui);
-    WARMED.call_once(|| warm(rig));
+    super::instance::first_exec(&rig.fake_tui)?;
+    WARMED.get_or_init(|| warm(rig)).clone()?;
     let started = Instant::now();
     let budget = Budget::from_now(BUDGET_SECS);
     let mut sampler = Sampler::start(SAMPLER_TICK);
@@ -130,9 +130,9 @@ pub fn measure(rig: &Rig, row: &PaintRow) -> Result<PaintReport, CouldNotRun> {
     })
 }
 
-/// [`WARM_ROW`]'s take, whatever it finds: it decides nothing, so its result is only said.
-fn warm(rig: &Rig) {
-    super::instance::first_exec(&rig.aterm);
+/// Log [`WARM_ROW`]'s findings without judging a measured row; return first-exec unavailability.
+fn warm(rig: &Rig) -> Result<(), CouldNotRun> {
+    super::instance::first_exec(&rig.aterm)?;
     let outcome = Scratch::new("atpaint").map_or_else(
         |e| format!("no scratch world: {e}"),
         |scratch| {
@@ -152,6 +152,7 @@ fn warm(rig: &Rig) {
         },
     );
     eprintln!("measure warm-up: paint — a take that decides nothing ({outcome})");
+    Ok(())
 }
 
 struct Take {

@@ -302,6 +302,111 @@ mod tests {
         );
     }
 
+    /// A temporary failure to read the signed envelope is not a settled answer. Clearing
+    /// that failure changes no input metadata, so the same memo must read the deny list again.
+    #[test]
+    fn a_failed_cache_read_does_not_poison_the_memo_until_a_vault_write() {
+        struct FailedReads(PathBuf);
+        impl Drop for FailedReads {
+            fn drop(&mut self) {
+                fsx::fail_reads(&self.0, 0);
+            }
+        }
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(&root.path().join("member"));
+        let source = root.path().join("roster.vault");
+        crate::client::create(&paths, source.to_str().unwrap(), None, Some("m60")).unwrap();
+        let admin = crate::client::admin_open(&paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &crate::text::Audience::Everyone,
+            crate::client::SWARM_ROSTER_ENTRY,
+            b"deny_nodes = [\"m99\"]\n",
+        )
+        .unwrap();
+        crate::client::admin_publish(&paths, &admin, &doc).unwrap();
+        crate::client::sync(&paths, None).unwrap();
+        let expected = Some(vec!["m99".to_owned()]);
+        assert_eq!(crate::client::swarm_denied_nodes(&paths).unwrap(), expected);
+
+        let before = stamp_inputs(&paths).unwrap();
+        let memo = Memo::<Vec<String>>::new();
+        let failure = FailedReads(paths.cache_file());
+        // Keep failing until explicitly cleared, independently of how many reads the
+        // authorization path makes. The guard also clears the fault on an assertion panic.
+        fsx::fail_reads(&failure.0, usize::MAX);
+        let failed = memo.read(&paths, crate::client::swarm_denied_nodes);
+        drop(failure);
+        assert!(
+            stamp_inputs(&paths).unwrap() == before,
+            "clearing a read fault must not change the memo's input metadata"
+        );
+        assert_eq!(crate::client::swarm_denied_nodes(&paths).unwrap(), expected);
+        assert_eq!(
+            memo.read(&paths, crate::client::swarm_denied_nodes)
+                .unwrap(),
+            expected,
+            "a transient read failure must not remain cached after the read recovers"
+        );
+        assert!(
+            failed.is_err(),
+            "the unread envelope must remain an I/O error"
+        );
+    }
+
+    /// The roster memo must also recover after a cache read fails, without waiting for a
+    /// vault write to change its input stamps.
+    #[test]
+    fn a_failed_cache_read_does_not_poison_the_roster_memo_until_a_vault_write() {
+        struct FailedReads(PathBuf);
+        impl Drop for FailedReads {
+            fn drop(&mut self) {
+                fsx::fail_reads(&self.0, 0);
+            }
+        }
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(&root.path().join("member"));
+        let source = root.path().join("roster.vault");
+        crate::client::create(&paths, source.to_str().unwrap(), None, Some("m60")).unwrap();
+        let admin = crate::client::admin_open(&paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &crate::text::Audience::Everyone,
+            crate::client::SWARM_ROSTER_ENTRY,
+            b"deny_nodes = [\"m99\"]\n",
+        )
+        .unwrap();
+        crate::client::admin_publish(&paths, &admin, &doc).unwrap();
+        crate::client::sync(&paths, None).unwrap();
+        let expected = crate::client::swarm_roster(&paths).unwrap();
+        assert_eq!(expected.as_ref().unwrap().deny_nodes, ["m99"]);
+
+        let before = stamp_inputs(&paths).unwrap();
+        let memo = Memo::<SwarmRoster>::new();
+        let failure = FailedReads(paths.cache_file());
+        // The read fault lasts until explicitly cleared; no implementation read count
+        // decides when the actual signed roster becomes available again.
+        fsx::fail_reads(&failure.0, usize::MAX);
+        let failed = memo.read(&paths, crate::client::swarm_roster);
+        drop(failure);
+        assert!(
+            stamp_inputs(&paths).unwrap() == before,
+            "clearing a read fault must not change the memo's input metadata"
+        );
+        assert_eq!(crate::client::swarm_roster(&paths).unwrap(), expected);
+        assert_eq!(
+            memo.read(&paths, crate::client::swarm_roster).unwrap(),
+            expected,
+            "a transient read failure must not remain cached after the roster recovers"
+        );
+        assert!(
+            failed.is_err(),
+            "the unread roster envelope must remain an I/O error"
+        );
+    }
+
     /// Two reads of unchanged inputs read once; a rewritten input, and another input appearing
     /// beside it, are each read again at the next call, and the answer is the new list. Files in
     /// the vault folder the read never opens (the vault server's `served/`, `commons/`, a job's

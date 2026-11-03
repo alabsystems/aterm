@@ -626,7 +626,7 @@ tests/reconciled_view_safety.rs	the_chain_painter_paints_all_or_none	edit-overla
 tests/reconciled_view_safety.rs	each_named_case_holds_and_catches_its_mutant	edit-fold	reconcile-contract, edit-reconcile, tail-guard, standing-tail
 ```
 
-## 5. Open findings, and the counterexamples the rows cite
+## 3. Coverage
 
 - 179 live tests: 175 mapped across the 38 specs in §2, and 4 harness/oracle self-checks documented in §4
   (the 2026-10-15 recovery: 59 read, 58 mapped to 19 specs, 1 deleted as §4 says).

@@ -813,11 +813,30 @@ pub fn read_plist_text(path: &Path) -> Option<String> {
 }
 
 fn read_plist_bytes(path: &Path) -> Option<Vec<u8>> {
-    let meta = std::fs::metadata(path).ok()?;
+    use std::io::Read as _;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.len() > INFO_PLIST_MAX_BYTES {
         return None;
     }
-    std::fs::read(path).ok()
+    let mut bytes = Vec::new();
+    file.take(INFO_PLIST_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > INFO_PLIST_MAX_BYTES {
+        return None;
+    }
+    Some(bytes)
 }
 
 /// The string immediately following one exact XML plist key, non-empty and trimmed.
@@ -8487,15 +8506,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_running_ad_hoc_copy_meets_no_teams_requirement() {
-        let dir = aterm_tempfile::tempdir().expect("scratch");
-        let copy = dir.path().join("sleep");
-        std::fs::copy("/bin/sleep", &copy).expect("a copy of sleep");
-        let signed = aterm_uds::spawnfd::command("/usr/bin/codesign")
-            .args(["--force", "--sign", "-"])
-            .arg(&copy)
-            .output()
-            .expect("codesign runs");
-        assert!(signed.status.success(), "{signed:?}");
+        // `sleep`'s kept stand-in, run in place: the child is killed at once, maybe while macOS
+        // still assesses its exec, and a copy unlinked then crashes `syspolicyd`.
+        let copy = aterm_uds::deadline::stand_in(std::path::Path::new("/bin/sleep"));
         let mut child = aterm_uds::spawnfd::command(&copy)
             .arg("30")
             .spawn()

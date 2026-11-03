@@ -2781,8 +2781,12 @@ impl ControlWorkerContext {
         (content, drive): (bool, bool),
         peer: Option<std::net::SocketAddr>,
         driver: Option<crate::fabric::Driver>,
+        driver_key: Option<aterm_net::fleet::NodeKey>,
+        service_context: bool,
     ) {
         SERVING_FLEET_PEER.with(|serving| serving.set(peer));
+        SERVING_FLEET_KEY.with(|serving| serving.set(driver_key));
+        SERVING_SERVICE_REPAIR.with(|serving| serving.set(service_context));
         let drive = drive || driver.is_some();
         let content = content || driver.is_some();
         let _driving = driver.map(crate::fabric::DrivingAs::enter);
@@ -2796,6 +2800,8 @@ impl ControlWorkerContext {
             &self.recovery_count_admission,
         );
         SERVING_FLEET_PEER.with(|serving| serving.set(None));
+        SERVING_FLEET_KEY.with(|serving| serving.set(None));
+        SERVING_SERVICE_REPAIR.with(|serving| serving.set(false));
         aterm_uds::hangup::hang_up(&stream);
     }
 }
@@ -2836,7 +2842,7 @@ pub(crate) fn attach_fleet_connection(
     crate::qos::spawn_lane_thread(
         "aterm-fleet-serve".to_string(),
         crate::qos::Role::Responsive,
-        move || context.serve_fleet(stream, (content, drive), peer, None),
+        move || context.serve_fleet(stream, (content, drive), peer, None, None, false),
     )
     .is_ok()
 }
@@ -2858,6 +2864,8 @@ pub(crate) fn attach_fleet_drive(
     stream: CtlStream,
     peer: Option<std::net::SocketAddr>,
     driver: crate::fabric::Driver,
+    driver_key: Option<aterm_net::fleet::NodeKey>,
+    service_context: bool,
 ) -> bool {
     let Some(context) = BRIDGE_CONTEXT.get().cloned() else {
         return false;
@@ -2865,7 +2873,16 @@ pub(crate) fn attach_fleet_drive(
     crate::qos::spawn_lane_thread(
         "aterm-fleet-drive".to_string(),
         crate::qos::Role::Responsive,
-        move || context.serve_fleet(stream, (true, true), peer, Some(driver)),
+        move || {
+            context.serve_fleet(
+                stream,
+                (true, true),
+                peer,
+                Some(driver),
+                driver_key,
+                service_context,
+            )
+        },
     )
     .is_ok()
 }
@@ -3343,6 +3360,8 @@ pub(crate) fn spawn(
             });
             lanes.publish(worker_context.clone());
             let _ = BRIDGE_CONTEXT.set(worker_context.clone());
+            #[cfg(unix)]
+            aterm_agent::service_repair_rpc::start_recovery_in_window(&sock_dir);
             #[cfg(unix)]
             crate::fleet_listen::node_serve::start_window_fleet_relay(&sock_dir);
             if workers != CONTROL_WORKERS {
@@ -4223,31 +4242,20 @@ mod rekey_verb_tests {
     }
 
     fn leader() -> Leader {
-        use aterm_uds::spawnfd::InheritNothing as _;
-        use std::os::fd::{FromRawFd as _, OwnedFd};
-        use std::os::unix::process::CommandExt as _;
-        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-        // SAFETY: `slave` is a fresh fd this function alone owns.
-        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-        let stdio = || std::process::Stdio::from(slave.try_clone().expect("dup slave"));
-        let mut cmd = std::process::Command::new("/bin/sleep");
-        cmd.inherit_nothing()
-            .arg("30")
-            .stdin(stdio())
-            .stdout(stdio())
-            .stderr(stdio());
-        // SAFETY: `setsid` and `ioctl(TIOCSCTTY)` in the forked child before `exec` are async-signal-safe.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = cmd.spawn().expect("spawn sleep");
+        use std::os::fd::IntoRawFd as _;
+        let (master, slave, child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
+            let mut cmd = std::process::Command::new("/bin/sleep");
+            cmd.arg("30")
+                .stdout(std::process::Stdio::from(slave.try_clone()?))
+                .stderr(std::process::Stdio::from(slave.try_clone()?));
+            Ok(cmd)
+        })
+        .expect("spawn sleep");
         drop(slave);
-        let led = Leader { master, child };
+        let led = Leader {
+            master: master.into_raw_fd(),
+            child,
+        };
         let pid = libc::pid_t::try_from(led.child.id()).expect("pid");
         aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
@@ -4776,6 +4784,27 @@ fn dispatch_owner(
     let own_session = own_target.as_ref().map(|(session, _)| *session);
     let own_ctx = own_target.as_ref().map(|(_, ctx)| ctx.as_ref());
     match verb {
+        "service-repair" => match (
+            crate::fabric::serving_driver(),
+            SERVING_FLEET_KEY.with(|key| key.get()),
+            SERVING_SERVICE_REPAIR.with(|allowed| allowed.get()),
+        ) {
+            (Some(driver), Some(key), true) => aterm_agent::service_repair_rpc::serve_in_window(
+                &driver.node,
+                &key.hex(),
+                rest,
+                cx.sock_dir,
+            ),
+            _ => "ERR denied: service-repair requires an authenticated native Drive\n".into(),
+        },
+        #[cfg(unix)]
+        "vault" => {
+            let caller = crate::fabric::serving_driver().map_or_else(
+                || "local".to_owned(),
+                |driver| format!("fleet:{}", driver.node),
+            );
+            aterm_secrets::client::admin_service::serve(&caller, rest)
+        }
         "accounts-renew" => {
             let caller = crate::fabric::serving_driver().map_or_else(
                 || "local".to_owned(),
@@ -5545,6 +5574,9 @@ thread_local! {
     static SERVING_CONNECTION: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static CONNECTION_CLAIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static INPUT_COMMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SERVING_FLEET_KEY: std::cell::Cell<Option<aterm_net::fleet::NodeKey>> =
+        const { std::cell::Cell::new(None) };
+    static SERVING_SERVICE_REPAIR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(any(unix, test))]
     static SERVING_FLEET_PEER: std::cell::Cell<Option<std::net::SocketAddr>> =
         const { std::cell::Cell::new(None) };
@@ -5572,6 +5604,17 @@ impl Drop for ServingCaller<'_> {
     fn drop(&mut self) {
         *self.0 = SERVING_CALLER.with(|serving| serving.borrow_mut().take().flatten());
     }
+}
+
+/// The program whose connection asks the `signal` verb, unless it is aterm's own (the harness's
+/// principal), named as its typing is credited ([`serving_caller`],
+/// [`crate::typed_by::name_by_store`] over `store`'s tabs): the tab an `aterm ctl` ran from (its
+/// role, pinned title or short id), past the CLI's own process, else the program's own words. The
+/// act's `from=`, and the asker the harness host records when that stop ends an agent.
+fn signal_from(scope: Scope, ctx: &SessionCtx, store: &Store) -> Option<String> {
+    serving_caller(scope, ctx)
+        .filter(|caller| caller.who != crate::typed_by::Who::Aterm)
+        .map(|caller| crate::typed_by::name_by_store(&caller.who, store).words)
 }
 
 fn serving_caller(scope: Scope, ctx: &SessionCtx) -> Option<Arc<crate::typed_by::Caller>> {
@@ -6294,6 +6337,14 @@ fn fleet_refusal(request: &Request, scope: Scope) -> Option<String> {
     None
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Each fleet refusal's audit line on this test thread, written or thinned alike: the audit
+    /// a test reads, which `record_network`'s shared run rule would not let it count on.
+    static FLEET_AUDITED: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 #[cfg(any(unix, test))]
 fn audit_fleet_refusal(verb: &str, refused: &str) {
     let peer = SERVING_FLEET_PEER
@@ -6304,6 +6355,8 @@ fn audit_fleet_refusal(verb: &str, refused: &str) {
         "{peer} sent `{}`: {refused}",
         aterm_log::sanitize_record(&verb)
     );
+    #[cfg(test)]
+    FLEET_AUDITED.with(|audited| audited.borrow_mut().push(line.clone()));
     if let Some(line) =
         control_denials::FLEET_GATE_DENIALS.record_network(&line, std::time::Instant::now())
     {
@@ -6394,12 +6447,27 @@ fn drive_admission(
 }
 
 #[cfg(any(unix, test))]
-const DRIVE_CLOSE_REFUSED: &str = "a drive closes only its own worker or untouched plain shell \
-                                 from this aterm process";
+const DRIVE_CLOSE_REFUSED: &str = "a drive closes only a worker this Mac's aterm spawned for it, \
+                                 or a plain shell it opened that this aterm process kept untouched";
 
 #[cfg(any(unix, test))]
 const DRIVE_SHELL_REFUSED: &str = "this read needs the same driver's untouched plain shell";
 
+/// A word of a drive's line as its refusal names it to the driver and in this Mac's audit line:
+/// one line of ordinary characters, its first 32.
+#[cfg(any(unix, test))]
+fn drive_word(word: &str) -> String {
+    aterm_codec::tty::one_line(word, 32)
+}
+
+/// `why` a drive's line is refused, naming the `word` of it refused.
+#[cfg(any(unix, test))]
+fn drive_refused(why: &str, word: &str) -> String {
+    format!("{why}; not `{}`", drive_word(word))
+}
+
+/// Every refusal of the gate's own grammar names the word it refuses ([`drive_refused`]); a
+/// verb's own parser (`await task`'s, `vault`'s, …) answers in its words, as on one Mac.
 #[cfg(any(unix, test))]
 fn drive_gate(
     line: &str,
@@ -6413,15 +6481,21 @@ fn drive_gate(
                             with no @: hold s-… on|off [reason=<pct>]";
     const HOLD_SELECTOR: &str = "a drive's hold names its session as its argument, never a \
                                  selector: hold s-… on|off [reason=<pct>]";
+    const HOLD: &str = "hold <sid> on|off [reason=<pct>]";
     let request = Request::parse(line.to_owned());
     if request.frame().is_some() || request.post_frame().is_some() {
-        return Err("a drive serves no frame but a worker's task".to_owned());
+        return Err(drive_refused(
+            "a drive serves no frame but a worker's task",
+            request.head().verb,
+        ));
     }
     let Head {
         selector,
         verb,
         rest,
     } = request.head();
+    // The selector as the line spells it, which a refusal of it names.
+    let selected = line.split_whitespace().next().unwrap_or_default();
     let hosted = |sid: &str| {
         let sid = SessionId::new(sid);
         (sid.as_str().starts_with("s-") && hosts(&sid)).then_some(sid)
@@ -6442,6 +6516,23 @@ fn drive_gate(
     match selector {
         None => match verb {
             "survey" | "version" => Ok(DriveLine::Fleet),
+            "service-repair" => {
+                let request = aterm_agent::service_repair_rpc::Request::parse(rest)?;
+                if matches!(request.operation.as_str(), "inspect" | "prepare") {
+                    Ok(read())
+                } else {
+                    Ok(act("service-repair", None))
+                }
+            }
+            #[cfg(unix)]
+            "vault" => {
+                if rest.trim() == "status" {
+                    return Ok(read());
+                }
+                aterm_secrets::client::admin_service::Request::parse(rest)
+                    .map_err(|error| error.to_string())?;
+                Ok(act("vault", None))
+            }
             "accounts-renew" => {
                 use aterm_agent::harness::remote_renew::Request as RenewalRequest;
                 match RenewalRequest::parse(rest)? {
@@ -6451,16 +6542,19 @@ fn drive_gate(
             }
             "hold" => {
                 let mut words = rest.split_whitespace();
-                let (Some(sid), Some(way @ ("on" | "off"))) = (words.next(), words.next()) else {
-                    return Err("hold <sid> on|off [reason=<pct>]".to_owned());
+                let (sid, way) = (words.next(), words.next());
+                let (Some(sid), Some(way @ ("on" | "off"))) = (sid, way) else {
+                    return Err(way.map_or_else(|| HOLD.to_owned(), |way| drive_refused(HOLD, way)));
                 };
-                if !words.all(|word| word.starts_with("reason=")) {
-                    return Err("a drive's hold names no origin: hold <sid> on|off \
-                                [reason=<pct>]"
-                        .to_owned());
+                if let Some(word) = words.find(|word| !word.starts_with("reason=")) {
+                    return Err(drive_refused(
+                        &format!("a drive's hold names no origin: {HOLD}"),
+                        word,
+                    ));
                 }
-                let sid = hosted(sid)
-                    .ok_or_else(|| if sid.starts_with('@') { HOLD_SID } else { SID }.to_owned())?;
+                let sid = hosted(sid).ok_or_else(|| {
+                    drive_refused(if sid.starts_with('@') { HOLD_SID } else { SID }, sid)
+                })?;
                 Ok(DriveLine::Act {
                     line: line.to_owned(),
                     write: Some(DriveAct {
@@ -6486,7 +6580,10 @@ fn drive_gate(
             }),
             "await" => {
                 let Some(words) = await_task_list(rest) else {
-                    return Err("a drive awaits only `await task @<sid>,…`".to_owned());
+                    return Err(drive_refused(
+                        "a drive awaits only `await task @<sid>,…`",
+                        format!("await {}", rest.trim()).trim_end(),
+                    ));
                 };
                 let args = crate::task_record::parse_await_task(&words, true)
                     .map_err(|usage| usage.trim_end().trim_start_matches("ERR ").to_owned())?;
@@ -6495,7 +6592,7 @@ fn drive_gate(
                         continue;
                     }
                     if !matches!(Selector::parse(&target.selector), Selector::Sid(_)) {
-                        return Err(SID.to_owned());
+                        return Err(drive_refused(SID, &format!("@{}", target.selector)));
                     }
                     return Ok(DriveLine::Answer(format!(
                         "ERR no such session @{}\n",
@@ -6504,16 +6601,21 @@ fn drive_gate(
                 }
                 Ok(read())
             }
-            _ => Err(format!(
-                "a drive serves survey, version, hold, spawn cwd=<absolute>|agent=<word> and await task, \
-                 and @<sid> status|text|screen|result|inbox|post|turn|key|send|close; not `{}`",
-                verb.chars().take(32).collect::<String>()
+            "close" => Err(drive_refused(
+                "a drive's close names its session in front: @s-… close",
+                verb,
+            )),
+            _ => Err(drive_refused(
+                "a drive serves survey, version, vault status|approve, hold, spawn \
+                 cwd=<absolute>|agent=<word> and await task, and @<sid> \
+                 status|text|screen|result|inbox|post|turn|key|send|close",
+                verb,
             )),
         },
-        Some(_) if verb == "hold" => Err(HOLD_SELECTOR.to_owned()),
+        Some(_) if verb == "hold" => Err(drive_refused(HOLD_SELECTOR, selected)),
         Some(Selector::Sid(sid)) => {
             let Some(sid) = hosted(sid.as_str()) else {
-                return Err(SID.to_owned());
+                return Err(drive_refused(SID, selected));
             };
             match verb {
                 "status" | "text" | "screen" | "result" | "inbox" => Ok(read()),
@@ -6521,21 +6623,25 @@ fn drive_gate(
                     drive_shell_read(verb, rest)?;
                     Ok(act("shell-read", Some(sid)))
                 }
-                "blocks" | "blocktext" | "await" => Err(DRIVE_SHELL_REFUSED.to_owned()),
+                "blocks" | "blocktext" | "await" => Err(drive_refused(DRIVE_SHELL_REFUSED, verb)),
                 "post" => Ok(act("post", Some(sid))),
                 "turn" => drive_turn(rest).map(|()| act("turn", Some(sid))),
                 "key" => Ok(act("key", Some(sid))),
                 "send" => Ok(act("send", Some(sid))),
-                "close" if rest.trim().is_empty() && spawned(&sid) => Ok(act("close", Some(sid))),
-                "close" => Err(DRIVE_CLOSE_REFUSED.to_owned()),
-                _ => Err(format!(
-                    "a drive serves @<sid> status|text|screen|result|inbox|post|turn|key|send|close; not \
-                     `{}`",
-                    verb.chars().take(32).collect::<String>()
+                "close" if !rest.trim().is_empty() => Err(drive_refused(
+                    "a drive's close takes no words: @<sid> close",
+                    rest.trim(),
+                )),
+                "close" if spawned(&sid) => Ok(act("close", Some(sid))),
+                "close" => Err(drive_refused(DRIVE_CLOSE_REFUSED, selected)),
+                _ => Err(drive_refused(
+                    "a drive serves @<sid> \
+                     status|text|screen|result|inbox|post|turn|key|send|close",
+                    verb,
                 )),
             }
         }
-        Some(_) => Err(SID.to_owned()),
+        Some(_) => Err(drive_refused(SID, selected)),
     }
 }
 
@@ -6560,14 +6666,20 @@ fn drive_spawn(
     rest: &str,
     hosts: &dyn Fn(&SessionId) -> bool,
 ) -> Result<String, String> {
+    const SHELL: &str = "a plain fleet shell is spawn cwd=/absolute [raise=false]; no task, \
+                         command or other options";
     let usage = || {
         format!(
-            "a drive's worker form is spawn agent=<{}> [model=<m>] [cwd=<absolute>] \
-             [from=<sid>] [raise=false] - < task",
+            "a drive's worker form is spawn agent=<{}> [model=<m>] [autopilot=<land|cruise>] \
+             [cwd=<absolute>] [from=<sid>] [raise=false] - < task",
             aterm_agent::harness::worker::started_words()
         )
     };
-    let tokens = control_media::split_quoted_tokens(rest).ok_or_else(usage)?;
+    let Some(tokens) = control_media::split_quoted_tokens(rest) else {
+        // A quote left open is the last one the line holds: it opened the word it refuses.
+        let open = rest.rfind('"').map_or(rest, |at| &rest[at..]);
+        return Err(drive_refused(&usage(), open));
+    };
     if !tokens.iter().any(|token| token.starts_with("agent=")) {
         let mut cwd = None;
         let mut raise = false;
@@ -6579,7 +6691,7 @@ fn drive_spawn(
                     cwd = Some(value);
                 }
                 Some(("raise", "false")) if !raise => raise = true,
-                _ => return Err("a plain fleet shell is spawn cwd=/absolute [raise=false]; no task, command or other options".to_owned()),
+                _ => return Err(drive_refused(SHELL, token)),
             }
         }
         if cwd.is_none() {
@@ -6591,17 +6703,17 @@ fn drive_spawn(
             format!("{} raise=false", line.trim_end_matches('\r'))
         });
     }
-    let (mut agent, mut framed, mut raise) = (false, false, false);
+    // Every `agent=` word is a worker's or refused below, so the form names its worker.
+    let (mut framed, mut raise) = (false, false);
     for token in &tokens {
-        let (key, value) = token.split_once('=').ok_or_else(usage)?;
+        let Some((key, value)) = token.split_once('=') else {
+            return Err(drive_refused(&usage(), token));
+        };
         match key {
             "agent"
                 if aterm_agent::harness::worker::WORKERS
                     .iter()
-                    .any(|w| w.word == value) =>
-            {
-                agent = true;
-            }
+                    .any(|w| w.word == value) => {}
             "agent" if crate::task_launch::retired_worker(Some(value)).is_some() => {
                 return Err(format!(
                     "spawn agent={value}: {}",
@@ -6610,21 +6722,38 @@ fn drive_spawn(
             }
             "len" => framed = true,
             "model" => {}
+            // The worker's Autopilot, as on one Mac: the drive names it here alone, serving no
+            // `meta`, whose writes no hold stops.
+            "autopilot" if matches!(value, "land" | "cruise") => {}
             "cwd" if std::path::Path::new(value).is_absolute() => {}
-            "cwd" => return Err("a drive's spawn names an absolute cwd=".to_owned()),
+            "cwd" => {
+                return Err(drive_refused(
+                    "a drive's spawn names an absolute cwd=",
+                    token,
+                ));
+            }
             "from" if hosts(&SessionId::new(value)) => {
-                return Err(
-                    "a drive's from= is its own session, never one of the driven Mac's".to_owned(),
-                );
+                return Err(drive_refused(
+                    "a drive's from= is its own session, never one of the driven Mac's",
+                    token,
+                ));
             }
             "from" => {}
             "raise" if value == "false" => raise = true,
-            "raise" => return Err("a drive's worker opens raise=false".to_owned()),
-            _ => return Err(usage()),
+            "raise" => return Err(drive_refused("a drive's worker opens raise=false", token)),
+            _ => return Err(drive_refused(&usage(), token)),
         }
     }
-    if !(agent && framed) {
-        return Err(usage());
+    if !framed {
+        return Err(format!(
+            "{}: its line announces no task frame (len=<n>)",
+            usage()
+        ));
+    }
+    // The handler's own grammar (a repeated `autopilot=`, a `model=` or `from=` it cannot take)
+    // refuses here, so the word it refuses is named in the audit line as on the wire.
+    if let Err(refused) = control_media::parse_spawn_args(rest) {
+        return Err(refused.map_or_else(usage, |word| drive_refused(&usage(), &word)));
     }
     Ok(if raise {
         line.to_owned()
@@ -6655,7 +6784,11 @@ fn drive_shell_read(verb: &str, rest: &str) -> Result<(), String> {
     if valid {
         Ok(())
     } else {
-        Err("owned shell reads: blocks [n] [--json], blocktext <id> [trim], await idle <0..22000>|block timeout=<0..22000>".to_owned())
+        Err(drive_refused(
+            "owned shell reads: blocks [n] [--json], blocktext <id> [trim], await idle \
+             <0..22000>|block timeout=<0..22000>",
+            format!("{verb} {}", rest.trim()).trim_end(),
+        ))
     }
 }
 
@@ -6727,13 +6860,82 @@ fn shell_untouched(store: &Store, sid: &SessionId) -> bool {
 
 #[cfg(any(unix, test))]
 fn drive_may_close(store: &Store, sid: &SessionId, node: &str) -> bool {
-    let owned = DRIVE_SPAWNED
+    drive_owned(sid, node).is_some_and(|shell| !shell || shell_untouched(store, sid))
+}
+
+/// Whether `node` spawned `sid`, and if so whether as a plain shell: this process's record, else
+/// a worker's [`drive_worker_file`] from before an update of this aterm.
+#[cfg(any(unix, test))]
+fn drive_owned(sid: &SessionId, node: &str) -> Option<bool> {
+    let live = DRIVE_SPAWNED
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .iter()
         .find(|spawned| &spawned.sid == sid && spawned.node == node)
         .map(|spawned| spawned.shell);
-    owned.is_some_and(|shell| !shell || shell_untouched(store, sid))
+    live.or_else(|| {
+        let recorded = std::fs::read_to_string(drive_worker_file(sid)?).ok()?;
+        (recorded.trim() == node).then_some(false)
+    })
+}
+
+/// The file naming the node that drove worker `sid` into being, so it can still close the worker
+/// once this aterm has updated beneath it, which keeps the worker and its sid. A plain shell has
+/// none: whether a person touched it is this process's knowledge. A test names none unless it
+/// sets [`DRIVE_WORKERS_DIR`].
+#[cfg(any(unix, test))]
+fn drive_worker_file(sid: &SessionId) -> Option<std::path::PathBuf> {
+    aterm_types::control_request::Sid::parse(sid.as_str())?;
+    #[cfg(test)]
+    let dir = DRIVE_WORKERS_DIR.with(|dir| dir.borrow().clone())?;
+    #[cfg(not(test))]
+    let dir = aterm_types::dirs::state_dir()?.join("drive-workers");
+    Some(dir.join(sid.as_str()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static DRIVE_WORKERS_DIR: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// How long a file of a worker this aterm no longer hosts outlasts its last write: a session gone
+/// without a drive's close leaves one behind, and nothing reads it, because a drive names only a
+/// session hosted. A worker still hosted keeps its file at any age.
+#[cfg(any(unix, test))]
+const DRIVE_WORKER_FILE_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+
+/// Records a driven worker for [`drive_owned`] and removes the files of workers `store` no longer
+/// hosts once past [`DRIVE_WORKER_FILE_AGE`]. A write that fails costs only the close after an
+/// update, which then says it is refused.
+#[cfg(any(unix, test))]
+fn record_drive_worker(store: &Store, sid: &SessionId, node: &str) {
+    let Some(file) = drive_worker_file(sid) else {
+        return;
+    };
+    let Some(dir) = file.parent() else {
+        return;
+    };
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let hosts = store.read().unwrap_or_else(|p| p.into_inner());
+        for entry in entries.flatten() {
+            let hosted = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| hosts.by_sid(&SessionId::new(name)).is_some());
+            let expired = !hosted
+                && entry
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|written| written.elapsed().ok())
+                    .is_some_and(|age| age > DRIVE_WORKER_FILE_AGE);
+            if expired {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let _ = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&file, node));
 }
 
 #[cfg(any(unix, test))]
@@ -6782,12 +6984,7 @@ pub(crate) fn drive_close_admission(store: &Store, local: u64, node: &str) -> Op
             .by_local(local)
             .map(|h| h.sid.clone());
         let sid = sid?;
-        let shell = DRIVE_SPAWNED
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .find(|spawned| spawned.sid == sid && spawned.node == node)
-            .map(|spawned| spawned.shell)?;
+        let shell = drive_owned(&sid, node)?;
         (!shell || shell_untouched(store, &sid)).then_some(shell)
     }
     #[cfg(not(any(unix, test)))]
@@ -6852,6 +7049,7 @@ fn note_drive_act(act: &DriveAct, reply: &str, store: &Store) {
                 && !act.shell
             {
                 remember_driven_spawn(worker.clone(), driver.node.clone(), false);
+                record_drive_worker(store, worker, &driver.node);
             }
             worker
         }
@@ -6861,6 +7059,9 @@ fn note_drive_act(act: &DriveAct, reply: &str, store: &Store) {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .retain(|spawned| &spawned.sid != sid);
+                if let Some(file) = drive_worker_file(sid) {
+                    let _ = std::fs::remove_file(file);
+                }
             }
             act.sid.clone()
         }
@@ -6920,6 +7121,22 @@ fn serve_request_line(
         };
         out.push_secret(response);
         return None;
+    }
+    if head.verb == "sudo" {
+        let reply = if head.selector.is_some() {
+            "ERR sudo takes no @<sid>\n".to_string()
+        } else {
+            #[cfg(target_os = "macos")]
+            {
+                crate::control_sudo::serve(stream, head.rest, scope, store)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                "ERR sudo is macOS-only\n".to_string()
+            }
+        };
+        out.push_owned(reply.into_bytes());
+        return Some(ServeDisposition::Close);
     }
     if let Some(refusal) = worker_frame_refusal(&head, store) {
         out.push_owned(refusal.into_bytes());
@@ -7211,7 +7428,7 @@ mod final_reply_tests {
             "close",
             "@s-1 close",
             "tab close",
-            "tab close 0",
+            "tab close 1",
             "invoke Quit",
             "confirm yes",
         ] {
@@ -7227,7 +7444,7 @@ mod final_reply_tests {
             "version",
             "ls",
             "tab new",
-            "tab 0",
+            "tab 1",
             "text",
             "closed",
             "await seq 3",
@@ -9446,6 +9663,9 @@ fn serve_session_verb(
     }
     let host = GuiHost::with_fleet(session, term, Some(proxy), store, ctx);
 
+    if verb == "codex-renewal" {
+        return crate::native_act::serve_codex_renewal(self_ctx, master, rest);
+    }
     if verb == "native-observe" {
         return crate::native_act::serve_observation(self_ctx, master, rest);
     }
@@ -9822,9 +10042,13 @@ fn serve_session_verb(
             }
             Err(error) => error.to_string(),
         },
-        "signal" => {
-            control_input::signal_verb(master, rest, ctx, control_session::log_actor(scope, ctx))
-        }
+        "signal" => control_input::signal_verb_from(
+            master,
+            rest,
+            ctx,
+            control_session::log_actor(scope, ctx),
+            signal_from(scope, ctx, store).as_deref(),
+        ),
         "end" => {
             let caller = control_end::Caller {
                 owner: scope.is_owner_class(),

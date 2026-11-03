@@ -4581,6 +4581,103 @@ fn another_aterms_codex_row_reads_the_programs_own_report() {
     assert_eq!(crate::program_state::survey_word_of_wire("-"), None);
 }
 
+#[test]
+fn cached_machine_contact_keeps_never_seen_history_and_failures_distinct() {
+    let seen = 1_800_000_000_u64;
+    let state = |last_seen, unreachable_since, contact_error| {
+        aterm_json::json!({
+            "last_seen": last_seen,
+            "unreachable_since": unreachable_since,
+            "contact_error": contact_error,
+            "hello": r#"{"sessions":[{"instance_pid":71,"local_id":1,"sid":"retained","program":"sh"}]}"#,
+        })
+    };
+    let project = |state: Option<&aterm_json::Value>| {
+        cached_configured_computer(
+            "host".into(),
+            "host".into(),
+            "host.local".into(),
+            CachedMachineState::from_json(state),
+        )
+    };
+    let mut malformed = state(seen, None, None);
+    malformed
+        .as_object_mut()
+        .unwrap()
+        .insert("last_seen".into(), aterm_json::json!("not-a-timestamp"));
+    let observations = [
+        state(0, None, None),
+        state(seen, None, None),
+        state(seen - 3600, None, None),
+        state(seen, Some(seen + 1), None),
+        state(seen, None, Some((seen + 1, "authentication refused"))),
+        malformed,
+    ];
+    let statuses = observations
+        .iter()
+        .map(|state| {
+            let (computer, tabs) = project(Some(state));
+            assert_eq!(computer.tabs, Some(1));
+            assert_eq!(tabs[0].sid, "retained");
+            computer.status
+        })
+        .chain([project(None).0.status])
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(statuses.len(), observations.len() + 1);
+
+    let refused_run = aterm_json::json!({
+        "last_seen": seen,
+        "last_refusal": [seen + 1, "run was busy"],
+    });
+    assert_eq!(
+        project(Some(&refused_run)).0.status,
+        project(Some(&observations[1])).0.status
+    );
+}
+
+#[test]
+fn cached_machine_state_read_keeps_missing_and_unreadable_distinct() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let project = |state: &std::io::Result<Option<aterm_json::Value>>| {
+        cached_configured_computer(
+            "host".into(),
+            "host".into(),
+            "host.local".into(),
+            CachedMachineState::from_read(state),
+        )
+    };
+    let missing = read_cached_machine_state(&root.path().join("missing.json"));
+    assert!(matches!(missing, Ok(None)));
+    let missing_status = project(&missing).0.status;
+
+    let malformed = root.path().join("malformed.json");
+    std::fs::write(&malformed, "{").unwrap();
+    let malformed = read_cached_machine_state(&malformed);
+    assert_eq!(
+        malformed.as_ref().unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    let unreadable_status = project(&malformed).0.status;
+    assert_ne!(missing_status, unreadable_status);
+
+    let unreadable = read_cached_machine_state(root.path());
+    assert!(unreadable.is_err());
+    assert_eq!(project(&unreadable).0.status, unreadable_status);
+
+    let valid = root.path().join("valid.json");
+    std::fs::write(
+        &valid,
+        r#"{"last_seen":1800000000,"hello":"{\"sessions\":[{\"sid\":\"retained\"}]}"}"#,
+    )
+    .unwrap();
+    let valid = read_cached_machine_state(&valid);
+    assert!(matches!(valid, Ok(Some(_))));
+    let (computer, tabs) = project(&valid);
+    assert_ne!(computer.status, missing_status);
+    assert_ne!(computer.status, unreadable_status);
+    assert_eq!(tabs[0].sid, "retained");
+}
+
 #[cfg(unix)]
 #[test]
 fn tab_activity_counts_agree_across_local_sibling_and_cached_readings() {
@@ -4627,7 +4724,7 @@ fn tab_activity_counts_agree_across_local_sibling_and_cached_readings() {
             "remote".into(),
             "remote".into(),
             "remote.local".into(),
-            Some(&state),
+            CachedMachineState::from_json(Some(&state)),
         );
         assert_eq!(computer.active_ai, expected.map(usize::from), "{word}");
         let mut report = HarnessStatsReport::new(
@@ -4703,7 +4800,7 @@ fn tab_activity_keeps_unknown_classification_separate_from_non_ai() {
             "remote".into(),
             "remote".into(),
             "remote.local".into(),
-            Some(&state),
+            CachedMachineState::from_json(Some(&state)),
         );
         assert_eq!(computer.ai_clis, expected, "{sessions}");
         assert_eq!(computer.active_ai, expected, "{sessions}");
@@ -4745,10 +4842,12 @@ fn monitor_swarm_census_maps_members_aliases_and_stragglers_without_per_mac_dial
         members: vec![
             CensusMember {
                 label: "m15".to_owned(),
+                fleet_name: None,
                 aliases: Vec::new(),
                 node: Some("15151515151515151515151515151515".to_owned()),
                 host: Some("m15.local".to_owned()),
                 version: Some("0.146.0".to_owned()),
+                facts_at: Some(now_s - 5),
                 window: true,
                 window_last: Some(now_s - 5),
                 sessions: 3,
@@ -4765,10 +4864,12 @@ fn monitor_swarm_census_maps_members_aliases_and_stragglers_without_per_mac_dial
             },
             CensusMember {
                 label: "m100".to_owned(),
+                fleet_name: None,
                 aliases: vec!["m32".to_owned()],
                 node: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
                 host: Some("m100.local".to_owned()),
                 version: Some("0.146.0".to_owned()),
+                facts_at: Some(now_s - 3_600),
                 window: false,
                 window_last: Some(now_s - 7_200),
                 sessions: 0,
@@ -4855,7 +4956,7 @@ fn monitor_swarm_census_maps_members_aliases_and_stragglers_without_per_mac_dial
             format!("configured-{name}"),
             name.into(),
             format!("{name}.local"),
-            Some(&state(hello)),
+            CachedMachineState::from_json(Some(&state(hello))),
         )
     };
     let parsed = |hello: &str| parsed_for("m32", hello);
@@ -5137,7 +5238,7 @@ fn monitor_swarm_census_maps_members_aliases_and_stragglers_without_per_mac_dial
                 uuid.to_owned(),
                 canonical_host_name_gui(raw_name, &names),
                 address.to_owned(),
-                Some(&state(hello)),
+                CachedMachineState::from_json(Some(&state(hello))),
             );
             merge_cached_computer(
                 &mut computers,
@@ -5166,7 +5267,7 @@ fn monitor_swarm_census_maps_members_aliases_and_stragglers_without_per_mac_dial
         host_a.to_owned(),
         "m100".into(),
         "10.0.0.7".into(),
-        Some(&state(first)),
+        CachedMachineState::from_json(Some(&state(first))),
     );
     merge_cached_computer(
         &mut identities,
@@ -5186,7 +5287,7 @@ fn monitor_swarm_census_maps_members_aliases_and_stragglers_without_per_mac_dial
         host_b.to_owned(),
         "m15".into(),
         "m100.local".into(),
-        Some(&state(first)),
+        CachedMachineState::from_json(Some(&state(first))),
     );
     merge_cached_computer(
         &mut identities,
@@ -5204,7 +5305,7 @@ fn monitor_swarm_census_maps_members_aliases_and_stragglers_without_per_mac_dial
         host_b.to_owned(),
         "m15".into(),
         "10.0.0.8".into(),
-        Some(&state(first)),
+        CachedMachineState::from_json(Some(&state(first))),
     );
     merge_cached_computer(
         &mut identities,

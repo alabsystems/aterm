@@ -94,7 +94,7 @@ pub(crate) fn write(dir: &Path, rec: &Recording) -> Result<(), String> {
 /// digest.
 pub(crate) fn read(dir: &Path) -> Result<Recording, String> {
     let path = dir.join(MANIFEST);
-    let text = std::fs::read_to_string(&path)
+    let text = crate::read_regular_text(&path)
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
     let v: Value = aterm_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let text_of = |k: &str| {
@@ -128,7 +128,7 @@ pub(crate) fn read(dir: &Path) -> Result<Recording, String> {
             .and_then(Value::as_str)
             .ok_or_else(|| format!("{}: frame {name} has no `sha256`", path.display()))?;
         let png_path = dir.join(format!("{name}.png"));
-        let bytes = std::fs::read(&png_path)
+        let bytes = crate::read_regular(&png_path)
             .map_err(|e| format!("could not read {}: {e}", png_path.display()))?;
         let (rgba, w, h) = aterm_png::decode_rgba8(&bytes, MAX_SIDE)
             .ok_or_else(|| format!("{} is not an RGBA8 PNG", png_path.display()))?;

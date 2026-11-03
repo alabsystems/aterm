@@ -1619,7 +1619,7 @@ impl<'a, 'b> Page<'a, 'b> {
         // aterm sets up, never as the thing it names turned on.
         if !self.stacked() && self.lines.iter().any(|line| line.switch.is_some()) {
             let m = self.m;
-            let words = "aterm sets up";
+            let words = "Automatic";
             let words_w = Metrics::words_w(SemanticRole::Text, StyleRef::Note, words) + 2.0;
             let h = m.note_line + RHYTHM;
             items.push((
@@ -1754,10 +1754,14 @@ impl<'a, 'b> Page<'a, 'b> {
             inner - SWITCH_W - CHEVRON_W - m.title_x
         };
         let title_style = StyleRef::Plain;
-        // High Contrast says the state in words on every line (§4.4). A key's name stays whole
-        // on one line where the phrase wraps.
-        let phrase = if looks.high_contrast && !line.phrase.to_lowercase().contains(line.word) {
-            format!("{} · {}", line.phrase, line.word)
+        // Every theme names the state before its detail; the switch only names automatic
+        // setup. A key's name stays whole on one line where the phrase wraps.
+        let phrase = if !line.phrase.to_lowercase().contains(line.word) {
+            let mut word = line.word.to_owned();
+            if let Some(first) = word.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            format!("{word} · {}", line.phrase)
         } else {
             line.phrase.clone()
         }
@@ -2472,6 +2476,18 @@ impl<'a, 'b> Page<'a, 'b> {
                 None,
                 StyleRef::Quiet,
                 !status.busy,
+                m.control_h,
+                room,
+            ));
+        }
+        // What macOS needs a person for, batched: one quiet press, and nothing waits on it.
+        if read && !super::offered_access(status).is_empty() {
+            left.push(Self::fitted_button(
+                super::ASK_FOR_ACCESS,
+                "Turn On macOS Access…".to_owned(),
+                Some("Turn On…"),
+                StyleRef::Quiet,
+                true,
                 m.control_h,
                 room,
             ));

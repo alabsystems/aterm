@@ -285,7 +285,13 @@ impl Driver {
             }
         }
         let targo = bin.join("targo");
-        if fs::read(&targo).is_ok_and(|b| b.starts_with(b"#!")) {
+        if crate::durable::open_regular_file(&targo).is_ok_and(|f| {
+            use std::io::Read as _;
+            let mut head = [0u8; 2];
+            f.take(2)
+                .read(&mut head)
+                .is_ok_and(|n| n == 2 && head == *b"#!")
+        }) {
             return Err(format!(
                 "{} is a shim, not a toolchain: name the toolchain's own bin/ (aterm pkg which targo)",
                 targo.display()
@@ -468,7 +474,7 @@ pub fn lane_profile_args(rows: &BTreeSet<String>) -> Vec<String> {
 /// # Errors
 /// A file that is there and does not parse: unread, it would verify optimized.
 fn dev_package_rows(path: &Path) -> Result<BTreeSet<String>, String> {
-    let text = match fs::read_to_string(path) {
+    let text = match crate::durable::read_text(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
         Err(e) => return Err(format!("{}: {e}", path.display())),
@@ -796,7 +802,7 @@ pub fn read_costs(history: Option<&Path>, seed: &Path) -> BTreeMap<String, Cost>
 
 /// The rows of a cost file; one that cannot be read has none.
 fn cost_file(path: &Path) -> BTreeMap<String, Cost> {
-    fs::read_to_string(path)
+    crate::durable::read_text(path)
         .map(|t| parse_costs(&t))
         .unwrap_or_default()
 }
@@ -1154,6 +1160,10 @@ impl<'m> Admission<'m> {
                 ));
                 Some(Admitted::unclaimed())
             }
+            Polled::Unqualified(why) => {
+                say(&format!("capacity: {what} timing admission refused: {why}"));
+                None
+            }
             Polled::Admitted(claim) => {
                 if head.said.is_some() {
                     say(&format!("capacity: {what} admitted after {}", span(waited)));
@@ -1422,7 +1432,7 @@ pub fn record(
     if f.over_budget {
         fs::write(beside("budget"), format!("{}\n", budget.as_secs()))?;
     }
-    let text = fs::read(log).unwrap_or_default();
+    let text = crate::durable::read_file(log).unwrap_or_default();
     let refused = String::from_utf8_lossy(&text).contains(trust_facts::TRUSTD_REFUSED);
     if refused {
         fs::write(beside("trustd"), format!("{}\n", probe()))?;
@@ -1903,7 +1913,7 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
     let libs = gate_list(&meta, &|m| profile_rows_for(m, &repo))?;
     let gone = if files {
         let floors = cfg.repo.join(trust_facts::RATCHET);
-        let text = fs::read_to_string(&floors)
+        let text = crate::durable::read_text(&floors)
             .map_err(|e| format!("the floors {}: {e}", floors.display()))?;
         vanished(&libs, &text)
     } else {
@@ -2370,7 +2380,7 @@ fn finished_cost(f: &Finished) -> Option<Cost> {
     if f.over_budget {
         return None;
     }
-    let file = fs::File::open(&f.job.log).ok()?;
+    let file = crate::durable::open_regular_file(&f.job.log).ok()?;
     let m = trust_facts::Measured::of_log(BufReader::new(file), &f.ended.code.to_string());
     (!m.summary.is_empty() && m.ended.is_empty() && !m.transport).then(|| Cost {
         cpu: f.ended.cpu.as_secs(),
@@ -2385,7 +2395,7 @@ fn write_costs(path: Option<&Path>, new: &BTreeMap<String, Cost>, out: &mut dyn 
     let Some(path) = path.filter(|_| !new.is_empty()) else {
         return;
     };
-    let mut all = fs::read_to_string(path)
+    let mut all = crate::durable::read_text(path)
         .map(|t| parse_costs(&t))
         .unwrap_or_default();
     all.extend(new.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -2604,7 +2614,9 @@ fn held_words(kept: &[PathBuf]) -> String {
                 .file_name()
                 .and_then(|name| slot_number(&name.to_string_lossy()).map(str::to_owned))
                 .zip(slot.parent())
-                .and_then(|(n, root)| fs::read_to_string(root.join(format!(".check.{n}"))).ok());
+                .and_then(|(n, root)| {
+                    crate::durable::read_text(&root.join(format!(".check.{n}"))).ok()
+                });
             let Some(rec) = record.map(|text| CheckRecord::parse(&text)) else {
                 return format!(
                     "kept {}: a check that was ended mid-run or failed may have left a program \
@@ -2811,7 +2823,7 @@ fn reap_stale_checks_with(
             continue;
         };
         let slot = root.join(format!("j{n}"));
-        let text = fs::read_to_string(e.path()).unwrap_or_default();
+        let text = crate::durable::read_text(&e.path()).unwrap_or_default();
         let rec = CheckRecord::parse(&text);
         let hold_spent = |slot: &Path| crate::gates::first_exec_hold(slot).is_none();
         let spent = if rec
@@ -2883,7 +2895,7 @@ fn first_stamp(slot: &Path) -> bool {
 /// written whole beside it and renamed over it, so a lane that dies mid-write leaves it as it
 /// was: whether it keeps them. A record that names no mark is never rewritten.
 fn keep_in_record(record: &Path, reached: &[(i32, u64)]) -> bool {
-    let kept = fs::read_to_string(record).and_then(|text| {
+    let kept = crate::durable::read_text(record).and_then(|text| {
         let mut rec = CheckRecord::parse(&text);
         if rec.nonce.is_none() {
             return Err(std::io::Error::other("it names no mark"));
@@ -2953,7 +2965,7 @@ fn driver_ceiling(
     let cache = state.map(|s| s.join(CEILING_CACHE));
     let text = cache
         .as_deref()
-        .and_then(|c| fs::read_to_string(c).ok())
+        .and_then(|c| crate::durable::read_text(c).ok())
         .unwrap_or_default();
     let kept = key.as_deref().and_then(|k| {
         text.lines()
@@ -3004,11 +3016,13 @@ fn host_memory() -> (u64, bool) {
     if let Some(b) = crate::artifact::host_memory_bytes() {
         return (b, false);
     }
-    let kib = fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
-        t.lines()
-            .find_map(|l| l.strip_prefix("MemTotal:"))
-            .and_then(|v| parse_uint::<u64>(v.split_whitespace().next()?))
-    });
+    let kib = crate::durable::read_regular_text(Path::new("/proc/meminfo"), 64 * 1024)
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("MemTotal:"))
+                .and_then(|v| parse_uint::<u64>(v.split_whitespace().next()?))
+        });
     kib.map_or((0, false), |k| (k * 1024, true))
 }
 
@@ -3392,7 +3406,7 @@ fn cleanup_checkout(dir: &Path) -> Option<PathBuf> {
             owned_cache_file(&entry.path())?;
         }
     }
-    let bytes = fs::read(dir.join(CHECKOUT_RECORD)).ok()?;
+    let bytes = crate::durable::read_regular_bytes(&dir.join(CHECKOUT_RECORD), 64 * 1024).ok()?;
     let path = bytes.strip_suffix(b"\n")?;
     let checkout = PathBuf::from(std::ffi::OsStr::from_bytes(path));
     (checkout.is_absolute()
@@ -6827,6 +6841,9 @@ mod tests {
             aterm_capacity::Polled::Admitted(c) => c,
             aterm_capacity::Polled::Waiting(_, short) => panic!("the holder waits: {short}"),
             aterm_capacity::Polled::Gone(e) => panic!("the holder is gone: {e}"),
+            aterm_capacity::Polled::Unqualified(why) => {
+                panic!("load-only holder unqualified: {why}")
+            }
         };
         let covers: Vec<(String, bool)> = l
             .list()
@@ -6938,6 +6955,9 @@ mod tests {
             aterm_capacity::Polled::Admitted(c) => c,
             aterm_capacity::Polled::Waiting(_, short) => panic!("the holder waits: {short}"),
             aterm_capacity::Polled::Gone(e) => panic!("the holder is gone: {e}"),
+            aterm_capacity::Polled::Unqualified(why) => {
+                panic!("load-only holder unqualified: {why}")
+            }
         };
         let mut f = fake(&[("aterm-render", 5)]);
         f.gate = Some(gate(&l, &m, aterm_capacity::Admit::Wait));

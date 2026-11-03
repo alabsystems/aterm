@@ -272,6 +272,7 @@ struct HandoffWorkerJob {
     preverified: Option<PreverifyPublisher>,
     parked_under: Option<aterm_update_core::handoff_policy::CarryCeiling>,
     successor_grant_chunks: bool,
+    successor_grant_empty: bool,
     command: aterm_uds::spawnfd::StdCommand,
     capture: Option<HandoffCapture>,
     #[cfg(target_os = "macos")]
@@ -284,6 +285,10 @@ struct HandoffWorkerJob {
     expected: Option<(u64, String, String)>,
     #[cfg(target_os = "macos")]
     renews_launch_record: bool,
+    /// The attempt was admitted with no live terminal session, which only the launched lane
+    /// carries.
+    #[cfg(target_os = "macos")]
+    sessionless: bool,
     cleanup: HandoffWorkerCleanup,
     cancel: std::sync::mpsc::Receiver<()>,
     arbiter: crate::HandoffAttemptArbiter,
@@ -296,6 +301,9 @@ pub(crate) struct ParkPolicy {
     pub(crate) policy: Option<aterm_update_core::handoff_policy::HandoffPolicy>,
     pub(crate) known: bool,
     pub(crate) grant_chunks: bool,
+    /// The successor reads a sessionless grant (`empty1`), so a park with no terminal session
+    /// may still hand over.
+    pub(crate) grant_empty: bool,
 }
 
 #[cfg(unix)]
@@ -391,6 +399,7 @@ impl PreverifyPublisher {
                 reason: None,
                 policy,
                 grant_chunks: facts.grant_chunks,
+                grant_empty: facts.grant_empty,
             });
         policy
     }
@@ -412,6 +421,7 @@ impl PreverifyPublisher {
                 reason: Some(reason.to_string()),
                 policy: None,
                 grant_chunks: false,
+                grant_empty: false,
             });
     }
 
@@ -426,6 +436,7 @@ impl PreverifyPublisher {
             &aterm_update::HandoffCandidateFacts {
                 policy: read.clone(),
                 grant_chunks: false,
+                grant_empty: false,
             },
             current_build,
             candidate,
@@ -485,6 +496,7 @@ struct HandoffLaneFacts {
     target_not_older: bool,
     sessions: usize,
     grant_chunks: bool,
+    grant_empty: bool,
     environment_is_a_merge: bool,
 }
 
@@ -503,9 +515,10 @@ const fn out_of_band_lane_refusal(facts: HandoffLaneFacts) -> Option<&'static st
     if !facts.target_not_older {
         return Some("the authorized target build is older than this build");
     }
-    if facts.sessions == 0
-        || facts.sessions > crate::handoff_rendezvous::grant_session_limit(facts.grant_chunks)
-    {
+    if facts.sessions == 0 && !facts.grant_empty {
+        return Some("the successor does not read a grant with no terminal session");
+    }
+    if facts.sessions > crate::handoff_rendezvous::grant_session_limit(facts.grant_chunks) {
         return Some(if facts.grant_chunks {
             "the session count does not fit the successor's chunked descriptor grant"
         } else {
@@ -516,6 +529,126 @@ const fn out_of_band_lane_refusal(facts: HandoffLaneFacts) -> Option<&'static st
         return Some("the launch environment needs a removal a merge cannot express");
     }
     None
+}
+
+/// How an attempt with no live terminal session stands ([`sessionless_lane`]).
+#[cfg(unix)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(dead_code, reason = "only macOS has the launched lane that takes one")
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionlessLane {
+    /// The overlap handoff takes it: the launched lane carries it, or the attempt reports its
+    /// failed pre-park verdict as its own failure.
+    Takes,
+    /// The targeted artifact's pre-park verification has not been read.
+    Unread,
+    /// The launched lane cannot carry it, for this reason.
+    Cannot(&'static str),
+}
+
+/// What [`sessionless_lane`] reads: the windows handed over, the launched lane's facts with no
+/// session, and the targeted artifact's pre-park verdict.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionlessFacts {
+    /// A window is open.
+    window: bool,
+    /// The handed layout holds a tab the successor restores (`App::capture_handoff_layout`).
+    layout: bool,
+    /// The launched lane's facts for this attempt.
+    lane: HandoffLaneFacts,
+    /// A same-image handoff, whose target is this very build: it has no verdict to read.
+    same_image: bool,
+    /// The targeted artifact's cached pre-park verdict, `None` while unread.
+    verdict: Option<bool>,
+}
+
+/// Whether the launched lane carries an attempt with no live terminal session, exactly as the
+/// lane choice ([`out_of_band_lane_refusal`]) will judge it. A cause the verdict cannot change
+/// is named before an unread verdict is waited for.
+#[cfg(target_os = "macos")]
+#[must_use]
+const fn sessionless_lane(facts: SessionlessFacts) -> SessionlessLane {
+    if !facts.window {
+        return SessionlessLane::Cannot("no window is open to hand over");
+    }
+    if !facts.layout {
+        return SessionlessLane::Cannot("no open tab is one the new build can restore");
+    }
+    let reachable = HandoffLaneFacts {
+        grant_empty: true,
+        ..facts.lane
+    };
+    if let Some(reason) = out_of_band_lane_refusal(reachable) {
+        return SessionlessLane::Cannot(reason);
+    }
+    if !facts.same_image {
+        match facts.verdict {
+            None => return SessionlessLane::Unread,
+            Some(false) => return SessionlessLane::Takes,
+            Some(true) => {}
+        }
+    }
+    match out_of_band_lane_refusal(facts.lane) {
+        Some(reason) => SessionlessLane::Cannot(reason),
+        None => SessionlessLane::Takes,
+    }
+}
+
+/// What [`crate::App::admit_update_handoff`] reads beside the live sessions.
+#[cfg(unix)]
+struct AdmissionInputs<'a> {
+    build: u64,
+    target_build: u64,
+    mode: crate::native_updater_service::ApplyMode,
+    apply_attempt: Option<&'a crate::native_updater_service::ApplyAttemptTicket>,
+    same_image: Option<SameImageHandoff>,
+    safety_token: &'a crate::app_native::NativeUpdateSafetyToken,
+    handoff_unavailable: Option<HandoffUnavailable>,
+    /// The launched lane's facts, observed by the caller (the bundle, the rendezvous path and
+    /// the successor command's environment are probes of this process).
+    #[cfg(target_os = "macos")]
+    lane: HandoffLaneFacts,
+}
+
+/// The successor command an overlap handoff starts: this executable with this process's
+/// arguments, told what it updates from, and bound to the authorized artifact.
+#[cfg(unix)]
+fn launched_successor_command(
+    exe: &std::path::Path,
+    build: u64,
+    renewal: bool,
+    attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
+) -> aterm_uds::spawnfd::StdCommand {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
+    )]
+    let mut command = std::process::Command::new(exe);
+    crate::control_socket_identity::bind_command(&mut command);
+    command
+        .args(aterm_update::running_window_successor_args(
+            std::env::args_os().skip(1),
+            None,
+        ))
+        .env("ATERM_UPDATED_FROM", build.to_string())
+        .env(aterm_update::RELAUNCH_OF_RUNNING_ENV, "1");
+    #[cfg(target_os = "macos")]
+    if renewal {
+        command.env(
+            crate::launch_record_renewal::RENEWED_FROM_ENV,
+            std::process::id().to_string(),
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = renewal;
+    bind_expected_update_artifact(
+        &mut command,
+        attempt.filter(|attempt| !attempt.is_installed_activation()),
+    );
+    command
 }
 
 /// The `.app` root containing `exe` (`<bundle>.app/Contents/MacOS/<bin>`), if any.
@@ -1710,6 +1843,7 @@ impl ColdRelaunch {
                 )),
                 policy: None,
                 grant_chunks: false,
+                grant_empty: false,
             },
             roster_wait,
             dmg_sha256: crate::app_native::decode_dmg_sha256(&self.artifact),
@@ -2081,6 +2215,7 @@ fn worker_pre_park_check(
             }
         };
         job.successor_grant_chunks = facts.grant_chunks;
+        job.successor_grant_empty = facts.grant_empty;
         let adopted = job.preverified.as_ref().and_then(|publisher| {
             publisher.publish_pass(
                 &facts,
@@ -2890,6 +3025,11 @@ fn hold_for_park(
     }
 }
 
+/// Why an attempt admitted with no live terminal session never takes the fork lane: a forked
+/// successor keeps this process's launchd job, and there is no session a fork would rescue.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+const SESSIONLESS_NEVER_FORKS: &str = "a handoff with no terminal session never forks";
+
 #[cfg(target_os = "macos")]
 fn fork_after_park(
     job: &HandoffWorkerJob,
@@ -2905,6 +3045,16 @@ fn fork_after_park(
             proxy,
             Some(lane.nonce),
             format!("{why}; a launch-record renewal never forks"),
+        );
+        return Prelaunched::Finished;
+    }
+    if job.sessionless {
+        aterm_log::warn!("update apply: {why}; {SESSIONLESS_NEVER_FORKS}");
+        send_handoff_producer_failure(
+            job,
+            proxy,
+            Some(lane.nonce),
+            format!("{why}; {SESSIONLESS_NEVER_FORKS}"),
         );
         return Prelaunched::Finished;
     }
@@ -3173,11 +3323,10 @@ fn run_prelaunched_handoff(
     );
     environment.push(crate::handoff_rendezvous::ENV_RENDEZVOUS.pair(rendezvous_path));
     environment.push(crate::handoff_rendezvous::ENV_CLAIM.pair(rendezvous.claim()));
-    if job.successor_grant_chunks {
-        environment.push(
-            crate::handoff_rendezvous::ENV_GRANT_CAPS
-                .pair(crate::handoff_rendezvous::GRANT_CAPS_CHUNKS),
-        );
+    if let Some(caps) =
+        crate::handoff_rendezvous::grant_caps(job.successor_grant_chunks, job.successor_grant_empty)
+    {
+        environment.push(crate::handoff_rendezvous::ENV_GRANT_CAPS.pair(caps));
     }
     environment.push(crate::handoff_warm_hint::ENV_WARM_HINT.pair(&lane.warm_hint));
     for (key, value) in crate::seamless::outgoing_parent_env() {
@@ -3290,7 +3439,7 @@ fn run_prelaunched_handoff(
         &job.cancel,
         &named,
     ) {
-        Ok(peer) => peer,
+        Ok(peer) => peer.reading_empty_grant(job.successor_grant_empty),
         Err(end @ (LaunchedDialEnd::Cancelled | LaunchedDialEnd::Rendezvous(_))) => {
             let retire = file_undialled_retire(
                 job,
@@ -4295,12 +4444,16 @@ impl App {
             .find(|why| why.holds_for(self))
     }
 
-    /// This process keeps the image it was launched with (`App::launch_image_kept`).
+    /// A kept image with no live terminal session whose last admission found the sessionless
+    /// handoff unable to carry it: its update installs at the next launch, and a press would
+    /// only be refused.
     #[must_use]
-    pub(crate) const fn launch_keeps_image(&self) -> bool {
+    pub(crate) fn kept_image_installs_at_next_launch(&self) -> bool {
         #[cfg(unix)]
         {
             self.launch_image_kept
+                && self.sessionless_handoff_refused.is_some()
+                && self.handoff_live_sessions().is_empty()
         }
         #[cfg(not(unix))]
         {
@@ -4308,23 +4461,12 @@ impl App {
         }
     }
 
-    /// A process that keeps its image with no live terminal session to hand over.
+    /// This process keeps the image it was launched with (`App::launch_image_kept`).
     #[must_use]
-    pub(crate) fn kept_image_waits_for_terminal(&self) -> bool {
+    pub(crate) const fn launch_keeps_image(&self) -> bool {
         #[cfg(unix)]
         {
-            if !self.launch_image_kept {
-                return false;
-            }
-            let store = self
-                .store
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            !self.pool.iter().any(|session| {
-                !store.by_local(session.id).is_some_and(|handle| {
-                    handle.state == crate::session_store::SessionState::Exited
-                })
-            })
+            self.launch_image_kept
         }
         #[cfg(not(unix))]
         {
@@ -4478,15 +4620,18 @@ impl App {
             // Held until the spawn's exit, or dropped with this attempt.
             let _latch = latch;
             let live_ptys = self.pool.iter().count();
-            let facts = crate::native_update_admission::AdmissionFacts {
-                staged_verified: same_image.is_some() || apply_attempt.is_some(),
-                seamless_capable: false,
-                native_state_certified: safety_token.is_certified(),
-                live_ptys,
-                foreground_jobs: 0,
-                unknown_foregrounds: live_ptys,
-                image_kept: false,
-            };
+            let facts = crate::native_update_admission::AdmissionFacts::observed(
+                crate::native_update_admission::Observation {
+                    staged_verified: same_image.is_some() || apply_attempt.is_some(),
+                    overlap_available: false,
+                    sessionless_handoff: false,
+                    native_state_certified: safety_token.is_certified(),
+                    live_ptys,
+                    foreground_jobs: 0,
+                    unknown_foregrounds: live_ptys,
+                    image_kept: false,
+                },
+            );
             match crate::native_update_admission::classify(facts) {
                 crate::native_update_admission::AdmissionDecision::Apply(
                     crate::native_update_admission::ApplyLane::Cold,
@@ -4598,6 +4743,115 @@ impl App {
             .flatten()
     }
 
+    /// THE ADMISSION of one attempt from what this process shows now: the lane it takes, or
+    /// its refusal. A kept image that the sessionless handoff cannot carry with no live session
+    /// leaves the cause in `App::sessionless_handoff_refused`, which the apply posture and the
+    /// launch-record renewal read; any other outcome clears it.
+    #[cfg(unix)]
+    fn admit_update_handoff(
+        &mut self,
+        live: &[(u64, i32, i32)],
+        inputs: AdmissionInputs<'_>,
+    ) -> Result<crate::native_update_admission::ApplyLane, crate::UpdateHandoffStartError> {
+        let AdmissionInputs {
+            build,
+            target_build,
+            mode,
+            apply_attempt,
+            same_image,
+            safety_token,
+            handoff_unavailable,
+            #[cfg(target_os = "macos")]
+            lane,
+        } = inputs;
+        self.sessionless_handoff_refused = None;
+        let renewal = same_image.is_some_and(SameImageHandoff::renews_launch_record);
+        let (foreground_jobs, unknown_foregrounds) = live.iter().fold(
+            (0usize, 0usize),
+            |(jobs, unknown), (_, master, shell_pid)| {
+                let foreground = crate::quit_safety::foreground_pgrp(*master);
+                if foreground <= 0 {
+                    (jobs, unknown + 1)
+                } else if foreground != *shell_pid {
+                    (jobs + 1, unknown)
+                } else {
+                    (jobs, unknown)
+                }
+            },
+        );
+        let overlap_available = handoff_unavailable.is_none();
+        let sessionless = if live.is_empty() && overlap_available {
+            #[cfg(target_os = "macos")]
+            let read = self.sessionless_lane(apply_attempt, same_image, lane);
+            #[cfg(not(target_os = "macos"))]
+            let read = SessionlessLane::Cannot("this platform has no launched lane to carry it");
+            Some(match (read, apply_attempt) {
+                (SessionlessLane::Unread, Some(attempt)) => {
+                    if let Some(wait) = self.sessionless_preverify_wait(mode, attempt) {
+                        return Err(wait);
+                    }
+                    SessionlessLane::Cannot("the new build's pre-park verification was not read")
+                }
+                (SessionlessLane::Unread, None) => {
+                    SessionlessLane::Cannot("no verified update names the new build")
+                }
+                (read, _) => read,
+            })
+        } else {
+            None
+        };
+        let facts = crate::native_update_admission::AdmissionFacts::observed(
+            crate::native_update_admission::Observation {
+                staged_verified: same_image.is_some() || apply_attempt.is_some(),
+                overlap_available,
+                sessionless_handoff: sessionless == Some(SessionlessLane::Takes),
+                native_state_certified: safety_token.is_certified(),
+                live_ptys: live.len(),
+                foreground_jobs,
+                unknown_foregrounds,
+                image_kept: self.launch_image_kept || renewal,
+            },
+        );
+        // The overlap handoff carries `--hold` panes (`capture_held_screens`); only the cold
+        // lane would close them, and a kept image never takes it.
+        if live.is_empty()
+            && !facts.seamless_capable
+            && !facts.image_kept
+            && !self.handoff_exited_session_ids().is_empty()
+        {
+            return Err(crate::UpdateHandoffStartError::refused(
+                "every open terminal pane's command has exited (panes kept open by --hold); \
+                 the update applies once they are all closed or a new tab opens, because \
+                 replacing the app now would close them",
+            ));
+        }
+        let decision = crate::native_update_admission::classify(facts);
+        let sessionless_refusal = match sessionless {
+            Some(SessionlessLane::Cannot(reason)) => Some(reason),
+            _ => None,
+        };
+        match decision {
+            crate::native_update_admission::AdmissionDecision::Block(reason) => {
+                if reason == crate::native_update_admission::AdmissionBlock::KeptImageWithoutHandoff
+                {
+                    self.sessionless_handoff_refused = sessionless_refusal;
+                }
+                Err(update_admission_refusal(
+                    reason,
+                    facts,
+                    handoff_unavailable,
+                    sessionless_refusal,
+                ))
+            }
+            crate::native_update_admission::AdmissionDecision::Apply(lane) => {
+                match lane_carry_refusal(safety_token, lane, build, target_build) {
+                    Some(refusal) => Err(crate::UpdateHandoffStartError::refused(refusal)),
+                    None => Ok(lane),
+                }
+            }
+        }
+    }
+
     #[cfg(unix)]
     fn start_unix_update_handoff(
         &mut self,
@@ -4620,19 +4874,6 @@ impl App {
                 "terminal activity has not reached the automatic-update quiet epoch",
             ));
         }
-        let (foreground_jobs, unknown_foregrounds) = live.iter().fold(
-            (0usize, 0usize),
-            |(jobs, unknown), (_, master, shell_pid)| {
-                let foreground = crate::quit_safety::foreground_pgrp(*master);
-                if foreground <= 0 {
-                    (jobs, unknown + 1)
-                } else if foreground != *shell_pid {
-                    (jobs + 1, unknown)
-                } else {
-                    (jobs, unknown)
-                }
-            },
-        );
         let handoff_unavailable = self.seamless_handoff_unavailable();
         if let Some(why) = handoff_unavailable {
             if self.launch_image_kept {
@@ -4656,48 +4897,45 @@ impl App {
                 );
             }
         }
-        if live.is_empty()
-            && !(self.launch_image_kept && handoff_unavailable.is_some())
-            && !self.handoff_exited_session_ids().is_empty()
-        {
-            return Err(crate::UpdateHandoffStartError::refused(
-                if self.launch_image_kept {
-                    "every open terminal pane's command has exited (panes kept open by \
-                     --hold); the update applies once a new tab opens, because this aterm \
-                     hands its terminals to the new build and never restarts in place"
-                } else {
-                    "every open terminal pane's command has exited (panes kept open by \
-                     --hold); the update applies once one is closed or a new tab opens, \
-                     because replacing the app now would close them"
-                },
-            ));
-        }
-        let overlap_available = handoff_unavailable.is_none();
-        let facts = crate::native_update_admission::AdmissionFacts {
-            staged_verified: same_image.is_some() || apply_attempt.is_some(),
-            seamless_capable: overlap_available && !live.is_empty(),
-            native_state_certified: safety_token.is_certified(),
-            live_ptys: live.len(),
-            foreground_jobs,
-            unknown_foregrounds,
-            image_kept: self.launch_image_kept || renewal,
-        };
-        let decision = crate::native_update_admission::classify(facts);
         let target_build = apply_attempt
             .as_ref()
             .map_or(build, |attempt| attempt.target_build());
-        if let crate::native_update_admission::AdmissionDecision::Apply(lane) = decision
-            && let Some(refusal) = lane_carry_refusal(&safety_token, lane, build, target_build)
-        {
-            return Err(crate::UpdateHandoffStartError::refused(refusal));
-        }
-        match decision {
-            crate::native_update_admission::AdmissionDecision::Block(reason) => {
-                return Err(update_admission_refusal(reason, facts, handoff_unavailable));
+        let command = launched_successor_command(&exe, build, renewal, apply_attempt.as_ref());
+        #[cfg(target_os = "macos")]
+        let bundle = app_bundle_root(&exe);
+        // One reading of the launched lane's facts, for the admission and the lane choice alike.
+        #[cfg(target_os = "macos")]
+        let lane_facts = {
+            let policy = self.park_policy(apply_attempt.as_ref());
+            HandoffLaneFacts {
+                bundled: bundle.is_some(),
+                launcher_available: true,
+                socket_path_fits: crate::handoff_rendezvous::rendezvous_path_fits(),
+                target_not_older: target_build >= build,
+                sessions: live.len(),
+                grant_chunks: policy.grant_chunks || renewal,
+                // A same-image handoff (`DebugSeam`, a launch-record renewal) targets this very
+                // build, which reads a sessionless grant.
+                grant_empty: policy.grant_empty || same_image.is_some(),
+                environment_is_a_merge: launch_environment(&command).is_some(),
             }
-            crate::native_update_admission::AdmissionDecision::Apply(
-                crate::native_update_admission::ApplyLane::Cold,
-            ) => {
+        };
+        let lane = self.admit_update_handoff(
+            &live,
+            AdmissionInputs {
+                build,
+                target_build,
+                mode,
+                apply_attempt: apply_attempt.as_ref(),
+                same_image,
+                safety_token: &safety_token,
+                handoff_unavailable,
+                #[cfg(target_os = "macos")]
+                lane: lane_facts,
+            },
+        )?;
+        match lane {
+            crate::native_update_admission::ApplyLane::Cold => {
                 // The admission already refuses it (`image_kept`); said again where the
                 // exec is, whatever the facts.
                 if renewal {
@@ -4713,7 +4951,7 @@ impl App {
                     clippy::disallowed_types,
                     reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
                 )]
-                let mut command = std::process::Command::new(exe);
+                let mut command = std::process::Command::new(&exe);
                 command
                     .args(aterm_update::running_window_successor_args(
                         std::env::args_os().skip(1),
@@ -4772,9 +5010,7 @@ impl App {
                 self.resume_after_cold_exec();
                 return Err(why);
             }
-            crate::native_update_admission::AdmissionDecision::Apply(
-                crate::native_update_admission::ApplyLane::Seamless,
-            ) => {}
+            crate::native_update_admission::ApplyLane::Seamless => {}
         }
 
         let target_commit = apply_attempt.as_ref().map_or_else(
@@ -4802,7 +5038,9 @@ impl App {
         let preverified = apply_attempt
             .as_ref()
             .and_then(|attempt| self.cached_handoff_preverification(attempt));
-        if preverified == Some(false) && mode.is_automatic() {
+        // An attempt with no session reports its failed verdict whoever pressed: only the
+        // launched lane carries it, to a successor this verdict did not pass.
+        if preverified == Some(false) && (mode.is_automatic() || live.is_empty()) {
             let reason = apply_attempt
                 .as_ref()
                 .and_then(|attempt| self.cached_handoff_preverification_reason(attempt))
@@ -4864,11 +5102,6 @@ impl App {
         }
         self.record_update_switch_started(build, same_image.is_some(), mode.is_automatic());
 
-        #[cfg(target_os = "macos")]
-        let rendezvous_path_fits = crate::handoff_rendezvous::rendezvous_path_fits();
-        #[cfg(target_os = "macos")]
-        let bundle = app_bundle_root(&exe);
-
         let (cancel, cancelled) = std::sync::mpsc::sync_channel(1);
         let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<HandoffWorkerJob>(1);
         let worker_proxy = proxy.clone();
@@ -4892,46 +5125,12 @@ impl App {
             ));
         };
         self.next_update_handoff_id = next_attempt_id;
-        #[expect(
-            clippy::disallowed_types,
-            reason = "the update successor's raw Command: it hands over exactly its own descriptors, which a strip at the exec would undo"
-        )]
-        let mut command = std::process::Command::new(exe);
-        crate::control_socket_identity::bind_command(&mut command);
-        command
-            .args(aterm_update::running_window_successor_args(
-                std::env::args_os().skip(1),
-                None,
-            ))
-            .env("ATERM_UPDATED_FROM", build.to_string())
-            .env(aterm_update::RELAUNCH_OF_RUNNING_ENV, "1");
-        #[cfg(target_os = "macos")]
-        if renewal {
-            command.env(
-                crate::launch_record_renewal::RENEWED_FROM_ENV,
-                std::process::id().to_string(),
-            );
-        }
         let installed_activation = apply_attempt
             .as_ref()
             .is_some_and(|attempt| attempt.is_installed_activation());
-        bind_expected_update_artifact(
-            &mut command,
-            apply_attempt.as_ref().filter(|_| !installed_activation),
-        );
-        #[cfg(target_os = "macos")]
-        let lane_grant_chunks = self.park_policy(apply_attempt.as_ref()).grant_chunks || renewal;
         #[cfg(target_os = "macos")]
         let lane = {
-            let facts = HandoffLaneFacts {
-                bundled: bundle.is_some(),
-                launcher_available: true,
-                socket_path_fits: rendezvous_path_fits,
-                target_not_older: target_build >= build,
-                sessions: live.len(),
-                grant_chunks: lane_grant_chunks,
-                environment_is_a_merge: launch_environment(&command).is_some(),
-            };
+            let facts = lane_facts;
             let never_forks = |why: &str| {
                 crate::UpdateHandoffStartError::refused(format!(
                     "{why}; a launch-record renewal never forks: a forked successor keeps \
@@ -4954,6 +5153,11 @@ impl App {
                     }
                 }
                 Some(reason) if renewal => return Err(never_forks(reason)),
+                Some(reason) if live.is_empty() => {
+                    return Err(crate::UpdateHandoffStartError::refused(format!(
+                        "{reason}; {SESSIONLESS_NEVER_FORKS}"
+                    )));
+                }
                 Some(reason) => {
                     aterm_log::info!("update apply: forking instead of launching — {reason}");
                     HandoffLane::Fork
@@ -4978,7 +5182,9 @@ impl App {
                 target_commit,
                 command,
                 verify_staged_candidate,
-                grant_chunks: lane_grant_chunks,
+                grant_chunks: lane_facts.grant_chunks,
+                grant_empty: lane_facts.grant_empty,
+                sessionless: live.is_empty(),
                 installed_activation,
                 bundle,
                 cancel,
@@ -5197,6 +5403,7 @@ impl App {
             preverified,
             parked_under: Some(ceiling),
             successor_grant_chunks: false,
+            successor_grant_empty: false,
             command,
             capture: Some(HandoffCapture {
                 #[cfg(target_os = "macos")]
@@ -5231,6 +5438,8 @@ impl App {
             expected: None,
             #[cfg(target_os = "macos")]
             renews_launch_record: renewal,
+            #[cfg(target_os = "macos")]
+            sessionless: false,
             cleanup,
             cancel: cancelled,
             arbiter,
@@ -6070,6 +6279,8 @@ impl App {
             command,
             verify_staged_candidate,
             grant_chunks,
+            grant_empty,
+            sessionless,
             installed_activation,
             bundle,
             cancel,
@@ -6128,6 +6339,7 @@ impl App {
             revoked_by_activity: false,
             booked_launch_unregistered: false,
             history_export,
+            sessionless,
         });
         let cleanup = HandoffWorkerCleanup {
             parent_socket: self.handoff_parent_socket(),
@@ -6143,6 +6355,7 @@ impl App {
             preverified,
             parked_under: None,
             successor_grant_chunks: grant_chunks,
+            successor_grant_empty: grant_empty,
             command,
             capture: None,
             prelaunch: Some(HandoffPrelaunchLane {
@@ -6159,6 +6372,7 @@ impl App {
             bundle,
             expected,
             renews_launch_record: same_image.is_some_and(SameImageHandoff::renews_launch_record),
+            sessionless,
             cleanup,
             cancel: cancelled,
             arbiter,
@@ -6495,6 +6709,7 @@ impl App {
         let dialled_at = dialled.map_or(now, |dialled| dialled.at);
         let park_misses = prelaunch.park_misses;
         let land_waits = prelaunch.land_waits;
+        let sessionless = prelaunch.sessionless;
         let build = crate::build_info::build_number()
             .parse::<u64>()
             .unwrap_or(0);
@@ -6505,10 +6720,25 @@ impl App {
         }
 
         let live: Vec<(u64, i32, i32)> = self.handoff_live_sessions();
-        if live.is_empty() {
+        // A sessionless attempt parks with none, for a successor that reads that grant (a
+        // same-image one is this build); one admitted with sessions stands down once they
+        // have all closed.
+        let reads_empty = policy.grant_empty || same_image.is_some();
+        if live.is_empty() && (!sessionless || !reads_empty) {
             return ParkAttempt::Failed(HandoffStandDown {
                 outcome: crate::UpdateHandoffOutcome::ActivityRevoked,
-                detail: "every terminal session closed while the successor booted".to_string(),
+                detail: if sessionless {
+                    "the successor does not read a grant with no terminal session".to_string()
+                } else {
+                    "every terminal session closed while the successor booted".to_string()
+                },
+            });
+        }
+        // A park cue with no dialler is the fork lane's, which carries no sessionless attempt.
+        if live.is_empty() && dialer_pid.is_none() {
+            return ParkAttempt::Failed(HandoffStandDown {
+                outcome: crate::UpdateHandoffOutcome::ProducerFailed,
+                detail: format!("the launched lane refused at runtime; {SESSIONLESS_NEVER_FORKS}"),
             });
         }
         let pause_asked = self
@@ -7266,8 +7496,11 @@ impl App {
                 let _ = crate::menu::cancel_current_native_termination();
                 self.on_quit_requested(el);
             }
-            crate::DeferredHandoffTeardown::NativeTerminate { generation } => {
-                self.on_native_terminate_requested(el, generation);
+            crate::DeferredHandoffTeardown::NativeTerminate {
+                generation,
+                confirmed,
+            } => {
+                self.resume_native_termination(el, generation, confirmed);
             }
             crate::DeferredHandoffTeardown::CleanQuitReady => {
                 // A native view or document may have gained unsaved work during the
@@ -8240,6 +8473,68 @@ impl App {
             .and_then(read)
     }
 
+    /// How an attempt with no live terminal session stands: only the launched lane carries one,
+    /// to a successor that reads a sessionless grant, and only windows with a restorable tab
+    /// give it something to hand over.
+    #[cfg(target_os = "macos")]
+    fn sessionless_lane(
+        &self,
+        attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
+        same_image: Option<SameImageHandoff>,
+        lane: HandoffLaneFacts,
+    ) -> SessionlessLane {
+        sessionless_lane(SessionlessFacts {
+            window: !self.windows.is_empty(),
+            layout: !self.capture_handoff_layout().is_empty(),
+            lane,
+            same_image: same_image.is_some(),
+            verdict: attempt.and_then(|attempt| self.cached_handoff_preverification(attempt)),
+        })
+    }
+
+    /// The wait for the targeted artifact's pre-park read before an attempt with no live
+    /// terminal session is classified, or `None` when there is nothing left to wait for. A read
+    /// that ended without a verdict (a passing error, which no cache keeps) is read again.
+    #[cfg(unix)]
+    fn sessionless_preverify_wait(
+        &mut self,
+        mode: crate::native_updater_service::ApplyMode,
+        attempt: &crate::native_updater_service::ApplyAttemptTicket,
+    ) -> Option<crate::UpdateHandoffStartError> {
+        let now = std::time::Instant::now();
+        let target_build = attempt.target_build();
+        let passing = self
+            .handoff_preverify_in_flight
+            .as_ref()
+            .filter(|read| read.reads(attempt))
+            .and_then(|read| read.ended_passing(now))
+            .map(str::to_string);
+        if let Some(reason) = passing {
+            let started = crate::app_native::decode_dmg_sha256(attempt.target_dmg_sha256())
+                .is_some_and(|dmg_sha256| {
+                    self.start_fresh_preverification(target_build, dmg_sha256)
+                });
+            if !started {
+                return Some(crate::UpdateHandoffStartError::failed(format!(
+                    "{reason}; the update is tried again later"
+                )));
+            }
+            let until = now + crate::HANDOFF_PREVERIFY_READ_CEILING;
+            self.preverify_read_waited = Some((target_build, until));
+            return Some(if mode.is_automatic() {
+                preverify_read_activity(target_build, PreverifyWaiter::SessionlessHandoff)
+            } else {
+                preverify_read_hold(target_build, PreverifyWaiter::SessionlessHandoff, until)
+            });
+        }
+        self.preverify_read_wait(
+            mode,
+            target_build,
+            true,
+            PreverifyWaiter::SessionlessHandoff,
+        )
+    }
+
     /// The successor's handoff policy as every park follows it, from the passed pre-verification of exactly the targeted artifact.
     #[cfg(unix)]
     #[must_use]
@@ -8266,6 +8561,7 @@ impl App {
                 policy: entry.policy,
                 known: true,
                 grant_chunks: entry.grant_chunks,
+                grant_empty: entry.grant_empty,
             })
     }
 
@@ -8520,6 +8816,7 @@ fn preverify_read_hold(
 enum PreverifyWaiter {
     ForkPark,
     ColdRelaunch,
+    SessionlessHandoff,
 }
 
 #[cfg(unix)]
@@ -8528,13 +8825,14 @@ impl PreverifyWaiter {
         match self {
             Self::ForkPark => "the fork lane",
             Self::ColdRelaunch => "the cold lane",
+            Self::SessionlessHandoff => "the handoff with no terminal session",
         }
     }
 
     const fn what(self) -> &'static str {
         match self {
             Self::ForkPark => "handoff policy",
-            Self::ColdRelaunch => "pre-park verification",
+            Self::ColdRelaunch | Self::SessionlessHandoff => "pre-park verification",
         }
     }
 
@@ -8542,6 +8840,7 @@ impl PreverifyWaiter {
         match self {
             Self::ForkPark => "parks",
             Self::ColdRelaunch => "relaunches",
+            Self::SessionlessHandoff => "starts",
         }
     }
 
@@ -8549,6 +8848,7 @@ impl PreverifyWaiter {
         match self {
             Self::ForkPark => "parking",
             Self::ColdRelaunch => "relaunching",
+            Self::SessionlessHandoff => "deciding",
         }
     }
 }
@@ -8993,6 +9293,7 @@ fn update_admission_refusal(
     reason: crate::native_update_admission::AdmissionBlock,
     facts: crate::native_update_admission::AdmissionFacts,
     unavailable: Option<HandoffUnavailable>,
+    sessionless_refusal: Option<&str>,
 ) -> crate::UpdateHandoffStartError {
     let message = if reason == crate::native_update_admission::AdmissionBlock::LivePtysNeedSeamless
         && facts.foreground_jobs <= facts.live_ptys
@@ -9005,7 +9306,7 @@ fn update_admission_refusal(
             why.cause(),
             why.remedy(),
         )
-    } else if reason == crate::native_update_admission::AdmissionBlock::KeptImageNeedsTerminal
+    } else if reason == crate::native_update_admission::AdmissionBlock::KeptImageWithoutHandoff
         && let Some(why) = unavailable
     {
         format!(
@@ -9013,6 +9314,10 @@ fn update_admission_refusal(
             why.cause(),
             why.remedy(),
         )
+    } else if reason == crate::native_update_admission::AdmissionBlock::KeptImageWithoutHandoff
+        && let Some(why) = sessionless_refusal
+    {
+        format!("The update installs at the next launch: {why}")
     } else {
         reason.message(facts)
     };
@@ -9054,7 +9359,7 @@ mod admission_refusal_detail_tests {
                 let AdmissionDecision::Block(reason) = classify(facts) else {
                     panic!("live terminals without seamless handoff must block");
                 };
-                let refusal = update_admission_refusal(reason, facts, Some(unavailable));
+                let refusal = update_admission_refusal(reason, facts, Some(unavailable), None);
                 assert!(
                     refusal.is_refused(),
                     "a refusal cannot increment a failure streak"
@@ -9074,15 +9379,57 @@ mod admission_refusal_detail_tests {
                 image_kept: true,
                 ..live_facts()
             };
+            assert_eq!(
+                classify(kept),
+                AdmissionDecision::Block(AdmissionBlock::KeptImageWithoutHandoff)
+            );
             let refusal = update_admission_refusal(
-                AdmissionBlock::KeptImageNeedsTerminal,
+                AdmissionBlock::KeptImageWithoutHandoff,
                 kept,
                 Some(unavailable),
+                Some("the sessionless cause"),
             );
             assert!(refusal.is_refused());
             let message = refusal.into_message();
             assert!(message.contains(cause), "{message}");
+            assert!(!message.contains("terminal tab"), "{message}");
+            assert_eq!(
+                classify(AdmissionFacts {
+                    seamless_capable: true,
+                    ..kept
+                }),
+                AdmissionDecision::Apply(crate::native_update_admission::ApplyLane::Seamless),
+                "a kept image the handoff can carry with no terminal is never refused"
+            );
         }
+    }
+
+    /// A kept image the sessionless handoff cannot carry names that cause, and the next launch.
+    #[test]
+    fn a_kept_image_without_a_sessionless_handoff_names_its_cause() {
+        let kept = AdmissionFacts {
+            live_ptys: 0,
+            foreground_jobs: 0,
+            image_kept: true,
+            ..live_facts()
+        };
+        let cause = "no open tab is one the new build can restore";
+        let message = update_admission_refusal(
+            AdmissionBlock::KeptImageWithoutHandoff,
+            kept,
+            None,
+            Some(cause),
+        )
+        .into_message();
+        assert_eq!(
+            message,
+            format!("The update installs at the next launch: {cause}")
+        );
+        assert_eq!(
+            update_admission_refusal(AdmissionBlock::KeptImageWithoutHandoff, kept, None, None)
+                .into_message(),
+            AdmissionBlock::KeptImageWithoutHandoff.message(kept),
+        );
     }
 
     #[test]
@@ -9121,13 +9468,17 @@ mod admission_refusal_detail_tests {
             ),
         ] {
             assert_eq!(classify(facts), AdmissionDecision::Block(expected));
-            let refusal =
-                update_admission_refusal(expected, facts, Some(HandoffUnavailable::Headless));
+            let refusal = update_admission_refusal(
+                expected,
+                facts,
+                Some(HandoffUnavailable::Headless),
+                Some("a sessionless cause"),
+            );
             assert!(refusal.is_refused());
             assert_eq!(refusal.into_message(), expected.message(facts));
         }
         assert_eq!(
-            update_admission_refusal(AdmissionBlock::LivePtysNeedSeamless, base, None)
+            update_admission_refusal(AdmissionBlock::LivePtysNeedSeamless, base, None, None)
                 .into_message(),
             AdmissionBlock::LivePtysNeedSeamless.message(base),
         );
@@ -9180,6 +9531,8 @@ struct PrelaunchArgs {
     command: aterm_uds::spawnfd::StdCommand,
     verify_staged_candidate: bool,
     grant_chunks: bool,
+    grant_empty: bool,
+    sessionless: bool,
     installed_activation: bool,
     bundle: Option<std::path::PathBuf>,
     cancel: std::sync::mpsc::SyncSender<()>,

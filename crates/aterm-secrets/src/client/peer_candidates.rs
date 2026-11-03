@@ -209,12 +209,7 @@ impl<'a> PeerDiscovery<'a> {
         policy: &[String],
         current: &str,
     ) -> Vec<String> {
-        let mut seen = BTreeSet::new();
-        let mut urls: Vec<_> = std::iter::once(primary)
-            .chain(policy.iter().map(String::as_str))
-            .filter_map(|raw| normalized_url(raw, &config.name))
-            .filter(|url| seen.insert(transport::describe(url).to_ascii_lowercase()))
-            .collect();
+        let mut urls = policy_queues(config, primary, policy);
         if urls.is_empty() {
             return urls;
         }
@@ -248,6 +243,16 @@ impl<'a> PeerDiscovery<'a> {
         }
         urls
     }
+}
+
+/// Every explicitly configured queue, without discovery hints or cursor selection.
+pub(super) fn policy_queues(config: &Config, primary: &str, policy: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    std::iter::once(primary)
+        .chain(policy.iter().map(String::as_str))
+        .filter_map(|raw| normalized_url(raw, &config.name))
+        .filter(|url| seen.insert(transport::describe(url).to_ascii_lowercase()))
+        .collect()
 }
 
 enum Pool {

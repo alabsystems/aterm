@@ -35,6 +35,10 @@ pub(crate) struct Fx {
 pub(crate) enum ClockSource {
     /// The system's: what every call site read before the door.
     Os,
+    /// A host that never sleeps: the system's monotonic clock and a wall clock kept to it
+    /// ([`AwakeClock`]).
+    #[cfg(any(test, debug_assertions))]
+    Awake(AwakeClock),
     /// The tests' fixed wall clock over the real monotonic one.
     #[cfg(test)]
     Scripted(Arc<ScriptedClock>),
@@ -576,6 +580,13 @@ impl Fx {
         }
     }
 
+    /// This door's clocks from now: a host's that never sleeps, started where the system's stand
+    /// ([`AwakeClock`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn awake(&mut self) {
+        self.clock = ClockSource::Awake(AwakeClock::from_os());
+    }
+
     /// The test clock this door reads, made a [`ScriptedClock`] first if it was the system's.
     #[cfg(test)]
     pub(crate) fn scripted(&mut self) -> Option<&ScriptedClock> {
@@ -584,7 +595,7 @@ impl Fx {
         }
         match &self.clock {
             ClockSource::Scripted(c) => Some(c),
-            ClockSource::Os | ClockSource::Virtual(_) => None,
+            ClockSource::Os | ClockSource::Awake(_) | ClockSource::Virtual(_) => None,
         }
     }
 
@@ -594,7 +605,7 @@ impl Fx {
         self.scripted()?;
         match &self.clock {
             ClockSource::Scripted(c) => Some(Arc::clone(c)),
-            ClockSource::Os | ClockSource::Virtual(_) => None,
+            ClockSource::Os | ClockSource::Awake(_) | ClockSource::Virtual(_) => None,
         }
     }
 }
@@ -603,6 +614,8 @@ impl ClockSource {
     fn mono(&self) -> Instant {
         match self {
             Self::Os => Instant::now(),
+            #[cfg(any(test, debug_assertions))]
+            Self::Awake(_) => Instant::now(),
             #[cfg(test)]
             Self::Scripted(c) => c.mono(),
             #[cfg(test)]
@@ -614,6 +627,11 @@ impl ClockSource {
     fn peek(&self) -> (Instant, i64) {
         match self {
             Self::Os => (Instant::now(), super::limit::unix_now_ms()),
+            #[cfg(any(test, debug_assertions))]
+            Self::Awake(c) => {
+                let at = Instant::now();
+                (at, c.wall_at(at))
+            }
             #[cfg(test)]
             Self::Scripted(c) => (c.mono(), c.peek_wall_ms()),
             #[cfg(test)]
@@ -624,6 +642,8 @@ impl ClockSource {
     fn wall_ms(&self) -> i64 {
         match self {
             Self::Os => super::limit::unix_now_ms(),
+            #[cfg(any(test, debug_assertions))]
+            Self::Awake(c) => c.wall_ms(),
             #[cfg(test)]
             Self::Scripted(c) => c.wall_ms(),
             #[cfg(test)]
@@ -634,6 +654,8 @@ impl ClockSource {
     fn wall_s(&self) -> i64 {
         match self {
             Self::Os => super::limit::unix_now(),
+            #[cfg(any(test, debug_assertions))]
+            Self::Awake(c) => c.wall_ms().div_euclid(1000),
             #[cfg(test)]
             Self::Scripted(c) => c.wall_s(),
             #[cfg(test)]
@@ -644,6 +666,8 @@ impl ClockSource {
     fn stamp_ms(&self) -> i64 {
         match self {
             Self::Os => super::journal::unix_ms(),
+            #[cfg(any(test, debug_assertions))]
+            Self::Awake(c) => c.wall_ms(),
             #[cfg(test)]
             Self::Scripted(c) => c.stamp_ms(),
             #[cfg(test)]
@@ -654,6 +678,8 @@ impl ClockSource {
     fn sleep(&self, d: Duration) {
         match self {
             Self::Os => std::thread::sleep(d),
+            #[cfg(any(test, debug_assertions))]
+            Self::Awake(_) => std::thread::sleep(d),
             #[cfg(test)]
             Self::Scripted(c) => c.sleep(d),
             #[cfg(test)]
@@ -665,6 +691,8 @@ impl ClockSource {
     fn asleep(&self) -> Option<SleepStamp> {
         match self {
             Self::Os => os_asleep(),
+            #[cfg(any(test, debug_assertions))]
+            Self::Awake(_) => Some(AwakeClock::asleep()),
             #[cfg(test)]
             Self::Scripted(c) => c.asleep(),
             #[cfg(test)]
@@ -676,6 +704,8 @@ impl ClockSource {
     fn last_sleep(&self) -> Option<(i64, i64)> {
         match self {
             Self::Os => os_last_sleep(),
+            #[cfg(any(test, debug_assertions))]
+            Self::Awake(_) => None,
             #[cfg(test)]
             Self::Scripted(c) => c.script().last_sleep,
             #[cfg(test)]
@@ -687,6 +717,8 @@ impl ClockSource {
     fn full_wake(&self) -> Option<bool> {
         match self {
             Self::Os => os_full_wake(),
+            #[cfg(any(test, debug_assertions))]
+            Self::Awake(_) => Some(true),
             #[cfg(test)]
             Self::Scripted(c) => c.script().full_wake,
             #[cfg(test)]
@@ -732,6 +764,51 @@ fn os_full_wake() -> Option<bool> {
 #[cfg(test)]
 fn os_full_wake() -> Option<bool> {
     None
+}
+
+/// THE CLOCKS OF A HOST THAT NEVER SLEEPS, for a test whose loop runs on a real machine: the
+/// system's monotonic clock, and a wall clock that keeps its pace from where the system's stood
+/// when it was made, so the wall never runs ahead of the monotonic clock whatever the machine
+/// does ([`super::run::slept_through`]). Its machine counts no sleep on its boot, keeps no record
+/// of a last one, and is in a full wake, so no reader of the sleep doors finds one to settle.
+#[cfg(any(test, debug_assertions))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AwakeClock {
+    /// The monotonic clock when it was made.
+    origin: Instant,
+    /// The system's wall clock then, Unix milliseconds.
+    wall_origin_ms: i64,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl AwakeClock {
+    /// Clocks that start where the system's stand now.
+    fn from_os() -> Self {
+        Self {
+            origin: Instant::now(),
+            wall_origin_ms: super::limit::unix_now_ms(),
+        }
+    }
+
+    /// The wall clock when the monotonic one read `at`, Unix milliseconds.
+    fn wall_at(&self, at: Instant) -> i64 {
+        let ran = at.saturating_duration_since(self.origin).as_millis();
+        self.wall_origin_ms
+            .saturating_add(i64::try_from(ran).unwrap_or(i64::MAX))
+    }
+
+    /// The wall clock now, Unix milliseconds.
+    fn wall_ms(&self) -> i64 {
+        self.wall_at(Instant::now())
+    }
+
+    /// The machine's count of its sleep: none, on [`TEST_BOOT`].
+    fn asleep() -> SleepStamp {
+        SleepStamp {
+            asleep: Duration::ZERO,
+            boot: Some(Boot::kernel(TEST_BOOT)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -799,7 +876,7 @@ struct Script {
 }
 
 /// The boot a counting test clock counts on unless the test names another.
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 pub(crate) const TEST_BOOT: [u8; 16] = [
     0x7E, 0x57, 0xB0, 0x07, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
 ];

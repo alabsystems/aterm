@@ -265,3 +265,23 @@ fn has_section_is_exact_about_versions() {
     assert!(!changelog::has_section("## [0.2.10] - x\n", "0.2.1"));
     assert!(!changelog::has_section(FIX_SMALL, "0.25.0"));
 }
+
+#[test]
+fn gate_refuses_git_conflict_markers_with_the_file_line_number() {
+    for (marker_line, head) in [
+        ("<<<<<<< HEAD", "<<<<<<<"),
+        ("||||||| base", "|||||||"),
+        ("=======", "======="),
+        (">>>>>>> origin/main", ">>>>>>>"),
+    ] {
+        let fix = format!(
+            "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- clean entry\n{marker_line}\n\n## [0.25] - 2026-01-01\n- old\n"
+        );
+        let err = changelog::gate_unreleased(&fix).unwrap_err().to_string();
+        assert!(err.contains("line 7"), "{marker_line}: {err}");
+        assert!(err.contains(head), "{marker_line}: {err}");
+    }
+
+    let outside = "## [Unreleased]\n\n### Fixed\n- clean entry\n\n## [0.25] - x\n>>>>>>> origin/main\n- old\n";
+    assert!(changelog::gate_unreleased(outside).is_ok());
+}

@@ -244,13 +244,135 @@ fn a_pass_end_quotes_the_outcome_this_pass_wrote_and_no_other() {
 fn the_defer_busy_flip_flag_is_stripped_and_picks_the_policy() {
     let argv = |parts: &[&str]| parts.iter().map(ToString::to_string).collect::<Vec<_>>();
     let mut args = argv(&["update", "--wait-lock", "1800", "--defer-busy-flip"]);
-    assert!(super::apply_defer_busy_flip_flag(&mut args));
-    assert_eq!(args, argv(&["update", "--wait-lock", "1800"]));
+    let lane = super::LaneFlags::take(&mut args);
+    assert!(lane.defer_busy_flip);
+    assert_eq!(args, argv(&["update"]));
+    super::pick_flip_policy(lane.defer_busy_flip);
     assert_eq!(super::flip_policy(), crate::quiet::FlipPolicy::WhenQuiet);
     let mut args = argv(&["update"]);
-    assert!(!super::apply_defer_busy_flip_flag(&mut args));
+    let lane = super::LaneFlags::take(&mut args);
+    assert!(!lane.defer_busy_flip);
     assert_eq!(args, argv(&["update"]), "absent: untouched");
+    super::pick_flip_policy(lane.defer_busy_flip);
     assert_eq!(super::flip_policy(), crate::quiet::FlipPolicy::Now);
+}
+
+#[test]
+fn lane_flags_come_off_a_pass_wherever_they_stand_and_stay_on_other_verbs() {
+    let argv = |parts: &[&str]| parts.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let mut args = argv(&[
+        "update",
+        "--progress-file",
+        "/p/one",
+        "claude",
+        crate::cli::HEAD_WATCH_FLAG,
+        "--wait-lock",
+        "60",
+        PUBLISHED_INDEX_HINT_FLAG,
+        "45",
+        "--progress-file",
+        "/p/two",
+        crate::cli::NO_INIT_FLAG,
+        crate::cli::DEFER_BUSY_FLIP_FLAG,
+    ]);
+    assert_eq!(
+        super::LaneFlags::take(&mut args),
+        super::LaneFlags {
+            progress_file: Some("/p/one".into()),
+            head_watch: true,
+            wait_lock: Some(std::time::Duration::from_secs(60)),
+            no_init: true,
+            published_index_hint: Some(45),
+            defer_busy_flip: true,
+        }
+    );
+    assert_eq!(args, argv(&["update", "claude"]));
+    // The update-only two stay on an install, where its own parse refuses them.
+    let mut args = argv(&[
+        "install",
+        crate::cli::NO_INIT_FLAG,
+        "--wait-lock",
+        "5",
+        "clt",
+        PUBLISHED_INDEX_HINT_FLAG,
+        "4",
+    ]);
+    let lane = super::LaneFlags::take(&mut args);
+    assert_eq!(lane.wait_lock, Some(std::time::Duration::from_secs(5)));
+    assert!(lane.no_init);
+    assert_eq!(lane.published_index_hint, None);
+    assert_eq!(
+        args,
+        argv(&["install", "clt", PUBLISHED_INDEX_HINT_FLAG, "4"])
+    );
+    let mut args = argv(&["seed", crate::cli::NO_INIT_FLAG]);
+    assert!(super::LaneFlags::take(&mut args).no_init);
+    assert_eq!(args, argv(&["seed"]));
+    let words = argv(&[
+        "run",
+        "tool",
+        "--wait-lock",
+        "5",
+        "--progress-file",
+        "p",
+        crate::cli::NO_INIT_FLAG,
+    ]);
+    let mut args = words.clone();
+    assert_eq!(
+        super::LaneFlags::take(&mut args),
+        super::LaneFlags::default()
+    );
+    assert_eq!(args, words, "another verb's words are its own");
+}
+
+#[test]
+fn a_finished_install_or_update_is_followed_by_setup_unless_its_words_say_otherwise() {
+    let words = |parts: &[&str]| {
+        parts
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>()
+    };
+    for follows in [
+        &["install", "trust"][..],
+        &["install", "--default-set"],
+        &["update"],
+        &["update", "codex"],
+        &["update", "codex", SOURCE_VENDOR_FLAG],
+        &["update", "--retry"],
+        &["install", "--progress-file", "p", "trust"],
+        &["update", "--wait-lock", "soon"],
+        &["install", "claude"],
+    ] {
+        assert!(super::pass_finishes_setup(&words(follows)), "{follows:?}");
+    }
+    let clt = ["clt", "base.clt", "command-line-tools"];
+    for alias in clt {
+        assert!(super::is_clt_alias(alias), "{alias}");
+    }
+    for stays in [
+        &[][..],
+        &["doctor"],
+        &["seed"],
+        &["list"],
+        &["help", "install"],
+        &["install", "--help"],
+        &["update", "codex", "-h"],
+        &["install", clt[0]],
+        &["update", clt[1]],
+        &["install", crate::cli::HEAD_WATCH_FLAG, clt[2]],
+        &["install", "--wait-lock", "60", "trust"],
+        &["update", "claude", "--wait-lock", "1800"],
+        &["install", crate::cli::NO_INIT_FLAG, "claude"],
+        &["install", "claude", crate::cli::NO_INIT_FLAG],
+        &["update", crate::cli::NO_INIT_FLAG],
+        &[crate::cli::PRIVATE_STATE_ROOT_FLAG, "update"],
+    ] {
+        assert!(!super::pass_finishes_setup(&words(stays)), "{stays:?}");
+    }
+    let built_in = crate::builtin::BUILTIN_PROGRAMS[0].name;
+    assert!(!super::pass_finishes_setup(&words(&["install", built_in])));
+    assert!(!super::pass_finishes_setup(&words(&["update", built_in])));
 }
 
 #[test]
@@ -3064,6 +3186,37 @@ fn roll_forward_never_activates_a_pinned_yanked_or_rolled_off_build() {
         roll_forward_interrupted_activations(&layout, || index(&[])).is_empty(),
         "the rolled-off build stays off"
     );
+    let v281 = vendor_version("2.1.281").build_id();
+    let v282 = vendor_version("2.1.282").build_id();
+    make_live(&layout, "claude", v281);
+    flip_only(&layout, "claude", v282);
+    assert!(
+        roll_forward_interrupted_activations(&layout, || index(&["claude@2.1.282"])).is_empty(),
+        "a vendor build yanked in the cached index is never rolled forward"
+    );
+    assert_eq!(crate::active_builds(&layout).get("claude"), Some(&v281));
+
+    let b1 = 2_026_101_601;
+    let b2 = 2_026_101_602;
+    make_live(&layout, "codex", b1);
+    flip_only(&layout, "codex", b2);
+    for b in [b1, b2] {
+        let dir = layout.build_dir("codex", b);
+        std::fs::write(
+            dir.join(crate::alab::PACKAGE_JSON),
+            r#"{"layoutVersion":1,"version":"0.164.0-dev.1+gabc","entrypoint":"bin/codex"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(crate::alab::ALAB_BUILD_JSON), br#"{"source":"0"}"#).unwrap();
+    }
+    assert!(
+        roll_forward_interrupted_activations(&layout, || {
+            index(&["claude@2.1.282", "codex@2026101602"])
+        })
+        .is_empty(),
+        "an ALab build yanked in the cached index is never rolled forward"
+    );
+    assert_eq!(crate::active_builds(&layout).get("codex"), Some(&b1));
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
@@ -13976,4 +14129,71 @@ fn command_links_are_fenced_before_targets_and_bounded_to_sixteen_hops() {
         );
     }
     assert_eq!(std::fs::read(foreign).unwrap(), b"unrelated bytes");
+}
+
+#[test]
+fn an_alab_rollback_on_the_vendor_door_sweeps_the_revoked_build_and_refreshes_hooks() {
+    use crate::vendor_direct::lane::world::{self, Fake};
+    if !crate::alab::agent("codex")
+        .unwrap()
+        .serves(current_triple())
+    {
+        return;
+    }
+    let layout = world::layout("alab-door-rollback");
+    let f = Fake::default();
+    let trust = world::trust();
+    static HOOKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn count_hooks(_: &crate::store::Layout) {
+        HOOKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    let seams = PassSeams {
+        shell_hooks: count_hooks,
+        ..world_seams(&trust)
+    };
+    let b_prev = crate::alab::LEGACY_PIN_CEILING + 49;
+    let b_yanked = crate::alab::LEGACY_PIN_CEILING + 50;
+    for (b, v) in [
+        (b_prev, "0.1.0-dev.1+g111111111"),
+        (b_yanked, "0.1.0-dev.2+g222222222"),
+    ] {
+        let dir = layout.build_dir("codex", b);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let bin = dir
+            .join("bin")
+            .join(format!("codex{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        std::fs::write(
+            dir.join(crate::alab::PACKAGE_JSON),
+            format!(
+                r#"{{"layoutVersion":1,"version":"{v}","entrypoint":"bin/codex{}"}}"#,
+                std::env::consts::EXE_SUFFIX
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join(crate::alab::ALAB_BUILD_JSON), "{}\n").unwrap();
+        crate::store::mark_build_ready(&dir).unwrap();
+        crate::activate::activate_build(&layout, &dir).unwrap();
+        crate::activate::install_shims(&layout, &dir, &["codex".into()], crate::Aliases::Off)
+            .unwrap();
+    }
+    let yank = format!("codex@{b_yanked}");
+    *f.index.borrow_mut() = Some(world::signed_index(
+        45,
+        "2099-01-01T00:00:00Z",
+        &[yank.as_str()],
+    ));
+    HOOKS.store(0, std::sync::atomic::Ordering::SeqCst);
+    let report = do_install_with(&layout, &f, "stable", "codex", &seams).expect("rolled back");
+    assert_eq!(report.build, b_prev);
+    assert!(
+        !layout.build_dir("codex", b_yanked).exists(),
+        "the revoked ALab build is swept when the vendor door rolls back off it"
+    );
+    assert!(
+        layout.build_dir("codex", b_prev).exists(),
+        "the active ALab rollback target stays"
+    );
+    assert_eq!(HOOKS.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let _ = std::fs::remove_dir_all(&layout.prefix);
 }

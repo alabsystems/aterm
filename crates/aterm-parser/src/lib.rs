@@ -165,7 +165,8 @@ pub struct Parser {
     pub(crate) utf8_expected: u8,
     /// Incomplete UTF-8 prefix at the end of a DCS/APC string payload chunk.
     pub(crate) string_utf8: utf8::Utf8Prefix,
-    /// Bitmask where bit `i` marks `params[i]` as a colon subparameter of `params[i - 1]`.
+    /// Bitmask where bit `i` marks `params[i]` as a colon subparameter of `params[i - 1]`, and
+    /// bit `MAX_PARAMS` that the cap dropped a subparameter (`csi::subparam_mask_fits`).
     pub(crate) subparam_mask: u32,
     /// Tracks if the last separator was a colon (for next param)
     pub(crate) last_was_colon: bool,

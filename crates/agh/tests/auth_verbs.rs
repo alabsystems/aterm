@@ -1933,3 +1933,157 @@ fn a_loose_config_directory_with_a_space_gets_a_quoted_chmod() {
     assert!(next.contains(&format!("chmod 755 {word}")), "{error}");
     assert!(fake.seen().is_empty(), "{:?}", fake.seen());
 }
+
+/// A dev token file, 0644 in a 0700 directory under `root`'s home: what a builder's lanes
+/// read until the token modes are narrowed (plan §20, item 11).
+fn loose_dev_token(root: &Path, fake: &FakeGithub, seed: &str) -> PathBuf {
+    let token = agh_fake::token(seed);
+    fake.add_token(&token, "fixture-dev-bot");
+    let dirs = dirs(root);
+    std::fs::create_dir_all(&dirs.home).expect("home");
+    let file = common::write_token(&dirs.home.join("lane"), "dev.token", &token);
+    common::chmod(&file, 0o644);
+    file
+}
+
+fn add_file(root: &Path, fake: &FakeGithub, file: &Path, loose: bool) -> (u8, Captured) {
+    let (mut ctx, captured) = person(root, fake, common::env());
+    let path = file.display().to_string();
+    let mut args = vec![
+        "auth",
+        "add",
+        "dev",
+        "--file",
+        path.as_str(),
+        "--tier",
+        "dev",
+        "--owner",
+        "fixture-dev",
+    ];
+    if loose {
+        args.push("--legacy-loose");
+    }
+    (run(&mut ctx, &args), captured)
+}
+
+fn legacy_loose_row(dirs: &Dirs) -> Option<bool> {
+    parsed(dirs)
+        .get("profiles")
+        .and_then(|p| p.get("dev"))
+        .expect("the dev row")
+        .get("legacy_loose")
+        .and_then(aterm_toml::Value::as_bool)
+}
+
+#[test]
+fn legacy_loose_accepts_a_loose_file_and_marks_the_row() {
+    let strict = common::scratch("auth-loose-strict");
+    let fake = FakeGithub::start();
+    let file = loose_dev_token(strict.path(), &fake, "loose-strict");
+    let (exit, captured) = add_file(strict.path(), &fake, &file, false);
+    assert_eq!(exit, 1, "{}", captured.stderr_text());
+    let error = common::error_json(&captured.stderr_text());
+    assert_eq!(error["kind"], Value::from("refused"), "{error}");
+    // M1's loose refusal: its next names the chmod and the file.
+    let next = error["next"].as_str().unwrap_or_default();
+    assert!(next.contains("chmod 600"), "{next}");
+    assert!(next.contains("~/lane/dev.token"), "{next}");
+    assert!(!dirs(strict.path()).config_file().exists());
+    assert!(fake.seen().is_empty());
+
+    let root = common::scratch("auth-legacy-loose");
+    let file = loose_dev_token(root.path(), &fake, "legacy-loose");
+    let (exit, captured) = add_file(root.path(), &fake, &file, true);
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    let answer = common::stdout_json(&captured);
+    assert_eq!(answer["login"], Value::from("fixture-dev-bot"));
+    // The CLI loads the file strictly (only AghHost honours the key), so the answer says
+    // what `auth status` will: unusable, with the chmod remedy.
+    assert_eq!(answer["presence"], Value::from("unusable"), "{answer}");
+    let remedy = answer["remedy"].as_str().unwrap_or_default();
+    assert!(remedy.contains("chmod 600"), "{answer}");
+    assert_eq!(mode(&file), 0o644);
+    let dirs = dirs(root.path());
+    assert_eq!(legacy_loose_row(&dirs), Some(true));
+    let for_host = config::load_for_host(&dirs)
+        .expect("agh.toml loads")
+        .expect("agh.toml");
+    assert!(for_host.profiles()["dev"].legacy_loose());
+    let plain = config::load(&dirs)
+        .expect("agh.toml loads")
+        .expect("agh.toml");
+    assert!(!plain.profiles()["dev"].legacy_loose());
+}
+
+#[test]
+fn legacy_loose_refuses_stdin() {
+    let root = common::scratch("auth-loose-stdin");
+    let fake = FakeGithub::start();
+    let token = agh_fake::token("loose-stdin");
+    fake.add_token(&token, "fixture-dev-bot");
+    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{token}\n"));
+    let exit = run(
+        &mut ctx,
+        &[
+            "auth",
+            "add",
+            "dev",
+            "--stdin",
+            "--tier",
+            "dev",
+            "--legacy-loose",
+        ],
+    );
+    assert_eq!(exit, 2, "{}", captured.stderr_text());
+    assert!(fake.seen().is_empty(), "{:?}", fake.seen());
+    assert!(!dirs(root.path()).config.exists());
+}
+
+#[test]
+fn a_re_add_without_the_flag_drops_it() {
+    let root = common::scratch("auth-loose-readd");
+    let fake = FakeGithub::start();
+    let file = loose_dev_token(root.path(), &fake, "loose-readd");
+    let (exit, captured) = add_file(root.path(), &fake, &file, true);
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    let dirs = dirs(root.path());
+    assert_eq!(legacy_loose_row(&dirs), Some(true));
+    common::chmod(&file, 0o600);
+    let (exit, captured) = add_file(root.path(), &fake, &file, false);
+    assert_eq!(exit, 0, "{}", captured.stderr_text());
+    assert_eq!(legacy_loose_row(&dirs), None, "{}", config_text(&dirs));
+    validated(&dirs);
+}
+
+#[test]
+fn legacy_loose_still_refuses_what_m1_refuses() {
+    let fake = FakeGithub::start();
+
+    let linked = common::scratch("auth-loose-link");
+    let file = loose_dev_token(linked.path(), &fake, "loose-link");
+    common::chmod(&file, 0o600);
+    let link = file.with_file_name("link.token");
+    std::os::unix::fs::symlink(&file, &link).expect("a symlink");
+
+    let shared = common::scratch("auth-loose-0666");
+    let writable = loose_dev_token(shared.path(), &fake, "loose-0666");
+    common::chmod(&writable, 0o666);
+
+    let open = common::scratch("auth-loose-0777");
+    let in_open = loose_dev_token(open.path(), &fake, "loose-0777");
+    common::chmod(&in_open, 0o600);
+    let open_dir = in_open.parent().expect("its directory").to_path_buf();
+    common::chmod(&open_dir, 0o777);
+
+    for (root, path) in [
+        (linked.path(), link.as_path()),
+        (shared.path(), writable.as_path()),
+        (open.path(), in_open.as_path()),
+    ] {
+        let (exit, captured) = add_file(root, &fake, path, true);
+        assert_eq!(exit, 1, "{}: {}", path.display(), captured.stderr_text());
+        assert!(!dirs(root).config_file().exists(), "{}", path.display());
+    }
+    common::chmod(&open_dir, 0o700);
+    assert!(fake.seen().is_empty(), "{:?}", fake.seen());
+}

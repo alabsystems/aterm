@@ -141,6 +141,11 @@ pub(crate) fn pick_next_need(stops: &[NeedStop], cursor: Option<(u64, u64)>) -> 
     }
 }
 
+/// `t` as one line of a label (40 bytes at most), `None` where nothing is left of it.
+fn label_line(t: &str) -> Option<String> {
+    Some(crate::session_timeline::sanitize_presentation_line(t, 40)).filter(|t| !t.is_empty())
+}
+
 const CLAUDE_IDLE_MARK: char = '\u{2733}';
 
 /// A program's OSC title as a label names it: trimmed, and without the status glyph and blank
@@ -1010,27 +1015,28 @@ impl App {
         Some(Instant::now() + Duration::from_secs(wait))
     }
 
+    /// The label a role or a pinned title gives `session` (the first rung of
+    /// [`Self::tab_label_of_session`]), `None` where neither names it.
+    pub(crate) fn named_label_of_session(&self, session: u64) -> Option<String> {
+        let s = self.pool.get(session)?;
+        let (role, pin) = {
+            let meta = s.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+            (meta.role.clone(), meta.presentation_value("title"))
+        };
+        role.as_deref()
+            .and_then(label_line)
+            .or_else(|| pin.as_deref().and_then(label_line))
+    }
+
     /// A session's tab label as every Agents row names it (the Overview, a manager's Workers
     /// rows, `Go to <manager>`, the long-hold entry): the words the person can find on the strip
     /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3, §6).
     pub(crate) fn tab_label_of_session(&self, session: u64) -> String {
-        let whole = |t: &str| {
-            Some(crate::session_timeline::sanitize_presentation_line(t, 40))
-                .filter(|t| !t.is_empty())
-        };
-        let clip = |t: &str| whole(title_without_agent_glyph(t));
+        let clip = |t: &str| label_line(title_without_agent_glyph(t));
+        if let Some(label) = self.named_label_of_session(session) {
+            return label;
+        }
         if let Some(s) = self.pool.get(session) {
-            let (role, pin) = {
-                let meta = s.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-                (meta.role.clone(), meta.presentation_value("title"))
-            };
-            if let Some(label) = role
-                .as_deref()
-                .and_then(whole)
-                .or_else(|| pin.as_deref().and_then(whole))
-            {
-                return label;
-            }
             let rung = |t: &aterm_core::terminal::Terminal| {
                 use crate::cwd_native::ReportedCwd as _;
                 let cwd = t.native_working_directory();
@@ -1062,7 +1068,10 @@ impl App {
         if let Some(label) = registry.as_deref().and_then(clip) {
             return label;
         }
-        if let Some(position) = self.tab_position_of_session(session) {
+        // A worker has no place on the strip for a position to name.
+        if !self.session_is_parked(session)
+            && let Some(position) = self.tab_position_of_session(session)
+        {
             return format!("tab {position}");
         }
         match sid {
@@ -1102,6 +1111,7 @@ impl App {
             .unwrap_or_else(|p| p.into_inner())
             .task()
             .is_some_and(|t| matches!(t.state, TaskState::Working | TaskState::Stalled));
+        let stoppable = stoppable || crate::native_act::renewal_pending(&ctx);
         let team = self.teams.get(&session);
         let manager = self.manager_of(session).and_then(|local| {
             let sid = self.pool.get(local)?.ctx.self_id.clone();
@@ -1118,6 +1128,7 @@ impl App {
                     Some(TaskState::Working) => "\u{25cf}",
                     Some(TaskState::Done) => "\u{2713}",
                     Some(TaskState::Stalled) => "\u{25c6}",
+                    Some(TaskState::Failed) => crate::status_item::FAILED_GLYPH,
                     Some(TaskState::Exited) | None => "\u{00b7}",
                 };
                 let age = u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1134,6 +1145,7 @@ impl App {
             manager,
             stoppable,
             workers,
+            parked: self.session_is_parked(session),
         }
     }
 

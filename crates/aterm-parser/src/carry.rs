@@ -35,7 +35,8 @@ pub struct ParserCarry {
     pub state: State,
     /// Finalized CSI or DCS parameters (at most [`MAX_PARAMS`]).
     pub params: Vec<u16>,
-    /// Bit `i` set: `params[i]` followed a colon (a subparameter).
+    /// Bit `i` set: `params[i]` followed a colon (a subparameter). Bit [`MAX_PARAMS`] set, on a
+    /// full list only: the cap dropped a subparameter.
     pub subparam_mask: u32,
     /// The parameter being accumulated.
     pub current_param: u32,
@@ -89,7 +90,7 @@ pub enum CarryRefusal {
     State(State),
     /// More than [`MAX_PARAMS`] parameters.
     Params,
-    /// A subparameter bit at or past `params.len()`.
+    /// A subparameter bit at or past `params.len()`, but for the bit that marks a full list as cut.
     SubparamMask,
     /// `current_param` non-zero while no digit was read.
     CurrentParam,
@@ -269,7 +270,7 @@ impl Parser {
         if carry.params.len() > MAX_PARAMS {
             return Err(CarryRefusal::Params);
         }
-        if carry.subparam_mask >> carry.params.len() != 0 {
+        if !crate::csi::subparam_mask_fits(carry.subparam_mask, carry.params.len()) {
             return Err(CarryRefusal::SubparamMask);
         }
         if !carry.param_started && carry.current_param != 0 {

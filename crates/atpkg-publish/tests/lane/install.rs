@@ -45,7 +45,7 @@ impl SnapshotBuilder for FakeBuild {
 /// Records the calls, and checks at each arm that the snapshot the units name was stamped before
 /// the arm could start it.
 #[derive(Clone)]
-struct Recorder {
+pub(super) struct Recorder {
     calls: Arc<Mutex<Vec<String>>>,
     unstamped: Arc<Mutex<Vec<String>>>,
     state_dir: PathBuf,
@@ -60,7 +60,7 @@ impl Recorder {
         }
     }
 
-    fn calls(&self) -> Vec<String> {
+    pub(super) fn calls(&self) -> Vec<String> {
         self.calls.lock().expect("calls").clone()
     }
 
@@ -136,13 +136,13 @@ impl ServiceManager for Recorder {
     }
 }
 
-struct Box_ {
-    fx: Fx,
-    rec: Recorder,
-    machine: Machine,
+pub(super) struct Box_ {
+    pub(super) fx: Fx,
+    pub(super) rec: Recorder,
+    pub(super) machine: Machine,
 }
 
-fn machine(label: &str, os: Os) -> Box_ {
+pub(super) fn machine(label: &str, os: Os) -> Box_ {
     let mut fx = Fx::new(label);
     let repo = fx.path("checkout");
     super::fixture::repo(&repo, 0);
@@ -164,7 +164,7 @@ fn machine(label: &str, os: Os) -> Box_ {
     Box_ { fx, rec, machine }
 }
 
-fn install(
+pub(super) fn install(
     b: &Box_,
     kind: LaneKind,
     flags: InstallFlags,

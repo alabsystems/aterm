@@ -118,6 +118,7 @@ const fn plain(ty: &Ty) -> bool {
             | Ty::Int { .. }
             | Ty::Uint
             | Ty::Text(_)
+            | Ty::AccountLabel(_)
             | Ty::Enum(_)
             | Ty::Time
             | Ty::Day
@@ -174,20 +175,47 @@ pub fn show_field(column: &Column, field: Option<&Field>, reveal: bool) -> Strin
                 .collect();
             format!("{CONFLICT}{}", values.join(BETWEEN))
         }
-        Some(set @ Field::Set(_)) => set.members().into_iter().collect::<Vec<_>>().join(", "),
+        Some(set @ Field::Set(_)) => {
+            let inner = match column.ty {
+                Ty::Set(inner) => Some(inner),
+                _ => None,
+            };
+            set.members()
+                .into_iter()
+                .map(|elem| match inner {
+                    Some(inner) => show(inner, &Value::String(elem.to_owned()), reveal),
+                    None => show_raw_text(elem, reveal),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+}
+
+fn show_raw_text(text: &str, reveal: bool) -> String {
+    match raw_masked(&Value::String(text.to_owned()), reveal) {
+        Value::String(masked) => masked,
+        other => compact(&other),
     }
 }
 
 /// A cell of a column this reader cannot interpret: each candidate's raw value as JSON, masked.
-fn show_raw(cell: Option<&crate::database::Cell>, reveal: bool) -> String {
+fn show_raw(cell: Option<&crate::database::Cell>, field: Option<&Field>, reveal: bool) -> String {
     let Some(cell) = cell else {
-        return String::new();
+        return match field {
+            Some(set @ Field::Set(_)) => set
+                .members()
+                .into_iter()
+                .map(|elem| show_raw_text(elem, reveal))
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => String::new(),
+        };
     };
-    let values: Vec<String> = cell
-        .candidates
+    let values: Vec<String> = super::cell::origins(cell)
         .iter()
-        .map(|c| {
-            let x = CellValue::decode(&c.value).map_or_else(|_| c.value.clone(), |v| v.x);
+        .map(|(_, value)| {
+            let x = CellValue::decode(value).map_or_else(|_| value.clone(), |v| v.x);
             compact(&raw_masked(&x, reveal))
         })
         .collect();
@@ -199,10 +227,14 @@ fn show_raw(cell: Option<&crate::database::Cell>, reveal: bool) -> String {
 }
 
 /// Whether the grid shows `column` read-only: bounded JSON and import coordinates are written
-/// by tools, never typed (design §3.3).
+/// by tools, never typed (design §3.3), and a column only its row's own Mac writes
+/// (`Writer::Mine`, a roll's cover row) is that Mac's statement, never the owner's edit.
 pub const fn read_only(column: &Column) -> bool {
+    if matches!(column.writer, super::Writer::Mine) {
+        return true;
+    }
     match column.ty {
-        Ty::Json(_) | Ty::SrcRef => true,
+        Ty::Json(_) | Ty::SrcRef | Ty::Sealed(_) => true,
         Ty::List(inner, _) => matches!(inner, Ty::SrcRef),
         _ => false,
     }
@@ -223,7 +255,9 @@ pub fn read(ty: &Ty, text: &str) -> std::result::Result<Value, &'static str> {
     };
     match ty {
         Ty::Text(_) => Ok(Value::String(text.to_owned())),
-        Ty::Enum(_) | Ty::Url | Ty::Ref(_) => Ok(Value::String(text.trim().to_owned())),
+        Ty::AccountLabel(_) | Ty::Enum(_) | Ty::Url | Ty::Ref(_) => {
+            Ok(Value::String(text.trim().to_owned()))
+        }
         Ty::Hex(_) => Ok(Value::String(text.trim().to_ascii_lowercase())),
         Ty::Digits(_) => Ok(Value::String(text.trim().to_owned())),
         Ty::Bool => match text.trim() {
@@ -376,8 +410,12 @@ impl Where {
         let (column, text) = spec
             .split_once('=')
             .ok_or_else(|| Error::new("a filter is col=val"))?;
+        let column = column.trim();
+        if column.is_empty() {
+            return Err(Error::new("a filter is col=val"));
+        }
         Ok(Self {
-            column: column.trim().to_owned(),
+            column: column.to_owned(),
             text: text.to_owned(),
         })
     }
@@ -391,16 +429,25 @@ impl Where {
             return Ok(pk == self.text.trim());
         }
         let column = collection.column(&self.column).ok_or_else(|| {
-            Error::new(&format!(
-                "{}.{}: no such column to filter by",
-                collection.name, self.column
-            ))
+            Error::new(&format!("{}: no such column to filter by", collection.name))
         })?;
-        if let Ty::Set(_) = column.ty {
+        if let Ty::Set(inner) = column.ty {
+            if self.text.trim().is_empty() {
+                return Ok(row
+                    .fields
+                    .get(column.name)
+                    .is_none_or(|set| set.members().is_empty()));
+            }
+            let wanted = read(inner, &self.text).map_err(|rule| {
+                Error::new(&format!("{}.{}: {rule}", collection.name, column.name))
+            })?;
+            let Some(elem) = wanted.as_str() else {
+                return Ok(false);
+            };
             return Ok(row
                 .fields
                 .get(column.name)
-                .is_some_and(|set| set.members().contains(self.text.trim())));
+                .is_some_and(|set| set.members().contains(elem)));
         }
         let wanted = read(&column.ty, &self.text)
             .map_err(|rule| Error::new(&format!("{}.{}: {rule}", collection.name, column.name)))?;
@@ -489,10 +536,12 @@ pub fn export(
                 Source::Pk => pk.clone(),
                 Source::Unknown => show_raw(
                     cells.get(&(collection.name.to_owned(), format!("{pk}.{}", column.name))),
+                    row.fields.get(&column.name),
                     reveal,
                 ),
                 Source::Schema(_) if raw => show_raw(
                     cells.get(&(collection.name.to_owned(), format!("{pk}.{}", column.name))),
+                    row.fields.get(&column.name),
                     reveal,
                 ),
                 Source::Schema(schema) => show_field(schema, row.fields.get(&column.name), reveal),
@@ -786,6 +835,10 @@ pub fn plan(
             "this file was exported from another collection or version",
         ));
     }
+    let pk_header = format!("{READ_ONLY}{PK}");
+    if base.header.last() != Some(&pk_header) {
+        return Err(whole("not a grid baseline"));
+    }
     let Ok(sheet) = Sheet::scan(text, Delimiter::Tab) else {
         return Err(whole("the file is larger than the grid reads"));
     };
@@ -953,6 +1006,14 @@ pub fn plan(
                 reader.problem(record, at, "this column is read-only (=)");
                 continue;
             };
+            if schema.fixed {
+                reader.problem(
+                    record,
+                    at,
+                    "the row's key comes from this column; end this row and add another",
+                );
+                continue;
+            }
             reader.edits(record, at, &pk, schema, text, held, &mut edits);
         }
         if !edits.is_empty() {
@@ -1007,6 +1068,10 @@ pub struct Settled {
     pub unchanged: usize,
     /// Cells that changed meanwhile.
     pub stale: Vec<Stale>,
+    /// Keys of born rows whose changes this save writes.
+    pub born: Vec<String>,
+    /// Keys of rows whose lifecycle retirement or ending this save writes.
+    pub retired: Vec<String>,
 }
 
 /// Whether `cells` hold any cell of the row `pk` in `collection`, in any column.
@@ -1089,6 +1154,15 @@ pub fn settle(collection: &Collection, plan: &Plan, cells: &Cells) -> Settled {
             }
         }
         if !changes.is_empty() {
+            if !taken && plan.born.contains(pk) {
+                settled.born.push(pk.clone());
+            }
+            if plan.retired.contains(pk) {
+                let lifecycle_key = format!("{pk}.{LIFECYCLE}");
+                if changes.iter().any(|c| c.key == lifecycle_key) {
+                    settled.retired.push(pk.clone());
+                }
+            }
             settled.rows.push(changes);
         }
     }
@@ -1161,9 +1235,19 @@ impl Base {
     /// It is not one.
     pub fn from_json(value: &Value) -> Result<Self> {
         let bad = || Error::new("not a grid baseline");
+        let exact = |v: &Value, fields: &[&str]| -> Result<()> {
+            let Some(object) = v.as_object() else {
+                return Err(bad());
+            };
+            if object.len() != fields.len() || fields.iter().any(|f| !object.contains_key(*f)) {
+                return Err(bad());
+            }
+            Ok(())
+        };
         let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
         let digests = |v: Option<&Value>| -> Result<Vec<Digest>> {
-            v.and_then(Value::as_array)
+            let mut parsed: Vec<Digest> = v
+                .and_then(Value::as_array)
                 .ok_or_else(bad)?
                 .iter()
                 .map(|d| {
@@ -1171,24 +1255,63 @@ impl Base {
                         .and_then(|d| crate::database::decode_hex::<32>(d).ok())
                         .ok_or_else(bad)
                 })
-                .collect()
+                .collect::<Result<_>>()?;
+            parsed.sort_unstable();
+            Ok(parsed)
         };
+        exact(
+            value,
+            &[
+                "format",
+                "table",
+                "collection",
+                "version",
+                "reveal",
+                "header",
+                "rows",
+            ],
+        )?;
         if value.get("format").and_then(Value::as_str) != Some(FORMAT) {
             return Err(bad());
         }
+        let header: Vec<String> = value
+            .get("header")
+            .and_then(Value::as_array)
+            .ok_or_else(bad)?
+            .iter()
+            .map(|h| h.as_str().map(str::to_owned).ok_or_else(bad))
+            .collect::<Result<_>>()?;
+        let pk_header = format!("{READ_ONLY}{PK}");
+        let mut header_names = BTreeSet::new();
+        if header.last() != Some(&pk_header)
+            || header.iter().any(|h| {
+                let stripped = h.trim_start_matches(READ_ONLY);
+                stripped.is_empty() || !header_names.insert(stripped)
+            })
+        {
+            return Err(bad());
+        }
         let mut rows = Vec::new();
+        let mut seen_pks = BTreeSet::new();
         for row in value
             .get("rows")
             .and_then(Value::as_array)
             .ok_or_else(bad)?
         {
-            let pk = text(row, "pk").ok_or_else(bad)?;
+            exact(row, &["pk", "cells"])?;
+            let pk = text(row, "pk")
+                .filter(|pk| !pk.is_empty())
+                .ok_or_else(bad)?;
+            if !seen_pks.insert(pk.clone()) {
+                return Err(bad());
+            }
             let mut seen = BTreeMap::new();
             for (name, s) in row
                 .get("cells")
                 .and_then(Value::as_object)
                 .ok_or_else(bad)?
             {
+                exact(s, &["shown", "candidates", "elements", "raw"])?;
                 let mut elements = BTreeMap::new();
                 for (e, d) in s
                     .get("elements")
@@ -1210,8 +1333,12 @@ impl Base {
             rows.push((pk, seen));
         }
         Ok(Self {
-            table: text(value, "table").ok_or_else(bad)?,
-            collection: text(value, "collection").ok_or_else(bad)?,
+            table: text(value, "table")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(bad)?,
+            collection: text(value, "collection")
+                .filter(|s| !s.is_empty())
+                .ok_or_else(bad)?,
             version: value
                 .get("version")
                 .and_then(Value::as_u64)
@@ -1221,13 +1348,7 @@ impl Base {
                 .get("reveal")
                 .and_then(Value::as_bool)
                 .ok_or_else(bad)?,
-            header: value
-                .get("header")
-                .and_then(Value::as_array)
-                .ok_or_else(bad)?
-                .iter()
-                .map(|h| h.as_str().map(str::to_owned).ok_or_else(bad))
-                .collect::<Result<_>>()?,
+            header,
             rows,
         })
     }

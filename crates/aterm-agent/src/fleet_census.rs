@@ -96,6 +96,8 @@ pub struct MemberAccountSummary {
 pub struct CensusMember {
     /// Canonical `m<N>` label (e.g. `"m22"`).
     pub label: String,
+    /// Primary fleet name authenticated by this node, independent of its pool label.
+    pub fleet_name: Option<String>,
     /// Legacy `m<N>` aliases carried on the roster row.
     pub aliases: Vec<String>,
     /// Fleet node id (`32` lowercase hex chars) when bound or seen in the fleet book.
@@ -104,6 +106,8 @@ pub struct CensusMember {
     pub host: Option<String>,
     /// Last reported `aterm` version string (`None` when never heard via survey facts).
     pub version: Option<String>,
+    /// Receipt time of the survey reporting version, window and session facts.
+    pub facts_at: Option<u64>,
     /// True when the member's newest heartbeat reported an open GUI window.
     pub window: bool,
     /// Unix seconds when an open GUI window was last observed on this member.
@@ -253,6 +257,8 @@ pub struct CensusInputs {
     pub server_heard: Vec<ServerHeardFact>,
     /// Fleet book peers (`fleet-peers.toml` + `fleet-issuer-book-*.toml`).
     pub fleet_book: Vec<FleetBookPeerInput>,
+    /// Authenticated primary fleet names indexed by immutable node id.
+    pub fleet_names: BTreeMap<String, String>,
     /// Admitted pushed C16 survey-facts heartbeats, from current records or legacy text.
     pub heartbeats: Vec<HeartbeatInput>,
     /// Canonical `m<N>` labels (or recipient/node ids) enrolled in Commons, when known.
@@ -282,6 +288,16 @@ fn label_sort_key(label: &str) -> (u8, u32, String) {
 
 fn heard_within(now: u64, at: u64, within: u64) -> bool {
     now.checked_sub(at).is_some_and(|age| age <= within)
+}
+
+fn account_is_walled(acc: &crate::survey_facts::SurveyAccountFact, now_i64: i64) -> bool {
+    if !acc.enrolled {
+        return false;
+    }
+    match acc.walled_until {
+        Some(until) => until > now_i64,
+        None => matches!(acc.condition.as_str(), "limited" | "rate_limited"),
+    }
 }
 
 /// Normalize a raw hostname, `.local` target, or `m<N>`-prefixed instance name to its canonical
@@ -480,6 +496,20 @@ impl SwarmCensus {
 
         // Index fleet book & heartbeats by canonical `m<N>` label (falling back to fleet-only rows
         // when the vault roster hasn't materialized yet).
+        let mut fleet_names_by_node: BTreeMap<String, String> = BTreeMap::new();
+        for (raw_node, name) in &inputs.fleet_names {
+            let trimmed = raw_node.trim_ascii();
+            let node_lc = trimmed.to_ascii_lowercase();
+            if node_lc.is_empty()
+                || deny_nodes.contains(&node_lc)
+                || !aterm_types::fleet_name::valid_primary_name(name)
+            {
+                continue;
+            }
+            if trimmed == node_lc || !fleet_names_by_node.contains_key(&node_lc) {
+                fleet_names_by_node.insert(node_lc, name.clone());
+            }
+        }
         let mut fleet_host_by_label: BTreeMap<String, (u64, String)> = BTreeMap::new();
         let mut fleet_node_by_label: BTreeMap<String, (u64, String)> = BTreeMap::new();
         let mut fleet_seen_by_label: BTreeMap<String, u64> = BTreeMap::new();
@@ -743,9 +773,7 @@ impl SwarmCensus {
         let mut walled_pool_emails: BTreeSet<(String, String)> = BTreeSet::new();
         for hb in hb_by_label.values() {
             for acc in &hb.facts.accounts {
-                let is_walled = acc.condition == "rate_limited"
-                    || acc.walled_until.is_some_and(|u| u > now_i64);
-                if is_walled {
+                if account_is_walled(acc, now_i64) {
                     walled_pool_emails
                         .insert((acc.pool.to_ascii_lowercase(), acc.id.to_ascii_lowercase()));
                 }
@@ -846,9 +874,7 @@ impl SwarmCensus {
                     .facts
                     .accounts
                     .iter()
-                    .filter(|a| {
-                        a.condition == "rate_limited" || a.walled_until.is_some_and(|u| u > now_i64)
-                    })
+                    .filter(|a| account_is_walled(a, now_i64))
                     .count();
             }
 
@@ -872,6 +898,7 @@ impl SwarmCensus {
                 .filter(|at| *at <= now_s);
             let sessions = hb.map_or(0, |h| h.facts.sessions);
             let version = hb.map(|h| h.facts.version.clone());
+            let facts_at = hb.and_then(|h| h.received_at).filter(|at| *at <= now_s);
             let converge_failures = hb.map_or(0, |h| h.converge_failures);
             if converge_failures > 0
                 && last_seen.is_some_and(|seen| heard_within(now_s, seen, HEARD_24H_S))
@@ -895,10 +922,15 @@ impl SwarmCensus {
 
             members.push(CensusMember {
                 label: canon,
+                fleet_name: node
+                    .as_deref()
+                    .and_then(|n| fleet_names_by_node.get(&n.trim_ascii().to_ascii_lowercase()))
+                    .cloned(),
                 aliases,
                 node,
                 host,
                 version,
+                facts_at,
                 window,
                 window_last,
                 sessions,
@@ -1030,6 +1062,17 @@ impl SwarmCensus {
                 obj.insert("in_fleet".to_owned(), Value::Bool(m.in_fleet));
                 obj.insert("label".to_owned(), Value::String(m.label.clone()));
                 obj.insert(
+                    "fleet_name".to_owned(),
+                    m.fleet_name.clone().map_or(Value::Null, Value::String),
+                );
+                obj.insert(
+                    "node_alias".to_owned(),
+                    m.node
+                        .as_deref()
+                        .map(aterm_types::fleet_name::temporary_name)
+                        .map_or(Value::Null, Value::String),
+                );
+                obj.insert(
                     "last_seen".to_owned(),
                     m.last_seen.map_or(Value::Null, Value::from),
                 );
@@ -1038,6 +1081,10 @@ impl SwarmCensus {
                     m.node.clone().map_or(Value::Null, Value::String),
                 );
                 obj.insert("sessions".to_owned(), Value::from(m.sessions as u64));
+                obj.insert(
+                    "facts_at".to_owned(),
+                    m.facts_at.map_or(Value::Null, Value::from),
+                );
                 obj.insert(
                     "version".to_owned(),
                     m.version.clone().map_or(Value::Null, Value::String),
@@ -1185,6 +1232,11 @@ impl SwarmCensus {
                 );
                 members.push(CensusMember {
                     label,
+                    fleet_name: m
+                        .get("fleet_name")
+                        .and_then(aterm_json::Value::as_str)
+                        .filter(|name| aterm_types::fleet_name::valid_primary_name(name))
+                        .map(str::to_owned),
                     aliases,
                     node: m
                         .get("node")
@@ -1198,6 +1250,7 @@ impl SwarmCensus {
                         .get("version")
                         .and_then(aterm_json::Value::as_str)
                         .map(str::to_owned),
+                    facts_at: m.get("facts_at").and_then(aterm_json::Value::as_u64),
                     window: m
                         .get("window")
                         .and_then(aterm_json::Value::as_bool)
@@ -1324,7 +1377,7 @@ impl SwarmCensus {
         );
         let _ = writeln!(
             out,
-            "LABEL   VERSION         WINDOW  SESSIONS  WARM/LEASED/WALLED  ELIGIBLE  CONVERGE  LAST_SEEN"
+            "POOL    VERSION         WINDOW  SESSIONS  WARM/LEASED/WALLED  ELIGIBLE  CONVERGE  LAST_SEEN  FACTS_AT  FLEET_NAME"
         );
         for m in &self.members {
             let ver = m.version.as_deref().unwrap_or("-");
@@ -1348,8 +1401,18 @@ impl SwarmCensus {
                 .map_or_else(|| "-".to_owned(), |s| s.to_string());
             let _ = writeln!(
                 out,
-                "{:<7} {:<15} {:<7} {:<9} {:<19} {:<9} {:<9} {}",
-                m.label, ver, win, m.sessions, acct, elig, conv, seen
+                "{:<7} {:<15} {:<7} {:<9} {:<19} {:<9} {:<9} {}  {}  {}",
+                m.label,
+                ver,
+                win,
+                m.sessions,
+                acct,
+                elig,
+                conv,
+                seen,
+                m.facts_at
+                    .map_or_else(|| "-".to_owned(), |at| at.to_string()),
+                m.fleet_name.as_deref().unwrap_or("-")
             );
         }
         if !self.stragglers.is_empty() {
@@ -1466,18 +1529,20 @@ pub fn collect_local_census_inputs(
     }
 
     let mut raw_peers = read_peers(state_dir).unwrap_or_default();
-    if let Some(issuer_node) = raw_peers
+    let issuer_node = raw_peers
         .iter()
         .find(|p| p.via == Via::Issuer)
-        .and_then(|p| p.node.clone())
-    {
-        for copy in read_issuer_book(state_dir, &issuer_node) {
-            if !raw_peers
-                .iter()
-                .any(|p| p.node == copy.node && p.node.is_some())
-            {
-                raw_peers.push(copy);
-            }
+        .and_then(|p| p.node.clone());
+    let mut issuer_copies = issuer_node
+        .as_deref()
+        .map(|issuer| read_issuer_book(state_dir, issuer))
+        .unwrap_or_default();
+    for copy in &issuer_copies {
+        if !raw_peers
+            .iter()
+            .any(|p| p.node == copy.node && p.node.is_some())
+        {
+            raw_peers.push(copy.clone());
         }
     }
     let own_identity = aterm_net::fleet_member::read_node_identity(state_dir)
@@ -1527,29 +1592,38 @@ pub fn collect_local_census_inputs(
         roster.deny_nodes.push(own.key().hex());
         deny_nodes_changed = true;
     }
-    raw_peers.retain(|p| {
-        let held_out = p.key.is_some_and(|k| {
-            aterm_net::fleet::is_denied_key(&k, &roster.deny_nodes)
-                || log_keys.as_ref().is_some_and(|l| l.holds_out(&k))
+    for peers in [&mut raw_peers, &mut issuer_copies] {
+        peers.retain(|p| {
+            let held_out = p.key.is_some_and(|k| {
+                aterm_net::fleet::is_denied_key(&k, &roster.deny_nodes)
+                    || log_keys.as_ref().is_some_and(|l| l.holds_out(&k))
+            });
+            if held_out {
+                if let Some(node) = p.node.as_deref() {
+                    roster.deny_nodes.push(node.to_ascii_lowercase());
+                    deny_nodes_changed = true;
+                }
+                if let Some(key) = p.key {
+                    roster.deny_nodes.push(key.hex());
+                    deny_nodes_changed = true;
+                }
+            }
+            !held_out
+                && !p
+                    .node
+                    .as_deref()
+                    .is_some_and(|n| aterm_net::fleet::is_denied_node(n, &roster.deny_nodes))
         });
-        if held_out {
-            if let Some(node) = p.node.as_deref() {
-                roster.deny_nodes.push(node.to_ascii_lowercase());
-                deny_nodes_changed = true;
-            }
-            if let Some(key) = p.key {
-                roster.deny_nodes.push(key.hex());
-                deny_nodes_changed = true;
-            }
-        }
-        !held_out
-            && !p
-                .node
-                .as_deref()
-                .is_some_and(|n| aterm_net::fleet::is_denied_node(n, &roster.deny_nodes))
-    });
+    }
     if deny_nodes_changed {
         roster.canonicalize();
+        for peers in [&mut raw_peers, &mut issuer_copies] {
+            peers.retain(|p| {
+                !p.node
+                    .as_deref()
+                    .is_some_and(|n| aterm_net::fleet::is_denied_node(n, &roster.deny_nodes))
+            });
+        }
     }
     if let Some(ref paths) = home_paths
         && (paths.dir.join("commons").is_dir() || paths.records_file().is_file())
@@ -1587,6 +1661,90 @@ pub fn collect_local_census_inputs(
         &roster.deny_nodes,
         log_keys.as_deref(),
     );
+    let keyring = aterm_net::fleet_member::Keyring::of(raw_peers.iter().chain(&issuer_copies));
+    let mut roster_bound_keys: BTreeMap<String, aterm_net::fleet::NodeKey> = BTreeMap::new();
+    for member in &roster.members {
+        if roster.is_member_denied(member) {
+            continue;
+        }
+        if let (Some(node), Some(key_hex)) = (member.node_id.as_deref(), member.node_key.as_deref())
+            && let Some(key) = aterm_net::fleet::NodeKey::from_hex(key_hex.trim_ascii())
+        {
+            roster_bound_keys
+                .entry(node.trim_ascii().to_ascii_lowercase())
+                .or_insert(key);
+        }
+    }
+    let mut best_signed_names: BTreeMap<String, (u64, bool, Option<String>)> = BTreeMap::new();
+    for peer in raw_peers.iter().chain(&issuer_copies) {
+        if !peer.signature_holds() {
+            continue;
+        }
+        let (Some(node), Some(key), Some(signed)) = (&peer.node, peer.key, &peer.signed) else {
+            continue;
+        };
+        if keyring.bound(node) != Some(key) {
+            continue;
+        }
+        if peer.via == Via::IssuerBook
+            && issuer_node.as_deref() == Some(node.as_str())
+            && !raw_peers.iter().any(|p| {
+                p.via != Via::IssuerBook
+                    && p.node.as_deref() == Some(node.as_str())
+                    && p.key == Some(key)
+            })
+        {
+            continue;
+        }
+        let node_lc = node.trim_ascii().to_ascii_lowercase();
+        if let Some(roster_key) = roster_bound_keys.get(&node_lc)
+            && *roster_key != key
+        {
+            continue;
+        }
+        let first_hand = peer.via != Via::IssuerBook;
+        let rank = (signed.seq, first_hand);
+        let candidate_name = peer.primary_name().map(str::to_owned);
+        if best_signed_names
+            .get(&node_lc)
+            .is_none_or(|(prev_seq, prev_first_hand, _)| rank > (*prev_seq, *prev_first_hand))
+        {
+            best_signed_names.insert(node_lc, (signed.seq, first_hand, candidate_name));
+        }
+    }
+    let mut fleet_names: BTreeMap<String, String> = best_signed_names
+        .into_iter()
+        .filter_map(|(node, (_, _, name))| Some((node, name?)))
+        .collect();
+    let own_node = aterm_net::fleet_member::read_node_id(state_dir)
+        .ok()
+        .flatten();
+    let own_label_denied = steward.as_deref().is_some_and(|st| {
+        let st_stem = canonical_host_stem(st);
+        roster.is_label_denied(&st_stem)
+            && !roster
+                .members
+                .iter()
+                .any(|m| !roster.is_member_denied(m) && m.matches_label_or_alias(&st_stem))
+    });
+    let own_denied = own_node
+        .as_deref()
+        .is_some_and(|n| roster.is_node_denied(n))
+        || own_identity.as_ref().is_some_and(|id| {
+            roster.is_node_denied(&id.key().hex())
+                || log_keys.as_ref().is_some_and(|l| l.holds_out(&id.key()))
+        })
+        || own_label_denied;
+    if let Some(own) = &own_identity {
+        // The local name file is the source the node signs on its next heartbeat.
+        // Its absence or local denial removes any stale self entry instead of retaining an old name.
+        let own_lc = own.node().to_ascii_lowercase();
+        fleet_names.remove(&own_lc);
+        if !own_denied && let Ok(Some(name)) = aterm_net::fleet_member::read_primary_name(state_dir)
+        {
+            fleet_names.insert(own_lc, name);
+        }
+    }
     let mut fleet_book: Vec<FleetBookPeerInput> = raw_peers
         .into_iter()
         .map(|p| FleetBookPeerInput {
@@ -1598,22 +1756,7 @@ pub fn collect_local_census_inputs(
     if state_dir.join(aterm_net::fleet::KEY_FILE).is_file()
         && let Some(ref st) = steward
     {
-        let own_node = aterm_net::fleet_member::read_node_id(state_dir)
-            .ok()
-            .flatten();
         let st_stem = canonical_host_stem(st);
-        let own_denied = own_node
-            .as_deref()
-            .is_some_and(|n| roster.is_node_denied(n))
-            || own_identity.as_ref().is_some_and(|id| {
-                roster.is_node_denied(&id.key().hex())
-                    || log_keys.as_ref().is_some_and(|l| l.holds_out(&id.key()))
-            })
-            || (roster.is_label_denied(&st_stem)
-                && !roster
-                    .members
-                    .iter()
-                    .any(|m| !roster.is_member_denied(m) && m.matches_label_or_alias(&st_stem)));
         let already_in_book = fleet_book.iter().any(|p| {
             (own_node.is_some() && p.node.as_deref() == own_node.as_deref())
                 || canonical_host_stem(&p.host) == st_stem
@@ -1665,6 +1808,7 @@ pub fn collect_local_census_inputs(
         roster,
         server_heard,
         fleet_book,
+        fleet_names,
         heartbeats,
         commons_labels,
         commons_member_count,
@@ -1711,18 +1855,20 @@ fn cached_census_admitted(cached: &SwarmCensus, state_dir: &Path, home_dir: Opti
     }
 
     let mut raw_peers = read_peers(state_dir).unwrap_or_default();
-    if let Some(issuer_node) = raw_peers
+    let issuer_node = raw_peers
         .iter()
         .find(|p| p.via == Via::Issuer)
-        .and_then(|p| p.node.clone())
-    {
-        for copy in read_issuer_book(state_dir, &issuer_node) {
-            if !raw_peers
-                .iter()
-                .any(|p| p.node == copy.node && p.node.is_some())
-            {
-                raw_peers.push(copy);
-            }
+        .and_then(|p| p.node.clone());
+    let mut issuer_copies = issuer_node
+        .as_deref()
+        .map(|issuer| read_issuer_book(state_dir, issuer))
+        .unwrap_or_default();
+    for copy in &issuer_copies {
+        if !raw_peers
+            .iter()
+            .any(|p| p.node == copy.node && p.node.is_some())
+        {
+            raw_peers.push(copy.clone());
         }
     }
     let own_identity = aterm_net::fleet_member::read_node_identity(state_dir)
@@ -1772,29 +1918,38 @@ fn cached_census_admitted(cached: &SwarmCensus, state_dir: &Path, home_dir: Opti
         roster.deny_nodes.push(own.key().hex());
         deny_nodes_changed = true;
     }
-    raw_peers.retain(|p| {
-        let held_out = p.key.is_some_and(|k| {
-            aterm_net::fleet::is_denied_key(&k, &roster.deny_nodes)
-                || log_keys.as_ref().is_some_and(|l| l.holds_out(&k))
+    for peers in [&mut raw_peers, &mut issuer_copies] {
+        peers.retain(|p| {
+            let held_out = p.key.is_some_and(|k| {
+                aterm_net::fleet::is_denied_key(&k, &roster.deny_nodes)
+                    || log_keys.as_ref().is_some_and(|l| l.holds_out(&k))
+            });
+            if held_out {
+                if let Some(node) = p.node.as_deref() {
+                    roster.deny_nodes.push(node.to_ascii_lowercase());
+                    deny_nodes_changed = true;
+                }
+                if let Some(key) = p.key {
+                    roster.deny_nodes.push(key.hex());
+                    deny_nodes_changed = true;
+                }
+            }
+            !held_out
+                && !p
+                    .node
+                    .as_deref()
+                    .is_some_and(|n| aterm_net::fleet::is_denied_node(n, &roster.deny_nodes))
         });
-        if held_out {
-            if let Some(node) = p.node.as_deref() {
-                roster.deny_nodes.push(node.to_ascii_lowercase());
-                deny_nodes_changed = true;
-            }
-            if let Some(key) = p.key {
-                roster.deny_nodes.push(key.hex());
-                deny_nodes_changed = true;
-            }
-        }
-        !held_out
-            && !p
-                .node
-                .as_deref()
-                .is_some_and(|n| aterm_net::fleet::is_denied_node(n, &roster.deny_nodes))
-    });
+    }
     if deny_nodes_changed {
         roster.canonicalize();
+        for peers in [&mut raw_peers, &mut issuer_copies] {
+            peers.retain(|p| {
+                !p.node
+                    .as_deref()
+                    .is_some_and(|n| aterm_net::fleet::is_denied_node(n, &roster.deny_nodes))
+            });
+        }
     }
 
     let all_facts_count = aterm_net::fleet_member::read_pushed_facts(state_dir).len();
@@ -1814,13 +1969,24 @@ fn cached_census_admitted(cached: &SwarmCensus, state_dir: &Path, home_dir: Opti
         return false;
     }
 
+    let local_primary_name = own_identity.as_ref().and_then(|_| {
+        aterm_net::fleet_member::read_primary_name(state_dir)
+            .ok()
+            .flatten()
+    });
     !cached.members.iter().any(|cm| {
+        let is_own = own_identity.as_ref().is_some_and(|own| {
+            cm.node
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(own.node()))
+        });
         let has_active_match = roster.members.iter().any(|m| {
             !roster.is_member_denied(m)
                 && (m.matches_label_or_alias(&cm.label)
                     || (cm.node.is_some() && m.node_id == cm.node))
         });
-        cm.node.as_deref().is_some_and(|n| roster.is_node_denied(n))
+        (is_own && cm.fleet_name != local_primary_name)
+            || cm.node.as_deref().is_some_and(|n| roster.is_node_denied(n))
             || ((roster.is_label_denied(&cm.label)
                 || cm.aliases.iter().any(|a| roster.is_label_denied(a)))
                 && !has_active_match)

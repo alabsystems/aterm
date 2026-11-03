@@ -52,6 +52,11 @@ fn roster() -> Vec<Entry> {
         .collect();
     all.push(update_words::update_health_entry(HealthKind::Install, ""));
     for spot in places() {
+        all.push(mr::worker_failed_entry(
+            "s-3e79b5bde172ad0088ad",
+            &spot,
+            "it said it could not finish",
+        ));
         all.push(mr::supervisor_failing_entry(
             "s-3e79b5bde172ad0088ad",
             &spot,
@@ -312,6 +317,22 @@ fn every_host_entry_passes_the_door_and_the_caps() {
             mr::supervisor_failing_record("s-1", "in tab 1", "x")
                 .key
                 .unwrap_or_default(),
+            mr::worker_failed_record("s-1", "in tab 1", "x")
+                .key
+                .unwrap_or_default(),
+            mr::disk_worker_over_record(
+                "s-1",
+                "in tab 1",
+                &mr::DiskWorkerEnd {
+                    why: "finished",
+                    rose: 1,
+                    target_met: None,
+                    removed: 1,
+                    report: &[],
+                },
+            )
+            .key
+            .unwrap_or_default(),
             mr::disk_low_record(1, 2, &[]).key.unwrap_or_default(),
             mr::disk_low_cleanup_off_record(1, 2)
                 .key
@@ -1281,6 +1302,7 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
             none_soon: false,
             wrong: Vec::new(),
             no_sign_in: Vec::new(),
+            clock: None,
         })
     };
     let step = |app: &mut App, note: HostNote| -> Vec<(String, String)> {
@@ -1474,6 +1496,7 @@ fn the_accounts_usage_lines_follow_what_the_host_says_and_mark_nothing() {
             none_soon: false,
             wrong: Vec::new(),
             no_sign_in: Vec::new(),
+            clock: None,
         })
     };
     let step = |app: &mut App, note: HostNote| -> Vec<(String, String)> {
@@ -1583,6 +1606,7 @@ fn a_sign_in_with_no_route_is_one_fact_naming_each_route_tried_and_ends_with_it(
                 .iter()
                 .map(|(l, routes)| (l.to_string(), routes.to_string()))
                 .collect(),
+            clock: None,
         })
     };
     let routes = "profile(none) mailbox(none configured) vault(seq 51, nothing new) \
@@ -1736,6 +1760,43 @@ fn a_resume_exception_is_one_line_per_kind_and_a_stall_one_per_tab_and_each_ends
     told(&mut app, "s-4", None);
     let due = app.messages_deadline().expect("armed");
     let _ = app.settle_messages(due + Duration::from_secs(1));
+    assert!(app.messages.digest().is_empty());
+}
+
+/// An end aterm leaves ([`RelaunchSay::Left`]: a stop another program asked, an end whose owner
+/// could not be read, one that ended again soon after aterm brought it back) is a journal record
+/// alone: no exceptions line, now or later, since nobody is asked to act on it.
+#[test]
+fn an_end_aterm_leaves_is_a_record_alone() {
+    use crate::harness_host::LeftEnd;
+    let mut app = App::headless_for_test();
+    let tab = front_tab_sid(&mut app);
+    let records = |app: &App| {
+        app.messages
+            .log()
+            .records()
+            .filter(|r| {
+                !r.later && r.key.as_deref() == Some(&*format!("harness.host.relaunch.{tab}"))
+            })
+            .count()
+    };
+    for (n, end) in [
+        LeftEnd::AskedBy("lab-sweep".to_string()),
+        LeftEnd::Unread,
+        LeftEnd::EndedAgain,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        app.note_harness_host(HostNote::Relaunch {
+            sid: tab.clone(),
+            said: RelaunchSay::Left { end: end.clone() },
+        });
+        assert_eq!(records(&app), n + 1, "{end:?}: recorded");
+        assert!(app.messages.digest().is_empty(), "{end:?}: no line");
+        assert!(app.ripening_deadline().is_none(), "{end:?}: nothing ripens");
+    }
+    let _ = app.settle_messages(Instant::now() + 2 * DAY);
     assert!(app.messages.digest().is_empty());
 }
 
@@ -3039,7 +3100,14 @@ fn a_stall_on_an_agents_own_work_names_that_agent_and_reads_no_title() {
             );
         }
     }
+    // Claude's own work is told as agy's is, in its own name, under the title its tab's stall
+    // always has, and never as the unread screen.
+    let (own_title, own_detail) = record(Program::Claude, StallSeen::OwnWork { minutes: 90 });
+    let (_, agy_detail) = record(Program::Agy, StallSeen::OwnWork { minutes: 90 });
     let (title, detail) = record(Program::Claude, StallSeen::Unread { minutes: 90 });
+    assert_eq!(own_detail, agy_detail.replace("Antigravity CLI", "Claude"));
+    assert_eq!(own_title, title);
+    assert_ne!(own_detail, detail);
     assert!(title.starts_with("Claude has stalled"), "{title}");
     assert!(
         detail.contains("Claude's own title has said idle for 90 min"),
@@ -3062,6 +3130,10 @@ fn a_stall_on_an_agents_own_work_names_that_agent_and_reads_no_title() {
     assert_eq!(
         title(Exception::stalled_on_work(), Program::Agy),
         "Antigravity CLI in tab 2 has stalled"
+    );
+    assert_eq!(
+        title(Exception::stalled_on_work(), Program::Claude),
+        "Claude in tab 2 has stalled"
     );
     assert_eq!(
         title(Exception::stalled(), Program::Claude),
@@ -3730,6 +3802,7 @@ fn a_lost_login_is_its_tabs_ask_and_the_accounts_say_lines() {
             none_soon,
             wrong: wrong.iter().map(|l| l.to_string()).collect(),
             no_sign_in: Vec::new(),
+            clock: None,
         })
     };
     let keys = |app: &App| -> Vec<String> {
@@ -4333,14 +4406,17 @@ fn another_pools_due_line_follows_its_note_and_leaves_claudes_alone() {
         none_soon: false,
         wrong: Vec::new(),
         no_sign_in: Vec::new(),
+        clock: None,
     }));
     assert_eq!(keys(&app), [mr::ACCOUNTS_DUE_KEY.to_string()]);
+    looked_asked_for(&mut app, &["kimi"]);
     let kimi_due = mr::pool_notice_key(Cli::Kimi, "due");
     app.note_harness_host(HostNote::Pools(vec![PoolSaid {
         cli: Cli::Kimi,
         due: vec!["kimi-1".to_string()],
         wrong: Vec::new(),
         sign_in: Vec::new(),
+        asked: false,
     }]));
     let mut both = vec![mr::ACCOUNTS_DUE_KEY.to_string(), kimi_due.clone()];
     both.sort();
@@ -4361,11 +4437,92 @@ fn another_pools_due_line_follows_its_note_and_leaves_claudes_alone() {
     );
 }
 
+/// `app`'s newest look, finding `ids` used here: a pool's lines speak for those, and for any
+/// the host found named, pinned or served (`PoolSaid::asked`).
+fn looked_asked_for(app: &mut App, ids: &[&'static str]) {
+    app.ai_screen.looked_asked = ids.to_vec();
+    app.hand_pool_entries();
+}
+
+/// A pool of a CLI nobody asked for says nothing to the digest, however much it has to say (the
+/// new Mac's exceptions): the sheet synced its rows and aterm's ladder works them. The same words
+/// raise a line once the CLI is asked for, and a CLI asked for no more has its line withdrawn.
+#[test]
+fn a_pool_nobody_asked_for_raises_nothing_until_it_is_asked_for() {
+    use crate::harness_host::PoolSaid;
+    use aterm_agent::harness::accounts::{Cli, SignInAction};
+    let mut app = App::headless_for_test();
+    let key = mr::pool_notice_key(Cli::Grok, "sign-in");
+    let open = |app: &App| {
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .any(|entry| entry.key == key)
+    };
+    let said = HostNote::Pools(vec![PoolSaid {
+        cli: Cli::Grok,
+        due: vec!["grok-1".to_owned()],
+        wrong: vec!["grok-1".to_owned()],
+        sign_in: vec![("grok-1".into(), SignInAction::Login)],
+        asked: false,
+    }]);
+    app.note_harness_host(said);
+    assert!(app.messages.digest().is_empty(), "before any look");
+    looked_asked_for(&mut app, &["codex"]);
+    assert!(app.messages.digest().is_empty(), "another CLI is asked for");
+    looked_asked_for(&mut app, &["grok"]);
+    assert!(
+        open(&app),
+        "CONTROL: the look that asks raises what the pool said"
+    );
+    looked_asked_for(&mut app, &[]);
+    assert!(app.messages.digest().is_empty(), "withdrawn");
+}
+
+/// A pool the host found asked for (a pinned row, a served launch, a CLI named in config) raises
+/// its lines with no look at all, as with `[ai]` off: a pinned Grok row's device-code sign-in
+/// reaches the digest. Once its pool goes quiet the line is filed as fixed, not withdrawn; and a
+/// reload's cleared reading leaves a look's asks standing.
+#[test]
+fn a_pool_the_host_found_asked_for_speaks_with_no_look() {
+    use crate::harness_host::PoolSaid;
+    use aterm_agent::harness::accounts::{Cli, SignInAction};
+    let mut app = App::headless_for_test();
+    assert!(app.ai_screen.reading.is_none() && app.ai_screen.looked_asked.is_empty());
+    let key = mr::pool_notice_key(Cli::Grok, "sign-in");
+    let open = |app: &App| {
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .any(|entry| entry.key == key)
+    };
+    let pinned = |asked| PoolSaid {
+        cli: Cli::Grok,
+        due: Vec::new(),
+        wrong: Vec::new(),
+        sign_in: vec![("grok-1".into(), SignInAction::Login)],
+        asked,
+    };
+    app.note_harness_host(HostNote::Pools(vec![pinned(false)]));
+    assert!(!open(&app), "CONTROL: an unasked pool says nothing");
+    app.note_harness_host(HostNote::Pools(vec![pinned(true)]));
+    assert!(open(&app), "the pin's sign-in is shown with no look");
+    app.note_harness_host(HostNote::Pools(Vec::new()));
+    assert!(!open(&app), "cleared once the pool says nothing");
+    looked_asked_for(&mut app, &["grok"]);
+    app.ai_screen.reading = None;
+    app.note_harness_host(HostNote::Pools(vec![pinned(false)]));
+    assert!(open(&app), "a look's ask outlives a cleared reading");
+}
+
 #[test]
 fn a_background_sign_in_task_has_a_durable_action_and_clears_when_resolved() {
     use crate::harness_host::PoolSaid;
     use aterm_agent::harness::accounts::{Cli, SignInAction};
     let mut app = App::headless_for_test();
+    looked_asked_for(&mut app, &["kimi"]);
     let key = mr::pool_notice_key(Cli::Kimi, "sign-in");
     for (action, word) in [
         (SignInAction::Browser, "accounts browser"),
@@ -4376,6 +4533,7 @@ fn a_background_sign_in_task_has_a_durable_action_and_clears_when_resolved() {
             due: Vec::new(),
             wrong: Vec::new(),
             sign_in: vec![("kimi-one".into(), action)],
+            asked: false,
         }]));
         let digest = app.messages.digest();
         let entry = digest
@@ -4408,6 +4566,7 @@ fn a_grok_login_due_with_a_sign_in_task_is_asked_for_once() {
     use crate::harness_host::PoolSaid;
     use aterm_agent::harness::accounts::{Cli, SignInAction};
     let mut app = App::headless_for_test();
+    looked_asked_for(&mut app, &["grok", "kimi"]);
     let entries = |app: &App, key: &str| -> Vec<(String, Vec<String>)> {
         app.messages
             .digest()
@@ -4426,6 +4585,7 @@ fn a_grok_login_due_with_a_sign_in_task_is_asked_for_once() {
         due: due.iter().map(|label| (*label).to_owned()).collect(),
         wrong: Vec::new(),
         sign_in: vec![("grok-1".into(), SignInAction::Login)],
+        asked: false,
     };
     app.note_harness_host(HostNote::Pools(vec![said(&["grok-1"])]));
     assert!(
@@ -4450,6 +4610,7 @@ fn a_grok_login_due_with_a_sign_in_task_is_asked_for_once() {
         due: vec!["kimi-1".to_owned()],
         wrong: Vec::new(),
         sign_in: vec![("kimi-1".into(), SignInAction::Browser)],
+        asked: false,
     }]));
     assert!(
         entries(&app, &due).is_empty(),
@@ -4715,4 +4876,602 @@ fn an_adopted_service_entry_is_told_from_the_first_reading() {
     fresh.note_harness_host(fseventsd_note(fseventsd_seen(false, 141 << 30), true));
     assert!(fresh.messages.digest().entries.is_empty(), "in its hold");
     assert!(fresh.messages.live_by_key(&key).is_none());
+}
+
+/// A WORKER THAT ENDED UNFINISHED WITH NOBODY WAITING IS A FACT FOR LATER AND NEVER AN ALERT: one
+/// entry, told once, that goes when its task opens again, and a record in Messages either way.
+/// NEGATIVE CONTROLS: a live manager hears through `await task`, so no entry; a person's own Off
+/// and a stall (it keeps its need) make none; a working task makes nothing at all.
+#[test]
+fn a_failed_worker_nobody_waits_on_is_a_later_fact_gone_when_it_opens_again() {
+    use crate::task_record::{
+        TaskMark, TaskState, WHY_COULD_NOT_FINISH, WHY_OFF, mark_session_task,
+    };
+    let session = |app: &mut App| {
+        let local = app
+            .focused_session_id(crate::WindowId(0))
+            .expect("the front session");
+        let ctx = app.pool.get(local).expect("its session").ctx.clone();
+        (local, ctx)
+    };
+    let failed = |why| TaskMark {
+        why: Some(why),
+        ..TaskMark::new(TaskState::Failed)
+    };
+    let records = |app: &App, sid: &str| {
+        let key = mr::worker_failed_record(sid, "in tab 1", "x").key;
+        app.messages
+            .log()
+            .records()
+            .filter(|r| r.key == key)
+            .count()
+    };
+
+    let mut app = App::headless_for_test();
+    let (local, ctx) = session(&mut app);
+    let sid = ctx.self_id.as_str().to_string();
+    let key = mr::worker_failed_key(&sid);
+    mark_session_task(&ctx, local, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    app.note_worker_conclusion(local);
+    assert!(app.messages.digest().is_empty(), "it works on");
+    assert_eq!(records(&app, &sid), 0);
+
+    mark_session_task(&ctx, local, &failed(WHY_COULD_NOT_FINISH)).expect("unfenced");
+    app.note_worker_conclusion(local);
+    app.note_worker_conclusion(local);
+    let entries = app.messages.digest().entries;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].key, key);
+    assert!(app.messages.live_by_key(&key).is_none(), "never an alert");
+    assert_eq!(records(&app, &sid), 1, "told once");
+
+    mark_session_task(&ctx, local, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    app.note_worker_conclusion(local);
+    assert!(app.messages.digest().is_empty(), "it opened again");
+
+    // A manager in this window waits on it.
+    let mut app = App::headless_for_test();
+    let (local, ctx) = session(&mut app);
+    let sid = ctx.self_id.as_str().to_string();
+    let managed = TaskMark {
+        from: Some(sid.clone()),
+        ..failed(WHY_COULD_NOT_FINISH)
+    };
+    mark_session_task(&ctx, local, &managed).expect("unfenced");
+    app.note_worker_conclusion(local);
+    assert!(app.messages.digest().is_empty(), "the manager hears");
+    assert_eq!(records(&app, &sid), 1, "the record stands all the same");
+
+    // A person's own Off, and a stall.
+    let mut app = App::headless_for_test();
+    let (local, ctx) = session(&mut app);
+    mark_session_task(&ctx, local, &failed(WHY_OFF)).expect("unfenced");
+    app.note_worker_conclusion(local);
+    assert!(app.messages.digest().is_empty(), "their own act");
+    let mut app = App::headless_for_test();
+    let (local, ctx) = session(&mut app);
+    let sid = ctx.self_id.as_str().to_string();
+    mark_session_task(&ctx, local, &TaskMark::new(TaskState::Stalled)).expect("unfenced");
+    app.note_worker_conclusion(local);
+    assert!(app.messages.digest().is_empty(), "a stall keeps its need");
+    assert_eq!(records(&app, &sid), 0);
+}
+
+/// A FAILED FACT OUTLIVES WHAT RAISED IT: after a restart, its told map empty, the task's opening
+/// again still ends the entry, and a record a carry brought was told by the process that moved it,
+/// so its next move tells nothing again. NEGATIVE CONTROL: that record failing anew is told.
+#[test]
+fn a_restart_ends_an_adopted_fact_and_tells_a_carried_failure_no_second_time() {
+    use crate::task_record::{
+        TaskMark, TaskState, WHY_COULD_NOT_FINISH, mark_session_task, seed_carried,
+    };
+    let failed = TaskMark {
+        why: Some(WHY_COULD_NOT_FINISH),
+        ..TaskMark::new(TaskState::Failed)
+    };
+    let mut app = App::headless_for_test();
+    let local = app.focused_session_id(crate::WindowId(0)).expect("front");
+    let ctx = app.pool.get(local).expect("its session").ctx.clone();
+    mark_session_task(&ctx, local, &failed).expect("unfenced");
+    app.note_worker_conclusion(local);
+    assert_eq!(app.messages.digest().entries.len(), 1, "raised");
+    app.worker_end_told.clear();
+    mark_session_task(&ctx, local, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    app.note_worker_conclusion(local);
+    assert!(app.messages.digest().is_empty(), "it opened again");
+
+    let row = {
+        mark_session_task(&ctx, local, &failed).expect("unfenced");
+        let timeline = ctx.timeline.lock().unwrap();
+        timeline
+            .task()
+            .expect("a task")
+            .carry_row(std::time::Instant::now())
+    };
+    let mut app = App::headless_for_test();
+    let local = app.focused_session_id(crate::WindowId(0)).expect("front");
+    let ctx = app.pool.get(local).expect("its session").ctx.clone();
+    let sid = ctx.self_id.as_str().to_string();
+    seed_carried(&ctx, Some(&row));
+    let told = |app: &App| {
+        let key = mr::worker_failed_record(&sid, "in tab 1", "x").key;
+        app.messages
+            .log()
+            .records()
+            .filter(|r| r.key == key)
+            .count()
+    };
+    app.note_worker_conclusion(local);
+    assert_eq!(told(&app), 0, "told before the restart");
+    assert!(app.messages.digest().is_empty());
+    mark_session_task(&ctx, local, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    app.note_worker_conclusion(local);
+    mark_session_task(&ctx, local, &failed).expect("unfenced");
+    app.note_worker_conclusion(local);
+    assert_eq!(told(&app), 1, "a new failure");
+    assert_eq!(app.messages.digest().entries.len(), 1);
+}
+
+/// A MANAGER THIS WINDOW SAW CLOSE LEAVES ITS WORKERS TO THE OWNER, AND ONE IT NEVER KNEW IS NOT SAID
+/// TO BE NOBODY: a `from` from another Mac gets a record and no fact, the manager's close raises the
+/// fact for a worker already failed, and a later failure raises it at once. A manager with no
+/// worker here is not remembered.
+#[test]
+fn a_failed_worker_of_a_manager_that_closed_is_a_later_fact_and_an_unknown_one_is_not() {
+    use crate::task_record::{TaskMark, TaskState, WHY_COULD_NOT_FINISH, mark_session_task};
+    let manager = "s-00000000000000000099";
+    let mark = |state, why| TaskMark {
+        from: Some(manager.to_string()),
+        why,
+        ..TaskMark::new(state)
+    };
+    let mut app = App::headless_for_test();
+    let local = app.focused_session_id(crate::WindowId(0)).expect("front");
+    let ctx = app.pool.get(local).expect("its session").ctx.clone();
+    let sid = ctx.self_id.as_str().to_string();
+    let failed = mark(TaskState::Failed, Some(WHY_COULD_NOT_FINISH));
+    mark_session_task(&ctx, local, &failed).expect("unfenced");
+    app.note_worker_conclusion(local);
+    let key = mr::worker_failed_record(&sid, "in tab 1", "x").key;
+    assert_eq!(
+        app.messages
+            .log()
+            .records()
+            .filter(|r| r.key == key)
+            .count(),
+        1,
+        "the record stands"
+    );
+    assert!(app.messages.digest().is_empty(), "it may be on another Mac");
+
+    app.note_manager_gone("s-00000000000000000098");
+    assert!(app.messages.digest().is_empty(), "no worker of that one");
+    assert!(app.managers_gone.is_empty());
+
+    app.note_manager_gone(manager);
+    assert_eq!(app.messages.digest().entries.len(), 1, "gone now");
+
+    mark_session_task(&ctx, local, &mark(TaskState::Working, None)).expect("unfenced");
+    app.note_worker_conclusion(local);
+    assert!(app.messages.digest().is_empty(), "it opened again");
+    mark_session_task(&ctx, local, &failed).expect("unfenced");
+    app.note_worker_conclusion(local);
+    assert_eq!(
+        app.messages.digest().entries.len(),
+        1,
+        "failed after it left"
+    );
+}
+
+/// A MANAGER'S OR A SCRIPT'S OFF IS NO PERSON'S OWN ACT: it is told, in words that do not say a
+/// person did it, where a person's stays a record alone. A worker with its own report of its end has
+/// only that: no generic record and no fact, whichever word ended it.
+#[test]
+fn an_off_by_a_manager_is_told_and_a_worker_with_its_own_report_has_only_that() {
+    use crate::task_record::{
+        TaskMark, TaskRecord, TaskState, WHY_OFF, WHY_OFF_CTL, mark_session_task, seed_carried,
+    };
+    let failed = |why| TaskMark {
+        why: Some(why),
+        ..TaskMark::new(TaskState::Failed)
+    };
+    let records = |app: &App, sid: &str| {
+        let key = mr::worker_failed_record(sid, "in tab 1", "x").key;
+        app.messages
+            .log()
+            .records()
+            .filter(|r| r.key == key)
+            .map(|r| r.detail.join("\n"))
+            .collect::<Vec<_>>()
+    };
+    let mut app = App::headless_for_test();
+    let local = app.focused_session_id(crate::WindowId(0)).expect("front");
+    let ctx = app.pool.get(local).expect("its session").ctx.clone();
+    let sid = ctx.self_id.as_str().to_string();
+    mark_session_task(&ctx, local, &failed(WHY_OFF_CTL)).expect("unfenced");
+    app.note_worker_conclusion(local);
+    assert_eq!(app.messages.digest().entries.len(), 1, "nobody did it here");
+    let said = records(&app, &sid);
+    assert!(
+        said.len() == 1 && said[0].contains("a manager or a script") && !said[0].contains("person"),
+        "{said:?}"
+    );
+
+    let mut app = App::headless_for_test();
+    let local = app.focused_session_id(crate::WindowId(0)).expect("front");
+    let ctx = app.pool.get(local).expect("its session").ctx.clone();
+    let sid = ctx.self_id.as_str().to_string();
+    mark_session_task(&ctx, local, &failed(WHY_OFF)).expect("unfenced");
+    app.note_worker_conclusion(local);
+    assert!(app.messages.digest().is_empty(), "their own act");
+    assert!(records(&app, &sid)[0].contains("a person"));
+
+    let mut app = App::headless_for_test();
+    let local = app.focused_session_id(crate::WindowId(0)).expect("front");
+    let ctx = app.pool.get(local).expect("its session").ctx.clone();
+    let sid = ctx.self_id.as_str().to_string();
+    let mut working: TaskRecord = TaskMark::new(TaskState::Working)
+        .apply(None, false, std::time::Instant::now(), 1_000)
+        .0;
+    working.trusted_cwd = Some(format!(
+        "/state/aterm/{}/{}",
+        aterm_agent::harness::cli::HARNESS,
+        aterm_agent::harness::disk::fence::WORKER_FOLDER
+    ));
+    seed_carried(&ctx, Some(&working.carry_row(std::time::Instant::now())));
+    assert!(
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .task()
+            .is_some_and(|r| r.trusted_cwd.is_some()),
+        "PRECONDITION: its folder"
+    );
+    mark_session_task(
+        &ctx,
+        local,
+        &failed(crate::task_record::WHY_COULD_NOT_FINISH),
+    )
+    .expect("unfenced");
+    app.note_worker_conclusion(local);
+    assert!(records(&app, &sid).is_empty(), "its own record says so");
+    assert!(app.messages.digest().is_empty(), "no look-at item");
+}
+
+/// A CREDIT CLAIM WORKER'S END IS ITS OWN RECORD, ONCE, EITHER WAY: a failure says how, and its
+/// program's exit after it tells nothing again; a landing says its reply holds the claim's outcome.
+/// No generic record and no fact goes beside it. NEGATIVE CONTROL: a working record tells nothing.
+#[test]
+fn a_claim_workers_end_is_its_own_record_once_either_way() {
+    use crate::task_record::{
+        TaskMark, TaskRecord, TaskState, WHY_COULD_NOT_FINISH, WHY_LANDED, mark_session_task,
+        seed_carried,
+    };
+    let claim = format!(
+        "/state/aterm/{}/{}",
+        aterm_agent::harness::cli::HARNESS,
+        aterm_agent::harness::credit_offers::CLAIM_FOLDER
+    );
+    let worker = |app: &mut App| {
+        let local = app.focused_session_id(crate::WindowId(0)).expect("front");
+        let ctx = app.pool.get(local).expect("its session").ctx.clone();
+        let mut working: TaskRecord = TaskMark::new(TaskState::Working)
+            .apply(None, false, std::time::Instant::now(), 1_000)
+            .0;
+        working.trusted_cwd = Some(claim.clone());
+        seed_carried(&ctx, Some(&working.carry_row(std::time::Instant::now())));
+        (local, ctx)
+    };
+    let claim_records = |app: &App, sid: &str| {
+        let key = mr::credit_claim_worker_record(sid, "in tab 1", None, None).key;
+        app.messages
+            .log()
+            .records()
+            .filter(|r| r.key == key)
+            .map(|r| (r.title.clone(), r.detail.join("\n")))
+            .collect::<Vec<_>>()
+    };
+    let generic = |app: &App, sid: &str| {
+        let key = mr::worker_failed_record(sid, "in tab 1", "x").key;
+        app.messages
+            .log()
+            .records()
+            .filter(|r| r.key == key)
+            .count()
+    };
+
+    let mut app = App::headless_for_test();
+    let (local, ctx) = worker(&mut app);
+    let sid = ctx.self_id.as_str().to_string();
+    app.note_worker_conclusion(local);
+    assert!(claim_records(&app, &sid).is_empty(), "still working");
+    let failed = TaskMark {
+        why: Some(WHY_COULD_NOT_FINISH),
+        ..TaskMark::new(TaskState::Failed)
+    };
+    mark_session_task(&ctx, local, &failed).expect("unfenced");
+    app.note_worker_conclusion(local);
+    app.note_worker_conclusion(local);
+    let mut exited = TaskMark::new(TaskState::Exited);
+    exited.why = Some("exit");
+    mark_session_task(&ctx, local, &exited).expect("unfenced");
+    app.note_worker_conclusion(local);
+    let said = claim_records(&app, &sid);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0].0.contains("did not finish") && said[0].1.contains("It said it could not finish"),
+        "{said:?}"
+    );
+    assert_eq!(generic(&app, &sid), 0, "no generic record beside it");
+    assert!(app.messages.digest().is_empty(), "no look-at item");
+
+    let mut app = App::headless_for_test();
+    let (local, ctx) = worker(&mut app);
+    let sid = ctx.self_id.as_str().to_string();
+    let landed = TaskMark {
+        why: Some(WHY_LANDED),
+        ..TaskMark::new(TaskState::Done)
+    };
+    mark_session_task(&ctx, local, &landed).expect("unfenced");
+    app.note_worker_conclusion(local);
+    assert!(
+        claim_records(&app, &sid).is_empty(),
+        "a landing waits for what its reply said, which its face's move brings"
+    );
+    let reply = "Nothing left: CLAIMED the $50 credit on the account page.";
+    ctx.timeline
+        .lock()
+        .unwrap()
+        .set_land_receipt(Some(std::sync::Arc::new(
+            aterm_agent::harness::acts::LandReceipt {
+                head: String::new(),
+                main_ref: String::new(),
+                repo: String::new(),
+                branch: String::new(),
+                leg: aterm_agent::harness::acts::ReceiptLeg::NoRepo,
+                check: false,
+                said: reply.to_owned(),
+                at_ms: 0,
+            },
+        )));
+    app.note_worker_conclusion(local);
+    app.note_worker_conclusion(local);
+    let said = claim_records(&app, &sid);
+    assert_eq!(said.len(), 1, "told once: {said:?}");
+    assert!(
+        said[0].0.contains("finished") && said[0].1.contains("CLAIMED the $50 credit"),
+        "the record keeps the claim's outcome past its tab: {said:?}"
+    );
+}
+
+/// A STALLED DISK WORKER RUNS OUT OF ITS TIME TOO: the lease runs it through the stall (a stall is
+/// no end), and its expiry ends its record `failed why=expired` and takes down the deadline's ask it
+/// raised, which nobody owes an answer now. CONTROL: an expiry that finds the worker already
+/// concluded leaves its record as it stands.
+#[test]
+fn a_stalled_disk_worker_that_runs_out_of_its_time_ends_failed_expired() {
+    use crate::task_record::{AttentionEdit, TaskMark, TaskState, mark_session_task_with};
+    let mut app = App::headless_for_test();
+    let local = app.focused_session_id(crate::WindowId(0)).expect("front");
+    let ctx = app.pool.get(local).expect("its session").ctx.clone();
+    let sid = ctx.self_id.as_str().to_string();
+    let ask = format!("{}a box", aterm_agent::supervise::HELD_HEAD);
+    let stalled = TaskMark {
+        why: Some("held"),
+        ..TaskMark::new(TaskState::Stalled)
+    };
+    mark_session_task_with(
+        &ctx,
+        local,
+        Some(&stalled),
+        AttentionEdit::Raise(&ask),
+        Duration::ZERO,
+        |_, _| true,
+    )
+    .expect("unfenced");
+    let attention = || {
+        ctx.meta
+            .lock()
+            .unwrap()
+            .attention_owners
+            .get(crate::harness_host::ATTENTION_OWNER)
+            .map(str::to_owned)
+    };
+    assert_eq!(attention().as_deref(), Some(ask.as_str()), "PRECONDITION");
+    let record = || {
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .task()
+            .cloned()
+            .expect("its record")
+    };
+    app.note_harness_host(HostNote::DiskWorkerExpired { sid: sid.clone() });
+    let after = record();
+    assert_eq!(
+        (after.state, after.why),
+        (TaskState::Failed, Some(crate::task_record::WHY_EXPIRED))
+    );
+    assert_eq!(attention(), None, "the deadline's ask went with it");
+
+    let mut app = App::headless_for_test();
+    let local = app.focused_session_id(crate::WindowId(0)).expect("front");
+    let ctx = app.pool.get(local).expect("its session").ctx.clone();
+    let sid = ctx.self_id.as_str().to_string();
+    let done = TaskMark {
+        why: Some(crate::task_record::WHY_LANDED),
+        ..TaskMark::new(TaskState::Done)
+    };
+    crate::task_record::mark_session_task(&ctx, local, &done).expect("unfenced");
+    app.note_harness_host(HostNote::DiskWorkerExpired { sid });
+    let after = ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .task()
+        .cloned()
+        .expect("its record");
+    assert_eq!(after.state, TaskState::Done, "a landing stands");
+}
+
+/// A DISK WORKER WITH NO SID (ONE THAT NEVER STARTED) STILL GETS ITS RECORD, keyed by its volume and
+/// placed nowhere.
+#[test]
+fn a_disk_worker_that_never_started_gets_its_record_by_its_volume() {
+    use crate::harness_host::HostNote;
+    let mut app = App::headless_for_test();
+    app.note_harness_host(HostNote::DiskWorkerOver {
+        sid: None,
+        volume: "dev:7".to_string(),
+        why: "spawn:no-folder".to_string(),
+        rose: 0,
+        target_met: None,
+        removed: 0,
+        report: Vec::new(),
+    });
+    let record = app
+        .messages
+        .log()
+        .records()
+        .find(|r| r.key.as_deref() == Some("harness.host.disk-worker.dev:7"))
+        .expect("the record");
+    assert!(record.title.contains("did not finish"), "{}", record.title);
+    assert!(app.messages.digest().is_empty());
+}
+
+/// A DISK WORKER'S END IS READ IN MESSAGES EITHER WAY: how it ended, what it removed itself and the
+/// rise beside it, whose words say the rise is not what it removed, and the target.
+#[test]
+fn a_disk_workers_end_says_how_it_ended_and_both_figures() {
+    use crate::harness_host::HostNote;
+    let mut app = App::headless_for_test();
+    app.note_harness_host(HostNote::DiskWorkerOver {
+        sid: Some("w-1".to_string()),
+        volume: "dev:1".to_string(),
+        why: "failed:could-not-finish".to_string(),
+        rose: 3 << 30,
+        target_met: Some(false),
+        removed: 2 << 30,
+        report: vec!["disk-free owner-only: the VM images".to_string()],
+    });
+    let record = app
+        .messages
+        .log()
+        .records()
+        .find(|r| r.key.as_deref() == Some("harness.host.disk-worker.w-1"))
+        .expect("the record");
+    assert!(record.title.contains("did not finish"), "{}", record.title);
+    let body = record.detail.join("\n");
+    for said in [
+        "It said it could not finish",
+        "It removed 2.0 GiB",
+        "free space rose 3.0 GiB",
+        "whoever freed it",
+        "did not reach its target",
+        "disk-free owner-only: the VM images",
+    ] {
+        assert!(body.contains(said), "{said}: {body}");
+    }
+    assert!(app.messages.digest().is_empty(), "no later fact, no alert");
+    app.note_harness_host(HostNote::DiskWorkerOver {
+        sid: Some("w-2".to_string()),
+        volume: "dev:1".to_string(),
+        why: "finished".to_string(),
+        rose: 1 << 30,
+        target_met: Some(true),
+        removed: 1 << 30,
+        report: Vec::new(),
+    });
+    let record = app
+        .messages
+        .log()
+        .records()
+        .find(|r| r.key.as_deref() == Some("harness.host.disk-worker.w-2"))
+        .expect("the record");
+    assert!(record.title.contains("finished"), "{}", record.title);
+}
+
+/// A FAILED WORKER'S FACT ENDS WHEN ITS TAB IS GONE: its row would show a tab no longer there.
+/// NEGATIVE CONTROL: the fact of a tab still shown stands.
+#[test]
+fn a_failed_workers_fact_ends_with_its_tab() {
+    let mut app = App::headless_for_test();
+    let tab = front_tab_sid(&mut app);
+    let [spot, ..] = places();
+    app.except(&mr::worker_failed_entry(
+        &tab,
+        &spot,
+        "it said it could not finish",
+    ));
+    app.except(&mr::worker_failed_entry(
+        CLOSED_SID,
+        &spot,
+        "its agent exited before landing",
+    ));
+    assert_eq!(app.messages.digest().entries.len(), 2);
+    app.end_relaunch_lines_of_closed_tabs();
+    let entries = app.messages.digest().entries;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].key, mr::worker_failed_key(&tab));
+}
+
+/// This Mac's clock lines follow what the host says (docs/DESIGN-fluid-swarm-2026-10-28.md F22):
+/// an Off clock raises the clock-off line alone, a Split one the clock-split line alone (the Off
+/// line ended), Off again ends the Split line, and a clock that agrees ends both; neither marks
+/// the glass.
+///
+/// Negative control: with the clock-split line's slot filled whatever the standing (its filter
+/// by standing left out), a move from Split back to Off left the Split line standing beside the
+/// Off one (`left: ["harness.accounts.clock-off", "harness.accounts.clock-split"]`). Without the
+/// move back the mutant passed: the entry keys itself by its standing, so the filter decides
+/// only which line ends.
+#[test]
+fn the_clock_lines_follow_the_standing_the_host_says() {
+    use aterm_agent::harness::accounts::ClockStanding;
+    let mut app = App::headless_for_test();
+    let before = glass(&app);
+    let said = |standing: Option<ClockStanding>| {
+        HostNote::Accounts(AccountsSaid::Listed {
+            signed_out: Vec::new(),
+            credits: Vec::new(),
+            window_full: Vec::new(),
+            due: Vec::new(),
+            none_soon: false,
+            wrong: Vec::new(),
+            no_sign_in: Vec::new(),
+            clock: standing.map(|standing| crate::harness_host::ClockSaid {
+                standing,
+                by_s: 2 * 86_400,
+                against: 2,
+                of: 2,
+                peers: vec!["m3".to_owned()],
+            }),
+        })
+    };
+    let mut keys = |standing| -> Vec<String> {
+        app.note_harness_host(said(standing));
+        assert_eq!(glass(&app), before, "{standing:?}: nothing on the glass");
+        let mut keys: Vec<String> = app
+            .messages
+            .digest()
+            .entries
+            .iter()
+            .map(|entry| entry.key.clone())
+            .collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(
+        keys(Some(ClockStanding::Off { ahead: true })),
+        [mr::ACCOUNTS_CLOCK_OFF_KEY]
+    );
+    assert_eq!(
+        keys(Some(ClockStanding::Split)),
+        [mr::ACCOUNTS_CLOCK_SPLIT_KEY]
+    );
+    assert_eq!(
+        keys(Some(ClockStanding::Off { ahead: false })),
+        [mr::ACCOUNTS_CLOCK_OFF_KEY]
+    );
+    assert!(keys(None).is_empty());
 }

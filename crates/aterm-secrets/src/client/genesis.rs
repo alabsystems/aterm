@@ -225,9 +225,9 @@ pub(super) fn sign_genesis(
             let wire = store.encode();
             let _ = super::save_records(paths, &wire)?;
             if matches!(admin.config.source, Source::Url(_)) {
-                for url in super::ledger_publish::candidate_server_urls(paths, &admin.config, &[]) {
-                    let _ = transport::post_records(&url, &wire);
-                }
+                let urls = super::ledger_publish::candidate_server_urls(paths, &admin.config, &[]);
+                let _ =
+                    super::fan_out::post_records_to(&urls, &wire, super::fan_out::one_exchange());
             }
             let _ = super::sync(paths, None);
         }

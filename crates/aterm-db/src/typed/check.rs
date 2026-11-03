@@ -154,5 +154,6 @@ pub fn findings(schemas: &[&Collection], tables: &BTreeMap<&str, &Projection>) -
         }
     }
     found.sort();
+    found.dedup();
     found
 }

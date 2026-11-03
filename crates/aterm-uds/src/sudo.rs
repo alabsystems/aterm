@@ -95,6 +95,58 @@ const fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
+/// Where a sudo that aterm itself started finds its instance's control socket. A routing hint like
+/// the session id: the server still attests the helper and binds the sudo it started.
+pub const ASKPASS_SOCK_ENV: &str = "ATERM_ASKPASS_SOCK";
+
+fn hex_word(word: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(1 + word.len() * 2);
+    out.push('x');
+    for byte in word.bytes() {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn word_of_hex(token: &str) -> Option<String> {
+    let hex = token.strip_prefix('x')?.as_bytes();
+    let (pairs, []) = hex.as_chunks::<2>() else {
+        return None;
+    };
+    let mut bytes = Vec::with_capacity(pairs.len());
+    for &[high, low] in pairs {
+        let byte = (hex_digit(high)? << 4) | hex_digit(low)?;
+        if byte == 0 {
+            return None;
+        }
+        bytes.push(byte);
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// The `sudo` verb's arguments: the working directory, then each exact command word, so a space,
+/// a newline or an empty word survives the line protocol.
+#[must_use]
+pub fn encode_command(cwd: &str, words: &[String]) -> String {
+    let mut out = hex_word(cwd);
+    for word in words {
+        out.push(' ');
+        out.push_str(&hex_word(word));
+    }
+    out
+}
+
+/// The working directory and exact words of [`encode_command`]; `None` for anything else,
+/// including no command at all.
+#[must_use]
+pub fn decode_command(rest: &str) -> Option<(String, Vec<String>)> {
+    let mut tokens = rest.split(' ');
+    let cwd = word_of_hex(tokens.next()?)?;
+    let words = tokens.map(word_of_hex).collect::<Option<Vec<_>>>()?;
+    (!words.is_empty()).then_some((cwd, words))
+}
+
 /// Direct storage for AppKit's secure UTF-16 field extraction.
 pub struct SecretUtf16 {
     units: Box<[u16]>,

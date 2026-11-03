@@ -3,7 +3,7 @@
 
 //! `codex-alab` package metadata, build identification, and upgrade argv reconstruction.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use aterm_json::Value;
 
@@ -16,8 +16,8 @@ pub const PACKAGE_JSON: &str = "codex-package.json";
 /// The file an ALab build of Codex (codex-alab) carries in its package root.
 pub const ALAB_BUILD_JSON: &str = "alab-build.json";
 
-/// Optional package metadata is small.
-const MAX_PACKAGE_BYTES: u64 = 1024 * 1024;
+/// Optional package metadata is small ([`atpkg::alab::MAX_PACKAGE_JSON_BYTES`]).
+const MAX_PACKAGE_BYTES: u64 = atpkg::alab::MAX_PACKAGE_JSON_BYTES as u64;
 
 fn package_text(path: &Path) -> Option<String> {
     if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
@@ -111,15 +111,11 @@ fn package_root(exe: &Path) -> Option<(PathBuf, String)> {
     let exe = std::fs::canonicalize(exe).ok()?;
     exe.ancestors().skip(1).take(2).find_map(|root| {
         let text = package_text(&root.join(PACKAGE_JSON))?;
-        let entry_path = root.join(package_entrypoint(&text)?);
-        if !std::fs::symlink_metadata(&entry_path)
-            .ok()?
-            .file_type()
-            .is_file()
-        {
+        let rel = package_entrypoint(&text)?;
+        if !atpkg::alab::regular_entry_under(root, &rel) {
             return None;
         }
-        let entry = std::fs::canonicalize(entry_path).ok()?;
+        let entry = std::fs::canonicalize(root.join(rel)).ok()?;
         (entry == exe).then(|| (root.to_path_buf(), text))
     })
 }
@@ -144,18 +140,7 @@ pub fn parse_package(text: &str) -> Option<(Version, PathBuf)> {
 /// One `codex-package.json`'s entrypoint (relative to the root), whatever its version says.
 #[must_use]
 pub fn package_entrypoint(text: &str) -> Option<PathBuf> {
-    let v: Value = aterm_json::from_str(text).ok()?;
-    if v.get("layoutVersion").and_then(Value::as_u64) != Some(1) {
-        return None;
-    }
-    let entry = Path::new(v.get("entrypoint")?.as_str()?);
-    if entry
-        .components()
-        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
-    {
-        return None;
-    }
-    Some(entry.to_path_buf())
+    atpkg::alab::package_entrypoint(text)
 }
 
 /// How a Codex flag takes its value (clap, `codex --help` 0.157.1).

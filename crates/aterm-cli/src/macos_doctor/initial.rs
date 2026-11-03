@@ -458,7 +458,7 @@ fn request_stop_with_flush(
 /// The Stop no pass has folded in yet. Reads only: no durability flush, since
 /// honoring a request that was not flushed can only stop a run, never start one.
 fn stop_request_at(root: &Path) -> Option<StopRequest> {
-    let bytes = match std::fs::read(root.join(STOP_REQUEST)) {
+    let bytes = match super::read_record_bytes(&root.join(STOP_REQUEST)) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(_) => return Some(StopRequest::Unreadable),
@@ -651,7 +651,7 @@ fn progress(root: &Path) -> Result<Option<Progress>, String> {
 /// The physical progress publication, before an interrupted upgrade's fallback.
 fn progress_file(root: &Path) -> Result<Option<Progress>, String> {
     let path = root.join("initial-setup.json");
-    let bytes = match std::fs::read(&path) {
+    let bytes = match super::read_record_bytes(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("{}: {error}", path.display())),
@@ -783,6 +783,7 @@ fn parse_progress(value: &Value) -> Result<Progress, String> {
 }
 
 fn save_progress(root: &Path, progress: Progress) -> Result<(), String> {
+    carry_older_person_access(root)?;
     revision::reserve(root, progress.revision)?;
     write_json(&root.join("initial-setup.json"), &progress_record(progress))
 }
@@ -860,7 +861,7 @@ fn progress_publication_error(
 
 fn progress_record(progress: Progress) -> Value {
     let mut record = stamped(
-        json!({"profile":PROFILE,"state":if progress.completed {"completed"} else {"pending"},"admitted":progress.admitted,"done":progress.done,"running":progress.running.map(Stage::bit),"plan":aterm_secrets::b64::encode_padded(&progress.plan),"revision":progress.revision,"stages":Stage::ALL.len()}),
+        json!({"profile":PROFILE,"state":if progress.completed {"completed"} else {"pending"},PROGRESS_BY_PRESS:true,"admitted":progress.admitted,"done":progress.done,"running":progress.running.map(Stage::bit),"plan":aterm_secrets::b64::encode_padded(&progress.plan),"revision":progress.revision,"stages":Stage::ALL.len()}),
     );
     if let Some(fields) = record.as_object_mut() {
         if progress.stopped {
@@ -894,7 +895,7 @@ fn saved_plan(root: &Path) -> Result<Option<Plan>, String> {
 
 fn saved_plan_record(root: &Path) -> Result<Option<(Plan, bool)>, String> {
     let path = root.join("automatic-plan.json");
-    let bytes = match std::fs::read(&path) {
+    let bytes = match super::read_record_bytes(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("{}: {error}", path.display())),
@@ -956,6 +957,7 @@ fn save_plan(root: &Path, plan: &Plan) -> Result<(), String> {
 /// field is written only when set: an absent field is a plan a person shaped.
 fn save_plan_as(root: &Path, plan: &Plan, provisional: bool) -> Result<(), String> {
     validate_plan(plan)?;
+    carry_older_person_access(root)?;
     scope::settle_put_back(root)?;
     let mut record = plan_record(plan, provisional);
     scope::keep_upgrade(root, plan, &mut record)?;
@@ -977,7 +979,7 @@ fn plan_record(plan: &Plan, provisional: bool) -> Value {
 /// ([`scope::put_back_held_initial_setup`]), and the Stop declined the widen for good.
 fn saved_plan_provisional(root: &Path) -> Result<bool, String> {
     let path = root.join("automatic-plan.json");
-    let bytes = match std::fs::read(&path) {
+    let bytes = match super::read_record_bytes(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(format!("{}: {error}", path.display())),
@@ -1145,6 +1147,7 @@ fn save_explicit_workstation_plan_with(
     }
     progress.access = carried_access(Some(&previous), Some(prior), &plan);
     before(ExplicitWrite::Decision)?;
+    seal_older_person_access(root)?;
     save_workstation_authorization(root, &plan)?;
     before(ExplicitWrite::Plan)?;
     save_plan_as(root, &plan, own)?;
@@ -3325,7 +3328,12 @@ fn save_workstation_decision(root: &Path, applied: bool) -> Result<(), String> {
 /// ([`admitted_keeps`]), which this does not.
 #[cfg(test)]
 fn authorize_at(root: &Path, plan: &Plan) -> Result<Option<u64>, String> {
-    authorize_reading(root, plan, || Ok(None))
+    let admitted = authorize_reading(root, plan, || Ok(None));
+    // These tests stand for a person's admission, whose press asked for macOS's grants.
+    if matches!(admitted, Ok(Some(_))) {
+        note_person_asked_at(root)?;
+    }
+    admitted
 }
 
 #[cfg(test)]
@@ -3561,7 +3569,7 @@ fn first_use(
         LocalNetworkFirstUse::NoStep(why)
     } else if steps == Ok(PermissionSteps::Off) {
         LocalNetworkFirstUse::NoStep(
-            "System State's plan leaves Permissions out, or a person's Cancel or Stop holds it",
+            "no person asked for System State's access steps, or a person's Cancel or Stop holds them",
         )
     } else if steps.as_ref().is_err_and(|error| setup_is_newer(error)) {
         LocalNetworkFirstUse::NoStep(NEWER_SETUP_NO_STEP)
@@ -3917,7 +3925,11 @@ pub(super) fn init_grants(
     let mut selection = Selection::none();
     selection.set(Setting::Permissions, true);
     selection.set(Setting::Messages, sign_out);
-    let grants = access::read(selection, &[]);
+    // A person's own `aterm init` lists every grant left to them, as it always did.
+    let grants = access::Grants {
+        acquiring: true,
+        ..access::read(selection, &[])
+    };
     let app = i32::try_from(std::process::id())
         .ok()
         .and_then(aterm_containment::responsible_app)
@@ -4176,7 +4188,7 @@ fn decision_record(root: &Path) -> Result<(Decision, Option<Restored>), String> 
 /// it is the decision ([`Records::cancelled`]).
 fn decision_record_reviewed(root: &Path) -> Result<DecisionRecord, String> {
     let path = root.join("first-run.json");
-    let bytes = match std::fs::read(&path) {
+    let bytes = match super::read_record_bytes(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok((Decision::Missing, None, None));
@@ -4286,6 +4298,11 @@ struct Records {
     /// decision ([`save_older_cancel`]): every reader presents every group at Leave as is while
     /// it stands ([`Self::present`]).
     cancelled: Option<Plan>,
+    /// A person pressed for macOS's grants on this Mac ([`note_person_asked_for_access`]): only
+    /// then do the window's access steps put a macOS prompt or page on screen. Automatic setup
+    /// keeps its Permissions group on, reads the grants and finishes without that press. Records
+    /// an older aterm left read as its rule did ([`PersonAccess::Older`]).
+    person_access: bool,
 }
 
 impl Records {
@@ -4299,7 +4316,19 @@ impl Records {
             provisional: saved_plan_provisional(root)?,
             stop_request: stop_request_at(root),
             cancelled,
-        })
+            person_access: false,
+        }
+        .with_person_access(root))
+    }
+
+    /// `self` with [`Self::person_access`] read from `root` ([`PersonAccess`]).
+    fn with_person_access(mut self, root: &Path) -> Self {
+        self.person_access = match person_access_at(root) {
+            PersonAccess::Asked => true,
+            PersonAccess::NotAsked => false,
+            PersonAccess::Older => older_rule_allows(&self),
+        };
+        self
     }
 
     fn presented_plan_record(&self) -> Option<(Plan, bool)> {
@@ -4527,14 +4556,231 @@ fn snapshot_with(
 /// first) run for the setup records in force (design §6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionSteps {
-    /// They run: an admitted run whose plan selects Permissions, the run a Restore ended (a
-    /// Restore never withdraws aterm's own permissions), or an older aterm's verified setup.
+    /// They run: a person pressed for them on this Mac ([`note_person_asked_for_access`]), with an
+    /// admitted run whose plan selects Permissions, the run a Restore ended (a Restore never
+    /// withdraws aterm's own permissions), or an older aterm's verified setup.
     Allowed,
     /// Not yet: no plan or no admitted run yet. They may still come with nobody's choice.
     NotYet,
     /// Held until a person chooses again: their Cancel or Stop holds them (a Restore's record a
-    /// Cancel holds among them), or the admitted run's plan leaves Permissions out.
+    /// Cancel holds among them), the admitted run's plan leaves Permissions out, or no person
+    /// pressed for them: an automatic setup decision authorizes no OS permission prompt.
     Off,
+}
+
+/// The record of whether a person pressed for macOS's grants on this Mac
+/// ([`Records::person_access`]).
+const PERSON_ACCESS: &str = "person-access.json";
+
+/// The progress record's mark that this build wrote it, and so reads macOS's grants as a
+/// person's press ([`PERSON_ACCESS`]). A record without it is an older aterm's.
+const PROGRESS_BY_PRESS: &str = "access_by_press";
+
+/// Whether a person pressed for macOS's grants on this Mac, as [`PERSON_ACCESS`] says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersonAccess {
+    /// No record, under an older aterm's progress record (or none): that aterm read its admitted
+    /// Permissions group as the authority (it struck the group from every automatic answer, so
+    /// an admitted one was a person's), and its rule stands ([`older_rule_allows`]) until this
+    /// build first writes the records, which carries an approval over as [`Self::Asked`]
+    /// ([`carry_older_person_access`]): an update stops no step a person already approved.
+    Older,
+    /// A person pressed for them on this Mac ([`note_person_asked_for_access`]).
+    Asked,
+    /// Nobody pressed for them on this Mac: this build wrote the records and no person pressed,
+    /// the record is damaged, or it names another Mac (a home migrated or restored here carries
+    /// it, and no one pressed on this one).
+    NotAsked,
+}
+
+const MAX_SETUP_RECORD_BYTES: u64 = 64 * 1024;
+
+fn person_access_at(root: &Path) -> PersonAccess {
+    person_access_at_with_host(root, aterm_containment::consent::host_uuid().as_deref())
+}
+
+fn person_access_at_with_host(root: &Path, host: Option<&str>) -> PersonAccess {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    match std::fs::symlink_metadata(root) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return PersonAccess::Older,
+        Ok(_) | Err(_) => return PersonAccess::NotAsked,
+    }
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+        .open(root.join(PERSON_ACCESS))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return if older_progress_without_press(root) {
+                PersonAccess::Older
+            } else {
+                PersonAccess::NotAsked
+            };
+        }
+        Err(_) => return PersonAccess::NotAsked,
+    };
+    let Some(host) = host.map(str::trim).filter(|host| !host.is_empty()) else {
+        return PersonAccess::NotAsked;
+    };
+    let euid = aterm_machines::port::Live::new().euid();
+    let Ok(metadata) = file.metadata() else {
+        return PersonAccess::NotAsked;
+    };
+    if !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != euid
+        || metadata.mode() & 0o6077 != 0
+        || metadata.len() > MAX_SETUP_RECORD_BYTES
+    {
+        return PersonAccess::NotAsked;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    if file
+        .take(MAX_SETUP_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() > MAX_SETUP_RECORD_BYTES as usize
+    {
+        return PersonAccess::NotAsked;
+    }
+    let asked = aterm_json::from_slice::<Value>(&bytes).is_ok_and(|value| {
+        value["profile"].as_str() == Some(PROFILE)
+            && value["asked"].as_bool() == Some(true)
+            && value["host"].as_str() == Some(host)
+    });
+    if asked {
+        PersonAccess::Asked
+    } else {
+        PersonAccess::NotAsked
+    }
+}
+
+/// Whether `root` has either no progress record yet or a regular progress record an older aterm
+/// wrote without [`PROGRESS_BY_PRESS`]. A marked, unreadable, symlinked or special file never
+/// qualifies for [`PersonAccess::Older`].
+fn older_progress_without_press(root: &Path) -> bool {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+        .open(root.join("initial-setup.json"))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    let euid = aterm_machines::port::Live::new().euid();
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != euid
+        || metadata.len() > MAX_SETUP_RECORD_BYTES
+    {
+        return false;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    if file
+        .take(MAX_SETUP_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() > MAX_SETUP_RECORD_BYTES as usize
+    {
+        return false;
+    }
+    aterm_json::from_slice::<Value>(&bytes)
+        .is_ok_and(|value| value.get(PROGRESS_BY_PRESS).is_none())
+}
+
+/// Whether an older aterm's rule allows the access steps for `records`: its Permissions group,
+/// admitted, with no press asked for.
+fn older_rule_allows(records: &Records) -> bool {
+    let older = Records {
+        person_access: true,
+        ..records.clone()
+    };
+    steps_of(&older) == PermissionSteps::Allowed
+}
+
+/// Whether macOS's grants are being acquired for this Mac's records ([`Records::person_access`]).
+fn person_access_admits(root: &Path) -> bool {
+    match person_access_at(root) {
+        PersonAccess::Asked => true,
+        PersonAccess::NotAsked => false,
+        PersonAccess::Older => Records::read(root).is_ok_and(|records| records.person_access),
+    }
+}
+
+/// Before this build first writes a plan or a progress record over an older aterm's
+/// ([`PersonAccess::Older`]): an approval that aterm's rule gave carries over as a person's
+/// ([`PersonAccess::Asked`]), so it outlives the records that showed it. Nothing is written
+/// otherwise: this build's progress record then reads as nobody's press.
+fn carry_older_person_access(root: &Path) -> Result<(), String> {
+    if person_access_at(root) != PersonAccess::Older {
+        return Ok(());
+    }
+    // Unreadable records carry nothing over: their reader refuses them on its own.
+    if Records::read(root).is_ok_and(|records| records.person_access) {
+        note_person_access_at(root, true)?;
+    }
+    Ok(())
+}
+
+/// Before an explicit pass rewrites `first-run.json` ahead of its plan and progress writes:
+/// durably record whatever [`PersonAccess::Older`] answered before the decision changes, so an
+/// older unverified (`Applied(false)`) progress record cannot be promoted by a pending decision.
+fn seal_older_person_access(root: &Path) -> Result<(), String> {
+    if person_access_at(root) != PersonAccess::Older {
+        return Ok(());
+    }
+    if let Ok(records) = Records::read(root) {
+        note_person_access_at(root, records.person_access)?;
+    }
+    Ok(())
+}
+
+/// A person's press on System State asked for macOS's grants: durably say so, for this Mac's
+/// hardware UUID, so the window's access steps may put macOS's prompts and pages on screen from
+/// now on, a Quit & Reopen's next launch included. Only the window calls this, once it read the
+/// press as a person's.
+///
+/// # Errors
+///
+/// The state root cannot be resolved, or the record cannot be written.
+pub fn note_person_asked_for_access() -> Result<(), String> {
+    note_person_asked_at(&state_root()?)
+}
+
+fn note_person_asked_at(root: &Path) -> Result<(), String> {
+    note_person_access_at(root, true)
+}
+
+/// Write [`PERSON_ACCESS`]: `asked` for this Mac's hardware UUID.
+fn note_person_access_at(root: &Path, asked: bool) -> Result<(), String> {
+    note_person_access_at_with_host(
+        root,
+        asked,
+        aterm_containment::consent::host_uuid().as_deref(),
+    )
+}
+
+fn note_person_access_at_with_host(
+    root: &Path,
+    asked: bool,
+    host: Option<&str>,
+) -> Result<(), String> {
+    let Some(host) = host.map(str::trim).filter(|host| !host.is_empty()) else {
+        return Err("this Mac's hardware UUID could not be read".into());
+    };
+    write_json_with_flush(
+        &root.join(PERSON_ACCESS),
+        &json!({"profile":PROFILE,"asked":asked,"host":host}),
+        durable_name,
+    )
 }
 
 /// [`PermissionSteps`] of `records`, with `progress` their run's progress when it belongs to the
@@ -4555,6 +4801,7 @@ fn permission_steps(records: &Records, progress: Option<Progress>, plan: &Plan) 
     // themselves. Only a person's Cancel or Stop holds them.
     let allowed = !cancelled
         && !run_stopped
+        && records.person_access
         && match records.progress {
             Some(_) => admitted && selected,
             None => {
@@ -4569,7 +4816,7 @@ fn permission_steps(records: &Records, progress: Option<Progress>, plan: &Plan) 
     } else if cancelled
         || run_stopped
         || held_restore
-        || (records.progress.is_some() && admitted && !selected)
+        || (records.progress.is_some() && admitted && !(selected && records.person_access))
     {
         PermissionSteps::Off
     } else {
@@ -4593,6 +4840,11 @@ fn permission_steps_at(root: &Path) -> Result<PermissionSteps, String> {
     let records = observation_at(root)
         .map_err(|error| error.to_string())?
         .records;
+    Ok(steps_of(&records))
+}
+
+/// [`PermissionSteps`] of `records` alone ([`permission_steps_at`]).
+fn steps_of(records: &Records) -> PermissionSteps {
     // With no saved plan the fallback never decides the answer: the progress branch needs a
     // saved plan, and the legacy branch reads only the decision.
     let raw_plan = records
@@ -4603,7 +4855,7 @@ fn permission_steps_at(root: &Path) -> Result<PermissionSteps, String> {
         .progress
         .filter(|progress| progress.belongs_to(&raw_plan));
     let plan = records.present(raw_plan);
-    Ok(permission_steps(&records, progress, &plan))
+    permission_steps(records, progress, &plan)
 }
 
 fn snapshot_from_observation(
@@ -8670,6 +8922,238 @@ mod tests {
         assert!(!finished_at(root.path()).unwrap());
     }
 
+    /// An automatic admission keeps Permissions in its plan and admits no step: Local Network's
+    /// first LAN use goes on (`Off`, no wait for a step), until a person's press on this Mac.
+    #[test]
+    fn permission_steps_need_a_persons_press_whatever_the_automatic_plan_selects() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Permissions, Setting::Secrets]);
+        authorize_reading(root.path(), &plan, || Ok(None)).unwrap();
+        assert_eq!(
+            permission_steps_at(root.path()),
+            Ok(PermissionSteps::Off),
+            "no press: no step"
+        );
+        let snapshot = snapshot_at(root.path(), Plan::default()).unwrap();
+        assert!(snapshot.plan.selection.contains(Setting::Permissions));
+        assert!(!snapshot.permissions_allowed);
+        note_person_asked_at(root.path()).unwrap();
+        assert_eq!(
+            permission_steps_at(root.path()),
+            Ok(PermissionSteps::Allowed),
+            "CONTROL: the press admits them, on this Mac's records"
+        );
+    }
+
+    /// The records as an older aterm left them: its progress record carries no
+    /// [`PROGRESS_BY_PRESS`] mark and there is no [`PERSON_ACCESS`] record.
+    fn as_an_older_aterm_left_it(root: &Path) {
+        let path = root.join("initial-setup.json");
+        let mut record: Value = aterm_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record.as_object_mut().unwrap().remove(PROGRESS_BY_PRESS);
+        write_json(&path, &record).unwrap();
+        let _ = std::fs::remove_file(root.join(PERSON_ACCESS));
+    }
+
+    /// An update stops no step a person approved: an older aterm's admitted Permissions group
+    /// keeps the steps allowed, and this build's next choice carries that over as a person's
+    /// press. Negative control: an older run whose plan left Permissions out carries nothing,
+    /// and this build's choice that adds the group asks for no grant.
+    #[test]
+    fn an_older_aterms_approval_outlives_its_records() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let older = selected(&[Setting::Permissions, Setting::Secrets]);
+        authorize_reading(root.path(), &older, || Ok(None)).unwrap();
+        as_an_older_aterm_left_it(root.path());
+        assert_eq!(person_access_at(root.path()), PersonAccess::Older);
+        assert!(permissions_allowed(root.path()), "the older rule stands");
+        system_state_choice(
+            root.path(),
+            &selected(&[Setting::Permissions, Setting::Spotlight]),
+        );
+        assert_eq!(person_access_at(root.path()), PersonAccess::Asked);
+        assert!(permissions_allowed(root.path()), "carried over");
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_reading(root.path(), &selected(&[Setting::Secrets]), || Ok(None)).unwrap();
+        as_an_older_aterm_left_it(root.path());
+        assert!(!permissions_allowed(root.path()));
+        system_state_choice(
+            root.path(),
+            &selected(&[Setting::Permissions, Setting::Secrets]),
+        );
+        assert_eq!(person_access_at(root.path()), PersonAccess::NotAsked);
+        assert!(
+            !permissions_allowed(root.path()),
+            "CONTROL: nothing carried"
+        );
+    }
+
+    /// A person's press is this Mac's: the record names its hardware UUID, and one another Mac
+    /// wrote (a home migrated or restored here) admits no prompt. Negative control: this Mac's.
+    #[test]
+    fn a_press_recorded_on_another_mac_asks_for_nothing_here() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_reading(
+            root.path(),
+            &selected(&[Setting::Permissions, Setting::Secrets]),
+            || Ok(None),
+        )
+        .unwrap();
+        write_json(
+            &root.path().join(PERSON_ACCESS),
+            &json!({"profile":PROFILE,"asked":true,"host":"00000000-0000-0000-0000-000000000000"}),
+        )
+        .unwrap();
+        assert_eq!(person_access_at(root.path()), PersonAccess::NotAsked);
+        assert!(!permissions_allowed(root.path()));
+        note_person_asked_at(root.path()).unwrap();
+        assert_eq!(person_access_at(root.path()), PersonAccess::Asked);
+        assert!(
+            permissions_allowed(root.path()),
+            "CONTROL: this Mac's press"
+        );
+    }
+
+    /// NEGATIVE CONTROL: an unreadable or blank hardware UUID never matches a `null` or missing
+    /// `host` field, and a symlink, FIFO or non-private `person-access.json` (or special
+    /// `initial-setup.json`) fails closed without blocking.
+    #[test]
+    fn a_missing_host_uuid_or_unsafe_person_access_file_never_admits_a_prompt() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        assert!(note_person_access_at_with_host(root.path(), true, None).is_err());
+        assert!(note_person_access_at_with_host(root.path(), true, Some("   ")).is_err());
+
+        for payload in [
+            json!({"profile":PROFILE,"asked":true,"host":null}),
+            json!({"profile":PROFILE,"asked":true}),
+            json!({"profile":PROFILE,"asked":true,"host":""}),
+        ] {
+            write_json(&root.path().join(PERSON_ACCESS), &payload).unwrap();
+            assert_eq!(
+                person_access_at_with_host(root.path(), None),
+                PersonAccess::NotAsked
+            );
+            assert_eq!(
+                person_access_at_with_host(root.path(), Some("")),
+                PersonAccess::NotAsked
+            );
+        }
+
+        let host = "11111111-2222-3333-4444-555555555555";
+        note_person_access_at_with_host(root.path(), true, Some(host)).unwrap();
+        assert_eq!(
+            person_access_at_with_host(root.path(), Some(host)),
+            PersonAccess::Asked,
+            "CONTROL: 0600 regular file with matching host UUID admits"
+        );
+
+        let record = root.path().join(PERSON_ACCESS);
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            person_access_at_with_host(root.path(), Some(host)),
+            PersonAccess::NotAsked,
+            "world-readable person-access.json must fail closed"
+        );
+        std::fs::remove_file(&record).unwrap();
+
+        let target = root.path().join("target-access.json");
+        write_json(
+            &target,
+            &json!({"profile":PROFILE,"asked":true,"host":host}),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, &record).unwrap();
+        assert_eq!(
+            person_access_at_with_host(root.path(), Some(host)),
+            PersonAccess::NotAsked,
+            "symlinked person-access.json must fail closed"
+        );
+        std::fs::remove_file(&record).unwrap();
+
+        assert!(
+            aterm_uds::spawnfd::command("/usr/bin/mkfifo")
+                .arg(&record)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            person_access_at_with_host(root.path(), Some(host)),
+            PersonAccess::NotAsked,
+            "FIFO person-access.json must return immediately without blocking"
+        );
+        std::fs::remove_file(&record).unwrap();
+
+        let progress_path = root.path().join("initial-setup.json");
+        assert!(
+            aterm_uds::spawnfd::command("/usr/bin/mkfifo")
+                .arg(&progress_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            person_access_at_with_host(root.path(), Some(host)),
+            PersonAccess::NotAsked,
+            "FIFO initial-setup.json must fail closed without blocking"
+        );
+    }
+
+    /// NEGATIVE CONTROL: `aterm doctor --apply` over an older unverified (`Applied(false)`) setup
+    /// never promotes its Permissions group to allowed, even if cut short right after rewriting
+    /// `first-run.json` to pending.
+    #[test]
+    fn an_explicit_apply_over_an_unverified_older_setup_never_promotes_permissions() {
+        for cut_at_plan in [true, false] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let older = selected(&[Setting::Permissions, Setting::Dock]);
+            authorize_reading(root.path(), &older, || Ok(None)).unwrap();
+            as_an_older_aterm_left_it(root.path());
+            write_json(
+                &root.path().join("first-run.json"),
+                &json!({"profile":PROFILE,"state":"applied","accounts_verified":false}),
+            )
+            .unwrap();
+            assert!(!permissions_allowed(root.path()));
+
+            let outcome = save_explicit_workstation_plan_with(
+                root.path(),
+                Selection::all().workstation(),
+                |write| {
+                    if cut_at_plan && write == ExplicitWrite::Plan {
+                        Err("cut after decision".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(outcome.is_err(), cut_at_plan);
+            assert_eq!(person_access_at(root.path()), PersonAccess::NotAsked);
+            assert!(!permissions_allowed(root.path()), "{cut_at_plan}");
+        }
+
+        let verified = aterm_tempfile::tempdir().unwrap();
+        let older = selected(&[Setting::Permissions, Setting::Dock]);
+        authorize_reading(verified.path(), &older, || Ok(None)).unwrap();
+        as_an_older_aterm_left_it(verified.path());
+        write_json(
+            &verified.path().join("first-run.json"),
+            &json!({"profile":PROFILE,"state":"applied","accounts_verified":true}),
+        )
+        .unwrap();
+        assert!(permissions_allowed(verified.path()));
+        save_explicit_workstation_plan(verified.path(), Selection::all().workstation()).unwrap();
+        assert_eq!(person_access_at(verified.path()), PersonAccess::Asked);
+        assert!(
+            permissions_allowed(verified.path()),
+            "CONTROL: verified older approval survives explicit apply"
+        );
+    }
+
     #[test]
     fn permission_policy_requires_authorization_without_creating_missing_state() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -8835,7 +9319,7 @@ mod tests {
         use aterm_types::macos_setup::AccessOutcome;
         const PRIVACY: &str = "a [privacy] switch is off";
         let no_step = LocalNetworkFirstUse::NoStep(
-            "System State's plan leaves Permissions out, or a person's Cancel or Stop holds it",
+            "no person asked for System State's access steps, or a person's Cancel or Stop holds them",
         );
         let off = || Ok(PermissionSteps::Off);
         let to_come = || Ok(PermissionSteps::NotYet);
@@ -9078,7 +9562,14 @@ mod tests {
         );
         assert_eq!(saved_plan(root.path()).unwrap(), Some(reviewed.clone()));
         let page = snapshot_at(root.path(), reviewed.clone()).unwrap();
-        assert!(!page.cancelled && page.permissions_allowed);
+        // Set up now asks for no macOS grant: they are on offer, a press of their own away.
+        assert!(!page.cancelled && !page.permissions_allowed);
+        note_person_asked_at(root.path()).unwrap();
+        assert!(
+            snapshot_at(root.path(), reviewed.clone())
+                .unwrap()
+                .permissions_allowed
+        );
 
         // A group press, from a page that still sends every group at Set up: that group alone.
         let root = cancelled();
@@ -9157,7 +9648,8 @@ mod tests {
         .expect("admitted");
         assert_eq!(saved_plan(root.path()).unwrap(), Some(reviewed.clone()));
         let page = snapshot_at(root.path(), Plan::default()).unwrap();
-        assert!(!page.cancelled && page.permissions_allowed);
+        // Set up now asks for no macOS grant: they are on offer.
+        assert!(!page.cancelled && !page.permissions_allowed);
         let records = Records::read(root.path()).unwrap();
         assert_eq!(
             records.restored.map(|restored| restored.left),
@@ -9177,19 +9669,18 @@ mod tests {
         assert_eq!(launch_startup(root.path()), None);
     }
 
-    /// An older aterm's setup gets aterm's own permissions at the next launch unless a person
-    /// cancelled it: a verified completion at once, as before; a pending or unverified one through
-    /// the launch's offer, which adds them to the plan that aterm saved; a restored one brought
-    /// forward first ([`bring_forward_restored_at`]). Before the launch admits a run, none is
-    /// allowed.
+    /// An older aterm's verified completion keeps aterm's own permissions across the update, and
+    /// through this build's next admission ([`carry_older_person_access`]). A pending, unverified,
+    /// cancelled or restored one never had them allowed: the launch's offer adds the group to the
+    /// plan aterm saved, and its grants are on offer, since an automatic admission asks for none.
     #[test]
-    fn permission_policy_approves_legacy_setups_unless_a_person_cancelled() {
+    fn permission_policy_carries_only_what_an_older_aterm_allowed() {
         for (state, verified, allowed) in [
             ("applied", true, true),
-            ("applied", false, true),
-            ("pending", false, true),
+            ("applied", false, false),
+            ("pending", false, false),
             ("cancelled", true, false),
-            ("restored", true, true),
+            ("restored", true, false),
         ] {
             let root = aterm_tempfile::tempdir().unwrap();
             save_automatic_plan(root.path(), Selection::all().workstation()).unwrap();
@@ -9217,6 +9708,15 @@ mod tests {
             if admitted.is_some() {
                 assert!(snapshot.plan.selection.contains(Setting::Permissions));
             }
+            if state != "cancelled" {
+                note_person_asked_at(root.path()).unwrap();
+                assert!(
+                    snapshot_at(root.path(), Plan::default())
+                        .unwrap()
+                        .permissions_allowed,
+                    "CONTROL {state}/{verified}: a person's press here allows them"
+                );
+            }
         }
     }
 
@@ -9235,11 +9735,11 @@ mod tests {
     /// A Restore an older aterm made, before any run was admitted here, left aterm's own
     /// permissions with no run to hold them, so nothing asked for them again (design §3.4: a
     /// Restore withdraws none). The launch brings it forward, and its startup's offer admits a
-    /// run that sets aterm's permissions alone: the restored groups stay at Leave as is,
-    /// Messages & FaceTime as the plan had them, and no preference, sign-out or Spotlight step
-    /// runs.
+    /// run that reads aterm's permissions alone, their grants on offer (no press asked for them):
+    /// the restored groups stay at Leave as is, Messages & FaceTime as the plan had them, and no
+    /// preference, sign-out or Spotlight step runs.
     #[test]
-    fn a_setup_restored_before_any_run_gets_aterms_permissions_and_nothing_else() {
+    fn a_setup_restored_before_any_run_offers_aterms_permissions_and_nothing_else() {
         let sign_outs = accounts(Selection::all());
         for case in [
             "no plan",
@@ -9283,13 +9783,13 @@ mod tests {
 
             let revision = launch_startup(root.path()).expect("the offer admits the run");
             let admitted = snapshot_at(root.path(), Plan::default()).unwrap();
-            assert!(admitted.permissions_allowed, "{case}");
+            assert!(!admitted.permissions_allowed, "{case}: on offer");
             assert!(!admitted.finished, "{case}");
             assert_eq!(admitted.plan.selection, wanted, "{case}");
             let host = run_pass(root.path(), revision);
             assert_eq!(host.calls, [Stage::Permissions], "{case}");
             let done = snapshot_at(root.path(), Plan::default()).unwrap();
-            assert!(done.finished && done.permissions_allowed, "{case}");
+            assert!(done.finished && !done.permissions_allowed, "{case}");
             assert_eq!(launch_startup(root.path()), None, "{case}");
             assert_eq!(
                 bring_forward_restored_at(root.path()).unwrap(),
@@ -9351,7 +9851,7 @@ mod tests {
             leave_restored_as_is(root.path()).unwrap();
             assert!(!finished_at(root.path()).unwrap(), "{state}: the offer");
             let revision = launch_startup(root.path()).expect("the offer admits it");
-            assert!(permissions_allowed(root.path()), "{state}");
+            assert!(!permissions_allowed(root.path()), "{state}: on offer");
             let host = run_pass(root.path(), revision);
             assert_eq!(host.calls, [Stage::Permissions], "{state}");
         }
@@ -11164,7 +11664,10 @@ mod tests {
         assert!(admitted.admitted);
         assert_ne!(admitted.done & Stage::Workstation.bit(), 0);
         assert!(admission_at(root.path()).unwrap().is_some());
-        assert!(permissions_allowed(root.path()));
+        assert!(
+            !permissions_allowed(root.path()),
+            "an explicit apply asks for no macOS grant: on offer"
+        );
         assert_eq!(Withholding::withheld(root.path()), [WIDGETS]);
         assert_eq!(doctor.notification_center_writes(), 0);
 
@@ -13695,6 +14198,17 @@ mod tests {
             }
             fn turned_off(&self) -> bool {
                 false
+            }
+            /// The fixture's "home" network is the ALab LAN; it cannot tell where any other is.
+            /// NEGATIVE CONTROL: answering `Unknown` everywhere fails
+            /// `an_approval_is_picked_up_at_the_next_pass_and_within_the_longest_pause`, whose
+            /// waiting row then gives the place-unknown words instead of `LET_IN`.
+            fn join_place(&self) -> aterm_secrets::alab_join::JoinPlace {
+                if *self.network.lock().unwrap() == "home" {
+                    aterm_secrets::alab_join::JoinPlace::Home
+                } else {
+                    aterm_secrets::alab_join::JoinPlace::Unknown
+                }
             }
             fn started(&self) -> Result<(), String> {
                 Ok(())
@@ -18822,7 +19336,10 @@ mod tests {
         let root = aterm_tempfile::tempdir().unwrap();
         older(root.path(), false);
         let revision = launch_startup(root.path()).expect("the offer admits the plan");
-        assert!(permissions_allowed(root.path()));
+        assert!(
+            !permissions_allowed(root.path()),
+            "an automatic offer: on offer"
+        );
         let host = run_pass(root.path(), revision);
         assert_eq!(host.calls, [Stage::Permissions, Stage::Accounts]);
     }
@@ -19273,7 +19790,10 @@ mod tests {
             .expect("staged");
         // The offer waits for a focused window; the person runs `aterm doctor --apply` meanwhile.
         doctor_apply(root.path());
-        assert!(permissions_allowed(root.path()));
+        assert!(
+            !permissions_allowed(root.path()),
+            "`doctor --apply` asks for no macOS grant: on offer"
+        );
         let revision = launch_startup(root.path()).expect("the admitted run goes on");
         let host = run_pass(root.path(), revision);
         assert_eq!(host.calls, [Stage::Permissions]);
@@ -19567,6 +20087,7 @@ mod tests {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let root = scratch.path();
         system_state_choice(root, &selected(&[Setting::Permissions]));
+        note_person_asked_at(root).unwrap();
         std::fs::write(root.join("initial-setup.json"), CORRUPT).unwrap();
         set_aside_unreadable_setup_at(root, false).unwrap().unwrap();
         let revision = launch_startup(root).expect("the offer admits the recovered plan");

@@ -1543,14 +1543,12 @@ fn quorum_candidates_cost_one_authorization_pass_each_not_one_per_pair() {
     );
 }
 
-#[test]
-fn a_thousand_record_sybil_quorum_flood_evaluates_without_cubic_passes() {
-    // §4.2's 1,030-record shape: A removes X on our branch, while on an isolated branch X admits
-    // Y, Z and W, W signs 256 records (removing A and then alternating Sybil admissions and
-    // removals every 8 steps so 32 distinct cutoffs change membership-record voiding while X, Y
-    // and Z stay a majority at every cutoff), and X, Y and Z sign quorum removals of W at every
-    // cutoff (1 + 1 + 3 + 256 + 768 = 1,029 records, 256 quorum candidates).
-    const N: usize = 256;
+/// §4.2's Sybil quorum flood: A removes X on our branch, while on an isolated branch X admits
+/// Y, Z and W, W signs `n` records (removing A and then alternating Sybil admissions and removals
+/// every 8 steps, so `n / 8` distinct cutoffs change membership-record voiding while X, Y and Z
+/// stay a majority at every cutoff), and X, Y and Z sign quorum removals of W at every cutoff
+/// (`5 + 4n` records, `n` quorum candidates).
+fn section_4_2_flood(n: usize) -> Log {
     let lab = found(&[(A, "m1"), (B, "m2"), (X, "m3")]);
     let mut ours = lab.clone();
     let mut theirs = lab.clone();
@@ -1559,9 +1557,9 @@ fn a_thousand_record_sybil_quorum_flood_evaluates_without_cubic_passes() {
         let entry = admit(&theirs, X, who, label);
         theirs.keep(entry);
     }
-    let mut cutoffs = Vec::with_capacity(N);
+    let mut cutoffs = Vec::with_capacity(n);
     let mut active_sybil: Option<(Mac, RecordId)> = None;
-    for i in 0..N {
+    for i in 0..n {
         let rec = if i % 8 == 7 {
             let step = i / 8;
             if step == 0 {
@@ -1569,9 +1567,9 @@ fn a_thousand_record_sybil_quorum_flood_evaluates_without_cubic_passes() {
             } else if let Some((sybil, admit_id)) = active_sybil.take() {
                 remove(&theirs, W, sybil, &admit_id)
             } else {
-                let n = 100 + (step / 2);
-                let sybil = Mac(u8::try_from(n).unwrap());
-                let entry = admit(&theirs, W, sybil, &format!("m{n}"));
+                let tag = 100 + (step / 2);
+                let sybil = Mac(u8::try_from(tag).unwrap());
+                let entry = admit(&theirs, W, sybil, &format!("m{tag}"));
                 let kept = *theirs.keep(entry).id();
                 active_sybil = Some((sybil, kept));
                 cutoffs.push(kept);
@@ -1595,6 +1593,14 @@ fn a_thousand_record_sybil_quorum_flood_evaluates_without_cubic_passes() {
         }
     }
     heal(&mut ours, &mut theirs);
+    ours
+}
+
+#[test]
+fn a_thousand_record_sybil_quorum_flood_evaluates_without_cubic_passes() {
+    // §4.2's 1,030-record shape (1 + 1 + 3 + 256 + 768 = 1,029 records, 256 quorum candidates).
+    const N: usize = 256;
+    let ours = section_4_2_flood(N);
     assert_eq!(ours.records().count(), 1029);
 
     let membership = ours.membership();
@@ -1609,7 +1615,19 @@ fn a_thousand_record_sybil_quorum_flood_evaluates_without_cubic_passes() {
         "{passes} authorization passes for {N} candidates with {} membership cutoffs",
         N / 8
     );
+    // Weighing the 256 candidates in pairs re-checks only what each one's voided records reach:
+    // 11,917 `is_member_upto` calls where the pair loop ran 704,154.
+    // NEGATIVE CONTROL: the walk re-checks every actor at every step that differs from plain:
+    // 704,154 calls, and the bound fails.
+    let cost = super::eval::weigh_cost(&records);
+    assert!(
+        cost.evaluations <= 1029 * 1029 / 8,
+        "{} is_member_upto calls weighing {N} candidates",
+        cost.evaluations
+    );
 }
+
+pub(super) mod weigh;
 
 /// A `[everyone]` entry.
 fn everyone(name: &str, value: &[u8]) -> crate::text::Entry {
@@ -1711,6 +1729,16 @@ fn dependents_of(log: &Log, epoch: &RecordId) -> Vec<RecordId> {
         .iter()
         .map(|&d| *log.order[d].id())
         .collect()
+}
+
+/// Original keyed-epoch history, then the late Undo which changes its evaluation.
+#[cfg(unix)]
+pub(in crate::membership_log) fn history_reader_fixture() -> (Log, Log, RecordId) {
+    let lab = keyed_lab();
+    let before = lab.with(&[&[&lab.removal][..], &lab.minted()[..], &[&lab.edit][..]].concat());
+    let mut after = before.clone();
+    undo_shares(&mut after, A, &[R, Y]);
+    (before, after, lab.epoch)
 }
 
 /// F21's rule 1, clause by clause, over [`keyed_lab`]'s records and variations of them.

@@ -143,6 +143,251 @@ fn a_bounded_log_answers_last_and_fetch_like_an_unbounded_one() {
         assert_eq!(pa, pb);
     }
     assert_eq!(bounded.read_from(Offset(0)), full.read_from(Offset(0)));
+    for log in [&mut bounded, &mut full] {
+        drop(log.publish_last_visible(head).unwrap());
+    }
+    let mut bounded_view = bounded.last_view_at(head).unwrap();
+    let mut full_view = full.last_view_at(head).unwrap();
+    assert_eq!(
+        bounded
+            .last_matching(&filter, "", 10, 100, &mut bounded_view)
+            .unwrap()
+            .into_page(),
+        full.last_matching(&filter, "", 10, 100, &mut full_view)
+            .unwrap()
+            .into_page(),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn last_refuses_an_unreadable_retained_value_in_plain_and_retirement_overlay_views() {
+    use std::os::unix::fs::FileExt as _;
+
+    for overlay in [false, true] {
+        let root = crate::test_scratch::Scratch::new("tier-last-unreadable");
+        eprintln!(
+            "Last unreadable overlay={overlay} world={}",
+            root.path().display()
+        );
+        let path = root.path().join("log");
+        let mut log = BrokerLog::open_with(&path, Durability::Strict).unwrap();
+        log.set_resident_budget(0);
+        for (seq, subject) in ["/f/tier/target", "/f/tier/retired", "/f/tier/newest"]
+            .into_iter()
+            .enumerate()
+        {
+            log.publish(7, seq as u64, subject.into(), body(seq as u64))
+                .unwrap();
+        }
+        let head = log.head().0;
+        drop(log.publish_last_visible(head).unwrap());
+        let mut view = log.last_view_at(head).unwrap();
+        if overlay {
+            assert!(log.retire_subject(7, "/f/tier/retired").unwrap().is_some());
+        }
+        let filter = astream_wire::Filter::new("/f/tier/>").unwrap();
+        let expected = log
+            .last_matching(&filter, "", 10, 100, &mut view)
+            .unwrap()
+            .into_page()
+            .unwrap();
+        assert_eq!(
+            expected.0.len(),
+            3,
+            "the old view includes the subsequently retired row"
+        );
+        assert_eq!(
+            expected
+                .0
+                .iter()
+                .find(|rec| rec.subject == "/f/tier/target")
+                .unwrap()
+                .seq,
+            Offset(0)
+        );
+        assert_eq!(
+            !view.overlay.is_empty(),
+            overlay,
+            "exercise both actual index branches"
+        );
+        assert_eq!(log.residency().0, 1);
+
+        let at = log.frame_at_for_test(0).unwrap() + 16;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut original = [0; 4];
+        file.read_exact_at(&mut original, at).unwrap();
+        let changed = original.map(|byte| byte ^ 0xff);
+        file.write_all_at(&changed, at).unwrap();
+        file.sync_all().unwrap();
+        let error = match log.last_matching(&filter, "", 10, 100, &mut view) {
+            Err(error) => error,
+            Ok(_) => panic!("unreadable retained Last record was answered successfully"),
+        };
+        assert_eq!(
+            error,
+            crate::LastViewError::UnreadableRetained { offset: 0 },
+            "retained damage cannot become an empty page or an older carried value"
+        );
+        file.write_all_at(&original, at).unwrap();
+        file.sync_all().unwrap();
+        let recovered = log
+            .last_matching(&filter, "", 10, 100, &mut view)
+            .unwrap()
+            .into_page()
+            .unwrap();
+        assert_eq!(
+            recovered, expected,
+            "the same owned view recovers only after the actual frame is readable"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn last_wire_refuses_cold_damage_and_recovers_the_actual_retained_value() {
+    use std::os::unix::fs::FileExt as _;
+
+    let root = crate::test_scratch::Scratch::new("tier-last-wire-unreadable");
+    eprintln!("Last wire unreadable world={}", root.path().display());
+    let path = root.path().join("log");
+    let sock = root.path().join("sock");
+    let mut opts = crate::OpenOptions::new(Durability::Strict);
+    opts.resident_budget = Some(0);
+    let broker = crate::Broker::open_opts(&path, opts, || Ok(crate::Prepared::Nothing)).unwrap();
+    let mut handle = broker.serve(&sock).unwrap();
+    let mut client = crate::Client::connect(&sock).unwrap();
+    let subject = "/f/F/pub/n-1/presence";
+    client.publish(7, 0, subject, b"inc=41").unwrap();
+    client.publish(7, 1, "/f/other", b"newest hot row").unwrap();
+    assert_eq!(broker.residency().0, 1);
+    let expected = client.last(subject, "", 8).unwrap().0;
+    assert_eq!(expected, vec![(0, subject.into(), b"inc=41".to_vec())]);
+    let at = broker.shared_log_frame_at_for_test(0).unwrap() + 16;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut original = [0; 4];
+    file.read_exact_at(&mut original, at).unwrap();
+    file.write_all_at(&original.map(|byte| byte ^ 0xff), at)
+        .unwrap();
+    file.sync_all().unwrap();
+    assert!(
+        client.last(subject, "", 8).is_err(),
+        "Last must refuse, not report missing presence"
+    );
+    let mut stamped = crate::Client::connect(&sock).unwrap();
+    assert!(
+        stamped.last_stamped(subject, "", 8).is_err(),
+        "stamped Last cannot certify absence either"
+    );
+    file.write_all_at(&original, at).unwrap();
+    file.sync_all().unwrap();
+    let mut recovered = crate::Client::connect(&sock).unwrap();
+    assert_eq!(recovered.last(subject, "", 8).unwrap().0, expected);
+    drop(recovered);
+    drop(stamped);
+    drop(client);
+    handle.shutdown();
+}
+
+#[cfg(all(unix, feature = "retention"))]
+#[test]
+fn a_known_pruned_last_value_remains_readable_from_carried_state_and_reopen() {
+    use std::os::unix::fs::FileExt as _;
+    let root = crate::test_scratch::Scratch::new("tier-last-carried");
+    eprintln!("Last carried world={}", root.path().display());
+    let path = root.path().join("log");
+    let subject = "/f/tier/quiet";
+    let mut log = BrokerLog::open_with(&path, Durability::Strict).unwrap();
+    log.set_resident_budget(0);
+    log.publish(7, 0, subject.into(), b"quiet retained state".to_vec())
+        .unwrap();
+    log.publish(7, 1, "/f/tier/newest".into(), b"newest".to_vec())
+        .unwrap();
+    assert_eq!(log.retain_before_carrying_state(Offset(1)).unwrap(), 1);
+    for reopen in [false, true] {
+        if reopen {
+            drop(log);
+            log = BrokerLog::open_with(&path, Durability::Strict).unwrap();
+            log.set_resident_budget(0);
+        }
+        let head = log.head().0;
+        drop(log.publish_last_visible(head).unwrap());
+        let mut view = log.last_view_at(head).unwrap();
+        let filter = astream_wire::Filter::new(subject).unwrap();
+        let (rows, resume) = log
+            .last_matching(&filter, "", 8, 100, &mut view)
+            .unwrap()
+            .into_page()
+            .unwrap();
+        assert_eq!(resume, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (
+                rows[0].seq,
+                rows[0].subject.as_str(),
+                rows[0].body.as_slice()
+            ),
+            (Offset(0), subject, b"quiet retained state".as_slice())
+        );
+    }
+
+    // A newer retained value supersedes the old carried value. Damage must not revive
+    // that old value as if it were still current, including after physical compaction.
+    log.publish(7, 2, subject.into(), b"newer retained state".to_vec())
+        .unwrap();
+    log.publish(
+        7,
+        3,
+        "/f/tier/newest".into(),
+        b"make the new value cold".to_vec(),
+    )
+    .unwrap();
+    let head = log.head().0;
+    drop(log.publish_last_visible(head).unwrap());
+    let mut view = log.last_view_at(head).unwrap();
+    let filter = astream_wire::Filter::new(subject).unwrap();
+    let expected = log
+        .last_matching(&filter, "", 8, 100, &mut view)
+        .unwrap()
+        .into_page()
+        .unwrap();
+    assert_eq!(expected.0.len(), 1);
+    assert_eq!(expected.0[0].seq, Offset(2));
+    let at = log.frame_at_for_test(1).unwrap() + 16; // base1: retained offset2 is index1.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let mut original = [0; 4];
+    file.read_exact_at(&mut original, at).unwrap();
+    file.write_all_at(&original.map(|byte| byte ^ 0xff), at)
+        .unwrap();
+    file.sync_all().unwrap();
+    match log.last_matching(&filter, "", 8, 100, &mut view) {
+        Err(error) => assert_eq!(
+            error,
+            crate::LastViewError::UnreadableRetained { offset: 2 }
+        ),
+        Ok(_) => panic!("damaged newer retained value revived old carried state"),
+    }
+    file.write_all_at(&original, at).unwrap();
+    file.sync_all().unwrap();
+    assert_eq!(
+        log.last_matching(&filter, "", 8, 100, &mut view)
+            .unwrap()
+            .into_page()
+            .unwrap(),
+        expected
+    );
 }
 
 #[cfg(unix)]
@@ -376,8 +621,15 @@ fn assert_rule_retention_parity(at_rest: Option<[u8; 32]>) {
     for seq in 12..18u64 {
         push_both(&mut bounded, &mut full, seq, "/f/F/pub/n1/s1/ev", 90);
     }
+    bounded.reset_cold_reads();
     let tb2 = bounded.retain_by_rules(3_000).unwrap();
     let tf2 = full.retain_by_rules(3_000).unwrap();
+    assert!(tb2.dropped >= 6, "tb2 dropped EV prefix: {}", tb2.dropped);
+    assert_eq!(
+        bounded.cold_reads(),
+        0,
+        "steady-state prefix compaction with no newly carried records must decode 0 cold frames"
+    );
     assert_eq!(
         (tb2.base, tb2.carried, tb2.released),
         (tf2.base, tf2.carried, tf2.released)
@@ -404,6 +656,10 @@ fn assert_rule_retention_parity(at_rest: Option<[u8; 32]>) {
     drop(bounded);
     drop(full);
     let reopened = open(&a, Some(0));
+    assert!(
+        reopened.hot_capacity_for_test() <= 16,
+        "reopened zero-budget log must not grow hot ring across recovered history"
+    );
     let reopened_full = open(&b, None);
     let all = astream_wire::Filter::new("/f/F/>").unwrap();
     let head = reopened.stats().head.0;
@@ -534,4 +790,136 @@ fn unreadable_cold_record_stops_fetch_and_refuses_subscribe_and_fork_without_spi
 
     // 4) Shutdown joins cleanly with zero stuck/spinning tail threads.
     handle.shutdown();
+}
+
+#[test]
+fn open_opts_and_set_resident_budget_bound_hot_ring_and_sharded_broker_tracks_residency() {
+    let root = crate::test_scratch::Scratch::new("tier-open-cap");
+    let path = root.path().join("log");
+    {
+        let mut log = BrokerLog::open(&path).unwrap();
+        for i in 0..500u64 {
+            log.publish(5, i + 1, format!("/f/cap/{}", i % 8), vec![b'z'; 64])
+                .unwrap();
+        }
+        assert_eq!(log.residency().0, 500);
+        assert!(log.hot_capacity_for_test() >= 500);
+        log.set_resident_budget(0);
+        assert_eq!(log.residency().0, 1);
+        assert!(
+            log.hot_capacity_for_test() <= 16,
+            "set_resident_budget(0) must shrink hot VecDeque capacity, got {}",
+            log.hot_capacity_for_test()
+        );
+    }
+
+    // Reopening the 500-record log with `resident_budget = Some(0)` must build only the
+    // hot suffix (never growing `tier.hot` to 500 slots during open).
+    let mut opts = crate::OpenOptions::new(Durability::Strict);
+    opts.resident_budget = Some(0);
+    let reopened = BrokerLog::open_opts(&path, opts, || Ok(crate::Prepared::Nothing)).unwrap();
+    assert_eq!((reopened.residency().0, reopened.residency().2), (1, 500));
+    assert!(
+        reopened.hot_capacity_for_test() <= 16,
+        "open_opts(resident_budget = Some(0)) must keep hot VecDeque bounded, got {}",
+        reopened.hot_capacity_for_test()
+    );
+    let all = reopened.read_from(Offset(0));
+    assert_eq!(all.len(), 500);
+    assert_eq!(all[0].seq, Offset(0));
+    assert_eq!(all[499].seq, Offset(499));
+    drop(reopened);
+
+    // Multi-shard `ShardedBroker::open_opts`, `residency`, and `set_resident_budget`.
+    let shard_dir = root.path().join("shards");
+    let mut s_opts = crate::OpenOptions::new(Durability::Relaxed);
+    s_opts.resident_budget = Some(0);
+    let sb = crate::ShardedBroker::open_opts(&shard_dir, 4, s_opts).unwrap();
+    let mut handle = sb.serve_tcp_loopback().unwrap();
+    for s in 0..4usize {
+        let addr = handle.tcp_addr(s).unwrap();
+        let mut cli = crate::Client::connect_tcp(addr).unwrap();
+        for i in 0..8u64 {
+            cli.publish(
+                11,
+                (s as u64) * 100 + i + 1,
+                &format!("/f/sh/{s}/{i}"),
+                b"v",
+            )
+            .unwrap();
+        }
+    }
+    let (res_recs, _res_bytes, ret_recs) = sb.residency();
+    assert_eq!((res_recs, ret_recs), (4, 32));
+    sb.set_resident_budget(usize::MAX);
+    assert_eq!(sb.residency().0, 4);
+    handle.shutdown();
+    drop(sb);
+
+    let mut reopen_opts = crate::OpenOptions::new(Durability::Relaxed);
+    reopen_opts.resident_budget = Some(0);
+    let sb2 = crate::ShardedBroker::open_opts(&shard_dir, 4, reopen_opts).unwrap();
+    assert_eq!((sb2.residency().0, sb2.residency().2), (4, 32));
+    let mut h2 = sb2.serve_tcp_loopback().unwrap();
+    for s in 0..4usize {
+        let mut cli = crate::Client::connect_tcp(h2.tcp_addr(s).unwrap()).unwrap();
+        let (rows, _) = cli.fetch(0, "/f/sh/>", 16).unwrap();
+        assert_eq!(rows.len(), 8);
+    }
+    h2.shutdown();
+}
+
+#[cfg(all(unix, feature = "retention"))]
+#[test]
+fn compaction_prunes_dropped_dedup_keys_and_skips_damaged_cold_prefix_payloads() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let root = crate::test_scratch::Scratch::new("tier-compact-dedup");
+    let path = root.path().join("log");
+    let mut opts = crate::OpenOptions::new(Durability::Strict);
+    opts.resident_budget = Some(0);
+    let mut log = BrokerLog::open_opts(&path, opts, || Ok(crate::Prepared::Nothing)).unwrap();
+
+    // Seed 8 records on one subject (`producer_id = 21`, `producer_seq = 1..=8`).
+    for seq in 1..=8u64 {
+        let (off, dup) = log
+            .publish(21, seq, "/f/ev".to_string(), vec![seq as u8; 48])
+            .unwrap();
+        assert_eq!((off, dup), (Offset(seq - 1), false));
+    }
+    // First carry-compaction to 2 charges `/f/ev` into `carried_charges` and leaves
+    // offsets 2..8 (`producer_seq` 3..=8) on disk, with 2..7 cold and 7 hot.
+    let d1 = log.retain_before_carrying_state(Offset(2)).unwrap();
+    assert_eq!(d1, 2);
+
+    // Corrupt cold offset 3 (`index == 1` above base 2)'s payload bytes on disk; its
+    // 8-byte frame header length stays intact, and retention to `Offset(6)` drops 2..6.
+    let bad_at = log.frame_at_for_test(1).expect("offset 3 frame start");
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(bad_at + 16)).unwrap();
+        f.write_all(&[0xde, 0xad, 0xbe, 0xef]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    log.reset_cold_reads();
+    let d2 = log.retain_before_carrying_state(Offset(6)).unwrap();
+    assert_eq!(d2, 4);
+    assert_eq!(
+        log.cold_reads(),
+        0,
+        "carrying cut across already-charged cold prefix must decode 0 dropped frames"
+    );
+    assert_eq!(log.base(), Offset(6));
+
+    // Kept key `producer_seq = 7` (offset 6) still dedups; dropped key `producer_seq = 4`
+    // (offset 3, below base 6) was pruned from `dedup` and appends at the head.
+    let (kept_off, kept_dup) = log
+        .publish(21, 7, "/f/ev".to_string(), vec![7u8; 48])
+        .unwrap();
+    assert_eq!((kept_off, kept_dup), (Offset(6), true));
+    let (new_off, new_dup) = log
+        .publish(21, 4, "/f/ev".to_string(), vec![4u8; 48])
+        .unwrap();
+    assert_eq!((new_off, new_dup), (Offset(8), false));
 }

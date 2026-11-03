@@ -348,6 +348,47 @@ fn the_asked_prefill_is_named_only_when_set_and_reproduces() {
     }
 }
 
+/// C13's knob: the messaging world's paced notes, named only when they are there, so every
+/// entry without them keeps its words; refused past their cap and on a run with no messaging.
+#[test]
+fn the_paced_notes_are_named_only_when_set_and_reproduce() {
+    let bare = parse("out=/o").expect("bare");
+    assert_eq!(bare.paced_notes, 0);
+    assert!(!bare.words().contains("paced_notes"), "{}", bare.words());
+    for (words, notes) in [
+        ("paced_notes=0", 0),
+        ("scenario=messaging paced_notes=60", 60),
+        ("paced_notes=1", 1),
+        (
+            &*format!("scenario=messaging paced_notes={PACED_NOTES_MAX}"),
+            PACED_NOTES_MAX,
+        ),
+    ] {
+        let spec = parse(&format!("out=/o {words}")).expect(words);
+        assert_eq!(spec.paced_notes, notes, "{words}");
+        assert_eq!(
+            spec.words().contains(&format!(" paced_notes={notes}")),
+            notes > 0,
+            "{words}"
+        );
+        assert_eq!(
+            parse(&format!("out=/o {}", spec.words())).expect("round trip"),
+            spec,
+            "{words}"
+        );
+    }
+    for bad in [
+        "paced_notes=-1",
+        "paced_notes=many",
+        &*format!("scenario=messaging paced_notes={}", PACED_NOTES_MAX + 1),
+        "scenario=pingpong paced_notes=10",
+        "scenario=ask paced_notes=10",
+    ] {
+        let err = parse(&format!("out=/o {bad}")).expect_err(bad);
+        assert!(err.contains("paced_notes="), "{bad}: {err}");
+    }
+}
+
 /// `at_rest=` reads, a plain run is sealed as what ships is, every entry says which it measured,
 /// and a word it does not know is refused.
 #[test]

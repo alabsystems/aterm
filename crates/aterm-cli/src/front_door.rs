@@ -84,8 +84,8 @@ pub fn alias_route(argv0: &str, first: &str) -> AliasRoute {
             Some(verb) if verb.is_windowing() => AliasRoute::AliasWindowVerb,
             _ => AliasRoute::AliasWindow,
         },
-        // A shim symlink (`git`, `cc`, …) the new-Mac setup laid while the Command Line Tools
-        // install: the one `aterm` binary, run under the tool's own name.
+        // A shim symlink (`git`, `cc`, …) a launch laid while the Command Line Tools are missing:
+        // the one `aterm` binary, run under the tool's own name.
         name if aterm_types::clt_shim::is_shim_tool(name) => AliasRoute::CommandLineToolsShim,
         _ => AliasRoute::FrontDoor,
     }

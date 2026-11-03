@@ -4,7 +4,8 @@
 //! The compiled schemas of `alab/registry` (docs/DESIGN-alab-lab-model-2026-11-01.md §4), the
 //! catalog table that holds the owner's data: providers and their CLIs, plans, Mac models,
 //! machines, login addresses, the mailboxes those deliver to (by name, never by login), phones
-//! (last four digits only), accounts, sub-accounts, sign-in routes and seats, plus two small
+//! (last four digits only), accounts, sub-accounts, sign-in routes and the accounts machines
+//! prefer, plus two small
 //! collections each Mac states about itself (`machine-facts`, `mailbox-obs`) under the per-Mac
 //! quota.
 //!
@@ -14,8 +15,9 @@
 //! reference (checked at compile time), and the registry holds only vault entry names. The one
 //! column typed `email` is `address.addr`, masked on every surface; every other address is a
 //! reference to its `address` row. A mailbox and a phone have random keys, never a digest of
-//! the login or the number. Imported notes, free-text cells and losing values are never copied:
-//! `notes_src` holds their source coordinates.
+//! the login or the number. An imported note's text goes in the row's `note` only when the note
+//! guard passes it (design §0); a refused note and every losing value stay coordinates in
+//! `notes_src`.
 
 use crate::{
     Error, Result,
@@ -50,7 +52,8 @@ const LIFE_FINAL_FIRST: &[&str] = &["locked", "merged", "retired", "ended", "liv
 const fn row() -> Column {
     Column::new("row", Ty::Enum(LIFE)).on_conflict(OnConflict::Prefer(LIFE_FINAL_FIRST))
 }
-/// The owner's note: free text, refused when it names a secret or holds an address.
+/// A row's note, the owner's or a sheet's: free text, refused when it names a secret or holds an
+/// address.
 const fn note() -> Column {
     Column::new("note", Ty::Text(512)).null()
 }
@@ -58,7 +61,8 @@ const fn note() -> Column {
 const fn src() -> Column {
     Column::new("src", Ty::SrcRef).null()
 }
-/// Coordinates of imported notes, free-text cells and losing values: never their text.
+/// Coordinates of imported note cells, the lead's reasoning and losing values: where each came
+/// from, never a refused cell's or a losing value's text.
 const fn notes_src() -> Column {
     Column::new("notes_src", Ty::List(&Ty::SrcRef, 8))
         .null()
@@ -216,27 +220,27 @@ crate::att_collection!(
         prefix: "mc",
         derive: Derive::BirthSha256,
         columns: &[
-            Column::new("label", Ty::Label),
+            Column::new("label", Ty::Label).writer(Writer::Birth),
             Column::new("aliases", Ty::Set(&Ty::Label)),
             Column::new("status", Ty::Enum(MACHINE_STATUS))
-                .on_conflict(OnConflict::Prefer(&["lost", "parked", "active", "planned"])),
+                .on_conflict(OnConflict::Prefer(&["lost", "parked", "active", "planned"]))
+                .writer(Writer::Birth),
             Column::new(
                 "role",
                 Ty::Enum(&["worker", "desk", "release", "vault", "lab", "spare"])
             )
             .null(),
-            Column::new("model", Ty::Ref("model")).null(),
+            Column::new("model", Ty::Ref("model")).null().writer(Writer::Birth),
             Column::new("chip", Ty::Text(32)).null(),
             Column::new("ram_gb", Ty::Uint).null(),
             Column::new("disk_gb", Ty::Uint).null(),
             Column::new("clis", Ty::Set(&Ty::Ref("cli"))),
-            Column::new("max_seats", Ty::Uint).null(),
             Column::new("location", Ty::Text(64)).null(),
-            Column::new("fleet_node", Ty::Hex(32)).null(),
-            Column::new("hosts", Ty::List(&Ty::Text(64), 4)).null(),
+            Column::new("fleet_node", Ty::Hex(32)).null().writer(Writer::Birth),
+            Column::new("hosts", Ty::List(&Ty::Text(64), 4)).null().writer(Writer::Birth),
             // Display-only unless the merged Mac's own facts row names the same target (§6).
             Column::new("merged_into", Ty::Ref("machine")).null(),
-            row(),
+            row().writer(Writer::Birth),
             note(),
             src(),
             notes_src(),
@@ -399,7 +403,7 @@ crate::att_collection!(
 
 /// The account statuses, safest first for a conflict.
 pub const ACCOUNT_STATUS: &[&str] = &["pending", "active", "paused", "broken", "banned"];
-/// The services an account's seats can run.
+/// The services an account can run.
 pub const SERVICES: &[&str] = &[
     "claude-code",
     "claude-web",
@@ -445,7 +449,9 @@ crate::att_collection!(
             .null(),
             Column::new("status", Ty::Enum(ACCOUNT_STATUS))
                 .on_conflict(OnConflict::Prefer(&["banned", "broken", "paused", "pending", "active"])),
-            Column::new("class", Ty::Enum(&["dedicated", "shared", "pool"])).null(),
+            // A name the owner can change, never a machine (`guard::account_label`); empty reads
+            // as the default, `keys::default_account_label`.
+            Column::new("label", Ty::AccountLabel(32)).null(),
             Column::new("services", Ty::Set(&Ty::Enum(SERVICES))),
             Column::new("plan", Ty::Ref("plan")).null(),
             Column::new("plan_since", Ty::Day).null(),
@@ -456,14 +462,16 @@ crate::att_collection!(
             Column::new("region", Ty::Enum(&["global", "mainland-cn"])).null(),
             Column::new("flow", Ty::Enum(&["device", "browser", "window"])).null(),
             Column::new("vault_ref", Ty::SecretRef).null(),
-            // The harness label at migration (`m8-2`, `m106-m38`, `kimi-m16`).
+            // The harness label at migration (`m8-2`, `m106-m38`, `kimi-m16`): what a Mac already
+            // calls this row, so its login directory never moves.
             Column::new("legacy_label", Ty::Text(64)).null(),
             row(),
             note(),
             src(),
             notes_src(),
         ],
-        unique: &[],
+        // Two live accounts under one name are a finding; the name is never a key.
+        unique: &[&["label"]],
         max_row: 0,
     }
 );
@@ -529,24 +537,25 @@ crate::att_collection!(
 );
 
 crate::att_collection!(
-    /// Slot k on a machine (`m2.2`), keyed `st-<machine 16hex>-<k>`, so two addresses placed in
-    /// one slot at once are a visible conflict. Owner placements only: an automatic move is a
-    /// journal `place` row, which never spends the registry's lifetime records.
-    pub SEAT = Collection {
-        name: "seat",
+    /// One machine prefers one account, keyed `pf-<22hex>` from the pair (design §0). A mapping,
+    /// never an identity or a limit: nothing refuses, drops or signs out an account because no
+    /// preference names it, and any number of machines may prefer one account. Owner and import
+    /// rows only: this Mac's automatic use of an account is a journal `place` row, which never
+    /// spends the registry's lifetime records.
+    pub PREFERENCE = Collection {
+        name: "preference",
         version: 1,
         kind: Kind::Cells,
         writers: Writers::Owner,
-        prefix: "st",
+        prefix: "pf",
         derive: Derive::Composite,
         columns: &[
-            // Null is a vacant seat; the slot keeps its history on its key.
-            Column::new("address", Ty::Ref("address")).null(),
-            // Empty means every account of the address.
-            Column::new("providers", Ty::Set(&Ty::Ref("provider"))),
-            Column::new("role", Ty::Enum(&["home", "warm", "borrow"])),
+            Column::new("machine", Ty::Ref("machine")).fixed(),
+            Column::new("account", Ty::Ref("account")).fixed(),
+            // Smaller is tried first; none sorts after every number.
+            Column::new("rank", Ty::Uint).null(),
+            Column::new("why", Ty::Enum(&["owner", "import"])),
             Column::new("since", Ty::Time).null(),
-            Column::new("why", Ty::Enum(&["owner", "import", "pin"])),
             row(),
             note(),
             src(),
@@ -596,6 +605,80 @@ crate::att_collection!(
     }
 );
 
+/// The largest earlier record an archived row carries: its padded base64 and the row's key fit
+/// one record's 64 KiB body.
+pub const MAX_ARCHIVED_WIRE: usize = 46 * 1024;
+
+crate::att_collection!(
+    /// An owned row of an earlier generation, carried by a roll (design §3.8): the signed record
+    /// that wrote it, still sealed under its own table's scope, so a reader authenticates its
+    /// signer and operation digest itself and no writer of this generation can speak for another
+    /// Mac. Keyed by a digest of the operation (`keys::archived_pk`); `generation` is the table
+    /// generation whose scope the record was sealed under. A row of this Mac's own in this
+    /// generation outranks it by the owned rule. Written by the roll alone, never edited.
+    pub ARCHIVED = Collection {
+        name: "archived",
+        version: 1,
+        kind: Kind::Cells,
+        writers: Writers::Owner,
+        prefix: "ar",
+        derive: Derive::BirthSha256,
+        columns: &[
+            Column::new("generation", Ty::Uint).fixed(),
+            Column::new("wire", Ty::Sealed(MAX_ARCHIVED_WIRE)).fixed(),
+            row(),
+        ],
+        unique: &[],
+        max_row: 0,
+    }
+);
+
+/// The most writers one cover row names.
+pub const MAX_COVER_WRITERS: usize = 512;
+
+/// One writer's covered history in a cover row: its actor's key (`keys::actor_key`) and the
+/// last sequence of its records the roll carried.
+pub const COVERED: &[Member] = &[
+    Member {
+        name: "a",
+        ty: Ty::Hex(32),
+        null: false,
+    },
+    Member {
+        name: "s",
+        ty: Ty::Uint,
+        null: false,
+    },
+];
+
+crate::att_collection!(
+    /// What one Mac's restatement of an earlier generation carried (design §3.8): for each
+    /// writer of that table, the last record sequence whose effect is now in this one. A Mac may
+    /// release its storage of the sealed table once these rows, merged, cover every record it
+    /// holds there (`alab::roll::covered`). Keyed by the generation and the restating Mac
+    /// (`keys::roll_pk`); written by that Mac's roll alone: a reader counts a cover only as the
+    /// Mac its key names signed it (`alab::roll::covers`), and the grid shows its columns
+    /// read-only (`Writer::Mine`).
+    pub ROLL = Collection {
+        name: "roll",
+        version: 1,
+        kind: Kind::Cells,
+        writers: Writers::Owner,
+        prefix: "rl",
+        derive: Derive::BirthSha256,
+        columns: &[
+            Column::new("from", Ty::Uint).fixed().writer(Writer::Mine),
+            Column::new("covered", Ty::List(&Ty::Struct(COVERED), MAX_COVER_WRITERS))
+                .writer(Writer::Mine),
+            Column::new("ops", Ty::Uint).writer(Writer::Mine),
+            Column::new("at", Ty::Time).writer(Writer::Mine),
+            row(),
+        ],
+        unique: &[],
+        max_row: 0,
+    }
+);
+
 /// Every collection of the registry, besides the reserved `schema` collection.
 pub const COLLECTIONS: [&Collection; 15] = [
     &PROVIDER,
@@ -611,7 +694,7 @@ pub const COLLECTIONS: [&Collection; 15] = [
     &ACCOUNT,
     &SUBACCOUNT,
     &AUTH_ROUTE,
-    &SEAT,
+    &PREFERENCE,
     &SOURCE,
 ];
 
@@ -621,16 +704,55 @@ pub const REGISTRY: Table = Table {
     role: ROLE,
     collections: &COLLECTIONS,
     self_quota: SELF_QUOTA,
-    ends: &["seat"],
+    ends: &["preference"],
 };
+
+/// The second generation's role (design §3.8, §11 step 13).
+pub const ROLE_2: &str = "registry.2";
+
+/// The second generation's collections: the first's, the rows a roll carries archived, and its
+/// cover rows.
+pub const COLLECTIONS_2: [&Collection; 17] = [
+    &PROVIDER,
+    &CLI,
+    &PLAN,
+    &MODEL,
+    &MACHINE,
+    &MACHINE_FACTS,
+    &ADDRESS,
+    &MAILBOX,
+    &MAILBOX_OBS,
+    &PHONE,
+    &ACCOUNT,
+    &SUBACCOUNT,
+    &AUTH_ROUTE,
+    &PREFERENCE,
+    &SOURCE,
+    &ARCHIVED,
+    &ROLL,
+];
+
+/// `alab/registry.2`: the registry restated by a roll, each writer's quota whole again. Readers
+/// take it up once `alab/registry` is sealed (`att::current`).
+pub const REGISTRY_2: Table = Table {
+    application: APPLICATION,
+    role: ROLE_2,
+    collections: &COLLECTIONS_2,
+    self_quota: SELF_QUOTA,
+    ends: &["preference"],
+};
+
+/// The registry's generations, oldest first: generation `n` is `GENERATIONS[n - 1]`.
+pub const GENERATIONS: [&Table; 2] = [&REGISTRY, &REGISTRY_2];
 
 /// The key a new grid row of `collection` is born under (design §5, §8), from the typed values
 /// the owner gave its cells: a random key for a mailbox or a phone, never a digest of what it
 /// guards; an address's digest; **the canonical account key** from the account's realm and the
 /// address of its identity, else its login (`keys::claims_email`), read from `cells`; a
 /// sub-account from its account and observed key; a sign-in route from its account and method;
-/// a planned machine from its label, the sheet placeholder's birth identity. A provider, CLI,
-/// plan, model, seat or source row is keyed by a lab verb or the importer, never the grid.
+/// a preference from its machine and account; a planned machine from its label, the sheet
+/// placeholder's birth identity. A provider, CLI, plan, model or source row is keyed by a lab
+/// verb or the importer, never the grid.
 ///
 /// # Errors
 /// A value the key needs is missing or malformed, or the collection's keys come from elsewhere.
@@ -652,12 +774,13 @@ pub fn birth(
         cell::project(&ADDRESS, cells)
             .rows
             .get(pk)
+            .filter(|row| row.live())
             .and_then(|row| row.get("addr"))
             .and_then(Value::as_str)
             .map(str::to_owned)
             .ok_or_else(|| {
                 Error::new(&format!(
-                    "{}: the address it names is not a row here, or is conflicted",
+                    "{}: the address it names is not a live row here, or is conflicted",
                     collection.name
                 ))
             })
@@ -675,8 +798,21 @@ pub fn birth(
         }
         "subaccount" => keys::subaccount_pk(need("account")?, need("key")?),
         "auth-route" => keys::auth_route_pk(need("account")?, need("method")?),
+        "preference" => keys::preference_pk(need("machine")?, need("account")?),
         other => Err(Error::new(&format!(
             "{other}: the grid adds no rows here; a lab verb or the importer keys them"
         ))),
     }
+}
+
+/// What an account row is called: the owner's or the import's `label`, else its default, from
+/// the key and the realm. `None` only for a row with neither a label nor a known realm.
+pub fn account_label(pk: &str, row: &cell::Row) -> Option<String> {
+    row.get("label")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            let realm = row.get("realm").and_then(Value::as_str)?;
+            keys::default_account_label(realm, pk).ok()
+        })
 }

@@ -221,6 +221,21 @@ fn a_seat_moves_only_once_every_member_the_book_heard_reads_moved_seats() {
     assert!(
         !book_word(&[member(Some("0.147.0"), Some(now))], &[7; 32], None, now).moved_seats_read
     );
+    for malformed in [
+        "0+148",
+        "0-148",
+        "0.148",
+        "0.148.0.1",
+        "00.148.0",
+        "0.0148.0",
+        "0.148.0+",
+        "0.148.0+bad space",
+    ] {
+        assert!(
+            !moved_seats_read(&[member(Some(malformed), Some(now))], now),
+            "malformed version counted as reading moved seats: {malformed:?}"
+        );
+    }
 }
 
 /// The book hears a node key elsewhere (`node_elsewhere`) only from a live entry of that very key
@@ -496,7 +511,7 @@ fn a_vault_join_over_the_fleets_channel_reaches_the_desk_only_as_the_channel_pro
 
     // The vault's current code: the desk is asked with the proved node, as the fleet's.
     let member = Member::listen(root.path(), &current, current.mark());
-    let missed = prove_over_fleet(&fresh, &joining, (&current, &m7), &at(&member))
+    let missed = prove_over_fleet(&fresh, &joining, (&current, &m7), &at(&member), None)
         .expect_err("the test's member refuses");
     assert!(
         refusals(missed).contains("decided by the test's member"),
@@ -505,9 +520,44 @@ fn a_vault_join_over_the_fleets_channel_reaches_the_desk_only_as_the_channel_pro
     assert_eq!(member.seen(), [(true, *m7.key().bytes())]);
     drop(member);
 
-    // A removed Mac's copy of the code the removal rotated: asked, but not as the fleet's.
+    // A removed Mac's copy of the code the removal rotated: asked, but not as the fleet's, and
+    // still bound to the node key its channel proved so one channel cannot name another Mac's
+    // node key.
     let member = Member::listen(root.path(), &stale, current.mark());
-    let missed = prove_over_fleet(&fresh, &joining, (&stale, &m7), &at(&member))
+    let m8 = NodeIdentity::from_seed(&"08".repeat(16), &[8; 32]).expect("node");
+    let dial_m8 = |_: &str| -> aterm_secrets::Result<Box<dyn Stream>> {
+        let reached = aterm_net::fleet_member::dial(
+            "127.0.0.1",
+            Some(std::net::Ipv4Addr::LOCALHOST.into()),
+            member.port,
+            (&stale, Some(&m8)),
+            FleetOp::VaultJoin,
+            HANG,
+        )
+        .map_err(|error| aterm_secrets::Error::new(error.to_string()))?;
+        let stream = reached.transport.into_stream();
+        stream.sock.set_read_timeout(Some(HANG))?;
+        stream.sock.set_write_timeout(Some(HANG))?;
+        Ok(Box::new(stream))
+    };
+    let sign_m7 = |message: &[u8]| -> [u8; 64] { m7.sign_record(desk::PROVE_RECORD, message) };
+    let mismatched = join::prove_first(
+        &fresh,
+        &dial_m8,
+        &joining,
+        &sign_m7,
+        &[format!("127.0.0.1:{}", member.port)],
+    )
+    .expect_err("a channel proved as m8 cannot submit m7's proof");
+    assert!(
+        refusals(mismatched).contains("another node key than the fleet's channel proved"),
+        "channel-binding refusal under stale code"
+    );
+    assert!(
+        member.seen().is_empty(),
+        "a mismatched node key under a stale fleet code never reaches decide"
+    );
+    let missed = prove_over_fleet(&fresh, &joining, (&stale, &m7), &at(&member), None)
         .expect_err("the test's member refuses");
     assert!(refusals(missed).contains("decided by the test's member"));
     assert_eq!(
@@ -519,7 +569,7 @@ fn a_vault_join_over_the_fleets_channel_reaches_the_desk_only_as_the_channel_pro
 
     // Another fleet's secret: no channel, so no desk.
     let member = Member::listen(root.path(), &current, current.mark());
-    let missed = prove_over_fleet(&fresh, &joining, (&foreign, &m7), &at(&member))
+    let missed = prove_over_fleet(&fresh, &joining, (&foreign, &m7), &at(&member), None)
         .expect_err("a wrong secret reaches nothing");
     assert!(
         !refusals(missed).contains("decided by the test's member"),

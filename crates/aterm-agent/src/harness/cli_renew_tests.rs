@@ -40,13 +40,14 @@ impl AccountsHost for NativeRenewal {
     fn renew_flow(&self, home: &str, email: &str, browser: &RenewBrowser) -> Result<i32, String> {
         self.renew_outcome(home, email, browser)
             .map(|exit| exit.code)
+            .map_err(|failure| failure.to_string())
     }
     fn renew_outcome(
         &self,
         home: &str,
         email: &str,
         browser: &RenewBrowser,
-    ) -> Result<RenewalExit, String> {
+    ) -> Result<RenewalExit, RenewalFailure> {
         renew_flow_of(
             self.program.as_os_str(),
             home,
@@ -1936,6 +1937,7 @@ fn a_whole_sitting_through_a_stand_in_checks_only_in_staging_homes() {
                 None,
             )
             .map(|exit| exit.code)
+            .map_err(|failure| failure.to_string())
         }
         fn status_in_home(&self, home: &str) -> Result<Captured, String> {
             let user = |name: &str| (name == "USER").then(|| OsString::from("someone"));
@@ -2067,6 +2069,7 @@ fn a_mailbox_directory_runs_accounts_renew_without_a_terminal_through_the_opener
                 Some(aterm_spec::wait::MUST_HAPPEN),
             )
             .map(|exit| exit.code)
+            .map_err(|failure| failure.to_string())
         }
         fn status_in_home(&self, home: &str) -> Result<Captured, String> {
             let user = |name: &str| (name == "USER").then(|| OsString::from("someone"));

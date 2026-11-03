@@ -30,7 +30,8 @@ pub(crate) struct Unacked<T> {
 /// One owed publish and the broker's answer to it: `(offset, deduped)`, or the refusal or transport failure ([`Link::recv`]).
 pub(crate) type Settled<T> = (Unacked<T>, io::Result<(u64, bool)>);
 
-/// A consumer group's commit that rides the next publish in one write ([`Link::send_after_commit`]).
+/// A consumer group's commit that rides a burst of publishes in one write, ahead of them
+/// ([`Link::send_burst`]).
 pub(crate) struct HeldCommit<'a, T> {
     /// The group.
     pub group: &'a str,
@@ -38,6 +39,34 @@ pub(crate) struct HeldCommit<'a, T> {
     pub upto: u64,
     /// What its sender wants done with its answer.
     pub tag: T,
+}
+
+/// One publish of a burst ([`Link::send_burst`]).
+pub(crate) struct Publish<'a, T> {
+    /// The producer the record is deduped under.
+    pub producer_id: u64,
+    /// Its sequence within that producer.
+    pub seq: u64,
+    /// Whether this is the FIRST send of a sequence just reserved ([`Unacked::first`]).
+    pub first: bool,
+    /// Where it is published.
+    pub subject: &'a str,
+    /// What it carries.
+    pub body: &'a [u8],
+    /// What its sender wants done with its answer.
+    pub tag: T,
+}
+
+/// A burst the connection did not take ([`Link::send_burst`]): the send's error and every tag
+/// it carried, the commit's apart. Nothing is owed for any of them, though each frame ahead
+/// of the cut may have landed.
+pub(crate) struct Unsent<T> {
+    /// The send's error.
+    pub error: io::Error,
+    /// The commit's tag, when one rode.
+    pub commit: Option<T>,
+    /// Each publish's tag, in the burst's order.
+    pub tags: Vec<T>,
 }
 
 /// The publisher connection and the acks owed on it, in send order.
@@ -76,9 +105,11 @@ impl<T> Link<T> {
         self.unacked.is_empty().then_some(&mut self.client)
     }
 
-    /// Write one publish WITHOUT waiting for its ack, and queue `tag` for the answer.
+    /// Write one publish WITHOUT waiting for its ack, and queue `tag` for the answer: a burst
+    /// of one ([`Link::send_burst`]), for the tests that drive the connection directly.
     /// # Errors
     /// The send's, with the tag.
+    #[cfg(test)]
     #[allow(
         clippy::too_many_arguments,
         reason = "one publish's fields, its tag and the instant its caller read off its own clock"
@@ -93,19 +124,19 @@ impl<T> Link<T> {
         tag: T,
         now: Instant,
     ) -> Result<(), (io::Error, T)> {
-        match self.client.send_publish(producer_id, seq, subject, body) {
-            Ok(()) => {
-                self.owe(Unacked {
-                    seq,
-                    first,
-                    sent: now,
-                    tag,
-                    rider: None,
-                });
-                Ok(())
-            }
-            Err(e) => Err((e, tag)),
-        }
+        let publish = Publish {
+            producer_id,
+            seq,
+            first,
+            subject,
+            body,
+            tag,
+        };
+        self.send_burst(None, vec![publish], now)
+            .map_err(|mut unsent| {
+                let tag = unsent.tags.pop().expect("the one publish's tag");
+                (unsent.error, tag)
+            })
     }
 
     /// Write a consumer group's COMMIT to `upto` WITHOUT waiting for its ack (astream's `Client::send_commit`), and queue `tag` for the answer.
@@ -133,61 +164,66 @@ impl<T> Link<T> {
         }
     }
 
-    /// Write a consumer group's COMMIT to `commit.upto` AND one publish in ONE write, the
-    /// commit first, WITHOUT waiting for either ack (astream's `Client::send_pipelined`), and
-    /// queue `commit.tag` then `tag` for the two answers. The broker hands writes it
-    /// receives together to its writer together, so the two land in one group-commit batch
-    /// behind one flush, where a commit written alone a moment before pays a flush of its
-    /// own (`broker.pipelining`).
+    /// Write a consumer group's COMMIT to `commit.upto`, when one rides, AND every publish of
+    /// `publishes` in ONE write, the commit first, WITHOUT waiting for any ack (astream's
+    /// `Client::send_pipelined`), and queue the commit's tag, then each publish's in order,
+    /// for their answers. The broker's reader hands its writer what it finds already
+    /// received whole as one unit, so a burst the reader takes in one read lands in one
+    /// group-commit batch behind one flush, where a commit written alone a moment before
+    /// pays a flush of its own (`broker.pipelining`). A burst the reader does not take whole
+    /// in one read (wider than its read step or the socket's buffer) is handed over in
+    /// parts that share batches as they allow: the batch is a cost, never a contract, and
+    /// what each op did is its own ack's to say.
     /// # Errors
-    /// The send's, with both tags: nothing is owed for either.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one publish's fields, the commit riding it, its tag and the caller's clock"
-    )]
-    pub fn send_after_commit(
+    /// The send's, with every tag ([`Unsent`]): nothing is owed for any of them, though a
+    /// write cut short may have landed every frame the broker received whole ahead of the
+    /// cut, so a publish of a failed burst may already be on the bus. Only the last frame is
+    /// sure not to be.
+    pub fn send_burst(
         &mut self,
-        commit: HeldCommit<'_, T>,
-        producer_id: u64,
-        seq: u64,
-        first: bool,
-        subject: &str,
-        body: &[u8],
-        tag: T,
+        commit: Option<HeldCommit<'_, T>>,
+        publishes: Vec<Publish<'_, T>>,
         now: Instant,
-    ) -> Result<(), (io::Error, T, T)> {
-        let burst = [
-            Pipelined::Commit {
-                group: commit.group,
-                upto: commit.upto,
-            },
-            Pipelined::Publish {
-                producer_id,
-                producer_seq: seq,
-                subject,
-                body,
-            },
-        ];
-        match self.client.send_pipelined(&burst) {
-            Ok(()) => {
-                self.owe(Unacked {
-                    seq: 0,
-                    first: false,
-                    sent: now,
-                    tag: commit.tag,
-                    rider: None,
-                });
-                self.owe(Unacked {
-                    seq,
-                    first,
-                    sent: now,
-                    tag,
-                    rider: None,
-                });
-                Ok(())
-            }
-            Err(e) => Err((e, commit.tag, tag)),
+    ) -> Result<(), Unsent<T>> {
+        let mut burst = Vec::with_capacity(publishes.len() + usize::from(commit.is_some()));
+        if let Some(c) = &commit {
+            burst.push(Pipelined::Commit {
+                group: c.group,
+                upto: c.upto,
+            });
         }
+        burst.extend(publishes.iter().map(|p| Pipelined::Publish {
+            producer_id: p.producer_id,
+            producer_seq: p.seq,
+            subject: p.subject,
+            body: p.body,
+        }));
+        if let Err(error) = self.client.send_pipelined(&burst) {
+            return Err(Unsent {
+                error,
+                commit: commit.map(|c| c.tag),
+                tags: publishes.into_iter().map(|p| p.tag).collect(),
+            });
+        }
+        if let Some(c) = commit {
+            self.owe(Unacked {
+                seq: 0,
+                first: false,
+                sent: now,
+                tag: c.tag,
+                rider: None,
+            });
+        }
+        for p in publishes {
+            self.owe(Unacked {
+                seq: p.seq,
+                first: p.first,
+                sent: now,
+                tag: p.tag,
+                rider: None,
+            });
+        }
+        Ok(())
     }
 
     fn owe(&mut self, owed: Unacked<T>) {
@@ -490,6 +526,102 @@ mod tests {
             first("/f/f/cur/m/node/inbox"),
             a_at,
             "NEGATIVE CONTROL: a group nobody committed starts at A"
+        );
+    }
+
+    /// **A COMMIT AND A BURST OF PUBLISHES GO IN ONE WRITE AND ONE BATCH, THE COMMIT FIRST**
+    /// (critic item C13) — on a real broker: their acks come back in the burst's order, the
+    /// commit's offset below every publish's, all in one writer batch, and the group resumes
+    /// past what the commit named. A burst with no commit owes its publishes alone.
+    #[test]
+    fn a_commit_and_a_burst_of_publishes_go_in_one_write_and_one_batch() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-p")
+            .tempdir_in("/tmp")
+            .expect("a scratch dir");
+        let socket = dir.path().join("b.sock");
+        let broker = crate::test_broker(dir.path().join("b.log")).expect("a broker");
+        let _server = broker.serve(&socket).expect("serve");
+        let dial = || {
+            crate::transport::connect(
+                &socket.to_string_lossy(),
+                std::time::Duration::from_secs(60),
+            )
+            .expect("dial")
+            .0
+        };
+        let mut link: Link<&str> = Link::from(dial());
+        let (group, filter) = ("/f/f/cur/n/node/inbox", "/f/f/c/*");
+        link.send(7, 1, true, "/f/f/c/a", b"a", "a", Instant::now())
+            .map_err(|(e, _)| e)
+            .expect("A written");
+        let (_, answer) = link.recv().expect("A's ack");
+        let (a_at, _) = answer.expect("A landed");
+
+        let publishes = ["s1", "s2", "s3"]
+            .into_iter()
+            .zip(2u64..)
+            .map(|(tag, seq)| Publish {
+                producer_id: 7,
+                seq,
+                first: true,
+                subject: "/f/f/pub/n/s/ev",
+                body: tag.as_bytes(),
+                tag,
+            })
+            .collect();
+        let batches = broker.stats().writer_batches;
+        link.send_burst(
+            Some(HeldCommit {
+                group,
+                upto: a_at,
+                tag: "commit",
+            }),
+            publishes,
+            Instant::now(),
+        )
+        .map_err(|unsent| unsent.error)
+        .expect("the burst written");
+        assert_eq!(link.unacked(), 4, "the commit and three publishes owed");
+        let answered: Vec<(&str, u64)> = std::iter::from_fn(|| link.recv())
+            .map(|(owed, answer)| (owed.tag, answer.expect("landed").0))
+            .collect();
+        assert_eq!(
+            answered.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            ["commit", "s1", "s2", "s3"],
+            "in the burst's order"
+        );
+        assert!(
+            answered.windows(2).all(|w| w[0].1 < w[1].1),
+            "the commit below every publish: {answered:?}"
+        );
+        assert_eq!(
+            broker.stats().writer_batches - batches,
+            1,
+            "one writer batch for the whole burst"
+        );
+        let mut sub = dial().subscribe_group(group, filter).expect("subscribe");
+        link.send_burst(
+            None,
+            vec![Publish {
+                producer_id: 7,
+                seq: 5,
+                first: true,
+                subject: "/f/f/c/b",
+                body: b"b",
+                tag: "b",
+            }],
+            Instant::now(),
+        )
+        .map_err(|unsent| unsent.error)
+        .expect("B written alone");
+        let (owed, answer) = link.recv().expect("B's ack, and no other");
+        assert_eq!(owed.tag, "b");
+        let (b_at, _) = answer.expect("B landed");
+        assert_eq!(
+            sub.recv().expect("a delivery").expect("not the end").0,
+            b_at,
+            "the commit moved the group past A"
         );
     }
 

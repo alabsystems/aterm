@@ -271,7 +271,7 @@ pub fn wasm_clause(config: &str) -> Result<WasmClause, ClauseError> {
 /// # Errors
 /// The file cannot be read, or its clause is refused ([`wasm_clause`]).
 pub fn wasm_pin(repo: &Path) -> Result<String, String> {
-    std::fs::read_to_string(repo.join("publish/config.sh"))
+    crate::read_regular_text(repo.join("publish/config.sh"))
         .map_err(|e| format!("publish/config.sh: {e}"))
         .and_then(|c| wasm_clause(&c).map_err(|r| format!("{} — {}", r.why, r.remedy)))
         .map(|clause| clause.pin)

@@ -15,8 +15,8 @@ const MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 
 fn bounded(path: &Path, maximum: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .and_then(|file| file.take(maximum as u64 + 1).read_to_end(&mut bytes))
+    crate::identity::open_regular_nonblock(path)
+        .and_then(|(file, _)| file.take(maximum as u64 + 1).read_to_end(&mut bytes))
         .map_err(|error| Error::io(format!("read {}", path.display()), &error))?;
     if bytes.len() > maximum {
         return Err(Error::refused(format!(

@@ -388,6 +388,7 @@ mod macos {
                         enabled: true,
                     },
                 ],
+                menu_tab: None,
             });
         }
         m
@@ -2253,18 +2254,24 @@ mod macos {
             row(&format!("tabs={n}"), &mut d, &mut el, &mut matrix);
         }
         let mut m = model(4);
-        for kind in [
-            TabIconKind::Codex,
-            TabIconKind::About,
-            TabIconKind::Settings,
-            TabIconKind::Markdown,
-            TabIconKind::Editor,
-            TabIconKind::Recovery,
-        ] {
+        let tile = |fill, glyph| crate::tab_bar::AppTile { fill, glyph };
+        let inks = |fill, glyph| crate::tab_bar::AppTileInks {
+            active: tile(fill, glyph),
+            solo: tile(fill, glyph),
+            quiet: tile(fill, glyph),
+        };
+        row("tile unpublished", &mut d, &mut el, &mut matrix);
+        toolbar::set_app_tiles(&handle, inks([40, 90, 160], [240, 240, 250]));
+        row("tile published", &mut d, &mut el, &mut matrix);
+        for kind in TabIconKind::ALL {
             m.metadata[0].icon = Some(kind);
             apply(&handle, &m);
             row(&format!("icon={kind:?}"), &mut d, &mut el, &mut matrix);
         }
+        m.metadata[0].icon = Some(TabIconKind::Settings);
+        apply(&handle, &m);
+        toolbar::set_app_tiles(&handle, inks([150, 60, 40], [250, 240, 230]));
+        row("tile recoloured", &mut d, &mut el, &mut matrix);
         for (name, f) in [
             ("dirty", 0usize),
             ("busy", 1),
@@ -2396,16 +2403,16 @@ mod macos {
             );
         }
 
-        let groups: [&[&str]; 8] = [
+        // Every icon kind the rows above drew, so a new kind joins its group without an edit.
+        let icon_rows: Vec<String> = TabIconKind::ALL
+            .iter()
+            .map(|kind| format!("icon={kind:?}"))
+            .collect();
+        let icons: Vec<&str> = icon_rows.iter().map(String::as_str).collect();
+        let groups: [&[&str]; 9] = [
+            &["tile unpublished", "tile published", "tile recoloured"],
             &["tabs=1", "tabs=2", "tabs=3", "tabs=5", "tabs=8"],
-            &[
-                "icon=About",
-                "icon=Settings",
-                "icon=Markdown",
-                "icon=Editor",
-                "icon=Recovery",
-                "icon=Codex",
-            ],
+            &icons,
             &["dirty", "busy", "plain"],
             &["conn=Outbound", "conn=Inbound", "conn=Both"],
             &["accent=None", "accent=(220,40,60)", "accent=(20,180,90)"],

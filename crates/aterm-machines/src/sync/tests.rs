@@ -166,6 +166,8 @@ pub(crate) struct Inert {
     locked_at_reads: Mutex<Vec<bool>>,
     sleeps: Mutex<Vec<Duration>>,
     fixed_wait_ms: Option<u64>,
+    /// Whether this Mac holds a fleet key already ([`Ports::holds_fleet_key`]).
+    fleet_key_held: bool,
 }
 
 impl Inert {
@@ -239,6 +241,7 @@ impl Inert {
             locked_at_reads: Mutex::new(Vec::new()),
             sleeps: Mutex::new(Vec::new()),
             fixed_wait_ms: Some(0),
+            fleet_key_held: true,
         }
     }
 
@@ -314,6 +317,9 @@ impl Ports for Inert {
     }
     fn sleep(&self, duration: Duration) {
         self.sleeps.lock().unwrap().push(duration);
+    }
+    fn holds_fleet_key(&self) -> bool {
+        self.fleet_key_held
     }
     fn installed_release(&self) -> bool {
         self.installed
@@ -1259,7 +1265,11 @@ fn the_accounts_resync_from_the_subscriber_or_a_person_and_never_from_a_window()
 }
 
 /// A sync that leaves a fleet a person joined by hand stands aside, waiting on that person, and
-/// fails nothing; one the issuer did not answer fails, for the next pass to try again.
+/// fails nothing; one the issuer did not answer fails, for the next pass to try again; and a check
+/// that reads the fleet as left so (`FleetRead::Blocked`) plans no change and runs no apply.
+///
+/// NEGATIVE CONTROL: read `FleetRead::Blocked` as a change, and the plan and the pass report one
+/// and run the fleet's apply.
 #[test]
 fn a_fleet_left_as_a_person_joined_it_waits_and_an_unanswered_join_fails() {
     let scratch = aterm_tempfile::tempdir().unwrap();
@@ -1284,6 +1294,26 @@ fn a_fleet_left_as_a_person_joined_it_waits_and_an_unanswered_join_fails() {
         fleet.why.as_deref(),
         Some("the issuer at m22:7100 did not answer; the next pass tries again")
     );
+
+    // A check that reads it so plans no change and runs no apply, in a plan or a pass alike.
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.fleet.lock().unwrap() =
+        FleetRead::Blocked("this Mac joined another fleet by hand".into());
+    for mode in [Mode::Plan, Mode::Apply] {
+        let pass = ran(ports.pass(Trigger::Subscriber, mode));
+        let fleet = row(&pass.rows, FLEET);
+        assert_eq!(fleet.outcome, Outcome::Blocked, "{mode:?}: {fleet:?}");
+        assert!(
+            fleet
+                .why
+                .as_deref()
+                .is_some_and(|why| why.contains("by hand")),
+            "{fleet:?}"
+        );
+        assert!(!fleet.outcome.is_failure());
+    }
+    assert!(!ports.applies().contains(&"fleet"), "{:?}", ports.applies());
 }
 
 /// Subscriber refresh runs from the installed apply path, including a headless subscriber
@@ -1966,6 +1996,23 @@ fn init_skips_join_jitter_and_non_capacity_failures_do_not_retry() {
         *sub_ports.sleeps.lock().unwrap(),
         vec![Duration::from_secs(45)],
         "Trigger::Subscriber must wait initial join jitter before dialing"
+    );
+
+    // A Mac in no fleet yet (the vault just let it in) joins at once on every trigger: the
+    // jitter spreads only a herd of members re-joining under a rotated code.
+    // NEGATIVE CONTROL: `&& ports.holds_fleet_key()` cut from `sync_fleet_with_retry`: the
+    // first join waits 45 s and this assert fails.
+    let scratch_first = aterm_tempfile::tempdir().unwrap();
+    let first_ports = Inert {
+        fixed_wait_ms: Some(45_000),
+        fleet_key_held: false,
+        ..Inert::new(scratch_first.path())
+    };
+    let first_pass = ran(first_ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(row(&first_pass.rows, FLEET).outcome, Outcome::Changed);
+    assert!(
+        first_ports.sleeps.lock().unwrap().is_empty(),
+        "a Mac in no fleet yet must not wait join jitter"
     );
 
     // 2. Non-capacity error and Blocked stand-aside do NOT retry at capacity backoff.

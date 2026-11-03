@@ -91,7 +91,7 @@ fn each_rule_says_its_own_numbers() {
     );
     let plain = wake(
         2,
-        Declarer::Owner,
+        Declarer::Agent,
         &[AtomKind::File, AtomKind::Pid, AtomKind::File, AtomKind::At],
         None,
         None,
@@ -99,7 +99,7 @@ fn each_rule_says_its_own_numbers() {
     assert!(
         plain
             .fact()
-            .starts_with("wake #2 (owner's): its file, pid and at conditions hold."),
+            .starts_with("wake #2 (yours): its file, pid and at conditions hold."),
         "each kind once, in order: {}",
         plain.text()
     );

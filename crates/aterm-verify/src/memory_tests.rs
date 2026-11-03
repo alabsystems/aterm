@@ -10,6 +10,45 @@ use crate::scope::Scope;
 
 const GIB: u64 = 1 << 30;
 
+#[test]
+fn cpu_observations_survive_exit_without_double_counting_or_hiding_missing_reads() {
+    let meter = Meter::new();
+    assert_eq!(meter.observed_cpu(), None);
+    meter.started();
+    meter.book(10, &[]);
+    meter.ended(10);
+    assert_eq!(
+        meter.observed_cpu(),
+        None,
+        "an unobserved child is not zero CPU"
+    );
+    let process = |pid, start, cpu_ns| aterm_sysprobe::MemberUsage {
+        pid,
+        start,
+        cpu_ns,
+        ..Default::default()
+    };
+    meter.book(10, &[process(10, 1, 100), process(11, 2, 200)]);
+    meter.book(10, &[process(10, 1, 150)]);
+    meter.ended(10);
+    // A repeated counter, even under another group, is not additional work.
+    meter.book(20, &[process(11, 2, 190), process(10, 3, 75)]);
+    assert_eq!(
+        meter.observed_cpu(),
+        Some(ObservedCpu {
+            nanoseconds: 425,
+            processes: 3
+        })
+    );
+    let sibling = Meter::new();
+    sibling.book(30, &[process(30, 4, 999)]);
+    assert_eq!(
+        meter.observed_cpu().unwrap().nanoseconds,
+        425,
+        "parallel stages are separate"
+    );
+}
+
 fn spec(id: StageId, lane: Lane) -> StageSpec {
     StageSpec {
         id,
@@ -493,6 +532,9 @@ fn a_run_keys_each_stage_by_its_checkout_selection_and_variant() {
         Key::of_run(StageId::Test, &here).variant,
         Some(format!("jobs {}", here.test_jobs()))
     );
+    let checker = Key::of_run(StageId::SpecCheckers, &here);
+    assert_eq!(checker.variant, Some(format!("jobs {}", here.test_jobs())));
+    assert_eq!(checker.crates, None, "checkers always run the workspace");
     let mut cells = ctx("/ck");
     cells.cells = vec!["win".to_owned(), "linux-arm".to_owned()];
     let foreign = Key::of_run(StageId::ForeignCells, &cells);

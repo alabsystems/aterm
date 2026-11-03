@@ -14,3 +14,6 @@ pub mod screen;
 pub mod ssh;
 pub mod templates;
 pub mod text;
+
+#[cfg(test)]
+mod github_keys_tests;

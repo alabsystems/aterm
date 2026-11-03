@@ -7,6 +7,10 @@
 //! approval rule (`RULE_DISK_WORKER` in `supervise::policy::approval`) passes, besides a command
 //! proven read-only, only `aterm harness disk` ([`runs_harness_disk`]); every other box of the
 //! worker's is declined.
+//!
+//! The worker runs with its parent's permissions (owner ruling 2026-11-02), so this fence holds only
+//! where its parent's mode raises boxes: under bypass none is raised, and what keeps it to `aterm
+//! harness disk free` is its task's words alone.
 
 use std::path::{Component, Path};
 

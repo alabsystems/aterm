@@ -8,7 +8,7 @@ use aterm_json::{Map, Value};
 
 use crate::config::{ConfigOrigin, Validated, on_floor};
 use crate::error::{Error, Kind, Result, Sub, Tried};
-use crate::identity::Profile;
+use crate::identity::{LoadKind, Profile};
 use crate::slug::{RepoArg, Slug};
 
 /// An owner's or a profile's tier.
@@ -297,7 +297,35 @@ impl Presence {
             Presence::Unusable(slug) => slug,
         }
     }
+
+    /// The presence whose [`Presence::slug`] is `slug`: `present`, `absent`, or the slug of a
+    /// `LoadKind` whose presence is unusable (`loose`, `symlink`, `malformed`, `unsupported`,
+    /// `io`), kept exactly; `None` for any other word. A taped decision decodes its steps by it,
+    /// through `LoadKind::presence`, the rule `LoadError::presence` encodes by.
+    #[must_use]
+    pub fn from_slug(slug: &str) -> Option<Presence> {
+        match slug {
+            "present" => Some(Presence::Present),
+            "absent" => Some(Presence::Absent),
+            _ => load_kind(slug)
+                .map(LoadKind::presence)
+                .filter(|presence| matches!(presence, Presence::Unusable(_))),
+        }
+    }
 }
+
+// How `Presence::from_slug` reads an unusable slug back: every `LoadKind`, by its slug.
+crate::fx::canon::by_slug!(
+    load_kind,
+    LOAD_KINDS,
+    LoadKind: Missing,
+    Loose,
+    Symlink,
+    Malformed,
+    Unsupported,
+    Io,
+    Unavailable,
+);
 
 /// Why a read went anonymous.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -640,6 +668,15 @@ impl Router {
             return (single.name == name).then_some(single);
         }
         self.validated.as_ref()?.profiles.get(name)
+    }
+
+    /// The profile so named's [`Presence`] in `env` ([`crate::identity::presence`]), `Absent`
+    /// when no profile has that name: what the credential helper, `whoami --git` and a lane's
+    /// host check each judge a writer by.
+    #[must_use]
+    pub fn presence(&self, name: &str, env: &dyn crate::identity::EnvSource) -> Presence {
+        self.profile(name)
+            .map_or(Presence::Absent, |row| crate::identity::presence(row, env))
     }
 
     /// Every profile, sorted by name.
@@ -1284,8 +1321,8 @@ impl Router {
         self.single.is_some()
     }
 
-    /// The `[[writers]]` rows (empty without a file-made `Validated`): `policy check` and
-    /// `atpkg-publish hosts check` print them.
+    /// The `[[writers]]` rows (empty without a file-made `Validated`): `policy check` prints
+    /// them.
     #[must_use]
     pub fn writers(&self) -> Vec<(String, Vec<Slug>)> {
         self.validated

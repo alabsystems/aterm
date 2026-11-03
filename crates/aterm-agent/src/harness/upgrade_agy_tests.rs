@@ -418,6 +418,11 @@ fn a_store_build_is_told_from_the_twin() {
     )));
     assert!(!store_build(Path::new("/opt/homebrew/bin/agy")));
     assert!(!store_build(Path::new("/p/store/muse/1/bin/agy")));
+    assert!(!store_build(Path::new("/p/store/agy/01/bin/agy")));
+    assert!(!store_build(Path::new("/p/store/agy/not-a-build/bin/agy")));
+    assert!(!store_build(Path::new("/p/store/agy/../bin/agy")));
+    assert!(!store_build(Path::new("/p/../store/agy/1/bin/agy")));
+    assert!(!store_build(Path::new("store/agy/1/bin/agy")));
 }
 
 /// The resume hint includes `HOME` and config-moving flags before `--conversation=<id>`.

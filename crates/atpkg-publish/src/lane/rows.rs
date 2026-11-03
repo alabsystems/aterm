@@ -44,7 +44,7 @@ pub fn unproven(m: &PkgManifest) -> BTreeSet<Triple> {
 /// # Errors
 /// A refusal when it cannot be read or does not parse.
 pub fn local(path: &Path) -> Result<PkgManifest> {
-    let text = std::fs::read_to_string(path)
+    let text = crate::identity::read_regular_text(path, crate::identity::MAX_META_BYTES)
         .map_err(|e| Error::io(format!("read {}", path.display()), &e))?;
     aterm_toml::from_str(&text).map_err(|e| {
         Error::refused(format!(
@@ -107,7 +107,10 @@ pub fn fetch(
         return Fetched::Unreachable(format!("{slug} {tag}: {last}"));
     }
     let path = dir.join(&pkg);
-    let (Ok(bytes), Ok(signature)) = (std::fs::read(&path), std::fs::read(dir.join(&sig))) else {
+    let (Ok(bytes), Ok(signature)) = (
+        crate::identity::read_regular_bytes(&path, crate::identity::MAX_META_BYTES),
+        crate::identity::read_regular_bytes(&dir.join(&sig), crate::identity::MAX_META_BYTES),
+    ) else {
         return Fetched::Unreachable(format!("{pkg} did not land in {}", dir.display()));
     };
     match quad.verify_pkg(&bytes, &signature) {

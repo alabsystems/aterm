@@ -28,6 +28,10 @@ use amacs::input::{EditorInput, Follow, Reduction};
 #[path = "app_document_watch.rs"]
 mod watch;
 
+#[cfg(test)]
+#[path = "owner_keys_save_tests.rs"]
+mod owner_keys_save_tests;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigEditorRevealDecision {
     Select {
@@ -267,6 +271,9 @@ struct PendingDocumentClose {
 struct PendingDocumentSaveIntent {
     seq: aterm_buffer::Seq,
     source_view: crate::tab_model::ViewId,
+    /// Whether control clients alone asked for it, so its replay is theirs
+    /// ([`crate::owner_keys_save`]); a person's request merged in makes it the person's.
+    controller: bool,
 }
 
 /// One document's leaves inside a larger window/quit close plan. The plan is
@@ -778,6 +785,11 @@ pub(crate) struct DocumentHostRuntime {
     /// Documents whose on-disk generation no longer matches the saver baseline,
     /// and why.
     disk_conflicts: BTreeMap<DocumentId, DiskConflictCause>,
+    /// Documents an edit no person at this window is known to have made reached since they
+    /// opened or last took the disk's text by a discard: a save of the aterm.toml in force keeps
+    /// the owner's keys as the file has them while one is here
+    /// ([`crate::owner_keys_save`]).
+    unvouched: BTreeMap<DocumentId, crate::owner_keys_save::Unvouched>,
     inflight: BTreeSet<DocumentId>,
     pending_saves: BTreeMap<DocumentId, PendingDocumentSaveIntent>,
     pending_closes: BTreeMap<DocumentId, Vec<PendingDocumentClose>>,
@@ -854,6 +866,7 @@ impl DocumentHostRuntime {
             #[cfg(all(test, unix))]
             carry_as_windowed_for_test: false,
             disk_conflicts: BTreeMap::new(),
+            unvouched: BTreeMap::new(),
             inflight: BTreeSet::new(),
             pending_saves: BTreeMap::new(),
             pending_closes: BTreeMap::new(),
@@ -1676,6 +1689,11 @@ impl App {
     ) {
         let commits = self.editor_workspace.take_commits(document);
         if let Some((seq, _)) = commits.last() {
+            if self.person_gesture_refused() {
+                self.native_documents
+                    .unvouched
+                    .insert(document, crate::owner_keys_save::Unvouched::Controller);
+            }
             self.edit_document_committed(document, source_view, *seq);
             let other_views = self
                 .view_store
@@ -3102,6 +3120,19 @@ impl App {
             "Discarded changes and reloaded from disk",
             crate::native_editor::Origin::Revert,
         )?;
+        // The buffer holds the file's text now, whoever edited it before; an edit no person
+        // here is known to have made must not come back unmarked by C-/ or redo, so its undo
+        // starts here.
+        if self.native_documents.unvouched.remove(&document).is_some()
+            && crate::owner_keys_save::discard_starts_history()
+        {
+            self.editor_workspace.start_history_here(document);
+            self.native_runtime.set_editor_history_availability(
+                document,
+                self.editor_workspace.can_undo(document),
+                self.editor_workspace.can_redo(document),
+            );
+        }
         self.set_editor_view_status(source_view, "Discarded changes and reloaded from disk");
         self.finish_pending_document_closes(document)?;
         // Discard is how a window close a failed save left waiting recovers: it
@@ -3252,6 +3283,31 @@ impl App {
         )
     }
 
+    /// Why the save of `document` now is refused ([`crate::owner_keys_save`]): it is the
+    /// aterm.toml in force, a control client made the save or an edit no person here is known
+    /// to have made reached it, and the owner's keys in its text differ from the file's.
+    fn owner_keys_save_refusal(&self, document: DocumentId) -> Option<String> {
+        let provenance = crate::owner_keys_save::Provenance::new(
+            self.person_gesture_refused(),
+            self.native_documents.unvouched.get(&document).copied(),
+        );
+        if !provenance.fenced() {
+            return None;
+        }
+        let host = &self.native_documents;
+        let grant = host.grants.get(host.persistence.grant(document)?)?;
+        let in_force =
+            crate::owner_keys_save::in_force(self.native_config_service.bound_logical_path())?;
+        if !crate::owner_keys_save::is_in_force(grant, &in_force) {
+            return None;
+        }
+        let saved = self.document_store.snapshot(document)?.text;
+        let disk =
+            crate::native_config_service::VersionedConfigService::observe_path(&in_force, true)
+                .map(|observation| observation.text);
+        provenance.refusal(&saved, disk.as_deref().map_err(|_| ()))
+    }
+
     pub(crate) fn save_front_document(&mut self) -> Result<(), String> {
         let wid = self
             .frontmost_window
@@ -3266,6 +3322,13 @@ impl App {
         document: DocumentId,
         source_view: crate::tab_model::ViewId,
     ) -> Result<(), String> {
+        if let Some(message) = self.owner_keys_save_refusal(document) {
+            aterm_log::info!(
+                "editor: a save of aterm.toml refused: its owner keys are the owner's"
+            );
+            self.set_editor_view_status(source_view, &message);
+            return Err(message);
+        }
         if self.native_documents.disk_conflicts.contains_key(&document) {
             let message = "Save blocked · file changed on disk; copy any local edits you need to keep, then choose ‘Discard Changes and Reload from Disk’".to_string();
             self.set_editor_view_status(source_view, &message);
@@ -3284,14 +3347,19 @@ impl App {
             let intent = PendingDocumentSaveIntent {
                 seq: snapshot.seq,
                 source_view,
+                controller: crate::owner_keys_save::queued_by_controller(
+                    self.person_gesture_refused(),
+                ),
             };
             self.native_documents
                 .pending_saves
                 .entry(document)
                 .and_modify(|pending| {
+                    let controller = pending.controller && intent.controller;
                     if intent.seq >= pending.seq {
                         *pending = intent;
                     }
+                    pending.controller = controller;
                 })
                 .or_insert(intent);
             return Ok(());
@@ -3579,8 +3647,12 @@ impl App {
                 // Keep the Editor in its Saving state across the hand-off. In a
                 // headless run this call completes inline (and performs the final
                 // publication); with a real event loop it launches the next worker
-                // generation and the later completion owns final publication.
-                if let Err(message) = self.save_document_checkpoint(document, intent.source_view) {
+                // generation and the later completion owns final publication. The
+                // replay is made for whoever asked, a control client included.
+                let replayed = self.with_controller_mark(intent.controller, |app| {
+                    app.save_document_checkpoint(document, intent.source_view)
+                });
+                if let Err(message) = replayed {
                     self.native_runtime.set_document_saving(document, false);
                     self.publish_editor_commit(document, source_view);
                     self.mark_document_shutdown_failure(document, &message);
@@ -4660,6 +4732,7 @@ impl App {
             }
             host.recovery_status.remove(document);
             host.disk_conflicts.remove(document);
+            host.unvouched.remove(document);
             host.journal_retries.remove(*document);
             host.watch.unwatch(*document);
             self.editor_workspace.forget(*document);
@@ -5306,6 +5379,7 @@ impl App {
                 })?
                 .inspect_open(&granted.grant.canonical_uri, granted.text.as_bytes())?;
             let recovered = decision.recovered_text.clone();
+            let mut drafted = false;
             let document = self
                 .document_store
                 .open(granted.grant.canonical_uri.clone(), granted.text.clone());
@@ -5330,6 +5404,7 @@ impl App {
                     let _ = self.document_store.remove_if_unattached(document);
                     return Err("recovered draft could not be installed atomically".to_string());
                 }
+                drafted = true;
             }
             let current = self
                 .document_store
@@ -5349,6 +5424,11 @@ impl App {
                 }
             };
             recovery_notice = initialized.notice;
+            if drafted {
+                self.native_documents
+                    .unvouched
+                    .insert(document, crate::owner_keys_save::Unvouched::Recovered);
+            }
             document
         };
         if let Some(listing) = granted.directory.clone() {
@@ -5421,7 +5501,8 @@ impl App {
             | AppKind::About
             | AppKind::Settings
             | AppKind::SystemState
-            | AppKind::Recovery => {
+            | AppKind::Recovery
+            | AppKind::Workers => {
                 return Err("requested app is not a document app".to_string());
             }
         };
@@ -5444,7 +5525,8 @@ impl App {
                     | AppKind::About
                     | AppKind::Settings
                     | AppKind::SystemState
-                    | AppKind::Recovery => {
+                    | AppKind::Recovery
+                    | AppKind::Workers => {
                         return Err("requested app is not a document app".to_string());
                     }
                 };
@@ -5582,7 +5664,8 @@ impl App {
             | AppKind::About
             | AppKind::Settings
             | AppKind::SystemState
-            | AppKind::Recovery => Err("requested app is not a document app".to_string()),
+            | AppKind::Recovery
+            | AppKind::Workers => Err("requested app is not a document app".to_string()),
         }
     }
 
@@ -10672,6 +10755,12 @@ mod tests {
 
     #[test]
     fn quit_during_inflight_save_pumps_the_frozen_quit_sequence() {
+        let _serial = crate::menu::terminate_test_serial();
+        let crate::menu::NativeTerminateDecision::Dispatch(generation) =
+            crate::menu::admit_native_terminate(crate::system_quit::Asker::Reopen)
+        else {
+            panic!("a fresh native quit dispatches");
+        };
         let dir = fresh_dir("aterm-app-quit-save-latch");
         let path = dir.join("quit.md");
         fs::write(&path, "base\n").unwrap();
@@ -10687,7 +10776,13 @@ mod tests {
         commit(&mut app, wid, "latest ");
         let latest = app.document_store.snapshot(document).unwrap();
 
-        assert!(!app.prepare_quit_document_shutdown_inner(true).unwrap());
+        assert_eq!(app.quit_barriers(), crate::app_window::QuitBarrier::Saving);
+        assert_eq!(
+            crate::menu::admit_native_terminate(crate::system_quit::Asker::Person),
+            crate::menu::NativeTerminateDecision::DeferExisting(generation),
+            "the native quit stays pending while the frozen save catches up"
+        );
+        assert!(crate::system_quit::reopens());
         assert!(app.native_documents.pending_saves.contains_key(&document));
         finish_inflight_save_for_test(&mut app, document, view, first);
 
@@ -10698,6 +10793,13 @@ mod tests {
             Some(latest.seq)
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), latest.text.as_ref());
+        assert!(crate::menu::complete_current_native_termination());
+        assert_eq!(
+            crate::menu::admit_native_terminate(crate::system_quit::Asker::Person),
+            crate::menu::NativeTerminateDecision::AllowExit(generation),
+            "only the saved native request becomes eligible to exit"
+        );
+        assert!(crate::system_quit::reopens());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -11735,6 +11837,7 @@ mod tests {
             },
             focused_path: vec![crate::restore::RestoreBranch::Second],
             zoomed,
+            parked: false,
         }];
         app.restore_into_window(WindowId(0), layout);
         app
@@ -12008,6 +12111,7 @@ mod tests {
                                     root,
                                     focused_path: Vec::new(),
                                     zoomed: false,
+                                    parked: false,
                                 })
                                 .collect();
                             layout.active_item = Some(1);
@@ -12461,6 +12565,7 @@ mod tests {
             },
             focused_path: vec![crate::restore::RestoreBranch::First],
             zoomed: false,
+            parked: false,
         }];
         let collapse_layout = layout.clone();
         let mut failures = Vec::new();

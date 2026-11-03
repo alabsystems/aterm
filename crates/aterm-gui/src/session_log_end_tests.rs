@@ -52,7 +52,12 @@ fn in_front(name: &str, pgid: i32) -> (Mutex<SessionTimeline>, Hand) {
 /// `by` asks aterm at `ms` to end group `pgid` by `word` (the hook the act and the verb call).
 fn ask(tl: &Mutex<SessionTimeline>, hand: &Hand, ms: u64, pgid: i32, word: AskWord, by: Actor) {
     hand.set(ms);
-    EndAsker { timeline: tl, by }.ask(pgid, word);
+    EndAsker {
+        timeline: tl,
+        by,
+        from: None,
+    }
+    .ask(pgid, word);
 }
 
 /// Command `r1`'s block ends at `end_ms` with status `code`, read at `read_ms` in `order`.
@@ -200,6 +205,95 @@ fn an_end_past_the_asks_window_is_the_programs_own() {
                 "{order:?} late={late}: {got:?}"
             );
         }
+    }
+}
+
+/// 1b'. AN ASKED END STANDS FOR ITS AGENT'S EXIT PAST THE CLOSE'S WINDOW
+/// ([`SessionLog::end_asked_of`]): an agent the Overview's Stop or `aterm ctl signal term` asked
+/// to end that takes 40 s to end in order is still its asker's when the harness reads its exit,
+/// for [`ASKED_EXIT_STANDS`] past the ask, unless it began after the ask (another process its
+/// group's id names); an agent whose start is unknown has the close's own window alone. The act
+/// names the program whose connection asked (`from=`).
+#[test]
+fn an_end_asked_of_an_agent_stands_for_its_exit_past_the_closes_window() {
+    let (tl, hand) = in_front("claude", 300);
+    hand.set(100);
+    EndAsker {
+        timeline: &tl,
+        by: Actor::Ctl,
+        from: Some("lab (pid 411)"),
+    }
+    .ask(300, AskWord::Signal);
+    let read = |ms: u64, pgid: i32, began: Option<u64>| {
+        hand.set(ms);
+        tl.lock().unwrap().slog().end_asked_of(pgid, began)
+    };
+    let lab = Some((Actor::Ctl, Some("lab (pid 411)".to_string())));
+    let began = Some(WALL0);
+    let exit_stands = u64::try_from(ASKED_EXIT_STANDS.as_millis()).expect("ms");
+    let late = 100 + stands_ms() + 5_000;
+    assert_eq!(
+        read(100 + stands_ms(), 300, None),
+        lab,
+        "the close's own window"
+    );
+    assert_eq!(
+        read(100 + stands_ms() + 1, 300, None),
+        None,
+        "an agent of unknown start: the close's own window alone"
+    );
+    assert_eq!(
+        read(late, 300, began),
+        lab,
+        "40 s to end in order: still asked"
+    );
+    assert_eq!(
+        read(late, 300, Some(WALL0 + 101)),
+        None,
+        "an agent begun after the ask is another process its group's id names"
+    );
+    assert_eq!(read(late, 400, began), None, "another group's");
+    assert_eq!(read(100 + exit_stands, 300, began), lab);
+    assert_eq!(
+        read(100 + exit_stands + 1, 300, began),
+        None,
+        "ended ten minutes on: for another reason"
+    );
+    let got = lines_of(&tl);
+    assert!(
+        find(
+            &got,
+            &[" mark r2 act word=signal ", " by=ctl ", "from=lab", "411"]
+        )
+        .is_some(),
+        "the act names the program that asked: {got:?}"
+    );
+}
+
+/// 1b''. ONLY A STOP OWNS ITS AGENT'S EXIT ([`SessionLog::end_asked_of`]): an end asked by the
+/// `signal` verb's `int` (an interrupt: Claude Code's Ctrl-C stops a turn and ends nothing on
+/// purpose) or by the restart act (which asks for the agent back, by its stamp) still reads as
+/// asked of its group, but names no asker of the agent's exit; a `term` does.
+#[test]
+fn only_a_stop_owns_its_agents_exit() {
+    for (word, owns) in [
+        (AskWord::Interrupt, false),
+        (AskWord::Restart, false),
+        (AskWord::Signal, true),
+    ] {
+        let (tl, hand) = in_front("claude", 300);
+        ask(&tl, &hand, 100, 300, word, Actor::Ctl);
+        hand.set(101);
+        assert_eq!(
+            asked(&tl).map(|(pgid, by, _)| (pgid, by)),
+            Some((300, Actor::Ctl)),
+            "{word:?}: asked of its group"
+        );
+        assert_eq!(
+            tl.lock().unwrap().slog().end_asked_of(300, Some(WALL0)),
+            owns.then_some((Actor::Ctl, None)),
+            "{word:?}"
+        );
     }
 }
 
@@ -378,6 +472,7 @@ fn a_stop_or_a_resume_asks_no_end() {
         let asker = EndAsker {
             timeline: &tl,
             by: Actor::Ctl,
+            from: None,
         };
         assert_eq!(
             crate::control::ask_signal_end(Some(asker), sig, 400).is_some(),
@@ -696,6 +791,7 @@ fn an_ask_stood_renewed_or_taken_back_reads_as_it_stands() {
         EndAsker {
             timeline: &tl,
             by: Actor::Aterm,
+            from: None,
         }
         .stand(300);
         assert_eq!(
@@ -737,6 +833,7 @@ fn an_ask_stood_renewed_or_taken_back_reads_as_it_stands() {
             let asker = EndAsker {
                 timeline: &tl,
                 by: Actor::Ctl,
+                from: None,
             };
             assert_eq!(asker.delivered(300, rc), rc == 0, "rc={rc}");
             assert_eq!(

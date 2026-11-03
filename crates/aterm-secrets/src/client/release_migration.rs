@@ -19,6 +19,10 @@ const CANONICAL: [&str; 3] = [
     "~/.aterm/release-ring/release-credentials.toml",
 ];
 const LEGACY_ROSTER: &str = "~/.aterm/roster/aterm-machines.toml";
+const CANONICAL_ROSTER: [&str; 2] = [
+    "~/.aterm/release-ring/roster/aterm-machines.toml",
+    "~/.aterm/release-ring/roster/aterm-machines.toml.sig",
+];
 const RECHECK: Duration = Duration::from_secs(300);
 
 #[derive(Default)]
@@ -148,6 +152,123 @@ enum Migration {
 }
 
 fn migrate(doc: &Document, anchors: &[&str], floor: u64, now: i64) -> Migration {
+    let targets: Vec<_> = doc
+        .entries()
+        .into_iter()
+        .filter(|entry| CANONICAL_ROSTER.contains(&entry.name.as_str()))
+        .collect();
+    if !targets.is_empty()
+        && (targets.len() != 2
+            || CANONICAL_ROSTER.iter().enumerate().any(|(index, name)| {
+                doc.entry(&Audience::Everyone, name).is_none_or(|entry| {
+                    !entry.if_absent || entry.anchor.as_deref() != Some(CANONICAL_ROSTER[1 - index])
+                })
+            }))
+    {
+        return Migration::Unchanged;
+    }
+    let identity = match migrate_identity(doc, anchors, floor, now) {
+        Migration::Ready(next) => Some(next),
+        Migration::Unchanged => None,
+        refused @ Migration::Refused(_) => return refused,
+    };
+    let current = identity.as_deref().unwrap_or(doc);
+    match complete_roster(current, anchors, floor, now) {
+        Migration::Unchanged => identity.map_or(Migration::Unchanged, Migration::Ready),
+        result => result,
+    }
+}
+
+fn complete_roster(doc: &Document, anchors: &[&str], floor: u64, now: i64) -> Migration {
+    // A partial or host-specific signer is an explicit choice, not a shared bundle to repair.
+    if doc
+        .entries()
+        .iter()
+        .filter(|entry| CANONICAL.contains(&entry.name.as_str()))
+        .count()
+        != 3
+    {
+        return Migration::Unchanged;
+    }
+    let Some(bundle) = CANONICAL
+        .iter()
+        .map(|name| doc.entry(&Audience::Everyone, name))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Migration::Unchanged;
+    };
+    if bundle.iter().enumerate().any(|(index, entry)| {
+        !entry.if_absent || entry.anchor.as_deref() != Some(CANONICAL[(index + 1) % 3])
+    }) {
+        return Migration::Unchanged;
+    }
+    let Some(pair) = authorized_pair(doc, &bundle, anchors, floor, now) else {
+        return Migration::Refused("shared release bundle has no current matching roster");
+    };
+    let values = [&pair.roster.value, &pair.signature.value];
+    let mut next = doc.clone();
+    if let Some(current) = doc.entry(&Audience::Everyone, CANONICAL_ROSTER[0]) {
+        let Some(signature) = doc.entry(&Audience::Everyone, CANONICAL_ROSTER[1]) else {
+            return Migration::Refused("canonical release roster pair is incomplete");
+        };
+        let old = aterm_update_core::roster::verify_roster(
+            anchors,
+            current.value.as_slice().to_vec(),
+            signature.value.as_slice(),
+        )
+        .and_then(|verified| aterm_update_core::roster::Roster::parse(&verified));
+        let Ok(old) = old else {
+            return Migration::Refused("existing canonical roster is not master-signed");
+        };
+        if old.roster_seq > pair.seq {
+            return Migration::Refused("canonical release roster would move backwards");
+        }
+        if current.value == *values[0] {
+            return Migration::Unchanged;
+        }
+        if old.roster_seq == pair.seq {
+            return Migration::Refused("different signed release rosters share one generation");
+        }
+        for (index, name) in CANONICAL_ROSTER.iter().enumerate() {
+            if next
+                .set_entry_with(
+                    &Audience::Everyone,
+                    name,
+                    values[index].as_slice(),
+                    true,
+                    Some(CANONICAL_ROSTER[1 - index]),
+                )
+                .is_err()
+            {
+                return Migration::Refused("canonical roster conflicts with the current document");
+            }
+        }
+        return Migration::Ready(Box::new(next));
+    }
+    let entries: Vec<_> = CANONICAL_ROSTER
+        .iter()
+        .enumerate()
+        .map(|(index, name)| Entry {
+            name: (*name).to_owned(),
+            value: (*values[index]).clone(),
+            audience: Audience::Everyone,
+            if_absent: true,
+            anchor: Some(CANONICAL_ROSTER[1 - index].to_owned()),
+        })
+        .collect();
+    let mut bytes = Zeroizing::new(doc.render().as_slice().to_vec());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(text::render_everyone_locker(&entries).as_slice());
+    match std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| Document::parse(text).ok())
+    {
+        Some(next) => Migration::Ready(Box::new(next)),
+        None => Migration::Refused("canonical roster conflicts with the current document"),
+    }
+}
+
+fn migrate_identity(doc: &Document, anchors: &[&str], floor: u64, now: i64) -> Migration {
     let entries = doc.entries();
     // Even a host-specific or partially supplied canonical bundle is an explicit existing
     // choice. Never add competing Everyone entries or complete it with a different signer.
@@ -202,59 +323,76 @@ fn migrate(doc: &Document, anchors: &[&str], floor: u64, now: i64) -> Migration 
 }
 
 fn valid_bundle(doc: &Document, bundle: &[&Entry], anchors: &[&str], floor: u64, now: i64) -> bool {
+    authorized_pair(doc, bundle, anchors, floor, now).is_some()
+}
+
+struct RosterPair<'a> {
+    roster: &'a Entry,
+    signature: &'a Entry,
+    seq: u64,
+}
+
+fn authorized_pair<'a>(
+    doc: &'a Document,
+    bundle: &[&Entry],
+    anchors: &[&str],
+    floor: u64,
+    now: i64,
+) -> Option<RosterPair<'a>> {
     let parse =
         |bytes: &SecretBytes| aterm_toml::from_str::<aterm_toml::Value>(bytes.as_str()?).ok();
-    let Some(profile) = parse(&bundle[2].value) else {
-        return false;
-    };
-    let Some(machine) = parse(&bundle[1].value) else {
-        return false;
-    };
-    let Some(encoded) = field(&profile, "signing_key") else {
-        return false;
-    };
-    let Ok(profile_key) = aterm_codec::base64::decode_strict(encoded.as_bytes()) else {
-        return false;
-    };
+    let profile = parse(&bundle[2].value)?;
+    let machine = parse(&bundle[1].value)?;
+    let encoded = field(&profile, "signing_key")?;
+    let profile_key = aterm_codec::base64::decode_strict(encoded.as_bytes()).ok()?;
     let profile_key = Zeroizing::new(profile_key);
     if profile_key.as_slice() != bundle[0].value.as_slice() {
-        return false;
+        return None;
     }
-    let Ok(key) = Ed25519KeyPair::from_pkcs8(bundle[0].value.as_slice()) else {
-        return false;
-    };
-    let Some(id) = field(&profile, "machine_id") else {
-        return false;
-    };
+    let key = Ed25519KeyPair::from_pkcs8(bundle[0].value.as_slice()).ok()?;
+    let id = field(&profile, "machine_id")?;
     if field(&machine, "id") != Some(id) {
-        return false;
+        return None;
     }
-    let Some(encoded_public) = field(&machine, "pubkey") else {
-        return false;
-    };
-    let Ok(public) = aterm_codec::base64::decode_strict(encoded_public.as_bytes()) else {
-        return false;
-    };
+    let encoded_public = field(&machine, "pubkey")?;
+    let public = aterm_codec::base64::decode_strict(encoded_public.as_bytes()).ok()?;
     if public != key.public_key().as_ref() {
-        return false;
+        return None;
     }
-    let roster_name = field(&profile, "machine_roster").unwrap_or(LEGACY_ROSTER);
-    let Some(roster) = doc.entry(&Audience::Everyone, roster_name) else {
-        return false;
+    let named = match profile.get("machine_roster") {
+        Some(value) => value.as_str().filter(|s| !s.is_empty())?,
+        None => LEGACY_ROSTER,
     };
-    let Some(signature) = doc.entry(&Audience::Everyone, &format!("{roster_name}.sig")) else {
-        return false;
+    let mut candidates = Vec::new();
+    for name in [named, CANONICAL_ROSTER[0], LEGACY_ROSTER] {
+        let Some(roster) = doc.entry(&Audience::Everyone, name) else {
+            continue;
+        };
+        let signature = doc.entry(&Audience::Everyone, &format!("{name}.sig"))?;
+        candidates.push((
+            (roster, signature),
+            roster.value.as_slice(),
+            signature.value.as_slice(),
+        ));
+    }
+    let ((roster, signature), seq) = crate::release_ring::newest_roster(anchors, candidates)?;
+    let chosen = RosterPair {
+        roster,
+        signature,
+        seq,
     };
+    // A newer signed revocation or expiry must not fall back to an older authorizing roster.
     crate::release_ring::authorize_with(
         bundle[2].value.as_slice(),
         bundle[0].value.as_slice(),
-        roster.value.as_slice().to_vec(),
-        signature.value.as_slice(),
+        chosen.roster.value.as_slice().to_vec(),
+        chosen.signature.value.as_slice(),
         anchors,
         floor,
         now,
     )
-    .is_ok()
+    .ok()?;
+    Some(chosen)
 }
 
 fn field<'a>(value: &'a aterm_toml::Value, name: &str) -> Option<&'a str> {

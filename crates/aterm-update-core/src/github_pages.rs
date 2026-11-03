@@ -38,6 +38,42 @@ pub fn page(
     Ok((value, fields))
 }
 
+/// Parses and validates the listing origin, endpoint path, and query parameters before any
+/// network request runs.
+fn parse_listing_base<'a>(
+    api: &str,
+    base: &'a str,
+    per_page: usize,
+) -> Result<(&'a str, BTreeMap<&'a str, &'a str>), String> {
+    if per_page == 0 {
+        return Err("invalid GitHub listing bound".into());
+    }
+    if api.is_empty() || api.ends_with('/') {
+        return Err("invalid GitHub API origin".into());
+    }
+    if !base.starts_with('/') {
+        return Err("invalid GitHub listing endpoint".into());
+    }
+    let (expected_path, expected_query) = base
+        .split_once('?')
+        .filter(|(path, query)| !path.is_empty() && !query.is_empty())
+        .ok_or("invalid GitHub listing endpoint")?;
+    let mut expected = BTreeMap::new();
+    for part in expected_query.split('&') {
+        let (key, value) = part
+            .split_once('=')
+            .filter(|(key, _)| !key.is_empty())
+            .ok_or("invalid listing query")?;
+        if key == "page" {
+            return Err("invalid listing query: page is managed by pagination".into());
+        }
+        if expected.insert(key, value).is_some() {
+            return Err("duplicate listing query key".into());
+        }
+    }
+    Ok((expected_path, expected))
+}
+
 /// Fetches all pages of the collection at `base` using `get`, validating links against `api`.
 ///
 /// # Errors
@@ -49,6 +85,7 @@ pub fn all(
     per_page: usize,
     mut get: impl FnMut(&str) -> Result<Page, String>,
 ) -> Result<Vec<Value>, String> {
+    let (expected_path, expected_query) = parse_listing_base(api, base, per_page)?;
     let mut items = Vec::new();
     let mut last = None;
     let mut alias: Option<String> = None;
@@ -62,7 +99,8 @@ pub fn all(
         }
         let scope = Scope {
             api,
-            base,
+            expected_path,
+            expected_query: &expected_query,
             alias: &mut alias,
         };
         let (next, advertised_last) = pagination(headers.get("link"), scope, page)?;
@@ -86,7 +124,8 @@ pub fn all(
             let (tail, tail_headers) = get(&format!("{base}&page={}", page + 1))?;
             let scope = Scope {
                 api,
-                base,
+                expected_path,
+                expected_query: &expected_query,
                 alias: &mut alias,
             };
             let (tail_next, tail_last) = pagination(tail_headers.get("link"), scope, page + 1)?;
@@ -106,23 +145,31 @@ pub fn all(
 /// repository-id path the listing's links named so far.
 struct Scope<'a> {
     api: &'a str,
-    base: &'a str,
+    expected_path: &'a str,
+    expected_query: &'a BTreeMap<&'a str, &'a str>,
     alias: &'a mut Option<String>,
 }
 
-/// Whether `path` is `expected` (`/repos/{owner}/{repo}{suffix}`) spelled by repository id,
-/// `/repositories/{id}{suffix}`, with the same suffix.
+/// Whether `path` is `expected` (`/repos/{owner}/{repo}/{suffix}`) spelled by repository id,
+/// `/repositories/{id}/{suffix}`, with the same suffix.
 fn names_repository_by_id(path: &str, expected: &str) -> bool {
-    let Some(suffix) = expected
-        .strip_prefix("/repos/")
-        .and_then(|rest| rest.splitn(3, '/').nth(2))
-    else {
+    let Some(rest) = expected.strip_prefix("/repos/") else {
         return false;
     };
+    let mut parts = rest.splitn(3, '/');
+    let (Some(owner), Some(repo), Some(suffix)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    if owner.is_empty() || repo.is_empty() || suffix.is_empty() {
+        return false;
+    }
     path.strip_prefix("/repositories/")
         .and_then(|rest| rest.split_once('/'))
         .is_some_and(|(id, rest)| {
-            !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) && rest == suffix
+            !id.is_empty()
+                && !id.starts_with('0')
+                && id.bytes().all(|b| b.is_ascii_digit())
+                && rest == suffix
         })
 }
 
@@ -136,14 +183,12 @@ fn pagination(
     let Some(link) = link else {
         return Ok((false, None));
     };
-    let Scope { api, base, alias } = scope;
-    let (expected_path, expected_query) = base
-        .split_once('?')
-        .ok_or("invalid GitHub listing endpoint")?;
-    let expected: BTreeMap<_, _> = expected_query
-        .split('&')
-        .map(|part| part.split_once('=').ok_or("invalid listing query"))
-        .collect::<Result<_, _>>()?;
+    let Scope {
+        api,
+        expected_path,
+        expected_query,
+        alias,
+    } = scope;
     let mut relations = BTreeSet::new();
     let (mut next, mut last) = (false, None);
     for entry in link.split(',') {
@@ -175,7 +220,7 @@ fn pagination(
             .and_then(|page| page.parse::<usize>().ok())
             .filter(|page| *page != 0)
             .ok_or("invalid GitHub pagination page")?;
-        if params != expected {
+        if &params != expected_query {
             return Err("GitHub pagination changed the requested listing scope".into());
         }
         if path != expected_path {
@@ -389,5 +434,46 @@ mod tests {
         })
         .unwrap_err();
         assert!(why.contains("outside the expected API"), "{why}");
+    }
+
+    /// NEGATIVE CONTROL: invalid listing bounds, origins, missing or duplicate base queries,
+    /// pre-set `page` parameters, and degenerate repository-id paths are refused before any
+    /// request is sent or link is accepted.
+    #[test]
+    fn malformed_listing_bases_and_zero_or_empty_repo_aliases_refuse_before_fetch() {
+        for (api, base, per_page) in [
+            (API, "/user/keys?per_page=2", 0),
+            ("", "/user/keys?per_page=2", 2),
+            ("https://api.github.com/", "/user/keys?per_page=2", 2),
+            (API, "user/keys?per_page=2", 2),
+            (API, "/user/keys", 2),
+            (API, "/user/keys?", 2),
+            (API, "/user/keys?=2", 2),
+            (API, "/user/keys?per_page=2&per_page=10", 2),
+            (API, "/user/keys?per_page=2&page=1", 2),
+        ] {
+            let err = all(api, base, per_page, |_| {
+                panic!("malformed base ({api:?}, {base:?}, {per_page}) must not call get")
+            })
+            .unwrap_err();
+            assert!(!err.is_empty());
+        }
+
+        assert!(names_repository_by_id(
+            "/repositories/1000/releases",
+            "/repos/o/r/releases"
+        ));
+        for (path, expected) in [
+            ("/repositories/0/releases", "/repos/o/r/releases"),
+            ("/repositories/0100/releases", "/repos/o/r/releases"),
+            ("/repositories/1000/releases", "/repos//r/releases"),
+            ("/repositories/1000/releases", "/repos/o//releases"),
+            ("/repositories/1000/", "/repos/o/r/"),
+        ] {
+            assert!(
+                !names_repository_by_id(path, expected),
+                "({path:?}, {expected:?}) must be rejected"
+            );
+        }
     }
 }

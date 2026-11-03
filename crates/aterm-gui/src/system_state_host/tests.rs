@@ -245,6 +245,10 @@ fn handlers() -> InitialSetupHandlers {
             note("sync on".to_owned());
             true
         },
+        ask_access: || {
+            note("ask access".to_owned());
+            true
+        },
         fda_granted: || {},
         tools_installed: || {},
         join_phrase: |phrase, receipt| {
@@ -459,7 +463,11 @@ fn withdrawn_system_state_request_cannot_open_or_hold_a_page() {
     for route in ["window", "attach", "model"] {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+        app.workstation_setup = crate::workstation_setup::Host::for_launch(
+            Some(|| true),
+            false,
+            crate::clt_shim::Shim::default(),
+        );
         if route != "window" {
             assert!(app.open_system_state_tab());
         }
@@ -517,7 +525,11 @@ fn withdrawn_system_state_offer_restores_policy_only_after_a_fresh_read() {
         ..SetupStatus::default()
     };
     let mut app = App::headless_for_test();
-    app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+    app.workstation_setup = crate::workstation_setup::Host::for_launch(
+        Some(|| true),
+        false,
+        crate::clt_shim::Shim::default(),
+    );
     app.receive_system_state_status(Some(app.system_state_host.generation), policy());
     assert!(!app.workstation_setup.suppresses_permissions());
     assert!(app.open_system_state_tab());
@@ -566,7 +578,11 @@ fn a_resumed_runs_offer_is_answered_by_the_page_while_the_run_goes() {
         ..running()
     };
     let mut app = App::headless_for_test();
-    app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+    app.workstation_setup = crate::workstation_setup::Host::for_launch(
+        Some(|| true),
+        false,
+        crate::clt_shim::Shim::default(),
+    );
     let (wid, instance, view) = page(&mut app);
     app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
     app.set_system_state_handlers_for_test(InitialSetupHandlers {
@@ -595,9 +611,7 @@ fn a_resumed_runs_offer_is_answered_by_the_page_while_the_run_goes() {
     let mut answer = receive.try_recv().expect("the page answered by itself");
     assert_eq!(
         answer.decision,
-        WorkstationSetupDecision::Begin(crate::workstation_setup::automatic_plan_for_test(
-            Plan::default()
-        ))
+        WorkstationSetupDecision::Begin(Plan::default())
     );
     assert!(!answer.chosen && !answer.vault_typed && answer.changed.is_none());
     assert!(
@@ -617,7 +631,11 @@ fn a_resumed_runs_offer_is_answered_by_the_page_while_the_run_goes() {
 
     // A Stop withdraws an offer still waiting.
     let mut app = App::headless_for_test();
-    app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+    app.workstation_setup = crate::workstation_setup::Host::for_launch(
+        Some(|| true),
+        false,
+        crate::clt_shim::Shim::default(),
+    );
     let (wid, _, _) = page(&mut app);
     app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
     fresh(&mut app, admitted());
@@ -633,7 +651,11 @@ fn a_resumed_runs_offer_is_answered_by_the_page_while_the_run_goes() {
 
     // A press answers for itself: the offer goes, and the press is the manual choice it is.
     let mut app = App::headless_for_test();
-    app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+    app.workstation_setup = crate::workstation_setup::Host::for_launch(
+        Some(|| true),
+        false,
+        crate::clt_shim::Shim::default(),
+    );
     let (wid, _, _) = page(&mut app);
     app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
     app.set_system_state_handlers_for_test(InitialSetupHandlers {
@@ -685,7 +707,11 @@ fn a_stop_ends_the_resumed_runs_offer_for_good() {
         ..running()
     };
     let setup = |app: &mut App| {
-        app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+        app.workstation_setup = crate::workstation_setup::Host::for_launch(
+            Some(|| true),
+            false,
+            crate::clt_shim::Shim::default(),
+        );
         let (wid, _, view) = page(app);
         app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
         fresh(app, admitted());
@@ -765,7 +791,11 @@ fn a_window_that_holds_its_own_admission_lets_the_resumed_offer_go() {
         );
     };
     let mut app = App::headless_for_test();
-    app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+    app.workstation_setup = crate::workstation_setup::Host::for_launch(
+        Some(|| true),
+        false,
+        crate::clt_shim::Shim::default(),
+    );
     let (wid, _, view) = page(&mut app);
     app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
     fresh(&mut app, admitted());
@@ -783,7 +813,11 @@ fn a_window_that_holds_its_own_admission_lets_the_resumed_offer_go() {
 
     // The admission came while the offer was up: its answer is let go, and nothing is held.
     let mut app = App::headless_for_test();
-    app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+    app.workstation_setup = crate::workstation_setup::Host::for_launch(
+        Some(|| true),
+        false,
+        crate::clt_shim::Shim::default(),
+    );
     let (wid, _, _) = page(&mut app);
     app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
     fresh(&mut app, admitted());
@@ -819,7 +853,11 @@ fn an_automatic_offer_withdrawn_after_queueing_restores_only_fresh_policy() {
         ..SetupStatus::default()
     };
     let mut app = App::headless_for_test();
-    app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+    app.workstation_setup = crate::workstation_setup::Host::for_launch(
+        Some(|| true),
+        false,
+        crate::clt_shim::Shim::default(),
+    );
     let (wid, instance, view) = page(&mut app);
     app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
     app.set_system_state_handlers_for_test(InitialSetupHandlers {
@@ -885,7 +923,11 @@ fn a_rejected_automatic_offer_restores_fresh_policy_unless_stopped() {
             ..SetupStatus::default()
         };
         let mut app = App::headless_for_test();
-        app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+        app.workstation_setup = crate::workstation_setup::Host::for_launch(
+            Some(|| true),
+            false,
+            crate::clt_shim::Shim::default(),
+        );
         let (wid, instance, view) = page(&mut app);
         app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
         app.set_system_state_handlers_for_test(InitialSetupHandlers::inert_for_test());
@@ -900,9 +942,7 @@ fn a_rejected_automatic_offer_restores_fresh_policy_unless_stopped() {
         let mut answer = receive.try_recv().unwrap();
         assert_eq!(
             answer.decision,
-            WorkstationSetupDecision::Begin(crate::workstation_setup::automatic_plan_for_test(
-                Plan::default()
-            ))
+            WorkstationSetupDecision::Begin(Plan::default())
         );
         let receipt = answer.receipt.take().unwrap();
         assert_eq!(receipt.admission(), Admission::Automatic);
@@ -951,7 +991,11 @@ fn an_automatic_offer_with_a_closed_answer_receiver_restores_fresh_policy() {
         ..SetupStatus::default()
     };
     let mut app = App::headless_for_test();
-    app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+    app.workstation_setup = crate::workstation_setup::Host::for_launch(
+        Some(|| true),
+        false,
+        crate::clt_shim::Shim::default(),
+    );
     let (wid, _, _) = page(&mut app);
     app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
     app.set_system_state_handlers_for_test(InitialSetupHandlers::inert_for_test());
@@ -981,7 +1025,11 @@ fn an_automatic_offer_with_a_closed_answer_receiver_restores_fresh_policy() {
 fn a_refused_local_decision_keeps_its_permission_hold() {
     for intent in ["person", "controller", "restore"] {
         let mut app = App::headless_for_test();
-        app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+        app.workstation_setup = crate::workstation_setup::Host::for_launch(
+            Some(|| true),
+            false,
+            crate::clt_shim::Shim::default(),
+        );
         let (wid, _, view) = page(&mut app);
         let policy = || SetupStatus {
             plan: Some(Plan::default()),
@@ -1342,7 +1390,11 @@ fn a_waiting_offer_must_be_answered_before_restore_can_start() {
 #[test]
 fn a_waiting_launch_offer_keeps_previous_permission_policy_held_and_allows_only_check() {
     let mut app = App::headless_for_test();
-    app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+    app.workstation_setup = crate::workstation_setup::Host::for_launch(
+        Some(|| true),
+        false,
+        crate::clt_shim::Shim::default(),
+    );
     let (wid, _, view) = page(&mut app);
     let mut status = fixture_status("sync-off").unwrap();
     status.permissions = Some(crate::InitialSetupPermissionPolicy {
@@ -1406,9 +1458,7 @@ fn the_offer_is_answered_on_the_first_tick_focused_or_not() {
             .expect("the first tick answers the offer");
         assert_eq!(
             answer.decision,
-            WorkstationSetupDecision::Begin(crate::workstation_setup::automatic_plan_for_test(
-                Plan::default()
-            ))
+            WorkstationSetupDecision::Begin(Plan::default())
         );
         assert!(!answer.chosen, "aterm's own answer, focused {focused}");
         assert_eq!(
@@ -1524,9 +1574,7 @@ fn a_mac_nobody_touches_admits_its_offer_at_once_and_holds_its_person_stages() {
             .expect("the first tick answers the offer");
         assert_eq!(
             answer.decision,
-            WorkstationSetupDecision::Begin(crate::workstation_setup::automatic_plan_for_test(
-                Plan::default()
-            ))
+            WorkstationSetupDecision::Begin(Plan::default())
         );
         (
             app.system_state_front_with_a_person(),
@@ -1575,9 +1623,7 @@ fn the_first_run_offer_is_answered_at_once_and_waits_for_its_run() {
     let mut answer = receive.try_recv().unwrap();
     assert_eq!(
         answer.decision,
-        WorkstationSetupDecision::Begin(crate::workstation_setup::automatic_plan_for_test(
-            Plan::default()
-        ))
+        WorkstationSetupDecision::Begin(Plan::default())
     );
     assert!(indicators(&app, instance, view).busy);
     answer.receipt.take().unwrap().accept();
@@ -3901,9 +3947,7 @@ fn a_closed_offer_comes_back_behind_the_terminal_and_is_answered_there() {
         .expect("the page answers at its first tick");
     assert_eq!(
         answer.decision,
-        WorkstationSetupDecision::Begin(crate::workstation_setup::automatic_plan_for_test(
-            Plan::default()
-        ))
+        WorkstationSetupDecision::Begin(Plan::default())
     );
     assert_eq!(
         answer
@@ -4543,6 +4587,47 @@ fn only_a_persons_turn_on_sync_turns_the_sync_on() {
     }
 }
 
+/// The page's automatic answer keeps the Permissions group on and asks for no macOS grant: no
+/// step's record, so no prompt, and a person's press alone saves the ask (negative control: a
+/// client's press spends its evidence and saves nothing).
+#[test]
+fn automatic_setup_keeps_permissions_on_and_only_a_persons_press_asks_for_grants() {
+    let mut app = App::headless_for_test();
+    let (_, _, _) = page(&mut app);
+    let plan = Plan::default();
+    assert!(plan.selection.contains(Setting::Permissions));
+    app.run_system_state_action_with_handlers(
+        SystemStateAction::Apply(
+            WorkstationSetupDecision::Begin(plan.clone()).into(),
+            Admission::Automatic,
+        ),
+        Some(handlers()),
+    );
+    let asked = calls();
+    assert!(!asked.iter().any(|call| call == "ask access"), "{asked:?}");
+    assert_eq!(
+        app.system_state_host
+            .pending_apply
+            .as_ref()
+            .map(|pending| pending.plan.selection),
+        Some(plan.selection),
+        "the plan goes as it stands, Permissions on"
+    );
+    for client in [true, false] {
+        let mut app = App::headless_for_test();
+        let (wid, _, _) = page(&mut app);
+        app.with_gesture_source(client, |app| {
+            app.interact_system_state(wid);
+            app.run_system_state_action_with_handlers(
+                SystemStateAction::AskForAccess { by_person: !client },
+                Some(handlers()),
+            );
+        });
+        let asked = calls();
+        assert_eq!(asked.iter().any(|call| call == "ask access"), !client);
+    }
+}
+
 /// §5.6: the page's own sub-second tick is a wake only while a run's village walks on
 /// a shown page. A settled, finished or hidden page owes no tick wake — the worker's
 /// publications and the one-second status poll already wake the loop — so a poll in
@@ -5177,7 +5262,11 @@ fn admitted_here(app: &mut App) -> SetupStatus {
         }),
         ..running()
     };
-    app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+    app.workstation_setup = crate::workstation_setup::Host::for_launch(
+        Some(|| true),
+        false,
+        crate::clt_shim::Shim::default(),
+    );
     app.hold_initial_setup_permissions();
     app.note_system_state_touch();
     app.note_system_state_apply(Admission::Person);
@@ -5323,12 +5412,12 @@ fn a_newer_aterms_setup_is_read_as_it_stands() {
 
 /// A plan that leaves the GitHub repositories out (the Workspace group left as is) wants no
 /// Command Line Tools, and no pass of it will say so: once the worker takes that plan, the
-/// window withdraws the run's want, and the git-and-friends shim comes off new shells (its
-/// directory stays until the next launch). CONTROL: a plan that keeps the repositories (another
+/// window withdraws the run's want, and the shim's line stops saying an install is on its way
+/// (new shells keep the shim, as the tools are still missing). CONTROL: a plan that keeps the repositories (another
 /// group left as is) keeps the want and the shim. Only a Unix host lays the shim.
 #[cfg(unix)]
 #[test]
-fn a_plan_without_the_repositories_takes_the_shim_off_new_shells() {
+fn a_plan_without_the_repositories_ends_the_shims_word_of_an_install() {
     let workspace = aterm_types::macos_setup::Group::ALL
         .iter()
         .position(|group| *group == aterm_types::macos_setup::Group::Developer)
@@ -5341,12 +5430,28 @@ fn a_plan_without_the_repositories_takes_the_shim_off_new_shells() {
         app.set_system_state_handlers_for_test(handlers());
         app.workstation_setup.developer_tools_shim =
             crate::clt_shim::Shim::at(shim.clone(), || false);
+        // The person admitted run 4, whose pass wants the tools: an install of them can run.
+        app.user_input_recent = |_| true;
+        app.note_system_state_touch();
+        app.note_system_state_apply(crate::system_state::Admission::Person);
+        app.accepted_initial_setup_apply();
+        let permissions = Some(crate::InitialSetupPermissionPolicy {
+            revision: 4,
+            allowed: true,
+        });
+        app.observe_initial_setup_permissions(permissions);
+        app.publish_system_state(SetupStatus {
+            plan: Some(aterm_types::macos_setup::Plan::default()),
+            permissions,
+            run: Some(crate::InitialSetupRunPolicy {
+                revision: 4,
+                allowed: true,
+            }),
+            ..SetupStatus::default()
+        });
         app.want_developer_tools_install(4, true);
-        let wanted = || aterm_types::clt_shim::wanted_mark(&shim).is_file();
-        assert!(
-            shim.is_dir() && wanted(),
-            "a pass that wants the tools lays the shim"
-        );
+        let wanted = || aterm_types::clt_shim::installing_mark(&shim).is_file();
+        assert!(shim.is_dir() && wanted(), "a pass wants the tools");
         press(
             &mut app,
             wid,
@@ -5362,8 +5467,8 @@ fn a_plan_without_the_repositories_takes_the_shim_off_new_shells() {
         );
         assert_eq!(wanted(), kept, "group {group} left as is");
         assert!(
-            shim.is_dir(),
-            "group {group}: the directory goes at the next launch"
+            aterm_types::clt_shim::wanted_mark(&shim).is_file(),
+            "group {group}: the tools are still missing: new shells keep the shim"
         );
     }
 }

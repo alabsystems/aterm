@@ -1944,7 +1944,7 @@ pub(crate) fn read(
                     c::of(c::REFUSED, program),
                     Class::Person,
                     format!("{program}'s tools refused a shim"),
-                    refused_line(program, r),
+                    refused_line(layout, program, r),
                 ));
             }
             if refused.is_empty() && !active.is_empty() {
@@ -1970,7 +1970,7 @@ pub(crate) fn read(
                     format!("{program}'s active store tree"),
                     format!(
                         "active {} store missing/incomplete",
-                        crate::vendor_direct::display_build(program, *build)
+                        crate::vendor_direct::display_have_build(layout, program, *build)
                     ),
                     "complete",
                     Remedy::Command(format!("aterm pkg install {program}")),
@@ -3178,7 +3178,7 @@ pub(crate) fn read(
             && let Some((shim, _)) = drift.shims.first()
         {
             let have = crate::platform::shim_env_of(shim);
-            let line = env_drift_line(program, *build, shim, &have, &drift.declared);
+            let line = env_drift_line(layout, program, *build, shim, &have, &drift.declared);
             f.push(Finding::change(
                 id,
                 Class::Relay,
@@ -3775,6 +3775,7 @@ fn withheld_summary(cannot: usize, unproven: usize) -> String {
 }
 
 fn env_drift_line(
+    layout: &Layout,
     program: &str,
     build: u64,
     shim: &Path,
@@ -3801,12 +3802,12 @@ fn env_drift_line(
         "{} exports {exports}, but {} declares {}{consequence} — fix: `aterm pkg repair` \
          re-lays it",
         shim.display(),
-        crate::vendor_direct::display_build(program, build),
+        crate::vendor_direct::display_have_build(layout, program, build),
         declared.spelled()
     )
 }
 
-fn refused_line(program: &str, r: &crate::status::RefusedShims) -> String {
+fn refused_line(layout: &Layout, program: &str, r: &crate::status::RefusedShims) -> String {
     let mut names: Vec<String> = r
         .names
         .iter()
@@ -3822,7 +3823,7 @@ fn refused_line(program: &str, r: &crate::status::RefusedShims) -> String {
         "{} exposes {}, {} no shim may carry (a shell, another core command, or no tool name) \
          \u{2014} {} no shim here, so typed in a shell {} never {} {program}'s copy; its \
          signed manifest names {}, and nothing on this machine changes that",
-        crate::vendor_direct::display_build(program, r.build),
+        crate::vendor_direct::display_have_build(layout, program, r.build),
         names.join(", "),
         if one { "a name" } else { "names" },
         if one { "it has" } else { "they have" },

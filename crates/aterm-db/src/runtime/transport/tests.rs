@@ -914,7 +914,7 @@ fn a_round_refused_before_versions_never_hides_the_round_it_lost_to() {
     let after = |ms| start + Duration::from_millis(ms);
     // A crossed dial: the loser authenticated just after the round it lost to and finished
     // first, refused at admission before versions were traded.
-    let mut contact = Contact::new([7; 48], after(2), Said::Unknown);
+    let mut contact = Contact::new([7; 48], after(2), Said::Unknown, None);
     contact.heard(after(1), own);
     assert_eq!(
         (contact.at, contact.said, contact.said_at),
@@ -935,13 +935,45 @@ fn a_round_refused_before_versions_never_hides_the_round_it_lost_to() {
     );
     // Rounds that all said nothing of their version leave nothing to record apart from the
     // latest contact, whichever order they finished in.
-    let mut silent = Contact::new([7; 48], after(2), Said::Unknown);
+    let mut silent = Contact::new([7; 48], after(2), Said::Unknown, None);
     silent.heard(after(5), Said::Unknown);
     silent.heard(after(1), Said::Unknown);
     assert_eq!(
         (silent.at, silent.said, silent.said_at),
         (after(5), Said::Unknown, after(5))
     );
+}
+
+/// Of the readings a peer's rounds took, a contact keeps the one its latest-authenticated round
+/// took, whichever round finished first, and though a clock set back dates it earlier; a round
+/// that took none keeps it.
+///
+/// Negative controls: with `Contact::read` keeping the reading of the last round to finish, the
+/// earlier round's reading replaced the later one's (`left: Some(Reading { .., at_ms: 1000, ..
+/// })`, `right: Some(Reading { .., at_ms: 2000, .. })`); with it keeping the later wall time
+/// (`held.at_ms <= clock.at_ms`), the reading taken after the clock was set back was dropped
+/// (`left: Some(Reading { .., at_ms: 3000, .. })`, `right: Some(Reading { .., at_ms: 500, ..
+/// })`).
+#[test]
+fn a_contact_keeps_the_latest_clock_reading() {
+    let reading = |at_ms| crate::clock::Reading {
+        lo_ms: -1,
+        hi_ms: 0,
+        at_ms,
+        source: crate::clock::Source::Mark,
+    };
+    // When each round authenticated.
+    let start = Instant::now();
+    let round = |n: u64| start + Duration::from_secs(n);
+    let mut contact = Contact::new([7; 48], round(2), Said::Unknown, Some(reading(2000)));
+    contact.read(round(1), Some(reading(1000)));
+    contact.read(round(3), None);
+    assert_eq!(contact.clock, Some(reading(2000)));
+    contact.read(round(3), Some(reading(3000)));
+    assert_eq!(contact.clock, Some(reading(3000)));
+    // The clock is set back two seconds' worth: the next round's reading is dated earlier.
+    contact.read(round(4), Some(reading(500)));
+    assert_eq!(contact.clock, Some(reading(500)));
 }
 
 #[test]
@@ -1008,8 +1040,16 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
         .max_by_key(|contact| contact.at)
         .unwrap();
     assert_eq!(newest.actor, remote.request().unwrap().binding().actor());
-    // The completed round traded signed versions (C26).
+    // The completed round traded signed versions (C26), and each side read the other's clock
+    // mark (F22): one clock, so they agree. Negative control: with `finish` carrying no reading
+    // into the contacts, `left: None`, `right: Some((Mark, Agree))`.
     assert_eq!(newest.said, Said::Version(Version::own()));
+    assert_eq!(
+        newest
+            .clock
+            .map(|clock| (clock.source, clock.class(crate::clock::Standing::Unknown))),
+        Some((crate::clock::Source::Mark, crate::clock::Class::Agree))
+    );
     let contact = (newest.actor, newest.at);
     // Drive freshness from the real exchange's timestamp, not test execution speed.
     let at = contact.1;
@@ -1026,6 +1066,7 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
         .unwrap();
     super::super::observe_contacts(
         &bootstrap,
+        &std::cell::OnceCell::new(),
         &mut observer,
         vec![([0xff; 48], at)],
         &[],
@@ -1042,6 +1083,7 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
     assert!(published.snapshot().peers.is_empty());
     super::super::observe_contacts(
         &bootstrap,
+        &std::cell::OnceCell::new(),
         &mut observer,
         vec![contact],
         &[],
@@ -1059,6 +1101,7 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
     unknown.actor = Some([0xff; 48]);
     super::super::observe_contacts(
         &bootstrap,
+        &std::cell::OnceCell::new(),
         &mut observer,
         Vec::new(),
         &[wrong, unknown],
@@ -1069,6 +1112,7 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
     failed.control = Err("failed after authentication".into());
     super::super::observe_contacts(
         &bootstrap,
+        &std::cell::OnceCell::new(),
         &mut observer,
         Vec::new(),
         &[failed],
@@ -1084,6 +1128,7 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
     let endpoint = round.authenticated_endpoint().unwrap().1;
     super::super::observe_contacts(
         &bootstrap,
+        &std::cell::OnceCell::new(),
         &mut observer,
         Vec::new(),
         &[round],

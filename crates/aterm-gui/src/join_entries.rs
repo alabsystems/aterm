@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The Macs asking to join ALab as exceptions entries ([`Family::Join`],
-//! `docs/DESIGN-automatic-alab-lan-admission-2026-10-29.md` "No join alerts"): a fact for later,
+//! `docs/DESIGN-automatic-lan-admission-2026-11-02.md` "No join alerts"): a fact for later,
 //! never an alert on screen. A device nobody let in costs nothing while it waits (it keeps
 //! asking), so it is one Info entry in the digest, filed under its join code, with the press that
 //! lets it in beside it: Allow on a member's desk ([`Intent::AllowJoin`], a person's own press,
@@ -51,14 +51,11 @@ pub(crate) struct Asker {
     removed: Option<String>,
 }
 
-/// The askers of a member desk's rows still asking: Allow where this Mac can allow, Allow again
-/// for a Mac a plain removal took out, nothing for a quorum's removal. A row the default ALab
-/// policy forwards to the vault's own admission (`Row::automatic`: an asking Mac on this member's
-/// home ALab LAN) files nothing, since its Mac joins with nobody.
+/// The askers of a member desk's rows still asking, from whatever network: Allow where this Mac
+/// can allow, Allow again for a Mac a plain removal took out, nothing for a quorum's removal.
 pub(crate) fn desk_askers(rows: &[Row], can_allow: bool) -> Vec<Asker> {
     rows.iter()
         .filter(|row| matches!(row.state, RowState::Asking | RowState::Allowed(_)))
-        .filter(|row| !row.automatic)
         .map(|row| {
             let name = shown_name(&row.name);
             let (nav, then) = match &row.removed {

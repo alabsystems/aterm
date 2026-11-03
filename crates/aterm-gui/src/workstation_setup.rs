@@ -392,27 +392,33 @@ pub(crate) struct Host {
     /// The attempt whose result may change the install's state. Kept after its terminal leaves,
     /// so an older child's delayed status cannot become current again.
     pub(crate) developer_tools_attempt: Option<u64>,
-    /// Whether the tab opened on this Mac before: aterm opens it by itself once per Mac.
+    /// Whether the tab opened for this account on this build ([`crate::clt_install::Mark`]):
+    /// aterm opens it by itself once per account and build, so an update retries it once.
     pub(crate) developer_tools_mark: crate::clt_install::Mark,
     /// What this Mac shows of an install under way ([`crate::clt_install::installing_now`]);
     /// none in a headless instance or a test, which never look at this Mac's installers.
     pub(crate) developer_tools_probe: Option<fn() -> crate::clt_install::Reading>,
+    /// Read-only C compiler presence, asked only while its missing-tools exception is
+    /// unresolved; none in headless instances and tests, which inject their own reading.
+    pub(crate) developer_tools_installed: Option<fn() -> Option<bool>>,
     /// What the page says of the install beyond its tab and this Mac's installers: the tab said
     /// the tools are installed, or a person's press opened nothing, and why.
     pub(crate) developer_tools_after: crate::clt_install::Aftermath,
-    /// The newest setup pass that ended wanting the Command Line Tools, until a later pass, a
-    /// Stop, a plan without the GitHub repositories or the tools' arrival withdraws it: what
-    /// keeps the git-and-friends shim wanted ([`crate::clt_shim`]), which outlives the tab.
+    /// This launch's want of the Command Line Tools, or the newest setup pass that ended wanting
+    /// them, until a later pass, a Stop, a plan without the GitHub repositories or the tools'
+    /// arrival withdraws it: what makes the git-and-friends shim ([`crate::clt_shim`]) say they are
+    /// on their way, which outlives the tab.
     pub(crate) developer_tools_want: Option<u64>,
-    /// That shim, reconciled at launch (the mark an earlier launch left goes, and its directory
-    /// too unless the launch adopted live shells: [`crate::clt_shim::Shim::reconcile`]) and
-    /// settled at each change of the want or of the install ([`App::settle_developer_tools_want`]).
+    /// That shim, reconciled ahead of the launch's first shell
+    /// ([`crate::clt_shim::Shim::for_launch`]) and settled at each change of the want or of the
+    /// install, and each second until the tools exist ([`App::developer_tools_watch`]).
     pub(crate) developer_tools_shim: crate::clt_shim::Shim,
     /// An install of the tools ended unfinished (the tab said why, or ended without saying), or
-    /// the tab opened for this account at an earlier launch and nothing has started one since:
-    /// nothing installs them until a person presses Install…, so the shim is off new shells
-    /// though a pass still wants them. A tab that starts the install, or one adopted alive from
-    /// an earlier aterm, clears it.
+    /// the tab opened for this account at an earlier launch of this build and nothing has started
+    /// one since: nothing installs them until a person presses Install…, so the shim says they are
+    /// missing and not on their way, though a pass still wants them. A tab that starts the install,
+    /// or one adopted alive from an earlier aterm, clears it; a newer build's launch starts without
+    /// it, as its own automatic tab may open.
     pub(crate) developer_tools_unfinished: bool,
     /// Whether Low Data Mode holds the tools' download back, as the network watch reads it or the
     /// tab's program said: the automatic tab waits while it does, unspent. `None`: unread.
@@ -429,18 +435,43 @@ pub(crate) struct Host {
 }
 
 impl Host {
-    pub(crate) fn for_launch(startup: Option<fn() -> bool>, headless: bool) -> Self {
-        Self::for_launch_marked(startup, headless, crate::clt_install::Mark::for_launch())
+    /// The window's setup host at launch, keeping the Command Line Tools `shim` the launch
+    /// reconciled ahead of its first shell ([`crate::clt_shim::Shim::for_launch`]).
+    pub(crate) fn for_launch(
+        startup: Option<fn() -> bool>,
+        headless: bool,
+        shim: crate::clt_shim::Shim,
+    ) -> Self {
+        Self::for_launch_marked(
+            startup,
+            headless,
+            crate::clt_install::Mark::for_launch(),
+            shim,
+        )
     }
 
     /// [`Self::for_launch`] with this account's Command Line Tools tab `mark` as the launch read
-    /// it: a tab that opened at an earlier launch, with nothing installing the tools since, leaves
-    /// them unfinished ([`Self::developer_tools_unfinished`]).
+    /// it: a tab that opened at an earlier launch of this build, with nothing installing the tools
+    /// since, leaves them unfinished ([`Self::developer_tools_unfinished`]). A window whose `shim`
+    /// finds the tools missing wants them from here, as the launch's early step with no pass and no
+    /// page ([`crate::clt_install::LAUNCH_WANT`]), unless the mark says its tab opened on this
+    /// build before, and watches for their arrival where it reads this Mac.
     pub(crate) fn for_launch_marked(
         startup: Option<fn() -> bool>,
         headless: bool,
         mark: crate::clt_install::Mark,
+        shim: crate::clt_shim::Shim,
     ) -> Self {
+        let reads_mac = !headless && !cfg!(test);
+        let launch = crate::clt_install::launch_install(
+            !headless,
+            reads_mac,
+            shim.tools_missing(),
+            mark.opened(),
+        );
+        if launch.watch {
+            crate::clt_install::watch_for_tools();
+        }
         let preview = aterm_types::dev_seam!("ATERM_DEBUG_WORKSTATION_SETUP");
         let mode = preview_mode(
             preview.is_some(),
@@ -462,7 +493,7 @@ impl Host {
             request: None,
             permissions: PermissionGate::default(),
             proxy_registered: false,
-            developer_tools: crate::clt_install::Install::default(),
+            developer_tools: launch.install(),
             developer_tools_session: Vec::new(),
             developer_tools_attempt: None,
             developer_tools_unfinished: mark.opened(),
@@ -470,13 +501,15 @@ impl Host {
             developer_tools_probe: (!headless && !cfg!(test)).then_some(
                 crate::clt_install::installing_now as fn() -> crate::clt_install::Reading,
             ),
+            developer_tools_installed: (!headless && !cfg!(test))
+                .then_some(crate::clt_install::c_toolchain_installed as fn() -> Option<bool>),
             developer_tools_after: crate::clt_install::Aftermath::default(),
-            developer_tools_want: None,
-            developer_tools_shim: crate::clt_shim::Shim::for_launch(),
+            developer_tools_want: launch.want(),
+            developer_tools_shim: shim,
             developer_tools_low_data: None,
             developer_tools_network: None,
             developer_tools_not_admin: false,
-            developer_tools_reads_mac: !headless && !cfg!(test),
+            developer_tools_reads_mac: reads_mac,
         }
     }
 
@@ -651,7 +684,9 @@ impl App {
 
     /// An untouched offer lets the handoff go: the successor reads the plan still pending and
     /// admits it at once, as every launch does (init-on-by-default design §6.1). A draft or an
-    /// answer still being processed belongs to this process until it has settled.
+    /// answer still being processed belongs to this process until it has settled, and only a
+    /// System State page holds one: with no page there is nothing to settle (a page's close
+    /// lets its offer go, `SystemStateApp::closed`), so nothing holds the handoff.
     #[cfg(unix)]
     pub(crate) fn workstation_setup_holds_handoff(&self) -> bool {
         let Some(request) = self
@@ -662,11 +697,14 @@ impl App {
         else {
             return false;
         };
-        let state = self
+        let Some(state) = self
             .native_runtime
             .instance_by_kind(crate::native_app::AppKind::SystemState)
-            .and_then(|instance| self.native_runtime.app(instance));
-        !matches!(state, Some(crate::native_app::NativeApp::SystemState(state))
+            .and_then(|instance| self.native_runtime.app(instance))
+        else {
+            return false;
+        };
+        !matches!(state, crate::native_app::NativeApp::SystemState(state)
             if state.offer_can_restart(request))
     }
 
@@ -767,6 +805,17 @@ impl App {
             .apply_started(answers_offer, press);
     }
 
+    /// Whether the Apply being handled is a person's own press ([`Self::note_system_state_apply`]).
+    pub(crate) const fn system_state_apply_is_a_persons(&self) -> bool {
+        self.workstation_setup.permissions.apply_is_a_persons()
+    }
+
+    /// A person's press asked for macOS's grants, and the record says so: the next status read
+    /// makes this press the window's own admission of the plan in force.
+    pub(crate) fn person_asked_for_access(&mut self) {
+        self.workstation_setup.permissions.person_asked();
+    }
+
     /// Whether permission acquisition was explicitly chosen by the person.
     pub(crate) fn person_permission_admission_stands(&self) -> bool {
         self.workstation_setup.permissions.person_admission_stands()
@@ -834,14 +883,6 @@ impl App {
     }
 }
 
-/// The work an automatic setup can start without asking for OS permission.
-#[cfg(test)]
-pub(crate) fn automatic_plan_for_test(mut plan: Plan) -> Plan {
-    plan.selection
-        .set(aterm_types::macos_setup::Setting::Permissions, false);
-    plan
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,6 +937,49 @@ mod tests {
         }));
         gate.observe(allowed);
         assert!(!gate.allowed(), "an older run cannot re-enable guidance");
+    }
+
+    /// A pending offer with no System State page has no draft and no answer in flight: a
+    /// page's close lets its offer go, and the successor offers the plan again (§6.1).
+    #[cfg(unix)]
+    #[test]
+    fn a_pending_setup_offer_with_no_page_holds_no_handoff() {
+        let mut app = App::headless_for_test();
+        let (send, _receive) = mpsc::channel();
+        let request = Request::new(Plan::default(), send);
+        app.workstation_setup.request = Some(request.clone());
+        assert!(request.pending(), "PRECONDITION: the offer is unanswered");
+        assert!(
+            app.native_runtime
+                .instance_by_kind(crate::native_app::AppKind::SystemState)
+                .is_none(),
+            "PRECONDITION: no System State page"
+        );
+        assert!(!app.workstation_setup_holds_handoff());
+
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        app.user_input_recent = |_| false;
+        app.windows
+            .get_mut(&crate::WindowId(0))
+            .expect("window 0")
+            .os_window_for_test = true;
+        let (send, receive) = mpsc::channel();
+        let request = Request::new(Plan::default(), send);
+        app.offer_workstation_setup(request.clone());
+        let instance = app
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::SystemState)
+            .expect("the offer opened its page");
+        assert!(request.pending());
+        app.finish_system_state_close(instance, crate::native_app::CloseScope::Tab);
+        assert!(!request.pending(), "a page's close lets its offer go");
+        assert_eq!(
+            receive.try_recv().map(|answer| answer.decision),
+            Ok(WorkstationSetupDecision::Unavailable),
+            "the launch's offer is made again where a page can answer it"
+        );
+        assert!(!app.workstation_setup_holds_handoff());
     }
 
     fn policy(revision: u64, allowed: bool) -> Option<crate::InitialSetupPermissionPolicy> {
@@ -1093,9 +1177,7 @@ mod tests {
                 .expect("the first tick answers the offer");
             assert_eq!(
                 answer.decision,
-                WorkstationSetupDecision::Begin(crate::workstation_setup::automatic_plan_for_test(
-                    Plan::default()
-                ))
+                WorkstationSetupDecision::Begin(Plan::default())
             );
             let receipt = answer.receipt.take().expect("an answer's receipt");
             assert_eq!(
@@ -1123,7 +1205,8 @@ mod tests {
         app.headless = false;
         let wid = crate::WindowId(0);
         app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
-        app.workstation_setup = Host::for_launch(Some(|| true), false);
+        app.workstation_setup =
+            Host::for_launch(Some(|| true), false, crate::clt_shim::Shim::default());
         app.observe_initial_setup_permissions(policy(4, true));
         assert_eq!(app.access_revision(), Some(4));
         app.stop_initial_setup_permissions();
@@ -1492,9 +1575,7 @@ mod tests {
         let mut answer = receive.try_recv().expect("the first tick answers it");
         assert_eq!(
             answer.decision,
-            WorkstationSetupDecision::Begin(crate::workstation_setup::automatic_plan_for_test(
-                Plan::default()
-            ))
+            WorkstationSetupDecision::Begin(Plan::default())
         );
         answer.receipt.take().unwrap().accept();
         app.resolve_system_state_apply();

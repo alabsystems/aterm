@@ -23,7 +23,7 @@
 //! covers its tree's builds ([`aterm_capacity::covering`]) already holds its memory (a verify
 //! stage, a Trust lane check, the build that runs this one's test); a process that holds a claim
 //! of its own that does not cover, which a second claim would wait on, builds unclaimed and says
-//! so; and every error of the ledger fails open, saying so in one line. An interrupt ends a wait
+//! so. An unavailable or unreadable ledger refuses the build. An interrupt ends a wait
 //! before the build starts.
 //!
 //! How the hidden verb runs it ([`front_exec`], BUILD-ADMIT's shim hop): the front, which is the
@@ -534,12 +534,10 @@ pub enum Admission {
     Own(Record),
     /// Claimed: hold it while the build runs.
     Claimed(Box<Held>),
-    /// It could not claim (the line it said is here): it builds unclaimed.
-    Open(String),
     /// An interrupt ended its wait: the build does not start.
     Stopped(Error),
-    /// An unclaimed nested build could wait on work waiting for its parent's lock. No build
-    /// started and no claim was forced; enter the outer build through the admission shim.
+    /// The ledger or claim is unavailable, or a nested build could wait on work waiting for
+    /// its parent's unproven lock. No build started and no claim was forced.
     Refused(String),
 }
 
@@ -624,15 +622,15 @@ impl Ended {
     }
 }
 
-/// Fail open: say why in one line, and build unclaimed.
-fn open(say: &mut dyn FnMut(&str), why: &str) -> Admission {
-    let line = format!("{SAYS}: {why}; the build runs unclaimed");
+/// Report a refusal without granting unclaimed execution after an admission failure.
+fn refuse(say: &mut dyn FnMut(&str), why: &str) -> Admission {
+    let line = format!("{SAYS}: {why}; no build started");
     say(&line);
-    Admission::Open(line)
+    Admission::Refused(line)
 }
 
 /// CLAIM `build`'s memory, run in `cwd`, at `seat`, saying through `say` what it waits for
-/// ([`aterm_capacity::admit_with`]), what fails open and why it claims nothing.
+/// ([`aterm_capacity::admit_with`]), what refuses it and why it claims nothing.
 pub fn admit(build: &Build, cwd: &Path, seat: &Seat<'_>, say: &mut dyn FnMut(&str)) -> Admission {
     admit_bounded(build, cwd, seat, &|| None, say)
 }
@@ -645,12 +643,12 @@ fn admit_bounded(
     say: &mut dyn FnMut(&str),
 ) -> Admission {
     let Some(ledger) = &seat.ledger else {
-        return open(say, "no home directory keeps the capacity ledger");
+        return refuse(say, "no home directory keeps the capacity ledger");
     };
     match aterm_capacity::covering(ledger, seat.machine, seat.pid, seat.marker.as_deref()) {
         Ok(Some(holder)) => return Admission::Covered(holder),
         Ok(None) => {}
-        Err(e) => return open(say, &format!("the capacity ledger could not be read ({e})")),
+        Err(e) => return refuse(say, &format!("the capacity ledger could not be read ({e})")),
     }
     match ledger.of_pid(seat.pid) {
         Ok(mine) => {
@@ -663,7 +661,7 @@ fn admit_bounded(
                 return Admission::Own(r);
             }
         }
-        Err(e) => return open(say, &format!("the capacity ledger could not be read ({e})")),
+        Err(e) => return refuse(say, &format!("the capacity ledger could not be read ({e})")),
     }
     // Hints never precede verified authority, and an explicit mode choice needs no hint.
     let possible_lock = (seat.mode == Admit::Wait).then(probe_lock).flatten();
@@ -736,6 +734,7 @@ fn admit_bounded(
             // Its claim file was removed between its entry and its look: no look could admit
             // it, as `admit_waiting` ends such a wait.
             aterm_capacity::Polled::Gone(e) => Err(Error::Ledger(e)),
+            aterm_capacity::Polled::Unqualified(why) => Err(Error::Timing(why)),
         }
     };
     let mut admitted = attempt(ask(beyond), &mut speak);
@@ -767,7 +766,7 @@ fn admit_bounded(
             ));
             Admission::Stopped(e)
         }
-        Err(e) => open(say, &format!("{what}: its memory claim failed ({e})")),
+        Err(e) => refuse(say, &format!("{what}: its memory claim failed ({e})")),
     }
 }
 
@@ -1008,7 +1007,8 @@ fn tool_of(target: &Path) -> Tool {
 /// process's ([`supervise`]; a signal with no core that ended it ends this process), or how an
 /// interrupt that ended the wait would have ended it ([`end_like`]). `None` where nothing was
 /// claimed (no build that claims, one a held claim covers, one this process's own claim would
-/// hold up, or one that failed open), and the caller runs `target` as it would have.
+/// hold up), and the caller runs `target` as it would have. A refused admission returns an
+/// exit status and never delegates an unclaimed launch to the caller.
 #[cfg(unix)]
 pub fn run_if_claimed_at(
     target: &Path,
@@ -1042,7 +1042,7 @@ pub fn run_if_claimed_at(
         }) => Some(stopped_by(sig)),
         Admission::Stopped(_) => Some(std::process::ExitCode::from(1)),
         Admission::Refused(_) => Some(std::process::ExitCode::from(75)),
-        Admission::Covered(_) | Admission::Own(_) | Admission::Open(_) => None,
+        Admission::Covered(_) | Admission::Own(_) => None,
     }
 }
 
@@ -1216,7 +1216,7 @@ fn front_exec_bounded(
         }) => return stopped_by(sig),
         Admission::Stopped(_) => return std::process::ExitCode::from(1),
         Admission::Refused(_) => return std::process::ExitCode::from(75),
-        Admission::Covered(_) | Admission::Own(_) | Admission::Open(_) => {
+        Admission::Covered(_) | Admission::Own(_) => {
             return exec(target, args);
         }
     };
@@ -1237,9 +1237,9 @@ fn front_exec_bounded(
                 Ok(status) => end_like(status),
                 Err(e) => {
                     say(&format!(
-                        "{SAYS}: the build did not start under its claim ({e}); it runs unclaimed"
+                        "{SAYS}: running the build under its claim failed ({e}); no unclaimed retry"
                     ));
-                    exec(target, args)
+                    std::process::ExitCode::from(127)
                 }
             }
         }

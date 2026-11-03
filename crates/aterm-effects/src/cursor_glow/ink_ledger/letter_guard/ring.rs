@@ -62,9 +62,11 @@ struct Levels {
 }
 
 impl Levels {
-    fn level(&mut self, fg: u32, ground: u32, cov: u8, corrected: bool) -> TextLevel {
+    /// The way that holds `(fg, ground, corrected)`'s levels, taken (the oldest way evicted) if
+    /// none does. A glyph's pixels share one pair, so its way is found once, not per pixel.
+    fn way(&mut self, fg: u32, ground: u32, corrected: bool) -> usize {
         let key = (fg, ground, corrected);
-        let i = if let Some(i) = self.ways.iter().position(|(k, _)| *k == key) {
+        if let Some(i) = self.ways.iter().position(|(k, _)| *k == key) {
             i
         } else if self.ways.len() < LEVEL_WAYS {
             self.ways.push((key, Box::new([None; 256])));
@@ -74,9 +76,14 @@ impl Levels {
             self.next = (self.next + 1) % LEVEL_WAYS;
             self.ways[i] = (key, Box::new([None; 256]));
             i
-        };
-        *self.ways[i].1[usize::from(cov)]
-            .get_or_insert_with(|| TextLevel::new(fg, ground, cov, corrected))
+        }
+    }
+
+    /// Level `cov` of way `i` ([`Self::way`]).
+    fn level_at(&mut self, i: usize, cov: u8) -> TextLevel {
+        let ((fg, ground, corrected), levels) = &mut self.ways[i];
+        let (fg, ground, corrected) = (*fg, *ground, *corrected);
+        *levels[usize::from(cov)].get_or_insert_with(|| TextLevel::new(fg, ground, cov, corrected))
     }
 }
 
@@ -204,6 +211,7 @@ impl RingCell {
             let ox = ring as i64 + (i as i64 % 3 - 1) * cw as i64;
             let oy = ring as i64 + (i as i64 / 3 - 1) * ch as i64;
             let rh = raster.h();
+            let way = self.levels.way(fg & 0x00FF_FFFF, g, corrected);
             for ry in 0..rh {
                 let by = oy + i64::from(raster.y) + ry as i64;
                 if by < 0 || by >= h as i64 {
@@ -216,7 +224,7 @@ impl RingCell {
                         continue;
                     }
                     let k = by as usize * w + bx as usize;
-                    let level = self.levels.level(fg & 0x00FF_FFFF, g, cov, corrected);
+                    let level = self.levels.level_at(way, cov);
                     self.clean[k] = level.over(self.clean[k]);
                     self.has_text[k] = true;
                     self.text.push((k as u32, level));
@@ -228,13 +236,19 @@ impl RingCell {
             .extend((0..n).map(|k| !self.opaque[k] && self.clean[k] == ground));
         // The cell's extreme and its solid ink.
         let l_g = lum(ground);
-        let inner = |k: usize| {
-            let (x, y) = (k % w, k / w);
-            x >= ring && x < ring + cw && y >= ring && y < ring + ch
-        };
+        // The cell's own pixels in the box, row-major, each clean pixel's luminance read once
+        // (into `ratios`, which [`Self::reading`] clears before it reads its own).
+        let (x_end, y_end) = ((ring + cw).min(w), (ring + ch).min(h));
+        self.ratios.clear();
         let mut extreme = 1.0f32;
-        for k in (0..n).filter(|&k| inner(k) && !self.opaque[k]) {
-            extreme = extreme.max(ratio(lum(self.clean[k]), l_g));
+        for y in ring..y_end {
+            for k in y * w + ring..y * w + x_end {
+                if !self.opaque[k] {
+                    let lk = lum(self.clean[k]);
+                    self.ratios.push(lk);
+                    extreme = extreme.max(ratio(lk, l_g));
+                }
+            }
         }
         let solid_at = super::SOLID_SHARE * extreme;
         self.solid.clear();
@@ -242,40 +256,53 @@ impl RingCell {
         self.rings.clear();
         self.ring_text = false;
         self.l_min = f32::INFINITY;
-        for k in (0..n).filter(|&k| inner(k) && !self.opaque[k]) {
-            let lk = lum(self.clean[k]);
-            if ratio(lk, l_g) < solid_at {
-                continue;
-            }
-            let (x, y) = ((k % w) as i64, (k / w) as i64);
-            let from = self.rings.len();
-            for d in 1..=super::RING as i64 {
-                for dy in -d..=d {
-                    for dx in -d..=d {
-                        if dx.abs().max(dy.abs()) != d {
+        let mut li = 0;
+        for y in ring..y_end {
+            for x in ring..x_end {
+                let k = y * w + x;
+                if self.opaque[k] {
+                    continue;
+                }
+                let lk = self.ratios[li];
+                li += 1;
+                if ratio(lk, l_g) < solid_at {
+                    continue;
+                }
+                let (x, y) = (x as i64, y as i64);
+                let from = self.rings.len();
+                for d in 1..=super::RING as i64 {
+                    // The Chebyshev ring at `d`, row-major: its top and bottom rows whole, its
+                    // two sides between.
+                    for dy in -d..=d {
+                        let yy = y + dy;
+                        if yy < 0 || yy >= h as i64 {
                             continue;
                         }
-                        let (xx, yy) = (x + dx, y + dy);
-                        if xx < 0 || yy < 0 || xx >= w as i64 || yy >= h as i64 {
-                            continue;
-                        }
-                        let kk = yy as usize * w + xx as usize;
-                        if self.ground[kk] {
-                            self.rings.push(kk as u32);
-                            self.ring_text |= self.has_text[kk];
+                        let edge = dy.abs() == d;
+                        let mut dx = -d;
+                        while dx <= d {
+                            let xx = x + dx;
+                            if xx >= 0 && xx < w as i64 {
+                                let kk = yy as usize * w + xx as usize;
+                                if self.ground[kk] {
+                                    self.rings.push(kk as u32);
+                                    self.ring_text |= self.has_text[kk];
+                                }
+                            }
+                            dx += if edge { 1 } else { 2 * d };
                         }
                     }
+                    if self.rings.len() > from {
+                        break;
+                    }
                 }
-                if self.rings.len() > from {
-                    break;
+                if self.rings.len() == from {
+                    continue;
                 }
+                self.ring_at.push(from as u32);
+                self.solid.push((k as u32, y as u32));
+                self.l_min = self.l_min.min(lk);
             }
-            if self.rings.len() == from {
-                continue;
-            }
-            self.ring_at.push(from as u32);
-            self.solid.push((k as u32, y as u32));
-            self.l_min = self.l_min.min(lk);
         }
         self.ring_at.push(self.rings.len() as u32);
         // Its own reading: every ring on the clean frame is the ground itself.
@@ -340,15 +367,15 @@ impl RingCell {
                 // Each channel's median, the upper one of an even count (the judges').
                 let mut g = 0u32;
                 for (c, sh) in self.chan.iter_mut().zip([16u32, 8, 0]) {
-                    c.sort_unstable();
-                    g |= u32::from(c[c.len() / 2]) << sh;
+                    let mid = c.len() / 2;
+                    g |= u32::from(*c.select_nth_unstable(mid).1) << sh;
                 }
                 let (li, lg) = (lum(px.at(k as usize) & 0x00FF_FFFF), lum(g));
                 self.ratios.push((li.max(lg) + 0.05) / (li.min(lg) + 0.05));
                 i += 1;
             }
-            self.ratios.sort_unstable_by(f32::total_cmp);
-            worst = worst.min(self.ratios[(self.ratios.len() - 1) / 2]);
+            let mid = (self.ratios.len() - 1) / 2;
+            worst = worst.min(*self.ratios.select_nth_unstable_by(mid, f32::total_cmp).1);
         }
         worst
     }

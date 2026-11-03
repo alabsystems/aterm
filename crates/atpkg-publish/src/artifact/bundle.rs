@@ -106,8 +106,10 @@ pub fn hello_plan(def: &BundleDef, gate: &HelloGate) -> Result<HelloPlan> {
 /// # Errors
 /// A refusal when nothing names one.
 pub fn derive_version(tools: &dyn Tools, src_repo: &Path, sysroot: &Path) -> Result<String> {
-    if let Ok(text) = std::fs::read_to_string(src_repo.join("release/trust-version.toml"))
-        && let Ok(doc) = text.parse::<aterm_toml::Table>()
+    if let Ok(text) = crate::identity::read_regular_text(
+        &src_repo.join("release/trust-version.toml"),
+        crate::identity::MAX_META_BYTES,
+    ) && let Ok(doc) = text.parse::<aterm_toml::Table>()
         && let Some(v) = doc
             .get("release")
             .and_then(aterm_toml::Value::as_table)
@@ -253,7 +255,10 @@ pub fn admit<'a>(
     let base = req
         .merge_from
         .as_ref()
-        .map(|p| std::fs::read(p).map_err(|e| Error::io(format!("read {}", ctx.shown(p)), &e)))
+        .map(|p| {
+            crate::identity::read_regular_bytes(p, crate::identity::MAX_META_BYTES)
+                .map_err(|e| Error::io(format!("read {}", ctx.shown(p)), &e))
+        })
         .transpose()?;
     let lease = toolchain::lease(
         ctx,
@@ -641,7 +646,7 @@ pub fn thin_fat(tools: &dyn Tools, root: &Path, triple: Triple) -> Result<Vec<St
             let _ = std::fs::remove_file(&tmp);
             Error::refused(format!("lipo -thin {}: {e}", rel.display()))
         })?;
-        let thin = std::fs::read(&tmp).map_err(|e| {
+        let thin = crate::identity::read_regular_bytes(&tmp, 512 * 1024 * 1024).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             Error::io("read the thinned slice", &e)
         })?;
@@ -711,8 +716,10 @@ pub fn one_compiler(tools: &dyn Tools, root: &Path) -> Result<OneCompiler> {
         return Ok(OneCompiler::AlreadyLinked);
     }
     let (rb, tb) = (
-        std::fs::read(&r).map_err(|e| Error::io("read bin/rustc", &e))?,
-        std::fs::read(&t).map_err(|e| Error::io("read bin/trustc", &e))?,
+        crate::identity::read_regular_bytes(&r, 512 * 1024 * 1024)
+            .map_err(|e| Error::io("read bin/rustc", &e))?,
+        crate::identity::read_regular_bytes(&t, 512 * 1024 * 1024)
+            .map_err(|e| Error::io("read bin/trustc", &e))?,
     );
     let how = if rb == tb {
         OneCompiler::LinkedCopy
@@ -752,8 +759,10 @@ pub fn compiler_gate(root: &Path) -> Result<OneCompiler> {
         return Ok(OneCompiler::AlreadyLinked);
     }
     let (rb, tb) = (
-        std::fs::read(&r).map_err(|e| Error::io("read bin/rustc", &e))?,
-        std::fs::read(&t).map_err(|e| Error::io("read bin/trustc", &e))?,
+        crate::identity::read_regular_bytes(&r, 512 * 1024 * 1024)
+            .map_err(|e| Error::io("read bin/rustc", &e))?,
+        crate::identity::read_regular_bytes(&t, 512 * 1024 * 1024)
+            .map_err(|e| Error::io("read bin/trustc", &e))?,
     );
     if rb == tb {
         Ok(OneCompiler::LinkedCopy)
@@ -1299,7 +1308,7 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let request = parse_args(&mut ctx, args)?;
     let ctx = &ctx;
     if request.upload {
-        super::upload::token_preflight(ctx)?;
+        super::upload::program_preflight(ctx, &request.program)?;
     }
     let out = PackBundle.pack_bundle(ctx, &request)?;
     println!(

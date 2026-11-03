@@ -5,6 +5,7 @@
 
 mod caps;
 mod clusters;
+mod colours;
 mod corpus;
 mod engines;
 mod exclusions;

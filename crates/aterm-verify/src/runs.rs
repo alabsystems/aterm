@@ -405,8 +405,8 @@ impl Runs {
             sid.as_deref(),
             &roots,
         );
-        let mut file = open_regular_write(&path, false).ok()?;
-        file.write_all(header.as_bytes()).ok()?;
+        let file = open_regular_write(&path, false).ok()?;
+        aterm_uds::runs::write_record_text(&file, &header).ok()?;
         Some(Self {
             log: Mutex::new(file),
             path,
@@ -431,8 +431,8 @@ impl Runs {
 
     /// Append one line (a newline is added), best-effort.
     fn line(&self, line: &str) {
-        if let Ok(mut file) = self.log.lock() {
-            let _ = writeln!(file, "{line}");
+        if let Ok(file) = self.log.lock() {
+            let _ = aterm_uds::runs::write_line(&file, line);
         }
     }
 
@@ -760,10 +760,17 @@ pub fn end_dead_runs(
     let launchd = kernel.launchd_version();
     let mut ended = 0;
     for (path, rec) in &dead {
-        let horizon = rec.dead_seen.unwrap_or_else(|| {
-            aterm_uds::runs::append_dead_seen(path, high_water, kernel.now_ms());
-            high_water
-        });
+        let horizon =
+            match aterm_uds::runs::append_dead_seen(path, rec, high_water, kernel.now_ms()) {
+                Ok(recorded) => recorded.horizon,
+                Err(why) => {
+                    out(&format!(
+                        "could not retain the dead-run observation for {}: {why}; record kept",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
         let groups = led_groups(rec, kernel);
         let judge = Judge {
             kernel,

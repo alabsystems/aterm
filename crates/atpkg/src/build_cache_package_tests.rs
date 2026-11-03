@@ -380,8 +380,14 @@ fn a_late_preserve_request_keeps_every_generation_and_resumed_payload() {
         let older = world.cache.join("previous.noindex");
         let workspace = world.manifest.parent().unwrap();
         if phase == 0 {
-            super::super::create_with_policy(&world.home, &older, workspace, Some(older_policy))
-                .unwrap();
+            super::super::create_with_policy(
+                &world.home,
+                &older,
+                workspace,
+                Some(older_policy),
+                false,
+            )
+            .unwrap();
             std::fs::create_dir_all(older.join("debug/deps")).unwrap();
             std::fs::write(older.join("debug/.cargo-lock"), b"").unwrap();
             std::fs::write(older.join("debug/deps/unit"), vec![0x5a; 32 << 10]).unwrap();

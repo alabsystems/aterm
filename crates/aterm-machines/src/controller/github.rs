@@ -2,13 +2,22 @@
 // Copyright 2026 Andrew Yates
 
 //! Host GitHub key registration and revocation ([`login`], [`crate::git_credential`],
-//! [`TOKEN_HOST`], [`System::github_rest`], [`KEY_SCOPE`]).
+//! [`TOKEN_HOST`], [`System::github_rest`], [`KEY_SCOPE`]), or, by `[github] keys`, over agh's
+//! library ([`register_via`], [`revoke_via`]: machines 5a and 5b).
 
-use super::inventory::KeysVia;
+use super::inventory::{Github, KeysVia};
 use crate::git_credential::Git;
 use crate::github_pages;
 use crate::port::{GithubResponse, RestMethod, Secret, System};
+use agh::GithubBuilder;
+use agh::identity::{InlineToken, ProcessEnv, Profile};
+use agh::policy::{RouteRequest, RouteTarget, Router, Tier};
+use agh::redact::Redactor;
+use agh::retry::RetryPolicy;
 use serde::Serialize;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
 
 /// The host the machine user's token is filed under in the login keychain.
 pub const TOKEN_HOST: &str = "api.github.com";
@@ -61,16 +70,22 @@ struct Session {
     token: Secret,
 }
 
+/// `account`'s token, read from the login keychain with `git credential fill` under
+/// [`TOKEN_HOST`]: what `aterm machines github login` stored.
+fn stored_token(sys: &dyn System, account: &str) -> Result<Secret, String> {
+    let git = keychain(sys, account)?;
+    git.fill(sys, None, TOKEN_HOST, account)?.ok_or_else(|| {
+        format!(
+            "the login keychain holds no GitHub token for {account} (aterm machines github \
+             login stores one: a token of {account}'s with the {KEY_SCOPE} scope)"
+        )
+    })
+}
+
 impl Session {
     /// Read `account`'s token from the login keychain and check that it signs in as `account`.
     fn open(sys: &dyn System, account: &str) -> Result<Self, String> {
-        let git = keychain(sys, account)?;
-        let Some(token) = git.fill(sys, None, TOKEN_HOST, account)? else {
-            return Err(format!(
-                "the login keychain holds no GitHub token for {account} (aterm machines github \
-                 login stores one: a token of {account}'s with the {KEY_SCOPE} scope)"
-            ));
-        };
+        let token = stored_token(sys, account)?;
         let session = Self { token };
         let (login, _) = session.login(sys)?;
         if !login.eq_ignore_ascii_case(account) {
@@ -190,6 +205,39 @@ struct NewKey<'a> {
     key: &'a str,
 }
 
+/// What one registration did: each key registered or found held (`done`), and one line per
+/// key that was not, or the one line that stopped them all (`failed`). A key GitHub created
+/// is in `done` whatever became of the others, so its id can be recorded and later revoked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Registration {
+    /// The keys the account holds now, by host user.
+    pub(crate) done: Vec<Registered>,
+    /// Why each other key is not registered.
+    pub(crate) failed: Vec<String>,
+}
+
+impl Registration {
+    /// One line that stopped every key.
+    fn stopped(why: String) -> Self {
+        Self {
+            done: Vec::new(),
+            failed: vec![why],
+        }
+    }
+
+    /// `register`'s answer: `done`, or every failure joined by `; ` when any key failed.
+    ///
+    /// # Errors
+    /// The failures, joined.
+    pub(crate) fn into_result(self) -> Result<Vec<Registered>, String> {
+        if self.failed.is_empty() {
+            Ok(self.done)
+        } else {
+            Err(self.failed.join("; "))
+        }
+    }
+}
+
 /// Register each `github.key@<user>` public key in `report` not yet held by `account`.
 ///
 /// # Errors
@@ -200,17 +248,29 @@ pub fn register(
     host_name: &str,
     keys: &[(String, String)],
 ) -> Result<Vec<Registered>, String> {
+    register_each(sys, account, host_name, keys).into_result()
+}
+
+/// [`register`], each key's outcome kept.
+fn register_each(
+    sys: &dyn System,
+    account: &str,
+    host_name: &str,
+    keys: &[(String, String)],
+) -> Registration {
     if keys.is_empty() {
-        return Ok(Vec::new());
+        return Registration::default();
     }
-    let mut wanted = Vec::with_capacity(keys.len());
-    for (user, line) in keys {
-        let (kind, body) = crate::items::github::key_material(line)
-            .ok_or_else(|| format!("{user}'s key is not an OpenSSH public key"))?;
-        wanted.push((user, kind, body));
-    }
-    let session = Session::open(sys, account)?;
-    let held = listed(sys, &session)?;
+    let wanted = match wanted(keys) {
+        Ok(wanted) => wanted,
+        Err(why) => return Registration::stopped(why),
+    };
+    let opened = Session::open(sys, account)
+        .and_then(|session| listed(sys, &session).map(|held| (session, held)));
+    let (session, mut held) = match opened {
+        Ok(opened) => opened,
+        Err(why) => return Registration::stopped(why),
+    };
     let mut done = Vec::new();
     let mut failed = Vec::new();
     for (user, kind, body) in wanted {
@@ -223,22 +283,31 @@ pub fn register(
         }
         let title = crate::items::github::key_title(host_name, user);
         let key = format!("{kind} {body}");
-        let new = aterm_json::to_vec(&NewKey {
+        let new = match aterm_json::to_vec(&NewKey {
             title: &title,
             key: &key,
-        })
-        .map_err(|e| format!("{user}: {e}"))?;
+        }) {
+            Ok(new) => new,
+            Err(e) => {
+                failed.push(format!("{user}: {e}"));
+                continue;
+            }
+        };
         let posted = session.send(sys, RestMethod::Post, "/user/keys", Some(&new));
         match posted {
             Ok(answer) if answer.status == 201 => {
                 let id = aterm_json::from_slice::<aterm_json::Value>(&answer.body)
                     .ok()
-                    .and_then(|value| value["id"].as_u64());
+                    .and_then(|value| value["id"].as_u64())
+                    .filter(|id| *id != 0);
                 match id {
-                    Some(id) => done.push(Registered {
-                        user: user.clone(),
-                        id,
-                    }),
+                    Some(id) => {
+                        held.push((id, kind, body));
+                        done.push(Registered {
+                            user: user.clone(),
+                            id,
+                        });
+                    }
                     None => failed.push(format!("{user}: GitHub returned no key id")),
                 }
             }
@@ -249,11 +318,17 @@ pub fn register(
             Err(why) => failed.push(format!("{user}: {why}")),
         }
     }
-    if failed.is_empty() {
-        Ok(done)
-    } else {
-        Err(failed.join("; "))
+    Registration { done, failed }
+}
+
+fn dedup_ids(ids: &[u64]) -> Vec<u64> {
+    let mut unique = Vec::with_capacity(ids.len());
+    for &id in ids {
+        if !unique.contains(&id) {
+            unique.push(id);
+        }
     }
+    unique
 }
 
 /// Delete each key id from the machine user `account`, and read the account's keys back.
@@ -261,6 +336,7 @@ pub fn register(
 /// # Errors
 /// One line per key the account still holds, or why the keys could not be listed.
 pub fn revoke(sys: &dyn System, account: &str, ids: &[u64]) -> Result<Vec<String>, String> {
+    let ids = dedup_ids(ids);
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -286,6 +362,24 @@ pub fn revoke(sys: &dyn System, account: &str, ids: &[u64]) -> Result<Vec<String
         .into_iter()
         .map(|(id, ..)| id)
         .collect();
+    judged(&ids, &after, &answers)?;
+    Ok(deleted)
+}
+
+/// Each key's user, type and base64 body, or the first key that is not an OpenSSH public key.
+fn wanted(keys: &[(String, String)]) -> Result<Vec<(&String, String, String)>, String> {
+    keys.iter()
+        .map(|(user, line)| {
+            crate::items::github::key_material(line)
+                .map(|(kind, body)| (user, kind, body))
+                .ok_or_else(|| format!("{user}'s key is not an OpenSSH public key"))
+        })
+        .collect()
+}
+
+/// A revocation judged by the listing read after it (`after`), never by a DELETE's answer:
+/// one line per id still listed, carrying its DELETE's failure (`answers`) where one was kept.
+fn judged(ids: &[u64], after: &[u64], answers: &[(u64, String)]) -> Result<(), String> {
     let failed: Vec<String> = ids
         .iter()
         .filter(|id| after.contains(id))
@@ -298,7 +392,7 @@ pub fn revoke(sys: &dyn System, account: &str, ids: &[u64]) -> Result<Vec<String
         })
         .collect();
     if failed.is_empty() {
-        Ok(deleted)
+        Ok(())
     } else {
         Err(failed.join("; "))
     }
@@ -332,8 +426,336 @@ pub fn login(sys: &dyn System, account: &str, token: Secret) -> Result<(), Strin
     git.store(sys, None, TOKEN_HOST, account, &session.token)
 }
 
-/// The agh key path's refusal until WP13 writes it (plan §17).
-const AGH_KEYS_NOT_YET: &str = "not yet: the agh key path lands in WP13";
+/// The name of the profile the agh key path speaks as, inline (5a) or from agh.toml (5b).
+const FLEET: &str = "fleet";
+
+/// The single-identity router of the agh key path `github.keys_via()` names (plan §17): the
+/// keychain's token inline (`AghInline`), or agh.toml's `fleet` profile (`AghFleet`). Each
+/// refusal of its own ends `nothing was sent`; the keychain read refuses with
+/// `stored_token`'s texts, unchanged (body 3).
+fn agh_router(sys: &dyn System, github: &Github) -> Result<Router, String> {
+    let account = &github.account;
+    match github.keys_via() {
+        KeysVia::Gh => Err(format!(
+            "keys = \"gh\" sends {account}'s key calls over the REST path, not agh; nothing was \
+             sent"
+        )),
+        KeysVia::AghInline => {
+            let token = stored_token(sys, account)?;
+            let token =
+                InlineToken::new(aterm_uds::secret::Secret::new(token.bytes())).map_err(|e| {
+                    format!(
+                        "the stored token for {account} cannot be used by agh ({}); nothing was \
+                         sent",
+                        e.slug()
+                    )
+                })?;
+            // agh binds the profile to `account`: its first call is `GET /user`, and a token
+            // that signs in as another login is refused before any key call.
+            let profile = Profile::inline(FLEET, Tier::Dev, account.clone(), token)
+                .map_err(|e| format!("{}; nothing was sent", Redactor::shapes(&e.why)))?;
+            Ok(Router::single_identity(profile))
+        }
+        KeysVia::AghFleet => {
+            if !valid_login(account) {
+                return Err(format!(
+                    "{account:?} is not a GitHub login; nothing was sent"
+                ));
+            }
+            let dirs = sys.agh_dirs().ok_or(
+                "agh's directories cannot be resolved; keys = \"agh-fleet\" reads agh.toml's \
+                 fleet profile; nothing was sent",
+            )?;
+            let validated = agh::config::load(&dirs)
+                .map_err(|e| {
+                    format!(
+                        "agh.toml is invalid: {}; nothing was sent",
+                        Redactor::shapes(&e.why)
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "agh.toml is missing ({}); keys = \"agh-fleet\" reads its fleet profile; \
+                         nothing was sent",
+                        dirs.config_file().display()
+                    )
+                })?;
+            let profile = Router::from_validated(validated)
+                .profile(FLEET)
+                .cloned()
+                .ok_or(
+                    "agh.toml has no fleet profile: agh auth add fleet adds the machine user's \
+                     token; nothing was sent",
+                )?;
+            match profile.login.as_deref() {
+                Some(login) if login.eq_ignore_ascii_case(account) => {}
+                bound => {
+                    return Err(format!(
+                        "agh.toml's fleet profile is bound to {}, not {account}; nothing was sent",
+                        bound.unwrap_or("no login")
+                    ));
+                }
+            }
+            Ok(Router::single_identity(profile))
+        }
+    }
+}
+
+/// One agh client of the key path `github.keys_via()` names, the one identity write permit
+/// its key writes share, and whose token its error lines speak of.
+struct AghKeys {
+    gh: agh::Github,
+    permit: agh::Permit,
+    /// The account, on the inline path (5a), whose token is the login keychain's.
+    inline: Option<String>,
+}
+
+impl AghKeys {
+    /// Open the client. Under `AghFleet`, `GET /user` checks that the token agh.toml's profile
+    /// reads signs in as `github.account` before any key call, as the REST path's session and
+    /// the inline path's login binding check theirs: agh binds only an inline profile's login
+    /// (plan §17, As built).
+    fn open(sys: &dyn System, github: &Github) -> Result<Self, String> {
+        let router = agh_router(sys, github)?;
+        let (transport, endpoints) = sys.github_transport();
+        let gh = GithubBuilder::new(router)
+            .transport(transport)
+            .endpoints(endpoints)
+            .env(Arc::new(ProcessEnv))
+            .fx(sys.github_fx())
+            .retry(RetryPolicy::STANDARD)
+            .caller("aterm-machines")
+            .build();
+        let account = &github.account;
+        let via = github.keys_via();
+        if via == KeysVia::AghFleet {
+            let me = gh
+                .users()
+                .me(FLEET)
+                .map_err(|e| agh_line(&gh, "GET /user", &e))?;
+            if !me.login.eq_ignore_ascii_case(account) {
+                return Err(gh.redactor().apply(&format!(
+                    "agh.toml's fleet token signs in as {}, not {account}; nothing was sent",
+                    me.login
+                )));
+            }
+        }
+        let permit = gh
+            .permit(&RouteRequest::write(RouteTarget::Identity))
+            .map_err(|e| agh_line(&gh, "route /user/keys", &e))?;
+        let inline = (via == KeysVia::AghInline).then(|| account.clone());
+        Ok(Self { gh, permit, inline })
+    }
+
+    /// One line for a key call's failure, as `agh_line`. On the inline path a token agh
+    /// refuses as unauthenticated (another login's, or one GitHub answers 401) names the verb
+    /// that replaces the login keychain's token, never agh's own, which cannot see it: another
+    /// login's token gets the REST path's text. A token GitHub says lacks `admin:public_key`
+    /// keeps agh's scope hint and also names that verb, which stores the re-issued token.
+    fn line(&self, what: &str, e: &agh::Error) -> String {
+        let Some(account) = self.inline.as_deref() else {
+            return agh_line(&self.gh, what, e);
+        };
+        let line = if e.kind == agh::Kind::Unauthenticated {
+            match &e.sub {
+                agh::Sub::LoginMismatch { got, .. } => format!(
+                    "the login keychain's GitHub token for {account} signs in as {got:?}; \
+                     nothing was sent (aterm machines github login replaces it)"
+                ),
+                _ => format!(
+                    "{what}: {}; aterm machines github login replaces the login keychain's \
+                     token for {account} (a token of {account}'s with the {KEY_SCOPE} scope)",
+                    e.why
+                ),
+            }
+        } else if e.next.contains(KEY_SCOPE) {
+            format!(
+                "{what}: {}; {}; aterm machines github login stores the re-issued token for \
+                 {account}",
+                e.why, e.next
+            )
+        } else {
+            return agh_line(&self.gh, what, e);
+        };
+        self.gh.redactor().apply(&line)
+    }
+
+    /// The keys the client's identity holds: `(id, key type, base64 body)`, every page read.
+    fn listed(&self) -> Result<Vec<(u64, String, String)>, String> {
+        let keys = self
+            .gh
+            .users()
+            .keys()
+            .list()
+            .map_err(|e| self.line("GET /user/keys", &e))?;
+        keys.into_iter()
+            .map(|held| {
+                if held.id == 0 {
+                    return Err("GET /user/keys: GitHub listed key id 0".into());
+                }
+                crate::items::github::key_material(&held.key)
+                    .map(|(kind, body)| (held.id, kind, body))
+                    .ok_or_else(|| {
+                        format!(
+                            "GET /user/keys: key {} is not an OpenSSH public key",
+                            held.id
+                        )
+                    })
+            })
+            .collect()
+    }
+}
+
+/// One line for an agh call's failure, `{what}: {why}; {next}`, through the client's redactor.
+/// A 404 whose scope headers show the token lacks `admin:public_key` names that scope in its
+/// next (design §16.7).
+fn agh_line(gh: &agh::Github, what: &str, e: &agh::Error) -> String {
+    let line = if e.next.is_empty() {
+        format!("{what}: {}", e.why)
+    } else {
+        format!("{what}: {}; {}", e.why, e.next)
+    };
+    gh.redactor().apply(&line)
+}
+
+/// The key calls of one controller command (plan §17, As built). Over agh it opens one client
+/// and one identity write permit at its first call and shares them with every call after, so
+/// agh paces all of the command's key writes 1 s apart (§4.6.5), a rotation's DELETE after its
+/// POST and the next host's POST included, and binds the inline token's login once. A failed
+/// opening is not kept: the next call opens again. The REST path (`KeysVia::Gh`) opens its
+/// session per call, unchanged.
+pub(crate) struct KeyCalls<'s> {
+    sys: &'s dyn System,
+    /// The client opened for an account and a key path, and its permit.
+    agh: RefCell<Option<(String, KeysVia, Rc<AghKeys>)>>,
+}
+
+impl<'s> KeyCalls<'s> {
+    /// No client opened yet.
+    pub(crate) fn new(sys: &'s dyn System) -> Self {
+        Self {
+            sys,
+            agh: RefCell::new(None),
+        }
+    }
+
+    /// The agh client for `github`'s account and key path, opened at the first call.
+    fn agh(&self, github: &Github) -> Result<Rc<AghKeys>, String> {
+        let via = github.keys_via();
+        if let Some((account, held, keys)) = &*self.agh.borrow()
+            && *account == github.account
+            && *held == via
+        {
+            return Ok(Rc::clone(keys));
+        }
+        let keys = Rc::new(AghKeys::open(self.sys, github)?);
+        *self.agh.borrow_mut() = Some((github.account.clone(), via, Rc::clone(&keys)));
+        Ok(keys)
+    }
+
+    /// [`register`] by the path `github.keys_via()` names, each key's outcome kept: `Gh` is
+    /// the REST path, unchanged; `AghInline` and `AghFleet` the agh path (§17).
+    pub(crate) fn register(
+        &self,
+        github: &Github,
+        host_name: &str,
+        keys: &[(String, String)],
+    ) -> Registration {
+        match github.keys_via() {
+            KeysVia::Gh => register_each(self.sys, &github.account, host_name, keys),
+            KeysVia::AghInline | KeysVia::AghFleet => self.register_agh(github, host_name, keys),
+        }
+    }
+
+    /// [`revoke`] by the path `github.keys_via()` names, as `register`.
+    ///
+    /// # Errors
+    ///
+    /// As `revoke`, or the agh path's refusal.
+    pub(crate) fn revoke(&self, github: &Github, ids: &[u64]) -> Result<Vec<String>, String> {
+        match github.keys_via() {
+            KeysVia::Gh => revoke(self.sys, &github.account, ids),
+            KeysVia::AghInline | KeysVia::AghFleet => self.revoke_agh(github, ids),
+        }
+    }
+
+    /// [`register`] over agh: the same algorithm, its writes paced 1 s apart by agh.
+    fn register_agh(
+        &self,
+        github: &Github,
+        host_name: &str,
+        keys: &[(String, String)],
+    ) -> Registration {
+        if keys.is_empty() {
+            return Registration::default();
+        }
+        let wanted = match wanted(keys) {
+            Ok(wanted) => wanted,
+            Err(why) => return Registration::stopped(why),
+        };
+        let opened = self
+            .agh(github)
+            .and_then(|agh| agh.listed().map(|held| (agh, held)));
+        let (agh, mut held) = match opened {
+            Ok(opened) => opened,
+            Err(why) => return Registration::stopped(why),
+        };
+        let calls = agh.gh.users().keys();
+        let mut done = Vec::new();
+        let mut failed = Vec::new();
+        for (user, kind, body) in wanted {
+            if let Some((id, ..)) = held.iter().find(|(_, k, b)| *k == kind && *b == body) {
+                done.push(Registered {
+                    user: user.clone(),
+                    id: *id,
+                });
+                continue;
+            }
+            let title = crate::items::github::key_title(host_name, user);
+            match calls.add(&agh.permit, &title, &format!("{kind} {body}")) {
+                Ok(agh::Ensured { object, .. }) if object.id != 0 => {
+                    held.push((object.id, kind, body));
+                    done.push(Registered {
+                        user: user.clone(),
+                        id: object.id,
+                    });
+                }
+                Ok(_) => failed.push(format!(
+                    "{user}: POST /user/keys: GitHub returned no key id"
+                )),
+                Err(e) => failed.push(format!("{user}: {}", agh.line("POST /user/keys", &e))),
+            }
+        }
+        Registration { done, failed }
+    }
+
+    /// [`revoke`] over agh: each listed id deleted, then the revocation judged by a second
+    /// listing.
+    fn revoke_agh(&self, github: &Github, ids: &[u64]) -> Result<Vec<String>, String> {
+        let ids = dedup_ids(ids);
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let agh = self.agh(github)?;
+        let listing = agh.listed()?;
+        let before: Vec<u64> = listing.iter().map(|(id, ..)| *id).collect();
+        let deleted: Vec<String> = listing
+            .iter()
+            .filter(|(id, ..)| ids.contains(id))
+            .map(|(_, kind, body)| format!("{kind} {body}"))
+            .collect();
+        let calls = agh.gh.users().keys();
+        let mut answers: Vec<(u64, String)> = Vec::new();
+        for id in ids.iter().copied().filter(|id| before.contains(id)) {
+            if let Err(e) = calls.delete(&agh.permit, id) {
+                answers.push((id, agh.line(&format!("DELETE /user/keys/{id}"), &e)));
+            }
+        }
+        let after: Vec<u64> = agh.listed()?.into_iter().map(|(id, ..)| id).collect();
+        judged(&ids, &after, &answers)?;
+        Ok(deleted)
+    }
+}
 
 /// [`register`] by the path `github.keys_via()` names: `Gh` is
 /// `register(sys, &github.account, host_name, keys)`, unchanged; `AghInline` and `AghFleet`
@@ -344,14 +766,13 @@ const AGH_KEYS_NOT_YET: &str = "not yet: the agh key path lands in WP13";
 /// As `register`, or the agh path's refusal, one line naming the key call.
 pub fn register_via(
     sys: &dyn System,
-    github: &super::inventory::Github,
+    github: &Github,
     host_name: &str,
     keys: &[(String, String)],
 ) -> Result<Vec<Registered>, String> {
-    match github.keys_via() {
-        KeysVia::Gh => register(sys, &github.account, host_name, keys),
-        KeysVia::AghInline | KeysVia::AghFleet => Err(AGH_KEYS_NOT_YET.to_string()),
-    }
+    KeyCalls::new(sys)
+        .register(github, host_name, keys)
+        .into_result()
 }
 
 /// [`revoke`] by the path `github.keys_via()` names, as `register_via`.
@@ -359,15 +780,8 @@ pub fn register_via(
 /// # Errors
 ///
 /// As `revoke`, or the agh path's refusal.
-pub fn revoke_via(
-    sys: &dyn System,
-    github: &super::inventory::Github,
-    ids: &[u64],
-) -> Result<Vec<String>, String> {
-    match github.keys_via() {
-        KeysVia::Gh => revoke(sys, &github.account, ids),
-        KeysVia::AghInline | KeysVia::AghFleet => Err(AGH_KEYS_NOT_YET.to_string()),
-    }
+pub fn revoke_via(sys: &dyn System, github: &Github, ids: &[u64]) -> Result<Vec<String>, String> {
+    KeyCalls::new(sys).revoke(github, ids)
 }
 
 #[cfg(test)]

@@ -5,8 +5,10 @@
 //! (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.3.3, F10). The member's verbs (`requests`,
 //! `allow`, `invite`, `ignore`) go to this Mac's running window, which holds the desk and shows
 //! the phrase on its own screen; they never print the phrase. The default `join` finds
-//! ALab's members, queues at the default vault, and starts the subscriber to finish automatic
-//! LAN admission. An explicitly supplied phrase retains the manual join flow.
+//! ALab's members, proves this Mac to them first ([`proved_back`]: a member on the home ALab LAN
+//! lets it in at once, with nobody's Allow), asks them plainly only where none did, queues at
+//! the default vault for an admin's approval, and starts the subscriber, which proves and asks
+//! again while it waits. An explicitly supplied phrase retains the manual join flow.
 //!
 //! F16's verbs run in this process, on this Mac's own vault files: `list` prints the membership
 //! log's members and the Macs it removed, `remove` takes a member out as this Mac (any member,
@@ -38,8 +40,9 @@ const USAGE: &str = "aterm members: Macs joining ALab and the members that let t
   ignore <name>         hide that Mac's request on this Mac
   list                  the members and the Macs the vault removed, as this Mac's log says
   remove <name> [--stolen]
-                        take that Mac out of ALab as this Mac (--stolen: rotate the fleet
-                        code too, and name what to rotate at the providers)
+                        take that Mac out of ALab as this Mac, rotating the fleet code
+                        (--stolen: also deny-list its labels and node in the roster, and
+                        name what to rotate at the providers)
   undo [<name>]         the Undo rows this Mac shows for <name>'s removals; a person's
                         press of the row on the Machines view signs this Mac's share
   join [<phrase>] [--member <name>] [--at <host:port>]... [--no-wait]
@@ -51,6 +54,18 @@ const BROWSE_WITHIN: Duration = Duration::from_secs(3);
 
 /// Each member's dial and every exchange on it.
 const DIAL_WITHIN: Duration = Duration::from_secs(5);
+
+/// How long a phraseless `join` keeps dialing members to prove this Mac to ([`proved_back`]),
+/// which tries them one after another (the fleet path in the first half of what is left): once
+/// it passed, no further member is dialed and, where none let this Mac in and none may have
+/// signed, the members are asked plainly, all at once ([`join::ask_all`]), while this Mac's vault
+/// subscriber goes on proving with no such bound. It bounds the dials only: an exchange already
+/// begun keeps its own bounds (a member's port within its 3 s handshake watchdog, a fleet
+/// member's `VaultJoin` within the member's 30 s `SERVED_WITHIN`), and once a member let this Mac
+/// in, its first sync from the vault's servers keeps the transport's. So install.sh's 60 s hang
+/// detector (`VERIFY_WAIT_SECS`) can cut a slow run short; a Mac let in before that is in, and
+/// its subscriber, which the join set up, follows the vault from there.
+const PROVE_WITHIN: Duration = Duration::from_secs(20);
 
 /// The port a member's fleet listener serves when `--at` names none.
 const FLEET_PORT: u16 = 7100;
@@ -69,6 +84,21 @@ fn network_header() -> Option<String> {
     #[cfg(not(unix))]
     {
         None
+    }
+}
+
+/// Where this Mac is for its join's words ([`join::JoinPlace::of`] its network place under the
+/// state root `state`). A unit test reads no Mac: there it is not known, and the tests that word a
+/// place name it.
+fn join_place(state: &Path) -> join::JoinPlace {
+    #[cfg(not(test))]
+    {
+        join::JoinPlace::of(&aterm_netplace::read(state))
+    }
+    #[cfg(test)]
+    {
+        let _ = state;
+        join::JoinPlace::Unknown
     }
 }
 
@@ -171,11 +201,14 @@ fn in_vault(verb: impl FnOnce(&Paths) -> Result<Vec<String>, String>) -> ExitCod
     }
 }
 
-/// `list`'s lines: one per member, then one per Mac the log removed.
+/// `list`'s lines: one per member, then one per Mac the log removed, then one per pair of
+/// standing seats the log ties ([`client::Split::line`]: one Mac seated twice, or a Mac that asked
+/// under another standing seat's label).
 fn list_said(paths: &Paths) -> Result<Vec<String>, String> {
     let listed = client::member_list(paths)
         .map_err(|error| error.to_string())?
         .ok_or("this Mac's vault has no membership log yet")?;
+    let splits = client::seat_splits(paths).map_err(|error| error.to_string())?;
     Ok(listed
         .iter()
         .map(|mac| match &mac.removed {
@@ -197,6 +230,7 @@ fn list_said(paths: &Paths) -> Result<Vec<String>, String> {
                     .map_or(" founder".to_owned(), |by| format!(" admitted by={by}"))
             ),
         })
+        .chain(splits.iter().map(client::Split::line))
         .collect())
 }
 
@@ -374,13 +408,15 @@ impl JoinArgs {
     }
 }
 
-/// The joining Mac: its paths, Commons device, node key, name and model.
+/// The joining Mac: its paths, Commons device, node key, name and model, and where it is for its
+/// join's words ([`join_place`], read once when the run starts).
 struct Me {
     paths: Paths,
     device: Device,
     node: [u8; 32],
     name: String,
     model: String,
+    place: join::JoinPlace,
 }
 
 impl Me {
@@ -418,6 +454,7 @@ impl Me {
             node: *node.key().bytes(),
             name,
             model: model(),
+            place: join_place(state),
         })
     }
 
@@ -452,9 +489,15 @@ fn model() -> String {
 
 /// Reach the member at `at` (`host:port`): its `ask` op, every step within [`DIAL_WITHIN`].
 fn dial(at: &str) -> aterm_secrets::Result<Box<dyn Stream>> {
+    dial_within(at, DIAL_WITHIN)
+}
+
+/// [`dial`], its connect and handshake within `within`, every exchange after them within
+/// [`DIAL_WITHIN`].
+fn dial_within(at: &str, within: Duration) -> aterm_secrets::Result<Box<dyn Stream>> {
     let (host, port) = aterm_net::fleet_member::parse_host_port(at, None)
         .map_err(|_| aterm_secrets::Error::new(format!("{at} is not host:port")))?;
-    let (transport, _) = aterm_net::fleet_member::dial_ask(&host, None, port, DIAL_WITHIN)
+    let (transport, _) = aterm_net::fleet_member::dial_ask(&host, None, port, within)
         .map_err(|error| aterm_secrets::Error::new(error.to_string()))?;
     let stream = transport.into_stream();
     stream.sock.set_read_timeout(Some(DIAL_WITHIN))?;
@@ -553,6 +596,9 @@ struct Reach<'a> {
     browse: &'a (dyn Fn() -> aterm_secrets::Result<Vec<String>> + Sync),
     /// One member's `ask` op.
     dial: &'a Dial<'a>,
+    /// Prove this Mac to the members at the addresses given, dialing none after the instant
+    /// given ([`proved_back`]).
+    prove: &'a (dyn Fn(&Me, &[String], std::time::Instant) -> Proved + Sync),
     /// Join the ALab vault without waiting ([`join_alab_vault`]).
     join_vault: &'a (dyn Fn(&Paths) -> aterm_secrets::Result<()> + Sync),
     /// Make sure this Mac's vault subscriber runs ([`Follows::live`]).
@@ -570,6 +616,7 @@ fn run_join(args: &JoinArgs) -> ExitCode {
     let reach = Reach {
         browse: &|| aterm_secrets::discover::browse_members(BROWSE_WITHIN),
         dial: &dial,
+        prove: &|me, ats, until| proved_back(me, ats, Some(until)),
         join_vault: &join_alab_vault,
         follow: &Follows::live,
     };
@@ -633,8 +680,19 @@ fn join_tried(
     }
     let joining = me.joining();
     let dial = reach.dial;
-    // `--no-wait` sets this Mac up at the ALab vault while it asks the members, each within its
-    // own bound, so install.sh's lane ends within its own.
+    // A phraseless join proves this Mac only where sharing is on: a proof a member takes writes
+    // this Mac's vault and ~/.secrets, which `[swarm] enabled = false` (or a settings file aterm
+    // cannot read) keeps from happening by itself, as it keeps the vault half below
+    // (`client::prepare_alab_join_retry`) and this Mac's subscriber. The plain ask still goes:
+    // it writes nothing here, and only a phrase a person types lets this Mac in from it.
+    let proves = args.phrase.is_none()
+        && matches!(
+            aterm_secrets::swarm::enabled_in_home(&me.paths.home),
+            Ok(true)
+        );
+    // `--no-wait` sets this Mac up at the ALab vault while it proves this Mac (dialing no member
+    // after [`PROVE_WITHIN`]) and then asks the members, each within its own bound, so
+    // install.sh's lane ends within its own.
     let (asked, waits) = std::thread::scope(|scope| {
         let waits = (args.no_wait || args.phrase.is_none())
             .then(|| scope.spawn(|| wait_at_vault(&me.paths, reach)));
@@ -643,9 +701,21 @@ fn join_tried(
         } else {
             Ok(args.at.clone())
         };
+        // With no phrase, prove this Mac first, as its subscriber does ([`ask_members`]): a
+        // member on the home ALab LAN lets it in at once, with nobody's Allow, and it asks the
+        // members plainly only where none did and none may have signed it in, or where the
+        // proof's time ran out before any member signed.
         let asked = found.map(|ats| {
-            let (heard, missed) = join::ask_all(dial, &joining, &ats);
-            (ats, heard, missed)
+            let proved = if proves {
+                (reach.prove)(me, &ats, std::time::Instant::now() + PROVE_WITHIN)
+            } else {
+                Proved::No
+            };
+            let (heard, missed) = match proved {
+                Proved::No => join::ask_all(dial, &joining, &ats),
+                Proved::In | Proved::SignedMaybe => (Vec::new(), Vec::new()),
+            };
+            (proved, heard, missed)
         });
         let waits = waits.map(|waiting| {
             waiting
@@ -654,15 +724,26 @@ fn join_tried(
         });
         (asked, waits)
     });
-    let (_ats, heard, missed) = match (asked, waits) {
-        (Ok(asked), None) => asked,
+    let (heard, missed) = match (asked, waits) {
+        (Ok((Proved::In, ..)), waits) => return Tried::Ended(said_proved(PROVED_IN, waits, out)),
+        (Ok((Proved::SignedMaybe, ..)), waits) => {
+            return Tried::Ended(said_proved(join::let_in(me.place), waits, out));
+        }
+        (Ok((_, heard, missed)), None) => (heard, missed),
         (Ok((_, heard, missed)), Some(waits)) => {
-            return Tried::Ended(said_no_wait(Ok(&heard), &missed, waits, out, err));
+            return Tried::Ended(said_no_wait(me.place, Ok(&heard), &missed, waits, out, err));
         }
         // A Mac that cannot browse (off macOS, or one macOS refuses the local network) still
         // waits at the vault, and says why it asked no member where install.sh shows it.
         (Err(error), Some(waits)) => {
-            return Tried::Ended(said_no_wait(Err(error.to_string()), &[], waits, out, err));
+            return Tried::Ended(said_no_wait(
+                me.place,
+                Err(error.to_string()),
+                &[],
+                waits,
+                out,
+                err,
+            ));
         }
         (Err(error), None) => {
             let _ = writeln!(err, "aterm members join: {error}");
@@ -746,9 +827,10 @@ fn join_alab_vault(paths: &Paths) -> aterm_secrets::Result<()> {
 
 /// `join --no-wait`'s vault half, as System State's Secrets stage joins: with no vault set up
 /// here, join the ALab vault without waiting, then make sure this Mac's vault subscriber runs.
-/// While this Mac waits on the ALab vault, that subscriber asks ALab's members again, after 1,
-/// 2, 4 and 8 minutes and then every 15 (`aterm_secrets::client::ask_members_if_due`), so a
-/// member that was asleep, away or restarting its window when this asked shows the row too.
+/// While this Mac waits on the ALab vault, that subscriber proves this Mac to ALab's members
+/// and asks them again ([`ask_members`]), about half a minute later, then after 1, 2, 4 and 8
+/// minutes and then every 15 (`aterm_secrets::client::ask_members_if_due`), so a member that
+/// was asleep, away or restarting its window when this ran lets it in, or shows the row, too.
 /// Before the first fetch, a separate durable intent lets the subscriber retry setup even if
 /// no source was authenticated yet. That intent is never membership. `Err` says why setup
 /// could not be made retryable.
@@ -769,11 +851,28 @@ fn wait_at_vault(paths: &Paths, reach: &Reach<'_>) -> Result<Follows, String> {
     Ok((reach.follow)(&paths.home))
 }
 
+/// What a phraseless `join` says where a member let this Mac in by its proof ([`Proved::In`]).
+const PROVED_IN: &str = "Joined ALab: a member let this Mac in by its proof.";
+
+/// What a phraseless `join` whose proof let this Mac in ([`PROVED_IN`]), or may have
+/// ([`Proved::SignedMaybe`]: [`join::let_in`] where this Mac is, as every waiting line), says,
+/// `first` first, and its exit code: 0. Its first line is the one install.sh shows; `waits` says
+/// whether this Mac's subscriber, which follows the vault from here, runs.
+fn said_proved(first: &str, waits: Option<Result<Follows, String>>, out: &mut dyn Write) -> u8 {
+    let _ = writeln!(out, "{first}");
+    if let Some(fix) = waits.as_ref().and_then(|waits| waits.as_ref().ok()?.fix()) {
+        let _ = writeln!(out, "{fix}");
+    }
+    0
+}
+
 /// What `join --no-wait` says, and its exit code; its first line is the one install.sh shows.
 /// `heard` answered (`Err`: why no member could be looked for), `missed` did not, and `waits`
 /// says whether this Mac waits at the ALab vault and whether its subscriber, which asks the
-/// members again through the same browse, runs.
+/// members again through the same browse, runs. What lets it in follows where it is (`at`,
+/// [`join::let_in`]): automatic admission only on the ALab LAN.
 fn said_no_wait(
+    at: join::JoinPlace,
     heard: Result<&[Heard], String>,
     missed: &[(String, String)],
     waits: Result<Follows, String>,
@@ -796,7 +895,7 @@ fn said_no_wait(
             let _ = writeln!(out, "ALab vault setup has not finished ({why}); {next}");
         }
         (None, _) => {
-            let _ = writeln!(out, "{}", join::LET_IN);
+            let _ = writeln!(out, "{}", join::let_in(at));
         }
         (Some(Some(why)), Ok(_)) => {
             let _ = writeln!(out, "{why}; this Mac's request waits at the ALab vault");
@@ -812,15 +911,16 @@ fn said_no_wait(
             let _ = writeln!(
                 out,
                 "no ALab member answers on this network yet, and this Mac's vault subscriber asks \
-                 them again (after 1, 2, 4 and 8 minutes, then every 15): {}",
-                join::LET_IN
+                 them again (about half a minute later, then after 1, 2, 4 and 8 minutes, then \
+                 every 15): {}",
+                join::let_in(at)
             );
         }
         (Some(None), Ok(_)) => {
             let _ = writeln!(
                 out,
                 "no ALab member answers on this network yet: {}",
-                join::LET_IN
+                join::let_in(at)
             );
         }
         (Some(None), Err(why)) => {
@@ -894,7 +994,7 @@ fn joined_lines(joined: &join::Joined, follows: &Follows) -> Vec<String> {
 /// through it once its join waits on the ALab vault
 /// (`aterm_machines::init_secrets::on_ask_members`), so a member shows a row with nobody
 /// running `aterm members join` first, and that Mac's vault subscriber asks through it while it
-/// waits, after 1, 2, 4 and 8 minutes and then every 15
+/// waits, about half a minute later, then after 1, 2, 4 and 8 minutes and then every 15
 /// (`aterm_secrets::client::on_ask_members`), so a member that wakes, joins the LAN or restarts
 /// its window since shows the row too.
 /// # Errors
@@ -908,7 +1008,7 @@ pub fn ask_members(home: &Path) -> Result<usize, String> {
     }
     let ats = aterm_secrets::discover::browse_members(BROWSE_WITHIN)
         .map_err(|error| error.to_string())?;
-    ask_after_proof(proved_back(&me, &ats), || {
+    ask_after_proof(proved_back(&me, &ats, None), || {
         let dial: &Dial<'_> = &dial;
         let (heard, _) = join::ask_all(dial, &me.joining(), &ats);
         if heard.is_empty() {
@@ -918,14 +1018,21 @@ pub fn ask_members(home: &Path) -> Result<usize, String> {
     })
 }
 
+/// The fleet path's share of a proof that must dial no member past `until` ([`proved_back`]):
+/// half the time left, so the home-LAN path that follows keeps the rest.
+fn fleet_share(until: std::time::Instant) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    now + until.saturating_duration_since(now) / 2
+}
+
 /// What proving this Mac to the members came to ([`proved_back`]).
 #[derive(Debug)]
 enum Proved {
     /// A member let it in.
     In,
-    /// The last member tried may have signed this Mac's records (its possession answer went):
-    /// nothing more is sent this round, a plain ask included, until those records reached the
-    /// others.
+    /// The last member tried may have signed this Mac's records (its possession answer went), or
+    /// another proof of this Mac still runs ([`join::ProofLock`]): nothing more is sent this
+    /// round, a plain ask included, until those records reached the others.
     SignedMaybe,
     /// No member let it in, and none may have signed.
     No,
@@ -958,10 +1065,21 @@ fn ask_after_proof(
 /// ([`crate::vault_join::prove_over_fleet`]: the channel proves the fleet's key too, so a node key
 /// no seat binds gets a seat), then on each member's own port at `ats` (its node key alone, which
 /// moves the seat the log binds to it). One path after the other, and none after a try that may
-/// have signed ([`Proved::SignedMaybe`]). [`Proved::No`] where no member let it in: this Mac then
-/// asks a person as before.
-fn proved_back(me: &Me, ats: &[String]) -> Proved {
+/// have signed ([`Proved::SignedMaybe`]). No member is dialed on either path once `until` has
+/// passed ([`crate::vault_join::dial_until`]; `None`: none is too late), and the fleet path dials
+/// none past half the time left, so dead fleet peers never take the home-LAN proof's turn. One
+/// proof of this Mac runs at a time across processes ([`join::ProofLock`]): while another holds
+/// it (`aterm members join` beside the subscriber's round) this one waits until `until`, then
+/// sends nothing, as after a member that may have signed. [`Proved::No`] where no member let it
+/// in: this Mac then asks a person as before.
+fn proved_back(me: &Me, ats: &[String], until: Option<std::time::Instant>) -> Proved {
     use aterm_net::fleet_member::{read_join_code, read_node_identity, read_peers};
+    let Ok(lock) = join::ProofLock::take(&me.paths, until) else {
+        return Proved::No;
+    };
+    let Some(_proving) = lock else {
+        return Proved::SignedMaybe;
+    };
     let Some(state) = aterm_types::dirs::state_dir() else {
         return Proved::No;
     };
@@ -989,6 +1107,7 @@ fn proved_back(me: &Me, ats: &[String]) -> Proved {
                 &joining,
                 (&secret, &node),
                 &peers,
+                until.map(fleet_share),
             )) {
                 Proved::No => {}
                 done => return done,
@@ -998,6 +1117,7 @@ fn proved_back(me: &Me, ats: &[String]) -> Proved {
     let sign_node = |message: &[u8]| -> [u8; 64] {
         node.sign_record(aterm_secrets::members::desk::PROVE_RECORD, message)
     };
+    let dial = crate::vault_join::dial_until(until, DIAL_WITHIN, &dial_within);
     let dial: &Dial<'_> = &dial;
     proof_outcome(join::prove_first(
         &me.paths, dial, &joining, &sign_node, ats,
@@ -1037,6 +1157,7 @@ pub fn join_with_phrase(phrase: &SecretBytes) -> PhraseTry {
     let reach = Reach {
         browse: &|| aterm_secrets::discover::browse_members(BROWSE_WITHIN),
         dial: &dial,
+        prove: &|me, ats, until| proved_back(me, ats, Some(until)),
         join_vault: &join_alab_vault,
         follow: &Follows::live,
     };
@@ -1079,12 +1200,23 @@ fn status() -> ExitCode {
         eprintln!("aterm members: no home directory");
         return ExitCode::from(1);
     };
-    println!("{}", status_said(&paths, &Follows::now));
+    println!(
+        "{}",
+        status_said(&paths, &Follows::now, &|| {
+            aterm_types::dirs::state_dir()
+                .map_or(join::JoinPlace::Unknown, |state| join_place(&state))
+        })
+    );
     ExitCode::SUCCESS
 }
 
-/// `status`'s line for the Mac at `paths`, `follows` reading whether its vault subscriber runs.
-fn status_said(paths: &Paths, follows: &dyn Fn(&Path) -> Follows) -> String {
+/// `status`'s line for the Mac at `paths`, `follows` reading whether its vault subscriber runs
+/// and `place` where it is, which says what lets an asking Mac in ([`join::let_in`]).
+fn status_said(
+    paths: &Paths,
+    follows: &dyn Fn(&Path) -> Follows,
+    place: &dyn Fn() -> join::JoinPlace,
+) -> String {
     match client::status(paths).map(|status| status.membership) {
         Ok(client::Membership::In { .. }) => {
             let name = client::config(paths)
@@ -1097,7 +1229,7 @@ fn status_said(paths: &Paths, follows: &dyn Fn(&Path) -> Follows) -> String {
             allowed_words(&follows(&paths.home))
         }
         Ok(client::Membership::Pending) => {
-            format!("asking: {}", aterm_secrets::members::join::LET_IN)
+            format!("asking: {}", join::let_in(place()))
         }
         Ok(_) => "not in ALab: run `aterm members join` here".to_owned(),
         Err(error) => format!("unknown: {error}"),
@@ -1141,6 +1273,7 @@ mod tests {
             node: [7; 32],
             name: name.to_owned(),
             model: "Mac15,3".to_owned(),
+            place: join::JoinPlace::Home,
         }
     }
 
@@ -1249,6 +1382,7 @@ mod tests {
             let reach = Reach {
                 browse: &|| Ok(Vec::new()),
                 dial,
+                prove: &|_, _, _| panic!("a phrase join proves nothing"),
                 join_vault: &no_vault,
                 follow,
             };
@@ -1297,10 +1431,10 @@ mod tests {
         );
         assert!(said.contains("aterm secrets agent on"), "{said}");
         // `status` there: it finishes by itself only while the subscriber runs.
-        let absent = status_said(&j.paths, &|_| Follows::Absent);
+        let absent = status_said(&j.paths, &|_| Follows::Absent, &|| join::JoinPlace::Home);
         assert!(absent.contains("aterm secrets agent on"), "{absent}");
         assert!(!absent.contains("finishes by itself"), "{absent}");
-        let runs = status_said(&j.paths, &|_| Follows::Runs);
+        let runs = status_said(&j.paths, &|_| Follows::Runs, &|| join::JoinPlace::Home);
         assert!(runs.contains("finishes by itself"), "{runs}");
     }
 
@@ -1328,6 +1462,7 @@ mod tests {
             let reach = Reach {
                 browse: &|| Ok(ats.to_vec()),
                 dial,
+                prove: &|_, _, _| panic!("a phrase join proves nothing"),
                 join_vault: &no_vault,
                 follow: &|_| Follows::Runs,
             };
@@ -1345,6 +1480,7 @@ mod tests {
             let reach = Reach {
                 browse: &|| Ok(ats.to_vec()),
                 dial,
+                prove: &|_, _, _| panic!("a phrase join proves nothing"),
                 join_vault: &no_vault,
                 follow: &|_| Follows::Runs,
             };
@@ -1379,6 +1515,7 @@ mod tests {
             let nobody = Reach {
                 browse: &|| Ok(Vec::new()),
                 dial,
+                prove: &|_, _, _| panic!("a phrase join proves nothing"),
                 join_vault: &no_vault,
                 follow: &|_| Follows::Runs,
             };
@@ -1386,6 +1523,7 @@ mod tests {
             let reach = Reach {
                 browse: &|| Ok(ats.to_vec()),
                 dial,
+                prove: &|_, _, _| panic!("a phrase join proves nothing"),
                 join_vault: &no_vault,
                 follow: &|_| Follows::Runs,
             };
@@ -1402,6 +1540,7 @@ mod tests {
         let unbrowsable = Reach {
             browse: &|| Err(aterm_secrets::Error::new("macOS refused the local network")),
             dial: &|_| panic!("no member is dialed"),
+            prove: &|_, _, _| panic!("a phrase join proves nothing"),
             join_vault: &no_vault,
             follow: &|_| Follows::Runs,
         };
@@ -1456,6 +1595,7 @@ mod tests {
                 let reach = Reach {
                     browse: &|| Ok(vec![M1.to_owned()]),
                     dial,
+                    prove: &|_, _, _| panic!("a Mac let in proves nothing again"),
                     join_vault: &no_vault,
                     follow: &follow,
                 };
@@ -1474,6 +1614,33 @@ mod tests {
         );
     }
 
+    /// What `join --no-wait` says lets this Mac in follows where it is: its first line ends with
+    /// the words for that place (`join::let_in`: automatic admission on the ALab LAN only), and
+    /// the exit code is 0 everywhere: being away is words, not a failure.
+    /// NEGATIVE CONTROL: `said_no_wait` printing `join::LET_IN` whatever `at` says gives a Mac off
+    /// the LAN the ALab LAN's words, and this test fails at the first of them, "Proves".
+    #[test]
+    fn join_no_wait_says_what_lets_this_mac_in_where_it_is() {
+        for at in [
+            join::JoinPlace::Home,
+            join::JoinPlace::Proves,
+            join::JoinPlace::Away,
+            join::JoinPlace::Unknown,
+        ] {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = said_no_wait(at, Ok(&[]), &[], Ok(Follows::Runs), &mut out, &mut err);
+            let said = String::from_utf8(out).unwrap();
+            assert_eq!(code, 0, "{at:?}: {said}");
+            let first = said.lines().next().unwrap_or_default();
+            assert!(first.ends_with(join::let_in(at)), "{at:?}: {said}");
+            assert_eq!(
+                first.ends_with(join::LET_IN),
+                at == join::JoinPlace::Home,
+                "{at:?}: {said}"
+            );
+        }
+    }
+
     /// A first fetch failure must leave a subscriber able to retry, without claiming membership.
     #[test]
     fn a_first_vault_fetch_failure_keeps_headless_bootstrap_running() {
@@ -1487,6 +1654,7 @@ mod tests {
         let reach = Reach {
             browse: &|| Ok(Vec::new()),
             dial: &|_| panic!("no member dial"),
+            prove: &|_, _, _| panic!("the vault half proves nothing"),
             join_vault: &|_| Err(aterm_secrets::Error::new("first fetch unavailable")),
             follow: &follow,
         };
@@ -1500,7 +1668,17 @@ mod tests {
         );
         assert!(!paths.home.join(".secrets").exists());
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        assert_eq!(said_no_wait(Ok(&[]), &[], waiting, &mut out, &mut err), 0);
+        assert_eq!(
+            said_no_wait(
+                join::JoinPlace::Home,
+                Ok(&[]),
+                &[],
+                waiting,
+                &mut out,
+                &mut err
+            ),
+            0
+        );
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("retries setup automatically"), "{out}");
         assert!(
@@ -1522,6 +1700,7 @@ mod tests {
         let reach = Reach {
             browse: &|| panic!("no browse"),
             dial: &|_| panic!("no dial"),
+            prove: &|_, _, _| panic!("the vault half proves nothing"),
             join_vault: &|_| panic!("sharing off: no fetch"),
             follow: &|_| panic!("sharing off: no follower"),
         };
@@ -1532,7 +1711,9 @@ mod tests {
     /// install.sh's windowless `members join --no-wait` sets the Mac up at the ALab vault (its
     /// configuration, Pending, a queued request) and starts its vault subscriber, as System
     /// State's Secrets stage does, whether or not a member answers. That subscriber asks ALab's
-    /// members again (after 1, 2, 4 and 8 minutes, then every 15), so a member asleep, away or
+    /// members again (about half a minute later, then after 1, 2, 4 and 8 minutes, then every
+    /// 15), so a
+    /// member asleep, away or
     /// restarting its window when the lane asked shows the row too; and with no member
     /// answering, the lane says so rather than nothing.
     ///
@@ -1559,6 +1740,7 @@ mod tests {
                 let reach = Reach {
                     browse: &|| Ok(members.clone()),
                     dial,
+                    prove: &|_, _, _| Proved::No,
                     join_vault: &join_vault,
                     follow: &follow,
                 };
@@ -1580,13 +1762,182 @@ mod tests {
             assert!(first.ends_with(join::LET_IN), "{name}: {said}");
             if members.is_empty() {
                 assert!(
-                    first.contains("asks them again (after 1, 2, 4 and 8 minutes, then every 15)"),
+                    first.contains(
+                        "asks them again (about half a minute later, then after 1, 2, 4 and 8 \
+                         minutes, then every 15)"
+                    ),
                     "{said}"
                 );
             }
         }
         let rows = m1.lock().unwrap().rows(aterm_time::Instant::now());
         assert_eq!(rows.len(), 1, "j's request waits on m1");
+    }
+
+    /// A phraseless `join` (install.sh's `members join --no-wait` included) proves this Mac to
+    /// the members it found before it asks any plainly, as its subscriber does: where a member
+    /// let it in by its proof, or may have signed it in, no member is asked and no row waits for
+    /// a person's Allow; only where none did is each asked. The vault half runs either way, and
+    /// a line that waits says what lets this Mac in where it is (`join::let_in`), on the ALab
+    /// LAN and off it alike.
+    ///
+    /// The proof dials no member after [`PROVE_WITHIN`] from its start, so install.sh's lane
+    /// ends within its own bound.
+    ///
+    /// NEGATIVE CONTROLS: call `join::ask_all` whatever the proof came to: m1 shows a row for
+    /// the Mac a member let in ("j"). Prove before a phrase join too: the phrase tests' `prove`
+    /// panics ("a phrase join proves nothing"). Give the proof no deadline, or a later one: the
+    /// `until` assertion fails. Print `join::LET_IN` where a member may have signed this Mac in,
+    /// whatever its place: the Mac off the LAN that holds the fleet's book ("k-proves") is told
+    /// it waits for automatic admission, and its first line fails.
+    #[test]
+    fn a_phraseless_join_proves_first_and_asks_only_where_no_member_let_it_in() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        for ((place, at), (name, outcome, first, asks)) in [
+            (join::JoinPlace::Home, "home"),
+            (join::JoinPlace::Proves, "proves"),
+        ]
+        .into_iter()
+        .flat_map(|(place, at)| {
+            [
+                ("j", Proved::In, PROVED_IN, false),
+                ("k", Proved::SignedMaybe, join::let_in(place), false),
+                ("l", Proved::No, join::let_in(place), true),
+            ]
+            .map(|case| ((place, at), case))
+        }) {
+            // A machine name (lower case, `aterm_secrets::text::valid_machine_name`): the place's
+            // word after the case's.
+            let name = format!("{name}-{at}");
+            let m1 = member(root.path(), &format!("m1-{name}"));
+            let mac = Me {
+                place,
+                ..me(root.path(), &name)
+            };
+            let proved_at: Mutex<Vec<Vec<String>>> = Mutex::new(Vec::new());
+            let outcome = Mutex::new(Some(outcome));
+            let before = std::time::Instant::now();
+            let prove = |_: &Me, ats: &[String], until: std::time::Instant| {
+                assert!(
+                    until >= before + PROVE_WITHIN
+                        && until <= std::time::Instant::now() + PROVE_WITHIN,
+                    "the proof dials no member after PROVE_WITHIN from its start"
+                );
+                proved_at.lock().unwrap().push(ats.to_vec());
+                outcome.lock().unwrap().take().expect("one proof per join")
+            };
+            let ((code, said), dials) = with_member(&m1, |dial| {
+                let reach = Reach {
+                    browse: &|| Ok(vec![M1.to_owned()]),
+                    dial,
+                    prove: &prove,
+                    join_vault: &|_| Ok(()),
+                    follow: &|_| Follows::Runs,
+                };
+                let args = JoinArgs {
+                    no_wait: true,
+                    ..JoinArgs::default()
+                };
+                joined(&mac, &args, &reach)
+            });
+            assert_eq!(code, 0, "{name}: {said}");
+            assert_eq!(
+                *proved_at.lock().unwrap(),
+                [vec![M1.to_owned()]],
+                "{name} proves itself to the member it found first: {said}"
+            );
+            assert_eq!(said.lines().next(), Some(first), "{name}: {said}");
+            let rows = m1.lock().unwrap().rows(aterm_time::Instant::now());
+            assert_eq!(rows.len(), usize::from(asks), "{name}: {said}");
+            assert_eq!(dials, usize::from(asks), "{name}: {said}");
+        }
+    }
+
+    /// A phraseless `join` on a Mac whose person turned sharing off (`[swarm] enabled = false`)
+    /// proves this Mac to no member, so no member's proof writes its vault or ~/.secrets, as the
+    /// vault half and the subscriber keep that switch too; it still asks the members plainly,
+    /// which writes nothing here.
+    ///
+    /// NEGATIVE CONTROL: prove whatever `[swarm]` says (`proves` without its `enabled_in_home`
+    /// read): `prove` panics.
+    #[test]
+    fn a_phraseless_join_with_sharing_off_proves_nothing_and_writes_nothing() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let m1 = member(root.path(), "m1");
+        let mac = me(root.path(), "j");
+        let config = mac.paths.home.join(".config/aterm");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("aterm.toml"), "[swarm]\nenabled = false\n").unwrap();
+        let ((code, said), dials) = with_member(&m1, |dial| {
+            let reach = Reach {
+                browse: &|| Ok(vec![M1.to_owned()]),
+                dial,
+                prove: &|_, _, _| panic!("sharing off: no proof"),
+                join_vault: &|_| panic!("sharing off: no fetch"),
+                follow: &|_| panic!("sharing off: no follower"),
+            };
+            let args = JoinArgs {
+                no_wait: true,
+                ..JoinArgs::default()
+            };
+            joined(&mac, &args, &reach)
+        });
+        assert_eq!(code, 0, "{said}");
+        assert_eq!(dials, 1, "the plain ask still goes: {said}");
+        let rows = m1.lock().unwrap().rows(aterm_time::Instant::now());
+        assert_eq!(rows.len(), 1, "{said}");
+        assert!(client::config(&mac.paths).unwrap().is_none(), "{said}");
+        assert!(!mac.paths.home.join(".secrets").exists(), "{said}");
+    }
+
+    /// A proof whose time ran out ([`crate::vault_join::dial_until`], as [`proved_back`] dials
+    /// by) dials no further member and reads as one no member let in ([`Proved::No`], never
+    /// [`Proved::SignedMaybe`]: nothing went to that member), so the plain ask follows; before
+    /// then each member is dialed within [`DIAL_WITHIN`] and what is left, and with no deadline
+    /// within [`DIAL_WITHIN`].
+    ///
+    /// NEGATIVE CONTROL: let `dial_until` dial past `until`: the members are dialed after the
+    /// deadline, and the first assertion fails.
+    #[test]
+    fn a_proof_whose_time_ran_out_dials_no_further_member_and_leaves_the_plain_ask() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let mac = me(root.path(), "j");
+        let ats = ["m2:7100".to_owned(), M1.to_owned()];
+        let sign_node = |_: &[u8]| [0u8; 64];
+        let dialed: Mutex<Vec<(String, Duration)>> = Mutex::new(Vec::new());
+        let reach = |at: &str, within: Duration| -> aterm_secrets::Result<Box<dyn Stream>> {
+            dialed.lock().unwrap().push((at.to_owned(), within));
+            Err(aterm_secrets::Error::new("connection refused"))
+        };
+        let proved = |until: Option<std::time::Instant>| {
+            dialed.lock().unwrap().clear();
+            let dial = crate::vault_join::dial_until(until, DIAL_WITHIN, &reach);
+            let tried = join::prove_first(&mac.paths, &dial, &mac.joining(), &sign_node, &ats);
+            (proof_outcome(tried), dialed.lock().unwrap().clone())
+        };
+
+        let (outcome, dialed_then) = proved(Some(std::time::Instant::now()));
+        assert!(dialed_then.is_empty(), "{dialed_then:?}");
+        assert!(matches!(outcome, Proved::No), "{outcome:?}");
+
+        let (outcome, dialed_then) =
+            proved(Some(std::time::Instant::now() + Duration::from_secs(60)));
+        assert!(matches!(outcome, Proved::No), "{outcome:?}");
+        assert_eq!(
+            dialed_then
+                .iter()
+                .map(|(at, _)| at.as_str())
+                .collect::<Vec<_>>(),
+            [M1, "m2:7100"],
+            "one after another, in address order"
+        );
+        assert!(dialed_then.iter().all(|(_, within)| *within <= DIAL_WITHIN));
+
+        let (_, dialed_then) = proved(None);
+        assert!(
+            dialed_then.iter().all(|(_, within)| *within == DIAL_WITHIN),
+            "{dialed_then:?}"
+        );
     }
 
     /// A member whose vault state a pass holds (an admission publishing on the admin Mac, an
@@ -1640,6 +1991,7 @@ mod tests {
                 ))
             },
             dial: &unreached,
+            prove: &|_, _, _| panic!("with no browse there is no member to prove to"),
             join_vault: &join_vault,
             follow: &follow,
         };
@@ -1868,6 +2220,7 @@ mod tests {
             let reach = Reach {
                 browse: &|| Ok(vec![M1.to_owned()]),
                 dial,
+                prove: &|_, _, _| panic!("a phrase join proves nothing"),
                 join_vault: &no_vault,
                 follow: &|_| Follows::Runs,
             };
@@ -1905,6 +2258,7 @@ mod tests {
             let reach = Reach {
                 browse: &|| Ok(ats.to_vec()),
                 dial: &flaky,
+                prove: &|_, _, _| panic!("a phrase join proves nothing"),
                 join_vault: &no_vault,
                 follow: &|_| Follows::Runs,
             };

@@ -269,7 +269,17 @@ mod procfs {
 
     pub(super) fn uses(proc_dir: &Path, pid: u32, dirs: &[PathBuf]) -> Result<Option<PathUse>, ()> {
         let bytes = (|| -> std::io::Result<Vec<u8>> {
-            let file = std::fs::File::open(proc_dir.join("maps"))?;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(proc_dir.join("maps"))?;
+            if !file.metadata()?.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a regular file",
+                ));
+            }
             let mut bytes = Vec::new();
             file.take((MAX_BYTES + 1) as u64).read_to_end(&mut bytes)?;
             Ok(bytes)

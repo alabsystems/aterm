@@ -1,26 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm db alab …` (docs/DESIGN-alab-lab-model-2026-11-01.md §8, §9; step 6): `import`,
-//! `check` and `adopt` over `alab/registry`. Every report names keys, columns, counts and
-//! source coordinates, never a value; addresses are masked unless `--show-addresses` is given.
-//! The import's review (`--review`: a private `$TMPDIR/.ubd/alab-import-*.noindex/` folder opened
-//! in amacs and removed once the owner closes it) is the only place a note's text or a losing
-//! value is shown, and only on this Mac; a cell shaped like a credential, or one that names a
-//! secret, is never shown even there.
+//! `aterm db alab …` (docs/DESIGN-alab-lab-model-2026-11-01.md §0, §8, §9): `import`, `check`,
+//! `adopt`, `roll`, `prefer` and `unprefer` over `alab/registry`. Every report names keys, columns, counts
+//! and source coordinates, never a value; addresses are masked unless `--show-addresses` is
+//! given. A sheet's note crosses into its row's `note` only past the note guard. The import's
+//! review (`--review`: a private `$TMPDIR/.ubd/alab-import-*.noindex/` folder opened in amacs and
+//! removed once the owner closes it) is the only place a withheld note's text or a losing value
+//! is shown, and only on this Mac; a cell shaped like a credential, or one that names a secret, is
+//! never shown even there.
 
 use super::{
     Registry, checks,
     import::{
         self, Coord, Finding, Input, KnownMac, MailboxKeys, Plan, Sheet, SheetKind, Step, Vendors,
     },
-    registry::{MAILBOX, REGISTRY},
+    registry::{self, ACCOUNT, MACHINE, MAILBOX, PREFERENCE, REGISTRY},
 };
 use crate::{
     Error, Result,
     att::{self, Handle},
     machines::Label,
-    typed::{Ty, check, grid, guard},
+    typed::{
+        Ty,
+        cell::{self, CellKey, CellValue, Projection},
+        grid, guard, keys,
+    },
 };
 use aterm_json::{Map, Value, json};
 use aterm_secrets::client::Paths;
@@ -33,22 +38,41 @@ use std::{
 
 /// The verbs' help.
 pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\n\
-  import [--vault-sheet <csv>] [--logins <csv>] [--dry-run|--apply [--first]] [--review]\n\
-         [--findings] [--show-addresses]\n\
-                    plan the account sheets as registry writes: a dry run unless --apply.\n\
-                    Only empty cells, or cells an import wrote, are written; the owner's edits\n\
-                    stay and show as findings. Notes and free text never cross: their\n\
-                    coordinates do. --review opens a private review in amacs that shows them\n\
-                    (never a credential-shaped cell) and waits; it is removed once closed.\n\
+  import [--vault-sheet <csv>] [--logins <csv>] [--fleet-accounts <toml>]... [--ai-pool <toml>]\n\
+         [--dry-run|--apply [--first]] [--review] [--findings] [--show-addresses]\n\
+                    plan the account sheets and the harness's fleet and pool files as registry\n\
+                    writes: a dry run unless --apply. Only empty cells, or cells an import\n\
+                    wrote, are written; the owner's edits stay and show as findings. A note\n\
+                    crosses into its row's note unless it is shaped like a credential, says or\n\
+                    reads like a secret or holds an address: then only its coordinates do. --review opens a\n\
+                    private review in amacs that shows them (never a credential-shaped cell)\n\
+                    and waits; it is removed once closed.\n\
                     --apply waits until this Mac holds the registry (a peer's repair round\n\
                     brings it); --first writes where no Mac in the lab holds it yet\n\
-  check             seats, labels, logins and mailboxes, then every conflict, dangling\n\
-                    reference and unique clash\n\
+  check             preferences, labels, logins, aliases and mailboxes, then every conflict,\n\
+                    dangling\n\
+                    reference and unique clash, what this Mac's self-registration decides\n\
+                    now and why (registration; its findings join lab), writing nothing, and\n\
+                    whether this Mac's journal is on\n\
   adopt [--dry-run|--apply]\n\
                     bind the Macs the vault's swarm roster names to their machine rows, by fleet\n\
                     node, host, then label or alias; never births a row\n\
-  The sheets default to ~/.secrets/ai-accounts.csv and ~/ai-account-logins.csv, each read when\n\
-  present. Addresses are masked unless --show-addresses is given.\n";
+  prefer <machine> <account> [--rank <n>]\n\
+                    this machine prefers this account (smaller ranks are tried first). A\n\
+                    mapping, never a limit: any other live account can still run there\n\
+  roll [--dry-run|--apply]\n\
+                    restate the registry into its next generation (every register, conflicts\n\
+                    open, every owned row as its signed record), seal the old one once every\n\
+                    Writer runs a build that reads the next (`waiting` names the others), and\n\
+                    release this Mac's storage of it once the covers carry what it holds; check\n\
+                    asks for it at a spent quota or 75 % of the store. Run again on a Mac that\n\
+                    edited the old generation before it heard the seal, it carries those edits\n\
+  unprefer <machine> <account>\n\
+                    end that preference; nobody is signed out. A machine is its label, an alias\n\
+                    or its key; an account its label, legacy label or key, never its address\n\
+  The sheets default to ~/.secrets/ai-accounts.csv and ~/ai-account-logins.csv, the harness's\n\
+  files to ~/.secrets/fleet-accounts.toml, ai-accounts-<cli>.toml and ai-pool.toml, each read\n\
+  when present. Addresses are masked unless --show-addresses is given.\n";
 
 /// Where the importing Mac keeps its mailbox keys: private, beside its vault state.
 pub const MAILBOX_KEYS: &str = "alab-mailbox-keys.json";
@@ -103,6 +127,10 @@ struct Args {
     reveal: bool,
     vault: Option<PathBuf>,
     logins: Option<PathBuf>,
+    fleets: Vec<PathBuf>,
+    pool: Option<PathBuf>,
+    rank: Option<u64>,
+    operands: Vec<String>,
 }
 
 fn parse(verb: &str, words: &[String]) -> Result<Args> {
@@ -116,22 +144,61 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
                 .ok_or_else(|| Error::new(&format!("{name} needs a value")))
         };
         match (verb, word.as_str()) {
-            ("import" | "adopt", "--apply") => args.apply = true,
+            ("import" | "adopt" | "roll", "--apply") => args.apply = true,
             ("import", "--first") => args.first = true,
-            ("import" | "adopt", "--dry-run") => args.dry_run = true,
+            ("import" | "adopt" | "roll", "--dry-run") => args.dry_run = true,
             ("import", "--review") => args.review = true,
             ("import", "--no-review") => args.review = false,
             ("import" | "adopt", "--findings") => args.findings = true,
             (_, "--show-addresses") => args.reveal = true,
-            ("import", "--vault-sheet") => args.vault = Some(value("--vault-sheet")?),
-            ("import", "--logins") => args.logins = Some(value("--logins")?),
+            ("import", "--vault-sheet") => {
+                if args.vault.is_some() {
+                    return Err(Error::new("duplicate --vault-sheet"));
+                }
+                args.vault = Some(value("--vault-sheet")?);
+            }
+            ("import", "--logins") => {
+                if args.logins.is_some() {
+                    return Err(Error::new("duplicate --logins"));
+                }
+                args.logins = Some(value("--logins")?);
+            }
+            ("import", "--fleet-accounts") => args.fleets.push(value("--fleet-accounts")?),
+            ("import", "--ai-pool") => {
+                if args.pool.is_some() {
+                    return Err(Error::new("duplicate --ai-pool"));
+                }
+                args.pool = Some(value("--ai-pool")?);
+            }
+            ("prefer", "--rank") => {
+                if args.rank.is_some() {
+                    return Err(Error::new("duplicate --rank"));
+                }
+                let raw = value("--rank")?;
+                let text = raw
+                    .to_str()
+                    .ok_or_else(|| Error::new("--rank is a whole number"))?;
+                if text.is_empty()
+                    || (text.len() > 1 && text.starts_with('0'))
+                    || !text.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Err(Error::new("--rank is a whole number"));
+                }
+                args.rank = Some(
+                    text.parse()
+                        .map_err(|_| Error::new("--rank is a whole number"))?,
+                );
+            }
+            ("prefer" | "unprefer", operand) if !operand.starts_with("--") => {
+                args.operands.push(operand.to_owned());
+            }
             _ => {
                 return Err(Error::new(&format!(
-                    "{verb}: unknown word {} (see `aterm db alab --help`)",
+                    "{verb}: unknown {} (see `aterm db alab --help`)",
                     if word.starts_with("--") {
-                        word.as_str()
+                        "option"
                     } else {
-                        "<operand>"
+                        "operand"
                     }
                 )));
             }
@@ -140,6 +207,11 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
     if args.apply && args.dry_run {
         return Err(Error::new(&format!(
             "{verb}: --apply and --dry-run are opposites"
+        )));
+    }
+    if args.apply && args.review {
+        return Err(Error::new(&format!(
+            "{verb}: --review goes with a dry run, before --apply"
         )));
     }
     if args.first && !args.apply {
@@ -163,6 +235,12 @@ pub fn run(
         .first()
         .map(String::as_str)
         .ok_or_else(|| Error::new("missing alab verb"))?;
+    if !matches!(
+        verb,
+        "import" | "check" | "adopt" | "prefer" | "unprefer" | "roll"
+    ) {
+        return Err(Error::new("unknown alab verb (see `aterm db alab --help`)"));
+    }
     let args = parse(verb, &words[1..])?;
     match verb {
         "import" => {
@@ -172,10 +250,42 @@ pub fn run(
             import(paths, &args, vendors, review, now_ms)
         }
         "check" => {
-            let (view, usage) = Handle::at(paths.clone(), &att::REGISTRY).usage()?;
-            let (lab, generic) = checks::lab(&view.cells);
-            let table = att::REGISTRY.table;
-            let mut findings: Vec<Value> = generic.iter().map(generic_json).collect();
+            let handle = Handle::at(paths.clone(), &att::REGISTRY);
+            let (view, usage) = handle.usage()?;
+            let (mut lab, generic) = checks::lab(&view.cells);
+            lab.extend(checks::facts(
+                view.owned
+                    .get(registry::MACHINE_FACTS.name)
+                    .unwrap_or(&Default::default()),
+                &Registry::at(paths.clone()).live_uuids()?,
+                &view.project(&MACHINE),
+            ));
+            lab.extend(checks::mailbox_obs(
+                view.owned
+                    .get(registry::MAILBOX_OBS.name)
+                    .unwrap_or(&Default::default()),
+                &view.project(&registry::ADDRESS),
+                &view.project(&registry::MAILBOX),
+            ));
+            let registration = match vendors.and_then(|vendors| vendors.this_mac()) {
+                None => Value::Null,
+                Some(mac) => {
+                    match Registry::at(paths.clone()).preview(&mac.config, &mac.probe, now_ms) {
+                        Err(why) => json!({"error": why.to_string()}),
+                        Ok(pass) => {
+                            lab.extend(pass.findings);
+                            let (outcome, machine) = pass.outcome.report();
+                            json!({"outcome": outcome, "machine": machine})
+                        }
+                    }
+                }
+            };
+            // This Mac's journal: off, on, or local with the reason its last flush was kept.
+            let journal = super::journal::Spool::local().map(|spool| {
+                super::journal::status(&spool, aterm_types::dirs::aterm_config_path().as_deref())
+            });
+            let table = handle.compiled().table;
+            let mut findings: Vec<Value> = generic.iter().map(att::command::finding_json).collect();
             findings.extend(
                 att::capacity(table, &view, &usage)
                     .iter()
@@ -184,48 +294,20 @@ pub fn run(
             Ok(json!({
                 "complete": view.complete,
                 "refused": view.refused.iter().map(|id| aterm_codec::hex::encode_lower(id)).collect::<Vec<_>>(),
-                "lab": lab.iter().map(|f| json!({"finding": f.kind, "collection": f.collection, "pks": f.pks})).collect::<Vec<_>>(),
+                "lab": lab.iter().map(|f| json!({
+                    "finding": f.kind,
+                    "collection": f.collection,
+                    "pks": f.pks.iter().map(|pk| att::command::safe_key(pk)).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
                 "findings": findings,
+                "registration": registration,
+                "journal": journal,
             }))
         }
         "adopt" => adopt(paths, &args, now_ms),
-        other => Err(Error::new(&format!(
-            "unknown alab verb {other} (see `aterm db alab --help`)"
-        ))),
-    }
-}
-
-fn generic_json(finding: &check::Finding) -> Value {
-    match finding {
-        check::Finding::Conflict {
-            collection,
-            pk,
-            column,
-        } => {
-            json!({"finding": "conflict", "collection": collection, "pk": pk, "column": column})
-        }
-        check::Finding::Dangling {
-            collection,
-            pk,
-            column,
-            target,
-        } => {
-            json!({"finding": "dangling", "collection": collection, "pk": pk, "column": column, "target": target})
-        }
-        check::Finding::Unique {
-            collection,
-            columns,
-            pks,
-        } => {
-            json!({"finding": "unique", "collection": collection, "columns": columns, "pks": pks})
-        }
-        check::Finding::Raw {
-            collection,
-            pk,
-            column,
-        } => {
-            json!({"finding": "raw", "collection": collection, "pk": pk, "column": column})
-        }
+        "roll" => roll(paths, &args, now_ms),
+        "prefer" | "unprefer" => prefer(paths, &args, verb == "prefer", now_ms),
+        _ => Err(Error::new("unknown alab verb (see `aterm db alab --help`)")),
     }
 }
 
@@ -244,14 +326,14 @@ fn sheet(kind: SheetKind, explicit: Option<&Path>, default: PathBuf) -> Result<O
     Sheet::parse(kind, name, &bytes).map(Some)
 }
 
-/// The Macs the vault's swarm roster names: label, aliases and fleet node.
-fn known_macs(paths: &Paths) -> Vec<KnownMac> {
-    let Ok(Some(roster)) = aterm_secrets::client::swarm_roster(paths) else {
-        return Vec::new();
-    };
+/// The non-denied Macs `roster` names: label, aliases and fleet node.
+pub(super) fn known_macs_from_roster(
+    roster: &aterm_secrets::swarm_roster::SwarmRoster,
+) -> Vec<KnownMac> {
     roster
         .members
         .iter()
+        .filter(|member| !roster.is_member_denied(member))
         .map(|member| KnownMac {
             label: Label::parse(&member.label).ok(),
             aliases: member
@@ -268,18 +350,87 @@ fn known_macs(paths: &Paths) -> Vec<KnownMac> {
         .collect()
 }
 
-fn keys_path(paths: &Paths) -> PathBuf {
-    paths.dir.join(MAILBOX_KEYS)
+/// The Macs the vault's swarm roster names: label, aliases and fleet node.
+fn known_macs(paths: &Paths) -> Vec<KnownMac> {
+    let Ok(Some(roster)) = aterm_secrets::client::swarm_roster(paths) else {
+        return Vec::new();
+    };
+    known_macs_from_roster(&roster)
 }
 
-fn read_keys(paths: &Paths) -> Result<MailboxKeys> {
-    match std::fs::read(keys_path(paths)) {
+/// The harness files this import reads: those named, else the ones beside the vault sheet that
+/// exist. A file named and unreadable refuses the run; one found and unreadable is reported in
+/// `unread`, and since its kind then counts as unread this run it retracts nothing and no
+/// preference ends.
+fn harness_sheets(
+    paths: &Paths,
+    args: &Args,
+    vendors: &dyn Vendors,
+) -> Result<(Vec<Sheet>, Unread)> {
+    let secrets = paths.home.join(".secrets");
+    let named = !args.fleets.is_empty() || args.pool.is_some();
+    let files: Vec<(SheetKind, PathBuf)> = if named {
+        args.fleets
+            .iter()
+            .map(|path| (SheetKind::FleetAccounts, path.clone()))
+            .chain(
+                args.pool
+                    .iter()
+                    .map(|path| (SheetKind::AiPool, path.clone())),
+            )
+            .collect()
+    } else {
+        [
+            "fleet-accounts.toml",
+            "ai-accounts-codex.toml",
+            "ai-accounts-grok.toml",
+            "ai-accounts-kimi.toml",
+        ]
+        .into_iter()
+        .map(|name| (SheetKind::FleetAccounts, secrets.join(name)))
+        .chain([(SheetKind::AiPool, secrets.join("ai-pool.toml"))])
+        .filter(|(_, path)| path.is_file())
+        .collect()
+    };
+    let mut sheets = Vec::new();
+    let mut unread = Vec::new();
+    for (kind, path) in files {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| Error::new("a source's file name is not UTF-8"))?
+            .to_owned();
+        // Never the parser's own words, which may quote a row.
+        let read = crate::import::read_bounded(&path).ok().and_then(|bytes| {
+            let text = std::str::from_utf8(&bytes).ok()?;
+            let rows = vendors.stated(kind, &name, text).ok()?;
+            Sheet::stated(kind, &name, &bytes, &rows).ok()
+        });
+        match read {
+            Some(sheet) => sheets.push(sheet),
+            None if named => {
+                return Err(Error::new(&format!(
+                    "{name} is not a {} file this build reads",
+                    kind.word()
+                )));
+            }
+            None => unread.push((kind, name)),
+        }
+    }
+    Ok((sheets, unread))
+}
+
+/// The harness files found and not read, each with its kind.
+type Unread = Vec<(SheetKind, String)>;
+
+pub(super) fn read_keys(paths: &Paths) -> Result<MailboxKeys> {
+    match aterm_uds::private_file::read_private(&paths.dir, MAILBOX_KEYS, 1024 * 1024) {
         Ok(bytes) => {
             let value = aterm_json::from_slice(&bytes)
                 .map_err(|_| Error::new("the mailbox key file is not JSON"))?;
             MailboxKeys::from_json(&value)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(MailboxKeys::default()),
+        Err(aterm_uds::private_file::PrivateFileError::Missing) => Ok(MailboxKeys::default()),
         Err(_) => Err(Error::new("the mailbox key file cannot be read")),
     }
 }
@@ -300,7 +451,7 @@ fn import(
     review: Review<'_>,
     now_ms: u64,
 ) -> Result<Value> {
-    let sheets: Vec<Sheet> = [
+    let mut sheets: Vec<Sheet> = [
         sheet(
             SheetKind::Vault,
             args.vault.as_deref(),
@@ -315,6 +466,8 @@ fn import(
     .into_iter()
     .flatten()
     .collect();
+    let (harness, unread) = harness_sheets(paths, args, vendors)?;
+    sheets.extend(harness);
     if sheets.is_empty() {
         return Err(Error::new(
             "no sheet to import: give --vault-sheet or --logins, or put the sheets in their places",
@@ -322,6 +475,8 @@ fn import(
     }
     let macs = known_macs(paths);
     let keys = read_keys(paths)?;
+    let unread_kinds: Vec<SheetKind> = unread.iter().map(|(kind, _)| *kind).collect();
+    let unread: Vec<String> = unread.into_iter().map(|(_, name)| name).collect();
     let input = Input {
         sheets: &sheets,
         macs: &macs,
@@ -329,6 +484,7 @@ fn import(
         keys: keys.clone(),
         now_ms,
         births: true,
+        unread: &unread_kinds,
     };
     let handle = Handle::at(paths.clone(), &att::REGISTRY);
     if args.apply {
@@ -358,7 +514,12 @@ fn import(
             // mailboxes: those keys stay on the Mac that imported first (until step 11 keeps
             // them in the vault).
             let known = keys.pks();
-            if plan.keys.len() > keys.len()
+            let births_mailbox = plan.keys.len() > keys.len()
+                || plan
+                    .counts
+                    .get(MAILBOX.name)
+                    .is_some_and(|c| c.new_rows > 0);
+            if births_mailbox
                 && view
                     .project(&MAILBOX)
                     .rows
@@ -379,6 +540,7 @@ fn import(
         })?;
         let mut report = summary(&plan, &sheets, &macs, "held", args.findings);
         insert(&mut report, "dry_run", json!(false));
+        insert(&mut report, "unread", json!(unread));
         insert(&mut report, "records", json!(applied.records));
         insert(&mut report, "written", json!(applied.cells));
         insert(
@@ -400,6 +562,7 @@ fn import(
     let plan = import::plan(&input, &cells)?;
     let mut report = summary(&plan, &sheets, &macs, registry, args.findings);
     insert(&mut report, "dry_run", json!(true));
+    insert(&mut report, "unread", json!(unread));
     let records = crate::att::pack(plan.rows.clone())?.len();
     insert(&mut report, "records", json!(records));
     let seeds = crate::att::pack(super::seeds::rows_for(&cells)?)?.len();
@@ -414,6 +577,38 @@ fn import(
     }
     insert(&mut report, "review", json!(args.review));
     Ok(report)
+}
+
+/// `roll [--dry-run|--apply]` (design §3.8): restate the registry into its next generation, seal
+/// the old one once no current Writer is `waiting` (has shown no build that reads the next), and
+/// release this Mac's storage of it where the covers carry it. A dry run says what it would
+/// write and writes nothing.
+fn roll(paths: &Paths, args: &Args, now_ms: u64) -> Result<Value> {
+    let rolled = Registry::at(paths.clone()).roll(args.apply, now_ms)?;
+    let hex = |id: &[u8; 32]| aterm_codec::hex::encode_lower(id);
+    let name = |generation: u32| {
+        att::REGISTRY
+            .chain()
+            .into_iter()
+            .find(|compiled| compiled.generation == generation)
+            .map(att::Compiled::name)
+    };
+    Ok(json!({
+        "applied": args.apply,
+        "from": name(rolled.from),
+        "to": name(rolled.to),
+        "registers": rolled.registers,
+        "archived": rolled.archived,
+        "cover": rolled.cover,
+        "records": rolled.records,
+        "sealed": rolled.sealed,
+        "waiting": rolled.waiting.iter().map(keys::uuid32).collect::<Vec<_>>(),
+        "unread": rolled.unread,
+        "released": rolled.released.released.iter().map(hex).collect::<Vec<_>>(),
+        "kept": rolled.released.kept.iter().map(|(id, why)| json!({
+            "table": hex(id), "why": why.word(),
+        })).collect::<Vec<_>>(),
+    }))
 }
 
 fn adopt(paths: &Paths, args: &Args, now_ms: u64) -> Result<Value> {
@@ -431,6 +626,7 @@ fn adopt(paths: &Paths, args: &Args, now_ms: u64) -> Result<Value> {
         keys: MailboxKeys::default(),
         now_ms,
         births: false,
+        unread: &[],
     };
     let handle = Handle::at(paths.clone(), &att::REGISTRY);
     if args.apply {
@@ -454,6 +650,139 @@ fn adopt(paths: &Paths, args: &Args, now_ms: u64) -> Result<Value> {
         "records",
         json!(crate::att::pack(plan.rows.clone())?.len()),
     );
+    Ok(report)
+}
+
+/// The one row of `rows` whose text `matches`, by key first. `require_live` (`prefer`) refuses a
+/// retired or conflicted row even when named by key, while `!require_live` (`unprefer`) tries live
+/// rows first and falls back to retired rows so a lingering preference on a retired machine or
+/// account can be ended by label or key.
+fn named_row(
+    what: &str,
+    rows: &Projection,
+    name: &str,
+    require_live: bool,
+    matches: impl Fn(&str, &cell::Row) -> bool,
+) -> Result<String> {
+    if let Some(row) = rows.rows.get(name) {
+        if require_live && !row.live() {
+            return Err(Error::new(&format!("no live {what} goes by that name")));
+        }
+        return Ok(name.to_owned());
+    }
+    let mut found: Vec<&String> = rows
+        .rows
+        .iter()
+        .filter(|(pk, row)| (!require_live || row.live()) && matches(pk, row))
+        .map(|(pk, _)| pk)
+        .collect();
+    if found.is_empty() && !require_live {
+        found = rows
+            .rows
+            .iter()
+            .filter(|(pk, row)| !row.live() && matches(pk, row))
+            .map(|(pk, _)| pk)
+            .collect();
+    }
+    let adjective = if require_live { "live " } else { "" };
+    match found.as_slice() {
+        [pk] => Ok((*pk).clone()),
+        [] => Err(Error::new(&format!(
+            "no {adjective}{what} goes by that name"
+        ))),
+        _ => Err(Error::new(&format!(
+            "more than one {adjective}{what} goes by that name: name it by its key"
+        ))),
+    }
+}
+
+/// `prefer` and `unprefer`, the owner's word on one mapping: only the cells that change are
+/// written, so a repeat writes no record. Ending a preference touches no login: nothing here
+/// reaches a Mac's account directories.
+fn prefer(paths: &Paths, args: &Args, on: bool, now_ms: u64) -> Result<Value> {
+    let [machine, account] = args.operands.as_slice() else {
+        return Err(Error::new("name a machine and an account"));
+    };
+    if account.contains('@') || machine.contains('@') {
+        return Err(Error::new(
+            "an account is named by its label, legacy label or key, never its address",
+        ));
+    }
+    let handle = Handle::at(paths.clone(), &att::REGISTRY);
+    let (report, applied) = handle.commit_derived(false, |view| {
+        let wanted = Label::parse(machine).ok().map(|label| label.canonical());
+        let machine = named_row("machine", &view.project(&MACHINE), machine, on, |_, row| {
+            wanted.as_deref().is_some_and(|label| {
+                row.get("label").and_then(Value::as_str) == Some(label)
+                    || row
+                        .fields
+                        .get("aliases")
+                        .is_some_and(|field| field.members().contains(label))
+            })
+        })?;
+        let account = named_row(
+            "account",
+            &view.project(&ACCOUNT),
+            account,
+            on,
+            |pk, row| {
+                registry::account_label(pk, row).as_deref() == Some(account)
+                    || row.get("legacy_label").and_then(Value::as_str) == Some(account)
+            },
+        )?;
+        let pk = keys::preference_pk(&machine, &account)?;
+        let projected = view.project(&PREFERENCE);
+        let current = projected.rows.get(&pk);
+        let live = current.is_some_and(cell::Row::live);
+        let mut wanted: Vec<(&str, Value)> = Vec::new();
+        if on {
+            wanted.extend([("machine", json!(machine)), ("account", json!(account))]);
+            if !live {
+                wanted.extend([
+                    ("since", json!(now_ms)),
+                    (crate::typed::LIFECYCLE, json!("live")),
+                ]);
+            }
+            if let Some(rank) = args.rank {
+                wanted.push(("rank", json!(rank)));
+            }
+            // The owner's word makes the row theirs: a source dropping it no longer ends it.
+            wanted.push(("why", json!("owner")));
+        } else if current.is_none() {
+            return Err(Error::new("this machine does not prefer that account"));
+        } else if live {
+            wanted.push((crate::typed::LIFECYCLE, json!("ended")));
+        }
+        let mut changes = Vec::new();
+        for (column, x) in wanted {
+            if current.and_then(|row| row.get(column)) == Some(&x) {
+                continue;
+            }
+            changes.push(cell::change(
+                &PREFERENCE,
+                CellKey {
+                    pk: &pk,
+                    col: column,
+                    elem: None,
+                },
+                &CellValue::owner(PREFERENCE.version, x),
+            )?);
+        }
+        let report = json!({
+            "preference": pk,
+            "machine": machine,
+            "account": account,
+            "row": if on { "live" } else { "ended" },
+        });
+        let rows = if changes.is_empty() {
+            Vec::new()
+        } else {
+            vec![changes]
+        };
+        Ok((report, rows))
+    })?;
+    let mut report = report;
+    insert(&mut report, "written", json!(applied.cells));
     Ok(report)
 }
 
@@ -500,7 +829,7 @@ fn summary(plan: &Plan, sheets: &[Sheet], macs: &[KnownMac], registry: &str, lis
             .findings
             .iter()
             .map(|f: &Finding| {
-                json!({"finding": f.kind.word(), "collection": f.collection, "pk": f.pk,
+                json!({"finding": f.kind.word(), "collection": f.collection, "pk": f.pk.as_deref().map(crate::att::command::safe_key),
                     "column": f.column, "at": f.at.iter().map(|a| at_json(a, sheets)).collect::<Vec<_>>()})
             })
             .collect();
@@ -582,7 +911,11 @@ fn write_review(plan: &Plan, sheets: &[Sheet], reveal: bool) -> Result<aterm_tem
         let base = [
             finding.kind.word().to_owned(),
             finding.collection.unwrap_or_default().to_owned(),
-            finding.pk.clone().unwrap_or_default(),
+            finding
+                .pk
+                .as_deref()
+                .map_or("", crate::att::command::safe_key)
+                .to_owned(),
             finding.column.clone().unwrap_or_default(),
         ];
         if finding.at.is_empty() {
@@ -632,7 +965,7 @@ fn write_review(plan: &Plan, sheets: &[Sheet], reveal: bool) -> Result<aterm_tem
         };
         planned.push(vec![
             item.collection.to_owned(),
-            item.pk.clone(),
+            crate::att::command::safe_key(&item.pk).to_owned(),
             item.column.clone(),
             shown,
             step.to_owned(),

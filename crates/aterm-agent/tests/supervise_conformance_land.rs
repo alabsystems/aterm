@@ -11,8 +11,8 @@ use aterm_agent::harness::repo_work::{RepoRead, RepoWork};
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::land_check::listed_suffix;
 use aterm_agent::supervise::policy::turn_end::{
-    Composer, LAND, LAND_ANSWER, LAND_CHECK_HEAD, LAND_CONTRADICTED_HEAD, LAND_NUDGE, Outage,
-    RULE_API_CUTOFF, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_CHECK, RULE_LAND_NUDGE, Reach,
+    Composer, GaveUp, LAND, LAND_ANSWER, LAND_CHECK_HEAD, LAND_CONTRADICTED_HEAD, LAND_NUDGE,
+    Outage, RULE_API_CUTOFF, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_CHECK, RULE_LAND_NUDGE, Reach,
     TurnEndAction, TurnEndReading, TurnEndState, UNREACHABLE_HOLD, WaitKind, clean_defense,
     decide_turn_end, land_contradicted, open_work_strict, repo_work_suffix, says_done,
 };
@@ -55,6 +55,9 @@ const ANSWERED: &str = "Yes: the old syntax still parses.";
 const CHECKED: &str = aterm_agent::supervise::policy::land_check::LANDED;
 const LIST: &str = "The parser's branch is not merged yet.";
 const NEED_ONLY: &str = "NEEDS YOU: the release credential, to sign the build";
+/// A managed worker's own failed conclusion.
+const COULD_NOT_FINISH: &str =
+    "Could not finish: the grammar the parser needs was deleted upstream.";
 
 fn finding() -> RepoWork {
     RepoWork {
@@ -450,6 +453,8 @@ fn face(st: &State) -> TaskFace {
         TaskFace::Open
     } else if st["landed"] == 1 {
         TaskFace::Landed
+    } else if st["failed"] == 1 {
+        TaskFace::Failed
     } else {
         TaskFace::Open
     }
@@ -480,6 +485,7 @@ fn told(st: &State) -> TaskFace {
     match st["told"] {
         0 => TaskFace::Open,
         1 => TaskFace::Landed,
+        2 => TaskFace::Failed,
         _ => TaskFace::Theirs,
     }
 }
@@ -508,8 +514,16 @@ fn faces(real: &Real, st: &State) -> Result<(), String> {
 }
 
 fn projects(real: &TurnEndState, st: &State) {
-    let done = st["landed"] == 1;
+    let done = st["landed"] == 1 || st["failed"] == 1;
+    assert_eq!(
+        real.gave_up().is_some(),
+        st["failed"] == 1,
+        "the failed conclusion at {st:?}"
+    );
     assert_eq!(real.landed(), st["landed"] == 1, "the landing at {st:?}");
+    // What a relaunch's owed carry-on reads (`IdlePoint::done_under_land`): it types nothing at
+    // either end, so a task the model has concluded is never typed into by the host.
+    assert_eq!(real.concluded(), done, "what a carry-on reads at {st:?}");
     // Every walk begins after a point, so no person's exchange here opens the session: Land
     // carries each one on (owner ruling 2026-10-27).
     assert!(
@@ -612,6 +626,13 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
         ),
         "YieldList" => real.yields(LIST, plain, SHORT),
         "YieldNeedOnly" => real.yields(NEED_ONLY, plain, SHORT),
+        // The word counts for a managed worker alone, and a manager changes the back-off's pacing,
+        // which the model's other walks do not carry.
+        "YieldCouldNotFinish" => {
+            real.st.set_managed(true);
+            real.yields(COULD_NOT_FINISH, plain, LONG);
+            real.st.set_managed(false);
+        }
         "OtherTurnRuns" => {
             real.st.took();
             real.at.busy = true;
@@ -748,7 +769,12 @@ fn walk_all(
             {
                 assert_eq!(*text, nudge(&st), "the nudge at {st:?}");
             }
-            if st["landed"] == 0 && st["other"] == 0 && st["rest"] == 0 && st["same"] <= 1 {
+            if st["landed"] == 0
+                && st["failed"] == 0
+                && st["other"] == 0
+                && st["rest"] == 0
+                && st["same"] <= 1
+            {
                 assert_ne!(got, Verdict::Nothing, "a silent point at {st:?}");
             }
             *verdicts.entry(format!("{got:?}")).or_default() += 1;
@@ -1223,4 +1249,195 @@ fn tier1_each_check_mutant_breaks_its_law_and_the_real_decider_takes_no_such_ste
             "{yields}: the need stands until the agent retracts it"
         );
     }
+}
+
+/// A MANAGED WORKER'S `Could not finish:` ENDS THE WORK AND NOTHING IS TYPED INTO IT UNTIL A TURN
+/// RUNS. NEGATIVE CONTROLS: the `Buggy = 11` model, which nudges into it, breaks
+/// `NeverTypeIntoAFailedTask` (and nothing else), and a session no manager waits on gets no such
+/// word, so the same reply there is carried on from like any other. Run against a decider whose
+/// `conclude` keeps the books or that reads the word for everyone, this test and the full walk fail.
+#[test]
+fn tier1_a_worker_that_could_not_finish_rests_failed_until_a_turn_runs() {
+    let m = supervisor_land_model();
+    let base = Instant::now() + Duration::from_secs(3600);
+    let typed_in = aterm_spec::interp::with_buggy(&m, 11);
+    assert!(m.mutant_dials().contains(&11), "{:?}", m.mutant_dials());
+    assert_eq!(
+        aterm_spec::interp::violated_invariants(&typed_in),
+        BTreeSet::from(["NeverTypeIntoAFailedTask"]),
+    );
+    let verdicts = walk_all(&m, Teller::Loop, HoldTeller::Loop)
+        .unwrap_or_else(|e| panic!("the face or the hold told: {e}"));
+    assert!(verdicts.contains_key("Nothing"), "{verdicts:?}");
+
+    // Each act's answer may be the word, the land check's among them.
+    for path in [
+        &["Instruction", "YieldCouldNotFinish"][..],
+        &["Instruction", "YieldWork", "Nudge", "YieldCouldNotFinish"][..],
+        &[
+            "Instruction",
+            "YieldDefense",
+            "Check",
+            "YieldCouldNotFinish",
+        ][..],
+    ] {
+        let (st, mut real) = walk(&m, path, base);
+        assert_eq!(st["failed"], 1, "{path:?}");
+        assert_eq!(real.st.gave_up(), Some(GaveUp::CouldNotFinish), "{path:?}");
+        assert!(real.st.task_done() && !real.st.landed(), "{path:?}");
+        assert_eq!(real.st.land_held(), None, "nothing holds it: {path:?}");
+        assert_eq!(
+            real.st.face(),
+            TaskFace::Failed,
+            "its own face, no landing: {path:?}"
+        );
+        assert_eq!(verdict(&real.decide()), Verdict::Nothing, "{path:?}");
+        for act in ["Instruction", "Check", "Nudge", "Answer", "WallAct"] {
+            assert!(!m.action_enabled(act, &st), "{act} at {st:?}");
+        }
+        let mut wrote = st.clone();
+        assert!(typed_in.fire("Nudge", &mut wrote), "{path:?}");
+        assert!(!typed_in.check_invariant("NeverTypeIntoAFailedTask", &wrote));
+    }
+
+    // A turn of someone else's lifts it: the point is a report again.
+    let (st, mut real) = walk(
+        &m,
+        &["Instruction", "YieldCouldNotFinish", "HumanWork"],
+        base,
+    );
+    assert_eq!((st["failed"], real.st.gave_up()), (0, None));
+    assert_eq!(verdict(&real.decide()), Verdict::Nudge);
+
+    // No manager waits: the same reply concludes nothing and Land carries on.
+    let (_, mut unmanaged) = walk(&m, &["Instruction"], base);
+    unmanaged.yields(COULD_NOT_FINISH, Seen::default(), LONG);
+    assert_eq!(unmanaged.st.gave_up(), None);
+    assert!(!unmanaged.st.task_done());
+    assert_eq!(verdict(&unmanaged.decide()), Verdict::Nudge);
+}
+
+/// THE GATES ON THE WORD. A loop's first point is judged before the record is read: the word waits
+/// for [`TurnEndState::set_managed`]. Cruise never rests; a reply the person stopped or a wall cut
+/// gave no such answer; a point with no turn since is the same reply, not a new word. Each case's
+/// negative control is the row before it: the word with the gate open concludes.
+#[test]
+fn tier1_only_a_managed_land_worker_s_whole_reply_concludes() {
+    let now = Instant::now() + Duration::from_secs(3600);
+    let reading = |worked| point(COULD_NOT_FINISH, Seen::default(), worked, Reach::Unknown);
+    // The first point, managed only after it.
+    let mut st = TurnEndState::default();
+    st.observe(&reading(Some(LONG)), now);
+    assert_eq!(st.gave_up(), None);
+    st.set_managed(true);
+    assert_eq!(st.gave_up(), Some(GaveUp::CouldNotFinish));
+    // Unmanaged for good: nothing, at this point or the next.
+    let mut st = TurnEndState::default();
+    st.observe(&reading(Some(LONG)), now);
+    st.observe(&reading(None), now + SHORT);
+    st.set_managed(true);
+    assert_eq!(st.gave_up(), None, "the word was this point's alone");
+    // Under Cruise, or a reply the person stopped, or one a wall cut.
+    for (what, shaped) in [
+        (
+            "cruise",
+            TurnEndReading {
+                autopilot: Autopilot::Cruise,
+                ..reading(Some(LONG))
+            },
+        ),
+        (
+            "interrupted",
+            TurnEndReading {
+                interrupted: true,
+                ..reading(Some(LONG))
+            },
+        ),
+        (
+            "cut",
+            TurnEndReading {
+                said_cut: true,
+                ..reading(Some(LONG))
+            },
+        ),
+    ] {
+        let mut st = TurnEndState::default();
+        st.set_managed(true);
+        st.observe(&shaped, now);
+        assert_eq!(st.gave_up(), None, "{what}");
+    }
+    let mut st = TurnEndState::default();
+    st.set_managed(true);
+    st.observe(&reading(Some(LONG)), now);
+    assert_eq!(st.gave_up(), Some(GaveUp::CouldNotFinish), "the gate open");
+    // Cruise lifts one a loop before it left standing.
+    st.observe(
+        &TurnEndReading {
+            autopilot: Autopilot::Cruise,
+            ..reading(None)
+        },
+        now + SHORT,
+    );
+    assert_eq!(st.gave_up(), None, "Cruise never rests");
+}
+
+/// A RESTART TAKES THE RECORD'S CONCLUSION AT A POINT NO TURN RAN TO, AND ONLY THERE. NEGATIVE
+/// CONTROL: a turn that ran at the first point opens the work again, so the seed is refused.
+#[test]
+fn tier1_a_failed_record_seeds_only_a_point_no_turn_ran_to() {
+    let now = Instant::now() + Duration::from_secs(3600);
+    let mut st = TurnEndState::default();
+    st.observe(
+        &point(COULD_NOT_FINISH, Seen::default(), None, Reach::Unknown),
+        now,
+    );
+    assert!(st.seed_gave_up(GaveUp::Repeated));
+    assert_eq!(st.gave_up(), Some(GaveUp::Repeated));
+    assert!(st.task_done() && !st.landed());
+    let mut st = TurnEndState::default();
+    st.observe(
+        &point(PROGRESS, Seen::default(), Some(LONG), Reach::Unknown),
+        now,
+    );
+    assert!(!st.seed_gave_up(GaveUp::CouldNotFinish));
+    assert_eq!(st.gave_up(), None);
+}
+
+/// THE SAME REPLY ENDS A MANAGED WORKER'S WORK ONCE LAND'S STOP TOOK THE POINT: the model's
+/// `same == 2`, where the decider types nothing. NEGATIVE CONTROLS: one reply kept stops nothing,
+/// and an unmanaged session rests without concluding.
+#[test]
+fn tier1_a_managed_worker_that_repeats_itself_concludes_at_lands_stop() {
+    let m = supervisor_land_model();
+    let base = Instant::now() + Duration::from_secs(3600);
+    let held = [
+        "Instruction",
+        "YieldAsk",
+        "BackoffDue",
+        "Answer",
+        "YieldAskSame",
+    ];
+    let (st, mut real) = walk(&m, &held, base);
+    assert_eq!(st["same"], 2);
+    assert_eq!(verdict(&real.decide()), Verdict::Nothing);
+    let r = point(real.said, real.at, None, real.reach());
+
+    let mut unmanaged = real.clone();
+    unmanaged.st.conclude_repeated(&r, unmanaged.now);
+    assert_eq!(unmanaged.st.gave_up(), None, "no manager waits on it");
+
+    let mut managed = real.clone();
+    managed.st.set_managed(true);
+    managed.st.conclude_repeated(&r, managed.now);
+    assert_eq!(managed.st.gave_up(), Some(GaveUp::Repeated));
+    assert!(managed.st.task_done() && !managed.st.landed());
+    assert_eq!(verdict(&managed.decide()), Verdict::Nothing);
+
+    let (st, once) = walk(&m, &held[..2], base);
+    assert_eq!(st["same"], 1);
+    let mut once = once;
+    once.st.set_managed(true);
+    let r = point(once.said, once.at, None, once.reach());
+    once.st.conclude_repeated(&r, once.now);
+    assert_eq!(once.st.gave_up(), None, "one reply kept stops nothing");
 }

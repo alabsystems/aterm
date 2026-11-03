@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use aterm_uds::deadline::{self, RunError};
 use aterm_uds::spawnfd;
 
-use crate::error::{Error, Result, SideEffect, Sub};
+use crate::error::{Error, Result, SideEffect};
 
 /// A child's bound when nothing names another.
 const DEFAULT_BUDGET: Duration = Duration::from_secs(60);
@@ -119,11 +119,6 @@ pub struct ScriptedChild {
     pub out: ChildOut,
 }
 
-/// could_not_run, `Sub::Local`, naming `program`.
-fn local(why: String) -> Error {
-    Error::could_not_run(why).with_sub(Sub::Local)
-}
-
 /// The refusal every door that runs or logs a spec shares (`run`, and the simulated arms of
 /// `Fx::child` and `Fx::git`), before anything runs or is logged: a relative program is
 /// could_not_run, `Sub::Local`, why `{program} is not an absolute path`.
@@ -135,7 +130,7 @@ pub(crate) fn check(spec: &ChildSpec) -> Result<()> {
     if spec.program.is_absolute() {
         Ok(())
     } else {
-        Err(local(format!(
+        Err(Error::local(format!(
             "{} is not an absolute path",
             spec.program.display()
         )))
@@ -168,7 +163,7 @@ pub(crate) fn run(spec: &ChildSpec) -> Result<ChildOut> {
     check(spec)?;
     let program = spec.program.display();
     let Some(until) = Instant::now().checked_add(spec.budget) else {
-        return Err(local(format!(
+        return Err(Error::local(format!(
             "{program}'s budget {:?} is past what the clock holds",
             spec.budget
         )));
@@ -186,10 +181,12 @@ pub(crate) fn run(spec: &ChildSpec) -> Result<ChildOut> {
             stdout: output.stdout,
             stderr: output.stderr,
         }),
-        Err(RunError::Spawn(e)) => Err(local(format!("{program} could not start: {e}"))),
-        Err(RunError::Wait(e)) => Err(local(format!("{program} could not be waited for: {e}"))
-            .with_side_effect(SideEffect::Unknown)),
-        Err(RunError::TimedOut) => Err(local(format!(
+        Err(RunError::Spawn(e)) => Err(Error::local(format!("{program} could not start: {e}"))),
+        Err(RunError::Wait(e)) => Err(Error::local(format!(
+            "{program} could not be waited for: {e}"
+        ))
+        .with_side_effect(SideEffect::Unknown)),
+        Err(RunError::TimedOut) => Err(Error::local(format!(
             "{program} did not finish in {:?}",
             spec.budget
         ))

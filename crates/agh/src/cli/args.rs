@@ -319,32 +319,115 @@ pub fn verb_name(path: &[&str]) -> String {
     }
 }
 
-/// Rule 6 (what a tape cannot hold), for `verb` under `global`.
+/// Rule 6 (what a tape cannot hold), for `verb` under `global`. M2's rules (plan §14, body 1):
+/// a tape holds every verb that speaks to GitHub, under `--as` or not, writes and
+/// `release download` included (a write's tape is credentialed, and a streamed body is a
+/// sidecar beside it). It refuses a verb that answers from this machine or runs git:
+/// `ref delete` is Destructive, not Git, and is taped, because its push crosses the git door.
 /// # Errors
-/// Usage, next `agh help {verb}`: under `--record` or `--replay`, `M1's tapes are anonymous:
-/// drop --as` for `--as` or `--profile`; `{verb} cannot be taped: a tape holds only anonymous
-/// GitHub reads` for a `Local` or `Provision` verb; `release download cannot be taped in M1: it
-/// streams a body`.
+/// Usage, next `agh help {verb}`, under `--record` or `--replay`: `{path} cannot be taped: it
+/// answers from this machine, not from GitHub` for a `Local` or `Provision` verb; `{path}
+/// cannot be taped: it runs or answers git on this machine` for a `Git` verb (`repo clone`,
+/// `auth git-credential`).
 pub(crate) fn tape_rule(verb: &Verb, global: &Global) -> Result<()> {
     if global.record.is_none() && global.replay.is_none() {
         return Ok(());
     }
     let usage = |why: String| Error::usage(why).with_next(help_next(verb.path));
-    if global.as_profile.is_some() {
-        return Err(usage("M1's tapes are anonymous: drop --as".to_string()));
+    let path = verb.path.join(" ");
+    match verb.class {
+        Class::Local | Class::Provision => Err(usage(format!(
+            "{path} cannot be taped: it answers from this machine, not from GitHub"
+        ))),
+        Class::Git => Err(usage(format!(
+            "{path} cannot be taped: it runs or answers git on this machine"
+        ))),
+        _ => Ok(()),
     }
-    if matches!(verb.class, Class::Local | Class::Provision) {
-        return Err(usage(format!(
-            "{} cannot be taped: a tape holds only anonymous GitHub reads",
-            verb.path.join(" ")
-        )));
+}
+
+/// No `@target` under a tape (plan §14, body 2): the positional `verb`'s usage names `REPO`,
+/// the repository a `CONTENT` positional names first when no `-R` is given, and the values of
+/// `-R` and `--for` (in `flags`), each starting `@`, are refused. A replay has no agh.toml to
+/// resolve one with.
+/// # Errors
+/// Usage, next `agh help {verb}`, under `--record` or `--replay`: `a tape cannot hold @{name}:
+/// it names a repository through agh.toml; type the repository`.
+pub(crate) fn tape_targets(
+    verb: &Verb,
+    global: &Global,
+    positionals: &[String],
+    flags: &[(&'static str, Option<String>)],
+) -> Result<()> {
+    if global.record.is_none() && global.replay.is_none() {
+        return Ok(());
     }
-    if verb.path == ["release", "download"] {
-        return Err(usage(
-            "release download cannot be taped in M1: it streams a body".to_string(),
-        ));
+    let refuse = |name: &str| {
+        Err(Error::usage(format!(
+            "a tape cannot hold @{name}: it names a repository through agh.toml; type the \
+             repository"
+        ))
+        .with_next(help_next(verb.path)))
+    };
+    let at = |wanted: &str| {
+        verb.positionals
+            .iter()
+            .position(|name| name.trim_end_matches(['?', '…']) == wanted)
+            .filter(|_| global.repo.is_none())
+            .and_then(|at| positionals.get(at))
+    };
+    // A CONTENT positional (`cat`, `ls`, `find`, `rev`, `log`) names its repository first
+    // unless `-R` gave one, and a leading `@` there is a target (`ContentRef::parse`); with `-R`
+    // a leading `@` starts a REF and is the tape's to hold.
+    if let Some(text) = at("CONTENT")
+        && let Ok(ContentRef {
+            repo: Some(RepoArg::Target(name)),
+            ..
+        }) = ContentRef::parse(text, true)
+    {
+        return refuse(&name);
+    }
+    let named = flags
+        .iter()
+        .filter(|(name, _)| *name == "--for")
+        .filter_map(|(_, value)| value.as_ref());
+    for text in at("REPO")
+        .into_iter()
+        .chain(global.repo.as_ref())
+        .chain(named)
+    {
+        if let Some(name) = text.strip_prefix('@') {
+            return refuse(name);
+        }
     }
     Ok(())
+}
+
+/// A bare `--replay` runs the tape's own command line, which whoever made the tape wrote: it
+/// refuses one that writes a local file, `release download` with no `--output -`, and one that
+/// reads a local file into a request, `--notes-file` (release create, edit and ensure), so a file
+/// is written or sent only where the person typed it. A file `release upload` or `release
+/// ensure --file` names is only digested under replay, so it stays allowed.
+/// # Errors
+/// Usage, next `type the command line after --replay`: `a bare --replay writes no file a tape
+/// names: release download writes into {path}`, or `a bare --replay reads no file a tape names:
+/// --notes-file {path}`.
+pub(crate) fn bare_replay_rule(verb: &Verb, inv: &Invocation) -> Result<()> {
+    if let Some(file) = inv.flag("--notes-file") {
+        return Err(Error::usage(format!(
+            "a bare --replay reads no file a tape names: --notes-file {file}"
+        ))
+        .with_next("type the command line after --replay"));
+    }
+    let output = inv.flag("--output");
+    if verb.path != ["release", "download"] || output == Some("-") {
+        return Ok(());
+    }
+    let into = output.or_else(|| inv.flag("--dir")).unwrap_or(".");
+    Err(Error::usage(format!(
+        "a bare --replay writes no file a tape names: release download writes into {into}"
+    ))
+    .with_next("type the command line after --replay"))
 }
 
 /// `30s`, `2m`, `1h`, or bare seconds: a positive integer.
@@ -615,12 +698,14 @@ impl Parser {
         Ok(())
     }
 
-    /// Rule 6: what a tape cannot hold.
+    /// Rule 6: what a tape cannot hold, and no `@target` under a tape.
     fn tapes(&self, verb: &Verb) -> std::result::Result<(), ParseError> {
-        tape_rule(verb, &self.global).map_err(|error| ParseError {
-            verb: verb_name(verb.path),
-            error,
-        })
+        tape_rule(verb, &self.global)
+            .and_then(|()| tape_targets(verb, &self.global, &self.positionals, &self.flags))
+            .map_err(|error| ParseError {
+                verb: verb_name(verb.path),
+                error,
+            })
     }
 
     /// Rule 7: the positionals against the verb's names.
@@ -738,9 +823,6 @@ fn parse_noting_tapes(
                 });
             }
             if p.global.replay.is_some() {
-                if p.global.as_profile.is_some() {
-                    return Err(p.usage("M1's tapes are anonymous: drop --as"));
-                }
                 if let Some(flag) = p
                     .seen
                     .iter()

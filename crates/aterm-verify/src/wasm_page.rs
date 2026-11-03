@@ -15,6 +15,8 @@ pub(crate) use crate::browser::page::Chrome as Page;
 /// Why a run gave no answer.
 #[derive(Debug)]
 pub(crate) enum Refused {
+    /// Required measurement-entry readiness was not established; not a browser failure.
+    Timing(String),
     /// The machine, not the tree: no browser, or it did not start or answer
     /// its first call. Once a browser has answered, nothing it does is this.
     Unavailable(String),
@@ -34,7 +36,7 @@ impl Refused {
     #[cfg(all(test, unix))]
     pub(crate) fn why(&self) -> &str {
         match self {
-            Refused::Unavailable(why) | Refused::Failed(why) => why,
+            Refused::Unavailable(why) | Refused::Failed(why) | Refused::Timing(why) => why,
         }
     }
 
@@ -42,6 +44,10 @@ impl Refused {
     /// one, a page that failed is a FAIL.
     pub(crate) fn verdict(self, what: &str) -> crate::perf::LaneRun {
         match self {
+            Refused::Timing(why) => crate::perf::LaneRun::could_not_run(
+                format!("{what}: {why}"),
+                "run with measured timing admission at the postcompile entry",
+            ),
             Refused::Unavailable(why) => crate::perf::LaneRun::could_not_run(
                 format!("{what} runs in the pinned chrome-headless-shell, and none ran: {why}"),
                 browser_fix(),
@@ -153,5 +159,9 @@ pub(crate) fn start_for_test(root: &Path) -> Page {
             browser_fix()
         ),
         Err(Refused::Failed(why)) => panic!("the browser failed: {why}"),
+        Err(Refused::Timing(why)) => panic!(
+            "{}: timing observation unavailable ({why})",
+            crate::libtest::COULD_NOT_RUN_SENTINEL
+        ),
     }
 }

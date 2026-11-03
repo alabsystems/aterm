@@ -24,6 +24,135 @@ use crate::{channel, gates, machines, publish, sign};
 #[path = "provision/layer.rs"]
 mod layer;
 
+/// Restore only an already-authorized signer's public roster pair.
+pub fn run_roster_only(
+    repo: &std::path::Path,
+    id: &str,
+    check: bool,
+    input: &std::path::Path,
+) -> crate::ledger::Result<()> {
+    #[cfg(unix)]
+    {
+        let home = std::env::var("HOME").map_err(|_| Error::new("HOME is not set"))?;
+        let who = roster_only_in(
+            repo,
+            Path::new(&home),
+            id,
+            check,
+            input,
+            pins::PAPER_MASTER_PUBKEYS,
+            now_unix()? as i64,
+        )?;
+        println!(
+            "roster-only: {} authorized under roster seq {}{}",
+            who.machine_id,
+            who.roster_seq,
+            if check {
+                " (--check: nothing written)"
+            } else {
+                " (canonical pair verified)"
+            }
+        );
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (repo, id, check, input);
+        Err(crate::ledger::Error::new(
+            "roster-only provisioning is POSIX-only",
+        ))
+    }
+}
+
+/// Read only the canonical key and identity; never resolve a credential profile.
+#[cfg(unix)]
+fn existing_signer(repo: &Path, home: &Path, id: &str) -> Result<machines::MachineIdentity> {
+    atpkg_keys::provision::vet_machine_id(id).map_err(Error::new)?;
+    if !home.is_absolute() {
+        return Err(Error::new("HOME must be absolute"));
+    }
+    let home_text = utf8_path(home)?;
+    let credentials = sign::ReleaseCredentials::resolve_with(None, repo, Some(&home_text))
+        .map_err(Error::new)?
+        .ok_or_else(|| {
+            Error::new("roster-only requires an existing machine key; it never mints")
+        })?;
+    let identity = machines::MachineIdentity::read(&machines::identity_path_in(home))?
+        .ok_or_else(|| Error::new("existing machine key has no canonical identity"))?;
+    if identity.id != id || identity.pubkey != credentials.pubkey() {
+        return Err(Error::new(
+            "existing machine id or derived public key disagrees with canonical identity",
+        ));
+    }
+    Ok(identity)
+}
+
+/// Selection, authorization and publication share the kept pair's transaction lock.
+/// The check path only reads, including refusing an unfinished pair transaction.
+#[cfg(unix)]
+fn roster_only_in(
+    repo: &Path,
+    home: &Path,
+    id: &str,
+    check: bool,
+    input: &Path,
+    masters: &[&str],
+    now: i64,
+) -> Result<roster::Attribution> {
+    let identity = existing_signer(repo, home, id)?;
+    let kept = home.join(atpkg_keys::provision::RELEASE_ROSTER_REL);
+    let lock = if check {
+        None
+    } else {
+        Some(lock_roster_pair(&kept)?)
+    };
+    let dist = repo.join("dist").join(roster::ROSTER_ASSET);
+    // Even an absent explicit input is an error, not permission to fall back.
+    atpkg_keys::provision::refuse_pending_roster_transaction(&utf8_path(input)?)
+        .map_err(Error::new)?;
+    if read_local_candidate_with(input, masters)?.is_none() {
+        return Err(Error::new("--roster public pair is absent"));
+    }
+    let selected = newest_local_candidate(&[&dist, &kept, input], masters)?
+        .ok_or_else(|| Error::new("no admitted public roster pair"))?;
+    let authorize = |candidate: Candidate| {
+        let who = machines::authorize_cut(
+            masters,
+            candidate.bytes,
+            &candidate.sig,
+            &identity.pubkey,
+            now,
+        )
+        .map_err(|e| Error::new(e.to_string()))?;
+        if who.machine_id != identity.id {
+            return Err(Error::new(
+                "signed roster authorizes the key under a different machine id",
+            ));
+        }
+        Ok(who)
+    };
+    // Authorize the newest effective document, including a newer removal or revocation.
+    let bytes = selected.bytes.clone();
+    let sig = selected.sig.clone();
+    let who = authorize(selected)?;
+    if let Some(lock) = lock.as_ref() {
+        let unchanged = read_local_candidate_with(&kept, masters)?
+            .is_some_and(|c| c.bytes == bytes && c.sig == sig);
+        if !unchanged {
+            write_pair(lock, &kept, &bytes, &sig)?;
+        }
+        let effective = read_local_candidate_with(&kept, masters)?
+            .ok_or_else(|| Error::new("canonical public pair vanished after publication"))?;
+        if effective.bytes != bytes || effective.sig != sig {
+            return Err(Error::new(
+                "canonical public pair changed during publication",
+            ));
+        }
+        return authorize(effective);
+    }
+    Ok(who)
+}
+
 /// POSIX-only, exactly like the engine it drives.
 #[cfg(not(unix))]
 pub fn run_provision(
@@ -46,7 +175,7 @@ pub fn run_provision(
 ) -> Result<()> {
     atpkg_keys::provision::vet_machine_id(id).map_err(Error::new)?;
 
-    let manifest = std::fs::read_to_string(repo.join("Cargo.toml"))
+    let manifest = crate::durable::read_text(&repo.join("Cargo.toml"))
         .map_err(|e| Error::new(format!("read {}/Cargo.toml: {e}", repo.display())))?;
     let slug = channel::update_channel_slug(&manifest)?.ok_or_else(|| {
         Error::new(
@@ -195,7 +324,10 @@ pub fn run_provision(
         match aterm_verify::provision::this_machine(repo) {
             Some(machine) => {
                 aterm_verify::provision::run(
-                    &aterm_verify::provision::Options::default(),
+                    &aterm_verify::provision::Options {
+                        release: true,
+                        ..Default::default()
+                    },
                     &machine,
                     &aterm_verify::provision::System::new(repo),
                     &mut |line| step("provision", line),
@@ -218,9 +350,53 @@ pub fn run_provision(
     record("rust shims", rust_shim_check(), &mut checks);
     record("x86 slice", x86_slice_check(), &mut checks);
     record("apple sdk", apple_clt_check(), &mut checks);
-    let host: std::sync::Arc<dyn layer::ReleaseHost> =
-        std::sync::Arc::new(layer::System::new(repo, Path::new(&home)));
-    for (label, check) in layer::audit(&host) {
+    let source_helper = if check_only {
+        Ok(None)
+    } else {
+        let explicit = std::env::var_os("ATPKG_KEYS");
+        let system = aterm_verify::provision::System::new(repo);
+        crate::source_signing::prepare_helper(repo, explicit.as_deref(), |args| {
+            use aterm_verify::provision::Host as _;
+            step(
+                "source signer",
+                "building this checkout's atpkg-keys helper",
+            );
+            system
+                .run(&aterm_verify::provision::Spawn {
+                    program: system.targo()?,
+                    args: args.to_vec(),
+                    cwd: repo.to_path_buf(),
+                    set: Vec::new(),
+                    remove: aterm_verify::CHILD_ENV_REMOVED
+                        .iter()
+                        .map(|key| (*key).into())
+                        .collect(),
+                })
+                .map(String::into_bytes)
+        })
+        .map(Some)
+    };
+    let helper_ready = source_helper.is_ok();
+    if let Err(why) = &source_helper {
+        record(
+            "source helper",
+            Check::Fail {
+                what: why.clone(),
+                fix: "restore the helper build or the explicitly selected executable, then retry"
+                    .into(),
+            },
+            &mut checks,
+        );
+    }
+    let host: std::sync::Arc<dyn layer::ReleaseHost> = std::sync::Arc::new(
+        layer::System::new(repo, Path::new(&home)).with_source_helper(source_helper),
+    );
+    let initial = if check_only {
+        layer::audit(&host)
+    } else {
+        layer::audit_before_identity(&host)
+    };
+    for (label, check) in initial {
         record(label, check, &mut checks);
     }
     if !check_only && let Some(line) = layer::settle_site_key(&host) {
@@ -308,8 +484,6 @@ pub fn run_provision(
         };
         checks.push(("profile", check));
     }
-    let (fails, waiting) = tally(&checks);
-
     let authority = if key_path.exists() {
         let attribution = match attributed {
             Some(a) => a,
@@ -341,6 +515,13 @@ pub fn run_provision(
     } else {
         None
     };
+
+    if !check_only && helper_ready {
+        for (label, check) in layer::audit_source_signing(&host) {
+            record(label, check, &mut checks);
+        }
+    }
+    let (fails, waiting) = tally(&checks);
 
     close(Closing {
         id,
@@ -911,7 +1092,10 @@ fn lock_roster_pair(roster_path: &Path) -> Result<atpkg_keys::provision::RosterL
 #[cfg(unix)]
 fn pair_premise(roster_path: &Path) -> Result<Option<atpkg_keys::provision::RosterSnapshot>> {
     let sig_path = machines::RosterDocument::signature_path(roster_path);
-    match (std::fs::read(roster_path), std::fs::read(&sig_path)) {
+    match (
+        crate::durable::read_regular_bytes(roster_path, 65_536),
+        crate::durable::read_regular_bytes(&sig_path, 4_096),
+    ) {
         (Ok(raw), Ok(sig)) => Ok(Some(atpkg_keys::provision::RosterSnapshot { raw, sig })),
         (Err(body), Err(signature))
             if body.kind() == std::io::ErrorKind::NotFound
@@ -1619,7 +1803,7 @@ pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Fi
     found.push((crate::apple::APPLE_LABEL, apple));
     found.push((KEYCHAIN_LABEL, keychain_check(id, leave(dry))));
     found.push(("notary", notary_check_recording(!dry)));
-    let slug = std::fs::read_to_string(repo.join("Cargo.toml"))
+    let slug = crate::durable::read_text(&repo.join("Cargo.toml"))
         .map_err(|e| Error::new(format!("read {}/Cargo.toml: {e}", repo.display())))
         .and_then(|manifest| channel::update_channel_slug(&manifest))
         .and_then(|slug| slug.ok_or_else(|| Error::new("no update channel is committed")));
@@ -2261,6 +2445,109 @@ fn now_unix() -> Result<u64> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn roster_only_requires_existing_authority_and_preserves_newer_state() {
+        use ring::signature::KeyPair as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path().join("home");
+        let repo = scratch.path().join("repo");
+        let input = scratch.path().join("public/aterm-machines.toml");
+        let kept = home.join(atpkg_keys::provision::RELEASE_ROSTER_REL);
+        let key = home.join(atpkg_keys::provision::MACHINE_KEY_REL);
+        let identity = machines::identity_path_in(&home);
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let pubkey = aterm_codec::base64::encode(pair.public_key().as_ref()).unwrap();
+        let master = seed().pubkey_b64().unwrap();
+        let member = || Machine {
+            id: "m3".into(),
+            pubkey: pubkey.clone(),
+            added_at: "2026-01-01T00:00:00Z".into(),
+            not_after: None,
+        };
+        let write = |path: &Path, roster: Roster| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes = roster.to_toml().unwrap().into_bytes();
+            std::fs::write(path, &bytes).unwrap();
+            std::fs::write(
+                machines::RosterDocument::signature_path(path),
+                seed().sign(&bytes).unwrap(),
+            )
+            .unwrap();
+        };
+        let run =
+            |id, check| roster_only_in(&repo, &home, id, check, &input, &[&master], 1_793_000_000);
+        write(&input, roster_with(3, vec![member()], vec![]));
+        assert!(run("m3", false).is_err(), "missing key must never mint");
+        assert!(!kept.exists());
+        std::fs::write(&key, pkcs8.as_ref()).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let identity_bytes = format!("id = \"m3\"\npubkey = \"{pubkey}\"\n");
+        std::fs::write(&identity, &identity_bytes).unwrap();
+        assert!(run("m4", false).is_err());
+        assert!(!kept.exists());
+        assert_eq!(run("m3", true).unwrap().roster_seq, 3);
+        assert!(
+            !kept.parent().unwrap().exists(),
+            "check must not create a lock directory"
+        );
+        assert_eq!(run("m3", false).unwrap().roster_seq, 3);
+        let original = machines::RosterDocument::read(&kept).unwrap();
+        std::fs::write(&identity, "id = \"m3\"\npubkey = \"wrong\"\n").unwrap();
+        assert!(run("m3", false).is_err());
+        std::fs::write(&identity, &identity_bytes).unwrap();
+        std::fs::remove_file(machines::RosterDocument::signature_path(&input)).unwrap();
+        assert!(run("m3", false).is_err(), "unsigned input must refuse");
+        let mut renamed = member();
+        renamed.id = "m4".into();
+        write(&input, roster_with(4, vec![renamed], vec![]));
+        assert!(
+            run("m3", false).is_err(),
+            "the same key under a different id must refuse"
+        );
+        write(&input, roster_with(4, vec![], vec!["m3".into()]));
+        assert!(run("m3", false).is_err());
+        assert_eq!(machines::RosterDocument::read(&kept).unwrap(), original);
+        let mut expired = roster_with(4, vec![member()], vec![]);
+        expired.valid_until = "2026-01-01T00:00:00Z".into();
+        write(&input, expired);
+        assert!(run("m3", false).is_err());
+        write(&input, roster_with(3, vec![member()], vec![]));
+        write(&kept, roster_with(7, vec![member()], vec![]));
+        let newer = machines::RosterDocument::read(&kept).unwrap();
+        assert_eq!(run("m3", false).unwrap().roster_seq, 7);
+        assert_eq!(machines::RosterDocument::read(&kept).unwrap(), newer);
+        write(&input, roster_with(7, vec![], vec!["m3".into()]));
+        assert!(
+            run("m3", false).is_err(),
+            "same-generation forks must refuse"
+        );
+        assert_eq!(machines::RosterDocument::read(&kept).unwrap(), newer);
+        write(&input, roster_with(3, vec![member()], vec![]));
+        write(&kept, roster_with(8, vec![], vec!["m3".into()]));
+        let revoked = machines::RosterDocument::read(&kept).unwrap();
+        assert!(
+            run("m3", false).is_err(),
+            "newer kept revocation is effective"
+        );
+        assert_eq!(machines::RosterDocument::read(&kept).unwrap(), revoked);
+        assert_eq!(std::fs::read(&key).unwrap(), pkcs8.as_ref());
+        assert_eq!(std::fs::read_to_string(identity).unwrap(), identity_bytes);
+        assert!(
+            !home
+                .join(atpkg_keys::provision::RELEASE_CREDENTIALS_REL)
+                .exists()
+        );
+        assert!(!repo.join("dist").exists());
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 1);
+    }
 
     /// `--check` and a dry release promise no writes, so they only look at the release
     /// keychain; a provision run and a real release's audit may re-assert its partition list.

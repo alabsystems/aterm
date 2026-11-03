@@ -77,6 +77,9 @@ struct Knobs {
     /// The session's lock names another process from the hand's take on
     /// (between the first look and the last).
     lock_moves: bool,
+    /// The command line the shell's integration recorded for the command the
+    /// tab runs.
+    cmdline: Option<&'static str>,
 }
 
 /// The scripted kernel: [`TUI`] runs under [`SHELL`] until the signal; its
@@ -457,6 +460,12 @@ impl LiveRig {
                         "OK {}",
                         if back {
                             line_blocks(None)
+                        } else if !gone && let Some(cmdline) = knobs.cmdline {
+                            format!(
+                                r#"{{"blocks":[{{"id":7,"state":"executing","exit":null,"prompt":2,"cmd":2,"cmdcol":2,"out":3,"end":null,"cmdline":{}}}]}}"#,
+                                aterm_json::to_string(&aterm_json::Value::from(cmdline))
+                                    .expect("cmdline")
+                            )
                         } else {
                             blocks(143, gone, false)
                         }
@@ -1080,6 +1089,27 @@ fn the_build_the_order_and_the_launch_hold_the_restart() {
         },
         "wait:break",
     );
+    holds(
+        "inline-env",
+        Knobs {
+            cmdline: Some("OPENAI_API_KEY=k HTTPS_PROXY=http://p:1 muse --trust-workspace"),
+            ..Knobs::default()
+        },
+        "skip:env-not-carried",
+    );
+    for cmdline in [
+        "cd ~/p && muse --trust-workspace",
+        "XDG_DATA_HOME=/s/data XDG_CONFIG_HOME=/s/cfg HOME=/s/home muse --trust-workspace",
+    ] {
+        let rig = LiveRig::new(
+            "carried-env",
+            Knobs {
+                cmdline: Some(cmdline),
+                ..Knobs::default()
+            },
+        );
+        assert_eq!(rig.visit().step, "done:resumed", "{cmdline}");
+    }
 }
 
 /// A hold before the signal or a refused signal takes the claim back and types nothing.

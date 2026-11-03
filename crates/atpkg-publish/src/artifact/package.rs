@@ -135,17 +135,12 @@ pub fn check_build(program: &str, build: Build) -> Result<()> {
 }
 
 fn read_json(path: &Path) -> Result<aterm_json::Value> {
-    let small = std::fs::symlink_metadata(path)
-        .is_ok_and(|m| m.file_type().is_file() && m.len() <= MAX_RECORD_BYTES);
-    let text = small
-        .then(|| std::fs::read_to_string(path).ok())
-        .flatten()
-        .ok_or_else(|| {
-            Error::refused(format!(
-                "{} is not a regular UTF-8 record of at most {MAX_RECORD_BYTES} bytes",
-                path.display()
-            ))
-        })?;
+    let text = crate::identity::read_regular_text(path, MAX_RECORD_BYTES).map_err(|_| {
+        Error::refused(format!(
+            "{} is not a regular UTF-8 record of at most {MAX_RECORD_BYTES} bytes",
+            path.display()
+        ))
+    })?;
     aterm_json::from_str(&text)
         .map_err(|e| Error::refused(format!("{} is not JSON: {e}", path.display())))
 }
@@ -688,7 +683,7 @@ pub fn verify_pinned(
         fetch_pair(ctx, def.repo, &tag, &mf, &sig, scratch.path())?
     };
     let read = |name: &str| {
-        std::fs::read(dir.join(name))
+        crate::identity::read_regular_bytes(&dir.join(name), crate::identity::MAX_META_BYTES)
             .map_err(|e| Error::refused(format!("{tag}: {name} does not read from {from} ({e})")))
     };
     let pkg = quad.verify_pkg(&read(&mf)?, &read(&sig)?)?;
@@ -871,7 +866,10 @@ pub fn pack_package_with(
     let signature = pack::write_manifest(ctx, &doc, &header, &row_doc, &manifest, Some(&signer))?
         .ok_or_else(|| Error::refused("the manifest was not signed"))?;
 
-    let read = |p: &Path| std::fs::read(p).map_err(|e| Error::io(ctx.shown(p), &e));
+    let read = |p: &Path| {
+        crate::identity::read_regular_bytes(p, crate::identity::MAX_META_BYTES)
+            .map_err(|e| Error::io(ctx.shown(p), &e))
+    };
     let parsed = signer
         .authority()
         .verify_pkg(&read(&manifest)?, &read(&signature)?)?;
@@ -996,7 +994,7 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let request = parse_args(&mut ctx, args)?;
     let ctx = &ctx;
     if request.upload {
-        upload::token_preflight(ctx)?;
+        upload::program_preflight(ctx, &request.program)?;
     }
     let o = pack_package_with(ctx, &request, &HostTools)?;
     println!(

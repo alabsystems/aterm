@@ -14,6 +14,54 @@ struct Acceptance {
     report: PathBuf,
     report_sha256: String,
     reason: String,
+    #[serde(default)]
+    inputs: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Attempt {
+    inputs: String,
+    report_sha256: String,
+    exit_code: i32,
+    commit: String,
+    executable: String,
+}
+
+pub(crate) fn record_attempt(
+    report: &Path,
+    inputs: &str,
+    exit_code: i32,
+    commit: &str,
+    executable: &str,
+) -> Result<(), String> {
+    let attempt = Attempt {
+        inputs: inputs.into(),
+        report_sha256: crate::artifact::file_sha256(report)?,
+        exit_code,
+        commit: commit.into(),
+        executable: executable.into(),
+    };
+    let text = aterm_toml::to_string(&attempt).map_err(|error| error.to_string())?;
+    crate::durable::write_atomic_durable(
+        &report.with_extension("inputs.toml"),
+        text.as_bytes(),
+        0o600,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn report_inputs(report: &Path, commit: &str, executable: &str) -> Result<String, String> {
+    let text = crate::durable::read_regular_text(&report.with_extension("inputs.toml"), 64 * 1024)
+        .map_err(|error| error.to_string())?;
+    let attempt: Attempt = aterm_toml::from_str(&text).map_err(|error| error.to_string())?;
+    if attempt.exit_code != 1
+        || attempt.commit != commit
+        || attempt.executable != executable
+        || attempt.report_sha256 != crate::artifact::file_sha256(report)?
+    {
+        return Err("the failed verification attempt does not match its report".into());
+    }
+    Ok(attempt.inputs)
 }
 
 fn path(git: &dyn GitRunner, commit: &str) -> Result<PathBuf, String> {
@@ -65,18 +113,19 @@ pub fn record(repo: &Path, report: &Path, reason: &str) -> Result<(), String> {
     .ok_or("no release journal")?;
     let artifact = journal.artifact.ok_or("no built release artifact")?;
     let report = std::fs::canonicalize(report).map_err(|e| e.to_string())?;
-    let text = std::fs::read_to_string(&report).map_err(|e| e.to_string())?;
+    let text = crate::durable::read_text(&report).map_err(|e| e.to_string())?;
     if !report_is_measure_only(&text) {
         return Err(
             "acceptance requires a complete report: only measure failed, all other release checks passed"
                 .into(),
         );
     }
-    if !text.contains(&journal.commit) || !text.contains(&artifact.app.display().to_string()) {
-        return Err("the release report does not name this source and built app".into());
-    }
     if crate::artifact::macho_sha256(&artifact.app)? != artifact.macho_sha256 {
         return Err("the built executable changed since measurement".into());
+    }
+    let inputs = crate::build_inputs::current()?;
+    if report_inputs(&report, &journal.commit, &artifact.macho_sha256)? != inputs {
+        return Err("the measurement report has no matching compiler/SDK content identity; rerun verification".into());
     }
     let acceptance = Acceptance {
         commit: journal.commit,
@@ -84,6 +133,7 @@ pub fn record(repo: &Path, report: &Path, reason: &str) -> Result<(), String> {
         report_sha256: crate::artifact::file_sha256(&report)?,
         report,
         reason: reason.trim().into(),
+        inputs,
     };
     let dest = path(&git, &acceptance.commit)?;
     std::fs::create_dir_all(dest.parent().ok_or("acceptance has no parent")?)
@@ -101,17 +151,23 @@ pub fn record(repo: &Path, report: &Path, reason: &str) -> Result<(), String> {
 }
 
 fn read(git: &dyn GitRunner, commit: &str) -> Result<Option<Acceptance>, String> {
-    let text = match std::fs::read_to_string(path(git, commit)?) {
+    let text = match crate::durable::read_text(&path(git, commit)?) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.to_string()),
     };
     let held: Acceptance = aterm_toml::from_str(&text).map_err(|e| e.to_string())?;
+    if held.inputs.is_empty() {
+        return Ok(None);
+    }
+    if report_inputs(&held.report, &held.commit, &held.executable)? != held.inputs {
+        return Err("owner acceptance no longer matches its build inputs".into());
+    }
     if held.commit != commit
         || held.reason.is_empty()
         || crate::artifact::file_sha256(&held.report)? != held.report_sha256
         || !report_is_measure_only(
-            &std::fs::read_to_string(&held.report).map_err(|e| e.to_string())?,
+            &crate::durable::read_text(&held.report).map_err(|e| e.to_string())?,
         )
     {
         return Err("owner acceptance no longer matches its complete measurement report".into());
@@ -128,7 +184,13 @@ pub fn accepted(
     commit: &str,
     executable: &str,
 ) -> Result<Option<String>, String> {
-    Ok(read(git, commit)?.filter(|a| a.executable == executable).map(|a| {
+    let Some(acceptance) = read(git, commit)? else {
+        return Ok(None);
+    };
+    if acceptance.inputs != crate::build_inputs::current()? {
+        return Ok(None);
+    }
+    Ok(Some(acceptance).filter(|a| a.executable == executable).map(|a| {
         format!("OWNER ACCEPTED measure failure: {}; all other release checks passed; report {} (not a full verification pass)", a.reason, a.report.display())
     }))
 }
@@ -182,6 +244,33 @@ fn policy_paths_only(paths: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::report_is_measure_only;
+
+    #[test]
+    fn report_inputs_require_a_separate_matching_failed_attempt_receipt() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let report = root.path().join("verify.log");
+        let digest = "a".repeat(64);
+        let marker = format!("release-inputs-sha256: {digest}\n");
+        std::fs::write(&report, &marker).unwrap();
+        assert!(
+            super::report_inputs(&report, "source", "image").is_err(),
+            "test output cannot forge a receipt"
+        );
+        super::record_attempt(&report, &digest, 0, "source", "image").unwrap();
+        assert!(
+            super::report_inputs(&report, "source", "image").is_err(),
+            "a pass is not a measured failure"
+        );
+        super::record_attempt(&report, &digest, 1, "source", "image").unwrap();
+        assert_eq!(
+            super::report_inputs(&report, "source", "image").unwrap(),
+            digest
+        );
+        assert!(super::report_inputs(&report, "other source", "image").is_err());
+        assert!(super::report_inputs(&report, "source", "other image").is_err());
+        std::fs::write(&report, "changed report").unwrap();
+        assert!(super::report_inputs(&report, "source", "image").is_err());
+    }
 
     #[test]
     fn only_a_complete_measure_only_failure_can_be_accepted() {

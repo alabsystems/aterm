@@ -62,7 +62,7 @@ fn keep_once(
     now: u64,
     started_ms: u64,
 ) -> (Written, Place) {
-    let evidence = crate::heard::read(dir);
+    let evidence = crate::heard::read_for_place(dir);
     let book = crate::heard::read_book(dir);
     let (record, place) = step(
         &held.record,
@@ -257,7 +257,7 @@ pub fn read_with(state: &Path, facts: Facts, now: u64) -> Place {
     {
         facts.path = written.record.path;
     }
-    let evidence = crate::heard::read(&dir);
+    let evidence = crate::heard::read_for_place(&dir);
     let book = crate::heard::read_book(&dir);
     let (_, mut place) = step(&written.record, &facts, &evidence, book.as_ref(), now, None);
     let held_stay = written.record.current().map(|stay| stay.start_ms);
@@ -483,7 +483,7 @@ mod tests {
             ComputedBy::Reader,
             "the record lags this move"
         );
-        crate::heard::note_answer(&dir, Lane::Fleet, "m1", None, (now, now));
+        crate::heard::note_answer(&dir, (Lane::Fleet, "m1"), None, (None, true), (now, now));
     }
 
     /// A reader that runs no path monitor takes the record's path reading only from a live

@@ -446,7 +446,7 @@ fn union_names(root: &Path, cell: &Cell) -> Result<Vec<String>, UnionStop> {
 }
 
 fn read_doc(path: &Path) -> Result<Doc, CouldNotRun> {
-    let text = std::fs::read_to_string(path).map_err(|e| {
+    let text = crate::read_regular_text(path).map_err(|e| {
         CouldNotRun::new(
             format!(
                 "rustdoc reported success but {} is unreadable: {e}",

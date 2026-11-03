@@ -65,8 +65,8 @@ clean {
     -- 2. Clean-Origin Rust Implementation Functions (`clean_origin_mir` I5)
     --    Compiled directly from these Clean kernel definitions into Rust MIR
     --    (`pub const fn crc_table_index_clamp`, `pub const fn crc32_poly_select`,
-    --    and `pub const fn fnv1a_64_mul_prime`) and verified by
-    --    `trust_clean_origin::Faithful` (`clean-kernel-defeq`).
+    --    `pub const fn fnv1a_64_xor`, and `pub const fn fnv1a_64_mul_prime`) and
+    --    verified by `trust_clean_origin::Faithful` (`clean-kernel-defeq`).
     -- ========================================================================
 
     -- Clamp a table lookup index `idx` to `max_idx` (`255` for a 256-entry CRC row).
@@ -80,6 +80,11 @@ clean {
     -- Compiled directly to `pub const fn crc32_poly_select(crc: u32, poly: u32) -> u32`.
     def crc32_poly_select (crc : UInt32) (poly : UInt32) : UInt32 :=
       if (crc &&& 1) == 0 then 0 else poly
+
+    -- 64-bit FNV-1a word/byte XOR step (`h ^^^ word`).
+    -- Compiled directly to `pub const fn fnv1a_64_xor(h: u64, word: u64) -> u64`.
+    def fnv1a_64_xor (h : UInt64) (word : UInt64) : UInt64 :=
+      h ^^^ word
 
     -- 64-bit FNV-1a prime multiplication step (`xored * prime`).
     -- Compiled directly to `pub const fn fnv1a_64_mul_prime(xored: u64, prime: u64) -> u64`.
@@ -110,6 +115,21 @@ clean {
     -- `FNV1A_64_PRIME = 0x0000_0100_0000_01b3`).
     def fnv1a_64_init_isl : UInt64 := 14695981039346656037
     def fnv1a_64_prime_isl : UInt64 := 1099511628211
+
+    -- Island specifications of `crc32_is_ieee_poly`, `fnv1a_64_is_init`, and `fnv1a_64_is_prime`.
+    def crc32_is_ieee_poly_isl (poly : UInt32) : Bool :=
+      decide (poly = crc32_ieee_poly_isl)
+
+    def fnv1a_64_is_init_isl (h : UInt64) : Bool :=
+      decide (h = fnv1a_64_init_isl)
+
+    def fnv1a_64_is_prime_isl (p : UInt64) : Bool :=
+      decide (p = fnv1a_64_prime_isl)
+
+    -- Island specification of `pub const fn fnv1a_64_mix_u64(h: u64, word: u64) -> u64`:
+    -- `(h ^ word).wrapping_mul(FNV1A_64_PRIME)`.
+    def fnv1a_64_mix_u64_isl (h : UInt64) (word : UInt64) : UInt64 :=
+      (h ^^^ word) * fnv1a_64_prime_isl
 
     -- ------------------------------------------------------------------------
     -- 3a. Slice-by-8 Table Generation Recurrence Lemma (`crc32_row0`, `crc32_tables`)
@@ -294,8 +314,20 @@ clean {
     --     `fnv1a_64_update(h, d)` = left fold of `(h ^ b) * 0x0000_0100_0000_01b3`
     -- ------------------------------------------------------------------------
 
+    theorem fnv1a_64_xor_def (h : UInt64) (word : UInt64) :
+        _root_.fnv1a_64_xor h word = h ^^^ word :=
+      rfl
+
     theorem fnv1a_64_mul_prime_def (xored : UInt64) (prime : UInt64) :
         _root_.fnv1a_64_mul_prime xored prime = xored * prime :=
+      rfl
+
+    -- Composition theorem for `fnv1a_64_mix_u64`: composing the two Clean-origin (`I5`)
+    -- kernels `_root_.fnv1a_64_xor` and `_root_.fnv1a_64_mul_prime` at `FNV1A_64_PRIME`
+    -- computes `(h ^ word).wrapping_mul(FNV1A_64_PRIME)` (`fnv1a_64_mix_u64_isl`).
+    theorem fnv1a_64_mix_u64_eq_pieces (h : UInt64) (word : UInt64) :
+        _root_.fnv1a_64_mul_prime (_root_.fnv1a_64_xor h word) fnv1a_64_prime_isl =
+          fnv1a_64_mix_u64_isl h word :=
       rfl
 
     -- One byte step of FNV-1a/64: `(h ^ b) * 0x0000_0100_0000_01b3`, calling the

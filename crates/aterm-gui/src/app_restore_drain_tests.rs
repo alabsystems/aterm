@@ -36,6 +36,7 @@ fn leaf(title: &str) -> restore::RestoredSplitTree {
             claim_ended: false,
             not_claim_worker: false,
             claim_worker: None,
+            task: None,
         },
     ))
 }
@@ -55,12 +56,14 @@ fn window(titles: &[&str], front: usize) -> restore::WindowLayout {
         native_tabs: Vec::new(),
         tab_order: Vec::new(),
         active_item: Some(front),
+        workers_in_front: false,
         restored_tabs: titles
             .iter()
             .map(|title| restore::RestoredTab {
                 root: leaf(title),
                 focused_path: Vec::new(),
                 zoomed: false,
+                parked: false,
             })
             .collect(),
     }
@@ -813,5 +816,81 @@ fn a_system_quit_inside_the_drain_keeps_the_landed_tabs_agents_not_yet_handed() 
                 assert!(leaf.agent.as_ref().is_none_or(|a| a.cause.is_none()));
             }
         }
+    }
+}
+
+/// Make the tabs at `parked` workers that concluded, each with its record.
+fn parked_at(wl: &mut restore::WindowLayout, parked: &[usize]) {
+    for at in parked {
+        let tab = &mut wl.restored_tabs[*at];
+        tab.parked = true;
+        if let restore::RestoredSplitTree::Leaf {
+            view: restore::RestoredView::Terminal(leaf),
+        } = &mut tab.root
+        {
+            leaf.task = Some(
+                "rev=7 state=done from=ctl since=1700000000000 result_bytes=0 attention=0 \
+                 why=landed"
+                    .to_owned(),
+            );
+        }
+    }
+}
+
+/// A COLD DRAIN BRINGS PARKED WORKERS BACK BEHIND THE PERSON'S TAB WITH THEIR LIST OPEN as the fill
+/// ends, with no other sync, so the chip is there and the list opens; their ends, read before the
+/// quit, come back seen. A window that showed its list shows it again. NEGATIVE CONTROL: one that
+/// showed the person's tab shows that.
+#[test]
+fn a_cold_drain_opens_the_list_for_the_workers_it_brings_back() {
+    for in_front in [false, true] {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let mut wl = window(&["A", "W1", "W2"], 0);
+        parked_at(&mut wl, &[1, 2]);
+        wl.workers_in_front = in_front;
+        app.pending_restore = Some(restore::RestoreManifest::new(vec![wl]));
+        drain(&mut app);
+        let ws = &app.windows[&wid];
+        assert_eq!(ws.tab_set.parked().len(), 2, "{in_front}");
+        let home = ws
+            .tab_set
+            .home()
+            .expect("the list opened as the fill ended");
+        assert_eq!(ws.tab_set.shown_len(), 2, "the person's tab and the list");
+        if in_front {
+            assert_eq!(ws.tab_set.active_id(), Some(home), "it showed the list");
+        } else {
+            assert_eq!(front(&app, wid), "A", "CONTROL: it showed the person's tab");
+        }
+        assert!(app.open_workers_tab().is_ok(), "the list is there to open");
+        let parked: Vec<u64> = app.windows[&wid]
+            .tab_set
+            .parked()
+            .iter()
+            .filter_map(|tab| {
+                app.view_store
+                    .get(tab.focus)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)
+            })
+            .collect();
+        for session in parked {
+            let entered = app
+                .pool
+                .get(session)
+                .and_then(|live| live.ctx.timeline.lock().unwrap().task().map(|t| t.entered));
+            assert!(entered.is_some(), "PRECONDITION: its record came back");
+            assert_eq!(
+                app.done_seen.get(&session).copied(),
+                entered,
+                "an end read before the quit is no news"
+            );
+        }
+        assert!(
+            app.structural_invariants_ok(),
+            "{}",
+            app.structural_invariant_violation().unwrap_or_default()
+        );
     }
 }

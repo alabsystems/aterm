@@ -13,7 +13,7 @@ mod inventory;
 pub const USAGE: &str = "\
 aterm secrets: one credentials file for every machine (aterm help secrets).
 
-  aterm secrets [status]                 this machine's vault, join code, membership,
+  aterm secrets [status [--json]]        this machine's vault, join code, membership,
                                          secrets, subscriber and server, and on an admin
                                          whether the approver runs
   aterm secrets repair [--json]         migrate outdated managed vault services to this installed
@@ -31,8 +31,6 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
                                          new version; on an admin of a <url> vault, also
                                          the approver, which lets in a machine allowed on
                                          any member or one that types the join password
-                                         (at the open ALab vault, also one on the home
-                                         ALab LAN, where members answer)
   aterm secrets ls [--describe | --json]  the names this machine holds; descriptions and
                                          file pointers with --describe, metadata JSON
                                          with --json; neither prints secret values
@@ -71,16 +69,14 @@ admin (a machine in [admins]):
   aterm secrets password [show|set|new|open|off] [--no-agent]
                                          the join password: show (the default), set (typed
                                          or piped), new (generated), open (none: a
-                                         machine allowed on any member is let in, and at
-                                         the ALab vault one that asks on the home ALab
-                                         LAN, where members answer), off
+                                         machine allowed on any member is let in), off
                                          (close the vault or drop the password: an Allow on
                                          a member or approval by code); show and new print
                                          it only at a terminal; for a <url>, set, new and
                                          open also install the subscriber where it does not
                                          run, unless --no-agent
   aterm secrets requests [--json]        queued requests, with their codes; JSON includes
-                                         the server's LAN observation and whether known
+                                         the responding queue and server and whether known
                                          members could be excluded, never proof values
   aterm secrets approve <code>... | --all | <age1...> --name <host>
                                          let in machines by the code each shows (--all:
@@ -91,11 +87,11 @@ admin (a machine in [admins]):
                                          the vault's membership log, as `aterm members remove`
                                          (any member, no admin key); else, as an admin (first
                                          retiring its Commons membership, denying its swarm
-                                         label/node, and releasing its pool slots); --stolen
-                                         also rotates aterm-fleet-code and prints a NEEDS YOU:
-                                         provider rotation list; a section naming only it must
-                                         be empty unless --drop-sections drops it too (an
-                                         admin's edit)
+                                         label/node, and releasing its pool slots); either way
+                                         it rotates aterm-fleet-code; --stolen also prints a
+                                         NEEDS YOU: provider rotation list; a section naming
+                                         only it must be empty unless --drop-sections drops it
+                                         too (an admin's edit)
   aterm secrets retire <host|code|age1...>... permanently retire Commons membership alone;
                                          a full age key can name a device already removed
   aterm secrets admins add|remove <host|code>   (remove also rotates the vault key)
@@ -200,6 +196,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     Status,
+    StatusJson,
     Repair {
         json: bool,
     },
@@ -725,8 +722,13 @@ fn parse(words: &[String]) -> Result<Command, String> {
     };
     match verb.as_str() {
         "status" => {
-            no_operands(&flags(rest, &[], &[])?, "status")?;
-            Ok(Command::Status)
+            let f = flags(rest, &[], &["--json"])?;
+            no_operands(&f, "status")?;
+            Ok(if f.has("--json") {
+                Command::StatusJson
+            } else {
+                Command::Status
+            })
         }
         "repair" => {
             let f = flags(rest, &[], &["--json"])?;
@@ -1074,7 +1076,7 @@ mod unix {
     use zeroize::Zeroize;
 
     /// What an open vault means, said where one is made or shown.
-    const OPEN_VAULT: &str = "this vault is open: a machine joins with no password or code once a person presses Allow on any member and types the phrase it shows (at the ALab vault, a machine that asks on the home ALab LAN, where members answer, joins with no Allow; one on a phone hotspot or any other network waits for an Allow), and reads [everyone]'s entries; a key you let go comes back only by its code, but a machine that makes a new key asks as a new machine (aterm secrets password set also lets in a machine that types the join password, and ends the ALab vault's home-LAN rule)";
+    const OPEN_VAULT: &str = "this vault is open: a machine joins with no password or code once a person presses Allow on any member and types the phrase it shows (at the ALab vault, a Mac on the home ALab LAN that proves itself to a member there joins with no Allow; one on a phone hotspot or any other network waits for an Allow), and reads [everyone]'s entries; a key you let go comes back only by its code, but a machine that makes a new key asks as a new machine (aterm secrets password set also lets in a machine that types the join password)";
 
     /// What a vault at a path says where one served at a URL says whom its `[join]` lets in: a
     /// path has no join queue, so nothing lets a machine in by itself there.
@@ -1082,7 +1084,7 @@ mod unix {
 
     /// What a publish that let a machine go from an open vault says: only its key is kept out,
     /// since a new key still joins by a person's Allow on any member.
-    const KEPT_OUT: &str = "the vault stays open, but not to the key you let go: it is a `code-only` line in [join], so that key is let back in only by its code (aterm secrets approve), never by a member's Allow. A new key still joins when a person presses Allow on any member (at the ALab vault, also when it asks on the home ALab LAN), so if the machine was lost or compromised, let go any machine in [machines] (aterm secrets edit) it may have joined as since, even under its old name, and only then rotate what it could read";
+    const KEPT_OUT: &str = "the vault stays open, but not to the key you let go: it is a `code-only` line in [join], so that key is let back in only by its code (aterm secrets approve), never by a member's Allow. A new key still joins when a person presses Allow on any member (at the ALab vault, also when it proves itself to a member on the home ALab LAN), so if the machine was lost or compromised, let go any machine in [machines] (aterm secrets edit) it may have joined as since, even under its old name, and only then rotate what it could read";
 
     /// [`KEPT_OUT`] for a vault at a path: only an admin's approve of a key lets a machine in
     /// there, which a `code-only` line does not stop. A server may still serve the file
@@ -1137,6 +1139,10 @@ mod unix {
         };
         match command {
             Command::Status => status(&paths, &subscriber),
+            Command::StatusJson => {
+                println!("{}", crate::operational::read(&paths)?);
+                Ok(ExitCode::SUCCESS)
+            }
             Command::Repair { json } => repair(&paths, json),
             Command::Join {
                 source,
@@ -1768,10 +1774,10 @@ mod unix {
         doc.open().then_some(OPEN_VAULT)
     }
 
-    /// Who an approver for `approval` lets in: a personal open vault admits nothing new by
-    /// itself, only a machine a person allowed on a member (docs/DESIGN-fluid-swarm-2026-10-28.md
-    /// F10); the ALab vault also admits one its server observed on the home ALab LAN, where
-    /// members answered (docs/DESIGN-automatic-alab-lan-admission-2026-10-29.md).
+    /// Who an approver for `approval` lets in: an open vault admits nothing new by its asking
+    /// alone, only a machine a person allowed on a member (docs/DESIGN-fluid-swarm-2026-10-28.md
+    /// F10). A Mac on the home ALab LAN is let in by a member when it proves itself, never by an
+    /// approver (docs/DESIGN-automatic-lan-admission-2026-11-02.md).
     pub(super) const fn joiner(approval: Approval) -> &'static str {
         match approval {
             Approval::Password => "a machine that types the join password",
@@ -2010,9 +2016,9 @@ mod unix {
             Err(error) => println!("vault admin: unknown ({error})"),
         }
         match client::swarm_lease_holder(paths) {
-            Ok(Some(holder)) => println!("vault authority: {holder} (recorded steward)"),
-            Ok(None) => println!("vault authority: none recorded"),
-            Err(error) => println!("vault authority: unknown ({error})"),
+            Ok(Some(holder)) => println!("vault steward: {holder}"),
+            Ok(None) => println!("vault steward: none recorded"),
+            Err(error) => println!("vault steward: unknown ({error})"),
         }
         match client::release::signing_status(paths) {
             Ok(client::release::SigningStatus::Ready(now)) => {
@@ -2144,7 +2150,7 @@ mod unix {
         let given = Cell::new(from_pipe);
         let ask_password = || -> Option<SecretBytes> {
             let password = ask_hidden(
-                "Join password (an admin Mac shows it: aterm secrets password; Enter joins without one and waits for Allow on any member, or for approval by code; the ALab vault lets a Mac on the home ALab LAN in by itself): ",
+                "Join password (an admin Mac shows it: aterm secrets password; Enter joins without one and waits for Allow on any member, or for approval by code; at the ALab vault, a member on the home ALab LAN lets this Mac in by its proof): ",
             )
             .filter(|typed| !typed.as_slice().trim_ascii().is_empty());
             given.set(password.is_some());
@@ -3219,7 +3225,7 @@ mod unix {
                     approver(&admin.doc);
                     return Ok(ExitCode::SUCCESS);
                 }
-                let waiting = client::requests(paths, Some(&doc))?;
+                let waiting = client::requests_before_opening(&admin, &doc)?;
                 let (mut say, mut agree) = (
                     |line: String| eprintln!("{line}"),
                     |question: &str| yes(ask(question)),
@@ -3300,16 +3306,15 @@ mod unix {
         }
     }
 
-    /// The person at a terminal as `password open` asks them: where a line is said, and what
-    /// answers a yes-or-no question ([`admit_on_opening`]).
+    /// The person at a terminal as `password open` or `approve --all` asks them: where a line
+    /// is said, and what answers a yes-or-no question.
     pub(super) type Terminal<'a> = (&'a mut dyn FnMut(String), &'a mut dyn FnMut(&str) -> bool);
 
     /// `password open` over a closed vault: opens `doc` and publishes it, each request in
     /// `waiting` that the person at `terminal` lets in ([`admit_on_opening`]; none without one)
-    /// a machine in the same publish. Each is recorded as the open vault's approver records the
-    /// same admission (`Open`, never `Manual`: the prompt checks no code; through
-    /// [`client::admin_publish_opened`]), so in a vault with Commons control the publish shares
-    /// the control entry with it and it enrolls, as a machine the approver lets in does.
+    /// a machine in the same publish. Each is recorded as an open admission (`Open`, never
+    /// `Manual`: the prompt checks no code; through [`client::admin_publish_opened`]), so in a
+    /// vault with Commons control the publish shares the control entry with it and it enrolls.
     pub(super) fn open_vault(
         paths: &Paths,
         admin: &client::Admin,
@@ -3397,12 +3402,12 @@ mod unix {
     /// Render the queue after authenticated membership filtering. Administrator
     /// metadata is needed only to describe code-only holds.
     pub(super) fn requests_json(
-        pending: &[client::Request],
+        inspection: &client::RequestInspection,
         doc: Option<&text::Document>,
-        known_members_filtered: bool,
     ) -> aterm_json::Value {
         let code_only = doc.map(text::Document::code_only);
-        let requests: Vec<_> = pending
+        let requests: Vec<_> = inspection
+            .requests
             .iter()
             .map(|request| {
                 aterm_json::json!({
@@ -3410,7 +3415,6 @@ mod unix {
                     "host": request.host,
                     "code": request.code,
                     "requested_at": request.at,
-                    "lan_observed": request.home.is_some(),
                     "member_allow_present": request.allowed.is_some(),
                     "password_proof_present": request.proof.is_some(),
                     "code_only": code_only.as_ref().map(|keys| keys.contains(&request.recipient)),
@@ -3420,17 +3424,22 @@ mod unix {
         aterm_json::json!({
             "schema": 1,
             "kind": "vault-join-requests",
-            "scope": "configured-vault-source",
-            "known_members_filtered": known_members_filtered,
+            "scope": "observed-vault-queue",
+            "known_members_filtered": inspection.known_members_filtered,
+            "queue": {
+                "source": inspection.queue_source,
+                "server_address": inspection.queue_server.map(|ip| ip.to_string()),
+                "version": inspection.queue_version,
+            },
             "requests": requests,
         })
     }
 
     fn requests(paths: &Paths, json: bool) -> crate::Result<ExitCode> {
         let admin = client::admin_open(paths).ok();
-        let (pending, filtered) = client::inspect_requests(paths, admin.as_ref().map(|a| &a.doc))?;
+        let inspection = client::inspect_requests(paths, admin.as_ref().map(|a| &a.doc))?;
         if json {
-            let value = requests_json(&pending, admin.as_ref().map(|a| &a.doc), filtered);
+            let value = requests_json(&inspection, admin.as_ref().map(|a| &a.doc));
             println!(
                 "{}",
                 aterm_json::to_string(&value)
@@ -3443,8 +3452,20 @@ mod unix {
             .map(|a| a.doc.code_only())
             .unwrap_or_default();
         let mark = admin.as_ref().map_or(CODE_ONLY_MARK, |a| held_mark(&a.doc));
+        if let Some(source) = inspection.queue_source.as_deref() {
+            if let Some(server) = inspection.queue_server {
+                println!("queue: {source} (answered by {server})");
+            } else {
+                println!("queue: {source} (server address unobserved)");
+            }
+        }
+        let pending = inspection.requests;
         if pending.is_empty() {
-            println!("no machines are asking to join");
+            if inspection.queue_source.is_some() {
+                println!("no pending requests in the observed queue");
+            } else {
+                println!("this source has no network join queue");
+            }
         }
         for request in pending {
             let when = request.at.map(ago).unwrap_or_default();
@@ -3472,20 +3493,69 @@ mod unix {
         all: bool,
         name: Option<String>,
     ) -> crate::Result<ExitCode> {
+        let (mut say, mut agree) = (
+            |line: String| eprintln!("{line}"),
+            |question: &str| yes(ask(question)),
+        );
+        approve_with_terminal(
+            paths,
+            which,
+            all,
+            name,
+            interactive().then_some((&mut say, &mut agree)),
+        )
+    }
+
+    /// The same approval and publication as [`approve`], with its terminal supplied by the
+    /// caller. A bulk approval requires an affirmative answer; explicit codes need no terminal.
+    pub(super) fn approve_with_terminal(
+        paths: &Paths,
+        which: &[String],
+        all: bool,
+        name: Option<String>,
+        terminal: Option<Terminal<'_>>,
+    ) -> crate::Result<ExitCode> {
         let admin = client::admin_open(paths)?;
         let mut doc = admin.doc.clone();
-        let pending = client::requests(paths, Some(&doc))?;
+        // A named code can approve a recipient already present in the document: a plain
+        // document edit grants no admission provenance. Bulk approval keeps its pending-only
+        // meaning, rather than renewing every old request the server still retains.
+        let observed = if all {
+            client::all_requests_for_approval(&admin)?
+        } else {
+            let targets: Vec<_> = which
+                .iter()
+                .filter(|word| !word.starts_with("age1"))
+                .map(|code| client::ApprovalTarget::Code(code))
+                .collect();
+            client::requests_for_approval(&admin, &targets)?
+        };
+        let mut pending = observed.requests.clone();
+        if all {
+            let known: std::collections::BTreeSet<_> = doc
+                .machines()
+                .into_iter()
+                .map(|machine| machine.recipient)
+                .collect();
+            pending.retain(|request| !known.contains(&request.recipient));
+            pending.sort_unstable_by(|left, right| {
+                (&left.recipient, &left.host).cmp(&(&right.recipient, &right.host))
+            });
+            pending.dedup_by(|left, right| {
+                left.recipient == right.recipient && left.host == right.host
+            });
+        }
         if all && pending.is_empty() {
             println!("no machines are asking to join");
             return Ok(ExitCode::SUCCESS);
         }
         let mut chosen = from_queue(&pending, which, all)?;
         if all {
-            if !interactive() {
+            let Some((say, agree)) = terminal else {
                 return Err(Error::new(
                     "approve --all asks for a yes at a terminal; approve each code instead",
                 ));
-            }
+            };
             let code_only = doc.code_only();
             let mark = held_mark(&doc);
             for request in &pending {
@@ -3494,16 +3564,16 @@ mod unix {
                 } else {
                     ""
                 };
-                eprintln!(
+                say(format!(
                     "  {}  code {}  {}{held}",
                     request.host, request.code, request.recipient
-                );
+                ));
             }
             let question = format!(
                 "Approve these {} machines? Each one reads every [everyone] secret. Compare each code with the one its machine shows. [y/N] ",
-                pending.len()
+                chosen.len()
             );
-            if !yes(ask(&question)) {
+            if !agree(&question) {
                 println!("nothing approved");
                 return Ok(ExitCode::FAILURE);
             }
@@ -3548,7 +3618,7 @@ mod unix {
         }
         let done = client::admin_publish_approved(paths, &admin, &doc, &recipients)?;
         // Bookkeeping only: the approver records the requests too once it reads this version.
-        let _ = client::record_approved(paths, &pending, &recipients);
+        let _ = client::record_approved(paths, &observed.requests, &recipients, observed.complete);
         Ok(published(
             &format!("approved {}", approved.join(", ")),
             &done,
@@ -3593,11 +3663,14 @@ mod unix {
             picked.extend(pending);
         }
         for code in which.iter().filter(|word| !word.starts_with("age1")) {
-            let request = pending.iter().find(|r| &r.code == code).ok_or_else(|| {
-                Error::new(format!(
-                    "no machine waiting to join has code {code} (aterm secrets requests)"
-                ))
-            })?;
+            let request = pending
+                .iter()
+                .find(|r| r.code.eq_ignore_ascii_case(code))
+                .ok_or_else(|| {
+                    Error::new(format!(
+                        "no machine waiting to join has code {code} (aterm secrets requests)"
+                    ))
+                })?;
             picked.push(request);
         }
         let mut chosen = Vec::with_capacity(picked.len());
@@ -3682,7 +3755,7 @@ mod unix {
                     retirement.recipients, retirement.bindings
                 );
             }
-            if done.fleet_code_rotated {
+            if done.revocation.fleet_code_rotated {
                 println!("rotated aterm-fleet-code in [everyone].");
             }
             if let Some(held) = held {
@@ -3698,6 +3771,9 @@ mod unix {
                 "Commons membership permanently retired ({} recipients, {} prior device bindings).",
                 retirement.recipients, retirement.bindings
             );
+        }
+        if done.fleet_code_rotated {
+            println!("rotated aterm-fleet-code in [everyone].");
         }
         if let Some(held) = held {
             println!("{held}");
@@ -3873,7 +3949,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn join_requests_report_server_observations_without_disclosing_proofs() {
+    fn join_requests_report_the_answering_queue_without_disclosing_proofs() {
         let request = crate::client::Request {
             recipient: crate::age::Identity::from_secret_bytes([41; 32])
                 .recipient()
@@ -3881,16 +3957,32 @@ mod tests {
             host: "new-machine".into(),
             code: "abcd-efgh-ijkl-mnop".into(),
             at: Some(1793460000),
-            home: Some(crate::home_lan::HomeTag::test()),
             allowed: Some("private-member-allow".into()),
             proof: Some("private-password-proof".into()),
         };
-        let report = unix::requests_json(&[request], None, false);
+        let inspection = crate::client::RequestInspection {
+            requests: vec![request],
+            queue_source: Some("https://queue.example/v1/team".into()),
+            queue_server: Some("192.0.2.7".parse().unwrap()),
+            queue_version: Some(42),
+            ..Default::default()
+        };
+        let report = unix::requests_json(&inspection, None);
         assert_eq!(report["known_members_filtered"].as_bool(), Some(false));
+        assert_eq!(report["scope"].as_str(), Some("observed-vault-queue"));
+        assert_eq!(
+            report["queue"]["source"].as_str(),
+            Some("https://queue.example/v1/team")
+        );
+        assert_eq!(
+            report["queue"]["server_address"].as_str(),
+            Some("192.0.2.7")
+        );
+        assert_eq!(report["queue"]["version"].as_u64(), Some(42));
         let row = &report["requests"][0];
         assert_eq!(row["host"].as_str(), Some("new-machine"));
         assert_eq!(row["requested_at"].as_u64(), Some(1793460000));
-        assert_eq!(row["lan_observed"].as_bool(), Some(true));
+        assert!(row.get("lan_observed").is_none());
         assert_eq!(row["member_allow_present"].as_bool(), Some(true));
         assert_eq!(row["password_proof_present"].as_bool(), Some(true));
         assert!(row["code_only"].is_null());
@@ -3920,16 +4012,22 @@ mod tests {
                 host: "queued-machine".into(),
                 code: "abcd-efgh-ijkl-mnop".into(),
                 at: None,
-                home: None,
                 allowed: None,
                 proof: None,
             })
             .collect();
-        let report = unix::requests_json(&requests, Some(&doc), true);
+        let inspection = crate::client::RequestInspection {
+            requests,
+            known_members_filtered: true,
+            ..Default::default()
+        };
+        let report = unix::requests_json(&inspection, Some(&doc));
         assert_eq!(report["known_members_filtered"].as_bool(), Some(true));
+        assert!(report["queue"]["source"].is_null());
+        assert!(report["queue"]["server_address"].is_null());
+        assert!(report["queue"]["version"].is_null());
         assert_eq!(report["requests"][0]["code_only"].as_bool(), Some(true));
         assert_eq!(report["requests"][1]["code_only"].as_bool(), Some(false));
-        assert_eq!(report["requests"][1]["lan_observed"].as_bool(), Some(false));
         assert!(report["requests"][1]["requested_at"].is_null());
         assert_eq!(
             report["requests"][1]["member_allow_present"].as_bool(),
@@ -4076,6 +4174,8 @@ mod tests {
     fn bare_verb_is_status() {
         assert_eq!(parse(&[]), Ok(Command::Status));
         assert_eq!(parse(&words("status")), Ok(Command::Status));
+        assert_eq!(parse(&words("status --json")), Ok(Command::StatusJson));
+        assert!(parse(&words("status --json extra")).is_err());
     }
 
     #[test]
@@ -4349,7 +4449,6 @@ mod tests {
             host: host.to_owned(),
             code: String::new(),
             at: None,
-            home: None,
             allowed: None,
             proof: None,
         };
@@ -4506,7 +4605,6 @@ mod tests {
             host: host.into(),
             code: code.into(),
             at: None,
-            home: None,
             allowed: None,
             proof: None,
         };
@@ -4544,6 +4642,256 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn bulk_approval_refuses_an_incomplete_snapshot_before_asking() {
+        use crate::client;
+
+        let _answering = client::ServersAnswering::set();
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (paths, primary, mirror, _) = client::mirrored_vault_for_test(root.path(), false);
+        let crate::transport::Source::Url(primary_url) =
+            client::config(&paths).unwrap().unwrap().source
+        else {
+            unreachable!()
+        };
+        let (_, line) = client::queued_identity_for_test(root.path(), "reachable");
+        crate::transport::post_join(&primary_url, &line).unwrap();
+        let before = client::admin_open(&paths).unwrap();
+        let recorded = client::approved_recipients(&paths);
+        mirror.stop();
+
+        let (mut shown, mut questions) = (Vec::new(), 0);
+        let (mut say, mut agree) = (
+            |line| shown.push(line),
+            |_: &str| {
+                questions += 1;
+                true
+            },
+        );
+        let approved =
+            unix::approve_with_terminal(&paths, &[], true, None, Some((&mut say, &mut agree)));
+        let after = client::admin_open(&paths);
+        let after_recorded = client::approved_recipients(&paths);
+        primary.stop();
+
+        assert_eq!(
+            approved.unwrap_err().kind(),
+            crate::ErrorKind::JoinQueueIncomplete
+        );
+        assert_eq!(
+            questions, 0,
+            "an incomplete all-queue view cannot ask for approval"
+        );
+        assert!(shown.is_empty());
+        let after = after.unwrap();
+        assert_eq!(after.seq(), before.seq());
+        assert_eq!(after.doc.render(), before.doc.render());
+        assert_eq!(after_recorded, recorded);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bulk_approval_displays_and_admits_a_replicated_identity_once() {
+        use crate::client::{self, AdmissionMethod};
+
+        let _answering = client::ServersAnswering::set();
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (paths, primary, mirror, mirror_url) =
+            client::mirrored_vault_for_test(root.path(), false);
+        let crate::transport::Source::Url(primary_url) =
+            client::config(&paths).unwrap().unwrap().source
+        else {
+            unreachable!()
+        };
+        let (recipient, line) = client::queued_identity_for_test(root.path(), "replicated");
+        for (url, tag) in [(&primary_url, 1), (&mirror_url, 2)] {
+            let proof = crate::b64::encode_padded(&[tag; 32]);
+            crate::transport::post_join(url, &format!("{line} proof={proof}")).unwrap();
+        }
+        let (mut shown, mut counts) = (Vec::new(), Vec::new());
+        let (mut say, mut agree) = (
+            |line| shown.push(line),
+            |question: &str| {
+                counts.extend(
+                    question
+                        .split_whitespace()
+                        .filter_map(|word| word.parse::<usize>().ok()),
+                );
+                true
+            },
+        );
+        let approved =
+            unix::approve_with_terminal(&paths, &[], true, None, Some((&mut say, &mut agree)));
+        let after = client::admin_open(&paths);
+        let recorded = client::approved_recipients(&paths);
+        primary.stop();
+        mirror.stop();
+
+        assert_eq!(approved.unwrap(), std::process::ExitCode::SUCCESS);
+        assert_eq!(counts, [1]);
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].contains(&recipient));
+        let after = after.unwrap();
+        assert_eq!(
+            after
+                .doc
+                .machines()
+                .iter()
+                .filter(|machine| machine.recipient == recipient)
+                .count(),
+            1
+        );
+        assert_eq!(
+            after.commons_admission("replicated").unwrap().method,
+            AdmissionMethod::Manual
+        );
+        assert_eq!(
+            recorded,
+            [recipient.clone(), recipient],
+            "both distinct proof observations survive bookkeeping"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bulk_approval_keeps_answers_for_known_members_omitted_from_the_prompt() {
+        use crate::client::{self, AdmissionMethod};
+
+        let _answering = client::ServersAnswering::set();
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (paths, primary, mirror, mirror_url) =
+            client::mirrored_vault_for_test(root.path(), false);
+        let crate::transport::Source::Url(primary_url) =
+            client::config(&paths).unwrap().unwrap().source
+        else {
+            unreachable!()
+        };
+        let (known, known_line) = client::queued_identity_for_test(root.path(), "known");
+        crate::transport::post_join(&primary_url, &known_line).unwrap();
+        client::approve_request(&paths, &known).unwrap();
+        let before = client::admin_open(&paths).unwrap();
+        let known_admission = before.commons_admission("known").unwrap();
+        assert_eq!(
+            client::approved_recipients(&paths).as_slice(),
+            std::slice::from_ref(&known)
+        );
+        let (pending, pending_line) = client::queued_identity_for_test(root.path(), "pending");
+        crate::transport::post_join(&mirror_url, &pending_line).unwrap();
+
+        let mut shown = Vec::new();
+        let (mut say, mut agree) = (|line| shown.push(line), |_: &str| true);
+        let approved =
+            unix::approve_with_terminal(&paths, &[], true, None, Some((&mut say, &mut agree)));
+        let after = client::admin_open(&paths);
+        let recorded = client::approved_recipients(&paths);
+        primary.stop();
+        mirror.stop();
+
+        assert_eq!(approved.unwrap(), std::process::ExitCode::SUCCESS);
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].contains(&pending) && !shown[0].contains(&known));
+        let after = after.unwrap();
+        assert_eq!(after.commons_admission("known").unwrap(), known_admission);
+        assert_eq!(
+            after.commons_admission("pending").unwrap().method,
+            AdmissionMethod::Manual
+        );
+        assert_eq!(
+            recorded
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([known, pending])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bulk_approval_decline_and_missing_terminal_leave_the_vault_unchanged() {
+        use crate::client;
+
+        let _answering = client::ServersAnswering::set();
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (paths, primary, mirror, mirror_url) =
+            client::mirrored_vault_for_test(root.path(), false);
+        let (_, line) = client::queued_identity_for_test(root.path(), "waiting");
+        crate::transport::post_join(&mirror_url, &line).unwrap();
+        let before = client::admin_open(&paths).unwrap();
+        let recorded = client::approved_recipients(&paths);
+
+        let mut questions = 0;
+        let (mut say, mut decline) = (
+            |_: String| {},
+            |_: &str| {
+                questions += 1;
+                false
+            },
+        );
+        let declined =
+            unix::approve_with_terminal(&paths, &[], true, None, Some((&mut say, &mut decline)));
+        let after_decline = client::admin_open(&paths);
+        let missing_terminal = unix::approve_with_terminal(&paths, &[], true, None, None);
+        let after_missing = client::admin_open(&paths);
+        let after_recorded = client::approved_recipients(&paths);
+        primary.stop();
+        mirror.stop();
+
+        assert_eq!(declined.unwrap(), std::process::ExitCode::FAILURE);
+        assert_eq!(questions, 1);
+        assert!(missing_terminal.is_err());
+        for after in [after_decline, after_missing] {
+            let after = after.unwrap();
+            assert_eq!(after.seq(), before.seq());
+            assert_eq!(after.doc.render(), before.doc.render());
+        }
+        assert_eq!(after_recorded, recorded);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bulk_approval_refuses_conflicting_names_across_queues_without_asking() {
+        use crate::client;
+
+        let _answering = client::ServersAnswering::set();
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (paths, primary, mirror, mirror_url) =
+            client::mirrored_vault_for_test(root.path(), false);
+        let crate::transport::Source::Url(primary_url) =
+            client::config(&paths).unwrap().unwrap().source
+        else {
+            unreachable!()
+        };
+        let (recipient, line) = client::queued_identity_for_test(root.path(), "first-name");
+        let code = client::join_code(&crate::age::Recipient::parse(&recipient).unwrap());
+        crate::transport::post_join(&primary_url, &line).unwrap();
+        crate::transport::post_join(&mirror_url, &format!("{recipient} second-name {code}"))
+            .unwrap();
+        let before = client::admin_open(&paths).unwrap();
+
+        let (mut shown, mut questions) = (Vec::new(), 0);
+        let (mut say, mut agree) = (
+            |line| shown.push(line),
+            |_: &str| {
+                questions += 1;
+                true
+            },
+        );
+        let approved =
+            unix::approve_with_terminal(&paths, &[], true, None, Some((&mut say, &mut agree)));
+        let after = client::admin_open(&paths);
+        let recorded = client::approved_recipients(&paths);
+        primary.stop();
+        mirror.stop();
+
+        assert!(approved.is_err());
+        assert_eq!(questions, 0);
+        assert!(shown.is_empty());
+        let after = after.unwrap();
+        assert_eq!(after.seq(), before.seq());
+        assert_eq!(after.doc.render(), before.doc.render());
+        assert!(recorded.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn explicit_approval_can_record_existing_recipient_without_duplicating_machine() {
         use crate::client::{self, AdmissionMethod, Paths};
         let root = aterm_tempfile::tempdir().unwrap();
@@ -4574,14 +4922,14 @@ mod tests {
         assert_eq!(client::admin_open(&paths).unwrap().seq(), 3);
     }
 
-    /// `password open` at a terminal records each machine it lets in as the open vault's
-    /// approver records the same admission (`Open`; the prompt checks no code), so in a vault
-    /// with Commons control the same publish puts it in the control entry's audience.
+    /// `password open` at a terminal records each machine it lets in as an open admission
+    /// (`Open`; the prompt checks no code), so in a vault with Commons control the same publish
+    /// puts it in the control entry's audience.
     /// CONTROL: a machine a plain publish adds gets no decision and stays outside, opening with
     /// no terminal lets nothing in, and a closed vault records no open admission.
     #[cfg(unix)]
     #[test]
-    fn opening_at_a_terminal_records_each_machine_it_lets_in_as_the_approver_does() {
+    fn opening_at_a_terminal_records_each_machine_it_lets_in_as_an_open_admission() {
         use crate::client::{self, AdmissionMethod};
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let paths = admin_of_a_path_vault(root.path());
@@ -4595,7 +4943,6 @@ mod tests {
             host: host.to_owned(),
             code: String::new(),
             at: None,
-            home: None,
             allowed: None,
             proof: None,
         };
@@ -4702,6 +5049,388 @@ mod tests {
         );
         assert_eq!(client::approved_recipients(&paths), [key]);
         server.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approving_by_code_records_admission_for_an_existing_document_recipient() {
+        use crate::client::{self, AdmissionMethod, Paths};
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let server = crate::server::start(
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind"),
+            &crate::server::Options {
+                listen: "127.0.0.1:0".parse().expect("addr"),
+                store: root.path().join("store"),
+                advertise: None,
+                pins: Vec::new(),
+                hold: std::time::Duration::from_millis(200),
+                keep_awake: false,
+            },
+        )
+        .expect("a loopback server");
+        let paths = Paths::for_home(&root.path().join("m1"));
+        let url = format!("http://{}/v1/team", server.addr);
+        client::create(&paths, &url, None, Some("m1")).expect("create");
+        let recipient = crate::age::Identity::from_secret_bytes([38; 32]).recipient();
+        let code = client::join_code(&recipient);
+        let key = recipient.to_bech32();
+        crate::transport::post_join(&url, &format!("{key} m2 {code}")).expect("queued");
+
+        let admin = client::admin_open(&paths).expect("open");
+        let mut doc = admin.doc.clone();
+        doc.add_machine("m2", &key).expect("document recipient");
+        client::admin_publish(&paths, &admin, &doc).expect("plain publish");
+        let admin = client::admin_open(&paths).expect("open");
+        assert!(
+            admin.commons_admission("m2").is_none(),
+            "a plain document edit grants no admission"
+        );
+        assert!(
+            client::requests(&paths, Some(&admin.doc))
+                .expect("unpublished requests")
+                .is_empty(),
+            "bulk approval has no unpublished recipient"
+        );
+
+        assert_eq!(
+            unix::approve(&paths, &[code], false, None).expect("approve existing recipient"),
+            std::process::ExitCode::SUCCESS
+        );
+        let admin = client::admin_open(&paths).expect("open");
+        assert_eq!(admin.doc.machines().len(), 2);
+        assert_eq!(
+            admin.commons_admission("m2").expect("approved").method,
+            AdmissionMethod::Manual
+        );
+        assert_eq!(client::approved_recipients(&paths), [key]);
+        server.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_direct_key_approval_preserves_earlier_queue_answers() {
+        use crate::client::{self, AdmissionMethod};
+
+        let _answering = client::ServersAnswering::set();
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (paths, primary, mirror, mirror_url) =
+            client::mirrored_vault_for_test(root.path(), false);
+        let (earlier, line) =
+            client::queued_identity_for_test(root.path(), "earlier-queue-request");
+        crate::transport::post_join(&mirror_url, &line).unwrap();
+        client::approve_request(&paths, &earlier).unwrap();
+        let recorded_before = client::approved_recipients(&paths);
+        assert_eq!(recorded_before, [earlier]);
+        let (direct, _) = client::queued_identity_for_test(root.path(), "direct-key");
+
+        let approved = unix::approve(
+            &paths,
+            std::slice::from_ref(&direct),
+            false,
+            Some("direct-key".into()),
+        );
+        let after = client::admin_open(&paths);
+        let recorded_after = client::approved_recipients(&paths);
+        primary.stop();
+        mirror.stop();
+
+        assert_eq!(approved.unwrap(), std::process::ExitCode::SUCCESS);
+        let after = after.unwrap();
+        assert!(
+            after
+                .doc
+                .machines()
+                .iter()
+                .any(|machine| machine.recipient == direct && machine.name == "direct-key")
+        );
+        assert_eq!(
+            after.commons_admission("direct-key").unwrap().method,
+            AdmissionMethod::Manual
+        );
+        assert_eq!(
+            recorded_after, recorded_before,
+            "an approval that observed no queue leaves prior answers intact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bulk_approval_includes_every_verified_queue() {
+        use crate::client::{self, AdmissionMethod};
+
+        let _answering = client::ServersAnswering::set();
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (paths, primary, mirror, mirror_url) =
+            client::mirrored_vault_for_test(root.path(), false);
+        let crate::transport::Source::Url(primary_url) =
+            client::config(&paths).unwrap().unwrap().source
+        else {
+            unreachable!()
+        };
+        let (primary_key, primary_line) =
+            client::queued_identity_for_test(root.path(), "primary-only");
+        let (mirror_key, mirror_line) =
+            client::queued_identity_for_test(root.path(), "mirror-only");
+        crate::transport::post_join(&primary_url, &primary_line).unwrap();
+        crate::transport::post_join(&mirror_url, &mirror_line).unwrap();
+
+        let mut confirmations = 0;
+        let (mut say, mut agree) = (
+            |_: String| {},
+            |_: &str| {
+                confirmations += 1;
+                true
+            },
+        );
+        let approved =
+            unix::approve_with_terminal(&paths, &[], true, None, Some((&mut say, &mut agree)));
+        let after = client::admin_open(&paths);
+        primary.stop();
+        mirror.stop();
+
+        assert_eq!(approved.unwrap(), std::process::ExitCode::SUCCESS);
+        assert_eq!(confirmations, 1);
+        let after = after.unwrap();
+        let expected = std::collections::BTreeSet::from([primary_key, mirror_key]);
+        let admitted: std::collections::BTreeSet<_> = after
+            .doc
+            .machines()
+            .into_iter()
+            .map(|machine| machine.recipient)
+            .filter(|recipient| expected.contains(recipient))
+            .collect();
+        assert_eq!(admitted, expected);
+        for machine in after.doc.machines() {
+            if expected.contains(&machine.recipient) {
+                assert_eq!(
+                    after.commons_admission(&machine.name).unwrap().method,
+                    AdmissionMethod::Manual
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_listed_code_is_approved_when_another_queue_gets_the_next_turn() {
+        use crate::client::{self, AdmissionMethod};
+        let _answering = client::ServersAnswering::set();
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (paths, primary, mirror, mirror_url) =
+            client::mirrored_vault_for_test(root.path(), false);
+        let crate::transport::Source::Url(primary_url) =
+            client::config(&paths).unwrap().unwrap().source
+        else {
+            unreachable!()
+        };
+        let (primary_key, primary_line) =
+            client::queued_identity_for_test(root.path(), "primary-only");
+        let (mirror_key, mirror_line) =
+            client::queued_identity_for_test(root.path(), "mirror-only");
+        crate::transport::post_join(&primary_url, &primary_line).unwrap();
+        crate::transport::post_join(&mirror_url, &mirror_line).unwrap();
+        let admin = client::admin_open(&paths).unwrap();
+        let inspection = client::inspect_requests(&paths, Some(&admin.doc)).unwrap();
+        let listing = unix::requests_json(&inspection, Some(&admin.doc));
+        assert_eq!(inspection.requests.len(), 1);
+        let listed = &inspection.requests[0];
+        assert_eq!(
+            listing["requests"][0]["code"].as_str(),
+            Some(listed.code.as_str())
+        );
+        assert_eq!(
+            listing["requests"][0]["recipient"].as_str(),
+            Some(listed.recipient.as_str())
+        );
+        let other = if listed.recipient == primary_key {
+            mirror_key
+        } else {
+            assert_eq!(listed.recipient, mirror_key);
+            primary_key
+        };
+        let approved = unix::approve(&paths, std::slice::from_ref(&listed.code), false, None);
+        let after = client::admin_open(&paths);
+        primary.stop();
+        mirror.stop();
+        assert_eq!(approved.unwrap(), std::process::ExitCode::SUCCESS);
+        let after = after.unwrap();
+        let member = after
+            .doc
+            .machines()
+            .into_iter()
+            .find(|machine| machine.recipient == listed.recipient)
+            .expect("the listed recipient was approved");
+        assert_eq!(
+            after.commons_admission(&member.name).unwrap().method,
+            AdmissionMethod::Manual
+        );
+        assert!(
+            !after
+                .doc
+                .machines()
+                .iter()
+                .any(|machine| machine.recipient == other)
+        );
+    }
+
+    #[cfg(unix)]
+    fn set_opening_queue_policy(
+        paths: &crate::client::Paths,
+        mirror: &str,
+        audience: crate::text::Audience,
+        conditional: bool,
+    ) {
+        let admin = crate::client::admin_open(paths).unwrap();
+        let policy = admin
+            .doc
+            .entry(&crate::text::Audience::Everyone, crate::SWARM_POLICY_ENTRY)
+            .unwrap()
+            .value
+            .as_slice()
+            .to_vec();
+        let mut doc = admin.doc.clone();
+        assert!(
+            doc.unset_entry(&crate::text::Audience::Everyone, crate::SWARM_POLICY_ENTRY)
+                .unwrap()
+        );
+        doc.set_entry_with(
+            &audience,
+            crate::SWARM_POLICY_ENTRY,
+            &policy,
+            conditional,
+            None,
+        )
+        .unwrap();
+        crate::client::admin_publish(paths, &admin, &doc).unwrap();
+        crate::transport::publish(
+            &crate::transport::Source::Url(mirror.to_owned()),
+            &std::fs::read(paths.cache_file()).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_declined_opening_holds_all_queues(host_scoped: bool) {
+        use crate::client;
+        use std::collections::BTreeSet;
+
+        let _answering = client::ServersAnswering::set();
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (paths, primary, mirror, mirror_url) =
+            client::mirrored_vault_for_test(root.path(), true);
+        let crate::transport::Source::Url(primary_url) =
+            client::config(&paths).unwrap().unwrap().source
+        else {
+            unreachable!()
+        };
+        if host_scoped {
+            set_opening_queue_policy(
+                &paths,
+                &mirror_url,
+                crate::text::Audience::Hosts(vec!["admin".into()]),
+                false,
+            );
+        }
+        let (primary_key, primary_line) =
+            client::queued_identity_for_test(root.path(), "primary-only");
+        let (mirror_key, mirror_line) =
+            client::queued_identity_for_test(root.path(), "mirror-only");
+        crate::transport::post_join(&primary_url, &primary_line).unwrap();
+        crate::transport::post_join(&mirror_url, &mirror_line).unwrap();
+
+        let admin = client::admin_open(&paths).unwrap();
+        assert!(!admin.doc.open());
+        let waiting = client::requests(&paths, Some(&admin.doc)).unwrap();
+        assert!(
+            !waiting.is_empty(),
+            "the opening prompt has a request to decline"
+        );
+        let mut doc = admin.doc.clone();
+        let mut questions = 0;
+        let mut say = |_: String| {};
+        let mut decline = |_: &str| {
+            questions += 1;
+            false
+        };
+        let opened = unix::open_vault(
+            &paths,
+            &admin,
+            &mut doc,
+            waiting,
+            Some((&mut say, &mut decline)),
+        );
+        let after = client::admin_open(&paths);
+        primary.stop();
+        mirror.stop();
+
+        opened.unwrap();
+        assert_eq!(
+            questions, 1,
+            "opening explicitly declined the offered requests"
+        );
+        let after = after.unwrap();
+        assert!(after.doc.open());
+        assert_eq!(
+            after.doc.code_only().into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([primary_key.clone(), mirror_key.clone()]),
+            "opening must keep both waiting identities behind explicit code approval"
+        );
+        assert!(
+            after.doc.machines().iter().all(|machine| {
+                machine.recipient != primary_key && machine.recipient != mirror_key
+            }),
+            "declining the prompt admits neither waiting identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_after_declining_requests_holds_every_verified_queue() {
+        assert_declined_opening_holds_all_queues(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_holds_queues_from_a_host_scoped_policy() {
+        assert_declined_opening_holds_all_queues(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_refuses_a_conditional_queue_policy_without_publication() {
+        use crate::client;
+
+        let _answering = client::ServersAnswering::set();
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (paths, primary, mirror, mirror_url) =
+            client::mirrored_vault_for_test(root.path(), true);
+        set_opening_queue_policy(&paths, &mirror_url, crate::text::Audience::Everyone, true);
+        let crate::transport::Source::Url(primary_url) =
+            client::config(&paths).unwrap().unwrap().source
+        else {
+            unreachable!()
+        };
+        for (url, host) in [(&primary_url, "primary-only"), (&mirror_url, "mirror-only")] {
+            let (_, line) = client::queued_identity_for_test(root.path(), host);
+            crate::transport::post_join(url, &line).unwrap();
+        }
+        let admin = client::admin_open(&paths).unwrap();
+        assert!(!admin.doc.open());
+        let before = admin.doc.render();
+        let mut doc = admin.doc.clone();
+        let opened = unix::open_vault(&paths, &admin, &mut doc, Vec::new(), None);
+        let after = client::admin_open(&paths);
+        primary.stop();
+        mirror.stop();
+
+        assert!(
+            opened.is_err(),
+            "conditional policy cannot establish all waiting identities"
+        );
+        let after = after.unwrap();
+        assert_eq!(after.seq(), admin.seq());
+        assert!(!after.doc.open());
+        assert_eq!(after.doc.render().as_slice(), before.as_slice());
     }
 
     #[test]

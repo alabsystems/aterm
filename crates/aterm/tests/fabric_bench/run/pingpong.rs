@@ -14,9 +14,9 @@ use aterm_types::wait_tally::{HANDLER_FILE, HANDLER_SEAM, HandlerRow, HandlerTal
 
 use super::{
     DEADLINE, FLEET, Row, Ruler, Ticks, World, await_durable, await_note, boot_world, bystanders,
-    calibrate, flushes_between, flushes_json, fmt_x, list_since, ms, ms_opt, newest_id, per_unit,
-    post, sampled, served_line, stop_and_read, ticks, ticks_between, ticks_json, ticks_line,
-    wait_live, yardstick, yardstick_json, yardstick_rows,
+    calibrate, flushes_between, flushes_json, fmt_x, listing_since, ms, ms_opt, newest_id,
+    per_unit, post, rows_of, sampled, served_line, stop_and_read, ticks, ticks_between, ticks_json,
+    ticks_line, wait_live, yardstick, yardstick_json, yardstick_rows,
 };
 use crate::census;
 use crate::clock::Clock;
@@ -35,13 +35,15 @@ struct Round {
     /// A's post: before the request, after its `OK`.
     t_call: u64,
     t_ret: u64,
-    /// B's `await inbox` answering with the ping.
+    /// B's `await inbox` answering with the ping, and its `inbox` listing it.
     t_b_seen: u64,
+    t_b_listed: u64,
     /// B's post of the reply: before the request, after its `OK`.
     t_b_call: u64,
     t_b_ret: u64,
-    /// A's `await inbox` answering with the reply.
+    /// A's `await inbox` answering with the reply, and its `inbox` listing it.
     t_a_seen: u64,
+    t_a_listed: u64,
     /// The rows' `off=`: each message's record offset.
     ping_off: u64,
     pong_off: u64,
@@ -82,18 +84,20 @@ fn one_round(
     let ping = format!("ping-{i}");
     let pong = format!("pong-{i}");
     let (t_call, t_ret) = post(ctl, clock, a, b, &ping);
-    let (ping_row, t_b_seen) = woke_with(ctl, clock, b, b_since, &ping);
+    let (ping_row, t_b_seen, t_b_listed) = woke_with(ctl, clock, b, b_since, &ping);
     let (t_b_call, t_b_ret) = post(ctl, clock, b, a, &pong);
-    let (pong_row, t_a_seen) = woke_with(ctl, clock, a, a_since, &pong);
+    let (pong_row, t_a_seen, t_a_listed) = woke_with(ctl, clock, a, a_since, &pong);
     Round {
         ping,
         pong,
         t_call,
         t_ret,
         t_b_seen,
+        t_b_listed,
         t_b_call,
         t_b_ret,
         t_a_seen,
+        t_a_listed,
         ping_off: ping_row.off,
         pong_off: pong_row.off,
     }
@@ -158,22 +162,30 @@ fn handler_tally(ctl: &mut Ctl, path: &Path, pid: u32, sid: &str, since: u64) ->
 }
 
 /// Park on `sid`'s inbox for the round's one message, `text`, and list it:
-/// `(its row, the stamp when the wait answered)`.
+/// `(its row, the stamp when the wait answered, the stamp when the listing answered)`.
 ///
 /// # Panics
 ///
 /// A wait that timed out, or a wake that was not exactly `text`: a stray, or a
 /// repeat, would be timed as the reply.
-fn woke_with(ctl: &mut Ctl, clock: Clock, sid: &str, since: &mut u64, text: &str) -> (Row, u64) {
+fn woke_with(
+    ctl: &mut Ctl,
+    clock: Clock,
+    sid: &str,
+    since: &mut u64,
+    text: &str,
+) -> (Row, u64, u64) {
     let (woke_at, t) =
         await_note(ctl, clock, sid, *since).unwrap_or_else(|e| panic!("`{text}`: {e}"));
-    let rows = list_since(ctl, sid, *since);
+    let reply = listing_since(ctl, sid, *since);
+    let listed = clock.us();
+    let rows = rows_of(&reply);
     assert!(
         rows.len() == 1 && rows[0].text == text && rows[0].id == woke_at,
         "`{text}`: @{sid} woke at row {woke_at} and listed {rows:?}"
     );
     *since = woke_at;
-    (rows[0].clone(), t)
+    (rows[0].clone(), t, listed)
 }
 
 fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &str) -> Raw {
@@ -559,16 +571,22 @@ fn tally_json(d: &Tally, n: usize, rt: Option<f64>) -> Value {
     })
 }
 
-/// A window's park beside the bench's own spans, each a mean per round trip in ms: the bench's
-/// turn (which a real agent replaces), aterm's answer to `post` with its socket, and what is left,
+/// A window's park beside the bench's own spans, each a mean per round trip in ms: aterm's answer
+/// to the `inbox` listing a wake is followed by (a real agent lists too) and to `post`, each with
+/// its socket, the bench's own turn between them (which a real agent replaces), and what is left,
 /// wakes and idle. The loop may be working through part of a span, so [`ParkSplit::rest`] can read
 /// below zero; the spans are measured beside the park, not inside it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ParkSplit {
     park: f64,
-    /// B's wake to its post's request: its listing and its turn.
+    /// B's wake to its listing's reply.
+    b_list: f64,
+    /// B's listing's reply to its post's request: the bench's own turn.
     b_turn: f64,
-    /// A's wake to its next post's request (outside the round trip; [`PACE`] included when paced).
+    /// A's wake to its listing's reply (outside the round trip).
+    a_list: f64,
+    /// A's listing's reply to its next post's request: the bench's own turn (outside the round
+    /// trip; [`PACE`] included when paced).
     a_turn: f64,
     /// A's post, request to reply.
     a_post: f64,
@@ -594,10 +612,12 @@ impl ParkSplit {
         };
         Some(ParkSplit {
             park: per(ns_ms(park_ns)),
-            b_turn: span(|r| (r.t_b_seen, r.t_b_call)),
+            b_list: span(|r| (r.t_b_seen, r.t_b_listed)),
+            b_turn: span(|r| (r.t_b_listed, r.t_b_call)),
+            a_list: span(|r| (r.t_a_seen, r.t_a_listed)),
             a_turn: per(rounds
                 .windows(2)
-                .map(|w| ms(w[0].t_a_seen, w[1].t_call))
+                .map(|w| ms(w[0].t_a_listed, w[1].t_call))
                 .sum::<f64>()),
             a_post: span(|r| (r.t_call, r.t_ret)),
             b_post: span(|r| (r.t_b_call, r.t_b_ret)),
@@ -605,7 +625,13 @@ impl ParkSplit {
     }
 
     fn rest(&self) -> f64 {
-        self.park - self.b_turn - self.a_turn - self.a_post - self.b_post
+        self.park
+            - self.b_list
+            - self.b_turn
+            - self.a_list
+            - self.a_turn
+            - self.a_post
+            - self.b_post
     }
 
     fn rows(&self) -> Vec<String> {
@@ -617,11 +643,21 @@ impl ParkSplit {
                 self.park
             ),
             format!(
-                "| the bench's turn: B's wake to its post | {:.3} |",
+                "| aterm's answer to B's `inbox` after its wake, with its socket | {:.3} |",
+                self.b_list
+            ),
+            format!(
+                "| the bench's own turn: B's listing to its post | {:.3} |",
                 self.b_turn
             ),
             format!(
-                "| the bench's turn: A's wake to its next post (outside the round trip) | {:.3} |",
+                "| aterm's answer to A's `inbox` after its wake, with its socket (outside the round \
+                 trip) | {:.3} |",
+                self.a_list
+            ),
+            format!(
+                "| the bench's own turn: A's listing to its next post (outside the round trip) | \
+                 {:.3} |",
                 self.a_turn
             ),
             format!(
@@ -642,9 +678,11 @@ impl ParkSplit {
 
     fn json(&self) -> Value {
         json!({
-            "what": "means per round trip in ms, beside the park rather than inside it: the bench's turn (which a real agent replaces), aterm's answer to post with its socket, and the rest, wakes and idle; the loop may be working through part of a span, so the rest can read below zero",
+            "what": "means per round trip in ms, beside the park rather than inside it: aterm's answer to the inbox listing after a wake and to post, each with its socket (b_list, a_list, a_post, b_post), the bench's own turn between them (b_turn, a_turn: which a real agent replaces), and the rest, wakes and idle; the loop may be working through part of a span, so the rest can read below zero",
             "park": stats::round3(self.park),
+            "b_list": stats::round3(self.b_list),
             "b_turn": stats::round3(self.b_turn),
+            "a_list": stats::round3(self.a_list),
             "a_turn": stats::round3(self.a_turn),
             "a_post": stats::round3(self.a_post),
             "b_post": stats::round3(self.b_post),
@@ -668,7 +706,29 @@ const fn describe_handler(row: HandlerRow) -> &'static str {
         HandlerRow::Inbox => "`inbox`, the listing",
         HandlerRow::AwaitArm => "`await inbox`: entry to its first park",
         HandlerRow::AwaitWake => "`await inbox`: the row in the ring to the answer",
+        HandlerRow::FleetMail => {
+            "of `inbox`, `await inbox` and a direct post: a fleet-mailbox transaction"
+        }
     }
+}
+
+/// The bound of the log2 band that holds the nearest-rank `q` quantile of `h`'s values, in µs:
+/// the value is below it and, past the first band, at least half of it. The first band holds
+/// everything under its bound, zero included; the last band has no bound, only a floor.
+fn band_quantile(h: &Hist, q: f64) -> String {
+    let rank = ((q * h.count as f64).ceil() as u64).max(1);
+    let mut seen = 0u64;
+    for (i, &n) in h.buckets.iter().enumerate() {
+        seen += u64::from(n);
+        if h.count > 0 && seen >= rank {
+            return if i + 1 < h.buckets.len() {
+                format!("< {:.1}", Hist::floor(i + 1, Unit::Ns) as f64 / 1e3)
+            } else {
+                format!("≥ {:.1}", Hist::floor(i, Unit::Ns) as f64 / 1e3)
+            };
+        }
+    }
+    "–".to_string()
 }
 
 /// One request, timed from outside and by aterm's handler: what lies between is the socket, the
@@ -762,15 +822,15 @@ fn handler_rows(d: &HandlerTally, n: usize) -> Vec<String> {
         }
     };
     let mut rows = vec![
-        "| aterm's handler (handler tally v=1) | count | per round trip | µs a call | ms per round \
-         trip | ≥ 1.05 ms | largest (ms) |"
+        "| aterm's handler (handler tally v=2) | count | per round trip | µs a call | p50 / p95 / \
+         p99 (µs, the log2 band's bound) | ms per round trip | ≥ 1.05 ms | largest (ms) |"
             .to_string(),
-        "|---|---:|---:|---:|---:|---:|---:|".to_string(),
+        "|---|---:|---:|---:|---:|---:|---:|---:|".to_string(),
     ];
     for row in HandlerRow::ALL {
         let h = d.row(row);
         rows.push(format!(
-            "| {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} / {} / {} | {} | {} | {} |",
             describe_handler(row),
             h.count,
             per(h.count as f64),
@@ -779,6 +839,9 @@ fn handler_rows(d: &HandlerTally, n: usize) -> Vec<String> {
             } else {
                 format!("{:.1}", h.total as f64 / h.count as f64 / 1e3)
             },
+            band_quantile(h, 0.50),
+            band_quantile(h, 0.95),
+            band_quantile(h, 0.99),
             per(ns_ms(h.total)),
             h.at_least(TAIL_1MS),
             largest(h),
@@ -857,7 +920,7 @@ fn handlers_json(d: &HandlerTally, splits: &[RequestSplit], n: usize) -> Value {
         })
         .collect();
     json!({
-        "format": "handler-tally v=1",
+        "format": "handler-tally v=2",
         "aterm_wall_ms": stats::round3(ns_ms(d.at_ns)),
         "rows": Value::Object(rows),
         "requests": requests,
@@ -971,7 +1034,10 @@ fn paced_report(raw: &Raw) -> (Value, Vec<String>) {
         stats::row("**round trip, paced**", &round_trip),
         stats::row("ping: A's post `OK` -> visible to B", &ping_leg),
         stats::row("pong: B's post `OK` -> visible to A", &pong_leg),
-        stats::row("B's turnaround (the bench: wake, list, post)", &turnaround),
+        stats::row(
+            "B's turnaround (its wake, its `inbox` listing, its post's request)",
+            &turnaround,
+        ),
         String::new(),
         format!(
             "The wait tally's rows over the paced window (the bridge's own clock: {:.1} ms, the \
@@ -1197,7 +1263,10 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         ),
         stats::row("ping: A's post `OK` -> visible to B", &ping_leg),
         stats::row("pong: B's post `OK` -> visible to A", &pong_leg),
-        stats::row("B's turnaround (the bench: wake, list, post)", &turnaround),
+        stats::row(
+            "B's turnaround (its wake, its `inbox` listing, its post's request)",
+            &turnaround,
+        ),
         stats::row("ping: post `OK` -> acked on the broker", &ping_to_acked),
         stats::row("ping: post `OK` -> durable on the broker", &ping_to_durable),
         stats::row("pong: post `OK` -> acked on the broker", &pong_to_acked),
@@ -1649,7 +1718,7 @@ mod tests {
 
     #[allow(
         dead_code,
-        reason = "a `harness = false` bench compiles `cfg(test)` but not its `#[test]`s"
+        reason = "the harness-free bench also mounts this module under cfg(test); only the ordinary fabric_bench test target uses this fixture"
     )]
     fn round(base: u64) -> super::Round {
         super::Round {
@@ -1658,9 +1727,11 @@ mod tests {
             t_call: base,
             t_ret: base + 300,
             t_b_seen: base + 1_000,
+            t_b_listed: base + 1_060,
             t_b_call: base + 1_100,
             t_b_ret: base + 1_500,
             t_a_seen: base + 2_000,
+            t_a_listed: base + 2_100,
             ping_off: 0,
             pong_off: 0,
         }
@@ -1673,18 +1744,24 @@ mod tests {
         let rounds = [round(0), round(2_400), round(4_800), round(7_200)];
         let split = ParkSplit::of(&rounds, 8_000_000).expect("four rounds");
         assert!((split.park - 2.0).abs() < 1e-9);
-        assert!((split.b_turn - 0.1).abs() < 1e-9);
+        assert!(
+            (split.b_list - 0.06).abs() < 1e-9,
+            "the listing is aterm's, not the bench's turn: {}",
+            split.b_list
+        );
+        assert!((split.b_turn - 0.04).abs() < 1e-9, "{}", split.b_turn);
+        assert!((split.a_list - 0.1).abs() < 1e-9, "{}", split.a_list);
         assert!((split.a_post - 0.3).abs() < 1e-9);
         assert!((split.b_post - 0.4).abs() < 1e-9);
         assert!(
-            (split.a_turn - 0.3).abs() < 1e-9,
-            "three gaps of 0.4 ms over four round trips: {}",
+            (split.a_turn - 0.225).abs() < 1e-9,
+            "three gaps of 0.3 ms over four round trips: {}",
             split.a_turn
         );
-        assert!((split.rest() - 0.9).abs() < 1e-9);
+        assert!((split.rest() - 0.875).abs() < 1e-9);
         let rows = split.rows();
         assert!(rows[2].contains("2.000"), "{rows:?}");
-        assert!(rows[7].ends_with("| 0.900 |"), "{rows:?}");
+        assert!(rows[9].ends_with("| 0.875 |"), "{rows:?}");
         let busy = ParkSplit::of(&rounds, 800_000).expect("four rounds");
         assert!(busy.rest() < 0.0, "the loop worked through the spans");
         assert_eq!(ParkSplit::of(&[], 800_000), None);
@@ -1745,6 +1822,29 @@ mod tests {
             rows.iter()
                 .any(|r| r.starts_with("| every other verb | 0 | – | – | – | – |")),
             "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_handler_rows_quantiles_name_the_log2_band_that_holds_them() {
+        use super::*;
+
+        let mut h = Hist::default();
+        for _ in 0..98 {
+            h.add(3_000, Unit::Ns);
+        }
+        h.add(100_000, Unit::Ns);
+        h.add(100_000, Unit::Ns);
+        assert_eq!(band_quantile(&h, 0.50), "< 4.1");
+        assert_eq!(band_quantile(&h, 0.95), "< 4.1");
+        assert_eq!(band_quantile(&h, 0.99), "< 131.1", "rank 99 of 100");
+        assert_eq!(band_quantile(&Hist::default(), 0.50), "–");
+        let mut top = Hist::default();
+        top.add(u64::MAX, Unit::Ns);
+        assert_eq!(
+            band_quantile(&top, 0.50),
+            "≥ 67108.9",
+            "the last band has no bound"
         );
     }
 

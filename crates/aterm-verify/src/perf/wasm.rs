@@ -229,7 +229,7 @@ pub(crate) fn replay(
             .map_err(|e| failed(format!("could not write {}: {e}", answers.display())))?;
         let _ = writeln!(log, "  wasm-replay: recorded {}", answers.display());
     }
-    let text = std::fs::read_to_string(&answers)
+    let text = crate::read_regular_text(&answers)
         .map_err(|e| failed(format!("could not read {}: {e}", answers.display())))?;
     let (planted, hash) = plant_frame_hash(&text)
         .ok_or_else(|| failed(format!("{}: no frame hash to plant", answers.display())))?;
@@ -369,11 +369,15 @@ fn build_and_bench(
     let mut page = Page::start(browser, &site, &std::env::temp_dir())?;
     let product = page.product().to_string();
     eprintln!("  wasm-bench: in {product}");
+    let _entry = super::measurement_entry().map_err(Refused::Timing)?;
     let ran = page.run(
         &format!("{}/bench.mjs", wasm_page::DRIVERS),
         &json!({"cpu": "../cpu/aterm_wasm.js", "gpu": "../gpu/aterm_gpu_web.js",
                 "font": format!("../{}", wasm_page::FONT)}),
     )?;
+    _entry
+        .timing_admission()
+        .map_err(|why| Refused::Timing(why.to_string()))?;
     for line in ran.console.iter().filter(|l| l.contains("wasm-bench:")) {
         eprintln!("  {line}");
     }

@@ -88,7 +88,7 @@ impl VendoredFork {
 /// Read the root `[patch.crates-io]` table as rows naming the package each replaces.
 fn patch_paths(root: &Path) -> Result<PatchTable, String> {
     let manifest = root.join("Cargo.toml");
-    let text = std::fs::read_to_string(&manifest)
+    let text = crate::read_regular_text(&manifest)
         .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
     let doc: DocumentMut = text
         .parse()
@@ -168,7 +168,7 @@ fn partition_patches(patch: &[PatchRow], root: &Path) -> Partition {
 
 /// The absorbed crates renamed off their upstream name.
 fn absorbed_members(root: &Path, patch: &[PatchRow]) -> PatchTable {
-    let text = std::fs::read_to_string(root.join("NOTICE")).unwrap_or_default();
+    let text = crate::read_regular_text(root.join("NOTICE")).unwrap_or_default();
     let mut out: PatchTable = parse_notice(&text)
         .into_iter()
         .filter(|e| e.dir.starts_with("crates/") && !patch.iter().any(|row| row.rel == e.dir))
@@ -227,7 +227,7 @@ fn survey_forks(root: &Path, patch: &[PatchRow]) -> Vec<VendoredFork> {
             marked_files: Vec::new(),
             licenses: Vec::new(),
         };
-        match std::fs::read_to_string(dir.join("Cargo.toml")) {
+        match crate::read_regular_text(dir.join("Cargo.toml")) {
             Err(e) => fork.manifest_error = Some(format!("cannot read Cargo.toml: {e}")),
             Ok(text) => match text.parse::<DocumentMut>() {
                 Err(e) => fork.manifest_error = Some(format!("Cargo.toml is not valid TOML: {e}")),
@@ -276,7 +276,7 @@ fn count_markers(root: &Path, fork: &mut VendoredFork) {
     }
     files.sort();
     for file in &files {
-        let Ok(text) = std::fs::read_to_string(file) else {
+        let Ok(text) = crate::read_regular_text(file) else {
             continue;
         };
         let trust = text.matches(TRUST_MARKER).count() as u64;
@@ -399,7 +399,7 @@ pub(crate) fn apache_is_mandatory(expr: &str) -> bool {
 /// The `[licenses] allow` list from `deny.toml`.
 fn deny_allow(root: &Path) -> Result<Vec<String>, String> {
     let path = root.join("deny.toml");
-    let text = std::fs::read_to_string(&path)
+    let text = crate::read_regular_text(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let doc: DocumentMut = text
         .parse()
@@ -512,7 +512,7 @@ fn workspace_requirements(root: &Path, name: &str) -> Vec<(String, String)> {
     }
     let mut out = Vec::new();
     for manifest in manifests {
-        let Ok(text) = std::fs::read_to_string(&manifest) else {
+        let Ok(text) = crate::read_regular_text(&manifest) else {
             continue;
         };
         let Ok(doc) = text.parse::<DocumentMut>() else {
@@ -580,7 +580,7 @@ fn workspace_requirements(root: &Path, name: &str) -> Vec<(String, String)> {
 /// Every `[[package]]` entry in `Cargo.lock` for `name`, as `(version, has_source)`.
 pub(crate) fn lock_entries(root: &Path, name: &str) -> Result<Vec<(String, bool)>, String> {
     let path = root.join("Cargo.lock");
-    let text = std::fs::read_to_string(&path)
+    let text = crate::read_regular_text(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let doc: DocumentMut = text
         .parse()
@@ -1483,7 +1483,7 @@ fn ob5_license_files(forks: &[VendoredFork], log: &mut String) -> usize {
 /// `[OB-6]` `NOTICE` lists every fork and absorbed crate.
 fn ob6_notice_agreement(root: &Path, forks: &[VendoredFork], log: &mut String) -> usize {
     let path = root.join("NOTICE");
-    let text = match std::fs::read_to_string(&path) {
+    let text = match crate::read_regular_text(&path) {
         Ok(t) => t,
         Err(e) => {
             let _ = writeln!(
@@ -1596,7 +1596,7 @@ fn ob7_apache_modification_notices(
     let mut scoped = Vec::new();
     let mut unverified = Vec::new();
     // OB-6 judges a NOTICE it cannot read; here an unread one names no licence text.
-    let notice = std::fs::read_to_string(root.join("NOTICE")).unwrap_or_default();
+    let notice = crate::read_regular_text(root.join("NOTICE")).unwrap_or_default();
     for fork in forks {
         if !apache_is_mandatory(&fork.license) {
             continue;
@@ -1645,7 +1645,7 @@ fn ob7_apache_modification_notices(
             let path = fork.dir.join(rel);
             let regular = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
             let text = if regular {
-                std::fs::read(&path)
+                crate::read_regular(&path)
                     .map(|b| String::from_utf8_lossy(&b).into_owned())
                     .unwrap_or_default()
             } else {
@@ -1760,8 +1760,8 @@ fn diff_against_pristine(pristine: &Path, fork: &Path) -> Option<Divergence> {
                 }
                 continue;
             }
-            let ours = std::fs::read(entry.path()).ok()?;
-            match std::fs::read(pristine.join(&child)) {
+            let ours = crate::read_regular(entry.path()).ok()?;
+            match crate::read_regular(pristine.join(&child)) {
                 Ok(theirs) if theirs == ours => {}
                 Ok(_) => modified.push(child.to_string_lossy().into_owned()),
                 Err(_) => added.push(child.to_string_lossy().into_owned()),

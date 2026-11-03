@@ -147,9 +147,18 @@ fn reread(file: &Path) -> bool {
         return false;
     }
     let mut buf = [0u8; 65];
-    let Ok(mut f) = std::fs::File::open(file) else {
+    let Ok(mut f) = ({
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0004)
+            .open(file)
+    }) else {
         return false;
     };
+    if !f.metadata().is_ok_and(|m| m.is_file()) {
+        return false;
+    }
     let mut n = 0;
     while n < buf.len() {
         match f.read(&mut buf[n..]) {

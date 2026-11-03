@@ -352,6 +352,81 @@ fn every_record_owed_a_step_has_a_deadline_the_legacy_shapes_included() {
         ..St::default()
     };
     assert_eq!(watch_at(&looked), Some(T0 + 10_000 + WATCH_GAP));
+    for agent in [upgrade::Agent::Muse, upgrade::Agent::Agy] {
+        let skipped = St {
+            agent,
+            phase: Phase::Failed("signal-refused".to_string()),
+            from: "1.4.10-R6427.1".to_string(),
+            to: "1.4.10-R6500.1".to_string(),
+            tab: "s-3de30c3c66bf5c4496f8".to_string(),
+            failed_at: T0 - 10,
+            request: Request::Skip("1.4.10-R6500.1".to_string()),
+            ..St::default()
+        };
+        assert_eq!(
+            due_by(&skipped),
+            None,
+            "{agent:?}: a skipped vendor revision is not due"
+        );
+        assert_eq!(
+            watch_at(&skipped),
+            None,
+            "{agent:?}: a skipped vendor revision schedules no watch"
+        );
+        let older_skip = St {
+            request: Request::Skip("1.4.10-R6427.1".to_string()),
+            ..skipped
+        };
+        assert!(
+            due_by(&older_skip).is_some() && watch_at(&older_skip).is_some(),
+            "{agent:?}: a skip of an older revision does not suppress due_by/watch_at"
+        );
+
+        let skipped_pending = St {
+            agent,
+            phase: Phase::Pending,
+            from: "1.4.10-R6427.1".to_string(),
+            to: "1.4.10-R6500.1".to_string(),
+            source: "managed".to_string(),
+            progress_at: T0,
+            request: Request::Skip("v1.4.10-R6500.1".to_string()),
+            ..St::default()
+        };
+        assert_eq!(due_by(&skipped_pending), None, "{agent:?}");
+        assert_eq!(watch_at(&skipped_pending), None, "{agent:?}");
+
+        let mut prior_failed = St {
+            agent,
+            phase: Phase::Failed("no-resume".to_string()),
+            from: "1.4.10-R6427.1".to_string(),
+            to: "1.4.10-R6500.1".to_string(),
+            source: "managed".to_string(),
+            failed_at: T0,
+            streak_why: "no-resume".to_string(),
+            stop_streak: 2,
+            ..St::default()
+        };
+        let mut retry = St {
+            agent,
+            phase: Phase::Exiting { at_s: T0 + 60 },
+            from: "1.4.10-R6427.1".to_string(),
+            to: "1.4.10-R6500.1".to_string(),
+            source: "managed".to_string(),
+            ..St::default()
+        };
+        prior_failed.retried_by(&mut retry);
+        assert_eq!(retry.stop_streak, 2, "{agent:?}");
+        assert_eq!(retry.streak_why, "no-resume", "{agent:?}");
+
+        prior_failed.to = "1.4.10-R6499.1".to_string();
+        let mut next_build = St {
+            stop_streak: 0,
+            streak_why: String::new(),
+            ..retry
+        };
+        prior_failed.retried_by(&mut next_build);
+        assert_eq!(next_build.stop_streak, 0, "{agent:?}");
+    }
 }
 
 const TAB_ONE_RECORD: &str = r#"{"phase":"announced","why":"","from":"2.1.280","to":"2.1.283","source":"managed","marker":"ATERM-UPGRADE-READY-5f3a1c9e","notice_start":"Wed Sep 23 17:13:02 2026","tab":"s-3de30c3c66bf5c4496f8","line":"","noted":"","cause":"","model_before":"","launch_model":"","model_list":"","resumed_on":"","wait":"background","request":"-","request_tab":"","outcome":"","at":1790531333,"asks":1,"salt":1790373043,"last_seq":0,"seq_since":1790373043,"pid":52489,"notice_pid":52489,"shell":0,"mark":0,"confirm_by":0,"resumed_pid":0,"hold_since":0,"hold_seen":0,"ready_since":0,"pending_since":0,"wait_since":1790531333,"done_at":0,"request_at":0}"#;

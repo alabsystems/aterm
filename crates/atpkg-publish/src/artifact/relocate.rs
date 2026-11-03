@@ -526,7 +526,7 @@ pub fn is_native_object(path: &Path) -> bool {
 /// Read the first 4 magic bytes of a file (native-object sniff).
 pub fn magic4(path: &Path) -> Option<[u8; 4]> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
+    let (mut f, _) = crate::identity::open_regular_nonblock(path).ok()?;
     let mut m = [0u8; 4];
     f.read_exact(&mut m).ok()?;
     Some(m)

@@ -177,8 +177,15 @@ impl Pristine {
             "this host names no user cache folder (HOME is unset), so there is nowhere to \
              unpack one",
         )?;
+        if std::fs::symlink_metadata(cache).is_ok_and(|m| !m.file_type().is_dir()) {
+            return Err(format!("{} is not a cache directory", cache.display()));
+        }
+        let crates_dir = cache.join("crates");
+        if std::fs::symlink_metadata(&crates_dir).is_ok_and(|m| !m.file_type().is_dir()) {
+            return Err(format!("{} is not a cache directory", crates_dir.display()));
+        }
         let id = package_id(name, version)?;
-        let entry = cache.join("crates").join(&id);
+        let entry = crates_dir.join(&id);
         if let Some(copy) = cached(&entry, &id) {
             return Ok(copy);
         }
@@ -241,10 +248,18 @@ fn package_id(name: &str, version: &str) -> Result<String, String> {
 
 /// The whole cache entry at `entry`: its package root and the sha256 it was held to.
 fn cached(entry: &Path, id: &str) -> Option<Held> {
-    let stamp = std::fs::read_to_string(entry.join(STAMP)).ok()?;
-    let sha256 = stamp.trim();
+    const MAX_STAMP_BYTES: u64 = 128;
+    if !std::fs::symlink_metadata(entry).ok()?.file_type().is_dir() {
+        return None;
+    }
     let dir = entry.join(PACKAGE);
-    (aterm_codec::hex::is_lower(sha256, 64) && dir.is_dir()).then(|| Held {
+    if !std::fs::symlink_metadata(&dir).ok()?.file_type().is_dir() {
+        return None;
+    }
+    let stamp =
+        aterm_uds::atomic_file::read_regular_text(&entry.join(STAMP), MAX_STAMP_BYTES).ok()?;
+    let sha256 = stamp.trim();
+    aterm_codec::hex::is_lower(sha256, 64).then(|| Held {
         dir,
         id: id.to_string(),
         sha256: sha256.to_string(),
@@ -290,6 +305,13 @@ fn place(entry: &Path, id: &str, archive: &[u8], sha256: &str) -> Result<(), Str
         .ok_or_else(|| format!("{} has no parent", entry.display()))?;
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+    if !std::fs::symlink_metadata(parent)
+        .map_err(|e| format!("could not inspect {}: {e}", parent.display()))?
+        .file_type()
+        .is_dir()
+    {
+        return Err(format!("{} is not a cache directory", parent.display()));
+    }
     let staging = aterm_tempfile::Builder::new()
         .prefix(&format!(".unpack-{id}-"))
         .tempdir_in(parent)
@@ -357,16 +379,28 @@ fn unpack(archive: &[u8], top: &str, into: &Path) -> Result<usize, String> {
             skip(&mut tar, padding(field_size))?;
             match kind {
                 b'L' => {
+                    if long_name.is_some() || pax.path.is_some() {
+                        return Err(
+                            "duplicate path override in member extension headers".to_string()
+                        );
+                    }
                     let name = body.split(|b| *b == 0).next().unwrap_or_default();
                     long_name = Some(utf8(name)?);
                     pending_ext = true;
                 }
                 b'x' => {
-                    pax = parse_pax(&body)?;
+                    parse_pax_into(&body, &mut pax, long_name.is_some())?;
                     pending_ext = true;
                 }
                 b'g' => {
-                    let global = parse_pax(&body)?;
+                    if pending_ext {
+                        return Err(
+                            "a global PAX header appears inside a member's extension headers"
+                                .to_string(),
+                        );
+                    }
+                    let mut global = Pax::default();
+                    parse_pax_into(&body, &mut global, false)?;
                     if global.path.is_some() || global.size.is_some() {
                         return Err("a global PAX header overrides member path or size".to_string());
                     }
@@ -433,20 +467,36 @@ fn unpack(archive: &[u8], top: &str, into: &Path) -> Result<usize, String> {
     if pending_ext {
         return Err("an extension header has no member after it".to_string());
     }
-    // Read to the end of the gzip stream, so its CRC-32 and length are checked.
-    io::copy(&mut (&mut tar).take(UNPACKED_LIMIT), &mut io::sink())
-        .map_err(|e| format!("the gzip stream: {e}"))?;
-    let mut extra = [0u8; 1];
-    if tar
-        .read(&mut extra)
-        .map_err(|e| format!("the gzip stream: {e}"))?
-        != 0
-    {
-        return Err(format!(
-            "more than {UNPACKED_LIMIT} trailing bytes after the archive"
-        ));
-    }
+    drain_zero_trailer(&mut tar)?;
     Ok(members)
+}
+
+/// Read to the end of `tar`, checking its gzip CRC-32 and length while refusing non-zero
+/// trailing bytes after the end-of-archive zero block.
+fn drain_zero_trailer(tar: &mut impl Read) -> Result<(), String> {
+    const TRAILER_LIMIT: u64 = 1 << 20;
+    let mut seen = 0u64;
+    let mut buf = [0u8; 4096];
+    loop {
+        match tar.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                if buf[..n].iter().any(|b| *b != 0) {
+                    return Err(
+                        "non-zero bytes trail the archive's end-of-archive zero block".to_string(),
+                    );
+                }
+                seen = seen.saturating_add(n as u64);
+                if seen > TRAILER_LIMIT {
+                    return Err(format!(
+                        "more than {TRAILER_LIMIT} trailing zero bytes after the archive"
+                    ));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(format!("the gzip stream: {e}")),
+        }
+    }
 }
 
 /// Fill `block`, or `false` at a clean end of the stream.
@@ -543,10 +593,10 @@ fn utf8(bytes: &[u8]) -> Result<String, String> {
         .map_err(|_| format!("a member path is not UTF-8: `{}`", bytes.escape_ascii()))
 }
 
-/// The `path` and `size` records of a PAX body (`<len> <key>=<value>\n` each).
-fn parse_pax(body: &[u8]) -> Result<Pax, String> {
+/// Merge the `path` and `size` records of a PAX body (`<len> <key>=<value>\n` each) into `pax`,
+/// refusing duplicate `path` or `size` overrides.
+fn parse_pax_into(body: &[u8], pax: &mut Pax, has_long_name: bool) -> Result<(), String> {
     let bad = || "a PAX record is malformed".to_string();
-    let mut pax = Pax::default();
     let mut rest = body;
     while !rest.is_empty() {
         let space = rest.iter().position(|b| *b == b' ').ok_or_else(bad)?;
@@ -562,8 +612,16 @@ fn parse_pax(body: &[u8]) -> Result<Pax, String> {
         let eq = record.iter().position(|b| *b == b'=').ok_or_else(bad)?;
         let (key, value) = (&record[..eq], &record[eq + 1..]);
         match key {
-            b"path" => pax.path = Some(utf8(value)?),
+            b"path" => {
+                if has_long_name || pax.path.is_some() {
+                    return Err("duplicate path override in member extension headers".to_string());
+                }
+                pax.path = Some(utf8(value)?);
+            }
             b"size" => {
+                if pax.size.is_some() {
+                    return Err("duplicate size override in member PAX headers".to_string());
+                }
                 pax.size = Some(
                     std::str::from_utf8(value)
                         .ok()
@@ -586,7 +644,7 @@ fn parse_pax(body: &[u8]) -> Result<Pax, String> {
         }
         rest = &rest[len..];
     }
-    Ok(pax)
+    Ok(())
 }
 
 /// `path` below `top/`, or `None` for `top/` itself. Refuses an absolute path, one outside
@@ -887,5 +945,108 @@ pub(crate) mod tests {
         ] {
             assert_eq!(index_url(name), format!("{INDEX}/{path}"));
         }
+    }
+
+    /// NEGATIVE CONTROL: symlinked cache entries/roots, conflicting per-member extension
+    /// headers, and non-zero bytes smuggled after an end-of-archive zero block are refused.
+    #[test]
+    fn pristine_refuses_symlinked_cache_conflicting_headers_and_smuggled_trailer() {
+        #[cfg(unix)]
+        {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let forged = root.path().join("forged");
+            std::fs::create_dir_all(forged.join(PACKAGE)).unwrap();
+            std::fs::write(forged.join(STAMP), format!("{}\n", "a".repeat(64))).unwrap();
+            std::fs::write(forged.join(PACKAGE).join("lib.rs"), b"forged\n").unwrap();
+
+            let linked_cache = root.path().join("linked-cache");
+            std::os::unix::fs::symlink(&forged, &linked_cache).unwrap();
+            let Err(why) = pristine(
+                &linked_cache,
+                Served::honest("upstream", "1.2.3", upstream()),
+            )
+            .copy("upstream", "1.2.3") else {
+                panic!("symlinked cache root was accepted");
+            };
+            assert!(why.contains("not a cache directory"), "{why}");
+
+            let cache = root.path().join("cache");
+            std::fs::create_dir_all(cache.join("crates")).unwrap();
+            let linked_entry = cache.join("crates/upstream-1.2.3");
+            std::os::unix::fs::symlink(&forged, &linked_entry).unwrap();
+            assert!(
+                cached(&linked_entry, "upstream-1.2.3").is_none(),
+                "symlinked cache entry must not be trusted"
+            );
+            let copy = pristine(&cache, Served::honest("upstream", "1.2.3", upstream()))
+                .copy("upstream", "1.2.3")
+                .expect("symlinked entry unlinked and replaced by verified copy");
+            assert!(copy.fetched);
+            assert_eq!(
+                std::fs::read(forged.join(PACKAGE).join("lib.rs")).unwrap(),
+                b"forged\n",
+                "forged target outside cache left untouched"
+            );
+        }
+
+        // Duplicate `L` + `x` path overrides on one member are refused.
+        let pax_path = b"28 path=upstream-1.2.3/b.rs\n";
+        let mut dup_path = Vec::new();
+        dup_path.extend_from_slice(&header("././@LongLink", 20, b'L'));
+        dup_path.extend_from_slice(b"upstream-1.2.3/a.rs\0");
+        dup_path.resize(2 * BLOCK, 0);
+        dup_path.extend_from_slice(&header("PaxHeader", pax_path.len(), b'x'));
+        dup_path.extend_from_slice(pax_path);
+        dup_path.resize(4 * BLOCK, 0);
+        dup_path.extend_from_slice(&header("upstream-1.2.3/c.rs", 3, b'0'));
+        dup_path.extend_from_slice(b"ok\n");
+        dup_path.resize(dup_path.len().div_ceil(BLOCK) * BLOCK + 2 * BLOCK, 0);
+        let cache = aterm_tempfile::tempdir().unwrap();
+        let Err(why) = pristine(
+            cache.path(),
+            Served::honest("upstream", "1.2.3", gzip_stored(&dup_path)),
+        )
+        .copy("upstream", "1.2.3") else {
+            panic!("conflicting L + x path headers unpacked");
+        };
+        assert!(why.contains("duplicate path override"), "{why}");
+
+        // Duplicate `size` PAX records in one header body are refused.
+        let dup_size_records = b"10 size=3\n10 size=4\n";
+        let mut dup_size = Vec::new();
+        dup_size.extend_from_slice(&header("PaxHeader", dup_size_records.len(), b'x'));
+        dup_size.extend_from_slice(dup_size_records);
+        dup_size.resize(2 * BLOCK, 0);
+        dup_size.extend_from_slice(&header("upstream-1.2.3/ok.rs", 3, b'0'));
+        dup_size.extend_from_slice(b"ok\n");
+        dup_size.resize(dup_size.len().div_ceil(BLOCK) * BLOCK + 2 * BLOCK, 0);
+        let cache = aterm_tempfile::tempdir().unwrap();
+        let Err(why) = pristine(
+            cache.path(),
+            Served::honest("upstream", "1.2.3", gzip_stored(&dup_size)),
+        )
+        .copy("upstream", "1.2.3") else {
+            panic!("duplicate PAX size records unpacked");
+        };
+        assert!(why.contains("duplicate size override"), "{why}");
+
+        // Non-zero bytes smuggled after the first 512-byte zero block are refused.
+        let mut smuggled = Vec::new();
+        smuggled.extend_from_slice(&header("upstream-1.2.3/ok.rs", 3, b'0'));
+        smuggled.extend_from_slice(b"ok\n");
+        smuggled.resize(2 * BLOCK, 0);
+        smuggled.resize(3 * BLOCK, 0); // first 512-byte zero block ends archive
+        smuggled.extend_from_slice(&header("upstream-1.2.3/hidden.rs", 4, b'0'));
+        smuggled.extend_from_slice(b"bad\n");
+        smuggled.resize(smuggled.len().div_ceil(BLOCK) * BLOCK + 2 * BLOCK, 0);
+        let cache = aterm_tempfile::tempdir().unwrap();
+        let Err(why) = pristine(
+            cache.path(),
+            Served::honest("upstream", "1.2.3", gzip_stored(&smuggled)),
+        )
+        .copy("upstream", "1.2.3") else {
+            panic!("smuggled member past zero block unpacked");
+        };
+        assert!(why.contains("non-zero bytes trail"), "{why}");
     }
 }

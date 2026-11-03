@@ -256,7 +256,7 @@ impl<'a> Parser<'a> {
         &mut self,
         root: impl FnOnce(&mut Self, Tag) -> Result<T, String>,
     ) -> Result<T, String> {
-        self.skip_misc()?;
+        self.skip_prolog()?;
         let value = match self.tag()? {
             Tag::Open(name) if name == "plist" => {
                 self.skip_misc()?;
@@ -324,7 +324,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn skip_misc(&mut self) -> Result<(), String> {
+    fn skip_prolog(&mut self) -> Result<(), String> {
+        let mut seen_doctype = false;
         loop {
             while self
                 .s
@@ -338,7 +339,76 @@ impl<'a> Parser<'a> {
             } else if self.starts_with(b"<?") {
                 self.skip_past(b"?>", "processing instruction")?;
             } else if self.starts_with(b"<!DOCTYPE") {
-                self.skip_past(b">", "DOCTYPE")?;
+                if !self
+                    .s
+                    .get(self.pos + b"<!DOCTYPE".len())
+                    .is_some_and(|b| b.is_ascii_whitespace())
+                {
+                    return Err(self.err("malformed DOCTYPE"));
+                }
+                if seen_doctype {
+                    return Err(self.err("duplicate DOCTYPE"));
+                }
+                seen_doctype = true;
+                self.skip_doctype()?;
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
+    fn skip_doctype(&mut self) -> Result<(), String> {
+        self.pos += b"<!DOCTYPE".len();
+        let mut quote: Option<u8> = None;
+        loop {
+            let Some(&b) = self.s.get(self.pos) else {
+                return Err(self.err("unterminated DOCTYPE"));
+            };
+            match (quote, b) {
+                (Some(q), b) if b == q => {
+                    self.pos += 1;
+                    quote = None;
+                }
+                (Some(_), _) => {
+                    self.pos += 1;
+                }
+                (None, b'"' | b'\'') => {
+                    self.pos += 1;
+                    quote = Some(b);
+                }
+                (None, b'<') if self.starts_with(b"<!--") => {
+                    self.skip_past(b"-->", "comment")?;
+                }
+                (None, b'<') => {
+                    return Err(self.err("unexpected '<' in DOCTYPE"));
+                }
+                (None, b'[') => {
+                    return Err(self.err("DOCTYPE internal subset is not supported"));
+                }
+                (None, b'>') => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                (None, _) => {
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
+    fn skip_misc(&mut self) -> Result<(), String> {
+        loop {
+            while self
+                .s
+                .get(self.pos)
+                .is_some_and(|b| b.is_ascii_whitespace())
+            {
+                self.pos += 1;
+            }
+            if self.starts_with(b"<!--") {
+                self.skip_past(b"-->", "comment")?;
+            } else if self.starts_with(b"<?") {
+                self.skip_past(b"?>", "processing instruction")?;
             } else {
                 return Ok(());
             }
@@ -954,5 +1024,41 @@ mod malformed_integer_boundary_tests {
             refused, [true; 6],
             "every malformed form is observed before the aggregate assertion"
         );
+    }
+
+    /// DOCTYPE PROLOG SCANNER REFUSES INTERNAL SUBSETS AND MID-DOCUMENT DECLARATIONS: an internal
+    /// DTD subset (`[<!ENTITY ...>]`), duplicate `<!DOCTYPE`, or `<!DOCTYPE` inside `<plist>` /
+    /// `<dict>` cannot terminate early on a quoted `>` or smuggle a root `<dict>`.
+    /// NEGATIVE CONTROL: a standard `<!DOCTYPE plist PUBLIC ... "...">` (including `>` inside
+    /// quotes or comments) in the prolog parses cleanly.
+    #[test]
+    fn doctype_quotes_comments_and_internal_subsets_do_not_desync_the_prolog() {
+        let valid = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0 > test//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd" <!-- > -->>
+<plist version="1.0"><dict><key>ok</key><true/></dict></plist>"#;
+        assert_eq!(
+            parse(valid).expect("quoted and commented '>' in DOCTYPE must parse"),
+            PValue::Dict(vec![("ok".into(), PValue::Bool(true))])
+        );
+
+        let smuggled_subset = br#"<!DOCTYPE plist [
+  <!ENTITY inject "><dict><key>injected</key><true/></dict><!--">
+]>
+<plist version="1.0"><dict><key>injected</key><false/></dict></plist>"#;
+        let subset_err = parse(smuggled_subset).expect_err("internal DTD subset must be refused");
+        assert!(subset_err.contains("internal subset"), "{subset_err}");
+
+        for bad in [
+            &b"<!DOCTYPE plist><!DOCTYPE plist><plist><dict/></plist>"[..],
+            &b"<plist><!DOCTYPE plist><dict/></plist>"[..],
+            &b"<plist><dict><!DOCTYPE plist></dict></plist>"[..],
+            &b"<!DOCTYPEplist><plist><dict/></plist>"[..],
+        ] {
+            assert!(
+                parse(bad).is_err(),
+                "must refuse invalid DOCTYPE placement: {:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
     }
 }

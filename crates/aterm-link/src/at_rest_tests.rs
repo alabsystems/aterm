@@ -842,19 +842,47 @@ fn a_retire_a_crash_stopped_refuses_every_start_and_finishes_in_its_one_folder()
     }
 }
 
-/// A marker that names no retired folder moves nothing.
+/// NEGATIVE CONTROL: a marker that names no canonical `retired-<digits>` folder, or is a
+/// symlink, or resumes onto a non-regular `log`/sidecar, moves nothing.
 #[test]
 fn a_retires_marker_is_read_strictly() {
     let s = sealed();
     std::fs::remove_file(s.key()).expect("the key");
     let marker = beside(&s.log(), RETIRING);
-    for bad in ["../elsewhere", "notes", "retired-1/../.."] {
+    for bad in [
+        "../elsewhere",
+        "notes",
+        "retired-1/../..",
+        "retired-",
+        "retired-1\n",
+        "retired-1\\..\\..",
+        "retired-abc",
+    ] {
         std::fs::write(&marker, bad).expect("marker");
         let why = retire(&s.log(), Backups::INERT).expect_err(bad);
         assert!(why.contains("names no retired folder"), "{why}");
         assert!(s.log().exists(), "{bad}: nothing moved");
     }
     std::fs::remove_file(&marker).expect("marker");
+
+    let target_marker = s.dir.path().join("marker-target");
+    std::fs::write(&target_marker, "retired-123").expect("target marker");
+    std::os::unix::fs::symlink(&target_marker, &marker).expect("symlink marker");
+    let why = retire(&s.log(), Backups::INERT).expect_err("symlink marker");
+    assert!(why.contains("not a regular file"), "{why}");
+    assert!(s.log().exists(), "symlink marker moves nothing");
+    std::fs::remove_file(&marker).expect("remove symlink marker");
+
+    let to = begin_retire(&s.log()).expect("begin");
+    let saved_log = s.dir.path().join("saved-bus-log");
+    std::fs::rename(s.log(), &saved_log).expect("set aside log");
+    std::os::unix::fs::symlink(&saved_log, s.log()).expect("symlink at log");
+    let why = retire(&s.log(), Backups::INERT).expect_err("symlink at log on resume");
+    assert!(why.contains("is not a file"), "{why}");
+    std::fs::remove_file(s.log()).expect("remove symlink at log");
+    std::fs::rename(&saved_log, s.log()).expect("restore log");
+    let retired = retire(&s.log(), Backups::INERT).expect("clean resume");
+    assert_eq!(retired.to, to);
 }
 
 /// A bare relative name's folder is the working one, not the empty path every folder call refuses.

@@ -26,6 +26,55 @@ pub fn put(sys: &dyn System, sha: &str, stdin: &mut dyn Read, out: &mut dyn Writ
     put_as(sys, &me, sha, stdin, out)
 }
 
+/// Ensure `home` is a non-root, dot-free absolute directory and neither `home` nor any existing
+/// component along `target` inside `home` is a symbolic link or non-directory ancestor.
+fn check_home_and_walk(
+    sys: &dyn System,
+    home: &Path,
+    target: &Path,
+    target_is_dir: bool,
+) -> Result<(), String> {
+    let valid_home = home.is_absolute()
+        && home.parent().is_some()
+        && !home
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir));
+    if !valid_home {
+        return Err(format!(
+            "{} is not a non-root absolute home directory",
+            home.display()
+        ));
+    }
+    if !target.starts_with(home) || (!target_is_dir && target == home) {
+        return Err(format!(
+            "{} is outside {}",
+            target.display(),
+            home.display()
+        ));
+    }
+    let rel = target
+        .strip_prefix(home)
+        .map_err(|_| format!("{} is outside {}", target.display(), home.display()))?;
+    let check_component = |p: &Path, must_be_dir: bool| -> Result<(), String> {
+        match sys.stat(p) {
+            Ok(st) if st.symlink => Err(format!("{} is a symbolic link", p.display())),
+            Ok(st) if must_be_dir && !st.dir => Err(format!("{} is not a directory", p.display())),
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("{}: {e}", p.display())),
+        }
+    };
+    let mut cur = home.to_path_buf();
+    check_component(&cur, true)?;
+    let parts: Vec<Component<'_>> = rel.components().collect();
+    for (idx, comp) in parts.iter().enumerate() {
+        cur.push(comp.as_os_str());
+        let is_last = idx + 1 == parts.len();
+        check_component(&cur, target_is_dir || !is_last)?;
+    }
+    Ok(())
+}
+
 /// [`put`] for the resolved caller `me`.
 pub fn put_as(
     sys: &dyn System,
@@ -37,7 +86,11 @@ pub fn put_as(
     if !super::is_sha256(sha) {
         return super::refuse(out, "put takes a lowercase SHA-256 hex digest");
     }
+    let home = Path::new(&me.home);
     let dir = super::user_inbox(&me.home);
+    if let Err(why) = check_home_and_walk(sys, home, &dir, true) {
+        return super::refuse(out, &format!("put: {why}"));
+    }
     if let Err(e) = sys.create_dir_all(&dir, 0o700) {
         return super::refuse(out, &format!("put: {}: {e}", dir.display()));
     }
@@ -114,11 +167,8 @@ fn put_file_as(
     out: &mut dyn Write,
 ) -> ExitCode {
     let home = Path::new(&me.home);
-    if !path.starts_with(home) || path == home {
-        return super::refuse(
-            out,
-            &format!("put-file: {} is outside {}", path.display(), home.display()),
-        );
+    if let Err(why) = check_home_and_walk(sys, home, path, false) {
+        return super::refuse(out, &format!("put-file: {why}"));
     }
     let mut bytes = Vec::new();
     if let Err(e) = stdin.take(MAX_PUT_FILE + 1).read_to_end(&mut bytes) {
@@ -281,5 +331,81 @@ mod tests {
         assert!(String::from_utf8_lossy(&out).contains("hash to 2cf24dba"));
         assert!(fake.written(&format!("{inbox}/{wrong}")).is_none());
         assert!(fake.written(&format!("{inbox}/.{wrong}.partial")).is_none());
+    }
+
+    /// DEGENERATE HOME AND SYMLINK ESCAPE ARE REFUSED: `me.home = "/"` cannot turn `starts_with`
+    /// into root-wide write access, and a symbolic link along `home` or `path` is refused before
+    /// reading `create_dir_all` or `write_file`.
+    /// NEGATIVE CONTROL: a real directory inside a valid `/Users//admin` home still writes cleanly.
+    #[test]
+    fn put_file_and_put_refuse_root_home_and_symlink_ancestors() {
+        let fake = as_admin();
+        let mut root_home = admin();
+        root_home.home = "/".into();
+        let mut out = Vec::new();
+        assert_eq!(
+            put_file_as(
+                &fake,
+                &root_home,
+                Path::new("/etc/sudoers.d/escape"),
+                0o600,
+                &mut &b"ALL ALL=(ALL) NOPASSWD: ALL\n"[..],
+                &mut out,
+            ),
+            refused()
+        );
+        assert!(
+            String::from_utf8_lossy(&out).contains("non-root absolute home"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+
+        let sha = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        let mut out = Vec::new();
+        assert_eq!(
+            put_as(&fake, &root_home, sha, &mut &b"hello"[..], &mut out),
+            refused()
+        );
+
+        fake.symlink(Path::new("/tmp/outside"), Path::new("/Users//admin/.ssh"))
+            .unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            put_file_as(
+                &fake,
+                &admin(),
+                Path::new("/Users//admin/.ssh/authorized_keys"),
+                0o600,
+                &mut &b"ssh-ed25519 AAAA\n"[..],
+                &mut out,
+            ),
+            refused()
+        );
+        assert!(
+            String::from_utf8_lossy(&out).contains("symbolic link"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            fake.written("/Users//admin/.ssh/authorized_keys").is_none(),
+            "must never write through a symlinked parent"
+        );
+
+        let mut out = Vec::new();
+        assert_eq!(
+            put_file_as(
+                &fake,
+                &admin(),
+                Path::new("/Users//admin/.config/ok.toml"),
+                0o600,
+                &mut &b"ok = true\n"[..],
+                &mut out,
+            ),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            fake.written("/Users//admin/.config/ok.toml").unwrap(),
+            b"ok = true\n"
+        );
     }
 }

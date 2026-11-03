@@ -10,7 +10,7 @@
 
 use super::*;
 use crate::{
-    alab::registry::{ACCOUNT, ADDRESS, MACHINE, SEAT},
+    alab::registry::{ACCOUNT, ADDRESS, MACHINE, PREFERENCE},
     typed::grid::tests::{Book, elem, put},
 };
 
@@ -64,6 +64,29 @@ impl Vendors for Stand {
             Mark::Member(terms)
         }
     }
+
+    /// The fixtures' harness file: `realm,email,label,machine machine` per line.
+    fn stated(
+        &self,
+        _kind: SheetKind,
+        _name: &str,
+        text: &str,
+    ) -> std::result::Result<Vec<Stated>, String> {
+        text.lines()
+            .map(|line| {
+                let [realm, email, label, machines] = line.split(',').collect::<Vec<_>>()[..]
+                else {
+                    return Err(line.to_owned());
+                };
+                Ok(Stated {
+                    realm: realm.to_owned(),
+                    email: email.to_owned(),
+                    label: (!label.is_empty()).then(|| label.to_owned()),
+                    machines: machines.split_whitespace().map(str::to_owned).collect(),
+                })
+            })
+            .collect()
+    }
 }
 
 pub(crate) const VAULT_HEADER: &str = "m,email,computer,,claude,Open AI,google,meta,kimi,x,notes,,";
@@ -87,6 +110,7 @@ fn input<'a>(sheets: &'a [Sheet], macs: &'a [KnownMac], keys: MailboxKeys) -> In
         keys,
         now_ms: 1_800_000_000_000,
         births: true,
+        unread: &[],
     }
 }
 
@@ -107,6 +131,15 @@ fn planned<'p>(plan: &'p Plan, collection: &str, pk: &str, column: &str) -> Opti
         .map(|p| &p.x)
 }
 
+/// The live or planned key of the preference `label`'s Mac has for the Claude account of `address`.
+fn pref(label: &str, address: &str) -> String {
+    keys::preference_pk(
+        &keys::machine_pk(label),
+        &keys::account_pk("claude", address).unwrap(),
+    )
+    .unwrap()
+}
+
 fn kinds(plan: &Plan) -> Vec<&'static str> {
     plan.findings.iter().map(|f| f.kind.word()).collect()
 }
@@ -124,8 +157,7 @@ fn apply(book: &mut Book, plan: &Plan) -> Cells {
 /// region decides which account a sign-in makes), Kimi's region word keys `kimi:global`,
 /// Codex's flow word is kept, the `x` column is xAI's Grok realm, a note naming one vendor
 /// pauses that vendor's account and Claude Code's (whose column any disqualifying note
-/// pauses) but no other, and a value no column takes is free text kept as
-/// coordinates. Every account is keyed by the canonical claims key from its realm and address,
+/// pauses) but no other, and a value no column takes is free text, its coordinate kept. Every account is keyed by the canonical claims key from its realm and address,
 /// with one provider word per realm.
 /// NEGATIVE CONTROL: with a paused reading imported as a member (`Mark::Paused(terms) =>
 /// (terms, false)` in `vault`), the Kimi-banned row's Kimi account plans `pending`: `` left:
@@ -206,7 +238,7 @@ fn the_vault_sheet_reads_the_harness_way_and_keys_accounts_by_the_claims_key() {
         Some(&json!("pending"))
     );
     assert!(kinds(&plan).contains(&"paused"));
-    // Cy's `pro` is free text: no Claude account, a finding, its coordinates on the address.
+    // Cy's `pro` is free text: no Claude account, a finding, its coordinate on the address.
     assert!(
         planned(
             &plan,
@@ -248,16 +280,18 @@ fn the_vault_sheet_reads_the_harness_way_and_keys_accounts_by_the_claims_key() {
     }
 }
 
-/// No note, free-text cell, lead's reasoning or losing value reaches a replicated cell
-/// (`import.rs`'s privacy invariant, on its own `password PRIVATE-CELL` fixture): each stays a
-/// source coordinate, and a credential-shaped cell is reported by coordinate and never read.
-/// NEGATIVE CONTROL: with `vault` copying each note cell into the address's `note` column
-/// (`self.want(&ADDRESS, &address_pk, "note", json!(sheet.text(at)), at)` in place of
-/// `self.note(..)`), the plan refuses the credential-shaped note before a record could carry
-/// it: `` called `Result::unwrap()` on an `Err` value: Error("address.note: a credential-shaped
-/// value is never stored") ``.
+/// A note crosses behind the guard, and nothing else does (`import.rs`'s privacy invariant, on
+/// its own `password PRIVATE-CELL` fixture): the sheet's plain notes and free-text cells reach
+/// the row's `note`; a note naming a secret, a credential-shaped cell and one holding an address
+/// stay coordinates with a `note-withheld` finding; the `m` column, the lead's reasoning and a
+/// losing value never cross. A withheld cell costs only itself: the plain cell after it is kept.
+/// NEGATIVE CONTROL: with `note_text` skipping the per-cell guard (`match Ok::<(), guard::Refusal>
+/// (())`), the joined text is refused and the withheld cell's neighbours go with it: `` left: 5
+/// right: 4 `` at the withheld count; with the joined check off too (`if true {`), the plan
+/// itself refuses before any record could carry it: `` called `Result::unwrap()` on an `Err` value:
+/// Error("address.note: free text naming a secret is never stored; keep it in the vault") ``.
 #[test]
-fn no_note_free_text_or_losing_value_crosses() {
+fn notes_cross_behind_the_guard_and_nothing_else_does() {
     // A token-shaped note, split here so no whole token sits in the source.
     let token = ["gh", "p_0123456789abcdefABCDEF0123456789abcd"].concat();
     let dee = format!(",dee@example.invalid,m6,,1,,,,,,{token},,");
@@ -265,6 +299,9 @@ fn no_note_free_text_or_losing_value_crosses() {
         "7,owner+two@example.invalid,m3.2,,,,phone required,,,,password PRIVATE-CELL,,",
         "unknown,owner@example.invalid,m100,,,,email link,,,,alias mapping unconfirmed,,",
         &dee,
+        ",gil@example.invalid,m8,,,,,,,,forwards to hal@example.invalid,,",
+        ",ida@example.invalid,m9,,,,,,,,\"line one\nline two\",kept too,",
+        ",jan@example.invalid,m9,,,,,,,,password PRIVATE-CELL,kept after,",
     ]);
     let other = logins(&[
         "m7,dee@example.invalid,claude,box@proton.example,the lead guessed from the domain,",
@@ -277,24 +314,52 @@ fn no_note_free_text_or_losing_value_crosses() {
     let all = values(&plan).join("\n");
     for secret in [
         "PRIVATE-CELL",
-        "phone required",
-        "email link",
-        "alias mapping",
         "lead guessed",
         &token[..6],
         "unknown",
         "box@",
+        "hal@",
     ] {
         assert!(!all.contains(secret), "{secret}");
     }
+    let note = |address: &str| {
+        planned(
+            &plan,
+            "address",
+            &keys::address_pk(address).unwrap(),
+            "note",
+        )
+    };
+    assert_eq!(
+        note("owner@example.invalid"),
+        Some(&json!("google: email link; alias mapping unconfirmed"))
+    );
+    // The withheld note is gone from the text; the free-text cell beside it is not.
+    assert_eq!(
+        note("owner+two@example.invalid"),
+        Some(&json!("google: phone required"))
+    );
+    assert_eq!(note("dee@example.invalid"), None);
+    assert_eq!(note("gil@example.invalid"), None);
+    assert_eq!(
+        note("ida@example.invalid"),
+        Some(&json!("line one line two; kept too"))
+    );
+    let withheld: Vec<&Finding> = plan
+        .findings
+        .iter()
+        .filter(|f| f.kind == Kind::NoteWithheld)
+        .collect();
+    assert_eq!(withheld.len(), 4, "{withheld:?}");
+    assert_eq!(note("jan@example.invalid"), Some(&json!("kept after")));
     let owner = keys::address_pk("owner+two@example.invalid").unwrap();
-    let notes = planned(&plan, "address", &owner, "notes_src")
+    let coordinates = planned(&plan, "address", &owner, "notes_src")
         .unwrap()
         .as_array()
         .unwrap();
     for col in [1, 7, 11] {
         assert!(
-            notes
+            coordinates
                 .iter()
                 .any(|c| c["row"] == json!(2) && c["col"] == json!(col)),
             "{col}"
@@ -306,13 +371,50 @@ fn no_note_free_text_or_losing_value_crosses() {
     assert!(!all.contains("\"m7\""));
 }
 
+/// A sheet's note is three-way: an owner's note wins and is a finding, an import's follows the
+/// sheet, and a note the sheet drops is emptied; so a re-run of the same sheet writes nothing.
+/// NEGATIVE CONTROL: with `("address", "note")` out of `RETRACT_VALUES`, the dropped note stays:
+/// `` left: Some(String("first note")) right: Some(Null) ``.
+#[test]
+fn a_notes_import_is_three_way() {
+    let first = vault(&[
+        ",ann@example.invalid,m3,,1,,,,,,first note,,",
+        ",bob@example.invalid,m4,,1,,,,,,first note,,",
+    ]);
+    let mut book = Book::new();
+    let one = plan(
+        &input(std::slice::from_ref(&first), &[], MailboxKeys::default()),
+        &Cells::new(),
+    )
+    .unwrap();
+    let cells = apply(&mut book, &one);
+    let again = plan(&input(&[first], &[], MailboxKeys::default()), &cells).unwrap();
+    assert!(again.rows.is_empty(), "{:?}", again.rows);
+    let ann = keys::address_pk("ann@example.invalid").unwrap();
+    let bob = keys::address_pk("bob@example.invalid").unwrap();
+    let seen = book.all();
+    book.write(2, &seen, vec![put(&ADDRESS, &ann, "note", json!("mine"))]);
+    let cells = book.cells();
+    let edited = vault(&[
+        ",ann@example.invalid,m3,,1,,,,,,second note,,",
+        ",bob@example.invalid,m4,,1,,,,,,,,",
+    ]);
+    let next = plan(&input(&[edited], &[], MailboxKeys::default()), &cells).unwrap();
+    let after = apply(&mut book, &next);
+    let rows = cell::project(&ADDRESS, &after);
+    assert_eq!(rows.rows[&ann].get("note"), Some(&json!("mine")));
+    assert_eq!(rows.rows[&bob].get("note"), Some(&Value::Null));
+    assert!(next.findings.iter().any(|f| f.kind == Kind::OwnerKept
+        && f.pk.as_deref() == Some(ann.as_str())
+        && f.column.as_deref() == Some("note")));
+}
+
 /// What the sheets stop saying is retracted three-way: a service dropped from a services cell
-/// becomes `false` (an owner's element stays), a seat the sheet moved to another Mac is vacated
-/// on the old one so the address holds one home seat, and an account the sheet no longer lists
-/// is reported, never removed. A run that reads the other sheet only retracts nothing.
-/// NEGATIVE CONTROLS: with the seat pass in `finish` skipped (`if true { continue; }` at its
-/// head), the old seat keeps the address beside the new one: `` left:
-/// Some(String("ad-0fe911f39376ccda")) right: Some(Null) ``; with the element retraction off
+/// becomes `false` (an owner's element stays), a preference the sheet moved to another Mac ends
+/// on the old one and starts on the new, and an account the sheet no longer lists is reported,
+/// never removed. A run that reads the other sheet only retracts nothing.
+/// NEGATIVE CONTROLS: with the preference pass in `finish` skipped (`if true { continue; }` at
+/// its head), the old row stays live: `` left: Some("live") right: Some("ended") ``; with the element retraction off
 /// (`if false && field.present()`), the dropped service stays: `` left: {"chatgpt", "codex"}
 /// right: {"codex"} ``; with `retractable` ignoring the kinds read this run, the other sheet's
 /// run reports this sheet's rows: `` nor reports the rows only the other sheet lists ``.
@@ -361,12 +463,17 @@ fn a_re_import_retracts_what_the_sheet_no_longer_says() {
     );
     let next = plan(&input(&[edited], &[], MailboxKeys::default()), &cells).unwrap();
     let after = apply(&mut book, &next);
-    let ann = keys::address_pk("ann@example.invalid").unwrap();
-    let old_seat = keys::seat_pk(&keys::machine_pk("m5"), 1).unwrap();
-    let new_seat = keys::seat_pk(&keys::machine_pk("m7"), 1).unwrap();
-    let seats = cell::project(&SEAT, &after);
-    assert_eq!(seats.rows[&old_seat].get("address"), Some(&Value::Null));
-    assert_eq!(seats.rows[&new_seat].get("address"), Some(&json!(ann)));
+    let ann_codex_pk = keys::account_pk("codex", "ann@example.invalid").unwrap();
+    let old = keys::preference_pk(&keys::machine_pk("m5"), &ann_codex_pk).unwrap();
+    let new = keys::preference_pk(&keys::machine_pk("m7"), &ann_codex_pk).unwrap();
+    let preferences = cell::project(&PREFERENCE, &after);
+    assert_eq!(preferences.rows[&old].lifecycle(), Some("ended"));
+    assert!(preferences.rows[&new].live());
+    // The account no sheet lists now keeps its row and loses its mapping.
+    assert_eq!(
+        preferences.rows[&pref("m5", "ann@example.invalid")].lifecycle(),
+        Some("ended")
+    );
     let accounts = cell::project(&ACCOUNT, &after);
     let ann_codex = keys::account_pk("codex", "ann@example.invalid").unwrap();
     assert_eq!(
@@ -473,11 +580,11 @@ fn a_re_import_never_overwrites_the_owner_and_writes_nothing_when_unchanged() {
 /// Every label resolves before a placeholder is minted: through a live row's label or alias
 /// (a relabelled Mac keeps its row), then a Mac the roster knows by label or alias, whose row is
 /// found by its fleet node; only then a planned placeholder keyed by the label. Spellings fold
-/// (`M109` is m109, `m27-2` is slot 2 on m27) and are reported.
+/// (`M109` is m109, `m27-2` is number 2 on m27) and are reported.
 /// NEGATIVE CONTROL: with `machine_for` skipping the live rows (`let found: Vec<String> =
-/// Vec::new();`), the relabelled Mac's old label mints a second machine and its seat lands on
-/// it: `` left: "st-ee08c551e4729096-2" right: "st-3dd96e6460b76735-2" `` (the placeholder m40's
-/// seat, then the relabelled row's).
+/// Vec::new();`), the relabelled Mac's old label mints a second machine and its preference lands on
+/// it: `` left: "mc-ee08c551e4729096" right: "mc-3dd96e6460b76735" `` (the placeholder m40's
+/// key, then the relabelled row's).
 #[test]
 fn labels_resolve_through_live_rows_and_known_macs_before_a_placeholder() {
     // Born under its fleet node, so its key is not the placeholder its old label would mint.
@@ -524,27 +631,20 @@ fn labels_resolve_through_live_rows_and_known_macs_before_a_placeholder() {
         ",dee@example.invalid,m27-2,,1,,,,,,,,",
     ]);
     let plan = plan(&input(&[sheet], &macs, MailboxKeys::default()), &cells).unwrap();
-    let seat_of = |address: &str| {
-        let pk = keys::address_pk(address).unwrap();
+    let machine_of = |address: &str| {
+        let pk = keys::account_pk("claude", address).unwrap();
         plan.planned
             .iter()
-            .find(|p| p.collection == "seat" && p.column == "address" && p.x == json!(pk))
-            .map(|p| p.pk.clone())
+            .find(|p| p.collection == "preference" && p.column == "account" && p.x == json!(pk))
+            .and_then(|p| planned(&plan, "preference", &p.pk, "machine"))
+            .and_then(Value::as_str)
             .unwrap()
+            .to_owned()
     };
-    assert_eq!(
-        seat_of("ann@example.invalid"),
-        keys::seat_pk(&relabelled, 2).unwrap()
-    );
-    assert_eq!(
-        seat_of("bob@example.invalid"),
-        keys::seat_pk(&adopted, 1).unwrap()
-    );
+    assert_eq!(machine_of("ann@example.invalid"), relabelled);
+    assert_eq!(machine_of("bob@example.invalid"), adopted);
     let m109 = keys::machine_pk("m109");
-    assert_eq!(
-        seat_of("cy@example.invalid"),
-        keys::seat_pk(&m109, 1).unwrap()
-    );
+    assert_eq!(machine_of("cy@example.invalid"), m109);
     assert_eq!(
         planned(&plan, "machine", &m109, "label"),
         Some(&json!("m109"))
@@ -553,9 +653,15 @@ fn labels_resolve_through_live_rows_and_known_macs_before_a_placeholder() {
         planned(&plan, "machine", &m109, "status"),
         Some(&json!("planned"))
     );
+    assert_eq!(machine_of("dee@example.invalid"), keys::machine_pk("m27"));
     assert_eq!(
-        seat_of("dee@example.invalid"),
-        keys::seat_pk(&keys::machine_pk("m27"), 2).unwrap()
+        planned(
+            &plan,
+            "preference",
+            &pref("m27", "dee@example.invalid"),
+            "rank"
+        ),
+        Some(&json!(2))
     );
     // No placeholder for a label a live row or a known Mac already answers.
     for label in ["m40", "m32", "m107", "m100"] {
@@ -713,67 +819,299 @@ fn mailbox_logins_never_cross_and_keys_are_random_and_kept_locally() {
     );
 }
 
-/// Seats hold owner placements only, keyed by machine and slot: two addresses in one slot are a
-/// clash (the first stays), the sheet's second machine column is a warm seat in that machine's
-/// first free slot, an address the owner seated in another slot of that machine is left there,
-/// and every seat the import writes says `import`, never an allocator word.
-/// NEGATIVE CONTROL: with the clash arm removed from `seats` (a second address in a taken slot
-/// written like the first), the slot's address becomes a disagreement instead of a clash: ``
-/// assertion failed: kinds(&plan).contains(&"seat-clash") ``.
+/// Every account of a row gets a preference per machine its cells name, and the number is a rank
+/// and nothing else: `m3.2` is rank 2, a bare first cell rank 1, a second machine column one more
+/// preference with no rank unless it writes one, a two-Mac label one unranked preference on each,
+/// and two accounts at one rank on one Mac are no clash. No machine or rank is read from an
+/// address: `m9.5@example.invalid` is on m3 alone. A row with no account names no mapping, and
+/// says so. Each default label names no machine and no address.
+/// NEGATIVE CONTROL: with `label_cell` ranking a second bare cell as the grammar does (`if false
+/// && !first`), Ann's m8 ranks with the accounts there: `` left: Some(Number(1)) right: None ``.
 #[test]
-fn seats_hold_owner_placements_and_clash_visibly() {
-    let m3 = keys::machine_pk("m3");
-    let m8 = keys::machine_pk("m8");
-    let moved = keys::address_pk("eve@example.invalid").unwrap();
-    let mut book = Book::new();
-    let owner_seat = keys::seat_pk(&m8, 4).unwrap();
-    book.write(
-        2,
-        &[],
-        vec![
-            put(&MACHINE, &m8, "label", json!("m8")),
-            put(&MACHINE, &m8, "status", json!("active")),
-            put(&MACHINE, &m8, "row", json!("live")),
-            put(&SEAT, &owner_seat, "address", json!(moved)),
-            put(&SEAT, &owner_seat, "role", json!("home")),
-            put(&SEAT, &owner_seat, "why", json!("owner")),
-            put(&SEAT, &owner_seat, "row", json!("live")),
-        ],
-    );
-    let cells = book.cells();
+fn every_account_of_a_row_gets_its_mappings_and_a_number_is_only_a_rank() {
     let sheet = vault(&[
-        ",ann@example.invalid,m3.2,m8,1,,,,,,,,",
-        ",bob@example.invalid,m3.2,,1,,,,,,,,",
-        ",eve@example.invalid,m8.1,,1,,,,,,,,",
+        ",ann@example.invalid,m3.2,m8,1,browser,,,,,,,",
+        ",bob@example.invalid,m3.2,m8.4,1,,,,,,,,",
+        ",cy@example.invalid,m106-m38,,1,,,,,,,,",
+        ",dee@example.invalid,m4,,1,,,,,,,,",
+        ",m9.5@example.invalid,m3,,1,,,,,,,,",
+        ",eve@example.invalid,m5,,,,,,,,,,",
     ]);
-    let plan = plan(&input(&[sheet], &[], MailboxKeys::default()), &cells).unwrap();
-    let ann = keys::address_pk("ann@example.invalid").unwrap();
-    let clash = keys::seat_pk(&m3, 2).unwrap();
-    assert_eq!(planned(&plan, "seat", &clash, "address"), Some(&json!(ann)));
-    assert!(kinds(&plan).contains(&"seat-clash"));
-    // Ann's warm seat on m8 takes its first free slot; slot 4 is the owner's.
-    let warm = keys::seat_pk(&m8, 1).unwrap();
-    assert_eq!(planned(&plan, "seat", &warm, "address"), Some(&json!(ann)));
-    assert_eq!(planned(&plan, "seat", &warm, "role"), Some(&json!("warm")));
-    // Eve sits where the owner put her: no seat m8.1 for her, a finding instead.
+    let plan = plan(&input(&[sheet], &[], MailboxKeys::default()), &Cells::new()).unwrap();
+    let rank =
+        |label: &str, address: &str| planned(&plan, "preference", &pref(label, address), "rank");
+    let row = |label: &str, address: &str| {
+        planned(&plan, "preference", &pref(label, address), "machine").is_some()
+    };
+    assert_eq!(rank("m3", "ann@example.invalid"), Some(&json!(2)));
+    assert_eq!(rank("m3", "bob@example.invalid"), Some(&json!(2)));
+    assert_eq!(rank("m8", "ann@example.invalid"), None);
+    assert!(row("m8", "ann@example.invalid"));
+    assert_eq!(rank("m8", "bob@example.invalid"), Some(&json!(4)));
+    assert_eq!(rank("m4", "dee@example.invalid"), Some(&json!(1)));
+    for label in ["m106", "m38"] {
+        assert!(row(label, "cy@example.invalid"), "{label}");
+        assert_eq!(rank(label, "cy@example.invalid"), None);
+    }
+    // Ann's two accounts each get both.
+    let codex = keys::account_pk("codex", "ann@example.invalid").unwrap();
+    for label in ["m3", "m8"] {
+        let pk = keys::preference_pk(&keys::machine_pk(label), &codex).unwrap();
+        assert!(
+            planned(&plan, "preference", &pk, "account").is_some(),
+            "{label}"
+        );
+    }
+    // Nothing from the address.
+    assert!(row("m3", "m9.5@example.invalid"));
+    assert!(!row("m9", "m9.5@example.invalid"));
     assert!(
-        plan.findings
-            .iter()
-            .any(|f| f.kind == Kind::SeatMoved && f.pk.as_deref() == Some(owner_seat.as_str()))
+        planned(&plan, "machine", &keys::machine_pk("m9"), "label").is_none(),
+        "an address is no label"
     );
-    assert!(
-        !plan
-            .planned
-            .iter()
-            .any(|p| p.collection == "seat" && p.column == "address" && p.x == json!(moved))
-    );
+    // A row with no account births its machine and maps nothing, and says so.
+    assert!(planned(&plan, "machine", &keys::machine_pk("m5"), "label").is_some());
+    assert!(kinds(&plan).contains(&"no-account"));
     for item in plan
         .planned
         .iter()
-        .filter(|p| p.collection == "seat" && p.column == "why")
+        .filter(|p| p.collection == "preference" && p.column == "why")
     {
         assert_eq!(item.x, json!("import"));
     }
+    let ann = keys::account_pk("claude", "ann@example.invalid").unwrap();
+    assert_eq!(
+        planned(&plan, "account", &ann, "label"),
+        Some(&json!(keys::default_account_label("claude", &ann).unwrap()))
+    );
+    assert!(
+        !plan
+            .findings
+            .iter()
+            .any(|f| f.kind == Kind::SourcesDisagree),
+        "{:?}",
+        plan.findings
+    );
+}
+
+/// A preference the source drops ends three-way and comes back with it; one with an owner's cell
+/// on it, or one the owner ended, is left; and a label cell the run could not read ends nothing,
+/// since it says nothing against the mapping.
+/// NEGATIVE CONTROLS: with `owner_cell` always false, the owner's row ends: `` left: Some("ended")
+/// right: Some("live") ``; with `unsettled` never consulted, the unreadable cell ends Bob's: ``
+/// left: Some("ended") right: Some("live") ``; with `revived` always `None`, the restated row
+/// stays ended: `` assertion failed: rows[&cy].live() ``.
+#[test]
+fn ending_a_preference_is_three_way() {
+    let first = vault(&[
+        ",ann@example.invalid,m3,,1,,,,,,,,",
+        ",bob@example.invalid,m4,,1,,,,,,,,",
+        ",cy@example.invalid,m5,,1,,,,,,,,",
+        ",dee@example.invalid,m6,,1,,,,,,,,",
+    ]);
+    let mut book = Book::new();
+    let one = plan(
+        &input(std::slice::from_ref(&first), &[], MailboxKeys::default()),
+        &Cells::new(),
+    )
+    .unwrap();
+    apply(&mut book, &one);
+    let ann = pref("m3", "ann@example.invalid");
+    let bob = pref("m4", "bob@example.invalid");
+    let cy = pref("m5", "cy@example.invalid");
+    let dee = pref("m6", "dee@example.invalid");
+    let seen = book.all();
+    // The owner ranks Ann's row and ends Dee's.
+    book.write(
+        2,
+        &seen,
+        vec![
+            put(&PREFERENCE, &ann, "rank", json!(7)),
+            put(&PREFERENCE, &dee, "row", json!("ended")),
+        ],
+    );
+    let cells = book.cells();
+    let dropped = vault(&[
+        ",ann@example.invalid,,,1,,,,,,,,",
+        ",bob@example.invalid,not a label,,1,,,,,,,,",
+        ",cy@example.invalid,,,1,,,,,,,,",
+        ",dee@example.invalid,m6,,1,,,,,,,,",
+    ]);
+    let next = plan(&input(&[dropped], &[], MailboxKeys::default()), &cells).unwrap();
+    let after = apply(&mut book, &next);
+    let rows = cell::project(&PREFERENCE, &after).rows;
+    assert_eq!(rows[&ann].lifecycle(), Some("live"));
+    assert_eq!(rows[&bob].lifecycle(), Some("live"));
+    assert_eq!(rows[&cy].lifecycle(), Some("ended"));
+    assert_eq!(rows[&dee].lifecycle(), Some("ended"));
+    assert!(
+        next.findings
+            .iter()
+            .any(|f| f.kind == Kind::OwnerKept && f.pk.as_deref() == Some(ann.as_str()))
+    );
+    assert!(
+        next.findings
+            .iter()
+            .any(|f| f.kind == Kind::RetiredKept && f.pk.as_deref() == Some(dee.as_str()))
+    );
+    // The account row itself, and its status, are untouched by any of it.
+    let account = keys::account_pk("claude", "cy@example.invalid").unwrap();
+    assert_eq!(
+        cell::project(&ACCOUNT, &after).rows[&account].get("status"),
+        Some(&json!("pending"))
+    );
+    let restated = vault(&[",cy@example.invalid,m5,,1,,,,,,,,"]);
+    let back = plan(&input(&[restated], &[], MailboxKeys::default()), &after).unwrap();
+    let after = apply(&mut book, &back);
+    let rows = cell::project(&PREFERENCE, &after).rows;
+    assert!(rows[&cy].live());
+    assert_eq!(rows[&dee].lifecycle(), Some("ended"));
+}
+
+/// An owner's correction naming another listed login links this address to it, and a `+tag` of a
+/// listed login is its alias unless a correction says otherwise; a guess links nothing, and an
+/// address listed nowhere is no target (a mailbox's login never enters a row).
+/// NEGATIVE CONTROL: with `link_alias` called for a guess too (`column == "mailbox"` dropped), the
+/// lead's guess makes a link: `` left: Some(String("ad-…")) right: None ``.
+#[test]
+fn an_alias_links_to_the_listed_login_it_is_received_at() {
+    let hub = keys::address_pk("hub@example.invalid").unwrap();
+    let sheet = logins(&[
+        "m3,hub@example.invalid,claude,,x,",
+        "m4,ann@example.invalid,claude,,x,hub@example.invalid",
+        "m5,bob@example.invalid,claude,hub@example.invalid,x,",
+        "m6,cy@example.invalid,claude,,x,box@proton.example",
+        "m7,hub+two@example.invalid,claude,,x,",
+        "m8,hub+three@example.invalid,claude,,x,ann@example.invalid",
+        "m9,lone+tag@example.invalid,claude,,x,",
+    ]);
+    let plan = plan(&input(&[sheet], &[], MailboxKeys::default()), &Cells::new()).unwrap();
+    let link = |address: &str| {
+        planned(
+            &plan,
+            "address",
+            &keys::address_pk(address).unwrap(),
+            "alias_of",
+        )
+    };
+    assert_eq!(link("ann@example.invalid"), Some(&json!(hub)));
+    assert_eq!(link("bob@example.invalid"), None);
+    assert_eq!(link("cy@example.invalid"), None);
+    assert_eq!(link("hub+two@example.invalid"), Some(&json!(hub)));
+    assert_eq!(
+        link("hub+three@example.invalid"),
+        Some(&json!(keys::address_pk("ann@example.invalid").unwrap()))
+    );
+    assert_eq!(link("lone+tag@example.invalid"), None);
+    let ann = keys::address_pk("ann@example.invalid").unwrap();
+    assert_eq!(
+        planned(&plan, "address", &ann, "kind"),
+        Some(&json!("alias"))
+    );
+    assert!(!values(&plan).join("\n").contains("box@"));
+}
+
+/// A harness file adds what the sheets did not state, below them: its machines are a set, so a
+/// warm list adds preferences a sheet did not name, unranked, and keeps the sheet's rank where it
+/// did; its label says the rank on the machine it names and becomes `legacy_label`, never `label`;
+/// an account the vault sheet did not give is a disagreement, no row; a file dropped from a later
+/// run ends what it alone stated only when its kind is read.
+/// NEGATIVE CONTROL: with `harness` writing past the `held` check (`if true || !held`), the fleet
+/// file's `m3-5` is a disagreement with the sheet's rank, when a harness file only adds: this
+/// test's `` a preference a sheet stated is not compared `` message.
+#[test]
+fn a_harness_file_adds_below_the_sheets() {
+    let stated = |kind, name: &str, text: &str| {
+        let rows = Stand.stated(kind, name, text).unwrap();
+        Sheet::stated(kind, name, text.as_bytes(), &rows).unwrap()
+    };
+    let sheet = vault(&[",ann@example.invalid,m3.2,,1,,,,,,,,"]);
+    let fleet = stated(
+        SheetKind::FleetAccounts,
+        "fleet-accounts.toml",
+        "claude,ann@example.invalid,m3-5,m3\nclaude,bob@example.invalid,m8-2,m8\nkimi:global,bob@example.invalid,kimi-m16,m16",
+    );
+    let pool = stated(
+        SheetKind::AiPool,
+        "ai-pool.toml",
+        "claude,ann@example.invalid,,m3 m9\ncodex,ann@example.invalid,,m9",
+    );
+    let sheets = [pool, sheet, fleet];
+    let first = plan(&input(&sheets, &[], MailboxKeys::default()), &Cells::new()).unwrap();
+    let rank =
+        |label: &str, address: &str| planned(&first, "preference", &pref(label, address), "rank");
+    assert_eq!(rank("m3", "ann@example.invalid"), Some(&json!(2)));
+    assert!(
+        planned(
+            &first,
+            "preference",
+            &pref("m9", "ann@example.invalid"),
+            "machine"
+        )
+        .is_some()
+    );
+    assert_eq!(rank("m9", "ann@example.invalid"), None);
+    assert_eq!(rank("m8", "bob@example.invalid"), Some(&json!(2)));
+    let kimi = keys::account_pk("kimi:global", "bob@example.invalid").unwrap();
+    let on_m16 = keys::preference_pk(&keys::machine_pk("m16"), &kimi).unwrap();
+    assert_eq!(
+        planned(&first, "preference", &on_m16, "rank"),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        planned(&first, "account", &kimi, "legacy_label"),
+        Some(&json!("kimi-m16"))
+    );
+    assert_eq!(
+        planned(&first, "account", &kimi, "label"),
+        Some(&json!(
+            keys::default_account_label("kimi:global", &kimi).unwrap()
+        ))
+    );
+    // The vault sheet gave Ann no Codex account: compared, no row.
+    let codex = keys::account_pk("codex", "ann@example.invalid").unwrap();
+    assert!(planned(&first, "account", &codex, "realm").is_none());
+    assert!(kinds(&first).contains(&"sources-disagree"));
+    assert!(
+        !first
+            .findings
+            .iter()
+            .any(|f| f.kind == Kind::SourcesDisagree && f.collection == Some(PREFERENCE.name)),
+        "a preference a sheet stated is not compared: {:?}",
+        first.findings
+    );
+    let bob = keys::address_pk("bob@example.invalid").unwrap();
+    assert_eq!(
+        planned(&first, "address", &bob, "origin"),
+        Some(&json!("harness"))
+    );
+    // Applied, the same sources write nothing; a run without the pool file ends nothing, and one
+    // that reads a pool file no longer naming m9 ends that row alone.
+    let mut book = Book::new();
+    let cells = apply(&mut book, &first);
+    let again = plan(&input(&sheets, &[], MailboxKeys::default()), &cells).unwrap();
+    assert!(again.rows.is_empty(), "{:?}", again.rows);
+    let [_, sheet, fleet] = sheets;
+    let without = [sheet.clone(), fleet.clone()];
+    let skipped = plan(&input(&without, &[], MailboxKeys::default()), &cells).unwrap();
+    assert!(skipped.planned.iter().all(|p| p.x != json!("ended")));
+    let shorter = stated(
+        SheetKind::AiPool,
+        "ai-pool.toml",
+        "claude,ann@example.invalid,,m3",
+    );
+    let next = plan(
+        &input(&[sheet, fleet, shorter], &[], MailboxKeys::default()),
+        &cells,
+    )
+    .unwrap();
+    let ended: Vec<&str> = next
+        .planned
+        .iter()
+        .filter(|p| p.x == json!("ended"))
+        .map(|p| p.pk.as_str())
+        .collect();
+    assert_eq!(ended, [pref("m9", "ann@example.invalid").as_str()]);
 }
 
 /// Two live rows naming one fleet node (any writer can set the cell) adopt neither: the known
@@ -812,6 +1150,7 @@ fn two_rows_naming_one_fleet_node_adopt_neither() {
         keys: MailboxKeys::default(),
         now_ms: 0,
         births: false,
+        unread: &[],
     };
     let plan = plan(&adopt, &cells).unwrap();
     assert!(plan.planned.iter().all(|p| p.pk != first && p.pk != second));
@@ -873,6 +1212,7 @@ fn adopt_binds_known_macs_by_node_and_births_none() {
         keys: MailboxKeys::default(),
         now_ms: 0,
         births: false,
+        unread: &[],
     };
     let plan = plan(&adopt, &cells).unwrap();
     assert_eq!(
@@ -946,4 +1286,616 @@ fn mailbox_keys_round_trip() {
     assert!(MailboxKeys::from_json(&json!({"format": "other"})).is_err());
     let text = aterm_json::to_string(&plan.keys.to_json()).unwrap();
     assert!(!text.contains('@'));
+    assert!(
+        MailboxKeys::from_json(&json!({
+            "format": "alab-mailbox-keys/1",
+            "mailboxes": {"d": {"pk": "mb-0000000000000001", "label": ""}}
+        }))
+        .is_err()
+    );
+    let digest_a = "a".repeat(64);
+    let digest_b = "b".repeat(64);
+    for bad in [
+        json!({
+            "format": "alab-mailbox-keys/1",
+            "mailboxes": {"box@proton.example": {"pk": "mb-0000000000000001", "label": "proton-1"}}
+        }),
+        json!({
+            "format": "alab-mailbox-keys/1",
+            "mailboxes": {(digest_a.as_str()): {"pk": "mb-0000000000000001", "label": "box@proton.example"}}
+        }),
+        json!({
+            "format": "alab-mailbox-keys/1",
+            "mailboxes": {
+                (digest_a.as_str()): {"pk": "mb-0000000000000001", "label": "proton-1"},
+                (digest_b.as_str()): {"pk": "mb-0000000000000001", "label": "proton-2"},
+            }
+        }),
+        json!({
+            "format": "alab-mailbox-keys/1",
+            "mailboxes": {
+                (digest_a.as_str()): {"pk": "mb-0000000000000001", "label": "proton-1"},
+                (digest_b.as_str()): {"pk": "mb-0000000000000002", "label": "proton-1"},
+            }
+        }),
+        json!({
+            "format": "alab-mailbox-keys/1",
+            "extra": true,
+            "mailboxes": {}
+        }),
+    ] {
+        assert!(MailboxKeys::from_json(&bad).is_err(), "{bad}");
+    }
+    let win = Sheet::stated(
+        SheetKind::FleetAccounts,
+        r"C:\Users\owner\.secrets\fleet-accounts.toml",
+        b"",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(win.name, "fleet-accounts.toml");
+    assert!(Sheet::stated(SheetKind::FleetAccounts, "   ", b"", &[]).is_err());
+    assert!(Sheet::stated(SheetKind::AiPool, "", b"x", &[]).is_err());
+    assert!(Sheet::stated(SheetKind::AiPool, "dir/", b"x", &[]).is_err());
+    let stated = Sheet::stated(SheetKind::AiPool, "ai-pool.toml", b"x", &[]).unwrap();
+    assert_eq!(
+        stated.text(&Coord {
+            sheet: 0,
+            source: stated.source.clone(),
+            row: 0,
+            col: 1,
+        }),
+        None
+    );
+}
+
+/// When both sheets enrich one row (the vault sheet births the address and Google account, and the
+/// logins sheet adds `mailbox_hint`, `mailbox` and `services.agy`), each cell keeps the source of
+/// the sheet that stated it, so a later single-sheet import of the vault sheet alone leaves the
+/// logins sheet's cells intact, and an empty-row sheet that ends a preference still records its
+/// `source` row, so the cell it wrote names a source that exists.
+/// NEGATIVE CONTROL: with `finish` stamping every cell on a row with `want.src` (`row_source` in
+/// place of `wanted.at.source` and `at.source`), the vault-only re-import retracts the logins
+/// sheet's `mailbox_hint`, `mailbox` and `services.agy`: `` left: Some(Null) right:
+/// Some(String("mb-…")) ``.
+#[test]
+fn per_cell_provenance_preserves_cross_sheet_cells_and_empty_sheet_preference_endings() {
+    let vault_one = vault(&[",ann@example.invalid,m3,,,,1,,,,,,"]);
+    let logins_one =
+        logins(&["m3,ann@example.invalid,google/agy,box@proton.example,lead,real@proton.example"]);
+    let mut book = Book::new();
+    let combined = plan(
+        &input(
+            &[vault_one.clone(), logins_one],
+            &[],
+            MailboxKeys::default(),
+        ),
+        &Cells::new(),
+    )
+    .unwrap();
+    let keys = combined.keys.clone();
+    let cells = apply(&mut book, &combined);
+
+    let ann = keys::address_pk("ann@example.invalid").unwrap();
+    let google = keys::account_pk("google", "ann@example.invalid").unwrap();
+    let hint = cell::project(&ADDRESS, &cells).rows[&ann]
+        .get("mailbox_hint")
+        .unwrap()
+        .clone();
+    let mbox = cell::project(&ADDRESS, &cells).rows[&ann]
+        .get("mailbox")
+        .unwrap()
+        .clone();
+    assert!(hint.as_str().is_some_and(|pk| keys::is_digest_pk(pk, "mb")));
+    assert!(mbox.as_str().is_some_and(|pk| keys::is_digest_pk(pk, "mb")));
+
+    // Re-importing only an edited vault sheet must NOT wipe mailbox_hint, mailbox, or services.agy.
+    let vault_two = vault(&[",ann@example.invalid,m4,,,,1,,,,,,"]);
+    let vault_only = plan(&input(&[vault_two], &[], keys.clone()), &cells).unwrap();
+    let after_vault = apply(&mut book, &vault_only);
+    let addresses = cell::project(&ADDRESS, &after_vault);
+    assert_eq!(addresses.rows[&ann].get("mailbox_hint"), Some(&hint));
+    assert_eq!(addresses.rows[&ann].get("mailbox"), Some(&mbox));
+    let accounts = cell::project(&ACCOUNT, &after_vault);
+    assert_eq!(
+        accounts.rows[&google].fields["services"].members(),
+        BTreeSet::from(["agy", "gemini-web"])
+    );
+
+    // Next, re-importing only an edited logins sheet that drops `agy` and `mailbox_hint` retracts them.
+    let logins_two = logins(&["m4,ann@example.invalid,google,,,real@proton.example"]);
+    let logins_only = plan(&input(&[logins_two], &[], keys.clone()), &after_vault).unwrap();
+    let after_logins = apply(&mut book, &logins_only);
+    assert_eq!(
+        cell::project(&ADDRESS, &after_logins).rows[&ann].get("mailbox_hint"),
+        Some(&Value::Null)
+    );
+    assert_eq!(
+        cell::project(&ADDRESS, &after_logins).rows[&ann].get("mailbox"),
+        Some(&mbox)
+    );
+    assert_eq!(
+        cell::project(&ACCOUNT, &after_logins).rows[&google].fields["services"].members(),
+        BTreeSet::from(["gemini-web"])
+    );
+
+    // Empty-row vault sheet ending m4's preference still writes its `source` row.
+    let empty_vault = Sheet::parse(
+        SheetKind::Vault,
+        r"C:\dir\ai-accounts.csv",
+        format!("{VAULT_HEADER}\n").as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(empty_vault.name, "ai-accounts.csv");
+    let ending = plan(
+        &input(std::slice::from_ref(&empty_vault), &[], keys),
+        &after_logins,
+    )
+    .unwrap();
+    let after_ending = apply(&mut book, &ending);
+    let m4_google = keys::preference_pk(&keys::machine_pk("m4"), &google).unwrap();
+    assert_eq!(
+        cell::project(&PREFERENCE, &after_ending).rows[&m4_google].get(crate::typed::LIFECYCLE),
+        Some(&json!("ended"))
+    );
+    assert!(
+        cell::project(&SOURCE, &after_ending)
+            .rows
+            .contains_key(&empty_vault.source),
+        "ending a preference from a header-only sheet still records its source row"
+    );
+
+    // Path-only or empty sheet names and malformed KnownMac roster entries never crash `plan`.
+    assert!(
+        Sheet::parse(
+            SheetKind::Vault,
+            "dir/",
+            format!("{VAULT_HEADER}\n").as_bytes()
+        )
+        .is_err()
+    );
+    let noisy_macs = [
+        KnownMac {
+            label: None,
+            aliases: Vec::new(),
+            node: Some("not-a-32-hex-node".to_owned()),
+            hosts: vec!["bad\nhost".to_owned()],
+        },
+        KnownMac {
+            label: Some(Label::plain(77)),
+            aliases: Vec::new(),
+            node: Some("0123456789ABCDEF0123456789ABCDEF".to_owned()),
+            hosts: vec![
+                "m77.local".to_owned(),
+                "m77.local".to_owned(),
+                "x".repeat(80),
+                "ops@example.invalid".to_owned(),
+            ],
+        },
+    ];
+    let roster_plan = plan(
+        &input(&[], &noisy_macs, MailboxKeys::default()),
+        &Cells::new(),
+    )
+    .unwrap();
+    let m77 = keys::machine_pk("n-0123456789abcdef0123456789abcdef");
+    assert_eq!(
+        planned(&roster_plan, "machine", &m77, "fleet_node"),
+        Some(&json!("0123456789abcdef0123456789abcdef"))
+    );
+    assert_eq!(
+        planned(&roster_plan, "machine", &m77, "hosts"),
+        Some(&json!(["m77.local"]))
+    );
+}
+
+/// A run that reads no vault sheet leaves what the vault sheet said about a row: a paused account
+/// stays paused under a harness file or a logins sheet, an address keeps its origin, and a label
+/// the owner gave is no finding. Pausing is what keeps a sign-in from being tried, so losing it to
+/// a lower source would be a real harm.
+/// NEGATIVE CONTROL: with `birth_status` ignoring what is held (`if !wanted {`), the harness file
+/// plans over the import's `paused`: `` left: Some(String("pending")) right: None ``.
+#[test]
+fn a_lower_source_leaves_what_the_vault_sheet_said() {
+    let first = vault(&[",ann@example.invalid,m3,,1,,,,,,claude banned,,"]);
+    let mut book = Book::new();
+    let one = plan(&input(&[first], &[], MailboxKeys::default()), &Cells::new()).unwrap();
+    apply(&mut book, &one);
+    let account = keys::account_pk("claude", "ann@example.invalid").unwrap();
+    let ann = keys::address_pk("ann@example.invalid").unwrap();
+    let seen = book.all();
+    book.write(
+        2,
+        &seen,
+        vec![put(&ACCOUNT, &account, "label", json!("research"))],
+    );
+    let cells = book.cells();
+    let text = "claude,ann@example.invalid,m3,m3";
+    let rows = Stand
+        .stated(SheetKind::FleetAccounts, "fleet-accounts.toml", text)
+        .unwrap();
+    let fleet = Sheet::stated(
+        SheetKind::FleetAccounts,
+        "fleet-accounts.toml",
+        text.as_bytes(),
+        &rows,
+    )
+    .unwrap();
+    let other = logins(&["m3,ann@example.invalid,claude,,x,"]);
+    for sheet in [fleet, other] {
+        let next = plan(&input(&[sheet], &[], MailboxKeys::default()), &cells).unwrap();
+        assert_eq!(planned(&next, "account", &account, "status"), None);
+        assert_eq!(planned(&next, "address", &ann, "origin"), None);
+        assert_eq!(planned(&next, "account", &account, "label"), None);
+        assert!(
+            !next
+                .findings
+                .iter()
+                .any(|f| f.column.as_deref() == Some("label")),
+            "{:?}",
+            next.findings
+        );
+    }
+}
+
+/// The stated rows of one harness file.
+fn harness_file(kind: SheetKind, name: &str, text: &str) -> Sheet {
+    let rows = Stand.stated(kind, name, text).unwrap();
+    Sheet::stated(kind, name, text.as_bytes(), &rows).unwrap()
+}
+
+/// A note with no secret word from the old list still never crosses, on the address or on a
+/// paused account, and its coordinate stays.
+/// NEGATIVE CONTROL: with both of `note_text`'s checks using `guard::text`, `Hunter2` crosses: this test's
+/// `` the password crossed `` message.
+#[test]
+fn a_note_that_reads_as_a_password_never_crosses() {
+    let sheet = vault(&[
+        ",ann@example.invalid,m3,,1,,,,,,pass: Hunter2!,,",
+        ",bob@example.invalid,m3,,1,,,,,,claude banned,pw Hunter2!,",
+    ]);
+    let plan = plan(&input(&[sheet], &[], MailboxKeys::default()), &Cells::new()).unwrap();
+    assert!(
+        !values(&plan).join("\n").contains("Hunter2"),
+        "the password crossed"
+    );
+    let withheld = plan
+        .findings
+        .iter()
+        .filter(|f| f.kind == Kind::NoteWithheld)
+        .count();
+    assert_eq!(withheld, 2);
+    let bob = keys::address_pk("bob@example.invalid").unwrap();
+    assert_eq!(
+        planned(&plan, "address", &bob, "note"),
+        Some(&json!("claude banned"))
+    );
+}
+
+/// A retraction is written under the file that wrote the cell, whichever file of its kind the run
+/// read first, so an edited fleet file's ending names that file.
+/// NEGATIVE CONTROL: with `retract_source` matching the kind alone, the ending names the Codex file
+/// read first: the `assert_eq!` on the ended cell's source fails.
+#[test]
+fn a_retraction_names_the_file_that_wrote_the_cell() {
+    let claude = |text: &str| harness_file(SheetKind::FleetAccounts, "fleet-accounts.toml", text);
+    let codex = harness_file(
+        SheetKind::FleetAccounts,
+        "ai-accounts-codex.toml",
+        "codex,cod@example.invalid,m5-2,m5",
+    );
+    let mut book = Book::new();
+    let first = [
+        codex.clone(),
+        claude("claude,ann@example.invalid,,m3\nclaude,bob@example.invalid,,m3"),
+    ];
+    let cells = apply(
+        &mut book,
+        &plan(&input(&first, &[], MailboxKeys::default()), &Cells::new()).unwrap(),
+    );
+    let edited = claude("claude,ann@example.invalid,,m3");
+    let source = edited.source.clone();
+    let second = [codex, edited];
+    let after = apply(
+        &mut book,
+        &plan(&input(&second, &[], MailboxKeys::default()), &cells).unwrap(),
+    );
+    let preferences = cell::project(&PREFERENCE, &after);
+    let bob = &preferences.rows[&pref("m3", "bob@example.invalid")];
+    assert_eq!(bob.get(crate::typed::LIFECYCLE), Some(&json!("ended")));
+    let Some(Field::Value(ended)) = bob.fields.get(crate::typed::LIFECYCLE) else {
+        panic!("the row cell is one value");
+    };
+    assert_eq!(ended.value.s.as_deref(), Some(source.as_str()));
+    assert!(cell::project(&SOURCE, &after).rows.contains_key(&source));
+}
+
+/// Each fleet file is its own source: naming one file, or reading one beside another that failed,
+/// ends nothing the other stated, and a file read that dropped a row still ends its own.
+/// NEGATIVE CONTROL: with `ReadNow::covers` testing the kind alone, the rank the unread Codex file
+/// wrote is withdrawn: `` left: Some(Null) right: None ``.
+#[test]
+fn a_fleet_file_retracts_only_what_it_stated() {
+    let claude = |text: &str| harness_file(SheetKind::FleetAccounts, "fleet-accounts.toml", text);
+    let codex = harness_file(
+        SheetKind::FleetAccounts,
+        "ai-accounts-codex.toml",
+        "codex,cod@example.invalid,m5-2,m5",
+    );
+    let both = [
+        claude("claude,ann@example.invalid,,m3\nclaude,bob@example.invalid,,m3"),
+        codex,
+    ];
+    let mut book = Book::new();
+    let cells = apply(
+        &mut book,
+        &plan(&input(&both, &[], MailboxKeys::default()), &Cells::new()).unwrap(),
+    );
+    let ended = |plan: &Plan| {
+        plan.planned
+            .iter()
+            .filter(|p| p.x == json!("ended"))
+            .count()
+    };
+    // The Claude file now also lists Cod's mapping, with no rank: the rank the Codex file wrote,
+    // and that file is not read, stands.
+    let shorter = [claude(
+        "claude,ann@example.invalid,,m3\ncodex,cod@example.invalid,,m5",
+    )];
+    let only_named = plan(&input(&shorter, &[], MailboxKeys::default()), &cells).unwrap();
+    assert_eq!(
+        only_named
+            .planned
+            .iter()
+            .filter(|p| p.x == json!("ended"))
+            .map(|p| p.pk.clone())
+            .collect::<Vec<_>>(),
+        [pref("m3", "bob@example.invalid")],
+    );
+    let cod = keys::preference_pk(
+        &keys::machine_pk("m5"),
+        &keys::account_pk("codex", "cod@example.invalid").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(planned(&only_named, "preference", &cod, "rank"), None);
+    // The same run with a fleet file that failed to parse ends nothing.
+    let failed = Input {
+        unread: &[SheetKind::FleetAccounts],
+        ..input(&shorter, &[], MailboxKeys::default())
+    };
+    assert_eq!(ended(&plan(&failed, &cells).unwrap()), 0);
+}
+
+/// Any correction stops the `+tag` guess, and a run with no logins sheet neither guesses nor
+/// withdraws a link, since it cannot see the correction.
+/// NEGATIVE CONTROL: with `aliases` ignoring `corrected`, the self-mailbox row links to its base:
+/// `` left: Some(String(...)) right: None ``.
+#[test]
+fn a_correction_stops_the_tag_guess() {
+    let sheet = logins(&[
+        "m3,ann@example.invalid,claude,,x,",
+        "m4,ann+self@example.invalid,claude,,x,ann+self@example.invalid",
+        "m5,ann+far@example.invalid,claude,,x,box@proton.example",
+        "m6,ann+words@example.invalid,claude,,x,forwarded by hand",
+        "m7,ann+plain@example.invalid,claude,,x,",
+    ]);
+    let first = plan(
+        &input(std::slice::from_ref(&sheet), &[], MailboxKeys::default()),
+        &Cells::new(),
+    )
+    .unwrap();
+    let link = |plan: &Plan, address: &str, column: &str| {
+        planned(plan, "address", &keys::address_pk(address).unwrap(), column).cloned()
+    };
+    let base = json!(keys::address_pk("ann@example.invalid").unwrap());
+    for address in [
+        "ann+self@example.invalid",
+        "ann+far@example.invalid",
+        "ann+words@example.invalid",
+    ] {
+        assert_eq!(link(&first, address, "alias_of"), None, "{address}");
+        assert_eq!(link(&first, address, "kind"), None, "{address}");
+    }
+    assert_eq!(
+        link(&first, "ann+plain@example.invalid", "alias_of"),
+        Some(base)
+    );
+
+    // The vault sheet alone: no guess for a new `+tag`, no retraction of the one a logins run
+    // made through this vault listing.
+    let listing = vault(&[
+        ",ann@example.invalid,m3,,1,,,,,,,,",
+        ",ann+plain@example.invalid,m7,,1,,,,,,,,",
+        ",ann+new@example.invalid,m8,,1,,,,,,,,",
+    ]);
+    let both = [listing.clone(), sheet];
+    let mut book = Book::new();
+    let cells = apply(
+        &mut book,
+        &plan(&input(&both, &[], MailboxKeys::default()), &Cells::new()).unwrap(),
+    );
+    let alone = plan(&input(&[listing], &[], MailboxKeys::default()), &cells).unwrap();
+    assert_eq!(link(&alone, "ann+plain@example.invalid", "alias_of"), None);
+    assert_eq!(link(&alone, "ann+plain@example.invalid", "kind"), None);
+    assert_eq!(link(&alone, "ann+new@example.invalid", "alias_of"), None);
+}
+
+/// A file found and not read may state anything, so a sheet that drops a row ends nothing beside it.
+/// NEGATIVE CONTROL: with `can_end` ignoring `input.unread`, the vault sheet's dropped row ends:
+/// `` left: 1 right: 0 ``.
+#[test]
+fn an_unread_file_holds_every_ending() {
+    let mut book = Book::new();
+    let start = vault(&[
+        ",ann@example.invalid,m3,,1,,,,,,,,",
+        ",bob@example.invalid,m3,,1,,,,,,,,",
+    ]);
+    let cells = apply(
+        &mut book,
+        &plan(&input(&[start], &[], MailboxKeys::default()), &Cells::new()).unwrap(),
+    );
+    let dropped = [vault(&[",ann@example.invalid,m3,,1,,,,,,,,"])];
+    let ended = |plan: &Plan| {
+        plan.planned
+            .iter()
+            .filter(|p| p.x == json!("ended"))
+            .count()
+    };
+    let held = Input {
+        unread: &[SheetKind::FleetAccounts],
+        ..input(&dropped, &[], MailboxKeys::default())
+    };
+    assert_eq!(ended(&plan(&held, &cells).unwrap()), 0);
+    let whole = input(&dropped, &[], MailboxKeys::default());
+    assert_eq!(ended(&plan(&whole, &cells).unwrap()), 1);
+}
+
+/// A lower source's different rank is a finding and writes nothing, on a run that never read the
+/// vault sheet, while a rank that source itself wrote it may still move.
+/// NEGATIVE CONTROL: with `prefer` always wanting the rank (`held_above` returning false), the
+/// fleet file rewrites it: `` left: Some(Number(2)) right: None ``.
+#[test]
+fn a_lower_source_never_moves_the_vault_sheets_rank() {
+    let mut book = Book::new();
+    let cells = apply(
+        &mut book,
+        &plan(
+            &input(
+                &[vault(&[",ann@example.invalid,m8.3,,1,,,,,,,,"])],
+                &[],
+                MailboxKeys::default(),
+            ),
+            &Cells::new(),
+        )
+        .unwrap(),
+    );
+    let on_m8 = pref("m8", "ann@example.invalid");
+    for sheet in [
+        harness_file(
+            SheetKind::FleetAccounts,
+            "fleet-accounts.toml",
+            "claude,ann@example.invalid,m8-2,m8",
+        ),
+        logins(&["m8.2,ann@example.invalid,claude,,x,"]),
+    ] {
+        let next = plan(&input(&[sheet], &[], MailboxKeys::default()), &cells).unwrap();
+        assert_eq!(planned(&next, "preference", &on_m8, "rank"), None);
+        assert!(
+            next.findings
+                .iter()
+                .any(|f| f.kind == Kind::SourcesDisagree && f.column.as_deref() == Some("rank")),
+            "{:?}",
+            next.findings
+        );
+    }
+    let fleet = |label: &str| {
+        harness_file(
+            SheetKind::FleetAccounts,
+            "fleet-accounts.toml",
+            &format!("claude,bob@example.invalid,{label},m9"),
+        )
+    };
+    let mut book = Book::new();
+    let cells = apply(
+        &mut book,
+        &plan(
+            &input(&[fleet("m9-2")], &[], MailboxKeys::default()),
+            &Cells::new(),
+        )
+        .unwrap(),
+    );
+    let moved = plan(
+        &input(&[fleet("m9-3")], &[], MailboxKeys::default()),
+        &cells,
+    )
+    .unwrap();
+    assert_eq!(
+        planned(
+            &moved,
+            "preference",
+            &pref("m9", "bob@example.invalid"),
+            "rank"
+        ),
+        Some(&json!(3))
+    );
+}
+
+/// Every machine a harness label names is a preference, whatever the row's list says.
+/// NEGATIVE CONTROL: with the `named` loop in `harness` removed, m38 prefers nothing: this test's
+/// `` m38 `` message.
+#[test]
+fn a_two_mac_label_in_a_harness_file_maps_both_macs() {
+    let sheet = harness_file(
+        SheetKind::AiPool,
+        "ai-pool.toml",
+        "claude,ann@example.invalid,m106-m38,m106\nclaude,bob@example.invalid,m7-m9,",
+    );
+    let plan = plan(&input(&[sheet], &[], MailboxKeys::default()), &Cells::new()).unwrap();
+    for (machine, address) in [
+        ("m106", "ann@example.invalid"),
+        ("m38", "ann@example.invalid"),
+        ("m7", "bob@example.invalid"),
+        ("m9", "bob@example.invalid"),
+    ] {
+        assert!(
+            planned(&plan, "preference", &pref(machine, address), "machine").is_some(),
+            "{machine}"
+        );
+    }
+}
+
+/// One cell this run could not read says nothing against a row's mappings: a bad provider cell
+/// keeps that login's, a held Kimi cell keeps its Kimi account's, and a bad address cell, which
+/// could be any row's, ends nothing in the run, while a cell read as absent still ends its own.
+/// NEGATIVE CONTROL: with `can_end` true whatever the run missed, the typo ends ann's: this test's
+/// `` a typo ended `` message.
+#[test]
+fn a_cell_this_run_could_not_read_ends_nothing() {
+    let start = vault(&[
+        ",ann@example.invalid,m3,,1,,,,,,,,",
+        ",bob@example.invalid,m3,,1,,,,,,,,",
+        ",cy@example.invalid,m3,,1,,,,,,,,",
+        ",kay@example.invalid,m3,,,,,,global,,,,",
+    ]);
+    let mut book = Book::new();
+    let cells = apply(
+        &mut book,
+        &plan(&input(&[start], &[], MailboxKeys::default()), &Cells::new()).unwrap(),
+    );
+    let ended = |rows: &[&str]| {
+        plan(&input(&[vault(rows)], &[], MailboxKeys::default()), &cells)
+            .unwrap()
+            .planned
+            .iter()
+            .filter(|p| p.x == json!("ended"))
+            .map(|p| p.pk.clone())
+            .collect::<Vec<_>>()
+    };
+    let (ann, bob, cy) = (
+        ",ann@example.invalid,m3,,1,,,,,,,,",
+        ",bob@example.invalid,m3,,1,,,,,,,,",
+        ",cy@example.invalid,m3,,1,,,,,,,,",
+    );
+    let kay = ",kay@example.invalid,m3,,,,,,global,,,,";
+    assert_eq!(ended(&[ann, bob, cy, kay]), Vec::<String>::new());
+    assert_eq!(
+        ended(&["x,not-an-address,m3,,1,,,,,,,,", bob, cy, kay]),
+        Vec::<String>::new(),
+        "a typo ended"
+    );
+    assert_eq!(
+        ended(&[ann, ",bob@example.invalid,m3,,1?,,,,,,,,", cy, kay]),
+        Vec::<String>::new(),
+        "an unread provider cell ended"
+    );
+    assert_eq!(
+        ended(&[ann, bob, cy, ",kay@example.invalid,m3,,,,,,1,,,,"]),
+        Vec::<String>::new(),
+        "a held cell ended"
+    );
+    // The control: a row whose cell plainly says no account ends its mapping.
+    assert_eq!(
+        ended(&[ann, bob, ",cy@example.invalid,m3,,,,,,,,,,", kay]),
+        [pref("m3", "cy@example.invalid")]
+    );
 }

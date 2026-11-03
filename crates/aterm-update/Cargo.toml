@@ -39,6 +39,8 @@ aterm-digest = { workspace = true }
 # `aterm_uds::rand`, the audited entropy source (nonces, jitter); never a hand-rolled
 # `/dev/urandom` read.
 aterm-uds = { workspace = true }
+# Owned scratch for fully verified offline candidate staging.
+aterm-tempfile = { workspace = true }
 # The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
 # aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
 aterm-spec-anchor = { workspace = true }
@@ -64,9 +66,6 @@ aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-misc = { workspace = true }
 aterm-models-update = { workspace = true }
-# Test scratch directories removed on drop, and the shared-inode stand-ins the
-# install.sh tests lay as stub tools (`stand_in`).
-aterm-tempfile = { workspace = true }
 
 # Explicit mounted-volume acceptance; not an ordinary test or a release dependency.
 [[bench]]

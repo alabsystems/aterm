@@ -39,6 +39,8 @@ fn worker(
             result_bytes: result,
             result_path: (result > 0).then(|| std::path::PathBuf::from("/tmp/r.md")),
             seen: false,
+            finished: false,
+            own_report: false,
         }),
         ..SessionRow::default()
     }

@@ -9,6 +9,13 @@ use crate::grid::{CellFlags, PackedColor};
 use super::handler::SgrStyleHandler;
 use super::sgr_color_u8;
 
+/// What a colour's colon group names.
+#[derive(Clone, Copy)]
+enum ColonColour {
+    Rgb(u8, u8, u8),
+    Indexed(u8),
+}
+
 impl SgrStyleHandler<'_> {
     /// Apply an SGR rendition change.
     #[inline]
@@ -144,16 +151,21 @@ impl SgrStyleHandler<'_> {
         0
     }
 
-    /// Extra parameters consumed by an extended color code (`38`, `48`, `58`).
+    /// Extra parameters consumed by an extended color code (`38`, `48`, `58`) in all semicolons.
+    ///
+    /// CMY and CMYK render nowhere, so they consume their values and change nothing. xterm
+    /// consumes only the selector and runs the values as SGR codes; T.416 has no semicolon form
+    /// of them to say otherwise, and a colour's values are not attributes.
     #[inline]
     const fn extended_color_skip(params: &[u16]) -> usize {
         if params.len() < 2 {
             return 0; // a bare 38 at the end of the list
         }
         match params[1] {
-            2 => 4, // 38;2;r;g;b
-            5 => 2, // 38;5;n
-            _ => 1, // an unknown selector consumes itself
+            2 | 3 => 4, // 38;2;r;g;b, 38;3;c;m;y
+            4 => 5,     // 38;4;c;m;y;k
+            5 => 2,     // 38;5;n
+            _ => 1,     // an unknown selector consumes itself
         }
     }
 
@@ -282,6 +294,22 @@ impl SgrStyleHandler<'_> {
     }
 
     /// Handle SGR with colon subparameters.
+    ///
+    /// **One rule for 38, 48 and 58, `astream_term`'s `Screen::sgr` too.** A colon on the code or
+    /// on the selector makes a group that is all the colour's (`38:2:…`, `38;2:…`: "after the
+    /// first colon, colons must be used", xterm's ctlseqs), and the group is read by
+    /// [`Self::colon_colour`]. Otherwise it is all semicolons, read by
+    /// [`Self::parse_extended_color`]. A sub-parameter is never a code: a group on a code that
+    /// takes none (`1:4`) is ignored with its code, as in xterm and the fold, and one a semicolon
+    /// colour's values stopped short of (`38;5;9:4`) is skipped, as in the fold, where xterm runs
+    /// it as a code. An empty last element is an element (`38:2:cs:r:g:` has a blue of 0, as in
+    /// xterm and the fold), which the parser delivers as it delivers a `;`'s.
+    ///
+    /// **The rule's limit is the parser's cap of 24 parameters.** Past it values are dropped, so a
+    /// group can arrive shorter than it was written, and the bit past the last parameter says a
+    /// sub-parameter fell. A colour left with four values then reads as nothing: they are not the
+    /// three channels, but the id form with its blue gone. The fold has no such cap and draws what
+    /// was written, which the oracle excludes (`sgr_past_the_parameter_cap`).
     #[inline]
     pub(super) fn handle_sgr_with_subparams(&mut self, params: &[u16], subparam_mask: u32) {
         if params.is_empty() {
@@ -292,80 +320,44 @@ impl SgrStyleHandler<'_> {
             return;
         }
 
+        let is_sub = |k: usize| k < 32 && (subparam_mask & (1u32 << k)) != 0;
+        let group_end = |start: usize| {
+            let mut end = start + 1;
+            while end < params.len() && is_sub(end) {
+                end += 1;
+            }
+            end
+        };
+
         let mut i = 0;
         while i < params.len() {
+            let end = group_end(i);
+            if is_sub(i) {
+                i = end;
+                continue;
+            }
             let param = params[i];
-            let next_is_subparam =
-                i + 1 < params.len() && i + 1 < 32 && (subparam_mask & (1u32 << (i + 1))) != 0;
 
-            if param == 4 && next_is_subparam {
-                let subparam = params.get(i + 1).copied().unwrap_or(0);
-                match subparam {
-                    0 => self.style.flags.remove(CellFlags::ALL_UNDERLINES),
-                    1 => {
-                        self.style.flags.remove(CellFlags::ALL_UNDERLINES);
-                        self.style.flags.insert(CellFlags::UNDERLINE);
+            if matches!(param, 38 | 48 | 58) {
+                let group = if end > i + 1 {
+                    Some((i + 1, end))
+                } else {
+                    let selector_end = group_end(end);
+                    (end < params.len() && selector_end > end + 1).then_some((end, selector_end))
+                };
+                if let Some((start, stop)) = group {
+                    let cut = stop == params.len() && is_sub(stop);
+                    if let Some(colour) = Self::colon_colour(&params[start..stop], cut) {
+                        self.set_extended_colour(param, colour);
                     }
-                    2 => {
-                        self.style.flags.remove(CellFlags::ALL_UNDERLINES);
-                        self.style.flags.insert(CellFlags::DOUBLE_UNDERLINE);
-                    }
-                    3 => {
-                        self.style.flags.remove(CellFlags::ALL_UNDERLINES);
-                        self.style.flags.insert(CellFlags::CURLY_UNDERLINE);
-                    }
-                    4 => {
-                        self.style.flags.remove(CellFlags::ALL_UNDERLINES);
-                        self.style.flags.insert(CellFlags::DOTTED_UNDERLINE);
-                    }
-                    5 => {
-                        self.style.flags.remove(CellFlags::ALL_UNDERLINES);
-                        self.style.flags.insert(CellFlags::DASHED_UNDERLINE);
-                    }
-                    _ => {
-                        self.style.flags.remove(CellFlags::ALL_UNDERLINES);
-                        self.style.flags.insert(CellFlags::UNDERLINE);
-                    }
+                    i = stop;
+                    continue;
                 }
-                i += 2;
-                continue;
-            }
-
-            if param == 58 && next_is_subparam {
-                let mut skip = 1;
-                while i + skip < params.len()
-                    && i + skip < 32
-                    && (subparam_mask & (1u32 << (i + skip))) != 0
-                {
-                    skip += 1;
+            } else if end > i + 1 {
+                if param == 4 {
+                    self.apply_underline_style(params[i + 1]);
                 }
-                if let Some(color) = Self::parse_underline_color_colon(
-                    &params[i..i + skip],
-                    if i < 32 { subparam_mask >> i } else { 0 },
-                ) {
-                    self.transient.current_underline_color = Some(color);
-                    self.transient.update_has_transient_extras();
-                }
-                i += skip;
-                continue;
-            }
-
-            if (param == 38 || param == 48) && next_is_subparam {
-                let mut skip = 1;
-                while i + skip < params.len()
-                    && i + skip < 32
-                    && (subparam_mask & (1u32 << (i + skip))) != 0
-                {
-                    skip += 1;
-                }
-                if let Some(color) = Self::parse_extended_color_colon(&params[i..i + skip]) {
-                    if param == 38 {
-                        self.style.fg = color;
-                    } else {
-                        self.style.bg = color;
-                    }
-                }
-                i += skip;
+                i = end;
                 continue;
             }
 
@@ -376,65 +368,64 @@ impl SgrStyleHandler<'_> {
         self.apply_style_change();
     }
 
-    /// Parse extended color with colon subparameters (ISO 8613-3 format).
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "values clamped to u8::MAX by .min()"
-    )]
+    /// `4:n`: the underline style `n` names, `0` for none.
     #[inline]
-    const fn parse_extended_color_colon(params: &[u16]) -> Option<PackedColor> {
-        if params.len() < 3 {
-            return None;
+    fn apply_underline_style(&mut self, style: u16) {
+        self.style.flags.remove(CellFlags::ALL_UNDERLINES);
+        match style {
+            0 => {}
+            2 => self.style.flags.insert(CellFlags::DOUBLE_UNDERLINE),
+            3 => self.style.flags.insert(CellFlags::CURLY_UNDERLINE),
+            4 => self.style.flags.insert(CellFlags::DOTTED_UNDERLINE),
+            5 => self.style.flags.insert(CellFlags::DASHED_UNDERLINE),
+            _ => self.style.flags.insert(CellFlags::UNDERLINE),
         }
+    }
 
-        match params[1] {
-            2 => {
-                if params.len() >= 6 {
-                    let r = if params[3] > 255 {
-                        255
-                    } else {
-                        params[3] as u8
-                    };
-                    let g = if params[4] > 255 {
-                        255
-                    } else {
-                        params[4] as u8
-                    };
-                    let b = if params[5] > 255 {
-                        255
-                    } else {
-                        params[5] as u8
-                    };
-                    Some(PackedColor::rgb(r, g, b))
-                } else if params.len() >= 5 {
-                    let r = if params[2] > 255 {
-                        255
-                    } else {
-                        params[2] as u8
-                    };
-                    let g = if params[3] > 255 {
-                        255
-                    } else {
-                        params[3] as u8
-                    };
-                    let b = if params[4] > 255 {
-                        255
-                    } else {
-                        params[4] as u8
-                    };
-                    Some(PackedColor::rgb(r, g, b))
-                } else {
-                    None
-                }
+    /// Set the colour `code` (38, 48 or 58) selects.
+    #[inline]
+    fn set_extended_colour(&mut self, code: u16, colour: ColonColour) {
+        let packed = match colour {
+            ColonColour::Rgb(r, g, b) => PackedColor::rgb(r, g, b),
+            ColonColour::Indexed(n) => PackedColor::indexed(n),
+        };
+        match code {
+            38 => self.style.fg = packed,
+            48 => self.style.bg = packed,
+            _ => {
+                self.transient.current_underline_color = Some(match colour {
+                    ColonColour::Rgb(r, g, b) => {
+                        0x01_000000 | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+                    }
+                    ColonColour::Indexed(n) => 0x02_000000 | u32::from(n),
+                });
+                self.transient.update_has_transient_extras();
             }
-            5 => {
-                let index = if params[2] > 255 {
-                    255
-                } else {
-                    params[2] as u8
-                };
-                Some(PackedColor::indexed(index))
-            }
+        }
+    }
+
+    /// A colour's colon group, its selector first, wherever the first colon fell (`38:2:…`,
+    /// `38;2:…`). `5:n` selects a palette colour. `2:cs:r:g:b` selects a 24-bit colour, the second
+    /// element the colour-space id (ITU T.416 13.1.8, empty in `2::r:g:b`) and any past the blue
+    /// its elements 6 to 8, none of which means anything here. `2:r:g:b`, which programs emit, has
+    /// no id slot: only the count tells them apart, four values or three, as in xterm's
+    /// `parse_extended_colors`, Ghostty, kitty and iTerm2, and a `cut` group (the parser's cap
+    /// dropped what followed it) has lost the count. A shorter group, and any other selector (CMY
+    /// `3:cs:c:m:y`, CMYK `4:cs:c:m:y:k`), names no colour.
+    #[inline]
+    const fn colon_colour(group: &[u16], cut: bool) -> Option<ColonColour> {
+        match *group {
+            [5, n, ..] => Some(ColonColour::Indexed(sgr_color_u8(n))),
+            [2, _, r, g, b, ..] => Some(ColonColour::Rgb(
+                sgr_color_u8(r),
+                sgr_color_u8(g),
+                sgr_color_u8(b),
+            )),
+            [2, r, g, b] if !cut => Some(ColonColour::Rgb(
+                sgr_color_u8(r),
+                sgr_color_u8(g),
+                sgr_color_u8(b),
+            )),
             _ => None,
         }
     }
@@ -508,65 +499,6 @@ impl SgrStyleHandler<'_> {
                 Some(0x01_000000 | (r << 16) | (g << 8) | b)
             }
             5 if params.len() >= 3 => {
-                let index = if params[2] > 255 {
-                    255
-                } else {
-                    params[2] as u32
-                };
-                Some(0x02_000000 | index)
-            }
-            _ => None,
-        }
-    }
-
-    /// Parse an underline color from colon subparameters (ISO 8613-3).
-    #[inline]
-    const fn parse_underline_color_colon(params: &[u16], _subparam_mask: u32) -> Option<u32> {
-        if params.len() < 3 {
-            return None;
-        }
-
-        match params[1] {
-            2 => {
-                if params.len() >= 6 {
-                    let r = if params[3] > 255 {
-                        255
-                    } else {
-                        params[3] as u32
-                    };
-                    let g = if params[4] > 255 {
-                        255
-                    } else {
-                        params[4] as u32
-                    };
-                    let b = if params[5] > 255 {
-                        255
-                    } else {
-                        params[5] as u32
-                    };
-                    Some(0x01_000000 | (r << 16) | (g << 8) | b)
-                } else if params.len() >= 5 {
-                    let r = if params[2] > 255 {
-                        255
-                    } else {
-                        params[2] as u32
-                    };
-                    let g = if params[3] > 255 {
-                        255
-                    } else {
-                        params[3] as u32
-                    };
-                    let b = if params[4] > 255 {
-                        255
-                    } else {
-                        params[4] as u32
-                    };
-                    Some(0x01_000000 | (r << 16) | (g << 8) | b)
-                } else {
-                    None
-                }
-            }
-            5 => {
                 let index = if params[2] > 255 {
                     255
                 } else {
@@ -734,8 +666,8 @@ mod tests {
     }
 
     /// A colour the engine refuses still consumes what xterm's
-    /// `parse_extended_colors` consumes: the selector, and the values it
-    /// needs, present or not. Found by the astream-term differential oracle
+    /// `parse_extended_colors` consumes, CMY and CMYK aside (their own test below): the selector,
+    /// and the values it needs, present or not. Found by the astream-term differential oracle
     /// (aterm-conformance `tests/vt_oracle`): a truncated `38;5` turned on
     /// blink, because the refused colour returned its tail to the SGR loop.
     #[test]
@@ -764,5 +696,73 @@ mod tests {
         term.process(b"\x1b[0m\x1b[4;38m");
         assert_eq!(term.style.flags, CellFlags::UNDERLINE, "4;38");
         assert!(term.style.fg == PackedColor::DEFAULT_FG, "4;38");
+    }
+
+    /// The id is an id wherever the first colon falls, and three values are the channels: at the
+    /// end of the list too, where a trailing colon is an empty blue, and with the parameter cap
+    /// cutting the group. `tests/vt_oracle/colours.rs` holds every spelling to written answers on
+    /// both engines.
+    #[test]
+    fn a_colour_space_id_is_never_a_channel_or_a_code() {
+        let mut term = Terminal::new(2, 16);
+        for seq in [
+            "38;2:3:10:20:",
+            "38:2:3:10:20:",
+            "38;2::10:20:",
+            "38:2::10:20:",
+        ] {
+            term.process(format!("\x1b[0m\x1b[{seq}m").as_bytes());
+            assert!(term.style.fg == PackedColor::rgb(10, 20, 0), "{seq}");
+        }
+        let cap = "7;".repeat(19);
+        for seq in ["38:2:3:10:20:9", "38;2:3:10:20:9", "38:2::10:20:9"] {
+            term.process(format!("\x1b[0m\x1b[{cap}{seq}m").as_bytes());
+            assert!(term.style.fg == PackedColor::DEFAULT_FG, "{seq} at the cap");
+        }
+        term.process(format!("\x1b[0m\x1b[{cap}38:2:10:20:9m").as_bytes());
+        assert!(
+            term.style.fg == PackedColor::rgb(10, 20, 9),
+            "three channels ending at the cap are whole"
+        );
+
+        for seq in [
+            "38;2:3:10:20:9",
+            "38:2:3:10:20:9",
+            "38;2::10:20:9",
+            "38:2::10:20:9",
+            "38;2:10:20:9",
+            "38:2:10:20:9",
+            "38;2;10;20;9",
+        ] {
+            term.process(format!("\x1b[0m\x1b[{seq};1m").as_bytes());
+            assert!(term.style.fg == PackedColor::rgb(10, 20, 9), "{seq}");
+            assert_eq!(term.style.flags, CellFlags::BOLD, "{seq}");
+        }
+        term.process(b"\x1b[0m\x1b[58;2:3:10:20:9;1m");
+        assert_eq!(term.transient.current_underline_color, Some(0x010A_1409));
+        assert_eq!(term.style.flags, CellFlags::BOLD, "58;2:3:10:20:9");
+    }
+
+    /// CMY and CMYK render nowhere: no colour moves and no value lands as a code, in any spelling,
+    /// and the attribute after them applies.
+    #[test]
+    fn cmy_and_cmyk_consume_their_values_and_change_nothing() {
+        let mut term = Terminal::new(2, 16);
+        for seq in [
+            "38;3;4;5;9",
+            "48;4;4;5;9;7",
+            "58;3;4;5;9",
+            "38:3:3:4:5:9",
+            "48:4:3:4:5:9:7",
+            "38;3:3:4:5:9",
+            "48;4:3:4:5:9:7",
+            "58;4::4:5:9:7",
+        ] {
+            term.process(format!("\x1b[0;31;44m\x1b[{seq};1m").as_bytes());
+            assert!(term.style.fg == PackedColor::indexed(1), "{seq}");
+            assert!(term.style.bg == PackedColor::indexed(4), "{seq}");
+            assert_eq!(term.transient.current_underline_color, None, "{seq}");
+            assert_eq!(term.style.flags, CellFlags::BOLD, "{seq}");
+        }
     }
 }

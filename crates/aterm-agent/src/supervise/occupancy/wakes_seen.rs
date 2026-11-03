@@ -133,26 +133,24 @@ impl WakeClaim {
     }
 }
 
-/// WHO DECLARED A WAKE.
+/// WHO DECLARED A WAKE: a process of the session's own tree, alone. The owner declares
+/// through owner rules (`docs/DESIGN-harness-occupancy-2026-10-20.md` §3.3), never a wake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Declarer {
     /// A process of the session's own tree.
     Agent,
-    /// The owner.
-    Owner,
 }
 
 impl Declarer {
     /// Every declarer.
-    pub const ALL: [Declarer; 2] = [Declarer::Agent, Declarer::Owner];
+    pub const ALL: [Declarer; 1] = [Declarer::Agent];
 
     /// Its class word, as a told line names it.
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
             Declarer::Agent => "yours",
-            Declarer::Owner => "owner's",
         }
     }
 

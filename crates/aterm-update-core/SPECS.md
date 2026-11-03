@@ -1,21 +1,22 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-update-core: spec recovery from its 175 unit tests
+# aterm-update-core: spec recovery from its 179 unit tests
 
-> Status 2026-10-28: this is the crate's migration worklist across its 77 specs and 175 live
-> `#[test]` fns (`172` mapped to specs in §1–§2 + `3` non-spec tests in §4, including
-> `github-pages-whole-listing`, `github-rest-lane`, `link-down-fast-exit` and
-> `resumable-download-loop`). Each spec below is proved through Trust/Clean about the compiled
-> Rust function, and then the tests each one subsumes are deleted.
+> Status 2026-11-03: this is the crate's migration worklist across its 78 specs and 179 live
+> `#[test]` fns (`176` mapped to specs in §1–§2 + `3` non-spec tests in §4, including
+> `github-pages-whole-listing`, `github-rest-lane`, `link-down-fast-exit`,
+> `resumable-download-loop` and `service-image-qualification-and-digest`). Each spec below is
+> proved through Trust/Clean about the compiled Rust function, and then the tests each one
+> subsumes are deleted.
 
 Source: `crates/aterm-update-core` (read only). Every live `#[test]` is mapped together with the
 code it reaches: src/{http 43, roster 21, handoff_policy 19, github_rest_tests 11, manifest 11,
-pkg_check 11, sentinel 10, codesign 9, pointer 5, sys 5, github_pages 4, hash 4, linux 4,
-settings 4, source 4, cdn 3, pins 3, privatedir 2, tag 2} = 175 in all (`#[cfg]`-gated tests in
-`codesign.rs` and `sys.rs` included).
+pkg_check 11, sentinel 11, codesign 9, github_pages 5, pointer 5, sys 5, hash 4, linux 4,
+settings 4, source 4, cdn 3, pins 3, privatedir 2, service_image 2, tag 2} = 179 in all
+(`#[cfg]`-gated tests in `codesign.rs`, `sentinel.rs`, `service_image.rs` and `sys.rs` included).
 
-Result: **77 specs**, covering **172 tests**. **3 tests are not spec samples** (§4).
+Result: **78 specs**, covering **176 tests**. **3 tests are not spec samples** (§4).
 
 ## 0. Notation used in the statements
 
@@ -98,7 +99,7 @@ roster-machine-and-live	contract	roster::Roster::is_revoked, roster::Roster::mac
 roster-authorize-appcast	contract	roster::Roster::authorize_appcast	For all r, appcast, sig and now. authorize_appcast = Err(BadSig) if |sig| != 64. It is Err(UnknownMachine) if live(r,now) = []. Otherwise it is Ok(Attribution{m.id, m.pubkey, r.roster_seq}) for the first m in live(r,now) with verify_under(m.pubkey,appcast,sig) = Ok. Otherwise it is Err(BadKey) if no live pubkey is Usable and Err(Verify) if one is. Corollaries: Ok implies Ed(m.pubkey,appcast,sig) for a live m. A revoked, expired or unlisted key never authorizes, given roster-validate-bijection. Attribution follows the verifying key and never the appcast's contents.	src/roster.rs::a_valid_chain_verifies_and_attributes_the_signing_machine, src/roster.rs::attribution_follows_the_key_that_signed, src/roster.rs::an_appcast_signed_by_a_key_outside_the_roster_is_refused, src/roster.rs::a_revoked_machine_is_refused_though_its_signature_is_valid, src/roster.rs::an_expired_machine_ages_out_of_the_candidate_set	&self, loop over live set with early return, String clone, ring crypto (axiom)	0,1,2,3,7,12
 attribution-bind	contract	roster::Attribution::bind, roster::Attribution::fmt	For all a, id and seq. bind(a,id,seq) = Err(Unattributed) if id = None. It is Err(UnknownMachine) if id = Some(x) with x != a.machine_id. It is Ok(()) if seq = Some(s) with s <= a.roster_seq. Otherwise, seq absent or newer, it is Err(SeqMismatch). Display(a) = a.machine_id++" (roster seq "++dec(a.roster_seq)++")".	src/roster.rs::the_manifest_must_name_its_machine_and_not_outrun_its_roster_generation	&self, Option<&str> compare, match guard, Display	0,1,2
 clock-fails-closed	contract	roster::fail_closed	For all x: fail_closed(None) = i64::MAX. fail_closed(Some(s)) = s if s <= i64::MAX, else i64::MAX. Corollary with roster-admit: admit(r, f, fail_closed(None)) = Err(Rollback) or Err(Stale) for every r, since every U(..) value is below i64::MAX, so an unreadable clock admits no roster. admit(r,0,0) = Ok for any r whose valid_until parses to a time after 1970.	src/roster.rs::an_unreadable_clock_fails_closed_rather_than_reading_as_1970	Option::map_or with a closure, i64::try_from	0,3,13
-boot-sentinel-state-machine	refinement	sentinel::Sentinel::arm, sentinel::Sentinel::arm_with, sentinel::Sentinel::ordered, sentinel::Sentinel::restart_count, sentinel::Sentinel::read_state, sentinel::Sentinel::confirm, sentinel::Sentinel::observe_launch, sentinel::Sentinel::observe_launch_by, sentinel::Sentinel::forgive_launch, sentinel::Sentinel::forgive_launch_of, sentinel::Sentinel::should_revert, sentinel::Sentinel::named_launches, sentinel::Sentinel::unreadable	Over Sigma (notation), for successful writes. arm(b) writes with Flush::Durable and arm_with(b,f) with f (Sentinel::ordered selects Flush::Ordered); count, forgive_launch and restart_count writes use self.flush (Flush::Durable on Sentinel::new, Flush::Ordered on Sentinel::ordered), and forgive_launch_of writes with Flush::Ordered. arm(b): Sigma' = Some((b,0,[])). restart_count(b) resets Sigma' = Some((b,0,[])) using self.flush. An arm whose rename landed and whose folder flush then failed (with an error other than ENOTSUP) returns Err and attempts to remove the record; Sigma' = None only when that removal succeeds. A failed removal can leave the arm present, and removal has no directory barrier against power loss. An arm that fails before rename preserves the previous record. confirm(): Sigma' = None, and a missing file is Ok. read_state() = Sigma.map(|(b,k,_)| (b,k)), and named_launches(b) = N when Sigma = Some((b,_,N)), else []. observe_launch_by(b,n): when Sigma = Some((b,k,N)), Sigma' = Some((b, k+1 saturating, last32(N ++ n?))) and the call returns k+1 saturating; otherwise Sigma is unchanged and the call returns 0. observe_launch(b) = observe_launch_by(b,None). forgive_launch(b): when Sigma = Some((b,k,N)), Sigma' = Some((b, k ⊖ 1, N)) and the call returns k ⊖ 1; otherwise Sigma is unchanged and the call returns 0. forgive_launch_of(b,pid,st): when Sigma = Some((b,k,N)) and N has a first element with that pid whose start time matches st (any start time when st is None), that element is removed, k becomes k ⊖ 1 and the call returns Some(k ⊖ 1); otherwise Sigma is unchanged and the call returns None. should_revert(b,max) <=> Sigma = Some((b,k,_)) && k >= max. write/read round trip: Sigma after write_record(b,k,N) = Some((b,k,last32(N))). A file that does not parse gives Sigma = None, so should_revert is false. Corollary: a sentinel for build b' != b is never changed by the b-operations. unreadable() <=> a regular file is present at the path and Sigma = None (no file, a directory or a link is not unreadable).	src/sentinel.rs::healthy_boot_never_reverts, src/sentinel.rs::crash_loop_triggers_revert_at_max_attempts, src/sentinel.rs::a_launch_the_killer_forgives_is_not_a_crash, src/sentinel.rs::sentinel_for_another_build_is_preserved_and_not_counted, src/sentinel.rs::corrupt_sentinel_does_not_force_a_revert, src/sentinel.rs::only_a_present_marker_that_does_not_read_is_unreadable, src/sentinel.rs::each_sentinel_write_names_its_flush, src/sentinel.rs::a_failed_folder_flush_fails_the_arm_and_not_a_count, src/sentinel.rs::a_prelanding_arm_failure_preserves_the_previous_record, src/sentinel.rs::named_launches_and_forgive_launch_of_match_pid_start_time_and_cap_at_32	fs read/atomic temp+rename+fsync, split_whitespace parsing with nested closures, Vec<LaunchName> extend/remove/slicing, saturating u32; every method trust::skip today	0,1,2,7,8
+boot-sentinel-state-machine	refinement	sentinel::Sentinel::arm, sentinel::Sentinel::arm_with, sentinel::Sentinel::ordered, sentinel::Sentinel::restart_count, sentinel::Sentinel::read_state, sentinel::Sentinel::confirm, sentinel::Sentinel::observe_launch, sentinel::Sentinel::observe_launch_by, sentinel::Sentinel::forgive_launch, sentinel::Sentinel::forgive_launch_of, sentinel::Sentinel::should_revert, sentinel::Sentinel::named_launches, sentinel::Sentinel::unreadable	Over Sigma (notation), for successful writes. arm(b) writes with Flush::Durable and arm_with(b,f) with f (Sentinel::ordered selects Flush::Ordered); count, forgive_launch and restart_count writes use self.flush (Flush::Durable on Sentinel::new, Flush::Ordered on Sentinel::ordered), and forgive_launch_of writes with Flush::Ordered. Every write and confirm refuses a symlinked parent directory or a non-regular existing file at the sentinel path without following or unlinking it. arm(b): Sigma' = Some((b,0,[])). restart_count(b) resets Sigma' = Some((b,0,[])) using self.flush. An arm whose rename landed and whose folder flush then failed (with an error other than ENOTSUP) returns Err and attempts to remove the record; Sigma' = None only when that removal succeeds. A failed removal can leave the arm present, and removal has no directory barrier against power loss. An arm that fails before rename preserves the previous record. confirm(): Sigma' = None when the path is absent or a regular file, and Err when it is a symlink or directory. read_state() = Sigma.map(|(b,k,_)| (b,k)), and named_launches(b) = N when Sigma = Some((b,_,N)), else []. observe_launch_by(b,n): when Sigma = Some((b,k,N)), Sigma' = Some((b, k+1 saturating, last32(N ++ n?))) and the call returns k+1 saturating; otherwise Sigma is unchanged and the call returns 0. observe_launch(b) = observe_launch_by(b,None). forgive_launch(b): when Sigma = Some((b,k,N)), Sigma' = Some((b, k ⊖ 1, N)) and the call returns k ⊖ 1; otherwise Sigma is unchanged and the call returns 0. forgive_launch_of(b,pid,st): when Sigma = Some((b,k,N)) and N has a first element with that pid whose start time matches st (any start time when st is None), that element is removed, k becomes k ⊖ 1 and the call returns Some(k ⊖ 1); otherwise Sigma is unchanged and the call returns None. should_revert(b,max) <=> Sigma = Some((b,k,_)) && k >= max. write/read round trip: Sigma after write_record(b,k,N) = Some((b,k,last32(N))). A file that does not parse gives Sigma = None, so should_revert is false. Corollary: a sentinel for build b' != b is never changed by the b-operations. unreadable() <=> a regular file is present at the path and Sigma = None (no file, a directory or a link is not unreadable).	src/sentinel.rs::healthy_boot_never_reverts, src/sentinel.rs::crash_loop_triggers_revert_at_max_attempts, src/sentinel.rs::a_launch_the_killer_forgives_is_not_a_crash, src/sentinel.rs::sentinel_for_another_build_is_preserved_and_not_counted, src/sentinel.rs::corrupt_sentinel_does_not_force_a_revert, src/sentinel.rs::only_a_present_marker_that_does_not_read_is_unreadable, src/sentinel.rs::each_sentinel_write_names_its_flush, src/sentinel.rs::a_failed_folder_flush_fails_the_arm_and_not_a_count, src/sentinel.rs::a_prelanding_arm_failure_preserves_the_previous_record, src/sentinel.rs::named_launches_and_forgive_launch_of_match_pid_start_time_and_cap_at_32, src/sentinel.rs::arm_and_confirm_refuse_symlinked_parent_and_non_regular_target	fs read/atomic temp+rename+fsync, split_whitespace parsing with nested closures, Vec<LaunchName> extend/remove/slicing, saturating u32; every method trust::skip today	0,1,2,7,8
 update-settings-keys	contract	settings::parse_update_enabled, settings::parse_update_auto_apply	For every text. parse_update_enabled(text) = false iff text decodes through aterm_toml as {update: Option<{enabled: Option<bool>}>} with update.enabled = Some(false). Other tables and other [update] keys, auto_apply of any type included, are ignored. Otherwise, a decode failure included, it is true. parse_update_auto_apply(text) is the same with auto_apply, and it ignores `enabled` whatever its type. Each is a function of the whole-file TOML validity and its own key alone, so a typo in one key never flips the other.	src/settings.rs::absent_is_on_and_false_is_off, src/settings.rs::auto_apply_is_on_unless_the_table_says_false, src/settings.rs::only_the_update_table_is_read	serde default structs through aterm_toml, Option chaining; the warn side effect on decode failure	0,1,9,12
 update-parse-notice	contract	settings::update_parse_notice	For all text and e. update_parse_notice(text,e) = W++" — automatic updates stay on: "++Display(e). W = "aterm.toml does not parse" when text does not decode as an aterm_toml::Table, and W = "[update] in aterm.toml has a value of the wrong type" otherwise.	-	aterm_toml decode, format!	0,1,9,12
 update-enabled-at	contract	settings::update_enabled_at	For every file state. update_enabled_at(p) = true if metadata(p) fails, p is not a regular file, len > 512 KiB, or read_to_string fails (not UTF-8). Otherwise it is parse_update_enabled(contents(p)).	src/settings.rs::a_missing_or_foreign_file_is_on	fs metadata/read_to_string	0,8
@@ -117,17 +118,18 @@ keeps-every-sealed-build	equivalence	handoff_policy::PolicyFile::keeps, handoff_
 adoption-decision	contract	handoff_policy::Adoption::of, handoff_policy::Adoption::policy, handoff_policy::adopt	For every read and b. Adoption::of(read,b) is: None for Absent. Ignored(w) for Ignored(w). Ignored("not read just then: "++w) for Unread(w), so an unread policy is never followed. For Parsed(f): NotForThisBuild(f) if FB(f,b) = None, Follow(p) if FB(f,b) = Some(p) with asks(p), and None if FB(f,b) = Some(p) with !asks(p). policy(a) = Some(p) iff a = Follow(p). adopt(read,b,cand) logs any Unreadable ranges fallback and the non-None Adoption variant, and returns Adoption::of(read,b).policy(). Corollary: adopt(read,b,_) = of(read,b).policy() = Some(p) implies asks(p) and applies_to(p,b).	src/handoff_policy.rs::a_producer_follows_only_a_policy_that_asks_something_of_its_own_build, src/handoff_policy.rs::adopt_returns_follow_policy_only_when_it_asks_something_of_this_build	enum match, clone of PolicyFile, format!	0,1,3,4
 momentary-read-errors	contract	handoff_policy::is_momentary, handoff_policy::is_momentary_read_error, handoff_policy::unreadable, handoff_policy::judge	For every io::Error e. is_momentary(e) = is_momentary_read_error(e) <=> kind(e) in {Interrupted, WouldBlock, OutOfMemory} || raw_os_error(e) in {EMFILE, ENFILE, ENOMEM, ENOBUFS, EIO} (unix; EINTR and EAGAIN reach the set through their kinds). unreadable(e) = Moment("unreadable: "++e) if is_momentary(e), else File("unreadable: "++e). judge(p, read) is: Absent for Ok(None). Parsed(f) for Ok(Some(t)) when PolicyFile::parse(t) = Ok(f), and Ignored(p++": "++why) when it is Err(why). Ignored(p++": "++w) for Err(File(w)). Unread(p++": "++w) for Err(Moment(w)). So EACCES, EPERM, EISDIR and ENOTDIR are Ignored and EMFILE is Unread.	src/handoff_policy.rs::a_read_the_system_refused_for_now_is_unread_and_a_file_error_is_ignored	io::Error kind/raw_os_error (std model), libc errno constants, enum mapping, Path display	0,1,3,8,12
 bundle-policy-read	contract	handoff_policy::read_from_bundle, handoff_policy::read_bounded	For every file state on unix, with P = root/BUNDLE_PATH. read_bounded opens P with O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC and never blocks, a FIFO included. The result is Ok(None) on NotFound and Err(File("not a regular file (a symbolic link)")) on ELOOP. Any other open error gives unreadable(e). If the opened descriptor is not a regular file (a directory or a FIFO), the result is Err(File("not a regular file")). If its length exceeds MAX_POLICY_BYTES (16384), or the bounded read returns more than that, it is Err(File(.. "bound" ..)). If the bytes are not UTF-8, it is Err(File("not UTF-8")). Otherwise it is Ok(Some(text)). read_from_bundle(root) = judge(P, read_bounded(P)). So a link out of the bundle is never followed or read.	src/handoff_policy.rs::a_bundle_policy_is_read_absent_or_ignored_never_followed_through_a_link, src/handoff_policy.rs::a_fifo_in_place_of_the_policy_is_refused_without_waiting_for_a_writer	OpenOptions custom_flags, fstat via File::metadata, take/read_to_end, String::from_utf8	0,1,8
-github-pages-whole-listing	contract	github_pages::page, github_pages::all	page(status, headers, body) = Ok((json(body), {link}) ) iff status = 200, at most one `Link` header and body is JSON; else Err. all(api, base, per_page, get) asks base with `&page=n` for n = 1, 2, … and returns every item in order iff every page is a JSON array of at most per_page items, every `Link` names api with base's path and query (only `page` moves; a `/repos/{o}/{r}/…` base may be linked as `/repositories/{id}/…` with the same suffix and one id throughout), no `next` page answers empty, `last` never moves, and an exactly full final page is confirmed by the empty page after it; else Err, and at most MAX_PAGES pages are read.	src/github_pages.rs::every_page_is_read_and_a_full_final_page_is_confirmed_empty, src/github_pages.rs::a_link_off_the_api_origin_or_scope_and_an_empty_page_promising_more_are_refused, src/github_pages.rs::a_listing_answer_is_a_200_with_at_most_one_link, src/github_pages.rs::a_repository_listing_may_link_by_id_but_only_one_id_and_its_own_suffix	FnMut fetch, BTreeMap headers, JSON, URL parsing loops	0,1,7
+github-pages-whole-listing	contract	github_pages::page, github_pages::all, github_pages::names_repository_by_id	page(status, headers, body) = Ok((json(body), {link}) ) iff status = 200, at most one `Link` header and body is JSON; else Err. all(api, base, per_page, get) refuses per_page = 0, malformed api/base origins, missing or duplicate base query keys, or a pre-set `page` before calling get; otherwise it asks base with `&page=n` for n = 1, 2, … and returns every item in order iff every page is a JSON array of at most per_page items, every `Link` names api with base's path and query (only `page` moves; a `/repos/{o}/{r}/…` base may be linked as `/repositories/{id}/…` with canonical positive id, the same non-empty suffix, and one id throughout), no `next` page answers empty, `last` never moves, and an exactly full final page is confirmed by the empty page after it; else Err, and at most MAX_PAGES pages are read.	src/github_pages.rs::every_page_is_read_and_a_full_final_page_is_confirmed_empty, src/github_pages.rs::a_link_off_the_api_origin_or_scope_and_an_empty_page_promising_more_are_refused, src/github_pages.rs::a_listing_answer_is_a_200_with_at_most_one_link, src/github_pages.rs::a_repository_listing_may_link_by_id_but_only_one_id_and_its_own_suffix, src/github_pages.rs::malformed_listing_bases_and_zero_or_empty_repo_aliases_refuse_before_fetch	FnMut fetch, BTreeMap headers, JSON, URL parsing loops	0,1,7
 github-rest-lane	invariant	github_rest::Client::prepare, github_rest::Prepared::run, github_rest::Client::pages, github_rest::Client::upload, github_rest::Client::asset_location, github_rest::Client::open_asset, github_rest::Client::download_asset, github_rest::Token::new, github_rest::upload_path, github_rest::not_started	Every request is one `/usr/bin/curl` (`-q` first, `--globoff`) to the api or uploads origin, the token (when the client has one) on stdin as `-H @-` and never in argv or environment (`VENDOR_ENV_SCRUB`, `GH_TOKEN`, `GITHUB_TOKEN` removed); a token that could write a second header is refused; a non-GET without a token, or a URL off the api and uploads origins, is refused before curl starts. An answer is read by its status (`--fail-with-body` keeps GitHub's words and curl's exit 22); a redirect from the api is never followed. An asset is read through the asset API's redirect only onto a CDN origin (else Redirect, never asked), by an anonymous curl with `--max-redirs 0`, at most its cap (else Malformed, the file removed). An upload's file is `--upload-file` as given when absolute and from `./` when relative, so `-` and `.` are files, never curl's stdin. A Spawn's refusal to start curl (`ErrorKind::Interrupted`) is Local; any other failure to start it is Transport. Direct marks a failure to start curl with `unstarted` (kind and words kept), which `never_started` reads back. pages() is github_pages::all over the client.	src/github_rest_tests.rs::the_token_rides_stdin_and_never_argv_or_the_environment, src/github_rest_tests.rs::a_hostile_curlrc_is_never_read, src/github_rest_tests.rs::a_release_is_created_uploaded_listed_and_downloaded_through_curl, src/github_rest_tests.rs::a_redirect_off_the_cdn_origin_is_refused_and_never_followed, src/github_rest_tests.rs::a_listing_is_read_to_its_end_and_an_incomplete_page_is_refused, src/github_rest_tests.rs::a_write_without_a_token_and_a_url_off_the_origins_never_start_curl, src/github_rest_tests.rs::a_token_that_could_write_a_header_is_refused, src/github_rest_tests.rs::fail_with_body_keeps_curls_own_reading_and_githubs_words, src/github_rest_tests.rs::an_upload_names_its_file_and_never_curls_stdin_or_a_glob, src/github_rest_tests.rs::a_spawn_that_refuses_once_interrupted_is_a_refusal_made_here, src/github_rest_tests.rs::a_child_that_never_started_is_marked_so	curl child, Secret on stdin, loopback fake GitHub	0,1,8
 link-down-fast-exit	contract	http::handshake_in, http::reached_no_host, http::link_after, http::attempt_again, http::note_link_down, http::head_no_redirect_first, http::head_no_redirect_again	handshake_in(t) parses the last whitespace token of t as f64: Done if > 0.0, NotDone if = 0.0, Unknown otherwise. reached_no_host(x, h) <=> x in {Some(5), Some(6), Some(7)} || (x = Some(28) && h = NotDone). link_after(x, h, a, n, known_down) with last = (a >= n): if reached_no_host(x, h), ((known_down || (last && n > 1)) ? Down : Unknown, !last && !known_down); else if x in {Some(0), Some(22)}, (Reached, !last); else (Unknown, !last). attempt_again records LINK_DOWN_SINCE = Some(now) on Down, None on Reached, and leaves it unchanged on Unknown, treating known_down <=> elapsed <= LINK_DOWN_HOLDS (30 s); so a link known down fails fast after one unreached attempt without paying retry backoffs, while a reached host clears the hold.	src/http.rs::a_link_known_down_is_not_paid_for_twice, src/http.rs::a_connect_that_never_finished_reached_no_host	split_whitespace, f64 parse, enum/tuple matching, process-global Mutex<Option<Instant>>	0,1,3,5,7,8
 resumable-download-loop	contract	http::download_to, http::download_to_resumable, http::download_to_resumable_until, http::download_to_resumable_https_only, http::download_to_resumable_with, http::download_to_resumable_with_stop, http::clear_sink, http::DOWNLOAD_STOPPED	For https url, dest and max_filesize: Sink::Dest (download_to) truncates dest at call start and never passes an already-present dest prefix as a resume offset, whereas Sink::Part (download_to_resumable*) stages in part_path(dest) and atomically renames onto dest on exit 0. When stop is set during curl_fetch_until, the curl child is terminated, the sink is cleared, and download_to_resumable_until returns Err(DOWNLOAD_STOPPED.to_string()). On a non-verdict failure without stop, range_refused at offset > 0 clears the sink and retries fresh at most once; otherwise next_attempt and resume_allowed continue stalled/partial transfers within the call (switching StallBound via StallBound::after) while capping short (<1 MiB) resumes at 16 and total resumes at 16 + max_filesize / 1 MiB inside download_max_time_secs(max_filesize).	src/http.rs::probe_a_transfer_over_real_curl, src/http.rs::a_stopped_download_ends_its_curl_and_leaves_no_partial, src/http.rs::a_silently_held_transfer_continues_within_the_call, src/http.rs::a_link_that_keeps_moving_is_continued_and_one_that_cuts_short_is_not_asked_in_a_loop, src/http.rs::bytes_already_at_the_destination_are_never_continued	bounded loop over curl child spawns, AtomicBool stop polling, fs metadata/remove/rename, composition with resume-plan-and-prefix-rules, resume-args, resume-next-attempt and resume-budget	0,1,4,7,8
+service-image-qualification-and-digest	contract	service_image::ProtocolRange::supports, service_image::Qualification::validate, service_image::valid_executable_path, service_image::image_digest	supports(r, vs) <=> r.min > 0 && r.min <= r.max && every v in vs lies in r.min..=r.max. valid_executable_path(p) <=> p is valid non-empty UTF-8 without '\\', leading/trailing '/', empty segments, '.' or '..', and every Path component is Normal. Qualification::validate(q, b, rev, svc) = Ok iff q.schema = svc.schema = 1, q.status = "passed", q.scope = "release-gate-and-signed-image-protocol", b > 0, q.build = b, rev and q.verified_source_revision are 40-char lowercase hex with q.source_revision = rev, verified_input/image/executable/qualification digests are 64-char lowercase hex matching svc, release_check_evidence and svc.platform are non-blank, valid_executable_path(svc.executable), q.protocol = svc.protocol with supports(&[]), q.protocol_probe_passed && q.native_signature_verified && !q.live_service_health_tested. On unix, image_digest(root) requires root to be a real directory, canonicalizes root, and hashes sorted UTF-8 relative entries with 07777 mode, kind ('f'/'d'/'l'), regular-file SHA-256 (opened O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC with matching (dev,ino)), and confined relative symlink targets (<= 32 hops, never escaping root or traversing non-directories or special files).	src/service_image.rs::qualification_validate_rejects_blank_platform_and_non_relative_executable, src/service_image.rs::image_digest_refuses_multi_hop_root_escape_and_trailing_slash_on_file	struct field validation, Path component scan, recursive fs walk, bounded symlink hop stack, O_NOFOLLOW open + fstat inode match, SHA-256	0,1,2,3,5,7,8,12
 ```
 
-### Distribution by kind (77)
+### Distribution by kind (78)
 
 | kind | specs |
 |---|---|
-| contract | 63 |
+| contract | 64 |
 | table-property | 4 |
 | round-trip | 3 |
 | equivalence | 2 |
@@ -138,18 +140,18 @@ resumable-download-loop	contract	http::download_to, http::download_to_resumable,
 
 | gap | specs |
 |---|---|
-| 0 | 77 |
-| 1 | 67 |
-| 2 | 10 |
-| 3 | 37 |
+| 0 | 78 |
+| 1 | 68 |
+| 2 | 11 |
+| 3 | 38 |
 | 4 | 18 |
-| 5 | 18 |
-| 7 | 23 |
-| 8 | 19 |
+| 5 | 19 |
+| 7 | 24 |
+| 8 | 20 |
 | 9 | 8 |
 | 10 | 1 |
 | 11 | 4 |
-| 12 | 28 |
+| 12 | 29 |
 | 13 | 13 |
 
 Gap 1 (non-scalar carriers: `&str`, `String`, `Vec`, `Option`, enums and structs) blocks almost every spec,
@@ -349,41 +351,22 @@ src/sentinel.rs	each_sentinel_write_names_its_flush	boot-sentinel-state-machine
 src/sentinel.rs	a_failed_folder_flush_fails_the_arm_and_not_a_count	boot-sentinel-state-machine	
 src/sentinel.rs	a_prelanding_arm_failure_preserves_the_previous_record	boot-sentinel-state-machine	
 src/sentinel.rs	named_launches_and_forgive_launch_of_match_pid_start_time_and_cap_at_32	boot-sentinel-state-machine	
+src/sentinel.rs	arm_and_confirm_refuse_symlinked_parent_and_non_regular_target	boot-sentinel-state-machine	
+src/github_pages.rs	malformed_listing_bases_and_zero_or_empty_repo_aliases_refuse_before_fetch	github-pages-whole-listing	
+src/service_image.rs	qualification_validate_rejects_blank_platform_and_non_relative_executable	service-image-qualification-and-digest	
+src/service_image.rs	image_digest_refuses_multi_hop_root_escape_and_trailing_slash_on_file	service-image-qualification-and-digest	
 src/source.rs	an_invalid_slug_reaches_the_log_by_its_length	pick-slug-and-resolve	
 ```
 
-## 3. Proof order
+## 3. Summary & dependency order
 
-- 175 live tests; 172 map to one of the 77 specs, and 3 are not spec samples (§4).
-- The biggest collapses (primary tests): `github-rest-lane` (11), `boot-sentinel-state-machine` (10), `curl-lane-option-sets` (7), `full-pass-schedule-rule` (6), `manifest-round-trip` (5), `roster-authorize-appcast` (5), `resumable-download-loop` (5), and 4 each for `advisory-file-lock`, `github-pages-whole-listing`, `resume-plan-and-prefix-rules` and `roster-master-verify`.
+- 179 live tests; 176 map to one of the 78 specs, and 3 are not spec samples (§4).
+- The biggest collapses (primary tests): `github-rest-lane` (11), `boot-sentinel-state-machine` (11), `curl-lane-option-sets` (7), `full-pass-schedule-rule` (6), `github-pages-whole-listing` (5), `manifest-round-trip` (5), `roster-authorize-appcast` (5), `resumable-download-loop` (5), and 4 each for `advisory-file-lock`, `resume-plan-and-prefix-rules` and `roster-master-verify`.
 - 8 tests sample more than one spec (recorded in §2's `also` column, including `the_head_argv_stops_at_the_first_hop_and_carries_no_credential`, `the_vendor_lane_pins_https_on_the_first_hop_and_every_redirect`, `unknown_keys_are_ignored_by_a_producer_and_refused_by_the_cutter`, `the_top_level_keys_beside_ranges_are_the_hull_of_the_rescues`, `local_write_errors_are_recognized_and_stop_resumable_attempts`, and three `resumable-download-loop` tests).
 - The merge made no further cuts: no two specs state the same property about the same function. Two near-pairs are
   kept apart on purpose. `slug-validity` is `Safe` plus a 100-byte bound, so it is stated as a lemma over `Safe` and not
   folded into `url-builders`. `filesize_exceeded` and `vendor_curl_refusal` are defined once, in `vendor-download-verdict`,
   and `vendor-get-step` cites them.
-
-- `url-builders` (with `slug-validity`, the lemma `Safe(s) && |s| <= 100`) comes before
-  `pointer-location-strict`, then `pointer-classify`, then `pointer-resolve-one-request`.
-- `release-tag-grammar` (its round-trip lemma) comes before `canonical-app-tag`. It and
-  `linux-target-names` come before `linux-artifact-admission`, then `manifest-validate-gate`, then
-  `manifest-round-trip`.
-- `asset-failure-classification` (`Code`) and `api-host-predicate` come before
-  `resume-plan-and-prefix-rules`. `curl-argv-shape` comes before clause (h) of
-  `curl-lane-option-sets` and before `curl-child-env`.
-- `transient-status`, `vendor-trailer`, `header-readers` and `vendor-download-verdict` come before
-  `vendor-get-step` and `vendor-head-step`.
-- `roster-master-verify` and `roster-machine-and-live` come before `roster-authorize-appcast`, whose
-  revocation corollary comes from `roster-validate-bijection`. `roster-admit` comes before the
-  corollary of `clock-fails-closed`.
-- `policy-knob-predicates` comes before `handoff-policy-parse`, then `ranges-read-leniently` and
-  `cutter-strict-read`, then `for-build-and-hull`, then `hull-dominates-every-rescue`,
-  `keeps-every-sealed-build` and `adoption-decision`. `momentary-read-errors` comes before
-  `bundle-policy-read`.
-- `pass-outcome-words` comes before `stamps-parse`. `full-pass-schedule-rule` rests on
-  `elapsed`/`remaining` alone and should be bound to the `AtpkgPassStamps`/`AtpkgFullPassRule`
-  models (gap 10).
-
-Easiest first (fewest gaps beyond 0, a scalar core):
 
 Status (2026-10-16): `release_asset_bound_is_githubs_ceiling_and_covers_batteries_included` deleted; its `const` assert now sits at module scope beside `RELEASE_ASSET_DOWNLOAD_BOUND` in src/http.rs.
 
@@ -392,14 +375,16 @@ registry the test policed (AGENTS.md); `dev_seam!` compiles the seams out of shi
 `env_sanitize` keeps them from child processes, so no env-knob guard replaces it. The rows of these deleted
 tests, here and in §2, are gone.
 
-Actions: **delete** (it samples nothing, or duplicates another crate's spec), **move-to-bench** (it measures an
-external tool, so it belongs with the real-tool measurements and not in the unit-test lane).
+## 4. Tests that are not spec samples
+
+**move-to-bench**: the test measures an external tool, so it belongs with the real-tool
+measurements, not the unit-test lane. **keep**: it holds something no spec states yet.
 
 | test | why | action |
 |---|---|---|
-| `src/codesign.rs::an_unreadable_file_is_not_a_verdict_and_an_unsigned_one_is` | Measures codesign's real words for an unreadable versus an unsigned Mach-O. These are evidence for the MACHINE_FAULTS/SIGNATURE_FAULTS tables (an external-tool assumption). The first-party classification is covered by codesign-verdict-classification. | **move-to-bench** |
-| `src/codesign.rs::a_validly_signed_binary_of_another_signer_is_refused` | Runs the real codesign on /bin/ls and skips when trustd is silent. It measures the platform tool's behaviour, not our code. | **move-to-bench** |
-| `src/pkg_check.rs::the_stamp_parser_is_pinned` | Tests aterm_types::rfc3339::parse_utc_fractional through a one-line forwarding wrapper, but it is also the only test that holds the wrapper to the fractional reader: swapping in `parse_utc` fails it and nothing else, and atpkg's pass writer stamps `last_pass_at` as `….000000000Z`. | **keep** until a spec binds `rfc3339_to_unix` to the writer's shape |
+| `src/codesign.rs::an_unreadable_file_is_not_a_verdict_and_an_unsigned_one_is` | Measures codesign's real words for an unreadable versus an unsigned Mach-O: evidence for the `MACHINE_FAULTS`/`SIGNATURE_FAULTS` tables. `codesign-verdict-classification` covers the first-party classification. | **move-to-bench** |
+| `src/codesign.rs::a_validly_signed_binary_of_another_signer_is_refused` | Runs the real codesign on /bin/ls (COULD NOT RUN when trustd is silent): the platform tool's behaviour, not this crate's. | **move-to-bench** |
+| `src/pkg_check.rs::the_stamp_parser_is_pinned` | Reaches `aterm_types::rfc3339::parse_utc_fractional` through the one-line `rfc3339_to_unix`, but it is the only test that holds the wrapper to the fractional reader (atpkg stamps `last_pass_at` as `….000000000Z`): swapping in `parse_utc` fails it and nothing else. | **keep** until a spec binds `rfc3339_to_unix` to the writer's shape |
 
 By action: move-to-bench 2, keep 1.
 
@@ -427,10 +412,12 @@ By action: move-to-bench 2, keep 1.
      inside an `aterm_tempfile` scratch dir with no 20 ms sleep.)*
 5. *(Resolved: added direct tests and spec coverage for `pkg_check::Stamps::completed_older_index_pass`,
    `http::download_error_is_local_write`, `HandoffPolicy::names_producers` / `PolicyFile::names_producers`,
-   `handoff_policy::adopt`, and `Sentinel::{named_launches, forgive_launch_of}` including `MAX_NAMED_LAUNCHES = 32`.)*
-6. **Count.** The files hold 175 `#[test]` fns, including platform-gated tests (`#[cfg(windows)]` in `sys.rs`,
-   `#[cfg(target_os = "macos")]` and its negation in `codesign.rs`) that a single-host `targo test` run skips.
-   This file maps all 175.
+   `handoff_policy::adopt`, `Sentinel::{named_launches, forgive_launch_of}` including `MAX_NAMED_LAUNCHES = 32`
+   plus symlink/parent guards on `arm` and `confirm`, `github_pages::names_repository_by_id`, and
+   `service_image::{Qualification::validate, image_digest}` with `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC` + `(dev, ino)` verification.)*
+6. **Count.** The files hold 179 `#[test]` fns, including platform-gated tests (`#[cfg(windows)]` in `sys.rs`,
+   `#[cfg(unix)]` in `hash.rs`, `sentinel.rs` and `service_image.rs`, and `#[cfg(target_os = "macos")]` and its
+   negation in `codesign.rs`) that a single-host `targo test` run skips. This file maps all 179.
 
 ## 6. Proof order (easiest high-value first)
 
@@ -466,48 +453,7 @@ are the ones blocked by gap 0 plus the fewest real gaps, with a scalar core that
 
 The effectful specs (`advisory-file-lock`, `lane-slot-claim`, `ensure-private-dir`, `same-volume`,
 `update-enabled-at`, `bundle-policy-read`, `boot-sentinel-state-machine`, `https-gate-before-spawn`,
-`vendor-body-cap`, `codesign-run-mapping`, the hash arms) come last, on gap 8. Their pure cores (the
-sentinel record parser and its `Sigma` transitions, the `claim` decision, `read_bounded`'s verdict)
+`vendor-body-cap`, `codesign-run-mapping`, `service-image-qualification-and-digest`, the hash arms)
+come last, on gap 8. Their pure cores (the sentinel record parser and its `Sigma` transitions, the
+`claim` decision, `read_bounded`'s verdict, `Qualification::validate` and `valid_executable_path`)
 can be factored out and proved first.
-
-## 4. Tests that are not spec samples
-
-**move-to-bench**: the test measures an external tool, so it belongs with the real-tool
-measurements, not the unit-test lane. **keep**: it holds something no spec states yet.
-
-| test | why | action |
-|---|---|---|
-| `src/codesign.rs::an_unreadable_file_is_not_a_verdict_and_an_unsigned_one_is` | Measures codesign's real words for an unreadable versus an unsigned Mach-O: evidence for the `MACHINE_FAULTS`/`SIGNATURE_FAULTS` tables. `codesign-verdict-classification` covers the first-party classification. | **move-to-bench** |
-| `src/codesign.rs::a_validly_signed_binary_of_another_signer_is_refused` | Runs the real codesign on /bin/ls (COULD NOT RUN when trustd is silent): the platform tool's behaviour, not this crate's. | **move-to-bench** |
-| `src/pkg_check.rs::the_stamp_parser_is_pinned` | Reaches `aterm_types::rfc3339::parse_utc_fractional` through the one-line `rfc3339_to_unix`, but it is the only test that holds the wrapper to the fractional reader (atpkg stamps `last_pass_at` as `….000000000Z`): swapping in `parse_utc` fails it and nothing else. | **keep** until a spec binds `rfc3339_to_unix` to the writer's shape |
-
-## 5. Open findings
-
-1. **`parse_release_tag` answers Overflow where its doc says Malformed.** `v1.2.3.99999999999999999999`
-   gives `Overflow`, though it is not a run of two or three components. `release-tag-grammar` states
-   the code; no test samples the case.
-2. **A url can make a blocked-host 403 read as a rate limit.** `classify_asset_failure`'s web-host
-   403/404 messages embed the url, and `download_error_is_rate_limit` is a substring test for
-   `rate limited (HTTP `. `asset-failure-classification` carries "the url does not contain the
-   marker" as a precondition; a typed error would remove it.
-3. **A wording pin.** `a_vendor_get_attempt_answers_body_not_modified_or_the_status` asserts the
-   `VendorStatus` text lacks `GitHub`, which holds only because the sampled url lacks it.
-   `http-error-display` states the property.
-4. **An incomplete absent-key list.** `absent_optionals_are_omitted_from_emission` does not check
-   `machine_id` or `roster_seq`; `manifest-round-trip` states the rule for every `None` field.
-5. **Timing and clock dependence.** `an_already_private_dir_is_not_rewritten_and_a_drifted_one_is_hardened`
-   sleeps 20 ms so a ctime change shows; under coarse ctime an unwanted chmod goes unseen
-   (`ensure-private-dir` states the chmod condition). `an_unreadable_clock_fails_closed_rather_than_reading_as_1970`
-   also asserts `now_unix() > 1_700_000_000`, which reads the wall clock and samples no spec.
-6. **Public behaviour with no test, so no spec.** `pkg_check::Stamps::completed_older_index_pass`,
-   `HandoffPolicy::names_producers` and `PolicyFile::names_producers`, `handoff_policy::adopt`'s log
-   lines, `Sentinel::named_launches`, and the `None` arms of `Sentinel::forgive_launch_of`.
-7. **Tests §2 does not map.** No row states what these sample: in `src/http.rs`,
-   `a_link_known_down_is_not_paid_for_twice`, `a_connect_that_never_finished_reached_no_host`,
-   `a_silently_held_transfer_continues_within_the_call`,
-   `a_link_that_keeps_moving_is_continued_and_one_that_cuts_short_is_not_asked_in_a_loop`,
-   `bytes_already_at_the_destination_are_never_continued` and the child half the last three spawn,
-   `probe_a_transfer_over_real_curl`; in `src/privatedir.rs`,
-   `missing_ancestors_are_never_shared_whatever_the_umask` and its child half
-   `probe_missing_ancestors_are_never_shared_whatever_the_umask`; in `src/sentinel.rs`,
-   `each_sentinel_write_names_its_flush`.

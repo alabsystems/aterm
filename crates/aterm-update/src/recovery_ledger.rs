@@ -364,7 +364,7 @@ impl Restores {
         }
         for pair in token.split(',') {
             let (word, n) = pair.split_once(':')?;
-            if word.is_empty() {
+            if word.is_empty() || word.contains([':', ',']) || clean_token(word) != word {
                 return None;
             }
             self.whys.push((word.to_string(), crate::parse_uint(n)?));
@@ -376,7 +376,7 @@ impl Restores {
 /// Whether the launch that wrote a row kept its terminals with a PTY keeper (`keeper=`): the state of its keeper link (`aterm-gui`'s `keeper_link`) when the row was written.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KeeperAtLaunch {
-    /// The link is off: `[keeper] enabled` is absent or false, or the build has no code identity to check a keeper by (it fails closed).
+    /// The link is off: `[keeper] enabled = false`, a launch whose config leaves a keeper to a bundled window, or a build with no code identity to check a keeper by (it fails closed).
     #[default]
     Off,
     /// The link is on and no keeper answered the boot HELLO (none running, or one that is not this build's): terminals are registered once one answers.
@@ -537,7 +537,17 @@ impl Row {
         let mut fields = std::collections::BTreeMap::new();
         for pair in line.split_whitespace() {
             let (key, value) = pair.split_once('=')?;
-            fields.insert(key, value);
+            if key.is_empty()
+                || !key
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                || clean_token(value) != value
+            {
+                return None;
+            }
+            if fields.insert(key, value).is_some() {
+                return None;
+            }
         }
         if crate::parse_uint::<u32>(fields.get("v")?)? != ROW_VERSION {
             return None;
@@ -800,11 +810,16 @@ fn trim_locked(path: &Path) {
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(&tmp)
-        .and_then(|mut f| f.write_all(text.as_bytes()));
+        .and_then(|mut f| {
+            f.write_all(text.as_bytes())?;
+            aterm_durable::durable(&f)
+        });
     if written.is_err() || std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
+    } else if let Some(dir) = path.parent() {
+        let _ = aterm_durable::durable_dir(dir);
     }
 }
 
@@ -1528,5 +1543,62 @@ mod tests {
             1
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NEGATIVE CONTROL: duplicate field keys and unclean tokens (including embedded `=` in a
+    /// value or `restore_why` word) are rejected by `Row::parse`, while the canonical single-key
+    /// row parses cleanly; and `trim_locked` refuses to overwrite through a pre-planted symlink at
+    /// the `.recovery-ledger.log.trim` staging path.
+    #[test]
+    fn duplicate_keys_and_unclean_tokens_are_rejected_and_trim_refuses_symlinks() {
+        let mut base = row(1_790_600_000, 42, prev(EndClass::Killed));
+        base.restores = Some(Restores {
+            exact: 1,
+            whys: vec![("in-flight".to_string(), 1)],
+            ..Restores::default()
+        });
+        let good = base.to_line();
+        assert_eq!(Row::parse(&good), Some(base.clone()));
+
+        let dup = format!("{good} prev=clean");
+        assert_eq!(
+            Row::parse(&dup),
+            None,
+            "duplicate key must reject the ambiguous row"
+        );
+
+        let embedded_eq = good.replace("version=0.93.0", "version=0.93.0=1");
+        assert_ne!(embedded_eq, good);
+        assert_eq!(
+            Row::parse(&embedded_eq),
+            None,
+            "value containing '=' must be rejected"
+        );
+
+        let bad_why = good.replace("restore_why=in-flight:1", "restore_why=in=flight:1");
+        assert_ne!(bad_why, good);
+        assert_eq!(
+            Row::parse(&bad_why),
+            None,
+            "restore_why word containing '=' must be rejected"
+        );
+
+        #[cfg(unix)]
+        {
+            let dir = scratch("trim-symlink");
+            let path = ledger_path(&dir);
+            append_row(&path, &base).expect("append initial row");
+            let outside = dir.join("outside-victim");
+            std::fs::write(&outside, "keep me\n").expect("victim");
+            let tmp = path.with_file_name(format!(".{LEDGER_FILE_NAME}.trim"));
+            std::os::unix::fs::symlink(&outside, &tmp).expect("plant symlink");
+            trim_locked(&path);
+            assert_eq!(
+                std::fs::read_to_string(&outside).expect("victim intact"),
+                "keep me\n"
+            );
+            assert_eq!(read_rows(&path), vec![base]);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

@@ -166,6 +166,20 @@ impl PermissionGate {
         self.hold = PermissionHold::FreshStatus;
     }
 
+    /// The Apply being admitted came from a person's press.
+    pub(super) const fn apply_is_a_persons(&self) -> bool {
+        ::std::matches!(self.apply_by, Some(AdmittedBy::Person))
+    }
+
+    /// A person's press on the page's offer asked for macOS's grants: the status read after its
+    /// record releases them with this press as the window's own admission. A Stop stays a Stop.
+    pub(super) fn person_asked(&mut self) {
+        if !::std::matches!(self.hold, PermissionHold::Stopped { .. }) {
+            self.accepted_by = Some(AdmittedBy::Person);
+            self.hold = PermissionHold::FreshStatus;
+        }
+    }
+
     pub(super) fn await_fresh_status(&mut self) {
         if !::std::matches!(self.hold, PermissionHold::Stopped { .. }) {
             self.hold = PermissionHold::FreshStatus;

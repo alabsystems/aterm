@@ -763,7 +763,9 @@ pub(crate) fn plan_one_with(
             high_water: stamp.high_water,
             held,
             legacy_ceiling: spec.legacy_ceiling,
-            asked: lane.asked,
+            asked: lane.asked
+                || (crate::alab::vendor_chosen(layout, program)
+                    && active.is_some_and(|b| crate::alab::build_is_alab(layout, program, b))),
         };
         let mut decision = decide(&inputs);
         if let Installed::Legacy {
@@ -771,6 +773,7 @@ pub(crate) fn plan_one_with(
             version: None,
         } = installed
             && !legacy_asked
+            && !crate::alab::build_is_alab(layout, program, build)
             && (matches!(
                 decision,
                 Decision::Install {
@@ -1085,7 +1088,8 @@ fn decode_companion(dl: &Path, companion: &resolve::Companion) -> Result<(String
             companion.size
         ));
     }
-    let open = || std::fs::File::open(dl).map_err(|e| format!("open the download: {e}"));
+    let open =
+        || crate::metadata_io::open_regular(dl).map_err(|e| format!("open the download: {e}"));
     let declared = aterm_zstd::declared_content_size(open()?).map_err(|e| e.to_string())?;
     if declared != Some(companion.binary_size) {
         return Err(format!(
@@ -1703,7 +1707,7 @@ pub(crate) fn roll_back_by_hand(
             return Err(match active {
                 Some(b) => format!(
                     "{} is not a complete build — `aterm pkg update {program}` re-stages it",
-                    super::display_build(program, b)
+                    super::display_have_build(layout, program, b)
                 ),
                 None => format!(
                     "{program} is not installed — nothing to roll back (aterm pkg list shows \
@@ -1724,7 +1728,14 @@ pub(crate) fn roll_back_by_hand(
             .chain(
                 retained_legacy_below(layout, program, below)
                     .into_iter()
-                    .map(|b| (b, super::build_words(b))),
+                    .map(|b| {
+                        let words = if crate::alab::build_is_alab(layout, program, b) {
+                            crate::alab::build_words(layout, program, b)
+                        } else {
+                            super::build_words(b)
+                        };
+                        (b, words)
+                    }),
             )
             .collect()
     };
@@ -1743,7 +1754,7 @@ pub(crate) fn roll_back_by_hand(
             ),
         });
     };
-    if alab.is_none() {
+    if !crate::alab::build_is_alab(layout, program, to_build) {
         crate::shim_env::write_sidecar(&layout.build_dir(program, to_build), &spec.shim_env())
             .map_err(|e| format!("the rollback could not be laid: {e}"))?;
     }
@@ -1786,10 +1797,13 @@ fn keep_legacy_facts(
 /// and no recorded row for that build carrying one (an older client could drop it).
 pub(crate) fn legacy_root_owed(layout: &Layout, program: &str, active: Option<u64>) -> Option<u64> {
     let build = match installed_of(layout, program, active) {
-        Installed::Legacy { build, .. } => build,
-        Installed::Vendor(current) => {
-            *retained_legacy_below(layout, program, current.build).first()?
+        Installed::Legacy { build, .. } if !crate::alab::build_is_alab(layout, program, build) => {
+            build
         }
+        Installed::Legacy { .. } => return None,
+        Installed::Vendor(current) => retained_legacy_below(layout, program, current.build)
+            .into_iter()
+            .find(|b| !crate::alab::build_is_alab(layout, program, *b))?,
         Installed::Nothing => return None,
     };
     let kept =

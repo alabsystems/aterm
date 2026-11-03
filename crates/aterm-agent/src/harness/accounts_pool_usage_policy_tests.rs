@@ -189,3 +189,210 @@ fn a_public_usage_poll_with_no_result_still_refuses_changed_policy() {
     assert!(record_usage(&seat, Cli::Codex, &roster, &enrolled, &read).is_err());
     assert_eq!(std::fs::read(store.state_file()).unwrap(), before);
 }
+
+/// A reader that keeps the homes it was asked about and answers `answer` for each.
+struct Reads<'a> {
+    homes: std::sync::Mutex<Vec<PathBuf>>,
+    answer: &'a (dyn Fn(&Path) -> Reading + Sync),
+}
+
+impl crate::harness::accounts_pool::UsageReader for Reads<'_> {
+    fn read(&self, _: Cli, home: &Path, _: Option<&str>, _: i64) -> Reading {
+        self.homes.lock().unwrap().push(home.to_path_buf());
+        (self.answer)(home)
+    }
+}
+
+fn plain_usage() -> Reading {
+    Reading::Usage(Usage {
+        sample: Sample {
+            session_pct: Some(10),
+            at: NOW,
+            ..Sample::default()
+        },
+        walls: Vec::new(),
+    })
+}
+
+fn spent_usage() -> Reading {
+    Reading::Usage(Usage {
+        sample: Sample {
+            session_pct: Some(100),
+            at: NOW,
+            ..Sample::default()
+        },
+        walls: vec![(accounts::SESSION_LIMIT, Some(NOW + HOUR))],
+    })
+}
+
+/// The owner's rule at a launch: `work` is never asked about while `main` serves, and the read is
+/// reported with its row and why. CONTROL: `a_read_that_shows_a_wall_...` below reads `work` once
+/// `main` cannot serve, so the silence here is the rule and not a reader that never reaches it.
+#[test]
+fn a_launch_reads_only_the_row_it_starts_on_and_reports_it() {
+    let world = World::new("launch-one-row");
+    world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let answer = |_: &Path| plain_usage();
+    let reads = Reads {
+        homes: std::sync::Mutex::default(),
+        answer: &answer,
+    };
+    let (pick, events) = crate::harness::provider_read::captured(|| {
+        launch_env(&world.seat(), Cli::Codex, &reads).unwrap()
+    });
+    assert_eq!(pick.label, "main");
+    assert_eq!(
+        *reads.homes.lock().unwrap(),
+        [world.home.join(Cli::Codex.accounts().default_home)]
+    );
+    assert_eq!(
+        events,
+        [crate::harness::provider_read::ProbeEvent {
+            at: NOW,
+            read: crate::harness::provider_read::Read::CodexEndpoint,
+            account: Some("main".to_owned()),
+            login: None,
+            why: crate::harness::provider_read::InUse::Launching,
+        }]
+    );
+    assert_eq!(world.load(Cli::Codex).account("work").sample, None);
+}
+
+/// A pick the read shows spent gives way to the next, which is then the row being launched.
+/// CONTROL: the launch lands on `work`, read once, and `main` is not asked twice.
+#[test]
+fn a_read_that_shows_a_wall_moves_the_launch_to_the_next_row_and_reads_that() {
+    let world = World::new("launch-next-row");
+    let work = world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let default_home = world.home.join(Cli::Codex.accounts().default_home);
+    let answer = |home: &Path| {
+        if home == default_home {
+            spent_usage()
+        } else {
+            plain_usage()
+        }
+    };
+    let reads = Reads {
+        homes: std::sync::Mutex::default(),
+        answer: &answer,
+    };
+    let pick = launch_env(&world.seat(), Cli::Codex, &reads).unwrap();
+    assert_eq!(pick.label, "work");
+    assert_eq!(*reads.homes.lock().unwrap(), [default_home, work]);
+}
+
+/// A row read a moment ago is not read again. CONTROL: the first launch did read it.
+#[test]
+fn a_fresh_row_starts_with_no_read() {
+    let world = World::new("launch-fresh-row");
+    world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let answer = |_: &Path| plain_usage();
+    let reads = Reads {
+        homes: std::sync::Mutex::default(),
+        answer: &answer,
+    };
+    launch_env(&world.seat(), Cli::Codex, &reads).unwrap();
+    assert_eq!(reads.homes.lock().unwrap().len(), 1);
+    launch_env(&world.seat(), Cli::Codex, &reads).unwrap();
+    assert_eq!(reads.homes.lock().unwrap().len(), 1);
+}
+
+/// A pool whose every pick turns out spent stops at [`LAUNCH_READS`], so a launch never sweeps the
+/// pool. CONTROL: `LAUNCH_READS` rows are read, so the cap is what stopped it.
+#[test]
+fn a_launch_reads_no_more_than_its_cap() {
+    let world = World::new("launch-cap");
+    world.two(Cli::Codex);
+    let mut text =
+        std::fs::read_to_string(world.cfg.join(Cli::Codex.accounts().roster_file)).expect("roster");
+    for label in ["w2", "w3", "w4", "w5"] {
+        let dir = world.root.join("logins").join("codex").join(label);
+        std::fs::create_dir_all(&dir).expect("login dir");
+        std::fs::write(dir.join("auth.json"), "{}").expect("login");
+        text.push_str(&format!(
+            "\n[[account]]\nlabel = \"{label}\"\nclass = \"dedicated\"\ndir = {}\n",
+            toml(&dir)
+        ));
+    }
+    std::fs::write(world.cfg.join(Cli::Codex.accounts().roster_file), text).expect("roster");
+    world.on_main(Cli::Codex, &[]);
+    let answer = |_: &Path| spent_usage();
+    let reads = Reads {
+        homes: std::sync::Mutex::default(),
+        answer: &answer,
+    };
+    let _ = launch_env(&world.seat(), Cli::Codex, &reads);
+    assert_eq!(
+        reads.homes.lock().unwrap().len(),
+        crate::harness::accounts_pool::LAUNCH_READS
+    );
+}
+
+/// A login signed in again by hand comes back when nothing on record serves, the one row left to
+/// try. CONTROL: while another row serves it is not read, and stays signed out.
+#[test]
+fn a_signed_out_row_is_read_only_when_nothing_else_serves() {
+    let world = World::new("launch-signed-out");
+    let work = world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let sign_out = |label: &str| {
+        let mut note = None;
+        world
+            .seat()
+            .store(Cli::Codex)
+            .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |state| {
+                Ok(accounts::note_auth(
+                    state,
+                    label,
+                    accounts::Auth::SignedOut,
+                    NOW,
+                ))
+            })
+            .expect("signed out");
+    };
+    sign_out("main");
+    let answer = |_: &Path| plain_usage();
+    let reads = Reads {
+        homes: std::sync::Mutex::default(),
+        answer: &answer,
+    };
+    let pick = launch_env(&world.seat(), Cli::Codex, &reads).unwrap();
+    assert_eq!(pick.label, "work");
+    assert_eq!(*reads.homes.lock().unwrap(), std::slice::from_ref(&work));
+    assert_eq!(
+        world.load(Cli::Codex).account("main").auth,
+        accounts::Auth::SignedOut
+    );
+
+    let world = World::new("launch-signed-out-all");
+    world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let mut note = None;
+    world
+        .seat()
+        .store(Cli::Codex)
+        .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |state| {
+            let mut events = accounts::note_auth(state, "main", accounts::Auth::SignedOut, NOW);
+            events.extend(accounts::note_auth(
+                state,
+                "work",
+                accounts::Auth::SignedOut,
+                NOW,
+            ));
+            Ok(events)
+        })
+        .expect("both signed out");
+    let reads = Reads {
+        homes: std::sync::Mutex::default(),
+        answer: &answer,
+    };
+    let pick = launch_env(&world.seat(), Cli::Codex, &reads).unwrap();
+    assert_eq!(pick.label, "main");
+    assert_eq!(
+        world.load(Cli::Codex).account("main").auth,
+        accounts::Auth::Ok
+    );
+}

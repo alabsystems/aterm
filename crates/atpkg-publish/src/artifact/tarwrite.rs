@@ -444,7 +444,8 @@ fn encode(members: &[Member], asset: &Path, compressor: &dyn Compressor) -> io::
 /// checksummed frames that decode to exactly the `n`-byte stream written, whose XXH64
 /// is `sum`.
 fn decodes_back(asset: &Path, n: u64, sum: u64) -> io::Result<()> {
-    let mut decoder = aterm_zstd::Decoder::new(std::fs::File::open(asset)?).require_checksum();
+    let (file, _) = crate::identity::open_regular_nonblock(asset)?;
+    let mut decoder = aterm_zstd::Decoder::new(file).require_checksum();
     let mut hash = Xxh64::new(0);
     let mut got = 0u64;
     let mut buf = vec![0u8; 1 << 16];
@@ -471,7 +472,7 @@ fn decodes_back(asset: &Path, n: u64, sum: u64) -> io::Result<()> {
 /// refused before the stream passes the length [`stream_len`] gave.
 fn tar(out: &mut impl Write, members: &[Member]) -> io::Result<()> {
     layout(out, members, &mut |out, path, size| {
-        let mut f = std::fs::File::open(path)?;
+        let (mut f, _) = crate::identity::open_regular_nonblock(path)?;
         let copied = io::copy(&mut (&mut f).take(size), out)?;
         if copied != size || f.read(&mut [0u8; 1])? != 0 {
             let now = f.metadata().map_or(copied, |m| m.len());

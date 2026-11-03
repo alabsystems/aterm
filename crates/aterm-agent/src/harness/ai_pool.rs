@@ -328,8 +328,37 @@ pub fn resolve_local_pool_identity(
     .and_then(filter_denied)
 }
 
+pub(crate) fn read_bounded_bytes(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+            .ok()?
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > max_bytes {
+        return None;
+    }
+    let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= cap).then_some(bytes)
+}
+
+pub(crate) fn read_bounded_text(path: &Path, max_bytes: u64) -> Option<String> {
+    String::from_utf8(read_bounded_bytes(path, max_bytes)?).ok()
+}
+
 fn read_config_machine_raw(config: Option<&Path>) -> Option<String> {
-    let text = std::fs::read_to_string(config?).ok()?;
+    let text = read_bounded_text(config?, 2 * 1024 * 1024)?;
     let table = aterm_toml::from_str::<aterm_toml::Table>(&text).ok()?;
     for (section, key) in [
         ("swarm", "label"),
@@ -937,7 +966,6 @@ mod tests {
     #[cfg(unix)]
     use crate::harness::accounts_sync;
     use std::collections::BTreeSet;
-    #[cfg(unix)]
     use std::fs;
 
     const NOW: i64 = 1_762_000_000;
@@ -974,6 +1002,7 @@ mod tests {
                 label: label.to_owned(),
                 aliases: aliases.iter().map(|s| (*s).to_owned()).collect(),
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 1,
                 claimed_label: None,
                 claimed_at_ms: None,
@@ -1110,6 +1139,7 @@ warm = ["m3"]
                 label: "m100".to_owned(),
                 aliases: vec!["m32".to_owned()],
                 hint: None,
+                hw_hint: None,
                 admitted_ms: 1,
                 claimed_label: None,
                 claimed_at_ms: None,
@@ -1548,5 +1578,28 @@ warm = ["m9"]
             .find(|r| r.email.as_deref() == Some("c01@example.test"))
             .expect("c01 retained when moved to m9");
         assert_eq!(c01_after.held_by.as_deref(), Some("m9"));
+    }
+
+    #[test]
+    fn read_bounded_text_and_small_text_enforce_size_and_file_type() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("cfg.toml");
+        fs::write(&file, "label = \"m1\"\n").unwrap();
+        assert_eq!(
+            super::read_bounded_text(&file, 64).as_deref(),
+            Some("label = \"m1\"\n")
+        );
+        assert_eq!(super::read_bounded_text(&file, 4), None);
+        assert_eq!(super::read_bounded_text(dir.path(), 64), None);
+        assert_eq!(
+            super::super::disk::discover::small_text(&file).as_deref(),
+            Some("label = \"m1\"\n")
+        );
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.toml");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            assert_eq!(super::super::disk::discover::small_text(&link), None);
+        }
     }
 }

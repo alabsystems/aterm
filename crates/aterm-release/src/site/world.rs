@@ -16,6 +16,54 @@ use aterm_verify::wasm_glue::WASM_OPT_FLAGS;
 use super::engine::{STEM, TARGET};
 use super::{ENGINE_UNPROVEN, Launch, Ran, World, hosting, output};
 
+impl Real {
+    /// Observe the configured site's update permission without deploying it.
+    ///
+    /// # Errors
+    /// The key, site or IAM permission cannot be verified.
+    pub fn check_access(
+        &self,
+        path: &Path,
+        site: Option<&str>,
+    ) -> Result<hosting::access::Access, String> {
+        let key = hosting::Key::read(path)?;
+        let site = site
+            .or(key.project.as_deref())
+            .ok_or("no Hosting site or key project is configured")?;
+        let origins = hosting::Origins::google();
+        let hosting = hosting::Client::new(
+            origins.clone(),
+            Arc::clone(&self.curl),
+            &std::env::temp_dir(),
+        )?;
+        let mut iam_origins = origins;
+        iam_origins.api = "https://cloudresourcemanager.googleapis.com".into();
+        let iam = hosting::Client::new(iam_origins, Arc::clone(&self.curl), &std::env::temp_dir())?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        hosting::access::check(&hosting, &iam, &key, site, now).map_err(|why| why.to_string())
+    }
+
+    /// Exchanges the configured key for a token and immediately discards it.
+    ///
+    /// # Errors
+    /// The key cannot be read or parsed, the endpoint is not admitted, or Google
+    /// does not return a usable token. This checks no Hosting permissions.
+    pub fn check_key(&self, path: &Path) -> Result<(), String> {
+        let key = hosting::Key::read(path)?;
+        let client = hosting::Client::new(
+            hosting::Origins::google(),
+            Arc::clone(&self.curl),
+            &std::env::temp_dir(),
+        )?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        hosting::check_key(&client, &key, now).map_err(|e| e.to_string())
+    }
+}
+
 /// Environment variables stripped from the engine cargo build.
 pub const ENGINE_BUILD_UNSET: [&str; 12] = [
     "CARGO_TARGET_DIR",
@@ -319,7 +367,7 @@ impl World for Real {
             ));
         }
         let module = module_path(clone);
-        std::fs::read(&module).map_err(|e| format!("{}: {e}", module.display()))
+        crate::durable::read_file(&module).map_err(|e| format!("{}: {e}", module.display()))
     }
 
     fn optimise(&mut self, wasm: &Path, out: &mut dyn Write) -> Result<(), String> {

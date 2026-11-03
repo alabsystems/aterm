@@ -322,7 +322,7 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
 impl Stamp {
     fn of(root: &Path) -> Result<Self, String> {
         let manifest = root.join("Cargo.toml");
-        let text = std::fs::read_to_string(&manifest)
+        let text = crate::durable::read_text(&manifest)
             .map_err(|e| format!("read {}: {e}", manifest.display()))?;
         let version = crate::publish::workspace_version(&text).map_err(|e| e.to_string())?;
         let epoch = git(root, &["show", "-s", "--format=%ct", "HEAD"])?;
@@ -555,7 +555,7 @@ fn assemble(
     };
     crate::bundle::assemble_at(&spec, &app)?;
     let plist_path = app.join("Contents/Info.plist");
-    let plist = std::fs::read_to_string(&plist_path)
+    let plist = crate::durable::read_text(&plist_path)
         .map_err(|e| format!("read {}: {e}", plist_path.display()))?;
     let mut plist =
         crate::bundle::set_plist_string(&plist, "CFBundleDisplayName", DEV_DISPLAY_NAME)?;
@@ -792,7 +792,7 @@ fn install(
         ),
     }
     let release_plist = dir.join("aterm.app/Contents/Info.plist");
-    if std::fs::read_to_string(&release_plist).is_ok_and(|text| text.contains(DEV_MARK_KEY)) {
+    if crate::durable::read_text(&release_plist).is_ok_and(|text| text.contains(DEV_MARK_KEY)) {
         eprintln!(
             "ship dev-app: {} is an old dev build on the release path — tools/install.sh puts a \
              release back",

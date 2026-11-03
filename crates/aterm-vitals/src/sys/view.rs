@@ -2362,7 +2362,7 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
     ));
     for r in rows.iter().take(q.top) {
         let mut t = format!(
-            "proc pid={} exe={} label={} pgid={} cpu_mc={} wait_mc={} fp_bytes={} peak_bytes={} write_bps={} gpu_ppm={} stat={} scheduling={} age_ms={}",
+            "proc pid={} exe={} label={} pgid={} cpu_mc={} cpu_mc_scope=process_self wait_mc={} fp_bytes={} peak_bytes={} write_bps={} gpu_ppm={} stat={} scheduling={} age_ms={}",
             r.pid,
             exe_word(&r.name),
             proc_label(ctx, s, r),
@@ -3315,6 +3315,11 @@ fn proc_json(ctx: &Ctx<'_>, s: &Snapshot, r: &ProcView) -> Jv {
         }
     }
     o.set("cpu_mc", Jv::known_or(r.cores.map(mc), why));
+    o.set("cpu_mc_scope", Jv::s("process_self"));
+    o.set(
+        "cpu_accounting",
+        cpu_accounting_json(&r.cpu_accounting, ctx.machine.family),
+    );
     o.set("wait_mc", Jv::known_or(r.wait.map(mc), why));
     o.set("footprint_bytes", Jv::known_or(r.footprint, "refused"));
     o.set("peak_bytes", Jv::known_or(r.peak, "refused"));
@@ -3345,6 +3350,36 @@ fn scheduling_read<T>(read: Result<T, i32>, value: impl FnOnce(T) -> Jv) -> Jv {
         },
         value,
     )
+}
+
+pub(super) fn cpu_accounting_json(c: &crate::model::CpuAccounting, family: &str) -> Jv {
+    // Match raw hardware counters: decimal strings preserve every u64 bit.
+    let raw = |value: Option<u64>, why: &str| {
+        value.map_or_else(|| Jv::why(why), |v| Jv::s(v.to_string()))
+    };
+    let child_why = if family == "macOS" {
+        "not_sampled"
+    } else {
+        "unsupported"
+    };
+    Jv::obj([
+        ("scope", Jv::s("lifetime_counters")),
+        ("self_ns", raw(c.self_ns, "refused")),
+        ("reaped_children_ns", raw(c.reaped_children_ns, child_why)),
+        ("child_scope", Jv::s("reaped_descendants")),
+        (
+            "auto_reaps_children",
+            c.auto_reaps_children
+                .map_or_else(|| Jv::why(child_why), Jv::Bool),
+        ),
+        ("counter_at_ns", raw(c.sampled_at_ns, "not_sampled")),
+        ("pid_start", raw(c.start, "not_sampled")),
+        (
+            "exec_version",
+            c.exec_version
+                .map_or_else(|| Jv::why("not_sampled"), |v| Jv::Int(i64::from(v))),
+        ),
+    ])
 }
 
 pub(super) fn scheduling_json(s: Option<crate::scheduling::Scheduling>, family: &str) -> Jv {
@@ -3507,6 +3542,7 @@ fn procs_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, scope: ScopeArg) -> Jv 
     let unread = rows.iter().filter(|r| r.refused).count();
     Jv::obj([
         ("scope", Jv::s(scope.word())),
+        ("cpu_mc_scope", Jv::s("process_self")),
         ("live", Jv::u(rows.len() as u64)),
         ("unread", Jv::u(unread as u64)),
         (

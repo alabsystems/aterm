@@ -88,32 +88,6 @@ tests/decode_frames.rs	concatenated_raw_frames_decode_as_one_stream	raw-frame-rf
 
 ## 5. Notes on the tests
 
-1. `digest_then_continue`'s claim that a digest leaves the hasher usable holds by typing:
-   `digest` takes `&self`. What it adds, that updates after a digest stay correct, is
-   `xxh64-streaming-refines-oneshot`'s.
-2. `sanity()` is defined twice, in `src/xxh64.rs`'s test module and `tests/support/mod.rs`.
-   The Lean model needs one definition.
-
-## 6. Proof order
-
-Every §1 spec that touches a Rust fn needs gaps 1 (slices and byte lists) and 3 (calls, casts,
-shifts and loops in reflected bodies) beyond gap 0.
-
-1. `xxh64-model-reference-vectors`: Lean only, the evidence base for every XXH64 spec. It
-   retires nothing alone.
-2. The scalar core of `write-raw-refuses-oversize` (`ContentSize::of`, `flag`,
-   `block_header`): a range `match` on `usize`, casts the arms make exact, and shifts, the
-   nearest widening of the `u8` range match seal `150efe4a` admits. These are the lemmas
-   `write-raw-layout` builds on. `write_raw` itself waits on the writer model (gaps 8, 11).
-3. `xxh64-update-no-panic`: `usize` bounds arithmetic from `buffered < 32` alone,
-   `omega`-class once slices and `&mut self` are carried, and the first conjunct of `Inv`.
-4. `xxh64-oneshot-refines-model`, then `xxh64-streaming-refines-oneshot` from the same
-   stripe-fold lemma plus `Inv`. With items 1 and 3 they retire every XXH64 test.
-5. `write-raw-layout`, then `raw-frame-rfc8878-conformance`, which needs the `Rfc8878` model
-   and the model-to-code surface (gap 10).
-
-## 7. The encoder (`src/encode`)
-
 1. **Resolved: `digest_then_continue` carries no redundant ownership doc.** It tests only that
    updates after `digest(&self)` produce the streaming digest (`xxh64-streaming-refines-oneshot`).
 2. **The streaming invariant needs the length mod 2^64.** The `Xxh64` doc says "Every byte
@@ -230,6 +204,7 @@ src/encode/bits.rs	a_field_read_at_the_wrong_width_differs	encode-entropy-compon
 src/encode/fse.rs	histograms_round_trip_through_the_decoder	encode-entropy-components	
 src/encode/fse.rs	predefined_distributions_round_trip	encode-entropy-components	
 src/encode/fse.rs	a_stream_decoded_under_another_table_differs	encode-entropy-components	(its control)
+src/encode/fse.rs	byte_aligned_short_last_probability_round_trips	encode-entropy-components	
 src/encode/huffman.rs	skewed_flat_and_sparse_alphabets_round_trip	encode-entropy-components	
 src/encode/huffman.rs	deep_trees_are_cut_to_eleven_bits	encode-entropy-components	
 src/encode/huffman.rs	all_256_bytes_need_the_fse_weight_form	encode-entropy-components	

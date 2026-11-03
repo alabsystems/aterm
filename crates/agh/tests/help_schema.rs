@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
-use agh::cli::help::{brief, manual, render, verb_page};
+use agh::cli::help::{DESTRUCTIVE, brief, manual, render, verb_page};
 use agh::cli::schema::schema;
-use agh::cli::verbs::{GLOBAL_FLAGS, Noun, REFUSED, VERBS, find};
+use agh::cli::verbs::{Class, GLOBAL_FLAGS, Noun, REFUSED, VERBS, find};
 use agh::cli::{Captured, Ctx};
 use agh::wire::Endpoints;
 use agh::wire::door::is_authorization;
@@ -323,5 +323,119 @@ fn version_prints_both_versions() {
     assert_eq!(
         captured.stdout_text(),
         format!("agh {VERSION} (api {API_VERSION})\n")
+    );
+}
+
+#[test]
+fn every_write_verb_has_its_page() {
+    let rows: Vec<_> = VERBS.iter().filter(|verb| verb.milestone == 2).collect();
+    assert_eq!(rows.len(), 17);
+    for verb in rows {
+        let mut line = vec!["help"];
+        line.extend(verb.path.iter().copied());
+        let (exit, captured) = run(&line);
+        assert_eq!(exit, 0, "{verb:?}: {}", captured.stderr_text());
+        let page = captured.stdout_text();
+        for flag in verb.flags {
+            assert!(page.contains(flag.name), "{verb:?}: {}", flag.name);
+        }
+        if verb.class == Class::Destructive {
+            assert!(page.contains("--confirm"), "{verb:?}: {page}");
+        }
+    }
+    // A Destructive verb's page, and only one, adds the line body 11 names.
+    for verb in VERBS {
+        assert_eq!(
+            verb_page(verb).contains(DESTRUCTIVE),
+            verb.class == Class::Destructive,
+            "{verb:?}"
+        );
+    }
+}
+
+#[test]
+fn the_write_schema_lists_the_report() {
+    let keys = |noun: &str| -> Vec<String> {
+        let row = schema(Some(noun)).expect("a noun");
+        row["keys"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{noun} lists its keys: {row}"))
+            .keys()
+            .cloned()
+            .collect()
+    };
+    let report = agh::cli::write_out::WriteReport::new(
+        "created",
+        agh::write::WriteOp::ReleaseCreate,
+        &common::slug("alabsystems/aterm"),
+        "v1",
+    )
+    .to_value();
+    let printed: Vec<String> = report
+        .as_object()
+        .expect("an object")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(keys("write"), printed);
+    assert_eq!(printed.len(), 9);
+    assert_eq!(
+        schema(Some("release")).expect("a noun")["keys"],
+        Value::Null
+    );
+}
+
+/// The keys `noun`'s schema row lists, sorted.
+#[cfg(unix)]
+fn schema_keys(noun: &str) -> Vec<String> {
+    let row = schema(Some(noun)).expect("a noun");
+    let mut keys: Vec<String> = row["keys"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{noun} lists its keys: {row}"))
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// The schema's `intent` and `credential` keys are those of the documents agh prints:
+/// `intent show` of an intent a create began, and `whoami --git URL`, on agh-fake.
+#[cfg(unix)]
+#[test]
+fn the_intent_and_credential_keys_are_the_printed_documents() {
+    let root = common::scratch("schema-docs");
+    let fake = agh_fake::FakeGithub::start();
+    common::canonical_tokens(root.path(), &fake, true, true);
+    common::write_config(
+        &agh::config::Dirs::under(root.path()),
+        &common::canonical_config(root.path()),
+    );
+    common::canonical_repos(&fake);
+    let printed = |args: &[&str]| -> Value {
+        let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
+        let exit = common::run_cli(&mut ctx, args);
+        assert_eq!(exit, 0, "{args:?}: {}", captured.stderr_text());
+        common::stdout_json(&captured)
+    };
+    let keys_of = |doc: &Value| -> Vec<String> {
+        let mut keys: Vec<String> = doc
+            .as_object()
+            .unwrap_or_else(|| panic!("one object: {doc}"))
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    };
+    let created = printed(&["release", "create", "fixture-dev/app", "v1", "--draft"]);
+    let intent = created["intent"].as_str().expect("the create's intent");
+    let shown = printed(&["intent", "show", "fixture-dev/app", intent]);
+    assert_eq!(keys_of(&shown), schema_keys("intent"), "{shown}");
+    let credential = printed(&["whoami", "--git", "https://github.com/fixture-dev/app.git"]);
+    assert_eq!(
+        keys_of(&credential),
+        schema_keys("credential"),
+        "{credential}"
     );
 }

@@ -181,12 +181,67 @@ impl Host for RealHost {
         if !pre.file_type().is_file() {
             return Err(format!("{}: not a regular file", path.display()));
         }
+        #[cfg(any(
+            all(
+                any(target_os = "linux", target_os = "android"),
+                any(
+                    target_arch = "x86",
+                    target_arch = "x86_64",
+                    target_arch = "riscv64",
+                    target_arch = "aarch64",
+                    target_arch = "arm",
+                ),
+            ),
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        ))]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0800;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0004;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(NONBLOCK_OPEN_FLAG)
+                .open(path)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+        };
+        #[cfg(not(any(
+            all(
+                any(target_os = "linux", target_os = "android"),
+                any(
+                    target_arch = "x86",
+                    target_arch = "x86_64",
+                    target_arch = "riscv64",
+                    target_arch = "aarch64",
+                    target_arch = "arm",
+                ),
+            ),
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        )))]
         let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let meta = file
             .metadata()
             .map_err(|e| format!("{}: {e}", path.display()))?;
         if !meta.is_file() {
             return Err(format!("{}: not a regular file", path.display()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if (pre.dev(), pre.ino()) != (meta.dev(), meta.ino()) {
+                return Err(format!("{}: file changed during open", path.display()));
+            }
         }
         if meta.len() > MAX_HOST_READ_BYTES {
             return Err(format!(
@@ -209,31 +264,65 @@ impl Host for RealHost {
     }
     fn write(&self, path: &Path, text: &str) -> Result<(), String> {
         use std::io::Write;
-        match std::fs::symlink_metadata(path) {
-            Ok(meta) if meta.file_type().is_file() => {
-                std::fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            }
-            Ok(_) => {
-                return Err(format!(
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+
+        let check_regular_or_absent = |target: &Path| -> Result<(), String> {
+            match std::fs::symlink_metadata(target) {
+                Ok(meta) if meta.file_type().is_file() => Ok(()),
+                Ok(_) => Err(format!(
                     "{}: refusing to overwrite non-regular file",
-                    path.display()
-                ));
+                    target.display()
+                )),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!("{}: {e}", target.display())),
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        check_regular_or_absent(path)?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| format!("{}: missing file name", path.display()))?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let (tmp, mut file) = loop {
+            let seq = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(
+                ".{}.winsign-tmp-{}-{seq}",
+                file_name.to_string_lossy(),
+                std::process::id()
+            ));
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&candidate) {
+                Ok(file) => break (candidate, file),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            }
+        };
+        let written = file
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("{}: {e}", path.display()));
+        drop(file);
+        if let Err(err) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
         }
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+        if let Err(err) = check_regular_or_absent(path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
         }
-        let mut file = opts
-            .open(path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        file.write_all(text.as_bytes())
-            .map_err(|e| format!("{}: {e}", path.display()))
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("{}: {e}", path.display()));
+        }
+        Ok(())
     }
     fn remove_file(&self, path: &Path) {
         let _ = std::fs::remove_file(path);
@@ -2046,6 +2135,13 @@ Successfully verified: aterm.exe
         let regular = dir.path().join("meta.json");
         RealHost.write(&regular, "{}").expect("write regular file");
         assert_eq!(RealHost.read_to_string(&regular).expect("read"), "{}");
+        RealHost
+            .write(&regular, "{\"replaced\":true}")
+            .expect("atomic overwrite regular file");
+        assert_eq!(
+            RealHost.read_to_string(&regular).expect("read replaced"),
+            "{\"replaced\":true}"
+        );
         #[cfg(unix)]
         {
             let target = dir.path().join("victim.txt");

@@ -70,10 +70,9 @@ impl Parser {
                 self.utf8_expected
             );
 
-            assert_eq!(
-                self.subparam_mask >> self.params.len(),
-                0,
-                "TLA+ SubparamMaskValid violated: subparam_mask has bits set at or beyond params.len() (mask={:#010x}, params.len()={})",
+            assert!(
+                crate::csi::subparam_mask_fits(self.subparam_mask, self.params.len()),
+                "TLA+ SubparamMaskValid violated: subparam_mask has bits set at or beyond params.len(), past the cap's mark (mask={:#010x}, params.len()={})",
                 self.subparam_mask,
                 self.params.len()
             );

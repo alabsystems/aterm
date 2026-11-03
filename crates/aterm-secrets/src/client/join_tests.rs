@@ -10,6 +10,36 @@ use std::sync::mpsc;
 
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
+#[test]
+fn a_path_vault_has_no_join_queues_even_with_irrelevant_policy() {
+    let recipient = Identity::from_secret_bytes([7; 32]).recipient().to_bech32();
+    let config = Config {
+        source: Source::Path(std::path::PathBuf::from("unread.vault")),
+        name: "team".into(),
+        signer: Some([7; 32]),
+        followed: Vec::new(),
+        host: "admin".into(),
+    };
+    for (conditional, policy) in [(false, "servers = ["), (true, "servers = []")] {
+        let mut baseline = Document::parse(&format!(
+            "[machines]\nadmin = {recipient}\n[admins]\nadmin\n[everyone]\n"
+        ))
+        .unwrap();
+        baseline
+            .set_entry_with(
+                &Audience::Everyone,
+                crate::SWARM_POLICY_ENTRY,
+                policy.as_bytes(),
+                conditional,
+                None,
+            )
+            .unwrap();
+        let (pending, incomplete) = approval_requests(&config, &baseline).unwrap();
+        assert!(pending.is_empty());
+        assert!(!incomplete, "a path source has no network queue to observe");
+    }
+}
+
 fn serve_holding(store: &Path, hold: Duration) -> crate::server::Running {
     crate::server::start_with_join_change_gap(
         std::net::TcpListener::bind("127.0.0.1:0").expect("bind"),
@@ -385,6 +415,41 @@ fn an_admin_mac_records_each_mac_left_to_a_person_and_approves_exactly_the_one_n
         "{refused}"
     );
     assert!(matches!(sync(&mc, None).expect("sync"), SyncOutcome::NotIn));
+    server.stop();
+}
+
+#[test]
+fn failed_approval_refresh_withdraws_actions_until_a_fresh_judgment() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let server = serve_holding(&root.path().join("store"), Duration::from_millis(1));
+    let (admin, source, _) = team(root.path(), &server);
+    let peer = Paths::for_home(&root.path().join("mb"));
+    assert!(matches!(
+        join(
+            &peer,
+            &options(&source, JoinPassword::Given(None), None, Duration::ZERO)
+        )
+        .unwrap(),
+        JoinOutcome::Pending { .. }
+    ));
+    let mut approver = Approver::default();
+    approver_pass(&admin, &|_| {}, &mut approver);
+    let asking_before = asking(&admin);
+    assert_eq!(asking_before.len(), 1);
+    let judgment_before = approver.told.clone();
+
+    approver.trouble(&admin, &|_| {}, "queue unavailable".into());
+    assert!(asking(&admin).is_empty());
+    assert_eq!(approver.told, judgment_before);
+    approver_pass(&admin, &|_| {}, &mut approver);
+    assert_eq!(asking(&admin), asking_before);
+    assert!(matches!(sync(&peer, None).unwrap(), SyncOutcome::NotIn));
+
+    approve_request(&admin, &asking_before[0].recipient).unwrap();
+    approver.trouble(&admin, &|_| {}, "queue unavailable after approval".into());
+    assert!(asking(&admin).is_empty());
+    approver_pass(&admin, &|_| {}, &mut approver);
+    assert!(asking(&admin).is_empty());
     server.stop();
 }
 
@@ -1864,6 +1929,34 @@ fn a_version_notes_each_key_it_names_anew_and_carries_the_rest() {
     server.stop();
 }
 
+#[test]
+fn answered_records_round_trip_more_than_256_distinct_observations() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(root.path());
+    let recipient = Identity::from_secret_bytes([54; 32])
+        .recipient()
+        .to_bech32();
+    let original: BTreeSet<_> = (0_u64..600)
+        .map(|offset| Answered {
+            recipient: recipient.clone(),
+            host: "same-machine".into(),
+            at: 1_800_000_000 + offset,
+            proof: Some(format!("{offset:064x}")),
+        })
+        .collect();
+    let encoded = answered_text(&original);
+    let decoded = answered_lines(&encoded);
+    assert_eq!(decoded.len(), 600, "all observed requests must survive");
+    assert_eq!(decoded, original, "proofs must stay bound to every record");
+    assert!(
+        encoded.len() > 64 << 10,
+        "the fixture crosses the old read bound"
+    );
+    fsx::ensure_private_dir(&paths.dir).unwrap();
+    fsx::write_atomic(&paths.answered_approved_file(), encoded.as_bytes(), 0o600).unwrap();
+    assert_eq!(read_approved(&paths), original);
+}
+
 /// Exact proof metadata distinguishes same-second requests; missing or damaged
 /// metadata preserves the suppression older records could express.
 #[test]
@@ -1948,7 +2041,7 @@ fn an_approver_record_keeps_its_requests_and_judged_version_where_a_build_before
     let admin = Paths::for_home(&root.path().join("ma"));
     let seen: std::collections::BTreeSet<String> =
         (0..4000).map(|n| format!("age1{n:058}")).collect();
-    let answered: std::collections::BTreeSet<Answered> = (0..ANSWERED_MOST as u64)
+    let answered: std::collections::BTreeSet<Answered> = (0..256u64)
         .map(|n| Answered {
             recipient: format!("age1{n:058}"),
             host: format!("mac-{n}"),
@@ -2898,7 +2991,7 @@ fn waiting_for_alab(
 
 /// A Mac waiting to be let into the ALab vault, as System State's join leaves it (that join
 /// posts only to the vault's queue, which no member's desk reads), asks ALab's members on the
-/// LAN to show its request from its subscriber, and says how many heard it.
+/// LAN to let it in from its subscriber, and says how many answered.
 /// NEGATIVE CONTROL: a subscriber loop that never calls `ask_members_if_due` (main before this
 /// fix) asks no member, and the hang detector fails the test.
 #[test]
@@ -2947,18 +3040,17 @@ fn a_mac_waiting_for_alab_asks_its_members_from_its_subscriber() {
             .expect("cleanly");
     });
     assert!(
-        logged
-            .lock()
-            .expect("log")
-            .iter()
-            .any(|line| line.contains("2 show its request; press Allow on any one")),
+        logged.lock().expect("log").iter().any(
+            |line| line.contains("2 answered; a member on this Mac's home ALab LAN lets it in")
+        ),
         "{:?}",
         logged.lock().expect("log")
     );
 }
 
 /// When a waiting Mac's subscriber asks ALab's members: at once as it starts waiting for the ALab
-/// vault at a URL, then after 1, 2, 4 and 8 minutes and every 15 minutes from then on, saying a
+/// vault at a URL, then after 20 seconds, 1, 2, 4 and 8 minutes, and every 15 minutes from then
+/// on, saying a
 /// changed answer once; at once again on another network or once a person's Join posted its
 /// request again, but not after its own hourly ask again; never for another vault, never on a Mac
 /// that is in, and never once a member's `Allowed` is held (the run let it in, and the vault
@@ -2976,10 +3068,10 @@ fn a_waiting_mac_asks_alabs_members_less_often_until_a_member_allows_it() {
     let said = std::sync::Mutex::new(Vec::<String>::new());
     let log = |line: &str| said.lock().expect("log").push(line.to_owned());
     let count = || asks.load(Ordering::SeqCst);
-    let minutes: Vec<u64> = (1..=7)
-        .map(|asks| ask_members_pause(asks).as_secs() / 60)
+    let seconds: Vec<u64> = (1..=9)
+        .map(|asks| ask_members_pause(asks).as_secs())
         .collect();
-    assert_eq!(minutes, [1, 2, 4, 8, 15, 15, 15]);
+    assert_eq!(seconds, [20, 60, 120, 240, 480, 900, 900, 900, 900]);
     // The last ask, its pause gone by; and almost, a second short.
     let passed = |asked: &mut MembersAsked| {
         asked.at =
@@ -3004,15 +3096,15 @@ fn a_waiting_mac_asks_alabs_members_less_often_until_a_member_allows_it() {
     ask_members_if_due(&mb, &mut asked, &ask, &log);
     assert_eq!(count(), 1, "it asks as it starts waiting");
     ask_members_if_due(&mb, &mut asked, &ask, &log);
-    assert_eq!(count(), 1, "and not again within the minute");
-    for (asks, minutes) in [(1, 1), (2, 2), (3, 4), (4, 8), (5, 15), (6, 15)] {
+    assert_eq!(count(), 1, "and not again within 20 seconds");
+    for (asks, seconds) in [(1, 20), (2, 60), (3, 120), (4, 240), (5, 480), (6, 900)] {
         assert_eq!(asked.asks, asks);
         nearly(&mut asked);
         ask_members_if_due(&mb, &mut asked, &ask, &log);
-        assert_eq!(count(), asks as usize, "not within {minutes} minutes");
+        assert_eq!(count(), asks as usize, "not within {seconds} s");
         passed(&mut asked);
         ask_members_if_due(&mb, &mut asked, &ask, &log);
-        assert_eq!(count(), asks as usize + 1, "again after {minutes} minutes");
+        assert_eq!(count(), asks as usize + 1, "again after {seconds} s");
     }
     assert_eq!(
         said.lock().expect("log").len(),
@@ -3029,7 +3121,7 @@ fn a_waiting_mac_asks_alabs_members_less_often_until_a_member_allows_it() {
         "another network asks at once"
     );
     ask_members_if_due(&mb, &mut asked, &ask, &log);
-    assert_eq!(count(), 8, "and then waits a minute");
+    assert_eq!(count(), 8, "and then waits its first pause again");
     // The subscriber's own hourly ask again moves the request: no new start.
     let mut state = load_state(&mb).expect("state");
     state.requested = state.requested.saturating_add(3_600);
@@ -4120,7 +4212,8 @@ fn the_approver_says_how_each_mac_it_let_in_got_in() {
     assert_eq!(by_of("mc"), ["the join password"], "{said:?}");
 }
 
-/// The members' asks back off 1, 2, 4, 8, then every 15 minutes, and only a move to another
+/// The members' asks back off 20 seconds, then 1, 2, 4, 8, then every 15 minutes, and only a
+/// move to another
 /// network (the default route) starts the pauses over. A laptop that sleeps past a pause wakes
 /// with its Wi-Fi not joined yet, and then with the gateway's hardware address not resolved yet:
 /// neither read is a move, so the asks go on every 15 minutes on the same network rather than
@@ -4170,7 +4263,7 @@ fn a_wake_on_the_same_network_does_not_start_the_asks_over() {
     assert_eq!(
         after_wake,
         (7, 7),
-        "a wake on the same network asked at once and started the pauses over at a minute"
+        "a wake on the same network asked at once and kept its pauses"
     );
     assert_eq!(elsewhere, (8, 1), "another network asks at once");
 }

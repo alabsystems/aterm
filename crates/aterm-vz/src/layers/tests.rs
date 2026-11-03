@@ -546,3 +546,51 @@ fn symlinked_disks_and_partials_are_refused_or_replaced_without_touching_targets
     assert!(std::fs::symlink_metadata(&sealed).unwrap().is_file());
     assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
 }
+
+/// NEGATIVE CONTROL: `prepare` and `seed_iso` refuse symlinked layer directories without
+/// removing or overwriting entries in their target, and `seed_iso` rebuilds a zero-byte ISO.
+#[test]
+fn symlinked_layer_directories_are_refused_and_empty_seed_iso_is_rebuilt() {
+    let s = scratch();
+    let host = Fake::new();
+    let lane = User {
+        name: "lane".into(),
+        uid: 501,
+    };
+    let seed = Seed::new(&lane).unwrap();
+
+    let outside = s._dir.path().join("outside-dir");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep.partial.img"), b"keep").unwrap();
+
+    std::fs::create_dir_all(s.layers.root()).unwrap();
+    std::os::unix::fs::symlink(&outside, s.layers.baked_dir()).unwrap();
+    assert!(matches!(
+        s.layers.prepare(&host, &s.base, SEED, &mut |_| {}),
+        Err(Error::Io(_))
+    ));
+    assert_eq!(
+        std::fs::read(outside.join("keep.partial.img")).unwrap(),
+        b"keep"
+    );
+    std::fs::remove_file(s.layers.baked_dir()).unwrap();
+
+    std::os::unix::fs::symlink(&outside, s.layers.seed_dir()).unwrap();
+    assert!(matches!(s.layers.seed_iso(&host, &seed), Err(Error::Io(_))));
+    assert_eq!(
+        std::fs::read(outside.join("keep.partial.img")).unwrap(),
+        b"keep"
+    );
+    std::fs::remove_file(s.layers.seed_dir()).unwrap();
+
+    // Zero-byte ISO is regenerated rather than trusted as whole.
+    std::fs::create_dir_all(s.layers.seed_dir()).unwrap();
+    let iso_path = s
+        .layers
+        .seed_dir()
+        .join(format!("{}.iso", seed.fingerprint()));
+    std::fs::write(&iso_path, b"").unwrap();
+    let rebuilt = s.layers.seed_iso(&host, &seed).unwrap();
+    assert_eq!(rebuilt, iso_path);
+    assert!(std::fs::metadata(&rebuilt).unwrap().len() > 0);
+}

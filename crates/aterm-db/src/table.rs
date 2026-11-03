@@ -806,6 +806,10 @@ impl<'a> Session<'a> {
     pub const fn epoch(&self) -> u64 {
         self.access.generation()
     }
+    /// The lab this session's membership belongs to.
+    pub(crate) fn trust(&self) -> Trust {
+        self.journal.trust()
+    }
     pub fn scope(&self) -> Result<Scope> {
         self.writer()?;
         Scope::fresh(self.journal.trust())
@@ -1338,5 +1342,8 @@ pub(crate) fn binding_denied_in_roster(
         .is_some_and(|member| roster.is_member_denied(member))
 }
 
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub mod fixture;
 #[cfg(test)]
 pub(crate) mod tests;

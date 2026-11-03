@@ -19,6 +19,7 @@ use std::{
 pub(crate) mod command;
 mod descriptor;
 pub(crate) mod policy;
+pub mod release;
 pub(crate) mod ring;
 pub use descriptor::Descriptor;
 use policy::Policy;
@@ -27,27 +28,32 @@ use policy::Policy;
 pub(crate) const MAX_TABLES: usize = 63;
 /// The slots of [`MAX_TABLES`] kept for the compiled reserved tables ([`reserved`]), which take
 /// them before any declaration in causal order (docs/DESIGN-alab-lab-model-2026-11-01.md
-/// §3.10).
-pub(crate) const RESERVED_SLOTS: usize = 1;
+/// §3.10): the registry and the generation a roll restates it into, which both hold storage
+/// until the storage release frees the sealed one ([`release`]).
+pub(crate) const RESERVED_SLOTS: usize = 2;
 /// The slots of [`MAX_TABLES`] the catalog's declared tables share: the rest stay for the rings
 /// (`ring::RING_SLOTS`) and the reserved tables ([`RESERVED_SLOTS`]), whose storage never
 /// counts against these.
 pub(crate) const CATALOG_SLOTS: usize = MAX_TABLES - ring::RING_SLOTS - RESERVED_SLOTS;
 
-/// The compiled tables that take the reserved slots: the lab registry (`alab/registry` at
-/// version 1). Catalog slots otherwise go to declarations in causal order, so a new Mac that
-/// meets more subscribable declarations ahead of the registry than there are slots could never
-/// hold it, and the owner keeps adding Macs; a reserved table is subscribed whatever its causal
-/// order and whoever declared it, while there is storage room at all. Its descriptor is matched
-/// exactly: any other declaration at its identity conflicts as for every table.
+/// The compiled tables that take the reserved slots: the lab registry's generations
+/// (`alab/registry` and `alab/registry.2`, each at version 1). Catalog slots otherwise go to
+/// declarations in causal order, so a new Mac that meets more subscribable declarations ahead of
+/// the registry than there are slots could never hold it, and the owner keeps adding Macs; a
+/// reserved table is subscribed whatever its causal order and whoever declared it, while there
+/// is storage room at all. Its descriptor is matched exactly: any other declaration at its
+/// identity conflicts as for every table.
 pub(crate) fn reserved(trust: Trust) -> [Descriptor; RESERVED_SLOTS] {
-    [Descriptor::application(
-        trust,
-        crate::alab::registry::APPLICATION,
-        crate::alab::registry::ROLE,
-        crate::alab::registry::VERSION,
-    )
-    .expect("the registry's declaration is valid")]
+    let generation = |table: &crate::typed::Table| {
+        Descriptor::application(
+            trust,
+            table.application,
+            table.role,
+            crate::alab::registry::VERSION,
+        )
+        .expect("the registry's declaration is valid")
+    };
+    crate::alab::registry::GENERATIONS.map(generation)
 }
 pub(crate) const PER_CREATOR: usize = 8;
 pub(crate) const RECORDS_PER_CREATOR: usize = 64;
@@ -418,6 +424,70 @@ impl Directory {
         self.enroll(session, descriptor.scope)?;
         Ok(descriptor.scope)
     }
+
+    /// Add this Mac's own declaration of a reserved table another Mac declared, as evidence
+    /// that this Mac runs a build that compiles it (a registry roll seals only once every Writer
+    /// shows that, `alab::roll`): `publish` coalesces onto an existing declaration, so it says
+    /// nothing of the Mac that runs it. Only a reserved table, declared alike by everyone, still
+    /// subscribed and not yet declared by this Mac, gets one; it takes no creator slot. Returns
+    /// whether a declaration was written.
+    ///
+    /// # Errors
+    /// No Commons writer, the catalog cannot be read or written, or this Mac's catalog history
+    /// is spent.
+    pub(crate) fn endorse(&self, session: &Session<'_>, descriptor: &Descriptor) -> Result<bool> {
+        session.writer()?;
+        if !self.is_reserved(descriptor) || descriptor.scope.trust() != self.trust {
+            return Ok(false);
+        }
+        let mut catalog = self.catalog(session)?;
+        let snapshot = self.project(session, catalog.catalog(session)?, &Policy::default())?;
+        let Some(entry) = snapshot.entries.get(&descriptor.scope.digest()) else {
+            return Ok(false);
+        };
+        if entry.state != State::Subscribed
+            || entry
+                .declarations
+                .iter()
+                .any(|d| d.descriptor != *descriptor)
+            || entry
+                .declarations
+                .iter()
+                .any(|d| d.actor == session.actor())
+        {
+            return Ok(false);
+        }
+        if catalog.retained_by(session, session.actor())? >= RECORDS_PER_CREATOR {
+            return Err(Error::new("catalog author history limit reached"));
+        }
+        catalog.commit_catalog(session, &descriptor.encode()?)?;
+        Ok(true)
+    }
+
+    /// The current Writers (`Session::writers`) with no declaration of `descriptor` in
+    /// `snapshot`, by Commons machine: the Macs that have not shown a build that compiles it
+    /// ([`Self::endorse`]).
+    pub(crate) fn undeclared(
+        session: &Session<'_>,
+        snapshot: &Snapshot,
+        descriptor: &Descriptor,
+    ) -> Vec<[u8; 16]> {
+        let declared = snapshot
+            .entries
+            .get(&descriptor.scope.digest())
+            .map(|entry| entry.declarations.as_slice())
+            .unwrap_or_default();
+        session
+            .writers()
+            .into_iter()
+            .filter(|binding| {
+                !declared
+                    .iter()
+                    .any(|d| d.descriptor == *descriptor && d.actor == binding.actor())
+            })
+            .map(|binding| *binding.machine())
+            .collect()
+    }
     /// Opens work immediately on one offline machine, with the same identity
     /// when another machine independently opens this application role.
     pub fn open_application(
@@ -453,7 +523,16 @@ impl Directory {
     /// A genuinely absent catalog is empty. Damaged primary custody may use an
     /// already verified recovery replica; neither store is initialized here.
     pub fn observe_with_config(&self, session: &Session<'_>, config: &Path) -> Result<Snapshot> {
-        match self.observe_primary_with_config(session, config) {
+        self.observe_with_policy(session, &Policy::read(config)?)
+    }
+
+    /// Read retained declarations through one policy snapshot, including recovery fallback.
+    pub(crate) fn observe_with_policy(
+        &self,
+        session: &Session<'_>,
+        policy: &Policy,
+    ) -> Result<Snapshot> {
+        match self.observe_primary_with_policy(session, policy) {
             Ok(snapshot) => Ok(snapshot),
             Err(error) if self.is_recovery() || error.is_busy() => Err(error),
             Err(original) => {
@@ -465,7 +544,7 @@ impl Directory {
                     return Err(original);
                 }
                 recovery
-                    .observe_primary_with_config(session, config)
+                    .observe_primary_with_policy(session, policy)
                     .map_err(|_| original)
             }
         }
@@ -476,7 +555,14 @@ impl Directory {
         session: &Session<'_>,
         config: &Path,
     ) -> Result<Snapshot> {
-        let policy = Policy::read(config)?;
+        self.observe_primary_with_policy(session, &Policy::read(config)?)
+    }
+
+    fn observe_primary_with_policy(
+        &self,
+        session: &Session<'_>,
+        policy: &Policy,
+    ) -> Result<Snapshot> {
         let root_exists = match aterm_uds::private_file::check_private_dir(&self.root) {
             Ok(()) => true,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -494,7 +580,7 @@ impl Directory {
         self.project(
             session,
             self.discovery_records_from(session, &catalog)?,
-            &policy,
+            policy,
         )
     }
 
@@ -615,13 +701,13 @@ impl Directory {
         id: Digest,
         now: u64,
     ) -> Result<bool> {
-        if !policy.enabled || policy.excluded.contains(&self.catalog_scope().digest()) {
+        if !policy.includes(self.catalog_scope().digest(), id) {
             return Ok(false);
         }
         if id == self.catalog_scope().digest() {
             return Ok(true);
         }
-        if !policy.excluded.contains(&id) && self.ring_permits(session, id, now)? {
+        if self.ring_permits(session, id, now)? {
             return Ok(true);
         }
         Ok(self
@@ -851,10 +937,7 @@ impl Directory {
             }
             entry.state = if entry.declarations.iter().any(|d| &d.descriptor != first) {
                 State::Conflict
-            } else if !policy.enabled
-                || policy.excluded.contains(id)
-                || policy.excluded.contains(&self.catalog_scope().digest())
-            {
+            } else if !policy.includes(self.catalog_scope().digest(), *id) {
                 State::Excluded
             } else if !retained.contains(id)
                 && !reserved.contains(id)

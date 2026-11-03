@@ -91,7 +91,7 @@ impl AccountsHost for Host {
         email: &str,
         browser: &RenewBrowser,
         input: &Path,
-    ) -> Result<RenewalExit, String> {
+    ) -> Result<RenewalExit, crate::harness::cli::RenewalFailure> {
         let code = self.renew_flow_with_inputs(staging, email, browser, input)?;
         Ok(self.outcome.clone().unwrap_or(RenewalExit::from(code)))
     }

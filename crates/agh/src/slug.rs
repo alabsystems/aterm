@@ -165,7 +165,8 @@ pub(crate) fn target_name_ok(name: &str) -> bool {
 }
 
 impl RepoArg {
-    /// `@name` (`[a-z][a-z0-9-]{0,31}`) is a target. `.` is refused.
+    /// `@name` (`[a-z][a-z0-9-]{0,31}`) is a target. `.` is refused: agh infers no repository
+    /// from the directory.
     ///
     /// # Errors
     ///
@@ -173,7 +174,7 @@ impl RepoArg {
     pub fn parse(text: &str) -> Result<RepoArg> {
         if text == "." {
             return Err(Error::usage(
-                "no cwd inference in M1: name the repository (OWNER/NAME or @TARGET)",
+                "agh infers no repository from the directory: name it (OWNER/NAME or @TARGET)",
             ));
         }
         if let Some(name) = text.strip_prefix('@') {

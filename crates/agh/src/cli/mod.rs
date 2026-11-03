@@ -22,6 +22,7 @@ mod cmd_release_write;
 mod cmd_repo;
 mod cmd_wait;
 mod cmd_whoami;
+mod dry_run;
 pub mod format;
 pub mod help;
 pub mod jq;
@@ -43,8 +44,8 @@ use crate::client::{Github, GithubBuilder, Meter};
 use crate::config::{self, Dirs, Validated};
 use crate::download::DigestCheck;
 use crate::error::{Error, IdentityRef, Replay, Result, Sub};
+use crate::fx::Fx;
 use crate::fx::tape::TapeHeader;
-use crate::fx::{Fx, Mode};
 #[cfg(any(test, debug_assertions))]
 use crate::git::HelperCommand;
 #[cfg(any(test, debug_assertions))]
@@ -109,7 +110,12 @@ pub fn run(args: &[String], ctx: &mut Ctx) -> u8 {
                 Ok(Parsed::Run(verb, mut inv)) => {
                     inv.global.replay.clone_from(&global.replay);
                     inv.global.record.clone_from(&global.record);
-                    if let Err(e) = args::tape_rule(verb, &inv.global) {
+                    if let Err(e) = args::tape_rule(verb, &inv.global)
+                        .and_then(|()| {
+                            args::tape_targets(verb, &inv.global, &inv.positionals, &inv.flags)
+                        })
+                        .and_then(|()| args::bare_replay_rule(verb, &inv))
+                    {
                         return out::fail(ctx, &inv.verb_name(), &e);
                     }
                     run_verb(ctx, verb, &inv, &taped, Some(tape))
@@ -145,7 +151,7 @@ fn run_verb(
     {
         return out::fail(ctx, &name, &e.with_next(args::help_next(&inv.path)));
     }
-    if let Err(e) = out::check_opts(&name, &opts) {
+    if let Err(e) = out::check_opts(&name, verb.noun, &opts) {
         return out::fail(ctx, &name, &e);
     }
     let taped = inv.global.record.is_some() || inv.global.replay.is_some();
@@ -489,10 +495,7 @@ impl Ctx {
     /// there are any, the notifier, and (test and debug builds only) the git helper and remotes
     /// a test set. Under a tape the rate book is none whatever `dirs` is: it is not on the tape.
     fn client(&self, router: Router) -> Github {
-        let taped = matches!(
-            self.fx.mode(),
-            Mode::Recording | Mode::Replaying | Mode::Rerecording
-        );
+        let taped = self.fx.mode().is_taped();
         let rate_book = match &self.dirs {
             Some(dirs) if !taped => RateBook::at(dirs.rate()),
             _ => RateBook::none(),

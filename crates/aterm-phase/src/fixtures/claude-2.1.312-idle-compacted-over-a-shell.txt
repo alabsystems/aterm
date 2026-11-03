@@ -1,0 +1,67 @@
+# claude-code 2.1.312 · MEASURED 2026-10-27, a read-only capture of the text of the owner's tab (146 columns, aterm 0.145.0): the turn ended at 4:57 PM over a shell it left (`· 1 shell still running`), then Claude Code compacted the idle conversation under that done row. The composer's `ok, keep going` is as drawn; a text capture has no cell attributes. The home folder and the label on the composer's rule are written `user00` and `workspace`, as in the other fixtures
+
+
+  Ran 2 shell commands
+
+⏺ Both branches are on main, at commit 6f5b92bf39.
+
+  fix/replay-attribution
+  - A close that waited for an update to finish is now logged as whoever asked for it. An aterm ctl close stays a ctl close, and the window it
+    empties closes the same way.
+  - A text selection you're dragging keeps going when an aterm edit tab opens behind it or another tab closes. The drag ends only when what's in
+    front changes or your pane is laid out again.
+  - Two slips caught before landing: a misplaced doc comment, and missing blank lines between my two CHANGELOG entries.
+
+  fix/doc-window-plans
+  - A window close held up by a failed save no longer closes the window by surprise later, and no longer leaves documents frozen.
+  - A held close only finishes if the window is still as it was when you asked. Closes waiting on an update are counted when deciding whether to
+    ask about quitting, and a Quit drops them.
+  - The two branches each had their own version of the function that replays closes after an update; it's now one. It keeps who asked for each
+    close and re-checks the window before closing it.
+  - The Windows cross-build flagged two helpers as unused, because only unix code calls them. I marked them with the repo's usual allow attribute.
+
+  Checks
+  - On tree 7d90a81a7e everything passed: fmt, census, doc, 12383 aterm-gui tests, 172 amacs tests, and lint with the Linux, Windows and wasm
+    cross-builds.
+  - Main then moved 208 commits, touching lib.rs, app_mouse.rs and SPECS.md, but nowhere near my code. On the merged tree I re-ran fmt, census,
+    doc and the tests (12416 aterm-gui, 172 amacs), all passing.
+  - I didn't re-run lint and the cross-builds on that final merge; the merge commit message says so.
+
+  The earlier route-parity bug-hunt round 8 never ran: agents and workflows hit the weekly usage limit, which resets Oct 28 at 9pm Pacific. Land
+  mode says to start no new work, so I didn't run it inline.
+
+  NEEDS YOU: nothing
+
+  Nothing left: my only two branches are merged into origin/main at 6f5b92bf39. Both worktrees are removed and both local branches deleted, and
+  neither was ever pushed as a remote branch. ~/aterm is on main, even with origin/main, with a clean status. The other worktrees and branches in
+  the repo (the gate, r21, occupancy, rotation-proof and pkg-default-set ones) belong to other sessions, and I left them alone.
+
+✻ Crunched for 59s · done 4:56 PM · 1 shell still running
+
+❯ [aterm harness] Still landing: get everything onto the remote main branch, no exceptions, with nothing unlanded, parked on a branch or for
+  later. Files no git repository holds land where they are once verified. Put what only a person can give on a line starting NEEDS YOU: and land
+  the rest. Once it is all on remote main, defend that in a few lines starting Nothing left: Your report still names open work (still, whether
+  to, but, not re-run, …): finish and land it first.
+  ⎿  1 skill available
+
+⏺ The harness is right that one item was still open: lint and the cross-OS builds never ran on the final merged tree. I'm running them now on main
+  as pushed, in a fresh detached worktree.
+
+  Ran 2 shell commands
+
+⏺ Lint and the cross-OS cells are running on the landed tree 52625a4149, at commit 6f5b92bf39. I'll report the result when it finishes; if it
+  finds anything, I'll fix it and land the fix.
+
+✻ Worked for 23s · done 4:57 PM · 1 shell still running
+  ⎿  Read ../.claude/projects/-Users-user00-aterm/memory/lint-brings-cells-win-dead-code.md (23 lines)
+
+⏺ Task "Run lint and cross cells on the landed tree" still running in background
+  ⎿  Skills restored (workflow-authoring)
+
+⏺ Compacted while idle, before the prompt cache expired · turn off with "idleCompaction": false in settings.json
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── workspace ─
+❯ ok, keep going
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5h – · 7d 42%
+  ⏵⏵ bypass permissions on · 1 shell

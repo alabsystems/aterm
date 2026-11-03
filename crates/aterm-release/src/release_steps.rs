@@ -16,6 +16,9 @@ use crate::release::{
     Prover, RELEASE_COMMAND, Ran, Refusal, Reservation, Step,
 };
 
+#[path = "release_scanner_tools.rs"]
+mod scanner_tools;
+
 fn preflight_cache(repo: &Path) -> Result<PathBuf, String> {
     let dir = crate::snapshot::CacheRoot::for_repo(repo)?.preflight();
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
@@ -165,6 +168,7 @@ pub(crate) fn started_of(pid: u32) -> Option<String> {
 
 /// The real backend.
 pub struct Real {
+    pub(crate) build_inputs: fn() -> Result<String, String>,
     repo: PathBuf,
     home: PathBuf,
     engine: PathBuf,
@@ -182,6 +186,10 @@ pub struct Real {
     /// anchored ([`crate::release::ReleaseOptions::anchored_args`]): what the re-run
     /// as R's own cutter ([`Real::reexec_command`]) passes on, from the clone's root.
     argv: Vec<std::ffi::OsString>,
+    source_signing: Option<crate::source_signing::Tools>,
+    prepared_source_helper: Option<PathBuf>,
+    scanner_tools: Option<scanner_tools::Report>,
+    scanner_probe: scanner_tools::Probe,
 }
 
 struct Forwarded {
@@ -255,6 +263,7 @@ impl Real {
             )
             .join("aterm-release");
         Ok(Self {
+            build_inputs: crate::build_inputs::current,
             repo: repo.to_path_buf(),
             home,
             engine,
@@ -266,6 +275,10 @@ impl Real {
             origin_tags: String::new(),
             step: Step::Checks,
             argv: std::env::args_os().skip(1).collect(),
+            source_signing: None,
+            prepared_source_helper: None,
+            scanner_tools: None,
+            scanner_probe: scanner_tools::run,
         })
     }
 
@@ -374,10 +387,13 @@ impl Real {
     }
 
     fn scrubbed(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
-        let mut cmd = command(program);
-        scrub(&mut cmd);
-        cmd.env("PUBLICATION_ENGINE", &self.engine);
-        cmd.env("PATH", publication_path());
+        let mut cmd = publication_command(&self.engine, program);
+        if let Some(tools) = &self.source_signing {
+            tools.apply(&mut cmd);
+        }
+        if let Some(tools) = &self.scanner_tools {
+            tools.apply(&mut cmd);
+        }
         cmd
     }
 
@@ -613,7 +629,7 @@ impl Real {
             return Ok(());
         }
         let path = self.engine.join("verification-log.jsonl");
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let text = crate::durable::read_text(&path).unwrap_or_default();
         let merged = audit_rows_merged(&text, &rows);
         let recorded = std::fs::write(&path, merged).is_ok()
             && self
@@ -854,6 +870,7 @@ impl Real {
 
     /// The export guards, `ship check --export`: the engine's own dry run, `pub stage aterm --dry-run --no-check --commit R --repo-path <scratch clone>`, every export guard `pub stage` runs (forbidden content, private references, gitleaks, the cargo metadata closure, README versions, dead links) in one pass, over a scratch clone of R (never this checkout's `publish/.out`, where a real stage's attestation waits for `pub publish`) and a [`Real::scratch_engine`] copy. The engine reads the public tier as the public does ([`public_reads`]), so those reads need no SSH key.
     pub(crate) fn export_gate(&mut self, scratch: &Scratch, r: &str) -> (Outcome, Option<PathBuf>) {
+        self.scanner_tools = None;
         let not_run = |why: Refusal| (Outcome::CouldNotRun(why), None);
         if !self.is_ancestor(r, "refs/remotes/origin/main") {
             return not_run(Refusal::new(
@@ -902,6 +919,16 @@ impl Real {
         let toolchain = self.metadata_toolchain();
         let pubbin = engine.join("bin/pub");
         let (mut stage, handed) = self.dry_run_command(&engine, r, &root, &reads);
+        let scanners = match scanner_tools::prepare(
+            &stage,
+            &scratch.dir.join("scanner-tools.json"),
+            &[&self.repo, &root],
+            self.scanner_probe,
+        ) {
+            Ok(report) => report,
+            Err(why) => return not_run(scanner_refusal(why)),
+        };
+        scanners.apply(&mut stage);
         let (code, text) = match self.output_forwarded(&mut stage) {
             Ok(o) => (
                 o.status.code().unwrap_or(-1),
@@ -919,7 +946,7 @@ impl Real {
         let export = out.join("export");
         for (name, at) in &mut run.failed {
             if let Some(report) = gitleaks_report(name) {
-                let json = std::fs::read_to_string(report).unwrap_or_default();
+                let json = crate::durable::read_text(Path::new(report)).unwrap_or_default();
                 *at = gitleaks_locations(&json, &export);
             }
         }
@@ -1251,7 +1278,48 @@ impl Real {
             })
     }
 
-    fn stage_run(&self, c: &Candidate, prover: &Prover) -> Result<Ran, Refusal> {
+    fn stage_run(&mut self, c: &Candidate, prover: &Prover) -> Result<Ran, Refusal> {
+        self.stage_run_with(c, prover, Self::source_export_preflight)
+    }
+
+    fn source_export_preflight(&mut self, c: &Candidate) -> Result<(), Refusal> {
+        self.engine_sync()?;
+        let scratch = Scratch::read_only(&self.repo).map_err(|why| {
+            Refusal::new(
+                format!("cannot prepare the early export scan: {why}"),
+                "restore the release scratch directory and retry",
+            )
+            .could_not_run()
+        })?;
+        match self.export_gate(&scratch, &c.commit).0 {
+            Outcome::Pass(note) => {
+                if let Ok(mut log) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.step_log(self.step))
+                {
+                    let _ = writeln!(log, "early source scan: {note}");
+                }
+                Ok(())
+            }
+            Outcome::Refuse(why) => Err(why),
+            Outcome::CouldNotRun(why) => Err(why.could_not_run()),
+        }
+    }
+
+    fn stage_run_with(
+        &mut self,
+        c: &Candidate,
+        prover: &Prover,
+        source_scan: impl FnOnce(&mut Self, &Candidate) -> Result<(), Refusal>,
+    ) -> Result<Ran, Refusal> {
+        // Scan the exact export before compiling. The ordinary stage still runs
+        // its guards and public build; this dry run grants no reusable verdict.
+        source_scan(self, c)?;
+        // Compile the required test graph and check source closure before public staging or product builds. Use the
+        // same checkout, driver and scrubbed environment as verify below, retaining its
+        // normal target cache rather than creating another cold qualification tree.
+        self.compile_tests(c, prover)?;
         self.compat_check(c)?;
         self.engine_sync()?;
         let (mut cmd, handed) = self.stage_command(&c.commit, prover);
@@ -1265,6 +1333,110 @@ impl Real {
         let ran = self.logged(self.step, &mut cmd);
         self.engine_sync()?;
         Ok(ran)
+    }
+
+    fn prepare_source_signing(&mut self) -> Result<(), Refusal> {
+        if self.source_signing.is_none() {
+            self.source_signing = Some(crate::source_signing::Tools::probe(
+                &self.repo, &self.home, i64::try_from(now()).unwrap_or(i64::MAX), self.prepared_source_helper.as_deref(),
+            ).map_err(|why| Refusal::new(format!("source signing preflight: {why}"), "restore the source signing tools and the complete registered release ring, then retry"))?);
+        }
+        Ok(())
+    }
+
+    fn compile_tests(&mut self, c: &Candidate, prover: &Prover) -> Result<(), Refusal> {
+        self.scanner_tools = None;
+        let refuse_tree = || {
+            Refusal::new(
+                "the clone changed before or during required test compilation",
+                format!("restore the clean candidate tree, then {RELEASE_COMMAND}"),
+            )
+        };
+        if let Some(off) = self.off_tree(&c.commit) {
+            return Err(refuse_tree().detail(off));
+        }
+        self.prepare_scanner_tools(prover)?;
+        self.prepare_source_signing()?;
+        let mut cmd = self.child(prover.bin.join("targo"), Some(prover));
+        cmd.args([
+            "--unverified",
+            "run",
+            "-q",
+            "-p",
+            "aterm-verify",
+            "--",
+            "test",
+            "checkers",
+            "--all",
+            "--compile-only",
+        ]);
+        let ran = self.logged(self.step, &mut cmd);
+        if ran.code != 0 {
+            return Err(Refusal::new(
+                format!("required workspace test compilation failed (exit {}); this attempt starts no downstream product build", ran.code),
+                format!("fix the compilation failure on main, then {RELEASE_COMMAND} --commit origin/main"),
+            ).detail(ran.detail));
+        }
+        self.source_closure(prover, |cmd| self.logged(self.step, cmd))?;
+        if let Some(off) = self.off_tree(&c.commit) {
+            return Err(refuse_tree().detail(off));
+        }
+        Ok(())
+    }
+
+    fn source_closure(
+        &self,
+        prover: &Prover,
+        run: impl FnOnce(&mut Command) -> Ran,
+    ) -> Result<(), Refusal> {
+        // Keep the workspace feature graph just compiled above. Selecting only the
+        // models package would change dependency features and compile them again.
+        let mut cmd = self.child(prover.bin.join("targo"), Some(prover));
+        cmd.args([
+            "--unverified",
+            "test",
+            "--workspace",
+            "--test",
+            "spec_xref_closure",
+        ]);
+        // The pinned driver bypasses atpkg's shim. Match the verifier's cache
+        // after `child` has removed the caller's Cargo layout overrides.
+        let env = aterm_verify::EnvSnapshot {
+            home: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            path: publication_path(),
+            ..Default::default()
+        };
+        let target = self.repo.join("target");
+        if let Some(layout) = aterm_verify::main_build_dir(&env, &self.repo)
+            .or_else(|| aterm_verify::fallback_build_dir(&env, &self.repo, &target))
+        {
+            cmd.arg("--config").arg(layout);
+        }
+        let ran = run(&mut cmd);
+        if ran.code != 0 {
+            return Err(Refusal::new(
+                format!("required source-to-spec closure failed (exit {}); this attempt starts no downstream product build", ran.code),
+                format!("fix the source/model bindings on main, then {RELEASE_COMMAND} --commit origin/main"),
+            ).detail(ran.detail));
+        }
+        Ok(())
+    }
+
+    fn prepare_scanner_tools(&mut self, prover: &Prover) -> Result<(), Refusal> {
+        self.scanner_tools = None;
+        let publication = self.child(self.engine.join("bin/pub"), Some(prover));
+        self.scanner_tools = Some(
+            scanner_tools::prepare(
+                &publication,
+                &self.logs.join("scanner-tools.json"),
+                &[&self.repo],
+                self.scanner_probe,
+            )
+            .map_err(scanner_refusal)?,
+        );
+        Ok(())
     }
 
     /// The stage step's `pub stage aterm --commit <commit> --repo-path <repo>`, a [`Real::child`]
@@ -1408,16 +1580,8 @@ impl Real {
             build: reserved.build,
             commit: reserved.commit.clone(),
         };
-        let found = crate::buildplan::stable_rustc_commit()
-            .map(|rustc| {
-                crate::artifact::key(
-                    &identity,
-                    &crate::artifact::Compilers {
-                        trustc: prover.commit.clone(),
-                        rustc,
-                    },
-                )
-            })
+        let found = crate::artifact::compilers()
+            .map(|compilers| crate::artifact::key(&identity, &compilers))
             .and_then(|key| {
                 let store = crate::artifact::store(&self.repo)?;
                 crate::artifact::read(&store, &key).map(|c| c.map(|c| (store, c)))
@@ -1668,11 +1832,17 @@ fn built_answer(repo: &Path, artifact: Option<&Artifact>, prover: &Prover) -> An
             short(&complete.trustc),
             short(&prover.commit)
         )),
-        Ok(Some(_)) => Answer::yes(format!(
-            "built once: {} (executable sha256 {})",
-            a.app.display(),
-            short(&a.macho_sha256)
-        )),
+        Ok(Some(complete)) => match crate::build_inputs::current() {
+            Ok(inputs) if inputs == complete.inputs => Answer::yes(format!(
+                "built once: {} (executable sha256 {})",
+                a.app.display(),
+                short(&a.macho_sha256)
+            )),
+            Ok(_) => Answer::no("the compiler or SDK bytes changed since this bundle was built"),
+            Err(error) => Answer::no(format!(
+                "the bundle's build inputs cannot be checked: {error}"
+            )),
+        },
         Ok(None) => Answer::no(format!(
             "the release cache holds no COMPLETE bundle {}",
             short(&a.key)
@@ -1834,7 +2004,7 @@ fn append_output(log: &Path, out: &std::process::Output) {
 }
 
 fn tail(path: &Path, n: usize) -> Vec<String> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let text = crate::durable::read_text(path).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..]
         .iter()
@@ -2142,6 +2312,63 @@ fn public_reads(
     env.push(("GIT_CONFIG_PARAMETERS".to_string(), parameters));
     env.push(("GIT_TERMINAL_PROMPT".to_string(), "0".into()));
     Ok(env)
+}
+
+fn scanner_refusal(why: String) -> Refusal {
+    let mut lines = why.lines();
+    Refusal::new(
+        format!(
+            "publication scanner preflight: {}; no downstream work started by this operation",
+            lines.next().unwrap_or("engine refused")
+        ),
+        "restore the publication engine's scanner prerequisites and rerun preparation",
+    )
+    .detail(
+        lines
+            .filter(|line| !line.is_empty())
+            .take(20)
+            .map(str::to_owned),
+    )
+    .could_not_run()
+}
+
+fn publication_command(engine: &Path, program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = command(program);
+    scrub(&mut cmd);
+    cmd.env("PUBLICATION_ENGINE", engine);
+    cmd.env("PATH", publication_path());
+    cmd.env_remove(scanner_tools::ENV);
+    cmd
+}
+
+/// Start the engine's launcher without starting a stage, using the publication environment.
+///
+/// # Errors
+/// The launcher cannot start, exceeds the one-minute hang detector, or exits unsuccessfully.
+#[cfg(unix)]
+pub(crate) fn engine_bootstrap(repo: &Path, engine: &Path) -> Result<(), String> {
+    let mut cmd = publication_command(engine, engine.join("bin/pub"));
+    cmd.arg("--help")
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .env("PYTHONDONTWRITEBYTECODE", "1");
+    let out = aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(60))
+        .map_err(|e| {
+            format!(
+                "publication engine {} --help cannot run: {e}",
+                engine.display()
+            )
+        })?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "publication engine {} --help exited unsuccessfully ({}); check its launcher's \
+             runtime on the publication PATH",
+            engine.display(),
+            out.status
+        ))
+    }
 }
 
 /// The publication engine sees installed managed programs, rustup and the pinned scanner even
@@ -2824,6 +3051,34 @@ impl Backend for Real {
         }
     }
 
+    fn observe_operational(&mut self) {
+        #[cfg(unix)]
+        let observation = aterm_agent::operational::observe();
+        #[cfg(not(unix))]
+        let observation = aterm_json::json!({"state":"unknown", "reason":"operational observation is unavailable on this platform"});
+        let record = aterm_json::json!({"schema":1,
+            "attempt":self.logs.to_string_lossy().into_owned(), "observed_at":now(),
+            "observation":observation});
+        match aterm_json::to_vec(&record)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| {
+                crate::durable::write_atomic_durable(
+                    &self.logs.join("operational-status.json"),
+                    &bytes,
+                    0o600,
+                )
+                .map_err(|e| e.to_string())
+            }) {
+            Ok(()) => self.say(&format!(
+                "        operational status: {}",
+                self.logs.join("operational-status.json").display()
+            )),
+            Err(error) => self.say(&format!(
+                "        operational status could not be recorded: {error}"
+            )),
+        }
+    }
+
     fn release_dir(&mut self) -> PathBuf {
         self.release.clone()
     }
@@ -2874,6 +3129,10 @@ impl Backend for Real {
                 bin.display()
             ));
         }
+        // Hold the resolved store entry before executing any of its tools.
+        if !self.scratch_logs {
+            crate::gates::lease_toolchain_checked(&bin)?;
+        }
         let identity = crate::gates::toolchain_at(&bin).map_err(|e| e.to_string())?;
         let commit = identity.rsplit(' ').next().unwrap_or("unknown").to_string();
         if commit == "unknown" || commit.is_empty() {
@@ -2891,8 +3150,8 @@ impl Backend for Real {
         })
     }
 
-    fn lease(&mut self, prover: &Prover) {
-        crate::gates::lease_toolchain(&prover.bin);
+    fn lease(&mut self, prover: &Prover) -> Result<(), String> {
+        crate::gates::lease_toolchain_checked(&prover.bin)
     }
 
     fn cleared_env(&mut self) -> Vec<String> {
@@ -2906,6 +3165,15 @@ impl Backend for Real {
 
     fn machine(&mut self, creds: &Path, explicit: bool) -> (String, Vec<Refusal>) {
         let mut out = Vec::new();
+        if let Err(why) = crate::source_signing::Tools::authority(
+            &self.home,
+            i64::try_from(now()).unwrap_or(i64::MAX),
+        ) {
+            out.push(Refusal::new(
+                format!("source signing ring: {why}"),
+                "run targo --unverified ship provision --id <existing signer id> to restore the complete canonical ring, then retry",
+            ));
+        }
         if explicit && !creds.is_file() {
             out.push(Refusal::new(
                 format!("--release-credentials {} is not a file", creds.display()),
@@ -3371,7 +3639,10 @@ impl Backend for Real {
         let system = aterm_verify::provision::System::new(&self.repo);
         let mut lines = Vec::new();
         let code = aterm_verify::provision::run(
-            &aterm_verify::provision::Options::default(),
+            &aterm_verify::provision::Options {
+                release: true,
+                ..Default::default()
+            },
             &machine,
             &system,
             &mut |line| {
@@ -3379,16 +3650,48 @@ impl Backend for Real {
                 lines.push(line.to_string());
             },
         );
-        if code == 0 {
-            Ok("all pinned prerequisites are installed".into())
-        } else {
-            Err(Refusal::new(
+        if code != 0 {
+            return Err(Refusal::new(
                 "validation prerequisites are unavailable; no product build or staging started",
-                "run targo --unverified verify provision and retry the release",
+                "run targo --unverified verify provision --release and retry the release",
             )
             .detail(lines)
-            .could_not_run())
+            .could_not_run());
         }
+        let explicit = std::env::var_os("ATPKG_KEYS");
+        let helper =
+            crate::source_signing::prepare_helper(&self.repo, explicit.as_deref(), |args| {
+                use aterm_verify::provision::Host as _;
+                let targo = system.targo()?;
+                println!("validation tools: building this checkout's source-signing helper");
+                let mut cmd = self.child(targo, None);
+                cmd.args(args);
+                let out = self.output_forwarded(&mut cmd).map_err(|e| e.to_string())?;
+                if let Ok(mut log) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.step_log(self.step))
+                {
+                    let _ = log.write_all(&out.stdout);
+                    let _ = log.write_all(&out.stderr);
+                }
+                if !out.status.success() {
+                    return Err(format!(
+                        "source-signing helper build exited {}: {}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr)
+                    ));
+                }
+                Ok(out.stdout)
+            })
+            .map_err(|why| {
+                Refusal::new(
+                    why,
+                    "restore the source-signing helper build and retry the release",
+                )
+            })?;
+        self.prepared_source_helper = Some(helper);
+        Ok("all pinned prerequisites and the source-signing helper are ready".into())
     }
 
     fn move_to(&mut self, commit: &str) -> Result<(), Refusal> {
@@ -3701,6 +4004,14 @@ impl Backend for Real {
         prover: &Prover,
         fixtures: bool,
     ) -> Built {
+        // A resumed journal may have staged with an older cutter. Recheck the
+        // warm test graph before starting either the product or its fixtures.
+        if let Err(refusal) = self.compile_tests(c, prover) {
+            return Built {
+                artifact: Err(refusal),
+                fixtures: None,
+            };
+        }
         let fixtures_log = self.side_log(Step::Build, "fixtures");
         let this = &*self;
         std::thread::scope(|s| {
@@ -3737,14 +4048,13 @@ impl Backend for Real {
             .detail(off)
             .could_not_run());
         }
+        let inputs = (self.build_inputs)()
+            .map_err(|error| Refusal::new(error, "restore the release build inputs and retry"))?;
         let mut cmd = self.child(prover.bin.join("targo"), Some(prover));
         cmd.args(crate::release::VERIFY_ARGS)
             .arg("--app")
             .arg(&artifact.app);
         let mut ran = self.logged_to(Step::Verify, &mut cmd, true);
-        if ran.code != 0 {
-            return Ok(ran);
-        }
         if let Some(off) = self.off_tree(&c.commit) {
             return Err(Refusal::new(
                 format!(
@@ -3756,8 +4066,34 @@ impl Backend for Real {
             .detail(off)
             .could_not_run());
         }
+        if (self.build_inputs)()
+            .map_err(|error| Refusal::new(error, "restore the release build inputs and retry"))?
+            != inputs
+        {
+            return Err(Refusal::new(
+                "compiler or SDK bytes changed during release verification",
+                "restore the build inputs and rerun verification",
+            ));
+        }
+        let log = self.step_log(Step::Verify);
+        crate::accepted_measure::record_attempt(
+            &log,
+            &inputs,
+            ran.code,
+            &c.commit,
+            &artifact.macho_sha256,
+        )
+        .map_err(|error| {
+            Refusal::new(
+                format!("record verification inputs: {error}"),
+                "restore the verification log and retry",
+            )
+        })?;
+        if ran.code != 0 {
+            return Ok(ran);
+        }
         if let Err(e) =
-            crate::gates::record_verified(&self.git(), &c.commit, &artifact.macho_sha256)
+            crate::gates::record_verified(&self.git(), &c.commit, &artifact.macho_sha256, &inputs)
         {
             ran.detail.push(format!("its record was not written: {e}"));
         }
@@ -3769,7 +4105,10 @@ impl Backend for Real {
     }
 
     fn publish(&mut self, prover: &Prover) -> Result<Ran, Refusal> {
+        self.scanner_tools = None;
         self.engine_sync()?;
+        self.prepare_scanner_tools(prover)?;
+        self.prepare_source_signing()?;
         let mut cmd = self.publish_command(prover);
         Ok(self.logged(Step::Publish, &mut cmd))
     }
@@ -3982,6 +4321,9 @@ pub fn attested_candidate(json: &str) -> Option<(String, String)> {
 #[must_use]
 pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
     interrupt::install();
+    if !opts.dry_run {
+        crate::gates::arm_toolchain_lease();
+    }
     let opts = match std::env::current_dir() {
         Ok(cwd) => opts.anchored(&cwd),
         Err(_) => opts.clone(),
@@ -4152,6 +4494,31 @@ mod public_reads_http_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_engine_bootstrap_requires_a_working_launcher_and_recovers() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let repo = dir.path().join("source");
+        let engine = dir.path().join("engine");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(engine.join("bin")).unwrap();
+        let launcher = engine.join("bin/pub");
+        std::fs::write(&launcher, "#!/bin/sh\nexit 127\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(engine_bootstrap(&repo, &engine).is_err());
+
+        std::fs::rename(&launcher, engine.join("bin/unavailable-pub")).unwrap();
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\n[ \"$1\" = --help ] || exit 3\nprintf 'engine-help-ready\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(engine_bootstrap(&repo, &engine).is_ok());
+    }
 
     /// A descriptor without FD_CLOEXEC, held open as one is between a `pipe` and its
     /// `fcntl`: neither a detached step nor the snapshot's git may inherit it.
@@ -4621,6 +4988,8 @@ mod tests {
         )
         .unwrap();
         let seen = root.join("seen-env");
+        let scanner_report = root.join("scanner-report.json");
+        std::fs::write(&scanner_report, scanner_tools::test_output().stdout).unwrap();
         let dump: String = reads
             .iter()
             .map(|(key, _)| {
@@ -4636,9 +5005,13 @@ mod tests {
             std::fs::write(
                 &pubbin,
                 format!(
-                    "#!/bin/sh\nhere=$(cd \"$(dirname \"$0\")/..\" && pwd)\necho '{{\"row\":1}}' \
+                    "#!/bin/sh\nhere=$(cd \"$(dirname \"$0\")/..\" && pwd)\n\
+                     if [ \"$1\" = scanner-preflight ]; then cat '{scanner}'; exit 0; fi\n\
+                     [ -n \"$PUBLISH_SCANNER_TOOLS\" ] && cmp -s \"$PUBLISH_SCANNER_TOOLS\" '{scanner}' || exit 10\n\
+                     echo '{{\"row\":1}}' \
                      >> \"$here/verification-log.jsonl\"\n[ \"$1 $2 $3 $4\" = 'stage aterm \
-                     --dry-run --no-check' ] || exit 9\n{dump}printf '%s' '{say}'\nexit {code}\n"
+                     --dry-run --no-check' ] || exit 9\n{dump}printf '%s' '{say}'\nexit {code}\n",
+                    scanner = scanner_report.display(),
                 ),
             )
             .unwrap();
@@ -5291,6 +5664,19 @@ mod tests {
         assert!(real.candidate_missing().is_err());
     }
 
+    #[test]
+    fn dry_run_machine_checks_refuse_an_incomplete_source_signing_ring() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mut real = Real::new(dir.path(), Some(dir.path()), true, false).unwrap();
+        real.home = dir.path().join("empty-home");
+        let (_, refusals) = real.machine(&real.home.join("profile.toml"), false);
+        assert!(
+            refusals
+                .iter()
+                .any(|r| r.why.starts_with("source signing ring:"))
+        );
+    }
+
     /// The build and cut steps run this very executable or nothing: a cutter that cannot name
     /// its own executable builds no command for an `aterm-release` found on `PATH`, which would
     /// be handed nothing of this one; one that can runs that path, handed itself. NEGATIVE
@@ -5399,6 +5785,248 @@ mod tests {
         );
         let edit = real.scrubbed("/other/publication/bin/pub-bump-edit");
         assert!(edit.get_envs().any(|kv| kv == engine));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_export_preflight_uses_the_actual_dry_run_environment() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = root.join("candidate");
+        let export = root.join("export-candidate");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&export).unwrap();
+        let real = Real::new(&repo, Some(&root.join("engine")), true, false).unwrap();
+        let (mut stage, _) = real.dry_run_command(
+            &root.join("scratch-engine"),
+            "candidate",
+            &export,
+            &public_reads_at(0),
+        );
+        let report = scanner_tools::prepare(
+            &stage,
+            &real.logs.join("export-scanner-tools.json"),
+            &[&repo, &export],
+            |probe| {
+                assert_eq!(probe.get_program(), stage.get_program());
+                assert_eq!(
+                    probe.get_envs().collect::<Vec<_>>(),
+                    stage.get_envs().collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    probe.get_args().collect::<Vec<_>>(),
+                    [std::ffi::OsStr::new("scanner-preflight")]
+                );
+                Ok(scanner_tools::test_output())
+            },
+        )
+        .unwrap();
+        report.apply(&mut stage);
+        assert!(
+            stage
+                .get_envs()
+                .any(|(name, value)| name == scanner_tools::ENV && value.is_some())
+        );
+        assert_eq!(std::fs::read_dir(repo).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(export).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_and_test_compilation_failures_stop_before_export_or_product_builds() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        crate::ledger::testing::init(
+            &repo,
+            &[
+                ("user.name", "Test"),
+                ("user.email", "test@example.invalid"),
+                ("commit.gpgsign", "false"),
+            ],
+        );
+        let git = GitCli::new(&repo);
+        git.git(&["commit", "--allow-empty", "-qm", "candidate"])
+            .unwrap();
+        let candidate = Candidate {
+            commit: git
+                .git(&["rev-parse", "HEAD"])
+                .unwrap()
+                .stdout_utf8()
+                .trim()
+                .into(),
+            version: "1.0.0".into(),
+            why: "test".into(),
+            bump_from: None,
+        };
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/false", bin.join("targo")).unwrap();
+        let prover = Prover {
+            bin: bin.clone(),
+            commit: "test".into(),
+            source: "test".into(),
+        };
+        let mut real =
+            Real::new(&repo, Some(&dir.path().join("missing-engine")), true, false).unwrap();
+        real.home = dir.path().join("empty-home");
+        let scanner_failure = real
+            .stage_run_with(&candidate, &prover, |_, _| Ok(()))
+            .unwrap_err();
+        assert!(
+            scanner_failure
+                .why
+                .starts_with("publication scanner preflight:")
+        );
+        assert!(real.scanner_tools.is_none());
+        real.scanner_probe = |_| Ok(scanner_tools::test_output());
+        let unready = real
+            .stage_run_with(&candidate, &prover, |_, _| Ok(()))
+            .unwrap_err();
+        assert!(
+            unready.why.starts_with("source signing preflight:"),
+            "{unready:?}"
+        );
+        real.source_signing = Some(crate::source_signing::Tools::for_test());
+        for unavailable in [false, true] {
+            let mut expected = Refusal::new("export guard refused the source", "fix the source")
+                .detail(["GUARD FAIL: gitleaks".into()]);
+            if unavailable {
+                expected = expected.could_not_run();
+            }
+            let failure = real
+                .stage_run_with(&candidate, &prover, |_, given| {
+                    assert_eq!(given.commit, candidate.commit);
+                    Err(expected.clone())
+                })
+                .unwrap_err();
+            assert_eq!(failure.why, expected.why);
+            assert_eq!(failure.detail, expected.detail);
+            assert_eq!(failure.could_not_run, unavailable);
+            assert!(
+                !std::fs::read_to_string(real.step_log(real.step))
+                    .unwrap_or_default()
+                    .contains("--compile-only")
+            );
+        }
+        let failure = real
+            .stage_run_with(&candidate, &prover, |_, _| Ok(()))
+            .unwrap_err();
+        assert!(
+            failure
+                .why
+                .contains("required workspace test compilation failed"),
+            "{failure:?}"
+        );
+        real.entered(Step::Build);
+        let failed_build = real.build(&candidate, &Reservation::default(), &prover, true);
+        assert!(
+            failed_build
+                .artifact
+                .unwrap_err()
+                .why
+                .contains("required workspace test compilation failed")
+        );
+        assert!(failed_build.fixtures.is_none());
+        assert!(
+            std::fs::read_to_string(real.step_log(Step::Build))
+                .unwrap()
+                .contains("--compile-only")
+        );
+        std::fs::remove_file(bin.join("targo")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/true", bin.join("targo")).unwrap();
+        real.compile_tests(&candidate, &prover).unwrap();
+        let report = real.logs.canonicalize().unwrap().join("scanner-tools.json");
+        for cmd in [
+            real.stage_command(&candidate.commit, &prover).0,
+            real.publish_command(&prover),
+        ] {
+            assert!(cmd.get_envs().any(
+                |(name, value)| name == scanner_tools::ENV && value == Some(report.as_os_str())
+            ));
+        }
+        let failures: [scanner_tools::Probe; 3] = [
+            |_| Err("engine missing or probe timed out".into()),
+            |_| {
+                let mut out = scanner_tools::test_output();
+                out.stdout = b"unsupported command help".to_vec();
+                Ok(out)
+            },
+            |_| {
+                use std::os::unix::process::ExitStatusExt as _;
+                let mut out = scanner_tools::test_output();
+                out.status = std::process::ExitStatus::from_raw(1 << 8);
+                out.stderr = b"zstd unavailable: restore the supported managed zstd tool".to_vec();
+                Ok(out)
+            },
+        ];
+        for (index, probe) in failures.into_iter().enumerate() {
+            real.scanner_probe = probe;
+            let refusal = real.compile_tests(&candidate, &prover).unwrap_err();
+            assert!(refusal.why.starts_with("publication scanner preflight:"));
+            if index == 2 {
+                assert!(
+                    refusal
+                        .detail
+                        .iter()
+                        .any(|line| line.contains("zstd unavailable")
+                            && line.contains("supported managed zstd"))
+                );
+            }
+            assert!(real.scanner_tools.is_none());
+            assert!(
+                real.publish_command(&prover)
+                    .get_envs()
+                    .any(|(name, value)| name == scanner_tools::ENV && value.is_none())
+            );
+        }
+        real.scanner_probe = |_| Ok(scanner_tools::test_output());
+        std::fs::write(repo.join("untracked"), "changed").unwrap();
+        assert!(
+            real.compile_tests(&candidate, &prover)
+                .unwrap_err()
+                .why
+                .contains("clone changed")
+        );
+    }
+
+    #[test]
+    fn source_closure_uses_the_workspace_graph_and_refuses_a_failed_check() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let real = Real::new(dir.path(), Some(Path::new("/unused/engine")), true, false).unwrap();
+        let prover = Prover {
+            bin: dir.path().join("toolchain"),
+            commit: "test".into(),
+            source: "test".into(),
+        };
+        for code in [0, 101, -1] {
+            let result = real.source_closure(&prover, |cmd| {
+                assert_eq!(cmd.get_program(), prover.bin.join("targo"));
+                assert_eq!(cmd.get_current_dir(), Some(dir.path()));
+                let args = cmd.get_args().collect::<Vec<_>>();
+                assert_eq!(
+                    args[..5],
+                    [
+                        "--unverified",
+                        "test",
+                        "--workspace",
+                        "--test",
+                        "spec_xref_closure"
+                    ]
+                );
+                assert_eq!(args.len(), 7);
+                assert_eq!(args[5], "--config");
+                assert!(args[6].to_string_lossy().contains(".noindex"));
+                Ran {
+                    code,
+                    detail: vec!["unbound model action".into()],
+                }
+            });
+            if code == 0 {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result.unwrap_err().detail, ["unbound model action"]);
+            }
+        }
     }
 
     /// The stage step's `pub stage` is a child with the prover's bin, handed this cutter only as

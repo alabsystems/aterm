@@ -37,6 +37,15 @@ pub fn display_build(program: &str, build: u64) -> String {
     s
 }
 
+/// Format `program` and `build` offline using [`have_words`].
+#[must_use]
+pub fn display_have_build(layout: &crate::store::Layout, program: &str, build: u64) -> String {
+    let mut s = String::from(program);
+    s.push(' ');
+    s.push_str(&have_words(layout, program, Some(build)));
+    s
+}
+
 /// Format `build` as a version string for vendor-direct builds or `build <n>` for index builds.
 #[must_use]
 pub fn build_words(build: u64) -> String {
@@ -48,7 +57,7 @@ pub fn build_words(build: u64) -> String {
     s
 }
 
-/// Format `program`'s active `build` offline using its vendor version, recorded legacy version, or [`build_words`].
+/// Format `program`'s active `build` offline using its vendor version, ALab build words, recorded legacy version, or [`build_words`].
 #[must_use]
 pub fn have_words(layout: &crate::store::Layout, program: &str, build: Option<u64>) -> String {
     let Some(build) = build else {
@@ -56,6 +65,9 @@ pub fn have_words(layout: &crate::store::Layout, program: &str, build: Option<u6
     };
     if Version::from_build_id(build).is_some() {
         return build_label(build);
+    }
+    if crate::alab::build_is_alab(layout, program, build) {
+        return crate::alab::build_words(layout, program, build);
     }
     if let Some(v) =
         stamp::ProgramStamp::read(layout, program).and_then(|stamp| stamp.legacy_version_of(build))

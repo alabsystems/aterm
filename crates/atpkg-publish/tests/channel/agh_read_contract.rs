@@ -121,6 +121,10 @@ struct Setup {
     push: bool,
     reader: bool,
     ext: bool,
+    /// The owner's read chain ends in `anonymous`.
+    anonymous: bool,
+    /// The dev token is fine-grained, its drafts not vouched.
+    fine_grained: bool,
 }
 
 impl Setup {
@@ -131,6 +135,8 @@ impl Setup {
         push: true,
         reader: false,
         ext: false,
+        anonymous: false,
+        fine_grained: false,
     };
 }
 
@@ -166,13 +172,19 @@ impl AghWorld {
             push,
             reader,
             ext,
+            anonymous,
+            fine_grained,
         } = setup;
         let fake = FakeGithub::start();
         let dir = scratch("agh-contract");
         let tokens = dir.path().join("tokens");
         aterm_uds::private_file::create_private_dir(&tokens).expect("the token directory");
         let profile = |name: &str, login: &str, written: bool| {
-            let secret = agh_fake::token(name);
+            let secret = if fine_grained && name == "dev" {
+                agh_fake::fine_grained_token(name)
+            } else {
+                agh_fake::token(name)
+            };
             fake.add_token(&secret, login);
             let file = format!("{name}.token");
             if written {
@@ -199,8 +211,9 @@ impl AghWorld {
             text.push_str(&profile("ext", "fixture-ext-bot", true));
         }
         let write = if writer { "write = \"dev\"\n" } else { "" };
+        let chain = if anonymous { ", \"anonymous\"" } else { "" };
         text.push_str(&format!(
-            "[[owners]]\nname = \"fixture-dev\"\ntier = \"dev\"\nread = [\"{read}\"]\n{write}"
+            "[[owners]]\nname = \"fixture-dev\"\ntier = \"dev\"\nread = [\"{read}\"{chain}]\n{write}"
         ));
         if ext {
             text.push_str(
@@ -222,6 +235,8 @@ impl AghWorld {
             .fx(Arc::clone(&fx))
             .retry(policy)
             .caller("atpkg-publish")
+            // As production builds it: `write_preflight` opens the write journal first.
+            .journal(agh::config::Dirs::under(&dir.path().join("agh")))
             .build();
         let home = agh::Slug::new(OWNER, REPO).expect("the home slug");
         let host = AghHost::new(github, home).with_retry_pause(Duration::ZERO);
@@ -258,7 +273,8 @@ impl AghWorld {
         self.fake.seen().len()
     }
 
-    fn listing_gets(&self) -> usize {
+    /// GETs that resolve a tag: the tag read and the bounded listing behind it.
+    fn resolution_gets(&self) -> usize {
         let path = "/repos/fixture-dev/packs/releases";
         self.fake
             .seen()
@@ -266,9 +282,9 @@ impl AghWorld {
             .filter(|s| {
                 s.origin == FakeOrigin::Api
                     && s.method == "GET"
-                    && s.path_and_query
-                        .strip_prefix(path)
-                        .is_some_and(|rest| rest.is_empty() || rest.starts_with('?'))
+                    && s.path_and_query.strip_prefix(path).is_some_and(|rest| {
+                        rest.is_empty() || rest.starts_with('?') || rest.starts_with("/tags/")
+                    })
             })
             .count()
     }
@@ -758,20 +774,92 @@ fn race_rest() {
     on_rest(case_race);
 }
 
+/// `published_releases` and `published_by_tag` of `w`'s public `v1`, with `v2` a draft.
+fn published_answers(w: &AghWorld) {
+    w.put("v1", false, true, &[("a.bin", b"ay")]);
+    w.put("v2", true, true, &[]);
+    let listed = w
+        .host
+        .published_releases(&slug())
+        .expect("the published listing");
+    assert_eq!(
+        listed.into_iter().map(normal).collect::<Vec<_>>(),
+        vec![release("v1", false, true, &["a.bin"])]
+    );
+    let got = w.host.published_by_tag(&slug(), "v1").expect("the release");
+    assert_eq!(normal(got), release("v1", false, true, &["a.bin"]));
+    assert_eq!(
+        w.host.published_by_tag(&slug(), "v2"),
+        Err(HostError::NotFound)
+    );
+}
+
 #[test]
-fn agh_writes_and_git_are_refused() {
+fn published_reads_need_no_writer() {
+    let w = AghWorld::build(Setup {
+        token: false,
+        anonymous: true,
+        ..Setup::PLAN
+    });
+    published_answers(&w);
+    for s in w.fake.seen() {
+        assert!(!s.had_authorization, "{} {}", s.method, s.path_and_query);
+    }
+    match w.host.releases(&slug()) {
+        Err(HostError::Unreachable(why)) => assert!(why.contains(OWNER), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(w.fake.violations(), Vec::<String>::new());
+
+    let w = AghWorld::build(Setup {
+        fine_grained: true,
+        ..Setup::PLAN
+    });
+    published_answers(&w);
+    // The fail-closed gate stays (owner ruling 2026-10-26 (b)): an unvouched fine-grained
+    // writer's draft-inclusive reads are refused, never answered as a published-only listing.
+    match w.host.releases(&slug()) {
+        Err(HostError::Refused(_)) => {}
+        other => panic!("{other:?}"),
+    }
+    match w.host.release(&slug(), "v1") {
+        Err(HostError::Refused(_)) => {}
+        other => panic!("{other:?}"),
+    }
+    match w.host.write_preflight(&slug()) {
+        Err(HostError::Refused(_)) => {}
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        w.fake
+            .seen()
+            .iter()
+            .all(|s| s.as_login.as_deref() == Some("fixture-dev-bot") && s.method == "GET"),
+        "{:?}",
+        w.fake.seen()
+    );
+    assert_eq!(w.fake.violations(), Vec::<String>::new());
+}
+
+#[test]
+fn agh_repo_seen_answers_false_only_when_both_reads_miss() {
     let w = AghWorld::new();
-    let dir = scratch("contract-writes");
-    let host = &w.host;
-    let refused =
-        |r: Result<(), HostError>| assert!(matches!(r, Err(HostError::Refused(_))), "{r:?}");
-    refused(host.create(&slug(), "v1", "title", "notes", &[]));
-    refused(host.upload(&slug(), "v1", &[], Replace::Never));
-    refused(host.upload(&slug(), "v1", &[], Replace::Clobber));
-    refused(host.publish_draft(&slug(), "v1"));
-    refused(host.clone_repo(&slug(), &dir.path().join("clone")));
-    refused(host.fetch_repo(&slug(), dir.path()));
-    assert_eq!(w.requests(), 0);
+    assert_eq!(w.host.repo_seen(&slug()), Ok(true));
+    assert_eq!(w.host.repo_seen(&Slug::new(OWNER, "missing")), Ok(false));
+    let missing = "/repos/fixture-dev/missing";
+    let reads: Vec<bool> = w
+        .fake
+        .seen()
+        .iter()
+        .filter(|s| s.path_and_query == missing)
+        .map(|s| s.had_authorization)
+        .collect();
+    assert_eq!(reads, [true, false], "{:?}", w.fake.seen());
+    assert!(matches!(
+        w.host.repo_seen(&Slug::new("fixture-ext", "packs")),
+        Err(HostError::Refused(_))
+    ));
+    assert_eq!(w.fake.violations(), Vec::<String>::new());
 }
 
 #[test]
@@ -897,7 +985,7 @@ fn agh_download_resolution_never_compounds_the_lanes_retry() {
         matches!(retried, Err(HostError::Unreachable(_))),
         "{retried:?}"
     );
-    assert_eq!(w.listing_gets(), DOWNLOAD_ATTEMPTS);
+    assert_eq!(w.resolution_gets(), DOWNLOAD_ATTEMPTS);
     assert_eq!(w.download_attempts(), 0);
     let pauses = RetryPolicy::STANDARD.pauses;
     let slept = w.fx.slept();

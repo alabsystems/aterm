@@ -355,7 +355,7 @@ fn a_renewed_cap_is_attached_at_the_next_redial_without_a_restart() {
     let pid = w.bridge_pid();
     let renewed: String = node_grants(&w.node).iter().map(|g| cap_line(g)).collect();
     let staged = w.tmp.join("node.cap.renewed");
-    std::fs::write(&staged, renewed).expect("the renewed ring");
+    harness::write_cap(&staged, renewed);
     std::fs::rename(&staged, w.tmp.join("node.cap")).expect("install it over node.cap");
     w.wait_ready();
     assert_eq!(

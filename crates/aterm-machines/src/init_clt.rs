@@ -48,10 +48,14 @@ pub enum Unfinished {
     /// Apple's installer refused them: `softwareupdate -i` failed after its download, or exited
     /// 0 and installed nothing.
     Installer,
-    /// Another install of them runs (`softwareupdate`, `installer` or Apple's installer app holds
-    /// the placeholder).
+    /// Another install of them runs: `softwareupdate`, `installer` or Apple's installer window
+    /// holds the placeholder (the window while it or the placeholder is younger than
+    /// [`aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND`]), or a live run of the root half
+    /// stamped it.
     Busy,
-    /// A signal stopped the install.
+    /// A stop ended the install before the tools arrived: a signal the tab's run caught (a
+    /// person's Ctrl-C, at `sudo`'s password prompt or during the install), or the root half's
+    /// own stop.
     Stopped,
     /// Apple's own installer window, opened where the catalog lists none, did not install them
     /// in time.
@@ -113,16 +117,19 @@ impl Unfinished {
         }
     }
 
-    /// What the tab's program exits with once it said this class: Low Data Mode and an account
-    /// that is no administrator's have their own codes
+    /// What the tab's program exits with once it said this class: Low Data Mode, an account
+    /// that is no administrator's and a stop have their own codes
     /// ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LOW_DATA`],
-    /// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN`]), so the window spends no
-    /// automatic opening on the one and offers no Install… for the other; every other class is 1.
+    /// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN`],
+    /// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED`]), so the window spends no
+    /// automatic opening on the first, offers no Install… for the second, and keeps the third's
+    /// opening spent, a person's decline; every other class is 1.
     #[must_use]
     pub const fn tab_exit(self) -> u8 {
         match self {
             Self::LowData => aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LOW_DATA,
             Self::NotAdmin => aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN,
+            Self::Stopped => aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED,
             _ => 1,
         }
     }
@@ -346,22 +353,20 @@ pub const NOT_ADMIN: &str = "only an administrator of this Mac can install them,
                              base.clt` in their own login";
 
 /// Whether an install of the tools runs now, by the predicate the window's page and the root
-/// half share ([`aterm_types::macos_setup::tools_install_running`]): the on-demand placeholder,
-/// held by `softwareupdate`, `installer` or Apple's installer app, or stamped by a run of the
-/// root half that is still alive ([`crate::items::developer::placeholder_held_by_a_live_run`]:
-/// one between its steps, or waiting on Apple's installer window after a person closed it),
-/// which alone may hold or replace it. A process table that cannot be read is no install here
-/// (the root half then says whether one holds the placeholder).
+/// half share ([`aterm_types::macos_setup::tools_install_running`],
+/// [`crate::items::developer::installer_runs`]): the on-demand placeholder, held by
+/// `softwareupdate`, `installer` or Apple's installer window while it or the placeholder is
+/// younger than [`aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND`] (an age that cannot be
+/// read included), or stamped by a run of the root half that is still alive
+/// ([`crate::items::developer::placeholder_held_by_a_live_run`]: one between its steps, or
+/// waiting on Apple's installer window after a person closed it), which alone may hold or replace
+/// it. A process table that cannot be read is no install here (the root half then says whether
+/// one holds the placeholder).
 fn installing(sys: &dyn System) -> bool {
     sys.stat(std::path::Path::new(crate::items::developer::PLACEHOLDER))
         .is_ok()
-        && (sys.process_paths().is_some_and(|exes| {
-            aterm_types::macos_setup::tools_install_running(
-                true,
-                exes,
-                crate::items::developer::is_install_process,
-            )
-        }) || crate::items::developer::placeholder_held_by_a_live_run(sys))
+        && (crate::items::developer::installer_runs(sys) == Some(true)
+            || crate::items::developer::placeholder_held_by_a_live_run(sys))
 }
 
 /// Whether `row` is this item's, deferred: to an install under way, or to a person at this Mac's
@@ -502,8 +507,11 @@ impl CommandLineTools {
         // Still held: a second Ctrl-C now cannot end the run before `sudo` forgets the password.
         let _ = sys.run(&Cmd::new(SUDO).arg("-K"));
         drop(stops);
+        // A stop this run caught is the person's, whatever `sudo` or the root half then exited
+        // with: a Ctrl-C at the password prompt ends `sudo` on its own 1, which alone would read
+        // as a password macOS refused.
         let ended = match ran {
-            Ok(None) if stopped.is_some() => Err(Unfinished::Stopped),
+            Ok(code) if code != Some(0) && stopped.is_some() => Err(Unfinished::Stopped),
             Ok(code) => Unfinished::after_root(code),
             Err(_) => Err(Unfinished::Other),
         };
@@ -726,9 +734,11 @@ mod tests {
     }
 
     /// With an install of the tools under way (the placeholder held by `softwareupdate`, Apple's
-    /// package `installer` or Apple's installer app), the item asks no password and fails
-    /// nothing: it is deferred to that install. A placeholder left behind beside other programs,
-    /// one merely called `installer` included, is no install.
+    /// package `installer`, Apple's installer window while it or the placeholder is younger than
+    /// [`aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND`], or a live run of the root half),
+    /// the item asks no password and fails nothing: it is deferred to that install. A placeholder
+    /// left behind beside other programs, one merely called `installer` and Apple's window left
+    /// open past that bound beside a placeholder as old included, is no install.
     #[test]
     fn an_install_under_way_asks_no_password_and_fails_nothing() {
         for installer in ["/usr/sbin/softwareupdate", "/usr/sbin/installer"] {
@@ -752,6 +762,60 @@ mod tests {
             .running(&["/sbin/launchd", "/tmp/installer"]);
         assert_eq!(
             run(&stale, &missing(), Mode::Plan).outcome,
+            Outcome::Planned
+        );
+
+        // Apple's installer window beside the placeholder is the install a person started there
+        // while the window, or the placeholder its press created, is younger than its bound (an
+        // age nothing can read included): deferred, asking no password. So a press in a window
+        // opened hours before defers too. One left open past the bound beside a placeholder as
+        // old waits for a press beside a placeholder an ended install left, for days perhaps:
+        // no install, so it never defers `aterm init` for good.
+        let apple = "/System/Library/CoreServices/Install Command Line Developer Tools.app/\
+                     Contents/MacOS/Install Command Line Developer Tools";
+        let placeholder = crate::items::developer::PLACEHOLDER;
+        let bound = aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND.as_secs();
+        let window = |age: Option<u64>, changed: Option<u64>| {
+            let sys = console();
+            sys.file(placeholder, b"")
+                .running(&["/sbin/launchd", apple]);
+            if let Some(age) = age {
+                sys.born(Fake::PIDS + 1, sys.now - age);
+            }
+            if let Some(changed) = changed {
+                sys.changed_at(placeholder, sys.now - changed);
+            }
+            sys
+        };
+        for (age, changed) in [
+            (Some(60), Some(bound)),
+            (Some(bound - 1), Some(bound)),
+            (None, Some(bound)),
+            (Some(bound), Some(60)),
+            (Some(bound), Some(bound - 1)),
+            (Some(bound), None),
+        ] {
+            let young = window(age, changed);
+            let row = run(&young, &missing(), Mode::Apply);
+            assert_eq!(
+                row.outcome,
+                Outcome::Deferred,
+                "{age:?} {changed:?}: {row:?}"
+            );
+            assert!(
+                row.why
+                    .as_deref()
+                    .is_some_and(|why| why.ends_with(INSTALLING)),
+                "{age:?} {changed:?}: {row:?}"
+            );
+            assert!(
+                asked(&young).is_empty(),
+                "{age:?} {changed:?}: {:?}",
+                young.calls()
+            );
+        }
+        assert_eq!(
+            run(&window(Some(bound), Some(bound)), &missing(), Mode::Plan).outcome,
             Outcome::Planned
         );
 
@@ -969,6 +1033,9 @@ mod tests {
             (Some(82), false, Unfinished::Download),
             (None, false, Unfinished::Other),
             (None, true, Unfinished::Stopped),
+            // A Ctrl-C at `sudo`'s password prompt: `sudo` ends on its own 1.
+            (Some(1), true, Unfinished::Stopped),
+            (Some(82), true, Unfinished::Stopped),
         ] {
             let mut fake = console();
             if stopped {
@@ -1054,6 +1121,18 @@ mod tests {
                     assert_eq!(
                         why.tab_exit(),
                         aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN
+                    );
+                }
+                Unfinished::Stopped => {
+                    assert_eq!(
+                        why.line(),
+                        format!(
+                            "The install did not finish: {reason}. Install\u{2026} on System State tries again."
+                        ),
+                    );
+                    assert_eq!(
+                        why.tab_exit(),
+                        aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED
                     );
                 }
                 _ => {

@@ -121,24 +121,106 @@ fn verb_and_invocation(args: &[&str]) -> (&'static super::Verb, super::Invocatio
 
 #[test]
 fn rule_six_judges_a_taped_line_under_the_replay() {
+    let judged = |verb: &super::Verb, inv: &super::Invocation| {
+        super::tape_rule(verb, &inv.global)
+            .and_then(|()| super::tape_targets(verb, &inv.global, &inv.positionals, &inv.flags))
+    };
     for (line, names) in [
         (&["whoami"][..], "whoami"),
-        (&["--as", "dev", "repo", "view", "o/r"][..], "--as"),
         (&["policy", "check"][..], "policy check"),
+        (
+            &["auth", "git-credential", "get"][..],
+            "auth git-credential",
+        ),
+        (&["repo", "view", "@channel"][..], "@channel"),
+        (&["cat", "@channel:README.md"][..], "@channel"),
+        (&["ls", "@channel"][..], "@channel"),
+        (&["log", "@channel@main"][..], "@channel"),
     ] {
         let (verb, mut inv) = verb_and_invocation(line);
-        assert!(
-            super::tape_rule(verb, &inv.global).is_ok(),
-            "{line:?} untaped"
-        );
+        assert!(judged(verb, &inv).is_ok(), "{line:?} untaped");
         inv.global.replay = Some(std::path::PathBuf::from("t.atape"));
-        let error = super::tape_rule(verb, &inv.global).expect_err("refused under a tape");
+        let error = judged(verb, &inv).expect_err("refused under a tape");
         assert_eq!(error.exit(), 2, "{line:?}");
         assert!(error.why.contains(names), "{line:?}: {}", error.why);
     }
-    let (verb, mut inv) = verb_and_invocation(&["repo", "view", "o/r"]);
-    inv.global.replay = Some(std::path::PathBuf::from("t.atape"));
-    assert!(super::tape_rule(verb, &inv.global).is_ok());
+    for line in [
+        &["repo", "view", "o/r"][..],
+        &["--as", "dev", "repo", "view", "o/r"][..],
+        &["-R", "o/r", "cat", "@main:README.md"][..],
+        &["cat", "o/r@main:README.md"][..],
+    ] {
+        let (verb, mut inv) = verb_and_invocation(line);
+        inv.global.replay = Some(std::path::PathBuf::from("t.atape"));
+        assert!(judged(verb, &inv).is_ok(), "{line:?}");
+    }
+}
+
+#[test]
+fn a_bare_replay_reads_or_writes_no_file_its_tape_names() {
+    for (line, named) in [
+        (
+            &["release", "download", "o/r", "v1", "--asset", "x"][..],
+            ".",
+        ),
+        (
+            &[
+                "release", "download", "o/r", "v1", "--asset", "x", "--dir", "d",
+            ][..],
+            "d",
+        ),
+        (
+            &[
+                "release",
+                "download",
+                "o/r",
+                "v1",
+                "--asset",
+                "x",
+                "--output",
+                "f",
+                "--clobber",
+            ][..],
+            "f",
+        ),
+        (
+            &[
+                "release",
+                "create",
+                "o/r",
+                "v1",
+                "--draft",
+                "--notes-file",
+                "n1",
+            ][..],
+            "n1",
+        ),
+        (
+            &["release", "edit", "o/r", "v1", "--notes-file", "n2"][..],
+            "n2",
+        ),
+        (
+            &["release", "ensure", "o/r", "v1", "--notes-file", "n3"][..],
+            "n3",
+        ),
+    ] {
+        let (verb, inv) = verb_and_invocation(line);
+        let error = super::bare_replay_rule(verb, &inv).expect_err("a file the tape names");
+        assert_eq!(error.exit(), 2, "{line:?}");
+        assert!(error.why.ends_with(named), "{line:?}: {}", error.why);
+    }
+    for line in [
+        &[
+            "release", "download", "o/r", "v1", "--asset", "x", "--output", "-",
+        ][..],
+        &["release", "view", "o/r", "v1"][..],
+        &["release", "upload", "o/r", "v1", "a.bin"][..],
+        &["release", "ensure", "o/r", "v1", "--file", "a.bin"][..],
+        &["release", "edit", "o/r", "v1", "--notes", "text"][..],
+    ] {
+        let (verb, inv) = verb_and_invocation(line);
+        assert!(super::bare_replay_rule(verb, &inv).is_ok(), "{line:?}");
+    }
 }
 
 #[test]

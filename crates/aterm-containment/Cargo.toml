@@ -27,7 +27,7 @@ aterm-uds = { workspace = true }
 # sandbox profile admits as the user's own temporary root. Dependency-free.
 aterm-tempfile.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]

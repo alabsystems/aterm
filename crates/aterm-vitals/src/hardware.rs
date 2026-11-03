@@ -125,6 +125,30 @@ impl Sample {
     }
 }
 
+/// One worker's policy and CPU-accounting evidence, without arguments or environment.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Worker {
+    /// The process ID, scoped by its birth and accounting generation.
+    pub pid: u32,
+    /// Process birth time when read.
+    pub birth_ms: Option<i64>,
+    /// Policy and lifetime QoS counters.
+    pub scheduling: Option<crate::scheduling::Scheduling>,
+    /// Self and reaped-child counters from the same process reading.
+    pub cpu_accounting: crate::model::CpuAccounting,
+}
+
+impl From<&crate::model::ProcView> for Worker {
+    fn from(p: &crate::model::ProcView) -> Self {
+        Self {
+            pid: p.pid,
+            birth_ms: p.birth_ms,
+            scheduling: p.scheduling,
+            cpu_accounting: p.cpu_accounting,
+        }
+    }
+}
+
 /// One preserved anomaly frame, deliberately excluding command lines and environment.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
@@ -146,8 +170,8 @@ pub struct Frame {
     pub thermal: Option<Thermal>,
     /// Current runnable wait in cores.
     pub wait: Option<f32>,
-    /// Worker pid, birth in Unix milliseconds and policy/counters read with it.
-    pub workers: Vec<(u32, Option<i64>, Option<crate::scheduling::Scheduling>)>,
+    /// Worker identity, policy and CPU counters read with this frame.
+    pub workers: Vec<Worker>,
 }
 
 /// A sustained E-busy/P-underused observation, retained after recovery for export.
@@ -235,12 +259,7 @@ impl Recorder {
             hardware: s.hardware.clone(),
             thermal: s.thermal,
             wait: s.global.wait,
-            workers: s
-                .procs
-                .iter()
-                .take(64)
-                .map(|p| (p.pid, p.birth_ms, p.scheduling))
-                .collect(),
+            workers: s.procs.iter().take(64).map(Worker::from).collect(),
         };
         let b = self.pending.get_or_insert_with(|| Bundle {
             version: 1,
@@ -318,10 +337,31 @@ mod tests {
     #[test]
     fn sustained_episode_keeps_bounded_raw_evidence_and_survives_recovery() {
         let mut r = Recorder::default();
+        let mut model = crate::model::Vitals::new();
+        let mut reading = crate::model::Sample {
+            at_ns: 1_000_000_000,
+            procs: Some(vec![crate::model::ProcSample {
+                pid: 123,
+                start: Some(7),
+                cpu_ns: Some(1_000_000_000),
+                child_cpu_ns: Some(u64::MAX),
+                reaps_unwaited: Some(true),
+                version: Some(3),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        model.absorb(&reading);
+        reading.at_ns += 1_000_000_000;
+        let worker = model.absorb(&reading).procs.remove(0);
         for at in 1..31 {
-            assert!(r.observe(&anomaly(at), None).is_none());
+            let mut sample = anomaly(at);
+            sample.procs.push(worker.clone());
+            assert!(r.observe(&sample, None).is_none());
         }
-        let first = r.observe(&anomaly(31), None).unwrap();
+        let mut sample = anomaly(31);
+        sample.procs.push(worker.clone());
+        let first = r.observe(&sample, None).unwrap();
         assert_eq!(first.since_ns, 1_000_000_000);
         assert_eq!(first.frames.len(), 8);
         assert_eq!(first.frames[0].at_ns, first.since_ns);
@@ -343,6 +383,30 @@ mod tests {
         let kept = r.observe(&recovered, None).unwrap();
         assert_eq!(kept.resolved_ns, Some(recovered.at_ns));
         assert_eq!(kept.frames, first.frames);
+        assert!(
+            kept.frames.iter().all(|f| {
+                f.workers.len() == 1 && f.workers[0].cpu_accounting == worker.cpu_accounting
+            }),
+            "exited workers retain their own and reaped-child counters"
+        );
+        let exported = crate::sys::hardware::bundle_json(&kept);
+        let Some(crate::sys::json::Jv::Arr(frames)) = exported.get("frames") else {
+            panic!("missing retained frames");
+        };
+        for frame in frames {
+            let Some(crate::sys::json::Jv::Arr(workers)) = frame.get("workers") else {
+                panic!("missing retained workers");
+            };
+            let accounting = workers[0].get("cpu_accounting").unwrap();
+            assert_eq!(
+                accounting.get("self_ns"),
+                Some(&crate::sys::json::Jv::s("1000000000"))
+            );
+            assert_eq!(
+                accounting.get("reaped_children_ns"),
+                Some(&crate::sys::json::Jv::s("18446744073709551615"))
+            );
+        }
     }
     #[test]
     fn unknown_or_discontinuous_observations_do_not_certify_sustained_anomaly() {

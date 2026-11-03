@@ -1016,7 +1016,10 @@ impl<C: Ctl> Session<'_, C> {
         let mut guards = self.occupancy_guards(now, cfg, &screen.rows);
         guards.person = self.typed_within(now, cfg.human_grace_s) || seen.person(cfg.human_grace_s);
         guards.halted = seen.halted;
-        guards.draft |= seen.input_unread || self.door_draft(screen) != Some(false);
+        // A line this loop gave up on undrawn holds every line at a break as a draft does: it may
+        // still come, and a line behind it would join it (`turn_end_loop::Custody`).
+        guards.draft |=
+            seen.input_unread || self.custody.is_some() || self.door_draft(screen) != Some(false);
         guards.taskless |= host.taskless();
         // The reach read afresh too: the loop's own is its last point's, spent once the agent
         // moves on from it (a typed act, restart or dialog key there, or a turn read running:
@@ -1601,7 +1604,7 @@ impl<C: Ctl> Session<'_, C> {
         );
         IdlePoint {
             done_under_land: cfg.is_some_and(|cfg| self.autopilot_under(cfg) == Autopilot::Land)
-                && self.turn_end.landed(),
+                && self.turn_end.concluded(),
             held: guards.held_host_fact(),
             theirs: guards.theirs(),
             ..IdlePoint::default()

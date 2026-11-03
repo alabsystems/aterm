@@ -57,10 +57,19 @@ fn recorded_edited(edit: impl FnOnce(&mut Vec<Item>)) -> Vec<u8> {
     crate::supervise::tape::testing::written(&read.header.expect("a header"), &items)
 }
 
+/// The recording machine's scrub, as `lab tape promote` builds it: the owner's home, and the temporary directory the mock's session sits in (its `cwd=`) and the approval environment names (`tmpdir=`).
 fn owner_scrub() -> Scrub {
     let mut s = Scrub::new();
     s.path(std::path::Path::new(OWNER), token::HOME)
         .expect("a home");
+    let tmp = std::env::temp_dir();
+    for dir in [std::fs::canonicalize(&tmp).ok(), Some(tmp)]
+        .into_iter()
+        .flatten()
+    {
+        // A temporary directory one name below the root (`/tmp`) is refused as a scrub, and names no one's home.
+        let _ = s.path(&dir, token::TMP);
+    }
     s
 }
 

@@ -28,6 +28,7 @@ fn make_member(label: &str, aliases: &[&str], id: &Identity, node_id: Option<&st
         label: label.to_owned(),
         aliases: aliases.iter().map(|s| (*s).to_owned()).collect(),
         hint: None,
+        hw_hint: None,
         admitted_ms: 1_793_250_000_000,
         claimed_label: None,
         claimed_at_ms: None,
@@ -1076,6 +1077,7 @@ fn denied_member_stale_claim_cannot_block_active_member_mail_code() {
     let view = View {
         me: "00000000000000000000000000000001".to_owned(),
         presence: None,
+        ..View::default()
     };
     let req = MailCodeRequest {
         email: "shared@example.com".to_owned(),

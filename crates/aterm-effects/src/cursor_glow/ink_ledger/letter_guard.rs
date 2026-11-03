@@ -3569,15 +3569,21 @@ impl InkLedger {
             cut = true;
             let ny = self.knots_y.len() - 1;
             let nx = self.knots_x.len() - 1;
+            let x0_knot = self.knots_x[0];
+            let mut ya = self.knots_y[0];
             let mut yi = 0;
             while yi < ny {
-                let (ya, yb) = (self.knots_y[yi], self.knots_y[yi + 1]);
+                yi += 1;
+                let yb = self.knots_y[yi];
                 let ym = 0.5 * (ya + yb) as f32;
                 let ya_u = ya as u16;
                 let h_u = (yb - ya) as u16;
+                ya = yb;
+                let mut xa = x0_knot;
                 let mut xi = 0;
                 while xi < nx {
-                    let (xa, xb) = (self.knots_x[xi], self.knots_x[xi + 1]);
+                    xi += 1;
+                    let xb = self.knots_x[xi];
                     let m = self.mask_at_with(0.5 * (xa + xb) as f32, ym, feather);
                     let color = match h.mode {
                         HaloMode::Add => scale_rgb(h.color & 0x00FF_FFFF, m),
@@ -3587,13 +3593,13 @@ impl InkLedger {
                             }
                             Some(_) => h.color,
                             None => {
-                                xi += 1;
+                                xa = xb;
                                 continue;
                             }
                         },
                     };
                     if h.mode == HaloMode::Add && color == 0 {
-                        xi += 1;
+                        xa = xb;
                         continue;
                     }
                     pieces.push(RainHalo {
@@ -3604,9 +3610,8 @@ impl InkLedger {
                         color,
                         ..h
                     });
-                    xi += 1;
+                    xa = xb;
                 }
-                yi += 1;
             }
             hi += 1;
         }

@@ -399,7 +399,8 @@ fn sanctioned(
     if r.step.starts_with("would-rearm")
         && matches!(st.phase, Phase::Failed(_))
         && upgrade::retry_due(&st.phase, st.failed_for(now), false)
-        && upgrade::rearm_held(&st.request_for(&st.tab), Step::Rearm, &st.to, now) == Step::Rearm
+        && upgrade::rearm_held_for(st.agent, &st.request_for(&st.tab), Step::Rearm, &st.to, now)
+            == Step::Rearm
     {
         let done = rearm(
             opts,

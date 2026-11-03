@@ -47,7 +47,7 @@ fn accounts(passwd: &str) -> impl Iterator<Item = User> + '_ {
 /// The lane user: the one non-root account whose home is `/home/<name>.guest`.
 ///
 /// # Errors
-/// None is, or more than one is, or its uid is 0: which.
+/// None is, or more than one is, or its uid or gid is 0: which.
 pub fn lane_user(passwd: &str) -> Result<User, String> {
     let mut found: Vec<User> = accounts(passwd)
         .filter(|u| !u.name.contains('/') && u.home == format!("/home/{}.guest", u.name))
@@ -58,6 +58,12 @@ pub fn lane_user(passwd: &str) -> Result<User, String> {
             if user.uid == 0 {
                 return Err(format!(
                     "lane user '{}' in /etc/passwd has uid 0 (root)",
+                    user.name
+                ));
+            }
+            if user.gid == 0 {
+                return Err(format!(
+                    "lane user '{}' in /etc/passwd has gid 0 (root)",
                     user.name
                 ));
             }
@@ -165,6 +171,9 @@ bad:x:nan:dana
         assert_eq!(lane_user(&commented).unwrap().name, "dana");
         let root_lane = lane_user("dana:x:0:1001:Dana:/home/dana.guest:/bin/bash\n").unwrap_err();
         assert!(root_lane.contains("uid 0"), "{root_lane}");
+        let root_gid_lane =
+            lane_user("dana:x:501:0:Dana:/home/dana.guest:/bin/bash\n").unwrap_err();
+        assert!(root_gid_lane.contains("gid 0"), "{root_gid_lane}");
     }
 
     #[test]

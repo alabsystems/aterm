@@ -21,9 +21,6 @@ impl AccountsHost for NoProvider {
     fn now(&self) -> i64 {
         0
     }
-    fn usage_reader(&self) -> Option<crate::harness::accounts_pool::ReadUsage<'static>> {
-        None
-    }
 }
 
 struct Fixture {
@@ -157,7 +154,7 @@ fn other_provider_stats_recover_before_reading_account_records() {
         f.pending_login();
         let (mut out, mut err) = (Vec::new(), Vec::new());
         assert_eq!(
-            run_accounts_stats_of(cli, &f.env, &NoProvider, true, &mut out, &mut err),
+            run_accounts_stats_of(cli, &f.env, true, &mut out, &mut err),
             ExitCode::SUCCESS,
             "{cli:?}: {}",
             String::from_utf8_lossy(&err)
@@ -470,7 +467,7 @@ fn missing_report_paths_and_provider_homes_have_json_refusals() {
         out.clear();
         err.clear();
         assert_eq!(
-            run_accounts_stats_of(cli, &env, &NoProvider, true, &mut out, &mut err),
+            run_accounts_stats_of(cli, &env, true, &mut out, &mut err),
             ExitCode::from(1)
         );
         let doc: Value = aterm_json::from_slice(&out).unwrap();
@@ -489,7 +486,7 @@ fn missing_report_paths_and_provider_homes_have_json_refusals() {
         out.clear();
         err.clear();
         assert_eq!(
-            run_accounts_stats_of(cli, &env, &NoProvider, true, &mut out, &mut err),
+            run_accounts_stats_of(cli, &env, true, &mut out, &mut err),
             ExitCode::from(1)
         );
         let doc: Value = aterm_json::from_slice(&out).unwrap();

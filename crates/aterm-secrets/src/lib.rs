@@ -22,6 +22,7 @@ pub mod bech32;
 pub mod commons;
 pub mod envelope;
 pub mod join;
+pub mod mailbox_component;
 pub mod membership_log;
 pub mod pake;
 pub mod phrase;
@@ -76,6 +77,10 @@ pub mod need;
 #[cfg(unix)]
 pub mod network;
 #[cfg(unix)]
+pub mod operational;
+#[cfg(unix)]
+mod program_watch;
+#[cfg(unix)]
 pub mod release_keychain;
 #[cfg(unix)]
 pub mod release_ring;
@@ -83,6 +88,12 @@ pub mod release_ring;
 pub mod server;
 #[cfg(unix)]
 pub mod service;
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub mod service_acceptance;
+#[cfg(unix)]
+pub mod service_health;
+#[cfg(unix)]
+pub mod service_repair;
 pub mod sync_diagnostic;
 #[cfg(unix)]
 pub mod wake;
@@ -179,6 +190,9 @@ pub enum ErrorKind {
     /// version captured earlier. The old observation grants no access; a
     /// retry must obtain and authorize the current source again.
     VaultChanged,
+    /// A membership record or batch cannot fit the existing count or byte bounds.
+    /// No local operation may treat a partial draft as the complete operation.
+    MembershipCapacity,
     /// A connect to a private or link-local address (a vault on this LAN) found no route:
     /// what macOS answers while aterm may not yet reach the local network (its Local Network
     /// question is open, or was answered Don't Allow), and also what a LAN host that is down
@@ -191,6 +205,9 @@ pub enum ErrorKind {
     /// A request that ran past its deadline: a long-poll the server still held, a lookup with
     /// no answer, a slow network or a host that sleeps, which nothing here tells apart.
     TimedOut,
+    /// Some authorized join queues could not be observed. A missing identity is
+    /// unknown, and opening a vault cannot hold every already-waiting request.
+    JoinQueueIncomplete,
     /// A publish the vault refused before storing it: a version not newer than the one it holds
     /// (another admin's publish came first), or another publish holding its store or path (a
     /// server's 409). It cannot have landed.

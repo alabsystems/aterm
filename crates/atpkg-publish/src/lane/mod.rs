@@ -281,7 +281,7 @@ pub fn self_check(
         })
         .ok_or_else(|| not_a_snapshot(format!("not in {}/lane.<stamp>/", state_dir.display())))?;
     let record = snapshot.join("INSTALLED-FROM");
-    let recorded = std::fs::read_to_string(&record)
+    let recorded = crate::identity::read_regular_text(&record, crate::identity::MAX_META_BYTES)
         .map_err(|e| not_a_snapshot(format!("{}: {e}", record.display())))?;
     if !recorded.lines().any(|l| l == format!("sha256 {actual}")) {
         return Err(not_a_snapshot(format!(

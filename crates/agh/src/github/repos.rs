@@ -13,6 +13,11 @@ use crate::path;
 use crate::policy::{Access, Decision, RouteTarget};
 use crate::slug::Slug;
 
+/// The route door's fact naming a profile's drafts verdict (`Fx::fact`).
+const DRAFTS: &str = "drafts";
+/// The routing fact `own_login` asks: the profile's login, empty when it has none.
+const LOGIN: &str = "login";
+
 /// Repositories.
 pub struct Repos<'a> {
     gh: &'a Github,
@@ -115,16 +120,15 @@ impl<'a> Repos<'a> {
     pub fn permissions(&self, slug: &Slug, access: Access) -> Result<(RepoObject, Permissions)> {
         let how = self.how.with_access(access);
         if access == Access::WriterRead
-            && let Decision::Send { profile, tier } =
-                self.gh.decide(&how.route(RouteTarget::Repo(slug.clone())))
-            && !self.gh.drafts_vouched(&profile)
+            && let Decision::Send { profile, tier } = self.writer_decision(slug, &how)?
+            && let Drafts::Unproven { vault } = self.drafts_verdict(&profile)?
         {
             return Err(Error::new(
                 Kind::Forbidden,
                 format!("as {profile}: a fine-grained token's drafts are unproven (design §6.4)"),
             )
             .with_sub(Sub::Forbid(Forbid::DraftsUnproven))
-            .with_next(drafts_next(self.gh.router(), &profile, tier, slug))
+            .with_next(drafts_next(&vault, &profile, tier, slug))
             .with_repo(slug.to_string()));
         }
         let repo = self.read(slug, &how)?;
@@ -175,7 +179,7 @@ impl<'a> Repos<'a> {
                 &walk_opts,
                 &LinkScope::Owner { id: user.id },
             )?
-        } else if let Some(profile) = self.own_login(owner, &target) {
+        } else if let Some(profile) = self.own_login(owner, &target)? {
             let how = self.how.with_access(Access::Read).as_profile(Some(profile));
             let mut first = how
                 .get("/user/repos", RouteTarget::Identity)
@@ -207,52 +211,120 @@ impl<'a> Repos<'a> {
         Ok(listing)
     }
 
-    fn own_login(&self, owner: &str, target: &RouteTarget) -> Option<String> {
-        let Decision::Send { profile, .. } = self.gh.decide(&self.how.route(target.clone())) else {
-            return None;
+    /// The drafts gate's decision for `slug` under `how`, through the route door, so a tape
+    /// holds it and a replay meets it.
+    fn writer_decision(&self, slug: &Slug, how: &How) -> Result<Decision> {
+        let route = how.route(RouteTarget::Repo(slug.clone()));
+        self.gh.fx().route(&route, &mut || self.gh.decide(&route))
+    }
+
+    /// `profile`'s drafts verdict, through the route door's facts: a replay has no credential
+    /// to judge and no router to read, so it reads the verdict the recording taped, the
+    /// vault's profiles its step names included. The answer is `vouched`, `unproven`, or
+    /// `unproven vault` and the sorted names of the profiles that name a vault token file
+    /// when `profile` is one of them.
+    ///
+    /// # Errors
+    ///
+    /// `Fx::fact`'s (a replay's divergence, or a recording refused for a token shape).
+    fn drafts_verdict(&self, profile: &str) -> Result<Drafts> {
+        let verdict = self.gh.fx().fact(DRAFTS, profile, &mut || {
+            if self.gh.drafts_vouched(profile) {
+                return "vouched".to_string();
+            }
+            let names = vault_profiles(self.gh.router(), profile);
+            if names.is_empty() {
+                "unproven".to_string()
+            } else {
+                format!("unproven vault {}", names.join(" "))
+            }
+        })?;
+        // Any answer but `vouched` is unproven: the gate fails closed.
+        if verdict == "vouched" {
+            return Ok(Drafts::Vouched);
+        }
+        let vault = verdict
+            .strip_prefix("unproven vault ")
+            .map(|names| names.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default();
+        Ok(Drafts::Unproven { vault })
+    }
+
+    /// The profile `owner`'s repositories are listed as through `/user/repos`: the routed
+    /// profile whose login is `owner`. The decision comes through the route door and the
+    /// profile's login through its facts, so a recording lists as the untaped run does and a
+    /// replay, whose router holds no login, reads both off the tape.
+    fn own_login(&self, owner: &str, target: &RouteTarget) -> Result<Option<String>> {
+        let route = self.how.route(target.clone());
+        let Decision::Send { profile, .. } =
+            self.gh.fx().route(&route, &mut || self.gh.decide(&route))?
+        else {
+            return Ok(None);
         };
-        let login = self.gh.router().profile(&profile)?.login.clone()?;
-        login.eq_ignore_ascii_case(owner).then_some(profile)
+        let login = self.gh.fx().fact(LOGIN, &profile, &mut || {
+            self.gh
+                .router()
+                .profile(&profile)
+                .and_then(|p| p.login.clone())
+                .unwrap_or_default()
+        })?;
+        Ok((!login.is_empty() && login.eq_ignore_ascii_case(owner)).then_some(profile))
     }
 }
 
-/// The step for `profile`'s unvouched drafts. A profile that names one of the vault's token
-/// files is an agh.toml written before vault adoption: each rotation of that file changes the
-/// fingerprint its `drafts_fp` vouched, so the step removes every such profile, after which
-/// agh.toml says `vault = true` and adoption vouches each token it adopts (design §6.10). Any
-/// other is vouched again with `agh auth add --drafts`.
-fn drafts_next(
-    router: &crate::policy::Router,
-    profile: &str,
-    tier: crate::policy::Tier,
-    slug: &Slug,
-) -> String {
+/// A profile's drafts verdict, as `Repos::drafts_verdict` reads it off the route door.
+enum Drafts {
+    /// Its drafts are vouched.
+    Vouched,
+    /// Unproven; `vault` names, sorted, every profile that names one of the vault's token
+    /// files when this one does, else it is empty.
+    Unproven { vault: Vec<String> },
+}
+
+/// The profiles of `router` that name one of the vault's token files, sorted, when `profile`
+/// is one of them; else none.
+fn vault_profiles(router: &crate::policy::Router, profile: &str) -> Vec<String> {
     use crate::identity::{Source, vault};
     let names_vault = |p: &crate::identity::Profile| match &p.source {
         Source::File(path) => vault::names_vault_path(path),
         Source::Env(_) | Source::Inline(_) => false,
     };
-    if router.profile(profile).is_some_and(names_vault) {
-        let mut names: Vec<&str> = router
-            .profiles()
-            .into_iter()
-            .filter(|p| names_vault(p))
-            .map(|p| p.name.as_str())
-            .collect();
-        names.sort_unstable();
-        let removes: Vec<String> = names
-            .iter()
-            .map(|name| format!("agh auth remove {name}"))
-            .collect();
-        return format!(
-            "{}: agh.toml then says vault = true, and agh adopts the vault's tokens, vouching \
-             each rotation's",
-            removes.join("; ")
-        );
+    if !router.profile(profile).is_some_and(names_vault) {
+        return Vec::new();
     }
-    format!(
+    let mut names: Vec<String> = router
+        .profiles()
+        .into_iter()
+        .filter(|p| names_vault(p))
+        .map(|p| p.name.clone())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+/// The step for `profile`'s unvouched drafts: re-add it from its token file with `--drafts`
+/// (plan §20 item 2). A profile that names one of the vault's token files (`vault`, every
+/// such profile, empty when `profile` is not one) may be a builder lanes' agh.toml, which
+/// atpkg-publish requires to route alone and refuses once it says `vault = true`, or an
+/// agh.toml written before vault adoption. So the re-add comes first, and removing every such
+/// profile, after which agh.toml says `vault = true` and adoption vouches each rotation's
+/// token (design §6.10), is named only as the step for a file no lane reads.
+fn drafts_next(vault: &[String], profile: &str, tier: crate::policy::Tier, slug: &Slug) -> String {
+    let add = format!(
         "agh auth add {profile} --file PATH --tier {} --owner {} --write --drafts",
         tier.slug(),
         slug.owner()
+    );
+    if vault.is_empty() {
+        return add;
+    }
+    let removes: Vec<String> = vault
+        .iter()
+        .map(|name| format!("agh auth remove {name}"))
+        .collect();
+    format!(
+        "{add}; where no builder's lanes read this agh.toml, {} instead: agh.toml then says \
+         vault = true, and agh adopts the vault's tokens, vouching each rotation's",
+        removes.join("; ")
     )
 }

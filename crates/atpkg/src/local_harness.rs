@@ -271,6 +271,7 @@ fn admit(bytes: &[u8], authority: &LocalAuthority) -> io::Result<Receipt> {
         || r.source_policy != "clean-main"
         || r.program != authority.program
         || r.command != authority.command
+        || r.command != crate::harness::default_harness_tool(&r.program)
         || r.source != authority.source
         || r.target != authority.target
         || r.build_number == 0

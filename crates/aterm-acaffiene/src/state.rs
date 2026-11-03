@@ -215,6 +215,9 @@ pub fn read(path: &Path, now: Clocks) -> Option<Saved> {
 /// The text of the regular state file at `path`, as [`read`] reads it.
 fn read_text(path: &Path) -> Option<String> {
     use std::io::Read as _;
+    if !crate::paths::parent_is_real_dir(path) {
+        return None;
+    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -331,7 +334,9 @@ fn write_unless(
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("the state file has no directory"))?;
-    std::fs::create_dir_all(parent)?;
+    if !parent.as_os_str().is_empty() {
+        crate::paths::ensure_real_dir(parent)?;
+    }
     #[cfg(unix)]
     let (tmp, mut file) = aterm_uds::atomic_file::create_temp_beside(path, 0o600)?;
     #[cfg(not(unix))]
@@ -352,6 +357,12 @@ fn write_unless(
         aterm_durable::ordered(&file)?;
         landing();
         let _held = hold(parent, wait);
+        if !parent.as_os_str().is_empty() && !crate::paths::existing_real_dir(parent)? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} does not exist", parent.display()),
+            ));
+        }
         if changed() {
             return Ok(false);
         }
@@ -376,20 +387,31 @@ fn write_unless(
 #[cfg(unix)]
 #[must_use]
 pub fn sweep_temps(paths: &crate::paths::Paths) -> Vec<(std::path::PathBuf, io::Result<usize>)> {
-    [
+    let files = [
         paths.state_file(),
         paths.bridge_file(),
         paths.trouble_file(),
         crate::legacy::state_file(paths),
         crate::legacy::bridge_file(paths),
-    ]
-    .into_iter()
-    .map(|file| {
-        let after = aterm_uds::atomic_file::ABANDONED_AFTER;
-        let swept = aterm_uds::atomic_file::sweep_temps_beside(&file, after);
-        (file, swept)
-    })
-    .collect()
+    ];
+    match crate::paths::existing_real_dir(&paths.state_dir) {
+        Ok(true) => files
+            .into_iter()
+            .map(|file| {
+                let after = aterm_uds::atomic_file::ABANDONED_AFTER;
+                let swept = aterm_uds::atomic_file::sweep_temps_beside(&file, after);
+                (file, swept)
+            })
+            .collect(),
+        Ok(false) => files.into_iter().map(|file| (file, Ok(0))).collect(),
+        Err(e) => {
+            let (kind, msg) = (e.kind(), e.to_string());
+            files
+                .into_iter()
+                .map(|file| (file, Err(io::Error::new(kind, msg.clone()))))
+                .collect()
+        }
+    }
 }
 
 /// Saves `mode` to `path`, stamped with this boot ([`crate::instance::boot_id`]) and encoded at

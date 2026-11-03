@@ -9,6 +9,11 @@ use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
 
 use super::probe;
 
+fn row_is_visible(ui: &crate::native_ui::CompiledUi, key: &crate::native_ui::UiKey) -> bool {
+    ui.semantic(key)
+        .is_some_and(|node| !node.offscreen && node.rect.width > 0.0 && node.rect.height > 0.0)
+}
+
 fn capture(app: &mut crate::App, wid: crate::WindowId) -> Vec<u8> {
     app.redraw_window(wid);
     crate::scripted_redraw_fixture::headless(app, |app| {
@@ -38,6 +43,21 @@ fn capture(app: &mut crate::App, wid: crate::WindowId) -> Vec<u8> {
 fn account_progress_gallery() {
     let (dir, _gallery) =
         crate::scripted_redraw_fixture::gallery_directory("ATERM_ACCOUNT_PROGRESS_GALLERY");
+    let shared_row = aterm_agent::harness::accounts::Row {
+        label: "fixture-alternate".into(),
+        email: Some("fixture@example.test".into()),
+        ..Default::default()
+    };
+    let shared_diagnostic =
+        aterm_agent::harness::accounts_sync::LoginDiagnostic::from_exit_for_test(
+            &shared_row,
+            1_793_039_950,
+            1,
+            Some(aterm_agent::harness::open_url::Met::new(
+                aterm_agent::harness::open_url::MetWord::BrowserControl,
+                None,
+            )),
+        );
     let mut manifest = String::from(
         "# Synthetic owner-bound account facts and Claude-style screen; no live account state.\nscene\tcolumns\trows\tfile\n",
     );
@@ -171,7 +191,7 @@ fn account_progress_gallery() {
         (
             "activity-menu-bindings-changed",
             120,
-            ProgressPhase::Waiting,
+            ProgressPhase::Unknown,
             0,
             Some("weekly"),
             None,
@@ -180,7 +200,7 @@ fn account_progress_gallery() {
         (
             "activity-menu-bindings-changed-narrow",
             60,
-            ProgressPhase::Waiting,
+            ProgressPhase::Unknown,
             0,
             Some("weekly"),
             None,
@@ -203,6 +223,60 @@ fn account_progress_gallery() {
             Some("weekly"),
             None,
             aterm_agent::harness::account_progress::IDENTITY_MISMATCH_FINDING,
+        ),
+        (
+            "activity-menu-shared-failure",
+            120,
+            ProgressPhase::Waiting,
+            0,
+            Some("weekly"),
+            Some(1_793_040_160),
+            "No eligible alternate account",
+        ),
+        (
+            "activity-menu-shared-failure-narrow",
+            60,
+            ProgressPhase::Waiting,
+            0,
+            Some("weekly"),
+            Some(1_793_040_160),
+            "No eligible alternate account",
+        ),
+        (
+            "activity-menu-shared-failure-newest-short",
+            40,
+            ProgressPhase::Waiting,
+            0,
+            Some("weekly"),
+            Some(1_793_040_160),
+            "No eligible alternate account",
+        ),
+        (
+            "activity-menu-shared-failure-newest-short-wide",
+            60,
+            ProgressPhase::Waiting,
+            0,
+            Some("weekly"),
+            Some(1_793_040_160),
+            "No eligible alternate account",
+        ),
+        (
+            "lab-shared-failure",
+            120,
+            ProgressPhase::Waiting,
+            0,
+            Some("weekly"),
+            Some(1_793_040_160),
+            "No eligible alternate account",
+        ),
+        (
+            "lab-shared-failure-narrow",
+            60,
+            ProgressPhase::Waiting,
+            0,
+            Some("weekly"),
+            Some(1_793_040_160),
+            "No eligible alternate account",
         ),
         (
             "activity-menu-no-next-short",
@@ -360,9 +434,33 @@ fn account_progress_gallery() {
             phase,
             wall: wall.map(str::to_owned),
             details: vec![detail.into()],
+            login_diagnostics: Vec::new(),
             next_at,
             own_claim: None,
         };
+        if name.contains("newest-short") {
+            use aterm_agent::harness::{
+                accounts_sync::LoginDiagnostic,
+                open_url::{Met, MetWord},
+            };
+            let older = LoginDiagnostic::from_exit_for_test(
+                &shared_row,
+                1_793_039_900,
+                1,
+                Some(Met::new(MetWord::Stall, None)),
+            );
+            let mut current = shared_row.clone();
+            current.label = "fixture-current".into();
+            let newest = LoginDiagnostic::from_exit_for_test(
+                &current,
+                1_793_039_990,
+                1,
+                Some(Met::new(MetWord::BrowserControl, None)),
+            );
+            progress.login_diagnostics.extend([older, newest]);
+        } else if name.contains("shared-failure") {
+            progress.login_diagnostics.push(shared_diagnostic.clone());
+        }
         if name.contains("bindings-changed") {
             progress.eligible = None;
         }
@@ -494,8 +592,10 @@ fn account_progress_gallery() {
         app.config.cursor_trail = Some(false);
         app.config.cursor_trail_style = Some("off".into());
         app.recompute_sparkle();
-        let rows = if name == "activity-menu-no-next-short" {
+        let rows = if name == "activity-menu-no-next-short" || name.contains("newest-short") {
             14
+        } else if name.starts_with("lab-shared-failure") {
+            80
         } else {
             probe::ROWS
         };
@@ -569,6 +669,16 @@ fn account_progress_gallery() {
             }
             let facts = crate::fact_menu::FactMenuFacts {
                 account_progress: menu_progress,
+                title: if name.contains("newest-short") {
+                    "Accounts · tab 1".into()
+                } else {
+                    String::new()
+                },
+                room: if name.contains("newest-short") {
+                    crate::autopilot_menu::content_room(cols.into())
+                } else {
+                    0
+                },
                 cli: Some(aterm_agent::harness::accounts::Cli::Claude),
                 auto_rotate: true,
                 accounts,
@@ -580,6 +690,49 @@ fn account_progress_gallery() {
             let menu = app.autopilot_menu.as_mut().unwrap();
             menu.rows = crate::fact_menu::rows(fact, &facts);
             menu.highlight = None;
+        } else if name.starts_with("lab-shared-failure") {
+            app.pool
+                .get(session)
+                .unwrap()
+                .ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .set_program(4242, Some("claude".into()));
+            assert!(app.proxy.is_none(), "the scene starts no account reader");
+            let snapshot = app.harness_state();
+            let published = snapshot
+                .lab
+                .sessions
+                .iter()
+                .find(|entry| entry.local_id == session)
+                .expect("fixture session");
+            assert!(published.facts.iter().any(|(key, value)| {
+                key == "Last local sign-in" && value.contains("headless browser")
+            }));
+            assert!(
+                app.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Lab)
+            );
+            let key = |row: &str| {
+                crate::native_ui::UiKey::new(format!("lab/session/{session}/row/{row}"))
+            };
+            let mut visible = false;
+            for _ in 0..512 {
+                let compiled = app.compiled_native_ui(wid).unwrap();
+                if ["last-local-sign-in", "sign-in-finished"]
+                    .iter()
+                    .all(|row| row_is_visible(&compiled, &key(row)))
+                {
+                    visible = true;
+                    break;
+                }
+                app.dispatch_native_event(wid, crate::native_app::AppEvent::ScrollLines(1))
+                    .unwrap();
+            }
+            assert!(
+                visible,
+                "the finite Lab page exposes the historical failure and timestamp"
+            );
         }
         let before = (app.windows[&wid].rows, app.windows[&wid].cols);
         let png = capture(&mut app, wid);
@@ -690,14 +843,14 @@ fn lab_own_claim_gallery() {
                 "claim-timing",
                 "switch-blocker",
             ] {
-                if compiled.semantic(&key(row)).is_some() {
+                if row_is_visible(&compiled, &key(row)) {
                     seen.insert(row);
                 }
             }
             if ["own-account-claim", "claim-recorded-until", "claim-timing"]
                 .iter()
-                .all(|row| compiled.semantic(&key(row)).is_some())
-                && (!pinned || compiled.semantic(&key("switch-blocker")).is_some())
+                .all(|row| row_is_visible(&compiled, &key(row)))
+                && (!pinned || row_is_visible(&compiled, &key("switch-blocker")))
             {
                 visible = Some(compiled);
                 break;

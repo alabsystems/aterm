@@ -105,6 +105,7 @@ impl FreeHistory {
     /// Record `free` bytes read at `at_unix_ms`.
     pub fn note(&mut self, at_unix_ms: i64, free: u64) {
         let k = at_unix_ms.div_euclid(FREE_BUCKET_S * 1000);
+        let mut clamped_back = false;
         match self.last_k() {
             Some(last)
                 if k < last
@@ -132,9 +133,13 @@ impl FreeHistory {
                     self.first_k += 1;
                 }
             }
-            Some(_) => {}
+            Some(_) => {
+                clamped_back = at_unix_ms < self.last_ms;
+            }
         }
-        self.last_ms = at_unix_ms;
+        if !clamped_back {
+            self.last_ms = at_unix_ms;
+        }
         if let Some(b) = self.b.back_mut() {
             b.min = if b.n == 0 { free } else { b.min.min(free) };
             b.n = b.n.saturating_add(1);
@@ -217,10 +222,11 @@ impl FreeHistory {
     #[must_use]
     pub fn window(&self, now_unix_ms: i64) -> Vec<Option<u64>> {
         let now_k = now_unix_ms.div_euclid(FREE_BUCKET_S * 1000);
-        (now_k + 1 - FREE_BUCKETS as i64..=now_k)
+        let start_k = now_k.saturating_sub(FREE_BUCKETS as i64 - 1);
+        (start_k..=now_k)
             .map(|k| {
-                usize::try_from(k - self.first_k)
-                    .ok()
+                k.checked_sub(self.first_k)
+                    .and_then(|d| usize::try_from(d).ok())
                     .and_then(|i| self.b.get(i))
                     .filter(|b| b.n > 0)
                     .map(|b| b.min)
@@ -654,5 +660,25 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// NEGATIVE CONTROL: repeated sub-clamp backward steps eventually cross `CLAMP_BACK_S`
+    /// relative to the newest reading, and `window` handles extreme `i64` timestamps without
+    /// arithmetic overflow.
+    #[test]
+    fn repeated_backsteps_shift_free_history_and_extreme_window_does_not_overflow() {
+        let mut h = FreeHistory::new();
+        let newest = T0 + 2 * FREE_BUCKET_S * 1000;
+        h.note(newest, 100);
+        let initial_last = h.last_k().unwrap();
+        // 40 s into the previous bucket: clamped to the open bucket.
+        h.note(newest - 40_000, 90);
+        assert_eq!(h.last_k(), Some(initial_last));
+        // Another 40 s back (80 s behind `newest`, > CLAMP_BACK_S): shifts `first_k`.
+        let stepped = newest - 80_000;
+        h.note(stepped, 80);
+        assert_eq!(h.last_k(), Some(stepped.div_euclid(FREE_BUCKET_S * 1000)));
+        assert_eq!(h.window(i64::MIN).len(), FREE_BUCKETS);
+        assert_eq!(h.window(i64::MAX).len(), FREE_BUCKETS);
     }
 }

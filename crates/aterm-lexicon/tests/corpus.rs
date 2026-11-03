@@ -89,9 +89,25 @@ fn listed_surfaces_reach_their_class() {
     }
 }
 
+/// Short unmarked feline stems (`<= 3` chars, such as `cat` and `mew`) require `allow_bare_cat`
+/// on both bare tokens and possessive/apostrophe inflections.
+/// NEGATIVE CONTROL: measuring the full token fold instead of the matched stem key would let
+/// `cat's`, `cat’s`, and `mew's` escape `allow_bare_cat = false`.
 #[test]
 fn bare_cat_is_opt_in() {
     assert_eq!(classes("cat", &default_opts()), Vec::<Class>::new());
+    for inflected in ["cat's", "cat\u{2019}s", "cat'", "mew's"] {
+        assert_eq!(
+            classes(inflected, &default_opts()),
+            Vec::<Class>::new(),
+            "{inflected} must stay gated behind allow_bare_cat"
+        );
+        assert_eq!(
+            classes(inflected, &opts_allow_cat()),
+            vec![Class::Feline],
+            "{inflected} must scan when allow_bare_cat is enabled"
+        );
+    }
     assert_eq!(classes("cat", &opts_allow_cat()), vec![Class::Feline]);
     assert_eq!(classes("cats", &default_opts()), vec![Class::Feline]);
 }
@@ -711,6 +727,10 @@ fn form_hash_populated_on_cjk_path() {
     );
 }
 
+/// Short user-authored emphasis stems scan on both bare tokens and apostrophe/possessive forms.
+/// NEGATIVE CONTROL: checking `user_surfaces` against the full token fold instead of the matched
+/// stem key would suppress 3-character inflections such as `gg'` while letting non-user `gg's`
+/// bypass `has_scannable_class_surface`.
 #[test]
 fn user_short_emphasis_surface_matches() {
     let over = "[[entry]]\nclass=\"emphasis\"\nlang=\"en\"\nmode=\"forms\"\nforms=[\"gg\"]\n";
@@ -723,6 +743,11 @@ fn user_short_emphasis_surface_matches() {
         aterm_lexicon::form_hash("gg"),
         "scan-time hash == the resolver's fold-then-hash key"
     );
+    assert_eq!(
+        lx.scan("gg' well played", &default_opts()).len(),
+        1,
+        "a 3-char apostrophe inflection of a user stem still matches its user surface"
+    );
 }
 
 #[test]
@@ -730,9 +755,15 @@ fn non_user_short_emphasis_surface_stays_suppressed() {
     let toml = "[[entry]]\nclass=\"emphasis\"\nlang=\"en\"\nmode=\"forms\"\nforms=[\"gg\"]\n";
     let lx = Lexicon::from_sources(toml, "", &["all"]).expect("sources parse");
     assert!(
-        lx.scan("gg well played", &default_opts()).is_empty(),
-        "short emphasis surfaces without user consent never fire"
+        !lx.has_scannable_class_surface(Class::Emphasis, &default_opts(), |_| false),
+        "short non-user emphasis reports no scannable surface"
     );
+    for text in ["gg well played", "gg' well played", "gg's well played"] {
+        assert!(
+            lx.scan(text, &default_opts()).is_empty(),
+            "short emphasis surfaces without user consent never fire ({text})"
+        );
+    }
 }
 
 #[test]

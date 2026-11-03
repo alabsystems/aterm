@@ -487,21 +487,11 @@ fn observed_harness(
     >,
 ) -> Option<crate::app_config::HarnessPolicy> {
     use crate::native_document_host::DocumentHostError;
-    use std::io::Read as _;
     match observation {
         Ok(observation) => Some(crate::app_config::HarnessPolicy::read(&observation.text)),
         Err(DocumentHostError::InvalidUtf8 | DocumentHostError::TooLarge { .. }) => {
-            let file = std::fs::File::open(path?).ok()?;
-            if file.metadata().ok()?.len() > MAX_REJECTED_HARNESS_READ {
-                return None;
-            }
-            let mut bytes = Vec::new();
-            file.take(MAX_REJECTED_HARNESS_READ + 1)
-                .read_to_end(&mut bytes)
-                .ok()?;
-            if bytes.len() as u64 > MAX_REJECTED_HARNESS_READ {
-                return None;
-            }
+            let (bytes, _) =
+                aterm_uds::atomic_file::read_regular(path?, MAX_REJECTED_HARNESS_READ).ok()?;
             Some(crate::app_config::HarnessPolicy::read(
                 &String::from_utf8_lossy(&bytes),
             ))

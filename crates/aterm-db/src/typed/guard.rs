@@ -22,6 +22,8 @@ pub enum Refusal {
     Length,
     /// A full phone number.
     Phone,
+    /// An account's name that names a machine.
+    MachineLabel,
 }
 
 impl Refusal {
@@ -35,6 +37,9 @@ impl Refusal {
             Self::Length => "text is longer than its column allows",
             Self::Phone => {
                 "a phone number lives in the vault; a phone row keeps its last four digits"
+            }
+            Self::MachineLabel => {
+                "an account's label names no machine: a preference row maps it to one"
             }
         }
     }
@@ -271,6 +276,106 @@ pub fn text(value: &str, max: usize) -> Result<(), Refusal> {
     }
     if phone_shaped(value) {
         return Err(Refusal::Phone);
+    }
+    Ok(())
+}
+
+/// Whether `text` is shaped like a machine label or holds one: any of its words (split at
+/// anything but a letter or digit) is `m` or `M` and a digit (`m2`, `M109`, `m2.3`, `m106-m38`,
+/// `kimi-m16`, `m4max`). A word such as `max` or `muse` stays.
+pub fn machine_shaped(text: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| {
+            let mut bytes = word.bytes();
+            matches!(bytes.next(), Some(b'm' | b'M'))
+                && bytes.next().is_some_and(|b| b.is_ascii_digit())
+        })
+}
+
+/// Check an account's owner-editable name of at most `max` bytes: free text ([`text`]) with
+/// something in it and no machine in it, since a place on a Mac never names an account
+/// (design §0). The old name a Mac already calls a row by stays in `legacy_label`.
+///
+/// # Errors
+/// The rule it breaks; the value is never quoted.
+pub fn account_label(value: &str, max: usize) -> Result<(), Refusal> {
+    text(value, max)?;
+    if value.trim().is_empty() {
+        return Err(Refusal::Length);
+    }
+    if machine_shaped(value) {
+        return Err(Refusal::MachineLabel);
+    }
+    Ok(())
+}
+
+/// Words that, standing alone, say a note may carry a sign-in secret. A bulk copy of a cell nobody
+/// retyped refuses them where [`text`] would not, because `pass: x` or `pin 4821` is not a phrase
+/// [`SECRET_WORDS`] can list without refusing `compass` or a journal's `token limit`.
+const NOTE_WORDS: [&str; 19] = [
+    "pass",
+    "pw",
+    "pwd",
+    "psw",
+    "pswd",
+    "pword",
+    "pin",
+    "otp",
+    "token",
+    "tokens",
+    "seed",
+    "mnemonic",
+    "secret",
+    "secrets",
+    "key",
+    "keys",
+    "credential",
+    "credentials",
+    "creds",
+];
+
+/// The fewest characters of a word that reads as a password for mixing letters and digits.
+const MIXED_WORD: usize = 6;
+
+/// Whether a word of a note reads as a password rather than prose: a part of it (split at the
+/// marks that join ordinary words, `gpt-5.5`, `m106-m38`, `$200/mo`) of at least six characters
+/// mixing letters and digits, or holding a mark inside it beside a letter.
+fn password_shaped(word: &str) -> bool {
+    let edge = |c: char| {
+        matches!(
+            c,
+            '.' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '"' | '\'' | '!' | '?'
+        )
+    };
+    word.trim_matches(edge)
+        .split(['-', '.', '/', '_', ':', ',', '+'])
+        .any(|part| {
+            let letter = part.chars().any(char::is_alphabetic);
+            let digit = part.chars().any(|c| c.is_ascii_digit());
+            let mark = part.chars().any(|c| c.is_ascii_punctuation() && c != '\'');
+            letter && ((digit && part.chars().count() >= MIXED_WORD) || mark)
+        })
+}
+
+/// Check a note cell an import would copy lab-wide: [`text`], and no word that says it may carry a
+/// secret ([`NOTE_WORDS`]) or reads as a password. This is stricter than a typed cell because
+/// nobody retyped it and the table is never compacted, so a false refusal costs one cell's text
+/// (its coordinate stays) and a miss is a password on every Mac. A password that is a plain word
+/// with no such word beside it cannot be told from prose.
+///
+/// # Errors
+/// The rule it breaks; the value is never quoted.
+pub fn note_cell(value: &str, max: usize) -> Result<(), Refusal> {
+    text(value, max)?;
+    let lower = value.to_ascii_lowercase();
+    if lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| NOTE_WORDS.contains(&word))
+    {
+        return Err(Refusal::SecretWord);
+    }
+    if value.split_whitespace().any(password_shaped) {
+        return Err(Refusal::CredentialShape);
     }
     Ok(())
 }

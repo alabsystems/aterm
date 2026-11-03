@@ -53,8 +53,21 @@
 //! holds F21's split: a1 removes b3 on island A while b1 writes under b3's epoch on island B, and
 //! after the heal every member reads that write.
 //!
-//! A run whose cut held is a measurement of the build, whatever it finds, so `--record` writes it
-//! under `docs/measured/` red or green. Only a run whose cut leaked is never recorded there.
+//! Each split the lane holds (the cut, and F21's split after the heal) is the same seam, and the
+//! lab's own acts on a Mac's behalf run under that Mac's island's cut: a join post in this
+//! process on one thread ([`in_partition`]), F21's removals and put in a process of the Mac's
+//! world ([`ACT_VERB`]), since a records post fans out over threads a thread's cut does not
+//! hold. A split's ledger ([`split`]) reads every vault Mac's
+//! records and head and both servers' the moment the cut is up, again once an exchange that was
+//! crossing then has landed (before the split's first act), and just before the heal, and
+//! [`RECORDS_HELD`] and [`removals::SPLIT_HELD`] fail where a record or head one island made
+//! reached the other, naming the plane that carried it, so a leak is the lab's failure, never a
+//! verdict on the product.
+//!
+//! A run whose splits held is a measurement of the build, whatever it finds, so `--record` writes
+//! it under `docs/measured/` red or green. Only a run whose cut or F21's split is not shown to
+//! hold is never recorded there, and the console says why ([`split::Shortfall`]: something
+//! crossed, a holder could not be read, or the lab could not hold or heal it).
 //! `--label WORD` names the record for what it measured (a negative control's build, say) beside
 //! its arm's name, so it never replaces another run's record of the same day.
 
@@ -77,6 +90,9 @@ pub mod accounts;
 
 #[path = "swarm_partition_removals.rs"]
 pub mod removals;
+
+#[path = "swarm_partition_split.rs"]
+pub mod split;
 
 /// Hang detector for an event that must happen.
 const HANG: Duration = Duration::from_secs(60);
@@ -103,6 +119,9 @@ const DEFAULT_HOLD: Duration = Duration::from_secs(80);
 
 /// This lab's verb for a Mac's subscriber and approver ([`agent_main`]).
 pub const AGENT_VERB: &str = "partition-agent";
+
+/// This lab's verb for one of F21's acts in a Mac's world ([`act_main`]).
+pub const ACT_VERB: &str = "partition-act";
 
 /// Set in an agent's environment: the `init --converge` its subscriber starts is
 /// [`converge_standin`].
@@ -350,6 +369,8 @@ pub struct VaultEvidence {
     pub joins: Vec<JoinTry>,
     /// Each island at the cut's end.
     pub end_of_cut: Vec<IslandView>,
+    /// The cut's ledger: every vault Mac and both servers once the cut was up and at its end.
+    pub cut_ledger: Option<split::Ledger>,
     /// When (ms after the heal) every server and member first held one head, and that head.
     pub healed: Option<(u64, Head)>,
     /// Each server's head at the end, by island.
@@ -464,8 +485,9 @@ pub struct Reach {
     /// The members that answered it in the span.
     pub reached: Vec<String>,
     /// Of the members it did not reach, each whose last dial by its heartbeat missed after it
-    /// last answered (`aterm_net::fleet_member::read_missed`): a round asks such a member only
-    /// behind every member that answers, so one never asked at all is told from one passed over.
+    /// last answered (`aterm_net::fleet_member::read_missed`): a round asks such members behind
+    /// the rest, and past its three answers only until one of them misses, so one never asked at
+    /// all is told from one still dark.
     pub dark: Vec<String>,
 }
 
@@ -565,6 +587,9 @@ pub const CUT_HELD: &str = "vault: the cut held";
 /// The fleet's cut check: under `--one-url` nothing of the vault crosses even with no cut, so
 /// only this one sees an aterm that ignored the seam.
 pub const FLEET_CUT_HELD: &str = "fleet: the cut held";
+/// The cut's ledger check ([`split::judge`]): no membership record or vault head one island made
+/// during the cut reached the other's Macs or server before the heal.
+pub const RECORDS_HELD: &str = "vault: no record or head crossed the cut";
 /// F8's own check, which `--one-url` must fail.
 pub const ONE_HEAD: &str = "vault: one head on every server and Mac after the heal";
 /// The fleet's heartbeat-reach check before the cut.
@@ -680,6 +705,7 @@ fn vault_checks(v: &VaultEvidence) -> Vec<Check> {
             leaks.join("; ")
         },
     });
+    out.push(split::judge(RECORDS_HELD, "the cut", v.cut_ledger.as_ref()));
 
     // Each island kept working: it set an entry and let a newcomer in.
     let mut idle = Vec::new();
@@ -2148,6 +2174,60 @@ impl Lane {
     }
 }
 
+/// F21's split ([`removals`]) holds the lane's own cut.
+impl split::Cut for Lane {
+    fn set(&self, cut: bool) -> Result<(), String> {
+        self.set_cut(cut)
+            .map_err(|f| f.msg.unwrap_or_else(|| "the cut files".to_owned()))
+    }
+
+    fn act(&self, mac: &str, words: &[&str]) -> Result<String, String> {
+        let root = self.root(mac);
+        let home = self.home(mac).to_string_lossy().into_owned();
+        let mut cmd = aterm_uds::spawnfd::command(&crate::paths::paths().exe);
+        cmd.env_clear()
+            .envs(self.world.env_of(&root))
+            .args([ACT_VERB, "--home", &home])
+            .args(words)
+            .current_dir(root.join("home"));
+        match aterm_uds::deadline::output_until_from(&mut cmd, Stdio::null(), Instant::now() + HANG)
+        {
+            Ok(out) if out.status.success() => {
+                Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            }
+            Ok(out) => Err(one_line(&format!(
+                "{} {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ))),
+            Err(aterm_uds::deadline::RunError::TimedOut) => Err(format!(
+                "{ACT_VERB} still running after {HANG:?} (the hang detector)"
+            )),
+            Err(e) => Err(format!("{ACT_VERB} did not run: {e:?}")),
+        }
+    }
+
+    fn servers(&self) -> Vec<(Island, String)> {
+        [Island::A, Island::B]
+            .into_iter()
+            .map(|island| (island, self.url(island)))
+            .collect()
+    }
+}
+
+impl Lane {
+    /// The vault Macs a split's ledger reads.
+    fn watched(&self) -> Vec<split::Watched> {
+        vault_macs()
+            .map(|s| split::Watched {
+                name: s.name.to_owned(),
+                island: s.island,
+                paths: aterm_secrets::client::Paths::for_home(&self.home(s.name)),
+            })
+            .collect()
+    }
+}
+
 /// Write `bytes` to `path` whole: a sibling `.new` made with `mode`, renamed over it, so a
 /// reader (each connect reads the cut file) sees the old text or the new, never a part. The
 /// lane's own scratch base sits under `/tmp`, a link the lab's guarded `sys::put` refuses.
@@ -2571,6 +2651,13 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
     let cut = Instant::now();
     mark("cut");
     let cut_ms = ms_since(lane.t0);
+    let watched = lane.watched();
+    let servers = split::Cut::servers(&*lane);
+    let mut signers = split::Signers::new();
+    let mut cut_ledger = split::Ledger {
+        cut: split::read(&watched, &servers, &mut signers),
+        ..split::Ledger::default()
+    };
     lane.say(&format!(
         "CUT: island A ({}) and island B ({}) cannot reach each other",
         MACS.iter()
@@ -2615,6 +2702,12 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
         .iter()
         .map(|(mac, _)| (*mac, lane.issuer_answered(mac)))
         .collect();
+
+    // The cut's start read, once an exchange that was crossing when it fell has landed: what
+    // either island holds alone from here on, or makes, must stay there.
+    split::land(cut)?;
+    cut_ledger.start = split::read(&watched, &servers, &mut signers);
+    cut_ledger.landed_ms = ms_since(cut);
 
     // Each side writes.
     let mut sets = vec![("a1", "f8-a-1"), ("a1", "f8-a-2"), ("b1", "f8-b-1")];
@@ -2787,6 +2880,22 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
             short(view.server.as_ref())
         ));
     }
+    cut_ledger.end = split::read(&watched, &servers, &mut signers);
+    cut_ledger.ms = ms_since(cut);
+    let crossed = split::crossings(&cut_ledger);
+    lane.say(&format!(
+        "the cut's end: {}",
+        if crossed.is_empty() {
+            "no record or head crossed to the other island".to_owned()
+        } else {
+            crossed
+                .iter()
+                .map(|c| c.line("the cut"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+    ));
+    v.cut_ledger = Some(cut_ledger);
 
     // `--minter-away`: the minter leaves before the heal, so what spreads after it spreads
     // member to member, and no heartbeat can come back to its book.
@@ -3076,7 +3185,9 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
         ));
     }
     // Removals: b2 turns hostile and removes every other member; the Macs it removed undo it.
-    let removed = removals::run(&plane.macs, &|mac, args| lane.aterm(mac, args, None));
+    let removed = removals::run(&plane.macs, &*lane, &|mac, args| {
+        lane.aterm(mac, args, None)
+    });
     lane.say(&match &removed.skipped {
         Some(why) => format!("removals: not run: {why}"),
         None => format!(
@@ -3092,6 +3203,22 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
             }
         ),
     });
+    if let Some(ledger) = removed.kept.as_ref().and_then(|k| k.ledger.as_ref()) {
+        let crossed = split::crossings(ledger);
+        lane.say(&format!(
+            "removals: F21's split held by the lab's cut for {:.1}s: {}",
+            secs(ledger.ms),
+            if crossed.is_empty() {
+                "no record or head crossed to the other island".to_owned()
+            } else {
+                crossed
+                    .iter()
+                    .map(|c| c.line("F21's split"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            }
+        ));
+    }
     if let Some(kept) = &removed.kept {
         lane.say(&match &kept.skipped {
             Some(why) => format!("removals: F21's split: not run: {why}"),
@@ -3449,9 +3576,14 @@ pub fn report(ev: &Evidence, checks: &[Check]) -> String {
     );
     let _ = writeln!(
         out,
-        "- F21's split after it: the lab carries records only within each island; a1 removes {} \
-         and a3 on island A while {}, not yet told, removes a3 and b1 puts {} under its epoch on \
-         island B, each kept on its Mac; then the lab heals, runs the tender's pass, and reads \
+        "- F21's split after it: the lab cuts the islands apart again with the lane's cut, which \
+         every process of each island honours, carries records only within each island, and makes \
+         each act on a Mac's behalf in a process of that Mac's world; a1 removes {} and a3 on \
+         island A while {}, not yet told, removes a3 and b1 puts {} under its epoch on island B, \
+         each remover's own records sync (`aterm secrets sync` in its world) posting what it \
+         signed to every server that lacks it; the split's ledger reads every Mac and both \
+         servers when the cut falls, once what was in flight then has landed (before the first \
+         act) and just before the heal; then the lab heals, runs the tender's pass, and reads \
          each Mac from its own records",
         removals::CUT,
         removals::CUT,
@@ -3516,17 +3648,15 @@ pub fn cmd_partition(args: &[String]) -> Res {
     let text = report(&ev, &checks);
     println!("\n{text}");
     let failed = checks.iter().filter(|c| !c.pass).count();
-    let valid = [CUT_HELD, FLEET_CUT_HELD]
-        .iter()
-        .all(|name| checks.iter().any(|c| c.name == *name && c.pass));
-    match write_record(&lane, &text, &checks, opts.record && valid) {
+    let unmeasured = unmeasured(&ev, &checks);
+    match write_record(&lane, &text, &checks, opts.record && unmeasured.is_empty()) {
         Ok(path) => println!("written: {path}"),
         Err(e) => println!("could not write the record: {e}"),
     }
-    if opts.record && !valid {
+    if opts.record && !unmeasured.is_empty() {
         println!(
-            "not recorded under docs/measured: the cut did not hold on the vault or the fleet, so the \
-             run measured nothing"
+            "not recorded under docs/measured: {}, so the run is not shown to measure the build",
+            unmeasured.join("; ")
         );
     }
     if failed == 0 {
@@ -3536,6 +3666,32 @@ pub fn cmd_partition(args: &[String]) -> Res {
         println!("swarm partition: {failed}/{} checks failed", checks.len());
         Ok(1)
     }
+}
+
+/// Each way a split the run held is not shown to have held, so the run is not shown to measure
+/// the build (none: it did): the cut on the vault and the fleet, the cut's ledger, and F21's
+/// split's wherever the removals plane held one, each by why ([`split::Shortfall`], those that
+/// void a split), so a split not read whole is never told as one that leaked.
+fn unmeasured(ev: &Evidence, checks: &[Check]) -> Vec<String> {
+    let passed = |name: &str| checks.iter().any(|c| c.name == name && c.pass);
+    let mut out = Vec::new();
+    if !passed(CUT_HELD) {
+        out.push("the cut did not hold on the vault".to_owned());
+    }
+    if !passed(FLEET_CUT_HELD) {
+        out.push("the cut did not hold on the fleet".to_owned());
+    }
+    let f21 = ev
+        .removals
+        .as_ref()
+        .and_then(|r| r.kept.as_ref())
+        .and_then(|k| k.ledger.as_ref());
+    let splits = std::iter::once(("the cut", split::shortfalls(ev.vault.cut_ledger.as_ref())))
+        .chain(f21.map(|ledger| ("F21's split", split::shortfalls(Some(ledger)))));
+    for (name, short) in splits {
+        out.extend(short.iter().filter(|s| s.voids()).map(|s| s.words(name)));
+    }
+    out
 }
 
 /// A lane that could not be brought up or run through measured nothing: exit 3, not a finding.
@@ -3623,7 +3779,7 @@ fn write_record(
     let _ = writeln!(body);
     let _ = writeln!(
         body,
-        "The aterm under test is `{}`; every Mac is a private world on this Mac's loopback, and the cut is the `ATERM_DEBUG_PARTITION` seam (`crates/aterm-uds/src/partition.rs`), which both cut checks show it honoured (a run where either leaked is never written here). The fleet heartbeat runs every {HEARTBEAT_MS} ms here (production: 180 s), and since every Mac registers from 127.0.0.1, a book records up to {JOINED_PER_ADDRESS} members from one address (production: 4); every other period and bound is production's. The Commons plane is the lab driving production's repair exchange on each Mac's custody; the accounts plane is a model run of main's account claims on two Macs' table replicas on a simulated clock.",
+        "The aterm under test is `{}`; every Mac is a private world on this Mac's loopback, and the cut is the `ATERM_DEBUG_PARTITION` seam (`crates/aterm-uds/src/partition.rs`), which the cut checks and both splits' ledgers (the cut's, and F21's split after the heal) show it honoured (a run where any leaked is never written here). The fleet heartbeat runs every {HEARTBEAT_MS} ms here (production: 180 s), and since every Mac registers from 127.0.0.1, a book records up to {JOINED_PER_ADDRESS} members from one address (production: 4); every other period and bound is production's. The Commons plane is the lab driving production's repair exchange on each Mac's custody; the accounts plane is a model run of main's account claims on two Macs' table replicas on a simulated clock.",
         lane.world
             .aterm
             .strip_prefix(&p.repo)
@@ -3647,6 +3803,31 @@ fn write_record(
 // ---------------------------------------------------------------------------------------------
 // A Mac's agent and its converge stand-in.
 // ---------------------------------------------------------------------------------------------
+
+/// `aterm-lab partition-act --home <home> <act…>`: one of F21's acts on the vault under `<home>`
+/// ([`removals::act`]), made in a process of that Mac's world, which [`split::Cut::act`] starts
+/// with the world's environment, so its island's cut (`ATERM_DEBUG_PARTITION`) holds every
+/// thread of it. What the act says goes to stdout, a failure's why to stderr with exit 1.
+#[must_use]
+pub fn act_main(args: &[String]) -> i32 {
+    let (home, words) = match args {
+        [flag, home, words @ ..] if flag == "--home" => (PathBuf::from(home), words),
+        _ => {
+            eprintln!("usage: aterm-lab {ACT_VERB} --home <home> <act> [<arg>]");
+            return 2;
+        }
+    };
+    match removals::act(&aterm_secrets::client::Paths::for_home(&home), words) {
+        Ok(said) => {
+            println!("{said}");
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
 
 /// `aterm-lab partition-agent --home <home>`: a Mac's subscriber and approver, the loop of
 /// `aterm secrets watch` over the vault under `<home>`. The shell [`Lane::start_kept`] starts it

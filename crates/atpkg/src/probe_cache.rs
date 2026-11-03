@@ -95,10 +95,66 @@ pub fn identity(path: &Path) -> Option<String> {
     ))
 }
 
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments and is always safe to call.
+    unsafe { libc::geteuid() }
+}
+
+fn admitted_dir(dir: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.uid() != current_euid() || (meta.mode() & 0o002) != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn read_admitted(file: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let dir = file.parent()?;
+    if !admitted_dir(dir) {
+        return None;
+    }
+    let handle = crate::metadata_io::open_regular(file).ok()?;
+    let meta = handle.metadata().ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.uid() != current_euid() || (meta.mode() & 0o022) != 0 {
+            return None;
+        }
+    }
+    if meta.len() > MAX_PROBE_CACHE_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    handle
+        .take(MAX_PROBE_CACHE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_PROBE_CACHE_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// The reading `file` keeps under exactly `key`.
 #[must_use]
 pub fn get(file: &Path, key: &str) -> Option<String> {
-    let text = crate::metadata_io::read_bounded_regular_utf8(file, MAX_PROBE_CACHE_BYTES).ok()?;
+    if key.is_empty() {
+        return None;
+    }
+    let text = read_admitted(file)?;
     text.lines().find_map(|line| {
         let (k, v) = line.split_once(RECORD)?;
         (k == key).then(|| v.to_owned())
@@ -109,14 +165,43 @@ pub fn get(file: &Path, key: &str) -> Option<String> {
 /// at most [`ENTRIES`] keys; written whole beside it and renamed over it, so a reader never
 /// sees half a file. A key or value with a line break or a record separator is not kept.
 pub fn put(file: &Path, key: &str, value: &str) {
-    if value.contains(['\n', '\r', RECORD]) || key.contains(['\n', '\r', RECORD]) {
+    if key.is_empty() || value.contains(['\n', '\r', RECORD]) || key.contains(['\n', '\r', RECORD])
+    {
         return;
     }
+    let Some(dir) = file.parent() else {
+        return;
+    };
     let _serial = WRITES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let old = crate::metadata_io::read_bounded_regular_utf8(file, MAX_PROBE_CACHE_BYTES)
-        .unwrap_or_default();
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) if !admitted_dir(dir) => return,
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if crate::platform::make_dirs_born(dir, 0o700).is_err() || !admitted_dir(dir) {
+                return;
+            }
+        }
+        Err(_) => return,
+    }
+    let old = match std::fs::symlink_metadata(file) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                return;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                if meta.uid() != current_euid() {
+                    return;
+                }
+            }
+            read_admitted(file).unwrap_or_default()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return,
+    };
     let mut lines: Vec<&str> = old
         .lines()
         .filter(|line| line.split_once(RECORD).is_some_and(|(k, _)| k != key))
@@ -126,12 +211,6 @@ pub fn put(file: &Path, key: &str, value: &str) {
     let keep = lines.len().saturating_sub(ENTRIES);
     let mut text = lines[keep..].join("\n");
     text.push('\n');
-    let Some(dir) = file.parent() else {
-        return;
-    };
-    if crate::platform::make_dirs_born(dir, 0o700).is_err() {
-        return;
-    }
     let nanos = aterm_time::since_epoch().map_or(0, |d| d.as_nanos());
     let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = file
@@ -201,5 +280,60 @@ mod tests {
         std::fs::write(&file, "three").unwrap();
         assert_ne!(identity(&file).as_deref(), Some(first.as_str()));
         assert_eq!(identity(&dir.join("gone")), None);
+    }
+
+    #[cfg(unix)]
+    /// NEGATIVE CONTROL: `probe_cache` must refuse symlinked directories, symlinked cache files,
+    /// and group/world-writable cache files so a cached compiler or doctor verdict cannot be
+    /// poisoned or redirected.
+    #[test]
+    fn get_and_put_refuse_symlinked_dirs_symlinked_files_and_writable_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = crate::testdir::dir("atpkg-probe-cache-admit-");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("readings");
+        std::fs::write(&victim, format!("k{RECORD}poison\n")).unwrap();
+
+        let link_dir = root.join("doctor-link");
+        std::os::unix::fs::symlink(&outside, &link_dir).unwrap();
+        let via_link_dir = link_dir.join("readings");
+        assert_eq!(get(&via_link_dir, "k"), None);
+        put(&via_link_dir, "k", "safe");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            format!("k{RECORD}poison\n")
+        );
+
+        let clean_dir = root.join("doctor");
+        let file = clean_dir.join("readings");
+        put(&file, "k", "clean");
+        assert_eq!(get(&file, "k").as_deref(), Some("clean"));
+
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(
+            get(&file, "k"),
+            None,
+            "world-writable cache file must not be trusted"
+        );
+        put(&file, "k2", "fresh");
+        assert_eq!(get(&file, "k"), None, "untrusted old entries are discarded");
+        assert_eq!(get(&file, "k2").as_deref(), Some("fresh"));
+
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&victim, &file).unwrap();
+        assert_eq!(get(&file, "k"), None);
+        put(&file, "k", "overwrite");
+        assert!(
+            std::fs::symlink_metadata(&file)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            format!("k{RECORD}poison\n")
+        );
     }
 }

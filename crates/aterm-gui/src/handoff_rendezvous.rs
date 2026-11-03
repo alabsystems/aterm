@@ -28,6 +28,18 @@ const GRANT_CONTINUATION_LEN: usize = GRANT_CONTINUATION_MAGIC.len() + 1;
 
 pub(crate) const ENV_GRANT_CAPS: HandoffName = HandoffName::new("ATERM_HANDOFF_GRANT_CAPS");
 pub(crate) const GRANT_CAPS_CHUNKS: &str = "chunks1";
+pub(crate) const GRANT_CAPS_EMPTY: &str = "empty1";
+
+/// The `ENV_GRANT_CAPS` value that offers a successor the chunked and the sessionless grant
+/// its bundle declares, or `None` when it declares neither.
+#[must_use]
+pub(crate) fn grant_caps(chunks: bool, empty: bool) -> Option<String> {
+    let caps = [(chunks, GRANT_CAPS_CHUNKS), (empty, GRANT_CAPS_EMPTY)]
+        .into_iter()
+        .filter_map(|(offered, cap)| offered.then_some(cap))
+        .collect::<Vec<_>>();
+    (!caps.is_empty()).then(|| caps.join(","))
+}
 
 pub(crate) const MAX_CHUNKED_SESSIONS: usize = crate::seamless::MAX_HANDOFF_SESSIONS;
 const MAX_GRANT_FDS: usize = MAX_CHUNKED_SESSIONS + RENDEZVOUS_CHANNEL_FDS;
@@ -60,9 +72,13 @@ enum GrantShape {
     Chunked,
 }
 
-const fn grant_shape(chunks: bool, sessions: usize) -> Result<GrantShape, RendezvousError> {
+const fn grant_shape(
+    chunks: bool,
+    empty_ok: bool,
+    sessions: usize,
+) -> Result<GrantShape, RendezvousError> {
     let limit = grant_session_limit(chunks);
-    if sessions == 0 || sessions > limit {
+    if (sessions == 0 && !empty_ok) || sessions > limit {
         return Err(RendezvousError::TooManySessions { sessions, limit });
     }
     Ok(if sessions > MAX_RENDEZVOUS_SESSIONS {
@@ -877,6 +893,7 @@ impl Rendezvous {
                         stream,
                         pid,
                         chunks,
+                        empty: false,
                         token,
                     });
                 }
@@ -1064,6 +1081,9 @@ pub(crate) struct ClaimedPeer {
     stream: CtlStream,
     pid: i32,
     chunks: bool,
+    /// The successor reads a grant of no session (`empty1`), which its bundle declares; the
+    /// claim itself never says so, so the producer sets it ([`Self::reading_empty_grant`]).
+    empty: bool,
     token: Option<aterm_uds::peer::AuditToken>,
 }
 
@@ -1116,7 +1136,16 @@ impl ClaimedPeer {
         grant_session_limit(self.chunks)
     }
 
-    /// Transfers the readiness pipe, commit pipe, and session PTY masters over `SCM_RIGHTS`.
+    /// Marks this peer as a successor that reads a grant of no session (`empty1`), as its
+    /// bundle declares; [`Self::transfer`] sends an empty grant only to such a peer.
+    #[must_use]
+    pub(crate) const fn reading_empty_grant(mut self, empty: bool) -> Self {
+        self.empty = empty;
+        self
+    }
+
+    /// Transfers the readiness pipe, commit pipe, and session PTY masters over `SCM_RIGHTS`;
+    /// a grant of no session goes only to a peer [`Self::reading_empty_grant`] marked.
     pub(crate) fn transfer(
         &self,
         nonce: &str,
@@ -1126,7 +1155,7 @@ impl ClaimedPeer {
         deadline: Instant,
         parked_at: Option<Instant>,
     ) -> Result<(), RendezvousError> {
-        let shape = grant_shape(self.chunks, sessions.len())?;
+        let shape = grant_shape(self.chunks, self.empty, sessions.len())?;
         let malformed = || {
             RendezvousError::TransferNotSent("the grant body exceeds its wire format".to_string())
         };
@@ -1383,7 +1412,11 @@ fn is_canonical_decimal(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && (s.len() == 1 || !s.starts_with('0'))
 }
 
-fn parse_grant_body(body: &str, expected_nonce: &str) -> Result<GrantBody, RendezvousError> {
+fn parse_grant_body(
+    body: &str,
+    expected_nonce: &str,
+    empty_ok: bool,
+) -> Result<GrantBody, RendezvousError> {
     let Some((nonce, rest)) = body.split_once('\n') else {
         return Err(RendezvousError::Grant("no nonce line".to_string()));
     };
@@ -1407,10 +1440,16 @@ fn parse_grant_body(body: &str, expected_nonce: &str) -> Result<GrantBody, Rende
         }
     };
     if entries.is_empty() {
-        // An overlap with no sessions is not an overlap. The lane is only ever
-        // taken with a live pool, so an empty list is a malformed grant rather
-        // than a valid empty one.
-        return Err(RendezvousError::Grant("no sessions".to_string()));
+        // A grant of no session hands over the windows alone, and only a successor the
+        // parent offered `empty1` takes one: every build before it refuses the empty list,
+        // and an empty list it was not offered is a malformed grant.
+        if !empty_ok {
+            return Err(RendezvousError::Grant("no sessions".to_string()));
+        }
+        return Ok(GrantBody {
+            sessions: Vec::new(),
+            parked_for,
+        });
     }
     let mut sessions = Vec::new();
     for entry in entries.split(',') {
@@ -1626,10 +1665,15 @@ pub(crate) fn claim_incoming(
     deadlines: ClaimDeadlines,
     parent: Option<crate::seamless::AttestedParent>,
 ) -> Result<ClaimedHandoff, RendezvousError> {
-    let chunks = offers_chunked_grant(env.take(ENV_GRANT_CAPS).as_deref());
+    let caps = env.take(ENV_GRANT_CAPS);
+    let offered = OfferedGrants {
+        chunks: offers_chunked_grant(caps.as_deref()),
+        empty: offers_empty_grant(caps.as_deref()),
+    };
     let (path, secret) = rendezvous_env(env.take(ENV_RENDEZVOUS), env.take(ENV_CLAIM))?;
-    let claimed = dial_and_claim(&path, &secret, expected_nonce, deadlines, parent, chunks)
-        .map_err(claim_side);
+    let claimed =
+        dial_and_claim_offered(&path, &secret, expected_nonce, deadlines, parent, offered)
+            .map_err(claim_side);
     if claimed.is_ok() {
         let _ = std::fs::remove_file(&path);
     }
@@ -1644,8 +1688,23 @@ fn claim_side(error: RendezvousError) -> RendezvousError {
 }
 
 fn offers_chunked_grant(caps: Option<&std::ffi::OsStr>) -> bool {
+    offers_grant(caps, GRANT_CAPS_CHUNKS)
+}
+
+fn offers_empty_grant(caps: Option<&std::ffi::OsStr>) -> bool {
+    offers_grant(caps, GRANT_CAPS_EMPTY)
+}
+
+fn offers_grant(caps: Option<&std::ffi::OsStr>, wanted: &str) -> bool {
     caps.and_then(std::ffi::OsStr::to_str)
-        .is_some_and(|caps| caps.split(',').any(|cap| cap.trim() == GRANT_CAPS_CHUNKS))
+        .is_some_and(|caps| caps.split(',').any(|cap| cap.trim() == wanted))
+}
+
+/// The grant extensions the parent offered this successor in `ENV_GRANT_CAPS`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OfferedGrants {
+    chunks: bool,
+    empty: bool,
 }
 
 fn rendezvous_env(
@@ -1719,6 +1778,8 @@ fn listener_may_receive_claim(
     Ok(())
 }
 
+/// [`dial_and_claim_offered`] for a successor offered the chunked grant or nothing.
+#[cfg(test)]
 fn dial_and_claim(
     path: &Path,
     secret: &str,
@@ -1727,6 +1788,28 @@ fn dial_and_claim(
     parent: Option<crate::seamless::AttestedParent>,
     chunks: bool,
 ) -> Result<ClaimedHandoff, RendezvousError> {
+    dial_and_claim_offered(
+        path,
+        secret,
+        expected_nonce,
+        deadlines,
+        parent,
+        OfferedGrants {
+            chunks,
+            empty: false,
+        },
+    )
+}
+
+fn dial_and_claim_offered(
+    path: &Path,
+    secret: &str,
+    expected_nonce: &str,
+    deadlines: ClaimDeadlines,
+    parent: Option<crate::seamless::AttestedParent>,
+    offered: OfferedGrants,
+) -> Result<ClaimedHandoff, RendezvousError> {
+    let chunks = offered.chunks;
     let stream =
         CtlStream::connect(path).map_err(|error| RendezvousError::Dial(error.to_string()))?;
     // SAFETY: `getuid` has no preconditions.
@@ -1794,7 +1877,7 @@ fn dial_and_claim(
     let GrantBody {
         sessions,
         parked_for,
-    } = parse_grant_body(&body, expected_nonce)?;
+    } = parse_grant_body(&body, expected_nonce, offered.empty)?;
 
     let expected = sessions.len() + RENDEZVOUS_CHANNEL_FDS;
     if let Some(count) = chunk_count {
@@ -2044,7 +2127,7 @@ mod tests {
         let body = encode_grant_body(TEST_NONCE, &sessions, None).expect("encodes");
         assert_eq!(body, format!("{TEST_NONCE}\n7:4242,3:99\n"));
         assert_eq!(
-            parse_grant_body(&body, TEST_NONCE).expect("parses"),
+            parse_grant_body(&body, TEST_NONCE, false).expect("parses"),
             GrantBody {
                 sessions: vec![(7, 4242), (3, 99)],
                 parked_for: None,
@@ -2061,7 +2144,7 @@ mod tests {
         let body = encode_grant_body(TEST_NONCE, &sessions, Some(parked)).expect("encodes");
         assert_eq!(body, format!("{TEST_NONCE}\n7:4242\npark_us=1500\n"));
         assert_eq!(
-            parse_grant_body(&body, TEST_NONCE),
+            parse_grant_body(&body, TEST_NONCE, false),
             Ok(GrantBody {
                 sessions: vec![(7, 4242)],
                 parked_for: Some(parked),
@@ -2069,7 +2152,7 @@ mod tests {
         );
         let older = format!("{TEST_NONCE}\n7:4242\n");
         assert_eq!(
-            parse_grant_body(&older, TEST_NONCE).map(|body| body.parked_for),
+            parse_grant_body(&older, TEST_NONCE, false).map(|body| body.parked_for),
             Ok(None),
             "an older parent's grant has no stamp"
         );
@@ -2081,7 +2164,10 @@ mod tests {
             "\n",
         ] {
             let body = format!("{TEST_NONCE}\n7:4242\n{malformed}");
-            assert!(parse_grant_body(&body, TEST_NONCE).is_err(), "{body:?}");
+            assert!(
+                parse_grant_body(&body, TEST_NONCE, false).is_err(),
+                "{body:?}"
+            );
         }
         for parked in [
             Duration::ZERO,
@@ -2091,7 +2177,7 @@ mod tests {
         ] {
             let body = encode_grant_body(TEST_NONCE, &sessions, Some(parked))
                 .expect("a stamp in the reader's domain encodes");
-            let parsed = parse_grant_body(&body, TEST_NONCE).expect("the stamp parses");
+            let parsed = parse_grant_body(&body, TEST_NONCE, false).expect("the stamp parses");
             assert_eq!(parsed.sessions, vec![(7, 4242)]);
             assert_eq!(
                 parsed.parked_for,
@@ -2112,9 +2198,55 @@ mod tests {
     }
 
     #[test]
+    fn a_sessionless_grant_round_trips_only_to_a_successor_offered_it() {
+        let body =
+            encode_grant_body(TEST_NONCE, &[], Some(Duration::from_micros(7))).expect("encodes");
+        assert_eq!(body, format!("{TEST_NONCE}\n\npark_us=7\n"));
+        assert_eq!(
+            parse_grant_body(&body, TEST_NONCE, true),
+            Ok(GrantBody {
+                sessions: Vec::new(),
+                parked_for: Some(Duration::from_micros(7)),
+            })
+        );
+        let unstamped = encode_grant_body(TEST_NONCE, &[], None).expect("encodes");
+        assert_eq!(
+            parse_grant_body(&unstamped, TEST_NONCE, true).map(|body| body.sessions),
+            Ok(Vec::new())
+        );
+        for body in [&body, &unstamped] {
+            assert_eq!(
+                parse_grant_body(body, TEST_NONCE, false),
+                Err(RendezvousError::Grant("no sessions".to_string())),
+                "a successor not offered empty1 refuses the empty list, as every build \
+                 before it does"
+            );
+        }
+        assert_eq!(
+            grant_shape(false, true, 0),
+            Ok(GrantShape::OneMessage),
+            "the empty grant is one message carrying the two channel descriptors"
+        );
+        assert!(matches!(
+            grant_shape(true, false, 0),
+            Err(RendezvousError::TooManySessions { sessions: 0, .. })
+        ));
+        assert_eq!(grant_caps(false, false), None);
+        assert_eq!(grant_caps(true, false).as_deref(), Some("chunks1"));
+        assert_eq!(grant_caps(false, true).as_deref(), Some("empty1"));
+        assert_eq!(grant_caps(true, true).as_deref(), Some("chunks1,empty1"));
+        let offered = |caps: &str| offers_empty_grant(Some(std::ffi::OsStr::new(caps)));
+        assert!(offered("empty1"));
+        assert!(offered("chunks1,empty1"));
+        assert!(!offered("chunks1"));
+        assert!(!offered("empty10"));
+        assert!(!offers_empty_grant(None));
+    }
+
+    #[test]
     fn a_malformed_grant_body_is_refused_rather_than_partially_believed() {
         assert_eq!(
-            parse_grant_body(&format!("{TEST_NONCE}\n1:2\n"), &"f".repeat(32)),
+            parse_grant_body(&format!("{TEST_NONCE}\n1:2\n"), &"f".repeat(32), false),
             Err(RendezvousError::NonceMismatch),
             "a grant for another attempt"
         );
@@ -2137,9 +2269,10 @@ mod tests {
             format!("{TEST_NONCE}\n1:2\npark_us=01500\n"),
             format!("{TEST_NONCE}\n1:2\npark_us=+1500\n"),
             format!("{TEST_NONCE}\n1:2,1:3\n"),
+            format!("{TEST_NONCE}\n\n"),
         ] {
             assert!(
-                parse_grant_body(&body, TEST_NONCE).is_err(),
+                parse_grant_body(&body, TEST_NONCE, false).is_err(),
                 "{body:?} must not parse"
             );
         }
@@ -2421,7 +2554,7 @@ mod tests {
             .map(|(id, write)| (id as u64, 5000 + id as i32, write.as_fd()))
             .collect::<Vec<_>>();
         assert_eq!(
-            grant_shape(true, sessions),
+            grant_shape(true, false, sessions),
             Ok(GrantShape::Chunked),
             "PRECONDITION: {sessions} sessions take the chunked grant"
         );
@@ -3944,72 +4077,105 @@ mod tests {
     }
 
     fn grant_disagreement(
-        decide: &dyn Fn(bool, usize) -> Result<GrantShape, RendezvousError>,
+        decide: &dyn Fn(bool, bool, usize) -> Result<GrantShape, RendezvousError>,
     ) -> Option<String> {
         let model = aterm_models_update::native_update_rendezvous_grant_model();
-        for capable in [false, true] {
-            for declared in [false, true] {
-                for offered in [false, true] {
-                    for large in [false, true] {
-                        if (declared && !capable) || (offered && !declared) {
-                            continue;
-                        }
-                        let mut state = model.init_state();
-                        if capable {
-                            step_grant(&model, &mut state, "Upgrade");
-                        }
-                        if declared {
-                            step_grant(&model, &mut state, "Declare");
-                        }
-                        if large {
-                            step_grant(&model, &mut state, "Grow");
-                        }
-                        if offered {
-                            step_grant(&model, &mut state, "Offer");
-                        }
-                        step_grant(&model, &mut state, "Launch");
-                        let caps = offered.then(|| std::ffi::OsString::from(GRANT_CAPS_CHUNKS));
-                        let claims_chunks = capable && offers_chunked_grant(caps.as_deref());
-                        if model.action_enabled("ClaimChunks", &state) != claims_chunks
-                            || model.action_enabled("ClaimOne", &state) == claims_chunks
-                        {
-                            return Some(format!(
-                                "the claim of capable={capable} offered={offered}"
-                            ));
-                        }
-                        let secret = "d".repeat(CLAIM_HEX_LEN);
-                        let claimed =
-                            claim_frame_kind(&claim_frame_with(&secret, claims_chunks), &secret)
-                                .expect("the claim carries the secret");
-                        step_grant(
-                            &model,
-                            &mut state,
-                            if claimed { "ClaimChunks" } else { "ClaimOne" },
-                        );
-                        let pools: &[usize] = if large {
-                            &[MAX_RENDEZVOUS_SESSIONS + 1, 100, MAX_CHUNKED_SESSIONS]
-                        } else {
-                            &[1, 3, MAX_RENDEZVOUS_SESSIONS]
-                        };
-                        for &sessions in pools {
-                            let decided = decide(claimed, sessions);
-                            let expected = (
-                                matches!(decided, Ok(GrantShape::OneMessage)),
-                                matches!(decided, Ok(GrantShape::Chunked)),
-                                matches!(decided, Err(RendezvousError::TooManySessions { .. })),
-                            );
-                            let modelled = (
-                                model.action_enabled("GrantOne", &state),
-                                model.action_enabled("GrantChunks", &state),
-                                model.action_enabled("RefuseTooMany", &state),
-                            );
-                            if expected != modelled {
-                                return Some(format!(
-                                    "{sessions} sessions for claim chunks={claimed}: the parent \
-                                     decides {decided:?}, the model enables {modelled:?}"
-                                ));
-                            }
-                        }
+        let bools = [false, true];
+        for (capable, declared, offered, large) in bools.into_iter().flat_map(|a| {
+            bools.into_iter().flat_map(move |b| {
+                bools
+                    .into_iter()
+                    .flat_map(move |c| bools.into_iter().map(move |d| (a, b, c, d)))
+            })
+        }) {
+            for (empty_capable, empty_declared, empty_offered, sessionless) in
+                bools.into_iter().flat_map(|a| {
+                    bools.into_iter().flat_map(move |b| {
+                        bools
+                            .into_iter()
+                            .flat_map(move |c| bools.into_iter().map(move |d| (a, b, c, d)))
+                    })
+                })
+            {
+                if (declared && !capable)
+                    || (offered && !declared)
+                    || (empty_declared && !empty_capable)
+                    || (empty_offered && !empty_declared)
+                    || (large && sessionless)
+                {
+                    continue;
+                }
+                let mut state = model.init_state();
+                for (taken, action) in [
+                    (capable, "Upgrade"),
+                    (declared, "Declare"),
+                    (empty_capable, "UpgradeEmpty"),
+                    (empty_declared, "DeclareEmpty"),
+                    (large, "Grow"),
+                    (sessionless, "Empty"),
+                    (offered, "Offer"),
+                    (empty_offered, "OfferEmpty"),
+                    (true, "Launch"),
+                ] {
+                    if taken {
+                        step_grant(&model, &mut state, action);
+                    }
+                }
+                let caps = grant_caps(offered, empty_offered).map(std::ffi::OsString::from);
+                let claims_chunks = capable && offers_chunked_grant(caps.as_deref());
+                if model.action_enabled("ClaimChunks", &state) != claims_chunks
+                    || model.action_enabled("ClaimOne", &state) == claims_chunks
+                {
+                    return Some(format!("the claim of capable={capable} offered={offered}"));
+                }
+                let secret = "d".repeat(CLAIM_HEX_LEN);
+                let claimed = claim_frame_kind(&claim_frame_with(&secret, claims_chunks), &secret)
+                    .expect("the claim carries the secret");
+                step_grant(
+                    &model,
+                    &mut state,
+                    if claimed { "ClaimChunks" } else { "ClaimOne" },
+                );
+                let pools: &[usize] = if sessionless {
+                    &[0]
+                } else if large {
+                    &[MAX_RENDEZVOUS_SESSIONS + 1, 100, MAX_CHUNKED_SESSIONS]
+                } else {
+                    &[1, 3, MAX_RENDEZVOUS_SESSIONS]
+                };
+                for &sessions in pools {
+                    let decided = decide(claimed, empty_offered, sessions);
+                    let expected = (
+                        matches!(decided, Ok(GrantShape::OneMessage)),
+                        matches!(decided, Ok(GrantShape::Chunked)),
+                        matches!(decided, Err(RendezvousError::TooManySessions { .. })),
+                    );
+                    let modelled = (
+                        model.action_enabled("GrantOne", &state),
+                        model.action_enabled("GrantChunks", &state),
+                        model.action_enabled("RefuseTooMany", &state)
+                            || model.action_enabled("RefuseEmpty", &state),
+                    );
+                    if expected != modelled {
+                        return Some(format!(
+                            "{sessions} sessions for claim chunks={claimed} empty \
+                             offered={empty_offered}: the parent decides {decided:?}, the \
+                             model enables {modelled:?}"
+                        ));
+                    }
+                }
+                if sessionless && model.action_enabled("GrantOne", &state) {
+                    for action in ["GrantOne", "Send", "Take"] {
+                        step_grant(&model, &mut state, action);
+                    }
+                    let reads = empty_capable && offers_empty_grant(caps.as_deref());
+                    let adopted =
+                        parse_grant_body(&format!("{TEST_NONCE}\n\n"), TEST_NONCE, reads).is_ok();
+                    if model.action_enabled("Adopt", &state) != adopted {
+                        return Some(format!(
+                            "a sessionless grant to empty capable={empty_capable} \
+                             offered={empty_offered}: the successor adopts={adopted}"
+                        ));
                     }
                 }
             }
@@ -4021,8 +4187,13 @@ mod tests {
     fn rendezvous_grant_conformance() {
         assert_eq!(grant_disagreement(&grant_shape), None);
         assert!(
-            grant_disagreement(&|_, sessions| grant_shape(true, sessions)).is_some(),
+            grant_disagreement(&|_, empty, sessions| grant_shape(true, empty, sessions)).is_some(),
             "a parent that ignores the claim must disagree with the model"
+        );
+        assert!(
+            grant_disagreement(&|chunks, _, sessions| grant_shape(chunks, true, sessions))
+                .is_some(),
+            "a parent that sends an empty grant it never offered must disagree with the model"
         );
     }
 }
